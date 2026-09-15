@@ -314,8 +314,12 @@ enum PlaceTagged {
         name: String,
         environment: Option<String>,
     },
-    Url { href: String },
-    Named { label: String },
+    Url {
+        href: String,
+    },
+    Named {
+        label: String,
+    },
     LocalFrame {
         frame: String,
         x: f32,
@@ -361,8 +365,12 @@ enum PlaceBinary {
         name: String,
         environment: Option<String>,
     },
-    Url { href: String },
-    Named { label: String },
+    Url {
+        href: String,
+    },
+    Named {
+        label: String,
+    },
     LocalFrame {
         frame: String,
         x: f32,
@@ -1100,13 +1108,35 @@ mod tests {
                 pull_request: Some("7".into()),
                 dirty: Some(false),
             },
-            Place::Module { path: "memory::facets".into() },
-            Place::File { path: "src/lib.rs".into(), symbol: None },
-            Place::Geo { lat: 1.5, lon: -2.25, alt: None },
-            Place::Host { name: "box".into(), environment: Some("prod".into()) },
-            Place::Url { href: "https://example.com".into() },
-            Place::Named { label: "terrain:gravel".into() },
-            Place::LocalFrame { frame: "robot".into(), x: 1.0, y: 2.0, z: 3.0, orientation: None },
+            Place::Module {
+                path: "memory::facets".into(),
+            },
+            Place::File {
+                path: "src/lib.rs".into(),
+                symbol: None,
+            },
+            Place::Geo {
+                lat: 1.5,
+                lon: -2.25,
+                alt: None,
+            },
+            Place::Host {
+                name: "box".into(),
+                environment: Some("prod".into()),
+            },
+            Place::Url {
+                href: "https://example.com".into(),
+            },
+            Place::Named {
+                label: "terrain:gravel".into(),
+            },
+            Place::LocalFrame {
+                frame: "robot".into(),
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+                orientation: None,
+            },
             Place::GeoFix {
                 lat: 3.0,
                 lon: 4.0,
@@ -1122,16 +1152,25 @@ mod tests {
     #[test]
     fn every_place_round_trips_through_bincode() {
         let cfg = bincode::config::standard();
-        let facet = WhereFacet { places: every_place(), ..Default::default() };
+        let facet = WhereFacet {
+            places: every_place(),
+            ..Default::default()
+        };
         let bytes = bincode::serde::encode_to_vec(&facet, cfg).unwrap();
-        let (back, used): (WhereFacet, usize) = bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+        let (back, used): (WhereFacet, usize) =
+            bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
         assert_eq!(used, bytes.len());
         assert_eq!(back.places, facet.places);
     }
 
     #[test]
     fn place_json_keeps_its_kind_tag() {
-        let geo = serde_json::to_string(&Place::Geo { lat: 1.5, lon: -2.25, alt: None }).unwrap();
+        let geo = serde_json::to_string(&Place::Geo {
+            lat: 1.5,
+            lon: -2.25,
+            alt: None,
+        })
+        .unwrap();
         assert_eq!(geo, r#"{"kind":"geo","lat":1.5,"lon":-2.25,"alt":null}"#);
         for place in every_place() {
             let json = serde_json::to_value(&place).unwrap();

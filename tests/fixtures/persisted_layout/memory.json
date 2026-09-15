@@ -1,0 +1,1964 @@
+{
+  "AgentRef": {
+    "STRUCT": [
+      {
+        "entity_id": {
+          "OPTION": "BYTES"
+        }
+      },
+      {
+        "name": "STR"
+      },
+      {
+        "role": {
+          "TYPENAME": "AgentRole"
+        }
+      }
+    ]
+  },
+  "AgentRole": {
+    "ENUM": {
+      "0": {
+        "self_agent": "UNIT"
+      },
+      "1": {
+        "author": "UNIT"
+      },
+      "2": {
+        "subject": "UNIT"
+      },
+      "3": {
+        "audience": "UNIT"
+      },
+      "4": {
+        "mentioned": "UNIT"
+      }
+    }
+  },
+  "AgentSession": {
+    "STRUCT": [
+      {
+        "worktree_path": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "branch": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "agent_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "vscode_window_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "started_at": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "parent_repo": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "declared": {
+          "TYPENAME": "DeclaredWriter"
+        }
+      },
+      {
+        "verified": {
+          "TYPENAME": "VerifiedWriter"
+        }
+      }
+    ]
+  },
+  "BoundaryCause": {
+    "ENUM": {
+      "0": {
+        "goal_change": "UNIT"
+      },
+      "1": {
+        "prediction_error": "UNIT"
+      },
+      "2": {
+        "location_change": "UNIT"
+      },
+      "3": {
+        "agent_change": "UNIT"
+      },
+      "4": {
+        "temporal_gap": "UNIT"
+      }
+    }
+  },
+  "CausalLink": {
+    "STRUCT": [
+      {
+        "other": "BYTES"
+      },
+      {
+        "relation": {
+          "TYPENAME": "CausalRelation"
+        }
+      },
+      {
+        "confidence": "F32"
+      },
+      {
+        "inferred": "BOOL"
+      }
+    ]
+  },
+  "CausalRelation": {
+    "ENUM": {
+      "0": {
+        "caused": "UNIT"
+      },
+      "1": {
+        "triggered": "UNIT"
+      },
+      "2": {
+        "enabled": "UNIT"
+      },
+      "3": {
+        "prevented": "UNIT"
+      },
+      "4": {
+        "motivated": "UNIT"
+      }
+    }
+  },
+  "ChangeType": {
+    "ENUM": {
+      "0": {
+        "created": "UNIT"
+      },
+      "1": {
+        "content_updated": "UNIT"
+      },
+      "2": {
+        "status_changed": "UNIT"
+      },
+      "3": {
+        "tags_updated": "UNIT"
+      },
+      "4": {
+        "importance_adjusted": "UNIT"
+      }
+    }
+  },
+  "CodeContext": {
+    "STRUCT": [
+      {
+        "current_file": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "current_scope": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "related_files": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "recent_edits": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "call_stack": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "git_branch": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "recent_commits": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "patterns": {
+          "SEQ": "STR"
+        }
+      }
+    ]
+  },
+  "ConceptRelationship": {
+    "STRUCT": [
+      {
+        "from": "STR"
+      },
+      {
+        "to": "STR"
+      },
+      {
+        "relationship_type": {
+          "TYPENAME": "RelationshipType"
+        }
+      },
+      {
+        "strength": "F32"
+      }
+    ]
+  },
+  "ContentKind": {
+    "ENUM": {
+      "0": {
+        "observation": "UNIT"
+      },
+      "1": {
+        "decision": "UNIT"
+      },
+      "2": {
+        "learning": "UNIT"
+      },
+      "3": {
+        "action": "UNIT"
+      },
+      "4": {
+        "reflection": "UNIT"
+      },
+      "5": {
+        "conversation": "UNIT"
+      },
+      "6": {
+        "code": "UNIT"
+      },
+      "7": {
+        "document": "UNIT"
+      },
+      "8": {
+        "other": "UNIT"
+      }
+    }
+  },
+  "ConversationContext": {
+    "STRUCT": [
+      {
+        "conversation_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "topic": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "recent_messages": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "mentioned_entities": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "active_intents": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "tone": {
+          "OPTION": "STR"
+        }
+      }
+    ]
+  },
+  "DeclaredWriter": {
+    "STRUCT": [
+      {
+        "session_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "previous_session_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "session_name": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "transcript_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "model_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "workspace": {
+          "OPTION": "STR"
+        }
+      }
+    ]
+  },
+  "DocumentContext": {
+    "STRUCT": [
+      {
+        "document_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "document_type": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "current_section": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "related_documents": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "citations": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "categories": {
+          "SEQ": "STR"
+        }
+      }
+    ]
+  },
+  "EmotionalContext": {
+    "STRUCT": [
+      {
+        "valence": "F32"
+      },
+      {
+        "arousal": "F32"
+      },
+      {
+        "dominant_emotion": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "content_sentiment": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "confidence": "F32"
+      }
+    ]
+  },
+  "EngramBinding": {
+    "STRUCT": [
+      {
+        "conjunctive_key": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "binding_strength": "F32"
+      },
+      {
+        "present": {
+          "TYPENAME": "WFacetMask"
+        }
+      }
+    ]
+  },
+  "EntityRef": {
+    "STRUCT": [
+      {
+        "entity_id": "BYTES"
+      },
+      {
+        "name": "STR"
+      },
+      {
+        "relation": "STR"
+      }
+    ]
+  },
+  "EnvironmentContext": {
+    "STRUCT": [
+      {
+        "os": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "device": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "screen_size": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "location": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "network": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "resources": {
+          "MAP": {
+            "KEY": "STR",
+            "VALUE": "STR"
+          }
+        }
+      }
+    ]
+  },
+  "EpisodeContext": {
+    "STRUCT": [
+      {
+        "episode_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "sequence_number": {
+          "OPTION": "U32"
+        }
+      },
+      {
+        "preceding_memory_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "episode_type": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "episode_start": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "is_episode_start": "BOOL"
+      },
+      {
+        "is_episode_end": "BOOL"
+      },
+      {
+        "parent_episode_id": {
+          "OPTION": "STR"
+        }
+      }
+    ]
+  },
+  "Experience": {
+    "STRUCT": [
+      {
+        "experience_type": {
+          "TYPENAME": "ExperienceType"
+        }
+      },
+      {
+        "content": "STR"
+      },
+      {
+        "context": {
+          "OPTION": {
+            "TYPENAME": "RichContext"
+          }
+        }
+      },
+      {
+        "entities": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "metadata": {
+          "MAP": {
+            "KEY": "STR",
+            "VALUE": "STR"
+          }
+        }
+      },
+      {
+        "embeddings": {
+          "OPTION": {
+            "SEQ": "F32"
+          }
+        }
+      },
+      {
+        "embeddings_secondary": {
+          "OPTION": {
+            "SEQ": "F32"
+          }
+        }
+      },
+      {
+        "embedding_degraded": "BOOL"
+      },
+      {
+        "image_embeddings": {
+          "OPTION": {
+            "SEQ": "F32"
+          }
+        }
+      },
+      {
+        "audio_embeddings": {
+          "OPTION": {
+            "SEQ": "F32"
+          }
+        }
+      },
+      {
+        "video_embeddings": {
+          "OPTION": {
+            "SEQ": "F32"
+          }
+        }
+      },
+      {
+        "media_refs": {
+          "SEQ": {
+            "TYPENAME": "MediaRef"
+          }
+        }
+      },
+      {
+        "related_memories": {
+          "SEQ": "BYTES"
+        }
+      },
+      {
+        "causal_chain": {
+          "SEQ": "BYTES"
+        }
+      },
+      {
+        "outcomes": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "robot_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "mission_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "geo_location": {
+          "OPTION": {
+            "TUPLEARRAY": {
+              "CONTENT": "F64",
+              "SIZE": 3
+            }
+          }
+        }
+      },
+      {
+        "local_position": {
+          "OPTION": {
+            "TUPLEARRAY": {
+              "CONTENT": "F32",
+              "SIZE": 3
+            }
+          }
+        }
+      },
+      {
+        "heading": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "action_type": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "reward": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "sensor_data": {
+          "MAP": {
+            "KEY": "STR",
+            "VALUE": "F64"
+          }
+        }
+      },
+      {
+        "decision_context": {
+          "OPTION": {
+            "MAP": {
+              "KEY": "STR",
+              "VALUE": "STR"
+            }
+          }
+        }
+      },
+      {
+        "action_params": {
+          "OPTION": {
+            "MAP": {
+              "KEY": "STR",
+              "VALUE": "STR"
+            }
+          }
+        }
+      },
+      {
+        "outcome_type": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "outcome_details": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "confidence": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "alternatives_considered": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "weather": {
+          "OPTION": {
+            "MAP": {
+              "KEY": "STR",
+              "VALUE": "STR"
+            }
+          }
+        }
+      },
+      {
+        "terrain_type": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "lighting": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "nearby_agents": {
+          "SEQ": {
+            "MAP": {
+              "KEY": "STR",
+              "VALUE": "STR"
+            }
+          }
+        }
+      },
+      {
+        "is_failure": "BOOL"
+      },
+      {
+        "is_anomaly": "BOOL"
+      },
+      {
+        "severity": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "recovery_action": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "root_cause": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "pattern_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "predicted_outcome": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "prediction_accurate": {
+          "OPTION": "BOOL"
+        }
+      },
+      {
+        "tags": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "temporal_refs": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "ner_entities": {
+          "SEQ": {
+            "TYPENAME": "NerEntityRecord"
+          }
+        }
+      },
+      {
+        "cooccurrence_pairs": {
+          "SEQ": {
+            "TUPLEARRAY": {
+              "CONTENT": "STR",
+              "SIZE": 2
+            }
+          }
+        }
+      }
+    ]
+  },
+  "ExperienceType": {
+    "ENUM": {
+      "0": {
+        "Conversation": "UNIT"
+      },
+      "1": {
+        "Decision": "UNIT"
+      },
+      "2": {
+        "Error": "UNIT"
+      },
+      "3": {
+        "Learning": "UNIT"
+      },
+      "4": {
+        "Discovery": "UNIT"
+      },
+      "5": {
+        "Pattern": "UNIT"
+      },
+      "6": {
+        "Context": "UNIT"
+      },
+      "7": {
+        "Task": "UNIT"
+      },
+      "8": {
+        "CodeEdit": "UNIT"
+      },
+      "9": {
+        "FileAccess": "UNIT"
+      },
+      "10": {
+        "Search": "UNIT"
+      },
+      "11": {
+        "Command": "UNIT"
+      },
+      "12": {
+        "Observation": "UNIT"
+      },
+      "13": {
+        "Intention": "UNIT"
+      }
+    }
+  },
+  "GoalRef": {
+    "STRUCT": [
+      {
+        "id": "STR"
+      },
+      {
+        "label": {
+          "OPTION": "STR"
+        }
+      }
+    ]
+  },
+  "MediaRef": {
+    "STRUCT": [
+      {
+        "media_type": {
+          "TYPENAME": "MediaType"
+        }
+      },
+      {
+        "uri": "STR"
+      },
+      {
+        "filename": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "mime_type": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "size_bytes": {
+          "OPTION": "U64"
+        }
+      },
+      {
+        "media_metadata": {
+          "MAP": {
+            "KEY": "STR",
+            "VALUE": "STR"
+          }
+        }
+      },
+      {
+        "timestamp_ms": {
+          "OPTION": "U64"
+        }
+      },
+      {
+        "duration_ms": {
+          "OPTION": "U64"
+        }
+      }
+    ]
+  },
+  "MediaType": {
+    "ENUM": {
+      "0": {
+        "Image": "UNIT"
+      },
+      "1": {
+        "Audio": "UNIT"
+      },
+      "2": {
+        "Video": "UNIT"
+      },
+      "3": {
+        "Document": "UNIT"
+      }
+    }
+  },
+  "MemoryFlat": {
+    "STRUCT": [
+      {
+        "id": "BYTES"
+      },
+      {
+        "experience": {
+          "TYPENAME": "Experience"
+        }
+      },
+      {
+        "importance": "F32"
+      },
+      {
+        "access_count": "U32"
+      },
+      {
+        "created_at": "STR"
+      },
+      {
+        "last_accessed": "STR"
+      },
+      {
+        "compressed": "BOOL"
+      },
+      {
+        "persistent": "BOOL"
+      },
+      {
+        "tier": {
+          "TYPENAME": "MemoryTier"
+        }
+      },
+      {
+        "entity_refs": {
+          "SEQ": {
+            "TYPENAME": "EntityRef"
+          }
+        }
+      },
+      {
+        "activation": "F32"
+      },
+      {
+        "last_retrieval_id": {
+          "OPTION": "BYTES"
+        }
+      },
+      {
+        "agent_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "run_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "actor_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "temporal_relevance": "F32"
+      },
+      {
+        "score": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "external_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "version": "U32"
+      },
+      {
+        "history": {
+          "SEQ": {
+            "TYPENAME": "MemoryRevision"
+          }
+        }
+      },
+      {
+        "related_todo_ids": {
+          "SEQ": "BYTES"
+        }
+      },
+      {
+        "parent_id": {
+          "OPTION": "BYTES"
+        }
+      },
+      {
+        "anchored": "BOOL"
+      },
+      {
+        "calibrated_confidence": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "confidence_alpha": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "confidence_beta": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "valid_until": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "access_history": {
+          "OPTION": {
+            "SEQ": "STR"
+          }
+        }
+      },
+      {
+        "elaboration_score": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "fragment_demotion": {
+          "OPTION": "F32"
+        }
+      },
+      {
+        "kind": {
+          "TYPENAME": "RecordKind"
+        }
+      },
+      {
+        "what": {
+          "TYPENAME": "WhatFacet"
+        }
+      },
+      {
+        "when": {
+          "TYPENAME": "WhenFacet"
+        }
+      }
+    ]
+  },
+  "MemoryRevision": {
+    "STRUCT": [
+      {
+        "previous_content": "STR"
+      },
+      {
+        "change_type": {
+          "TYPENAME": "ChangeType"
+        }
+      },
+      {
+        "changed_at": "STR"
+      },
+      {
+        "changed_by": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "change_reason": {
+          "OPTION": "STR"
+        }
+      }
+    ]
+  },
+  "MemoryTier": {
+    "ENUM": {
+      "0": {
+        "Working": "UNIT"
+      },
+      "1": {
+        "Session": "UNIT"
+      },
+      "2": {
+        "LongTerm": "UNIT"
+      },
+      "3": {
+        "Archive": "UNIT"
+      }
+    }
+  },
+  "NerEntityRecord": {
+    "STRUCT": [
+      {
+        "text": "STR"
+      },
+      {
+        "entity_type": "STR"
+      },
+      {
+        "confidence": "F32"
+      },
+      {
+        "start_char": {
+          "OPTION": "U64"
+        }
+      },
+      {
+        "end_char": {
+          "OPTION": "U64"
+        }
+      }
+    ]
+  },
+  "Orientation": {
+    "STRUCT": [
+      {
+        "pitch": "F32"
+      },
+      {
+        "roll": "F32"
+      },
+      {
+        "yaw": "F32"
+      }
+    ]
+  },
+  "PlaceBinary": {
+    "ENUM": {
+      "0": {
+        "repo": {
+          "STRUCT": [
+            {
+              "slug": "STR"
+            },
+            {
+              "branch": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "commit": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "remote": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "pull_request": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "dirty": {
+                "OPTION": "BOOL"
+              }
+            }
+          ]
+        }
+      },
+      "1": {
+        "module": {
+          "STRUCT": [
+            {
+              "path": "STR"
+            }
+          ]
+        }
+      },
+      "2": {
+        "file": {
+          "STRUCT": [
+            {
+              "path": "STR"
+            },
+            {
+              "symbol": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      },
+      "3": {
+        "geo": {
+          "STRUCT": [
+            {
+              "lat": "F64"
+            },
+            {
+              "lon": "F64"
+            },
+            {
+              "alt": {
+                "OPTION": "F64"
+              }
+            }
+          ]
+        }
+      },
+      "4": {
+        "host": {
+          "STRUCT": [
+            {
+              "name": "STR"
+            },
+            {
+              "environment": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      },
+      "5": {
+        "url": {
+          "STRUCT": [
+            {
+              "href": "STR"
+            }
+          ]
+        }
+      },
+      "6": {
+        "named": {
+          "STRUCT": [
+            {
+              "label": "STR"
+            }
+          ]
+        }
+      },
+      "7": {
+        "local_frame": {
+          "STRUCT": [
+            {
+              "frame": "STR"
+            },
+            {
+              "x": "F32"
+            },
+            {
+              "y": "F32"
+            },
+            {
+              "z": "F32"
+            },
+            {
+              "orientation": {
+                "OPTION": {
+                  "TYPENAME": "Orientation"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "8": {
+        "geo_fix": {
+          "STRUCT": [
+            {
+              "lat": "F64"
+            },
+            {
+              "lon": "F64"
+            },
+            {
+              "alt": {
+                "OPTION": "F64"
+              }
+            },
+            {
+              "accuracy_m": {
+                "OPTION": "F32"
+              }
+            },
+            {
+              "speed_m_s": {
+                "OPTION": "F32"
+              }
+            },
+            {
+              "course_deg": {
+                "OPTION": "F32"
+              }
+            },
+            {
+              "captured_at": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Prediction": {
+    "STRUCT": [
+      {
+        "expected": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "observed": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "accurate": {
+          "OPTION": "BOOL"
+        }
+      }
+    ]
+  },
+  "ProjectContext": {
+    "STRUCT": [
+      {
+        "project_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "name": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "project_type": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "technologies": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "current_phase": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "active_files": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "current_task": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "dependencies": {
+          "SEQ": "STR"
+        }
+      }
+    ]
+  },
+  "Provenance": {
+    "STRUCT": [
+      {
+        "source_kind": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "source_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "credibility": "F32"
+      },
+      {
+        "verified": "BOOL"
+      },
+      {
+        "chain": {
+          "SEQ": {
+            "TYPENAME": "ProvenanceHop"
+          }
+        }
+      }
+    ]
+  },
+  "ProvenanceHop": {
+    "STRUCT": [
+      {
+        "source_kind": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "source_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "credibility": {
+          "OPTION": "F32"
+        }
+      }
+    ]
+  },
+  "RecordKind": {
+    "ENUM": {
+      "0": {
+        "memory": "UNIT"
+      },
+      "1": {
+        "plan": "UNIT"
+      },
+      "2": {
+        "prompt": "UNIT"
+      },
+      "3": {
+        "learning": "UNIT"
+      }
+    }
+  },
+  "RecurrencePattern": {
+    "STRUCT": [
+      {
+        "period": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "description": {
+          "OPTION": "STR"
+        }
+      }
+    ]
+  },
+  "RelationshipType": {
+    "ENUM": {
+      "0": {
+        "IsA": "UNIT"
+      },
+      "1": {
+        "HasA": "UNIT"
+      },
+      "2": {
+        "Uses": "UNIT"
+      },
+      "3": {
+        "RelatedTo": "UNIT"
+      },
+      "4": {
+        "Causes": "UNIT"
+      },
+      "5": {
+        "PartOf": "UNIT"
+      },
+      "6": {
+        "Similar": "UNIT"
+      },
+      "7": {
+        "Opposite": "UNIT"
+      }
+    }
+  },
+  "RichContext": {
+    "STRUCT": [
+      {
+        "id": "BYTES"
+      },
+      {
+        "conversation": {
+          "TYPENAME": "ConversationContext"
+        }
+      },
+      {
+        "user": {
+          "TYPENAME": "UserContext"
+        }
+      },
+      {
+        "project": {
+          "TYPENAME": "ProjectContext"
+        }
+      },
+      {
+        "temporal": {
+          "TYPENAME": "TemporalContext"
+        }
+      },
+      {
+        "semantic": {
+          "TYPENAME": "SemanticContext"
+        }
+      },
+      {
+        "code": {
+          "TYPENAME": "CodeContext"
+        }
+      },
+      {
+        "document": {
+          "TYPENAME": "DocumentContext"
+        }
+      },
+      {
+        "environment": {
+          "TYPENAME": "EnvironmentContext"
+        }
+      },
+      {
+        "emotional": {
+          "TYPENAME": "EmotionalContext"
+        }
+      },
+      {
+        "source": {
+          "TYPENAME": "SourceContext"
+        }
+      },
+      {
+        "episode": {
+          "TYPENAME": "EpisodeContext"
+        }
+      },
+      {
+        "place": {
+          "TYPENAME": "WhereFacet"
+        }
+      },
+      {
+        "who": {
+          "TYPENAME": "WhoFacet"
+        }
+      },
+      {
+        "why": {
+          "TYPENAME": "WhyFacet"
+        }
+      },
+      {
+        "binding": {
+          "TYPENAME": "EngramBinding"
+        }
+      },
+      {
+        "session": {
+          "TYPENAME": "AgentSession"
+        }
+      },
+      {
+        "parent": {
+          "OPTION": {
+            "TYPENAME": "RichContext"
+          }
+        }
+      },
+      {
+        "embeddings": {
+          "OPTION": {
+            "SEQ": "F32"
+          }
+        }
+      },
+      {
+        "decay_rate": "F32"
+      },
+      {
+        "created_at": "STR"
+      },
+      {
+        "updated_at": "STR"
+      }
+    ]
+  },
+  "SemanticContext": {
+    "STRUCT": [
+      {
+        "concepts": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "related_concepts": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "relationships": {
+          "SEQ": {
+            "TYPENAME": "ConceptRelationship"
+          }
+        }
+      },
+      {
+        "domain": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "abstraction_level": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "tags": {
+          "SEQ": "STR"
+        }
+      }
+    ]
+  },
+  "SourceContext": {
+    "STRUCT": [
+      {
+        "source_type": {
+          "TYPENAME": "SourceType"
+        }
+      },
+      {
+        "source_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "source_name": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "credibility": "F32"
+      },
+      {
+        "verified": "BOOL"
+      },
+      {
+        "source_chain": {
+          "SEQ": "STR"
+        }
+      }
+    ]
+  },
+  "SourceType": {
+    "ENUM": {
+      "0": {
+        "User": "UNIT"
+      },
+      "1": {
+        "System": "UNIT"
+      },
+      "2": {
+        "ExternalApi": "UNIT"
+      },
+      "3": {
+        "File": "UNIT"
+      },
+      "4": {
+        "Web": "UNIT"
+      },
+      "5": {
+        "AiGenerated": "UNIT"
+      },
+      "6": {
+        "Inferred": "UNIT"
+      },
+      "7": {
+        "Unknown": "UNIT"
+      }
+    }
+  },
+  "TemporalContext": {
+    "STRUCT": [
+      {
+        "time_of_day": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "day_of_week": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "session_duration_minutes": {
+          "OPTION": "U32"
+        }
+      },
+      {
+        "time_since_last_interaction": {
+          "OPTION": "I64"
+        }
+      },
+      {
+        "patterns": {
+          "SEQ": {
+            "TYPENAME": "TimePattern"
+          }
+        }
+      },
+      {
+        "trends": {
+          "SEQ": "STR"
+        }
+      }
+    ]
+  },
+  "TimePattern": {
+    "STRUCT": [
+      {
+        "pattern_type": "STR"
+      },
+      {
+        "frequency": "STR"
+      },
+      {
+        "time_range": {
+          "OPTION": {
+            "TUPLEARRAY": {
+              "CONTENT": "STR",
+              "SIZE": 2
+            }
+          }
+        }
+      },
+      {
+        "confidence": "F32"
+      }
+    ]
+  },
+  "TimePrecision": {
+    "ENUM": {
+      "0": {
+        "year": "UNIT"
+      },
+      "1": {
+        "month": "UNIT"
+      },
+      "2": {
+        "day": "UNIT"
+      },
+      "3": {
+        "hour": "UNIT"
+      },
+      "4": {
+        "minute": "UNIT"
+      },
+      "5": {
+        "instant": "UNIT"
+      }
+    }
+  },
+  "TimeSpan": {
+    "STRUCT": [
+      {
+        "start": "STR"
+      },
+      {
+        "end": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "precision": {
+          "TYPENAME": "TimePrecision"
+        }
+      }
+    ]
+  },
+  "UserContext": {
+    "STRUCT": [
+      {
+        "user_id": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "name": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "preferences": {
+          "MAP": {
+            "KEY": "STR",
+            "VALUE": "STR"
+          }
+        }
+      },
+      {
+        "work_patterns": {
+          "SEQ": {
+            "TYPENAME": "TimePattern"
+          }
+        }
+      },
+      {
+        "expertise": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "goals": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "learning_style": {
+          "OPTION": "STR"
+        }
+      }
+    ]
+  },
+  "VerifiedWriter": {
+    "STRUCT": [
+      {
+        "principal": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "received_at": {
+          "OPTION": "STR"
+        }
+      }
+    ]
+  },
+  "WFacetMask": {
+    "STRUCT": [
+      {
+        "what": "BOOL"
+      },
+      {
+        "where": "BOOL"
+      },
+      {
+        "when": "BOOL"
+      },
+      {
+        "who": "BOOL"
+      },
+      {
+        "why": "BOOL"
+      }
+    ]
+  },
+  "WhatFacet": {
+    "STRUCT": [
+      {
+        "verbatim": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "gist": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "content_kind": {
+          "TYPENAME": "ContentKind"
+        }
+      },
+      {
+        "content_salience": "F32"
+      },
+      {
+        "abstraction_level": "F32"
+      }
+    ]
+  },
+  "WhenFacet": {
+    "STRUCT": [
+      {
+        "encoded_at": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "event_time": {
+          "OPTION": {
+            "TYPENAME": "TimeSpan"
+          }
+        }
+      },
+      {
+        "episode_ordinal": {
+          "OPTION": "U32"
+        }
+      },
+      {
+        "context_drift": {
+          "SEQ": "F32"
+        }
+      },
+      {
+        "recurrence": {
+          "OPTION": {
+            "TYPENAME": "RecurrencePattern"
+          }
+        }
+      }
+    ]
+  },
+  "WhereFacet": {
+    "STRUCT": [
+      {
+        "places": {
+          "SEQ": {
+            "TYPENAME": "PlaceBinary"
+          }
+        }
+      },
+      {
+        "conceptual_anchors": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "heading": {
+          "OPTION": "F32"
+        }
+      }
+    ]
+  },
+  "WhoFacet": {
+    "STRUCT": [
+      {
+        "provenance": {
+          "TYPENAME": "Provenance"
+        }
+      },
+      {
+        "agents": {
+          "SEQ": {
+            "TYPENAME": "AgentRef"
+          }
+        }
+      }
+    ]
+  },
+  "WhyFacet": {
+    "STRUCT": [
+      {
+        "goal_stack": {
+          "SEQ": {
+            "TYPENAME": "GoalRef"
+          }
+        }
+      },
+      {
+        "causes": {
+          "SEQ": {
+            "TYPENAME": "CausalLink"
+          }
+        }
+      },
+      {
+        "event_model": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "boundary": {
+          "OPTION": {
+            "TYPENAME": "BoundaryCause"
+          }
+        }
+      },
+      {
+        "prediction": {
+          "OPTION": {
+            "TYPENAME": "Prediction"
+          }
+        }
+      },
+      {
+        "schema_id": {
+          "OPTION": "STR"
+        }
+      }
+    ]
+  }
+}
