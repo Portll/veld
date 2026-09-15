@@ -823,6 +823,95 @@ impl LegacyMemoryFlatV3 {
     }
 }
 
+/// `AgentSession` as persisted before 4a54053 (2026-09-10) appended `declared` and `verified`.
+#[derive(Deserialize)]
+struct LegacyAgentSessionPreWriter {
+    worktree_path: Option<PathBuf>,
+    branch: Option<String>,
+    agent_id: Option<String>,
+    vscode_window_id: Option<String>,
+    started_at: Option<DateTime<Utc>>,
+    parent_repo: Option<PathBuf>,
+}
+
+/// The record up to the end of a pre-4a54053 session: decoding this and nothing more yields the
+/// offset where the missing bytes belong. Trailing bytes are the rest of the record.
+#[derive(Deserialize)]
+struct LegacyRichContextThroughPreWriterSession {
+    id: ContextId,
+    conversation: ConversationContext,
+    user: UserContext,
+    project: ProjectContext,
+    temporal: TemporalContext,
+    semantic: SemanticContext,
+    code: CodeContext,
+    document: DocumentContext,
+    environment: EnvironmentContext,
+    emotional: EmotionalContext,
+    source: SourceContext,
+    episode: EpisodeContext,
+    place: WhereFacet,
+    who: WhoFacet,
+    why: WhyFacet,
+    binding: EngramBinding,
+    session: LegacyAgentSessionPreWriter,
+}
+#[derive(Deserialize)]
+struct LegacyExperienceThroughPreWriterSession {
+    experience_type: ExperienceType,
+    content: String,
+    context: Option<LegacyRichContextThroughPreWriterSession>,
+}
+#[derive(Deserialize)]
+struct LegacyMemoryThroughPreWriterSession {
+    id: MemoryId,
+    experience: LegacyExperienceThroughPreWriterSession,
+}
+
+/// Default `DeclaredWriter` (six `None`s) followed by default `VerifiedWriter` (two `None`s).
+const PRE_WRITER_SESSION_GAP: [u8; 8] = [0; 8];
+
+/// Recovers a record persisted with a populated context before 4a54053 appended two structs to
+/// `AgentSession`. bincode is positional, so `#[serde(default)]` on the appended fields does
+/// nothing for bytes already on disk: the decoder reads the next field's bytes as the missing
+/// ones and every later field misreads. The gap is exactly the encoding of the two defaults,
+/// so splicing it in where the old session ends gives the wire the ordinary arms already read.
+/// Measured 2026-09-15: 24 of 9950 live records, every one with `context: Some`, all written
+/// between 2026-08-03 and 2026-09-06 and never re-serialised since.
+///
+/// Both candidate layouts after the splice must consume every byte: the same splice applied to
+/// a record that already carries the two structs shifts its tail by eight and cannot.
+fn recover_pre_writer_session(data: &[u8]) -> Option<(Memory, &'static str)> {
+    let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
+    let (prefix, gap_at) =
+        bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(data, cfg).ok()?;
+    // Without a context the session never reaches the wire and the layouts are identical.
+    prefix.experience.context.as_ref()?;
+    let mut spliced = Vec::with_capacity(data.len() + PRE_WRITER_SESSION_GAP.len());
+    spliced.extend_from_slice(&data[..gap_at]);
+    spliced.extend_from_slice(&PRE_WRITER_SESSION_GAP);
+    spliced.extend_from_slice(&data[gap_at..]);
+
+    if let Ok((memory, n)) = bincode::serde::decode_from_slice::<Memory, _>(&spliced, cfg) {
+        if n == spliced.len() {
+            return Some((memory, "bincode2_pre_writer_session"));
+        }
+    }
+    // edfb43f (2026-09-02) inserted `persistent` mid-struct, so the same window of records is
+    // also V3-shaped, with the W3.4 facets trailing.
+    let (v3, n) = bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&spliced, cfg).ok()?;
+    let ((kind, what, when), m) =
+        bincode::serde::decode_from_slice::<(RecordKind, WhatFacet, WhenFacet), _>(&spliced[n..], cfg).ok()?;
+    if n + m != spliced.len() {
+        return None;
+    }
+    let mut memory = v3.into_memory();
+    memory.kind = kind;
+    memory.what = what;
+    memory.when = when;
+    Some((memory, "bincode2_pre_writer_session_v3"))
+}
+
 /// Try deserializing with multiple format fallbacks
 /// Supports bincode 2.x (current), MessagePack, and bincode 1.x (legacy) wire formats
 ///
@@ -904,6 +993,13 @@ fn deserialize_legacy_fallback(
         }
         Err(e) => errors.push(("bincode2 LegacyMemoryFlatV3", e.to_string())),
     }
+
+    if let Some((memory, branch)) = recover_pre_writer_session(data) {
+        tracing::debug!("Recovered memory persisted with a pre-4a54053 AgentSession");
+        record_branch(branch);
+        return Ok((memory, true));
+    }
+    errors.push(("bincode2 pre-writer AgentSession splice", "no layout consumed the spliced record".to_string()));
 
     // Try bincode 2.x MINIMAL format (just UUID + content string)
     // This matches the hex pattern: 16-byte UUID + varint length + string bytes
@@ -4496,6 +4592,459 @@ mod tests {
         assert_eq!(decoded.id, id);
         assert_eq!(decoded.experience.content, "a record from a schema between V3 and today");
         assert!(is_legacy);
+    }
+
+    /// A current record with a populated context and session. `declared`/`verified` stay at
+    /// their defaults so that, once stripped, the bytes are what a pre-4a54053 binary wrote.
+    fn memory_with_session(content: &str) -> Memory {
+        let mut context = crate::memory::context::ContextBuilder::new().build();
+        context.session = AgentSession {
+            worktree_path: Some(PathBuf::from("/wt/feature")),
+            branch: Some("feature/x".into()),
+            agent_id: None,
+            vscode_window_id: None,
+            started_at: Some(Utc::now()),
+            parent_repo: Some(PathBuf::from("/repo")),
+            declared: Default::default(),
+            verified: Default::default(),
+        };
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: content.to_string(),
+            context: Some(context),
+            embeddings: Some(vec![0.25; 4]),
+            tags: vec!["synthetic".into()],
+            ..Default::default()
+        };
+        let mut memory = Memory::new(MemoryId(uuid::Uuid::new_v4()), experience, 0.7, None, None, None, None);
+        memory.when.episode_ordinal = Some(3);
+        memory
+    }
+
+    fn encode(memory: &Memory) -> Vec<u8> {
+        bincode::serde::encode_to_vec(memory, bincode::config::standard()).unwrap()
+    }
+
+    /// Strips the eight default-writer bytes 4a54053 appended, producing the pre-4a54053 wire.
+    fn strip_writer_structs(current: &[u8]) -> Vec<u8> {
+        let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
+        let (_, gap_at) =
+            bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(current, cfg).unwrap();
+        assert_eq!(&current[gap_at..gap_at + 8], &PRE_WRITER_SESSION_GAP, "fixture must carry default writers");
+        [&current[..gap_at], &current[gap_at + 8..]].concat()
+    }
+
+    #[test]
+    fn a_record_with_a_pre_writer_session_recovers_through_the_splice() {
+        let original = memory_with_session("written with a six-field session");
+        let old = strip_writer_structs(&encode(&original));
+
+        assert!(bincode::serde::decode_from_slice::<Memory, _>(&old, bincode::config::standard()).is_err(),
+            "the current layout must refuse the old wire, or this test guards nothing");
+        let (back, is_legacy) = deserialize_with_fallback(&old).expect("recovery arm");
+        assert!(is_legacy, "must be re-serialised on the way back");
+        assert_eq!(back.id, original.id);
+        assert_eq!(back.experience.content, original.experience.content);
+        let session = &back.experience.context.as_ref().unwrap().session;
+        assert_eq!(session.branch.as_deref(), Some("feature/x"));
+        assert_eq!(session.declared, Default::default());
+        assert_eq!(back.when.episode_ordinal, Some(3));
+    }
+
+    #[test]
+    fn a_v3_record_with_a_pre_writer_session_recovers_and_keeps_its_facets() {
+        let original = memory_with_session("written before persistent was inserted");
+        let current = encode(&original);
+        let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
+        let (_, persistent_at) = bincode::serde::decode_from_slice::<
+            (MemoryId, Experience, f32, u32, DateTime<Utc>, DateTime<Utc>, bool), _>(&current, cfg).unwrap();
+        assert_eq!(current[persistent_at], 1, "persistent=true sits after compressed");
+        let without_persistent = [&current[..persistent_at], &current[persistent_at + 1..]].concat();
+        let old = strip_writer_structs(&without_persistent);
+
+        let (back, is_legacy) = deserialize_with_fallback(&old).expect("V3 recovery arm");
+        assert!(is_legacy);
+        assert_eq!(back.experience.content, original.experience.content);
+        assert_eq!(back.experience.context.as_ref().unwrap().session.branch.as_deref(), Some("feature/x"));
+        assert_eq!(back.when.episode_ordinal, Some(3), "trailing W3.4 facets must survive, not default");
+        assert_eq!(back.kind, original.kind);
+    }
+
+    #[test]
+    fn the_splice_refuses_records_that_already_carry_the_writer_structs() {
+        let mut populated = memory_with_session("current layout, writer populated");
+        populated.experience.context.as_mut().unwrap().session.declared.session_name = Some("commitwork-11".into());
+        assert!(recover_pre_writer_session(&encode(&populated)).is_none());
+
+        let defaults = memory_with_session("current layout, writer defaulted");
+        assert!(recover_pre_writer_session(&encode(&defaults)).is_none());
+
+        let mut no_context = memory_with_session("no context on the wire");
+        no_context.experience.context = None;
+        assert!(recover_pre_writer_session(&encode(&no_context)).is_none());
+    }
+
+    /// Probe-only: AgentSession as written before 4a54053 appended `declared`/`verified`.
+    /// bincode is positional, so `#[serde(default)]` on the appended fields does nothing for
+    /// records already on disk with a populated context.
+    #[derive(Deserialize)]
+    struct ProbeAgentSessionPreWriter {
+        worktree_path: Option<PathBuf>,
+        branch: Option<String>,
+        agent_id: Option<String>,
+        vscode_window_id: Option<String>,
+        started_at: Option<DateTime<Utc>>,
+        parent_repo: Option<PathBuf>,
+    }
+    #[derive(Deserialize)]
+    struct ProbeRichContextPreWriter {
+        id: ContextId,
+        conversation: ConversationContext,
+        user: UserContext,
+        project: ProjectContext,
+        temporal: TemporalContext,
+        semantic: SemanticContext,
+        code: CodeContext,
+        document: DocumentContext,
+        environment: EnvironmentContext,
+        emotional: EmotionalContext,
+        source: SourceContext,
+        episode: EpisodeContext,
+        place: WhereFacet,
+        who: WhoFacet,
+        why: WhyFacet,
+        binding: EngramBinding,
+        session: ProbeAgentSessionPreWriter,
+        parent: Option<Box<RichContext>>,
+        embeddings: Option<Vec<f32>>,
+        decay_rate: f32,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    }
+    #[derive(Deserialize)]
+    struct ProbeExperiencePreWriter {
+        experience_type: ExperienceType,
+        content: String,
+        context: Option<ProbeRichContextPreWriter>,
+        entities: Vec<String>,
+        metadata: HashMap<String, String>,
+        embeddings: Option<Vec<f32>>,
+        embeddings_secondary: Option<Vec<f32>>,
+        embedding_degraded: bool,
+        image_embeddings: Option<Vec<f32>>,
+        audio_embeddings: Option<Vec<f32>>,
+        video_embeddings: Option<Vec<f32>>,
+        media_refs: Vec<MediaRef>,
+        related_memories: Vec<MemoryId>,
+        causal_chain: Vec<MemoryId>,
+        outcomes: Vec<String>,
+        robot_id: Option<String>,
+        mission_id: Option<String>,
+        geo_location: Option<[f64; 3]>,
+        local_position: Option<[f32; 3]>,
+        heading: Option<f32>,
+        action_type: Option<String>,
+        reward: Option<f32>,
+        sensor_data: HashMap<String, f64>,
+        decision_context: Option<HashMap<String, String>>,
+        action_params: Option<HashMap<String, String>>,
+        outcome_type: Option<String>,
+        outcome_details: Option<String>,
+        confidence: Option<f32>,
+        alternatives_considered: Vec<String>,
+        weather: Option<HashMap<String, String>>,
+        terrain_type: Option<String>,
+        lighting: Option<String>,
+        nearby_agents: Vec<HashMap<String, String>>,
+        is_failure: bool,
+        is_anomaly: bool,
+        severity: Option<String>,
+        recovery_action: Option<String>,
+        root_cause: Option<String>,
+        pattern_id: Option<String>,
+        predicted_outcome: Option<String>,
+        prediction_accurate: Option<bool>,
+        tags: Vec<String>,
+        temporal_refs: Vec<String>,
+        ner_entities: Vec<NerEntityRecord>,
+        cooccurrence_pairs: Vec<(String, String)>,
+    }
+    /// LegacyMemoryFlatV3 (before edfb43f inserted `persistent` mid-struct on 2026-09-02) plus the
+    /// W3.4 trailing facets, so full consumption can be required.
+    #[derive(Deserialize)]
+    struct ProbeMemoryFlatPreWriter {
+        id: MemoryId,
+        experience: ProbeExperiencePreWriter,
+        importance: f32,
+        access_count: u32,
+        created_at: DateTime<Utc>,
+        last_accessed: DateTime<Utc>,
+        compressed: bool,
+        tier: MemoryTier,
+        entity_refs: Vec<EntityRef>,
+        activation: f32,
+        last_retrieval_id: Option<uuid::Uuid>,
+        agent_id: Option<String>,
+        run_id: Option<String>,
+        actor_id: Option<String>,
+        temporal_relevance: f32,
+        score: Option<f32>,
+        external_id: Option<String>,
+        version: u32,
+        history: Vec<MemoryRevision>,
+        related_todo_ids: Vec<TodoId>,
+        parent_id: Option<MemoryId>,
+        anchored: bool,
+        calibrated_confidence: Option<f32>,
+        confidence_alpha: Option<f32>,
+        confidence_beta: Option<f32>,
+        valid_until: Option<DateTime<Utc>>,
+        access_history: Option<Vec<DateTime<Utc>>>,
+        elaboration_score: Option<f32>,
+        fragment_demotion: Option<f32>,
+        kind: RecordKind,
+        what: WhatFacet,
+        when: WhenFacet,
+    }
+
+    /// Probe-only layout: veld's Experience WITHOUT the two fields upstream shodh-memory never
+    /// had (embeddings_secondary, embedding_degraded), inside the V3 memory shape. A record that
+    /// decodes here and nowhere else was written by an upstream-layout binary.
+    #[derive(Deserialize)]
+    struct ProbeExperienceNoSecondary {
+        experience_type: ExperienceType,
+        content: String,
+        context: Option<RichContext>,
+        entities: Vec<String>,
+        metadata: HashMap<String, String>,
+        embeddings: Option<Vec<f32>>,
+        image_embeddings: Option<Vec<f32>>,
+        audio_embeddings: Option<Vec<f32>>,
+        video_embeddings: Option<Vec<f32>>,
+        media_refs: Vec<MediaRef>,
+        related_memories: Vec<MemoryId>,
+        causal_chain: Vec<MemoryId>,
+        outcomes: Vec<String>,
+        robot_id: Option<String>,
+        mission_id: Option<String>,
+        geo_location: Option<[f64; 3]>,
+        local_position: Option<[f32; 3]>,
+        heading: Option<f32>,
+        #[serde(default)]
+        _rest: (),
+    }
+    #[derive(Deserialize)]
+    struct ProbeMemoryNoSecondary {
+        id: MemoryId,
+        experience: ProbeExperienceNoSecondary,
+    }
+
+    /// Offline diagnostic over a COPY of a store: for each id in VELD_PROBE_IDS (comma-separated),
+    /// report which decoder candidate accepts the record, or the distinct error every candidate
+    /// gives, and confirm the good records are untouched. Prints no content.
+    ///
+    ///   VELD_PROBE_STORE=/tmp/copy-of/portll/storage VELD_PROBE_IDS=uuid,uuid \
+    ///     cargo test --lib -- --ignored probe_undecodable_records --nocapture
+    #[test]
+    #[ignore = "offline diagnostic over a copied store — run explicitly"]
+    fn probe_undecodable_records() {
+        let path = std::env::var("VELD_PROBE_STORE").expect("VELD_PROBE_STORE unset");
+        let ids: Vec<MemoryId> = std::env::var("VELD_PROBE_IDS")
+            .expect("VELD_PROBE_IDS unset")
+            .split(',')
+            .map(|s| MemoryId(uuid::Uuid::parse_str(s.trim()).expect("uuid")))
+            .collect();
+        let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), &path).expect("list_cf");
+        let db = rocksdb::DB::open_cf_for_read_only(&rocksdb::Options::default(), &path, &cfs, false)
+            .expect("open read-only");
+        let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
+        let mut verdicts: std::collections::BTreeMap<String, usize> = Default::default();
+        for id in &ids {
+            let v = db.get(id.0.as_bytes()).unwrap().expect("record present in default CF");
+            let verdict = match deserialize_memory(&v) {
+                Ok((m, legacy)) => format!("DECODES legacy={legacy} content_len={}", m.experience.content.len()),
+                Err(_) => {
+                    let mut parts = Vec::new();
+                    parts.push(format!("Memory: {}", bincode::serde::decode_from_slice::<Memory, _>(&v, cfg).err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into())));
+                    parts.push(format!("V3: {}", bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, cfg).map(|(_, n)| format!("ok consumed {n}/{}", v.len())).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!("V2: {}", bincode::serde::decode_from_slice::<LegacyMemoryFlatV2, _>(&v, cfg).map(|(_, n)| format!("ok consumed {n}/{}", v.len())).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!("bincode1 V1: {}", bincode1::deserialize::<LegacyMemoryV1>(&v).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string())));
+                    let fix = bincode::config::standard().with_fixed_int_encoding().with_limit::<BINCODE_ALLOC_LIMIT>();
+                    let leg = bincode::config::legacy().with_limit::<BINCODE_ALLOC_LIMIT>();
+                    parts.push(format!("Memory FIXINT: {}", bincode::serde::decode_from_slice::<Memory, _>(&v, fix).map(|(m, n)| format!("ok consumed {n}/{} content_len={}", v.len(), m.experience.content.len())).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!("V3 FIXINT: {}", bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, fix).map(|(_, n)| format!("ok consumed {n}/{}", v.len())).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!("Memory LEGACY(bincode1-compatible): {}", bincode::serde::decode_from_slice::<Memory, _>(&v, leg).map(|(m, n)| format!("ok consumed {n}/{} content_len={}", v.len(), m.experience.content.len())).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!("V3 LEGACY: {}", bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, leg).map(|(_, n)| format!("ok consumed {n}/{}", v.len())).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!("V3 + PRE-WRITER AgentSession (before edfb43f and 4a54053): {}", bincode::serde::decode_from_slice::<ProbeMemoryFlatPreWriter, _>(&v, cfg).map(|(m, n)| format!("ok consumed {n}/{} content_len={} emb={} emb2={} created={} session_started={}", v.len(), m.experience.content.len(), m.experience.embeddings.as_ref().map(|e| e.len()).unwrap_or(0), m.experience.embeddings_secondary.as_ref().map(|e| e.len()).unwrap_or(0), m.created_at.format("%Y-%m-%d"), m.experience.context.as_ref().and_then(|c| c.session.started_at).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "none".into()))).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!("recover_pre_writer_session: {}", recover_pre_writer_session(&v).map(|(m, branch)| format!("{branch} content_len={} kind={:?} when.encoded_at={}", m.experience.content.len(), m.kind, m.when.encoded_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "none".into()))).unwrap_or_else(|| "none".into())));
+                    parts.push(format!("V3 with an Experience lacking embeddings_secondary/embedding_degraded: {}", bincode::serde::decode_from_slice::<ProbeMemoryNoSecondary, _>(&v, cfg).map(|(m, n)| format!("ok consumed {n}/{} content_len={} entities={}", v.len(), m.experience.content.len(), m.experience.entities.len())).unwrap_or_else(|e| e.to_string())));
+                    // Structural walk of the prefix, numbers only: uuid, experience_type varint,
+                    // content length, then the raw tag bytes that follow the content.
+                    fn varint(b: &[u8], i: &mut usize) -> u64 {
+                        let x = b[*i]; *i += 1;
+                        match x { 0..=250 => x as u64, 251 => { let v = u16::from_le_bytes([b[*i], b[*i+1]]) as u64; *i += 2; v }
+                            252 => { let v = u32::from_le_bytes([b[*i], b[*i+1], b[*i+2], b[*i+3]]) as u64; *i += 4; v }
+                            _ => { let v = u64::from_le_bytes(b[*i..*i+8].try_into().unwrap()); *i += 8; v } }
+                    }
+                    let mut i = 0usize;
+                    let uuid_len = varint(&v, &mut i); i += uuid_len as usize;
+                    let etype = varint(&v, &mut i);
+                    let clen = varint(&v, &mut i); i += clen as usize;
+                    // Deeper walk past Some(RichContext { id }): 48 bytes, printable runs masked.
+                    let deep = &v[(i + 2 + 16).min(v.len())..(i + 2 + 16 + 48).min(v.len())];
+                    let mut masked = String::new();
+                    let mut run = 0usize;
+                    for b in deep {
+                        if (0x20..0x7f).contains(b) { run += 1; if run == 4 { masked.push_str("…txt… "); } else if run < 4 { masked.push_str(&format!("{b:02x} ")); } }
+                        else { run = 0; masked.push_str(&format!("{b:02x} ")); }
+                    }
+                    parts.push(format!("after RichContext.id: [{}]", masked.trim_end()));
+                    let start = (i + 2 + 16).min(v.len());
+                    let zeros = v[start..].iter().take_while(|b| **b == 0).count();
+                    let next: Vec<String> = v[(start + zeros).min(v.len())..(start + zeros + 8).min(v.len())].iter().map(|b| format!("{b:02x}")).collect();
+                    parts.push(format!("zero-run after RichContext.id = {zeros} bytes, then [{}]", next.join(" ")));
+                    let after: Vec<String> = v[i..(i + 12).min(v.len())].iter().map(|b| format!("{b:02x}")).collect();
+                    parts.push(format!("walk: uuid_len={uuid_len} experience_type={etype} content_len={clen} bytes_after_content=[{}] total={}", after.join(" "), v.len()));
+                    // Field-by-field decode of RichContext then the Experience tail, each step
+                    // reporting bytes consumed, so the first refusing field is named not guessed.
+                    use crate::memory::facets::{AgentSession, EngramBinding, WhereFacet, WhoFacet, WhyFacet};
+                    fn step<'a, T: serde::de::DeserializeOwned>(v: &'a [u8], off: &mut usize, name: &str, log: &mut Vec<String>) -> bool {
+                        match bincode::serde::decode_from_slice::<T, _>(&v[*off..], bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>()) {
+                            Ok((_, n)) => { log.push(format!("{name}+{n}")); *off += n; true }
+                            Err(e) => {
+                                let peek: Vec<String> = v[*off..(*off + 8).min(v.len())].iter().map(|b| format!("{b:02x}")).collect();
+                                log.push(format!("{name} FAILS at offset {} of {}: {e} peek=[{}]", *off, v.len(), peek.join(" ")));
+                                false
+                            }
+                        }
+                    }
+                    let mut log = Vec::new();
+                    let mut off = i + 1;
+                    let ok = step::<ContextId>(&v, &mut off, "ctx.id", &mut log)
+                        && step::<ConversationContext>(&v, &mut off, "conversation", &mut log)
+                        && step::<UserContext>(&v, &mut off, "user", &mut log)
+                        && step::<ProjectContext>(&v, &mut off, "project", &mut log)
+                        && step::<TemporalContext>(&v, &mut off, "temporal", &mut log)
+                        && step::<SemanticContext>(&v, &mut off, "semantic", &mut log)
+                        && step::<CodeContext>(&v, &mut off, "code", &mut log)
+                        && step::<DocumentContext>(&v, &mut off, "document", &mut log)
+                        && step::<EnvironmentContext>(&v, &mut off, "environment", &mut log)
+                        && step::<EmotionalContext>(&v, &mut off, "emotional", &mut log)
+                        && step::<SourceContext>(&v, &mut off, "source", &mut log)
+                        && step::<EpisodeContext>(&v, &mut off, "episode", &mut log)
+                        && step::<WhereFacet>(&v, &mut off, "place", &mut log)
+                        && step::<WhoFacet>(&v, &mut off, "who", &mut log)
+                        && step::<WhyFacet>(&v, &mut off, "why", &mut log)
+                        && step::<EngramBinding>(&v, &mut off, "binding", &mut log)
+                        && (step::<AgentSession>(&v, &mut off, "session", &mut log) || step::<ProbeAgentSessionPreWriter>(&v, &mut off, "session(pre-writer)", &mut log))
+                        && step::<Option<Box<RichContext>>>(&v, &mut off, "parent", &mut log)
+                        && step::<Option<Vec<f32>>>(&v, &mut off, "ctx.embeddings", &mut log)
+                        && step::<f32>(&v, &mut off, "decay_rate", &mut log)
+                        && step::<DateTime<Utc>>(&v, &mut off, "ctx.created_at", &mut log)
+                        && step::<DateTime<Utc>>(&v, &mut off, "ctx.updated_at", &mut log)
+                        && step::<Vec<String>>(&v, &mut off, "entities", &mut log)
+                        && step::<std::collections::HashMap<String, String>>(&v, &mut off, "metadata", &mut log)
+                        && step::<Option<Vec<f32>>>(&v, &mut off, "embeddings", &mut log)
+                        && step::<Option<Vec<f32>>>(&v, &mut off, "embeddings_secondary", &mut log)
+                        && step::<bool>(&v, &mut off, "embedding_degraded", &mut log)
+                        && step::<Option<Vec<f32>>>(&v, &mut off, "image_embeddings", &mut log)
+                        && step::<Option<Vec<f32>>>(&v, &mut off, "audio_embeddings", &mut log)
+                        && step::<Option<Vec<f32>>>(&v, &mut off, "video_embeddings", &mut log)
+                        && step::<Vec<MediaRef>>(&v, &mut off, "media_refs", &mut log)
+                        && step::<Vec<MemoryId>>(&v, &mut off, "related_memories", &mut log)
+                        && step::<Vec<MemoryId>>(&v, &mut off, "causal_chain", &mut log)
+                        && step::<Vec<String>>(&v, &mut off, "outcomes", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "robot_id", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "mission_id", &mut log)
+                        && step::<Option<[f64; 3]>>(&v, &mut off, "geo_location", &mut log)
+                        && step::<Option<[f32; 3]>>(&v, &mut off, "local_position", &mut log)
+                        && step::<Option<f32>>(&v, &mut off, "heading", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "action_type", &mut log)
+                        && step::<Option<f32>>(&v, &mut off, "reward", &mut log)
+                        && step::<HashMap<String, f64>>(&v, &mut off, "sensor_data", &mut log)
+                        && step::<Option<HashMap<String, String>>>(&v, &mut off, "decision_context", &mut log)
+                        && step::<Option<HashMap<String, String>>>(&v, &mut off, "action_params", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "outcome_type", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "outcome_details", &mut log)
+                        && step::<Option<f32>>(&v, &mut off, "confidence", &mut log)
+                        && step::<Vec<String>>(&v, &mut off, "alternatives_considered", &mut log)
+                        && step::<Option<HashMap<String, String>>>(&v, &mut off, "weather", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "terrain_type", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "lighting", &mut log)
+                        && step::<Vec<HashMap<String, String>>>(&v, &mut off, "nearby_agents", &mut log)
+                        && step::<bool>(&v, &mut off, "is_failure", &mut log)
+                        && step::<bool>(&v, &mut off, "is_anomaly", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "severity", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "recovery_action", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "root_cause", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "pattern_id", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "predicted_outcome", &mut log)
+                        && step::<Option<bool>>(&v, &mut off, "prediction_accurate", &mut log)
+                        && step::<Vec<String>>(&v, &mut off, "tags", &mut log)
+                        && step::<Vec<String>>(&v, &mut off, "temporal_refs", &mut log)
+                        && step::<Vec<NerEntityRecord>>(&v, &mut off, "ner_entities", &mut log)
+                        && step::<Vec<(String, String)>>(&v, &mut off, "cooccurrence_pairs", &mut log)
+                        && step::<f32>(&v, &mut off, "importance", &mut log)
+                        && step::<u32>(&v, &mut off, "access_count", &mut log)
+                        && step::<DateTime<Utc>>(&v, &mut off, "created_at", &mut log)
+                        && step::<DateTime<Utc>>(&v, &mut off, "last_accessed", &mut log)
+                        && step::<bool>(&v, &mut off, "compressed", &mut log)
+                        && step::<MemoryTier>(&v, &mut off, "tier", &mut log)
+                        && step::<Vec<EntityRef>>(&v, &mut off, "entity_refs", &mut log)
+                        && step::<f32>(&v, &mut off, "activation", &mut log)
+                        && step::<Option<uuid::Uuid>>(&v, &mut off, "last_retrieval_id", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "agent_id", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "run_id", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "actor_id", &mut log)
+                        && step::<f32>(&v, &mut off, "temporal_relevance", &mut log)
+                        && step::<Option<f32>>(&v, &mut off, "score", &mut log)
+                        && step::<Option<String>>(&v, &mut off, "external_id", &mut log)
+                        && step::<u32>(&v, &mut off, "version", &mut log)
+                        && step::<Vec<MemoryRevision>>(&v, &mut off, "history", &mut log)
+                        && step::<Vec<TodoId>>(&v, &mut off, "related_todo_ids", &mut log)
+                        && step::<Option<MemoryId>>(&v, &mut off, "parent_id", &mut log)
+                        && step::<bool>(&v, &mut off, "anchored", &mut log)
+                        && step::<Option<f32>>(&v, &mut off, "calibrated_confidence", &mut log)
+                        && step::<Option<f32>>(&v, &mut off, "confidence_alpha", &mut log)
+                        && step::<Option<f32>>(&v, &mut off, "confidence_beta", &mut log)
+                        && step::<Option<DateTime<Utc>>>(&v, &mut off, "valid_until", &mut log)
+                        && step::<Option<Vec<DateTime<Utc>>>>(&v, &mut off, "access_history", &mut log)
+                        && step::<Option<f32>>(&v, &mut off, "elaboration_score", &mut log)
+                        && step::<Option<f32>>(&v, &mut off, "fragment_demotion", &mut log)
+                        && step::<RecordKind>(&v, &mut off, "kind", &mut log)
+                        && step::<WhatFacet>(&v, &mut off, "what", &mut log)
+                        && step::<WhenFacet>(&v, &mut off, "when", &mut log);
+                    log.push(format!("END off={off} of {}", v.len()));
+                    parts.push(format!("fieldwalk ok={ok} [{}]", log.join(" ")));
+                    format!("UNDECODABLE — {}", parts.join(" | "))
+                }
+            };
+            *verdicts.entry(verdict).or_default() += 1;
+        }
+        for (v, n) in &verdicts {
+            eprintln!("{n} × {v}");
+        }
+        let mut good = 0usize;
+        let mut good_bad = 0usize;
+        let mut good_fixint = 0usize;
+        let mut good_prewriter = 0usize;
+        let mut good_recovered = 0usize;
+        let mut good_with_context = 0usize;
+        for item in db.iterator(rocksdb::IteratorMode::Start) {
+            let (k, v) = item.unwrap();
+            if k.len() != 16 || ids.iter().any(|i| i.0.as_bytes() == &k[..]) { continue; }
+            good += 1;
+            let has_context = match deserialize_memory(&v) {
+                Err(_) => { good_bad += 1; false }
+                Ok((m, _)) => { if m.experience.context.is_some() { good_with_context += 1 }; m.experience.context.is_some() }
+            };
+            let fix = bincode::config::standard().with_fixed_int_encoding().with_limit::<BINCODE_ALLOC_LIMIT>();
+            if bincode::serde::decode_from_slice::<Memory, _>(&v, fix).is_ok() { good_fixint += 1; }
+            // The two layouts only differ inside a populated context, so ambiguity is measured there.
+            if has_context && matches!(bincode::serde::decode_from_slice::<ProbeMemoryFlatPreWriter, _>(&v, cfg), Ok((_, n)) if n == v.len()) { good_prewriter += 1; }
+            if recover_pre_writer_session(&v).is_some() { good_recovered += 1; }
+        }
+        eprintln!("control: {good} other records ({good_with_context} with context=Some), {good_bad} undecodable, {good_fixint} ALSO accepted by the fixint candidate (must be 0), {good_prewriter} of the context=Some records ALSO fully consumed by the pre-writer candidate (must be 0), {good_recovered} accepted by recover_pre_writer_session (must be 0)");
     }
 
     #[test]
