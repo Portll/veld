@@ -212,6 +212,20 @@ pub fn user_has_memories(user_dir: &Path) -> Result<Option<bool>> {
     Ok(Some(false))
 }
 
+/// Visits every default-family record of a rocksdb store opened read-only with all of its
+/// column families, for offline diagnostics over a copied store. Nothing is written.
+pub fn visit_records_read_only(path: &Path, mut visit: impl FnMut(&[u8], &[u8])) -> Result<()> {
+    let opts = rocksdb::Options::default();
+    let cfs = DB::list_cf(&opts, path).with_context(|| format!("list column families {}", path.display()))?;
+    let db = DB::open_cf_for_read_only(&opts, path, &cfs, false)
+        .with_context(|| format!("open read-only {}", path.display()))?;
+    for item in db.iterator(IteratorMode::Start) {
+        let (key, value) = item?;
+        visit(&key, &value);
+    }
+    Ok(())
+}
+
 impl RocksDbPrimaryMemoryStore {
     pub fn open(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
         Ok(Self {

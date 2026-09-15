@@ -4854,13 +4854,15 @@ mod tests {
             .split(',')
             .map(|s| MemoryId(uuid::Uuid::parse_str(s.trim()).expect("uuid")))
             .collect();
-        let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), &path).expect("list_cf");
-        let db = rocksdb::DB::open_cf_for_read_only(&rocksdb::Options::default(), &path, &cfs, false)
-            .expect("open read-only");
+        let mut records: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+        crate::storage::visit_records_read_only(std::path::Path::new(&path), |k, v| {
+            records.insert(k.to_vec(), v.to_vec());
+        })
+        .expect("open the copied store read-only");
         let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
         let mut verdicts: std::collections::BTreeMap<String, usize> = Default::default();
         for id in &ids {
-            let v = db.get(id.0.as_bytes()).unwrap().expect("record present in default CF");
+            let v = records.get(id.0.as_bytes().as_slice()).expect("record present in default CF");
             let verdict = match deserialize_memory(&v) {
                 Ok((m, legacy)) => format!("DECODES legacy={legacy} content_len={}", m.experience.content.len()),
                 Err(_) => {
@@ -5030,8 +5032,7 @@ mod tests {
         let mut good_prewriter = 0usize;
         let mut good_recovered = 0usize;
         let mut good_with_context = 0usize;
-        for item in db.iterator(rocksdb::IteratorMode::Start) {
-            let (k, v) = item.unwrap();
+        for (k, v) in &records {
             if k.len() != 16 || ids.iter().any(|i| i.0.as_bytes() == &k[..]) { continue; }
             good += 1;
             let has_context = match deserialize_memory(&v) {
