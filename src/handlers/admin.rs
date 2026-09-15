@@ -65,15 +65,34 @@ pub async fn reset_rate_limit(
             .into_response();
     };
 
+    if let Err(refusal) = require_admin_key(&headers) {
+        return refusal;
+    }
+
+    // 4) Authenticated — perform the reset and audit-log.
+    //    The audit trail is the caller IP; no key material (not even a prefix)
+    //    is logged — a partial admin key in logs still narrows a brute force.
+    handle.reset();
+    tracing::warn!(
+        caller_ip = %peer.ip(),
+        "rate-limit state reset by admin endpoint"
+    );
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// The admin-key gate: 503 when `VELD_ADMIN_API_KEY` is unset, 401 when
+/// `X-Admin-API-Key` is missing or wrong. Shared so every admin route refuses identically.
+pub(crate) fn require_admin_key(headers: &HeaderMap) -> Result<(), Response> {
     // 1) Configured?
     let configured_key = match std::env::var(ADMIN_API_KEY_ENV) {
         Ok(k) if !k.trim().is_empty() => k,
         _ => {
-            return (
+            return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": "admin_key_not_configured"})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -81,11 +100,11 @@ pub async fn reset_rate_limit(
     let provided = match headers.get(ADMIN_API_KEY_HEADER).and_then(|v| v.to_str().ok()) {
         Some(s) if !s.is_empty() => s,
         _ => {
-            return (
+            return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "unauthorized"})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -101,24 +120,18 @@ pub async fn reset_rate_limit(
     let bytes_eq = bool::from(configured_hash.ct_eq(&provided_hash));
 
     if !bytes_eq {
-        return (
+        return Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "unauthorized"})),
         )
-            .into_response();
+            .into_response());
     }
-
-    // 4) Authenticated — perform the reset and audit-log.
-    //    The audit trail is the caller IP; no key material (not even a prefix)
-    //    is logged — a partial admin key in logs still narrows a brute force.
-    handle.reset();
-    tracing::warn!(
-        caller_ip = %peer.ip(),
-        "rate-limit state reset by admin endpoint"
-    );
-
-    StatusCode::NO_CONTENT.into_response()
+    Ok(())
 }
+
+/// Serialises tests that set `VELD_ADMIN_API_KEY`, which is process-wide.
+#[cfg(test)]
+pub(crate) static ADMIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -129,11 +142,9 @@ mod tests {
     use axum::routing::post;
     use axum::Router;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Mutex;
     use tower::ServiceExt;
 
-    /// Process-global lock so tests don't trip over each other's env mutation.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use super::ADMIN_ENV_LOCK as ENV_LOCK;
 
     fn build_app(handle: ResetHandle) -> Router {
         Router::new()
@@ -161,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_503_when_admin_key_not_configured() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(ADMIN_API_KEY_ENV);
 
         let app = build_app(ResetHandle::new(10, 5));
@@ -171,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_401_when_header_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ADMIN_API_KEY_ENV, "test-admin-secret-12345");
 
         let app = build_app(ResetHandle::new(10, 5));
@@ -183,7 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_401_when_header_wrong() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ADMIN_API_KEY_ENV, "test-admin-secret-12345");
 
         let app = build_app(ResetHandle::new(10, 5));
@@ -195,7 +206,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_204_with_valid_key() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ADMIN_API_KEY_ENV, "test-admin-secret-12345");
 
         let handle = ResetHandle::new(10, 5);
@@ -211,7 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_401_for_length_mismatch() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ADMIN_API_KEY_ENV, "test-admin-secret-12345");
 
         let app = build_app(ResetHandle::new(10, 5));

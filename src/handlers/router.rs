@@ -15,7 +15,7 @@ use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
     memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time,
-    todos, user_auth,
+    storage_migration, todos, user_auth,
     users, visualization, webhooks,
 };
 
@@ -311,6 +311,12 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             post(compression::decompress_memory),
         )
         .route("/api/storage/stats", get(compression::get_storage_stats))
+        // =================================================================
+        // BACKEND MIGRATION (ADR 0006 WP2) — admin key checked in-handler
+        // =================================================================
+        .route("/api/admin/storage/export", post(storage_migration::export))
+        .route("/api/admin/storage/import", post(storage_migration::import))
+        .route("/api/admin/storage/migrate", post(storage_migration::migrate))
         // =================================================================
         // ADVANCED SEARCH
         // =================================================================

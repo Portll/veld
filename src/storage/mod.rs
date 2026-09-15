@@ -6,6 +6,7 @@
 
 pub mod boot_guard;
 pub mod legacy_rocksdb;
+pub mod migrate;
 pub mod portable;
 #[cfg(feature = "storage-redb")]
 pub mod redb;

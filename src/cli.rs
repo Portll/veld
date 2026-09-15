@@ -12,6 +12,7 @@
 //!   veld hook commit         - Sync the latest git commit into Veld memory
 //!   veld claude [args...]    - Launch Claude Code with Veld memory
 //!   veld version             - Print version and build info
+//!   veld export / import / migrate - Verified backend migration (ADR 0006)
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -189,6 +190,71 @@ enum Commands {
 
     /// Print version and build information
     Version,
+
+    /// Export one user's stores, or every store, to a directory of verified dumps
+    Export {
+        /// User id, or `all` for every user plus the shared stores
+        #[arg(long)]
+        user: String,
+
+        /// Directory to write into; must be absent or empty
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Backend to read (never modified)
+        #[arg(long, env = "VELD_STORAGE_BACKEND")]
+        backend: StorageBackend,
+
+        /// Write records no decoder accepts, byte for byte, to this directory instead of
+        /// failing. They are NOT exported and are reported as quarantined.
+        #[arg(long = "quarantine-undecodable")]
+        quarantine: Option<PathBuf>,
+
+        /// Data directory
+        #[arg(long = "storage", env = "VELD_MEMORY_PATH", default_value_os_t = veld::config::default_storage_path())]
+        storage_path: PathBuf,
+    },
+
+    /// Import a dump file or export directory into empty targets, verifying each against its trailer
+    Import {
+        /// A `.veldport` dump, or a directory written by `veld export`
+        #[arg(long = "in")]
+        input: PathBuf,
+
+        /// Backend to write
+        #[arg(long, env = "VELD_STORAGE_BACKEND")]
+        backend: StorageBackend,
+
+        /// Data directory
+        #[arg(long = "storage", env = "VELD_MEMORY_PATH", default_value_os_t = veld::config::default_storage_path())]
+        storage_path: PathBuf,
+    },
+
+    /// Copy stores from one backend to the other in the same data directory, verified; the source is never modified
+    Migrate {
+        #[arg(long)]
+        from: StorageBackend,
+
+        #[arg(long)]
+        to: StorageBackend,
+
+        /// User id, or `all` for every user plus the shared stores
+        #[arg(long, default_value = "all")]
+        user: String,
+
+        /// Report per-unit record counts on both backends and write nothing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Write records no decoder accepts, byte for byte, to this directory instead of
+        /// refusing. They are NOT migrated and are reported as quarantined.
+        #[arg(long = "quarantine-undecodable")]
+        quarantine: Option<PathBuf>,
+
+        /// Data directory
+        #[arg(long = "storage", env = "VELD_MEMORY_PATH", default_value_os_t = veld::config::default_storage_path())]
+        storage_path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -410,9 +476,62 @@ async fn main() -> Result<()> {
         Commands::Version => {
             handle_version();
         }
+
+        Commands::Export { user, out, backend, quarantine, storage_path } => {
+            let scope = veld::storage::migrate::Scope::parse(&user)?;
+            let reports = tokio::task::spawn_blocking(move || {
+                veld::storage::migrate::export(&storage_path, backend, &scope, &out, quarantine.as_deref())
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+            for r in reports.iter().filter_map(|r| r.quarantine.as_ref()) {
+                warn_quarantined(r);
+            }
+        }
+
+        Commands::Import { input, backend, storage_path } => {
+            let reports = tokio::task::spawn_blocking(move || {
+                veld::storage::migrate::import(&storage_path, backend, &input)
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+        }
+
+        Commands::Migrate { from, to, user, dry_run, quarantine, storage_path } => {
+            let scope = veld::storage::migrate::Scope::parse(&user)?;
+            let report = tokio::task::spawn_blocking(move || {
+                veld::storage::migrate::migrate(&storage_path, from, to, &scope, dry_run, quarantine.as_deref())
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            for r in &report.quarantined {
+                warn_quarantined(r);
+            }
+            if dry_run && report.quarantine_requested {
+                for u in &report.units {
+                    if let Some(n) = u.source.as_ref().map(|s| s.decode_failures).filter(|n| *n > 0) {
+                        eprintln!("WARNING: {}: {n} undecodable record(s) would be QUARANTINED, not migrated", u.unit);
+                    }
+                }
+            }
+            if report.blocked() {
+                anyhow::bail!("dry run: at least one unit is blocked; a real migration would refuse");
+            }
+        }
     }
 
     Ok(())
+}
+
+fn warn_quarantined(r: &veld::storage::migrate::QuarantineReport) {
+    eprintln!(
+        "WARNING: {}: {} undecodable record(s) QUARANTINED, not exported: {} (raw bytes in {}, sha256 listing in {})",
+        r.unit,
+        r.records,
+        r.ids.join(", "),
+        r.dump.display(),
+        r.listing.display()
+    );
 }
 
 // =============================================================================

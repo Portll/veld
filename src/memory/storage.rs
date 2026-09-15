@@ -646,6 +646,12 @@ impl LegacyMemoryV2 {
 /// Returns (Memory, needs_migration) where needs_migration=true means the data
 /// was in a legacy format and should be re-written for future performance.
 fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
+    deserialize_memory_with(data, true)
+}
+
+/// `allow_raw_parse: false` refuses the last-resort arm, which builds a memory from any
+/// UTF-8 run it finds and so "decodes" arbitrary bytes.
+fn deserialize_memory_with(data: &[u8], allow_raw_parse: bool) -> Result<(Memory, bool)> {
     // Reject obviously corrupt entries before any deserialization attempt.
     // A single memory should never exceed 64MB — corrupt varint length fields
     // in bincode1 can request 7.9 exabytes and OOM-kill the process.
@@ -676,11 +682,52 @@ fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
         }
         let payload = &data[4..payload_end];
         // Try current format first, then fallback to legacy formats
-        deserialize_with_fallback(payload).map_err(|e| anyhow!("v{version} decode failed: {e}"))
+        deserialize_with_fallback_with(payload, allow_raw_parse)
+            .map_err(|e| anyhow!("v{version} decode failed: {e}"))
     } else {
         // Legacy format: raw bincode (no SHO header)
-        deserialize_with_fallback(data).map_err(|e| anyhow!("legacy decode failed: {e}"))
+        deserialize_with_fallback_with(data, allow_raw_parse)
+            .map_err(|e| anyhow!("legacy decode failed: {e}"))
     }
+}
+
+/// The bytes a portable migration carries for one stored memory record.
+///
+/// A record already in the current plain-bincode format is carried as stored, so a
+/// re-derivation from the target reproduces it byte for byte; anything else is decoded
+/// through the legacy chain and re-encoded once. `Memory` holds `HashMap`s, so
+/// re-encoding is not byte-stable and must not be applied to already-current records.
+/// Encrypted records are refused: the redb backend has no at-rest encryption, and a
+/// dump is plaintext. So is a record only the raw-UTF-8 heuristic accepts: that arm
+/// fabricates a memory from arbitrary bytes, and carrying the fabrication would replace
+/// the original bytes on the target.
+pub(crate) fn portable_memory_value(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    if crate::keystore::is_encrypted_record(data) {
+        return Err(anyhow!("record is encrypted; a portable dump cannot carry it"));
+    }
+    let limited = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
+    if let Ok((_, used)) = bincode::serde::decode_from_slice::<Memory, _>(data, limited) {
+        if used == data.len() {
+            return Ok(std::borrow::Cow::Borrowed(data));
+        }
+    }
+    let (memory, _) = deserialize_memory_with(data, false)?;
+    let encoded = bincode::serde::encode_to_vec(&memory, bincode::config::standard())
+        .context("re-encoding a decoded memory")?;
+    Ok(std::borrow::Cow::Owned(encoded))
+}
+
+#[cfg(test)]
+pub(crate) fn deserialize_memory_for_test(data: &[u8]) -> Result<(Memory, bool)> {
+    deserialize_memory(data)
+}
+
+/// Whether stored vector-mapping bytes decode, with the same allocation bound as reads.
+pub(crate) fn check_vector_mapping_value(data: &[u8]) -> Result<()> {
+    let limited = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
+    bincode::serde::decode_from_slice::<VectorMappingEntry, _>(data, limited)
+        .map(|_| ())
+        .map_err(|e| anyhow!("vector mapping does not decode: {e}"))
 }
 
 /// Legacy MemoryFlat for bincode 2.x data written BEFORE multimodal Experience fields
@@ -918,6 +965,10 @@ fn recover_pre_writer_session(data: &[u8]) -> Option<(Memory, &'static str)> {
 /// Returns (Memory, is_legacy) where is_legacy=true means the data was in an old format
 /// and should be re-written to current format for future performance.
 fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
+    deserialize_with_fallback_with(data, true)
+}
+
+fn deserialize_with_fallback_with(data: &[u8], allow_raw_parse: bool) -> Result<(Memory, bool)> {
     fn record_branch(branch: &str) {
         crate::metrics::LEGACY_FALLBACK_BRANCH_TOTAL
             .with_label_values(&[branch])
@@ -933,7 +984,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
         Err(e) => {
             // Current format failed — enter fallback chain.
             // From here on we collect errors for diagnostics.
-            deserialize_legacy_fallback(data, e, record_branch)
+            deserialize_legacy_fallback(data, e, record_branch, allow_raw_parse)
         }
     }
 }
@@ -946,6 +997,7 @@ fn deserialize_legacy_fallback(
     data: &[u8],
     first_error: bincode::error::DecodeError,
     record_branch: fn(&str),
+    allow_raw_parse: bool,
 ) -> Result<(Memory, bool)> {
     // Guard: reject data larger than 64MB before attempting any deserialization.
     // This catches corrupt entries before bincode1 (which lacks with_limit) tries
@@ -1189,7 +1241,7 @@ fn deserialize_legacy_fallback(
 
     // LAST RESORT: Try raw byte parsing with different header skip sizes
     // This handles non-standard formats by finding where valid UTF-8 content starts
-    if let Some(memory) = try_raw_memory_parse(data) {
+    if let Some(memory) = try_raw_memory_parse(data).filter(|_| allow_raw_parse) {
         record_branch("raw_parse");
         return Ok((memory, true));
     }
