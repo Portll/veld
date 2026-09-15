@@ -53,6 +53,7 @@ pub mod similarity;
 pub mod storage;
 pub mod streaming;
 pub mod tracing_setup;
+pub mod oauth;
 pub mod user_auth;
 pub mod entity_cap;
 pub mod llm_hosts;
