@@ -794,32 +794,9 @@ impl VeldBackupEngine {
                     continue;
                 }
 
-                // Copy succeeded — now swap: remove original, rename temp to target
-                if target_path.exists() {
-                    if let Err(e) = fs::remove_dir_all(target_path) {
-                        // Can't remove original — roll back by removing temp
-                        let _ = fs::remove_dir_all(&temp_path);
-                        return Err(anyhow!(
-                            "Failed to remove existing {} directory at {:?}: {}",
-                            store_name,
-                            target_path,
-                            e
-                        ));
-                    }
-                }
-
-                if let Err(e) = fs::rename(&temp_path, target_path) {
-                    // Rename failed (cross-device?), fall back to copy + remove temp
-                    if let Err(copy_err) = copy_dir_recursive(&temp_path, target_path) {
-                        let _ = fs::remove_dir_all(&temp_path);
-                        return Err(anyhow!(
-                            "Failed to finalize restore for {}: rename={}, copy={}",
-                            store_name,
-                            e,
-                            copy_err
-                        ));
-                    }
+                if let Err(e) = swap_dir_into_place(&temp_path, target_path) {
                     let _ = fs::remove_dir_all(&temp_path);
+                    return Err(e.context(format!("Failed to finalize restore for {store_name}")));
                 }
 
                 restored_stores.push(store_name.to_string());
@@ -995,31 +972,12 @@ impl VeldBackupEngine {
             log.sync().context("failed to sync truncated intent log")?;
         }
 
-        // Swap staging into place. We delete any pre-existing target
-        // first, since the operator explicitly asked for the restored
-        // state to be on disk. (Note: this is destructive — that is the
-        // whole point of restore.)
-        if target.source_dir.exists() {
-            fs::remove_dir_all(&target.source_dir).map_err(|e| {
-                // Leave staging in place so the operator can recover.
-                anyhow!(
-                    "failed to remove existing intent log dir {:?}: {}",
-                    target.source_dir,
-                    e
-                )
-            })?;
-        }
+        // Staging is left in place on failure so the operator can recover from it.
         if let Some(parent) = target.source_dir.parent() {
             fs::create_dir_all(parent)?;
         }
-        match fs::rename(&staging, &target.source_dir) {
-            Ok(()) => {}
-            Err(_) => {
-                // Fall back to copy + remove for cross-device renames.
-                copy_dir_recursive(&staging, &target.source_dir)?;
-                let _ = fs::remove_dir_all(&staging);
-            }
-        }
+        swap_dir_into_place(&staging, &target.source_dir)
+            .context("failed to swap the restored intent log into place")?;
 
         restored.push("intent_log".to_string());
         tracing::info!(
@@ -1257,6 +1215,57 @@ fn dir_size(path: &Path) -> Result<u64> {
 }
 
 /// Recursively copy a directory
+/// Replace `target` with `staging`. The original is renamed aside rather than deleted and is
+/// only removed once the new copy is in place; if placing fails, any partial copy is removed
+/// and the original is renamed back. Deleting first (the previous order) lost both copies
+/// whenever the rename and its copy fallback both failed.
+fn swap_dir_into_place(staging: &Path, target: &Path) -> Result<()> {
+    let mut aside_os = target.as_os_str().to_os_string();
+    aside_os.push(".pre_restore");
+    let aside = PathBuf::from(aside_os);
+    if aside.exists() {
+        return Err(anyhow!(
+            "{:?} already exists, likely left by an interrupted restore and possibly the only \
+             copy of that data; move it away before restoring again",
+            aside
+        ));
+    }
+    let had_original = target.exists();
+    if had_original {
+        fs::rename(target, &aside)
+            .with_context(|| format!("failed to move {target:?} aside to {aside:?}"))?;
+    }
+    let placed = match fs::rename(staging, target) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => copy_dir_recursive(staging, target)
+            .map(|()| {
+                let _ = fs::remove_dir_all(staging);
+            })
+            .map_err(|copy_err| anyhow!("rename={rename_err}, copy={copy_err}")),
+    };
+    match placed {
+        Ok(()) => {
+            if had_original {
+                let _ = fs::remove_dir_all(&aside);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if had_original {
+                if target.exists() {
+                    let _ = fs::remove_dir_all(target);
+                }
+                if let Err(back) = fs::rename(&aside, target) {
+                    return Err(anyhow!(
+                        "{e}; the original could not be moved back and is intact at {aside:?}: {back}"
+                    ));
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -1475,6 +1484,57 @@ mod tests {
             fs::read(dst.join("deep").join("file2.txt")).unwrap(),
             b"beta"
         );
+    }
+
+    #[test]
+    fn test_swap_dir_into_place_replaces_and_cleans_up() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir.path().join("store");
+        let staging = temp_dir.path().join("store.restore_tmp");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("data"), b"original").unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("data"), b"restored").unwrap();
+
+        swap_dir_into_place(&staging, &target).unwrap();
+
+        assert_eq!(fs::read(target.join("data")).unwrap(), b"restored");
+        assert!(!staging.exists());
+        assert!(!temp_dir.path().join("store.pre_restore").exists());
+    }
+
+    #[test]
+    fn test_swap_dir_into_place_failure_keeps_original() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir.path().join("store");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("data"), b"original").unwrap();
+        // A staging dir that does not exist fails both the rename and the copy fallback.
+        let missing = temp_dir.path().join("missing.restore_tmp");
+
+        let err = swap_dir_into_place(&missing, &target).unwrap_err();
+
+        assert!(err.to_string().contains("rename="), "{err}");
+        assert_eq!(fs::read(target.join("data")).unwrap(), b"original");
+        assert!(!temp_dir.path().join("store.pre_restore").exists());
+    }
+
+    #[test]
+    fn test_swap_dir_into_place_refuses_existing_aside() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir.path().join("store");
+        let staging = temp_dir.path().join("store.restore_tmp");
+        let aside = temp_dir.path().join("store.pre_restore");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("data"), b"original").unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&aside).unwrap();
+        fs::write(aside.join("data"), b"survivor").unwrap();
+
+        assert!(swap_dir_into_place(&staging, &target).is_err());
+
+        assert_eq!(fs::read(target.join("data")).unwrap(), b"original");
+        assert_eq!(fs::read(aside.join("data")).unwrap(), b"survivor");
     }
 
     #[test]
