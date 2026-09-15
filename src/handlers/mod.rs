@@ -62,6 +62,9 @@ pub mod consolidation;
 // Admin operational endpoints (rate-limit reset, etc.)
 pub mod admin;
 
+// Admin-gated backend export / import / migrate (ADR 0006 WP2)
+pub mod storage_migration;
+
 // Context blocks (Letta-style mutable agent state)
 pub mod context_blocks;
 

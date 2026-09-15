@@ -90,8 +90,8 @@ pub fn refuse_stranded_data(
         bail!(
             "refusing to serve: the {selected} store is empty for {n} user(s) whose memories are \
              in {other}: {users}. Serving would report healthy over an empty store. Set \
-             VELD_STORAGE_BACKEND={other} to serve the existing data. Migrating it to {selected} \
-             is `veld migrate`, not yet wired (ADR 0006 WP2).",
+             VELD_STORAGE_BACKEND={other} to serve the existing data, or copy it with \
+             `veld migrate --from {other} --to {selected} --dry-run` and then without --dry-run.",
             n = stranded.len(),
             users = stranded.join(", "),
         );
