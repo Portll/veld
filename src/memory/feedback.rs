@@ -6,7 +6,7 @@
 //! type-dependent inertia to prevent noise from destabilizing useful memories.
 
 use chrono::{DateTime, Duration, Timelike, Utc};
-use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -1495,31 +1495,20 @@ impl FeedbackStore {
         Self::default()
     }
 
-    /// Bind a handle directly — the backend-agnostic constructor.
-    ///
-    /// Loads persisted pending feedback and previous context: those are read from
-    /// memory only, so a store bound without loading serves them empty after restart.
+    /// Bind a handle directly; loads now because pending and previous context are served from memory only.
     pub fn with_store(
         store: Arc<dyn crate::storage::KeyValueStore>,
         base_path: &Path,
     ) -> anyhow::Result<Self> {
-        // base_path is used by the rocksdb constructor for its one-time migration and
-        // is not state this store keeps; a handle-bound caller has nothing to migrate.
+        // Not state this store keeps; the pre-column-family import runs in the rocksdb boot path.
         let _ = base_path;
         Self::load_from(store)
     }
 
-    /// Create persistent store backed by a shared RocksDB instance.
-    ///
-    /// The caller is responsible for opening the DB with the `CF_FEEDBACK` column
-    /// family already declared. On first use this constructor migrates data from
-    /// the legacy standalone `feedback/` DB directory into the shared CF.
-    pub fn with_shared_db(db: Arc<DB>, base_path: &Path) -> anyhow::Result<Self> {
-        Self::migrate_from_separate_db(base_path, &db)?;
-        Self::load_from(Arc::new(
-            crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(db, CF_FEEDBACK),
-        ))
-    }
+    /// Pre-column-family standalone DB under the data root, imported into
+    /// CF_FEEDBACK by the rocksdb boot path before the store is bound.
+    pub(crate) const LEGACY_SEPARATE_DBS: &'static [(&'static str, &'static str)] =
+        &[("feedback", CF_FEEDBACK)];
 
     fn load_from(store: Arc<dyn crate::storage::KeyValueStore>) -> anyhow::Result<Self> {
         let mut momentum = HashMap::new();
@@ -1573,53 +1562,10 @@ impl FeedbackStore {
         })
     }
 
-    /// Migrate data from the legacy standalone `feedback/` RocksDB directory
-    /// into the `CF_FEEDBACK` column family of the shared DB.
-    ///
-    /// The old directory is renamed to `feedback.pre_cf_migration` so it can be
-    /// restored manually if needed.
-    fn migrate_from_separate_db(base_path: &Path, db: &DB) -> anyhow::Result<()> {
-        let old_dir = base_path.join("feedback");
-        if !old_dir.is_dir() {
-            return Ok(());
-        }
-
-        let cf = db.cf_handle(CF_FEEDBACK).expect("feedback CF must exist");
-        let old_opts = Options::default();
-        match DB::open_for_read_only(&old_opts, &old_dir, false) {
-            Ok(old_db) => {
-                let mut batch = WriteBatch::default();
-                let mut count = 0usize;
-                for (key, value) in old_db.iterator(IteratorMode::Start).flatten() {
-                    batch.put_cf(cf, &key, &value);
-                    count += 1;
-                    if count.is_multiple_of(10_000) {
-                        db.write(std::mem::take(&mut batch))?;
-                    }
-                }
-                if !batch.is_empty() {
-                    db.write(batch)?;
-                }
-                drop(old_db);
-                tracing::info!("  feedback: migrated {count} entries to {CF_FEEDBACK} CF");
-
-                let backup = base_path.join("feedback.pre_cf_migration");
-                if backup.exists() {
-                    let _ = std::fs::remove_dir_all(&backup);
-                }
-                if let Err(e) = std::fs::rename(&old_dir, &backup) {
-                    tracing::warn!("Could not rename old feedback dir: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("Could not open old feedback DB for migration: {e}"),
-        }
-        Ok(())
-    }
-
     /// Create persistent store with its own standalone RocksDB instance.
     ///
-    /// Primarily useful for tests and standalone operation. In production, prefer
-    /// [`with_shared_db`](Self::with_shared_db) to share a single DB instance.
+    /// Primarily useful for tests and standalone operation. In production the
+    /// rocksdb boot path binds [`with_store`](Self::with_store) to the shared DB.
     pub fn with_persistence<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);

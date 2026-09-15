@@ -43,7 +43,10 @@ use crate::memory::{
     ProspectiveStore, SessionStore, TodoStore,
 };
 use crate::relevance::RelevanceEngine;
-use crate::storage::legacy_rocksdb::{RocksDbGraphStore, RocksDbPrimaryMemoryStore};
+use crate::storage::legacy_rocksdb::{
+    import_separate_db_into_cf, RocksDbAuditStore, RocksDbColumnFamilyStore, RocksDbColumnStore,
+    RocksDbGraphStore, RocksDbPrimaryMemoryStore,
+};
 use crate::storage::{AuditLogEntry, AuditStore, StorageCapabilities};
 use crate::streaming;
 
@@ -729,31 +732,57 @@ impl MultiUserMemoryManager {
                 Self::migrate_audit_db(base_path, &shared_db)?;
 
                 let audit_store: Arc<dyn AuditStore> =
-                    Arc::new(crate::storage::legacy_rocksdb::RocksDbAuditStore::new(
-                        shared_db.clone(),
-                        CF_AUDIT,
-                    ));
+                    Arc::new(RocksDbAuditStore::new(shared_db.clone(), CF_AUDIT));
+
+                // Kept on boot: nothing shows every install already imported its pre-column-family DBs.
+                for (dir, cf) in ProspectiveStore::LEGACY_SEPARATE_DBS
+                    .iter()
+                    .chain(TodoStore::LEGACY_SEPARATE_DBS)
+                    .chain(FileMemoryStore::LEGACY_SEPARATE_DBS)
+                {
+                    import_separate_db_into_cf(&shared_db, &base_path.join(dir), cf)?;
+                }
+
+                let column: Arc<dyn crate::storage::ColumnStore> =
+                    Arc::new(RocksDbColumnStore::new(Arc::clone(&shared_db)));
 
                 let prospective_store =
-                    Arc::new(ProspectiveStore::new(shared_db.clone(), base_path)?);
+                    Arc::new(ProspectiveStore::with_store(Arc::clone(&column))?);
                 info!("Prospective memory store initialized");
 
-                let todo_store = Arc::new(TodoStore::new(shared_db.clone(), base_path)?);
+                let todo_store = Arc::new(TodoStore::with_store(Arc::clone(&column), base_path)?);
 
-                let file_store = Arc::new(FileMemoryStore::new(shared_db.clone(), base_path)?);
+                let file_store = Arc::new(FileMemoryStore::with_store(Arc::clone(&column))?);
                 info!("File memory store initialized");
 
-                let context_block_store =
-                    Arc::new(crate::memory::ContextBlockStore::new(shared_db.clone()));
+                let context_block_store = Arc::new(crate::memory::ContextBlockStore::with_store(
+                    Arc::new(RocksDbColumnFamilyStore::new(
+                        shared_db.clone(),
+                        crate::memory::context_blocks::CF_CONTEXT_BLOCKS,
+                    )),
+                ));
                 info!("Context block store initialized");
 
+                // Feedback is advisory: an import or load failure degrades to in-memory rather than refusing boot.
                 let feedback_store = Arc::new(parking_lot::RwLock::new(
-                    FeedbackStore::with_shared_db(shared_db.clone(), base_path).unwrap_or_else(
-                        |e| {
+                    FeedbackStore::LEGACY_SEPARATE_DBS
+                        .iter()
+                        .try_for_each(|(dir, cf)| {
+                            import_separate_db_into_cf(&shared_db, &base_path.join(dir), cf)
+                        })
+                        .and_then(|()| {
+                            FeedbackStore::with_store(
+                                Arc::new(RocksDbColumnFamilyStore::new(
+                                    shared_db.clone(),
+                                    crate::memory::feedback::CF_FEEDBACK,
+                                )),
+                                base_path,
+                            )
+                        })
+                        .unwrap_or_else(|e| {
                             tracing::warn!("Failed to load feedback store: {}, using in-memory", e);
                             FeedbackStore::new()
-                        },
-                    ),
+                        }),
                 ));
                 info!("Feedback store initialized");
 
@@ -3999,8 +4028,20 @@ impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
 mod shared_store_bootstrap_tests {
     use super::*;
 
-    // ADR 0006: the rocksdb arm must read rows the previous constructors wrote,
-    // across every index, after a real close and reopen of the shared DB.
+    fn boot_backend(
+        base: &std::path::Path,
+        backend: crate::config::StorageBackend,
+    ) -> Result<SharedStoreBootstrap> {
+        let mut config = ServerConfig::default();
+        config.effective_storage_backend = backend;
+        MultiUserMemoryManager::bootstrap_shared_stores(
+            base,
+            &config,
+            &rocksdb::Cache::new_lru_cache(1024),
+        )
+    }
+
+    // ADR 0006: a rocksdb arm that binds a different family or key layout serves an empty store over live data.
     mod rocksdb_on_disk_compat {
         use super::*;
         use crate::memory::types::{
@@ -4008,85 +4049,25 @@ mod shared_store_bootstrap_tests {
             TodoPriority, TodoStatus,
         };
         use crate::memory::ContextBlockStore;
-        use crate::storage::legacy_rocksdb::{RocksDbColumnFamilyStore, RocksDbColumnStore};
         use serde_json::{json, Value};
 
-        #[derive(Clone, Copy, Debug)]
-        enum Via {
-            Legacy,
-            Trait,
-        }
-
-        type Db = Arc<rocksdb::DB>;
-
-        fn open(base: &std::path::Path) -> Db {
-            let cache = rocksdb::Cache::new_lru_cache(1024);
-            MultiUserMemoryManager::open_legacy_shared_db(base, &cache).expect("open shared db")
-        }
-
-        fn prospective(via: Via, db: &Db, base: &std::path::Path) -> ProspectiveStore {
-            match via {
-                Via::Legacy => ProspectiveStore::new(db.clone(), base).unwrap(),
-                Via::Trait => {
-                    ProspectiveStore::with_store(Arc::new(RocksDbColumnStore::new(db.clone())))
-                        .unwrap()
-                }
-            }
-        }
-
-        fn todos(via: Via, db: &Db, base: &std::path::Path) -> TodoStore {
-            match via {
-                Via::Legacy => TodoStore::new(db.clone(), base).unwrap(),
-                Via::Trait => TodoStore::with_store(
-                    Arc::new(RocksDbColumnStore::new(db.clone())),
-                    base,
-                )
-                .unwrap(),
-            }
-        }
-
-        fn files(via: Via, db: &Db, base: &std::path::Path) -> FileMemoryStore {
-            match via {
-                Via::Legacy => FileMemoryStore::new(db.clone(), base).unwrap(),
-                Via::Trait => {
-                    FileMemoryStore::with_store(Arc::new(RocksDbColumnStore::new(db.clone())))
-                        .unwrap()
-                }
-            }
-        }
-
-        fn blocks(via: Via, db: &Db) -> ContextBlockStore {
-            match via {
-                Via::Legacy => ContextBlockStore::new(db.clone()),
-                Via::Trait => ContextBlockStore::with_store(Arc::new(
-                    RocksDbColumnFamilyStore::new(db.clone(), "context_blocks"),
-                )),
-            }
-        }
-
-        fn feedback(via: Via, db: &Db, base: &std::path::Path) -> FeedbackStore {
-            match via {
-                Via::Legacy => FeedbackStore::with_shared_db(db.clone(), base).unwrap(),
-                Via::Trait => FeedbackStore::with_store(
-                    Arc::new(RocksDbColumnFamilyStore::new(db.clone(), "feedback")),
-                    base,
-                )
-                .unwrap(),
-            }
+        fn boot(base: &std::path::Path) -> SharedStoreBootstrap {
+            boot_backend(base, crate::config::StorageBackend::RocksDb)
+                .expect("rocksdb shared-store bootstrap")
         }
 
         fn to_json<T: serde::Serialize>(v: &T) -> Value {
             serde_json::to_value(v).unwrap()
         }
 
-        fn raw_has(db: &Db, cf: &str, key: &str) -> bool {
+        // Literal family names on purpose: a renamed constant would move both sides of a round trip.
+        fn raw_has(bundle: &SharedStoreBootstrap, cf: &str, key: &str) -> bool {
+            let db = bundle.shared_db.rocksdb().expect("rocksdb engine");
             let handle = db
                 .cf_handle(cf)
                 .unwrap_or_else(|| panic!("deployed family '{cf}' missing"));
             db.get_cf(handle, key.as_bytes()).unwrap().is_some()
         }
-
-        // ---- prospective ----
 
         fn write_prospective(store: &ProspectiveStore) -> Vec<ProspectiveTask> {
             let past = chrono::Utc::now() - chrono::Duration::hours(2);
@@ -4139,38 +4120,40 @@ mod shared_store_bootstrap_tests {
             })
         }
 
-        fn prospective_round_trip(write: Via, read: Via) {
+        #[test]
+        fn rocksdb_prospective_rows_survive_reboot_through_with_store() {
             let tmp = tempfile::tempdir().unwrap();
             let (tasks, expected) = {
-                let db = open(tmp.path());
-                let store = prospective(write, &db, tmp.path());
-                let tasks = write_prospective(&store);
-                let expected = read_prospective(&store, &tasks);
+                let bundle = boot(tmp.path());
+                let tasks = write_prospective(&bundle.prospective_store);
+                let expected = read_prospective(&bundle.prospective_store, &tasks);
                 (tasks, expected)
             };
-            assert_eq!(expected["gets"].as_array().unwrap().iter().filter(|v| v.is_null()).count(), 0);
+            assert_eq!(
+                expected["gets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|v| v.is_null())
+                    .count(),
+                0
+            );
             assert_eq!(expected["alice_due"].as_array().unwrap().len(), 1);
             assert_eq!(expected["context"].as_array().unwrap().len(), 1);
 
-            let db = open(tmp.path());
+            let bundle = boot(tmp.path());
             let t = &tasks[0];
-            assert!(raw_has(&db, "prospective", &format!("alice:{}", t.id)));
-            assert!(raw_has(&db, "prospective_index", &format!("user:alice:{}", t.id)));
-            let store = prospective(read, &db, tmp.path());
-            assert_eq!(read_prospective(&store, &tasks), expected, "{write:?} -> {read:?}");
+            assert!(raw_has(&bundle, "prospective", &format!("alice:{}", t.id)));
+            assert!(raw_has(
+                &bundle,
+                "prospective_index",
+                &format!("user:alice:{}", t.id)
+            ));
+            assert_eq!(
+                read_prospective(&bundle.prospective_store, &tasks),
+                expected
+            );
         }
-
-        #[test]
-        fn rocksdb_prospective_rows_survive_legacy_to_with_store() {
-            prospective_round_trip(Via::Legacy, Via::Trait);
-        }
-
-        #[test]
-        fn rocksdb_prospective_rows_survive_with_store_to_legacy() {
-            prospective_round_trip(Via::Trait, Via::Legacy);
-        }
-
-        // ---- todos ----
 
         struct TodoFixture {
             todos: Vec<Todo>,
@@ -4178,7 +4161,9 @@ mod shared_store_bootstrap_tests {
         }
 
         fn write_todos(store: &TodoStore) -> TodoFixture {
-            let project = store.find_or_create_project("alice", "Backend Rewrite").unwrap();
+            let project = store
+                .find_or_create_project("alice", "Backend Rewrite")
+                .unwrap();
             let mut parent = Todo::new("alice".into(), "ship the storage traits".into());
             parent.project_id = Some(project.id.clone());
             parent.contexts = vec!["@Computer".into()];
@@ -4229,26 +4214,44 @@ mod shared_store_bootstrap_tests {
             })
         }
 
-        fn todos_round_trip(write: Via, read: Via) {
+        #[test]
+        fn rocksdb_todos_rows_survive_reboot_through_with_store() {
             let tmp = tempfile::tempdir().unwrap();
             let (fx, expected) = {
-                let db = open(tmp.path());
-                let store = todos(write, &db, tmp.path());
-                let fx = write_todos(&store);
-                let expected = read_todos(&store, &fx);
+                let bundle = boot(tmp.path());
+                let fx = write_todos(&bundle.todo_store);
+                let expected = read_todos(&bundle.todo_store, &fx);
                 (fx, expected)
             };
-            for key in ["by_project", "by_context", "due", "subtasks", "comments", "projects"] {
-                assert!(!expected[key].as_array().unwrap().is_empty(), "fixture reaches {key}");
+            for key in [
+                "by_project",
+                "by_context",
+                "due",
+                "subtasks",
+                "comments",
+                "projects",
+            ] {
+                assert!(
+                    !expected[key].as_array().unwrap().is_empty(),
+                    "fixture reaches {key}"
+                );
             }
 
-            let db = open(tmp.path());
+            let bundle = boot(tmp.path());
             let parent = &fx.todos[0];
-            assert!(raw_has(&db, "todos", &format!("alice:{}", parent.id.0)));
-            assert!(raw_has(&db, "todo_index", &format!("user:alice:{}", parent.id.0)));
-            assert!(raw_has(&db, "projects", &format!("alice:{}", fx.project.id.0)));
-            let store = todos(read, &db, tmp.path());
-            assert_eq!(read_todos(&store, &fx), expected, "{write:?} -> {read:?}");
+            assert!(raw_has(&bundle, "todos", &format!("alice:{}", parent.id.0)));
+            assert!(raw_has(
+                &bundle,
+                "todo_index",
+                &format!("user:alice:{}", parent.id.0)
+            ));
+            assert!(raw_has(
+                &bundle,
+                "projects",
+                &format!("alice:{}", fx.project.id.0)
+            ));
+            let store = &bundle.todo_store;
+            assert_eq!(read_todos(store, &fx), expected);
 
             // The sequence counter lives in the index family; a reset would reissue short ids.
             let next = store
@@ -4257,18 +4260,6 @@ mod shared_store_bootstrap_tests {
             let max_standalone = fx.todos[1].seq_num;
             assert_eq!(next.seq_num, max_standalone + 1);
         }
-
-        #[test]
-        fn rocksdb_todos_rows_survive_legacy_to_with_store() {
-            todos_round_trip(Via::Legacy, Via::Trait);
-        }
-
-        #[test]
-        fn rocksdb_todos_rows_survive_with_store_to_legacy() {
-            todos_round_trip(Via::Trait, Via::Legacy);
-        }
-
-        // ---- files ----
 
         fn write_files(store: &FileMemoryStore) -> (ProjectId, Vec<FileMemory>) {
             let project = ProjectId::new();
@@ -4315,37 +4306,28 @@ mod shared_store_bootstrap_tests {
             })
         }
 
-        fn files_round_trip(write: Via, read: Via) {
+        #[test]
+        fn rocksdb_files_rows_survive_reboot_through_with_store() {
             let tmp = tempfile::tempdir().unwrap();
             let (project, fs, expected) = {
-                let db = open(tmp.path());
-                let store = files(write, &db, tmp.path());
-                let (project, fs) = write_files(&store);
-                let expected = read_files(&store, &project, &fs);
+                let bundle = boot(tmp.path());
+                let (project, fs) = write_files(&bundle.file_store);
+                let expected = read_files(&bundle.file_store, &project, &fs);
                 (project, fs, expected)
             };
             assert!(!expected["by_path"].is_null());
             assert_eq!(expected["by_type"].as_array().unwrap().len(), 1);
             assert_eq!(expected["count"], 2);
 
-            let db = open(tmp.path());
-            assert!(raw_has(&db, "files", &format!("alice:{}", fs[0].id.0)));
-            assert!(raw_has(&db, "file_index", &format!("user:alice:{}", fs[0].id.0)));
-            let store = files(read, &db, tmp.path());
-            assert_eq!(read_files(&store, &project, &fs), expected, "{write:?} -> {read:?}");
+            let bundle = boot(tmp.path());
+            assert!(raw_has(&bundle, "files", &format!("alice:{}", fs[0].id.0)));
+            assert!(raw_has(
+                &bundle,
+                "file_index",
+                &format!("user:alice:{}", fs[0].id.0)
+            ));
+            assert_eq!(read_files(&bundle.file_store, &project, &fs), expected);
         }
-
-        #[test]
-        fn rocksdb_files_rows_survive_legacy_to_with_store() {
-            files_round_trip(Via::Legacy, Via::Trait);
-        }
-
-        #[test]
-        fn rocksdb_files_rows_survive_with_store_to_legacy() {
-            files_round_trip(Via::Trait, Via::Legacy);
-        }
-
-        // ---- context blocks ----
 
         fn read_blocks(store: &ContextBlockStore) -> Value {
             json!({
@@ -4357,39 +4339,33 @@ mod shared_store_bootstrap_tests {
             })
         }
 
-        fn blocks_round_trip(write: Via, read: Via) {
+        #[test]
+        fn rocksdb_context_blocks_rows_survive_reboot_through_with_store() {
             let tmp = tempfile::tempdir().unwrap();
             let expected = {
-                let db = open(tmp.path());
-                let store = blocks(write, &db);
-                store.set("alice", "persona", "terse reviewer", Some(500)).unwrap();
-                store.set("alice", "persona", "terse reviewer, v2", None).unwrap();
-                store.set("alice", "project_state", "WP3 in flight", None).unwrap();
+                let bundle = boot(tmp.path());
+                let store = &bundle.context_block_store;
+                store
+                    .set("alice", "persona", "terse reviewer", Some(500))
+                    .unwrap();
+                store
+                    .set("alice", "persona", "terse reviewer, v2", None)
+                    .unwrap();
+                store
+                    .set("alice", "project_state", "WP3 in flight", None)
+                    .unwrap();
                 store.set_locked("alice", "project_state", true).unwrap();
                 store.set("bob", "persona", "someone else", None).unwrap();
-                read_blocks(&store)
+                read_blocks(store)
             };
             assert_eq!(expected["persona"]["version"], 2);
             assert_eq!(expected["state"]["locked"], true);
             assert_eq!(expected["alice_list"].as_array().unwrap().len(), 2);
 
-            let db = open(tmp.path());
-            assert!(raw_has(&db, "context_blocks", "alice:persona"));
-            let store = blocks(read, &db);
-            assert_eq!(read_blocks(&store), expected, "{write:?} -> {read:?}");
+            let bundle = boot(tmp.path());
+            assert!(raw_has(&bundle, "context_blocks", "alice:persona"));
+            assert_eq!(read_blocks(&bundle.context_block_store), expected);
         }
-
-        #[test]
-        fn rocksdb_context_blocks_rows_survive_legacy_to_with_store() {
-            blocks_round_trip(Via::Legacy, Via::Trait);
-        }
-
-        #[test]
-        fn rocksdb_context_blocks_rows_survive_with_store_to_legacy() {
-            blocks_round_trip(Via::Trait, Via::Legacy);
-        }
-
-        // ---- feedback ----
 
         fn read_feedback(store: &FeedbackStore, memory: &crate::memory::MemoryId) -> Value {
             json!({
@@ -4400,12 +4376,13 @@ mod shared_store_bootstrap_tests {
             })
         }
 
-        fn feedback_round_trip(write: Via, read: Via) {
+        #[test]
+        fn rocksdb_feedback_rows_survive_reboot_through_with_store() {
             let tmp = tempfile::tempdir().unwrap();
             let memory = crate::memory::MemoryId(uuid::Uuid::new_v4());
             let expected = {
-                let db = open(tmp.path());
-                let mut store = feedback(write, &db, tmp.path());
+                let bundle = boot(tmp.path());
+                let mut store = bundle.feedback_store.write();
                 let surfaced = crate::memory::feedback::SurfacedMemoryInfo {
                     id: memory.clone(),
                     entities: ["rocksdb".to_string()].into_iter().collect(),
@@ -4439,21 +4416,77 @@ mod shared_store_bootstrap_tests {
             assert!(!expected["prev_ctx"].is_null());
             assert_eq!(expected["stats"]["total_momentum_entries"], 1);
 
-            let db = open(tmp.path());
-            assert!(raw_has(&db, "feedback", "pending:alice"));
-            assert!(raw_has(&db, "feedback", &format!("momentum:{}", memory.0)));
-            let store = feedback(read, &db, tmp.path());
-            assert_eq!(read_feedback(&store, &memory), expected, "{write:?} -> {read:?}");
+            let bundle = boot(tmp.path());
+            assert!(raw_has(&bundle, "feedback", "pending:alice"));
+            assert!(raw_has(
+                &bundle,
+                "feedback",
+                &format!("momentum:{}", memory.0)
+            ));
+            assert!(bundle.feedback_store.read().is_persistent());
+            assert_eq!(
+                read_feedback(&bundle.feedback_store.read(), &memory),
+                expected
+            );
         }
 
         #[test]
-        fn rocksdb_feedback_rows_survive_legacy_to_with_store() {
-            feedback_round_trip(Via::Legacy, Via::Trait);
-        }
+        fn rocksdb_bootstrap_imports_pre_column_family_dbs() {
+            let tmp = tempfile::tempdir().unwrap();
+            let legacy: Vec<(&str, &str)> = ProspectiveStore::LEGACY_SEPARATE_DBS
+                .iter()
+                .chain(TodoStore::LEGACY_SEPARATE_DBS)
+                .chain(FileMemoryStore::LEGACY_SEPARATE_DBS)
+                .chain(FeedbackStore::LEGACY_SEPARATE_DBS)
+                .copied()
+                .collect();
+            assert_eq!(legacy.len(), 8);
 
-        #[test]
-        fn rocksdb_feedback_rows_survive_with_store_to_legacy() {
-            feedback_round_trip(Via::Trait, Via::Legacy);
+            let todo = Todo::new("alice".into(), "written before column families".into());
+            for (dir, cf) in &legacy {
+                let mut rows = vec![(format!("marker:{cf}").into_bytes(), b"1".to_vec())];
+                if *cf == "todos" {
+                    let key = format!("alice:{}", todo.id.0);
+                    rows.push((key.into_bytes(), serde_json::to_vec(&todo).unwrap()));
+                }
+                if *cf == "todo_index" {
+                    rows.push((
+                        format!("user:alice:{}", todo.id.0).into_bytes(),
+                        b"1".to_vec(),
+                    ));
+                }
+                crate::storage::legacy_rocksdb::create_separate_db_for_test(
+                    &tmp.path().join(dir),
+                    &rows,
+                )
+                .unwrap();
+            }
+
+            for _ in 0..2 {
+                let bundle = boot(tmp.path());
+                for (dir, cf) in &legacy {
+                    assert!(
+                        raw_has(&bundle, cf, &format!("marker:{cf}")),
+                        "{dir} -> {cf}"
+                    );
+                    let old = tmp.path().join(dir);
+                    assert!(!old.exists(), "{dir} left in place");
+                    let name = old.file_name().unwrap().to_string_lossy().into_owned();
+                    assert!(old
+                        .with_file_name(format!("{name}.pre_cf_migration"))
+                        .is_dir());
+                }
+                let got = bundle.todo_store.get_todo("alice", &todo.id).unwrap();
+                assert_eq!(got.map(|t| t.content), Some(todo.content.clone()));
+                assert_eq!(
+                    bundle
+                        .todo_store
+                        .list_todos_for_user("alice", None)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
         }
     }
 
@@ -4465,11 +4498,7 @@ mod shared_store_bootstrap_tests {
     #[test]
     fn redb_shared_store_bootstrap_boots_and_stores_work() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = ServerConfig::default();
-        config.effective_storage_backend = crate::config::StorageBackend::Redb;
-        let cache = rocksdb::Cache::new_lru_cache(1024);
-
-        let bundle = MultiUserMemoryManager::bootstrap_shared_stores(tmp.path(), &config, &cache)
+        let bundle = boot_backend(tmp.path(), crate::config::StorageBackend::Redb)
             .expect("redb shared-store bootstrap");
 
         // The engine is the one asked for.

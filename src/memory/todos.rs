@@ -14,7 +14,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use parking_lot::RwLock;
-use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -81,10 +81,6 @@ pub struct TodoStore {
     /// Three families — CF_TODOS, CF_PROJECTS, CF_TODO_INDEX — so this takes the
     /// multi-family handle rather than a KeyValueStore bound to one.
     store: Arc<dyn crate::storage::ColumnStore>,
-    /// Present ONLY when rocksdb-backed: migrate_from_separate_dbs (a one-time
-    /// rocksdb-to-rocksdb import) and the rocksdb backup accessor need it; a
-    /// store built over another backend has no engine DB to hold.
-    db: Option<Arc<DB>>,
     /// Vector index for semantic search (per-user indices)
     vector_indices: RwLock<HashMap<String, VamanaIndex>>,
     /// Storage path for persisting vector indices
@@ -107,36 +103,16 @@ impl TodoStore {
         ]
     }
 
-    /// Create a new todo store backed by the given shared DB
-    pub fn new(db: Arc<DB>, storage_path: &Path) -> Result<Self> {
-        let todos_path = storage_path.join("todos");
-        std::fs::create_dir_all(&todos_path)?;
+    /// Pre-column-family standalone DBs under the data root, imported into these
+    /// families by the rocksdb boot path before the store is bound.
+    pub(crate) const LEGACY_SEPARATE_DBS: &'static [(&'static str, &'static str)] = &[
+        ("todos/items", CF_TODOS),
+        ("todos/projects", CF_PROJECTS),
+        ("todos/index", CF_TODO_INDEX),
+    ];
 
-        // Migrate from old separate-DB layout if needed
-        Self::migrate_from_separate_dbs(&todos_path, &db)?;
-
-        let store: Arc<dyn crate::storage::ColumnStore> = Arc::new(
-            crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db)),
-        );
-
-        // Migrate any unpadded due keys from prior versions
-        migrate_due_key_padding(store.as_ref())?;
-
-        tracing::info!("Todo store initialized");
-
-        Ok(Self {
-            store,
-            db: Some(db),
-            vector_indices: RwLock::new(HashMap::new()),
-            storage_path: todos_path,
-            seq_mutex: parking_lot::Mutex::new(()),
-        })
-    }
-
-    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
-    /// Skips migrate_from_separate_dbs (a rocksdb-to-rocksdb import with no
-    /// meaning on another backend) but still runs the logical due-key
-    /// migration; `storage_path` is still needed for the vector indices.
+    /// Bind a handle directly. Runs the logical due-key migration; `storage_path`
+    /// is needed for the vector indices.
     pub fn with_store(
         store: Arc<dyn crate::storage::ColumnStore>,
         storage_path: &Path,
@@ -152,65 +128,10 @@ impl TodoStore {
         tracing::info!("Todo store initialized");
         Ok(Self {
             store,
-            db: None,
             vector_indices: RwLock::new(HashMap::new()),
             storage_path: todos_path,
             seq_mutex: parking_lot::Mutex::new(()),
         })
-    }
-
-    /// Migrate data from the old separate-DB layout (items/, projects/, index/ sub-dirs)
-    /// into the unified column-family DB. After migration, old dirs are renamed to
-    /// `{name}.pre_cf_migration` so the migration is idempotent.
-    fn migrate_from_separate_dbs(todos_path: &Path, db: &DB) -> Result<()> {
-        let old_dirs: &[(&str, &str)] = &[
-            ("items", CF_TODOS),
-            ("projects", CF_PROJECTS),
-            ("index", CF_TODO_INDEX),
-        ];
-
-        for (old_name, cf_name) in old_dirs {
-            let old_dir = todos_path.join(old_name);
-            if !old_dir.is_dir() {
-                continue;
-            }
-
-            let cf = db
-                .cf_handle(cf_name)
-                .unwrap_or_else(|| panic!("{cf_name} CF must exist"));
-            let old_opts = Options::default();
-            match DB::open_for_read_only(&old_opts, &old_dir, false) {
-                Ok(old_db) => {
-                    let mut batch = WriteBatch::default();
-                    let mut count = 0usize;
-                    for (key, value) in old_db.iterator(rocksdb::IteratorMode::Start).flatten() {
-                        batch.put_cf(cf, &key, &value);
-                        count += 1;
-                        if count.is_multiple_of(10_000) {
-                            db.write(std::mem::take(&mut batch))?;
-                        }
-                    }
-                    if !batch.is_empty() {
-                        db.write(batch)?;
-                    }
-                    drop(old_db);
-                    tracing::info!("  todos/{old_name}: migrated {count} entries to {cf_name} CF");
-
-                    let backup = todos_path.join(format!("{old_name}.pre_cf_migration"));
-                    if backup.exists() {
-                        let _ = std::fs::remove_dir_all(&backup);
-                    }
-                    if let Err(e) = std::fs::rename(&old_dir, &backup) {
-                        tracing::warn!("Could not rename old {old_name} dir: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Could not open old {old_name} DB for migration: {e}");
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Get or create a Vamana vector index for a user
@@ -1504,18 +1425,6 @@ impl TodoStore {
         Ok(())
     }
 
-    /// Get reference to the shared RocksDB database for backup.
-    ///
-    /// Empty when not rocksdb-backed: there is no engine DB to hand a rocksdb
-    /// backup engine, and pretending otherwise is how a backup omits a store
-    /// while reporting success.
-    pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        match &self.db {
-            Some(db) => vec![("todos_shared", db)],
-            None => Vec::new(),
-        }
-    }
-
     /// Get overall todo stats for a user
     pub fn get_user_stats(&self, user_id: &str) -> Result<UserTodoStats> {
         let todos = self.list_todos_for_user(user_id, None)?;
@@ -1578,6 +1487,8 @@ pub struct UserTodoStats {
 mod tests {
     use super::*;
     use crate::memory::types::Recurrence;
+    use crate::storage::legacy_rocksdb::RocksDbColumnStore;
+    use rocksdb::DB;
     use tempfile::TempDir;
 
     fn open_test_shared_db(path: &Path) -> Arc<DB> {
@@ -1599,7 +1510,8 @@ mod tests {
     fn setup_store() -> (TodoStore, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let db = open_test_shared_db(temp_dir.path());
-        let store = TodoStore::new(db, temp_dir.path()).unwrap();
+        let store =
+            TodoStore::with_store(Arc::new(RocksDbColumnStore::new(db)), temp_dir.path()).unwrap();
         (store, temp_dir)
     }
 
@@ -1640,8 +1552,6 @@ mod tests {
 
         assert!(store.delete_todo("u", &stored.id).unwrap());
         assert!(store.list_todos_for_user("u", None).unwrap().is_empty());
-        // No engine DB behind this store — the backup accessor must say so.
-        assert!(store.databases().is_empty());
     }
 
     #[test]
@@ -1713,8 +1623,8 @@ mod tests {
         )
         .unwrap();
 
-        // Run migration through the trait, as new() does
-        let store = crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db));
+        // Run migration through the trait, as with_store() does
+        let store = RocksDbColumnStore::new(Arc::clone(&db));
         let migrated = migrate_due_key_padding(&store).unwrap();
         assert_eq!(migrated, 2);
 

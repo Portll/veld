@@ -37,7 +37,10 @@ fn create_test_store() -> (FileMemoryStore, TempDir) {
     let db = rocksdb::DB::open_cf_descriptors(&opts, &db_path, cfs).expect("Failed to open DB");
     let db = Arc::new(db);
 
-    let store = FileMemoryStore::new(db, temp_dir.path()).expect("Failed to create store");
+    let store = FileMemoryStore::with_store(Arc::new(
+        veld::storage::legacy_rocksdb::RocksDbColumnStore::new(db),
+    ))
+    .expect("Failed to create store");
     (store, temp_dir)
 }
 
