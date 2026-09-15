@@ -3999,6 +3999,464 @@ impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
 mod shared_store_bootstrap_tests {
     use super::*;
 
+    // ADR 0006: the rocksdb arm must read rows the previous constructors wrote,
+    // across every index, after a real close and reopen of the shared DB.
+    mod rocksdb_on_disk_compat {
+        use super::*;
+        use crate::memory::types::{
+            FileMemory, FileType, ProjectId, ProspectiveTask, ProspectiveTrigger, Todo,
+            TodoPriority, TodoStatus,
+        };
+        use crate::memory::ContextBlockStore;
+        use crate::storage::legacy_rocksdb::{RocksDbColumnFamilyStore, RocksDbColumnStore};
+        use serde_json::{json, Value};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Via {
+            Legacy,
+            Trait,
+        }
+
+        type Db = Arc<rocksdb::DB>;
+
+        fn open(base: &std::path::Path) -> Db {
+            let cache = rocksdb::Cache::new_lru_cache(1024);
+            MultiUserMemoryManager::open_legacy_shared_db(base, &cache).expect("open shared db")
+        }
+
+        fn prospective(via: Via, db: &Db, base: &std::path::Path) -> ProspectiveStore {
+            match via {
+                Via::Legacy => ProspectiveStore::new(db.clone(), base).unwrap(),
+                Via::Trait => {
+                    ProspectiveStore::with_store(Arc::new(RocksDbColumnStore::new(db.clone())))
+                        .unwrap()
+                }
+            }
+        }
+
+        fn todos(via: Via, db: &Db, base: &std::path::Path) -> TodoStore {
+            match via {
+                Via::Legacy => TodoStore::new(db.clone(), base).unwrap(),
+                Via::Trait => TodoStore::with_store(
+                    Arc::new(RocksDbColumnStore::new(db.clone())),
+                    base,
+                )
+                .unwrap(),
+            }
+        }
+
+        fn files(via: Via, db: &Db, base: &std::path::Path) -> FileMemoryStore {
+            match via {
+                Via::Legacy => FileMemoryStore::new(db.clone(), base).unwrap(),
+                Via::Trait => {
+                    FileMemoryStore::with_store(Arc::new(RocksDbColumnStore::new(db.clone())))
+                        .unwrap()
+                }
+            }
+        }
+
+        fn blocks(via: Via, db: &Db) -> ContextBlockStore {
+            match via {
+                Via::Legacy => ContextBlockStore::new(db.clone()),
+                Via::Trait => ContextBlockStore::with_store(Arc::new(
+                    RocksDbColumnFamilyStore::new(db.clone(), "context_blocks"),
+                )),
+            }
+        }
+
+        fn feedback(via: Via, db: &Db, base: &std::path::Path) -> FeedbackStore {
+            match via {
+                Via::Legacy => FeedbackStore::with_shared_db(db.clone(), base).unwrap(),
+                Via::Trait => FeedbackStore::with_store(
+                    Arc::new(RocksDbColumnFamilyStore::new(db.clone(), "feedback")),
+                    base,
+                )
+                .unwrap(),
+            }
+        }
+
+        fn to_json<T: serde::Serialize>(v: &T) -> Value {
+            serde_json::to_value(v).unwrap()
+        }
+
+        fn raw_has(db: &Db, cf: &str, key: &str) -> bool {
+            let handle = db
+                .cf_handle(cf)
+                .unwrap_or_else(|| panic!("deployed family '{cf}' missing"));
+            db.get_cf(handle, key.as_bytes()).unwrap().is_some()
+        }
+
+        // ---- prospective ----
+
+        fn write_prospective(store: &ProspectiveStore) -> Vec<ProspectiveTask> {
+            let past = chrono::Utc::now() - chrono::Duration::hours(2);
+            let mut due = ProspectiveTask::new(
+                "alice".into(),
+                "renew the certificate".into(),
+                ProspectiveTrigger::AtTime { at: past },
+            );
+            due.tags = vec!["ops".into()];
+            due.priority = 4;
+            let context = ProspectiveTask::new(
+                "alice".into(),
+                "mention the migration".into(),
+                ProspectiveTrigger::OnContext {
+                    keywords: vec!["Deploy".into(), "release".into()],
+                    threshold: 0.7,
+                },
+            );
+            let dismissed = ProspectiveTask::new(
+                "bob".into(),
+                "call back".into(),
+                ProspectiveTrigger::AfterDuration {
+                    seconds: 86_400,
+                    from: chrono::Utc::now(),
+                },
+            );
+            for t in [&due, &context, &dismissed] {
+                store.store(t).unwrap();
+            }
+            assert!(store.mark_dismissed("bob", &dismissed.id).unwrap());
+            vec![due, context, dismissed]
+        }
+
+        fn read_prospective(store: &ProspectiveStore, tasks: &[ProspectiveTask]) -> Value {
+            let gets: Vec<Value> = tasks
+                .iter()
+                .map(|t| to_json(&store.get(&t.user_id, &t.id).unwrap()))
+                .collect();
+            let prefix = &tasks[0].id.0.to_string()[..8];
+            json!({
+                "gets": gets,
+                "alice_all": to_json(&store.list_for_user("alice", None).unwrap()),
+                "alice_pending": to_json(&store.list_for_user("alice", Some(crate::memory::types::ProspectiveTaskStatus::Pending)).unwrap()),
+                "bob_dismissed": to_json(&store.list_for_user("bob", Some(crate::memory::types::ProspectiveTaskStatus::Dismissed)).unwrap()),
+                "alice_due": to_json(&store.get_due_tasks("alice").unwrap()),
+                "all_due": to_json(&store.get_all_due_tasks().unwrap()),
+                "context": to_json(&store.check_context_triggers("alice", "ready to deploy now").unwrap()),
+                "pending_count": store.pending_count("alice").unwrap(),
+                "by_prefix": to_json(&store.find_by_prefix("alice", prefix).unwrap()),
+            })
+        }
+
+        fn prospective_round_trip(write: Via, read: Via) {
+            let tmp = tempfile::tempdir().unwrap();
+            let (tasks, expected) = {
+                let db = open(tmp.path());
+                let store = prospective(write, &db, tmp.path());
+                let tasks = write_prospective(&store);
+                let expected = read_prospective(&store, &tasks);
+                (tasks, expected)
+            };
+            assert_eq!(expected["gets"].as_array().unwrap().iter().filter(|v| v.is_null()).count(), 0);
+            assert_eq!(expected["alice_due"].as_array().unwrap().len(), 1);
+            assert_eq!(expected["context"].as_array().unwrap().len(), 1);
+
+            let db = open(tmp.path());
+            let t = &tasks[0];
+            assert!(raw_has(&db, "prospective", &format!("alice:{}", t.id)));
+            assert!(raw_has(&db, "prospective_index", &format!("user:alice:{}", t.id)));
+            let store = prospective(read, &db, tmp.path());
+            assert_eq!(read_prospective(&store, &tasks), expected, "{write:?} -> {read:?}");
+        }
+
+        #[test]
+        fn rocksdb_prospective_rows_survive_legacy_to_with_store() {
+            prospective_round_trip(Via::Legacy, Via::Trait);
+        }
+
+        #[test]
+        fn rocksdb_prospective_rows_survive_with_store_to_legacy() {
+            prospective_round_trip(Via::Trait, Via::Legacy);
+        }
+
+        // ---- todos ----
+
+        struct TodoFixture {
+            todos: Vec<Todo>,
+            project: crate::memory::types::Project,
+        }
+
+        fn write_todos(store: &TodoStore) -> TodoFixture {
+            let project = store.find_or_create_project("alice", "Backend Rewrite").unwrap();
+            let mut parent = Todo::new("alice".into(), "ship the storage traits".into());
+            parent.project_id = Some(project.id.clone());
+            parent.contexts = vec!["@Computer".into()];
+            parent.priority = TodoPriority::High;
+            parent.due_date = Some(chrono::Utc::now() - chrono::Duration::days(1));
+            parent.tags = vec!["adr-0006".into()];
+            let parent = store.store_todo(&parent).unwrap();
+            let mut child = Todo::new("alice".into(), "write the compat test".into());
+            child.parent_id = Some(parent.id);
+            child.status = TodoStatus::InProgress;
+            child.blocked_on = Some(parent.id.0.to_string());
+            let child = store.store_todo(&child).unwrap();
+            let mut external = Todo::new("bob".into(), "imported".into());
+            external.external_id = Some("LIN-42".into());
+            let external = store.store_todo(&external).unwrap();
+            store
+                .add_comment("alice", &parent.id, "alice".into(), "halfway".into(), None)
+                .unwrap()
+                .unwrap();
+            TodoFixture {
+                todos: vec![parent, child, external],
+                project,
+            }
+        }
+
+        fn read_todos(store: &TodoStore, fx: &TodoFixture) -> Value {
+            let parent = &fx.todos[0];
+            let gets: Vec<Value> = fx
+                .todos
+                .iter()
+                .map(|t| to_json(&store.get_todo(&t.user_id, &t.id).unwrap()))
+                .collect();
+            json!({
+                "gets": gets,
+                "alice_all": to_json(&store.list_todos_for_user("alice", None).unwrap()),
+                "alice_in_progress": to_json(&store.list_todos_for_user("alice", Some(&[TodoStatus::InProgress])).unwrap()),
+                "by_project": to_json(&store.list_todos_by_project("alice", &fx.project.id).unwrap()),
+                "by_context": to_json(&store.list_todos_by_context("alice", "@computer").unwrap()),
+                "due": to_json(&store.list_due_todos("alice", true).unwrap()),
+                "subtasks": to_json(&store.list_subtasks(&parent.id).unwrap()),
+                "external": to_json(&store.find_by_external_id("bob", "LIN-42").unwrap()),
+                "short_id": to_json(&store.find_todo_by_prefix("alice", &parent.short_id()).unwrap()),
+                "comments": to_json(&store.get_comments("alice", &parent.id).unwrap()),
+                "projects": to_json(&store.list_projects("alice").unwrap()),
+                "project_by_name": to_json(&store.find_project_by_name("alice", "backend rewrite").unwrap()),
+                "project_stats": to_json(&store.get_project_stats("alice", &fx.project.id).unwrap()),
+                "user_stats": to_json(&store.get_user_stats("alice").unwrap()),
+            })
+        }
+
+        fn todos_round_trip(write: Via, read: Via) {
+            let tmp = tempfile::tempdir().unwrap();
+            let (fx, expected) = {
+                let db = open(tmp.path());
+                let store = todos(write, &db, tmp.path());
+                let fx = write_todos(&store);
+                let expected = read_todos(&store, &fx);
+                (fx, expected)
+            };
+            for key in ["by_project", "by_context", "due", "subtasks", "comments", "projects"] {
+                assert!(!expected[key].as_array().unwrap().is_empty(), "fixture reaches {key}");
+            }
+
+            let db = open(tmp.path());
+            let parent = &fx.todos[0];
+            assert!(raw_has(&db, "todos", &format!("alice:{}", parent.id.0)));
+            assert!(raw_has(&db, "todo_index", &format!("user:alice:{}", parent.id.0)));
+            assert!(raw_has(&db, "projects", &format!("alice:{}", fx.project.id.0)));
+            let store = todos(read, &db, tmp.path());
+            assert_eq!(read_todos(&store, &fx), expected, "{write:?} -> {read:?}");
+
+            // The sequence counter lives in the index family; a reset would reissue short ids.
+            let next = store
+                .store_todo(&Todo::new("alice".into(), "after reopen".into()))
+                .unwrap();
+            let max_standalone = fx.todos[1].seq_num;
+            assert_eq!(next.seq_num, max_standalone + 1);
+        }
+
+        #[test]
+        fn rocksdb_todos_rows_survive_legacy_to_with_store() {
+            todos_round_trip(Via::Legacy, Via::Trait);
+        }
+
+        #[test]
+        fn rocksdb_todos_rows_survive_with_store_to_legacy() {
+            todos_round_trip(Via::Trait, Via::Legacy);
+        }
+
+        // ---- files ----
+
+        fn write_files(store: &FileMemoryStore) -> (ProjectId, Vec<FileMemory>) {
+            let project = ProjectId::new();
+            let mut a = FileMemory::new(
+                project.clone(),
+                "alice".into(),
+                "src/main.rs".into(),
+                "/repo/src/main.rs".into(),
+                "hash-a".into(),
+                FileType::Rust,
+                120,
+                4096,
+            );
+            a.summary = "entry point".into();
+            let b = FileMemory::new(
+                project.clone(),
+                "alice".into(),
+                "docs/index.md".into(),
+                "/repo/docs/index.md".into(),
+                "hash-b".into(),
+                FileType::Markdown,
+                30,
+                900,
+            );
+            for f in [&a, &b] {
+                store.store(f).unwrap();
+            }
+            (project, vec![a, b])
+        }
+
+        fn read_files(store: &FileMemoryStore, project: &ProjectId, fs: &[FileMemory]) -> Value {
+            let gets: Vec<Value> = fs
+                .iter()
+                .map(|f| to_json(&store.get(&f.user_id, &f.id).unwrap()))
+                .collect();
+            json!({
+                "gets": gets,
+                "by_path": to_json(&store.get_by_path("alice", project, "src/main.rs").unwrap()),
+                "by_user": to_json(&store.list_by_user("alice", None).unwrap()),
+                "by_project": to_json(&store.list_by_project("alice", project, None).unwrap()),
+                "by_type": to_json(&store.list_by_type("alice", project, &FileType::Rust, None).unwrap()),
+                "count": store.count_by_project("alice", project).unwrap(),
+                "stats": to_json(&store.stats("alice").unwrap()),
+            })
+        }
+
+        fn files_round_trip(write: Via, read: Via) {
+            let tmp = tempfile::tempdir().unwrap();
+            let (project, fs, expected) = {
+                let db = open(tmp.path());
+                let store = files(write, &db, tmp.path());
+                let (project, fs) = write_files(&store);
+                let expected = read_files(&store, &project, &fs);
+                (project, fs, expected)
+            };
+            assert!(!expected["by_path"].is_null());
+            assert_eq!(expected["by_type"].as_array().unwrap().len(), 1);
+            assert_eq!(expected["count"], 2);
+
+            let db = open(tmp.path());
+            assert!(raw_has(&db, "files", &format!("alice:{}", fs[0].id.0)));
+            assert!(raw_has(&db, "file_index", &format!("user:alice:{}", fs[0].id.0)));
+            let store = files(read, &db, tmp.path());
+            assert_eq!(read_files(&store, &project, &fs), expected, "{write:?} -> {read:?}");
+        }
+
+        #[test]
+        fn rocksdb_files_rows_survive_legacy_to_with_store() {
+            files_round_trip(Via::Legacy, Via::Trait);
+        }
+
+        #[test]
+        fn rocksdb_files_rows_survive_with_store_to_legacy() {
+            files_round_trip(Via::Trait, Via::Legacy);
+        }
+
+        // ---- context blocks ----
+
+        fn read_blocks(store: &ContextBlockStore) -> Value {
+            json!({
+                "persona": to_json(&store.get("alice", "persona").unwrap()),
+                "state": to_json(&store.get("alice", "project_state").unwrap()),
+                "bob": to_json(&store.get("bob", "persona").unwrap()),
+                "alice_list": to_json(&store.list("alice").unwrap()),
+                "bob_list": to_json(&store.list("bob").unwrap()),
+            })
+        }
+
+        fn blocks_round_trip(write: Via, read: Via) {
+            let tmp = tempfile::tempdir().unwrap();
+            let expected = {
+                let db = open(tmp.path());
+                let store = blocks(write, &db);
+                store.set("alice", "persona", "terse reviewer", Some(500)).unwrap();
+                store.set("alice", "persona", "terse reviewer, v2", None).unwrap();
+                store.set("alice", "project_state", "WP3 in flight", None).unwrap();
+                store.set_locked("alice", "project_state", true).unwrap();
+                store.set("bob", "persona", "someone else", None).unwrap();
+                read_blocks(&store)
+            };
+            assert_eq!(expected["persona"]["version"], 2);
+            assert_eq!(expected["state"]["locked"], true);
+            assert_eq!(expected["alice_list"].as_array().unwrap().len(), 2);
+
+            let db = open(tmp.path());
+            assert!(raw_has(&db, "context_blocks", "alice:persona"));
+            let store = blocks(read, &db);
+            assert_eq!(read_blocks(&store), expected, "{write:?} -> {read:?}");
+        }
+
+        #[test]
+        fn rocksdb_context_blocks_rows_survive_legacy_to_with_store() {
+            blocks_round_trip(Via::Legacy, Via::Trait);
+        }
+
+        #[test]
+        fn rocksdb_context_blocks_rows_survive_with_store_to_legacy() {
+            blocks_round_trip(Via::Trait, Via::Legacy);
+        }
+
+        // ---- feedback ----
+
+        fn read_feedback(store: &FeedbackStore, memory: &crate::memory::MemoryId) -> Value {
+            json!({
+                "pending": to_json(&store.get_pending("alice")),
+                "prev_ctx": to_json(&store.get_previous_context("alice")),
+                "momentum": to_json(&store.get_momentum(memory)),
+                "stats": to_json(&store.stats()),
+            })
+        }
+
+        fn feedback_round_trip(write: Via, read: Via) {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory = crate::memory::MemoryId(uuid::Uuid::new_v4());
+            let expected = {
+                let db = open(tmp.path());
+                let mut store = feedback(write, &db, tmp.path());
+                let surfaced = crate::memory::feedback::SurfacedMemoryInfo {
+                    id: memory.clone(),
+                    entities: ["rocksdb".to_string()].into_iter().collect(),
+                    content_preview: "column families".into(),
+                    score: 0.8,
+                    embedding: vec![0.1, 0.2],
+                };
+                store.set_pending(crate::memory::feedback::PendingFeedback::new(
+                    "alice".into(),
+                    "how is storage opened".into(),
+                    vec![0.3, 0.4],
+                    vec![surfaced],
+                ));
+                store.set_previous_context(
+                    "alice",
+                    "how is storage opened".into(),
+                    vec![0.3, 0.4],
+                    vec![memory.clone()],
+                );
+                let m = store.get_or_create_momentum(
+                    memory.clone(),
+                    crate::memory::types::ExperienceType::Learning,
+                );
+                m.ema = 0.42;
+                m.signal_count = 3;
+                store.mark_dirty(&memory);
+                store.flush().unwrap();
+                read_feedback(&store, &memory)
+            };
+            assert!(!expected["pending"].is_null());
+            assert!(!expected["prev_ctx"].is_null());
+            assert_eq!(expected["stats"]["total_momentum_entries"], 1);
+
+            let db = open(tmp.path());
+            assert!(raw_has(&db, "feedback", "pending:alice"));
+            assert!(raw_has(&db, "feedback", &format!("momentum:{}", memory.0)));
+            let store = feedback(read, &db, tmp.path());
+            assert_eq!(read_feedback(&store, &memory), expected, "{write:?} -> {read:?}");
+        }
+
+        #[test]
+        fn rocksdb_feedback_rows_survive_legacy_to_with_store() {
+            feedback_round_trip(Via::Legacy, Via::Trait);
+        }
+
+        #[test]
+        fn rocksdb_feedback_rows_survive_with_store_to_legacy() {
+            feedback_round_trip(Via::Trait, Via::Legacy);
+        }
+    }
+
     /// The redb arm of bootstrap_shared_stores BOOTS and its stores WORK.
     /// The compile-only version of this claim is form satisfied, nothing fed:
     /// the arm could construct stores over the wrong tables and nothing would

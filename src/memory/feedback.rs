@@ -1495,13 +1495,10 @@ impl FeedbackStore {
         Self::default()
     }
 
-    /// Get a reference to the feedback column family handle.
-    /// Create persistent store backed by a shared RocksDB instance.
-    ///
-    /// The caller is responsible for opening the DB with the `CF_FEEDBACK` column
-    /// family already declared. On first use this constructor migrates data from
-    /// the legacy standalone `feedback/` DB directory into the shared CF.
     /// Bind a handle directly — the backend-agnostic constructor.
+    ///
+    /// Loads persisted pending feedback and previous context: those are read from
+    /// memory only, so a store bound without loading serves them empty after restart.
     pub fn with_store(
         store: Arc<dyn crate::storage::KeyValueStore>,
         base_path: &Path,
@@ -1509,46 +1506,48 @@ impl FeedbackStore {
         // base_path is used by the rocksdb constructor for its one-time migration and
         // is not state this store keeps; a handle-bound caller has nothing to migrate.
         let _ = base_path;
-        let mut s = Self::new();
-        s.store = Some(store);
-        Ok(s)
+        Self::load_from(store)
     }
 
+    /// Create persistent store backed by a shared RocksDB instance.
+    ///
+    /// The caller is responsible for opening the DB with the `CF_FEEDBACK` column
+    /// family already declared. On first use this constructor migrates data from
+    /// the legacy standalone `feedback/` DB directory into the shared CF.
     pub fn with_shared_db(db: Arc<DB>, base_path: &Path) -> anyhow::Result<Self> {
         Self::migrate_from_separate_db(base_path, &db)?;
-
-        let store: Arc<dyn crate::storage::KeyValueStore> = Arc::new(
+        Self::load_from(Arc::new(
             crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(db, CF_FEEDBACK),
-        );
+        ))
+    }
 
-        // Load all momentum entries from the feedback CF
+    fn load_from(store: Arc<dyn crate::storage::KeyValueStore>) -> anyhow::Result<Self> {
         let mut momentum = HashMap::new();
-        let iter = store.scan_prefix(b"momentum:", None)?;
-        for (key, value) in iter {
-            if let Ok(_key_str) = std::str::from_utf8(&key) {
-                if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
-                    momentum.insert(m.memory_id.clone(), m);
-                }
+        for (key, value) in store.scan_prefix(b"momentum:", None)? {
+            if std::str::from_utf8(&key).is_err() {
+                continue;
+            }
+            if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
+                momentum.insert(m.memory_id.clone(), m);
             }
         }
 
         let mut pending = HashMap::new();
-        let iter = store.scan_prefix(b"pending:", None)?;
-        for (key, value) in iter {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
-                    if !p.is_expired() {
-                        pending.insert(p.user_id.clone(), p);
-                    } else {
-                        let _ = store.delete_bytes(key_str.as_bytes());
-                    }
+        for (key, value) in store.scan_prefix(b"pending:", None)? {
+            if std::str::from_utf8(&key).is_err() {
+                continue;
+            }
+            if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
+                if !p.is_expired() {
+                    pending.insert(p.user_id.clone(), p);
+                } else {
+                    let _ = store.delete_bytes(&key);
                 }
             }
         }
 
         let mut previous_context = HashMap::new();
-        let iter = store.scan_prefix(b"prev_ctx:", None)?;
-        for (key, value) in iter {
+        for (key, value) in store.scan_prefix(b"prev_ctx:", None)? {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
                     let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
@@ -1558,7 +1557,7 @@ impl FeedbackStore {
         }
 
         tracing::info!(
-            "Loaded {} momentum, {} pending, {} previous context from shared feedback CF",
+            "Loaded {} momentum, {} pending, {} previous context from feedback store",
             momentum.len(),
             pending.len(),
             previous_context.len()
@@ -1637,64 +1636,9 @@ impl FeedbackStore {
         ];
         let db = DB::open_cf_descriptors(&opts, path.as_ref(), cfs)?;
         let db = Arc::new(db);
-        let store: Arc<dyn crate::storage::KeyValueStore> = Arc::new(
+        Self::load_from(Arc::new(
             crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(db, CF_FEEDBACK),
-        );
-
-        // Load all momentum entries from the feedback CF
-        let mut momentum = HashMap::new();
-        let iter = store.scan_prefix(b"momentum:", None)?;
-        for (key, value) in iter {
-            if let Ok(_key_str) = std::str::from_utf8(&key) {
-                if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
-                    momentum.insert(m.memory_id.clone(), m);
-                }
-            }
-        }
-
-        // Also load pending feedback entries (filter expired ones)
-        let mut pending = HashMap::new();
-        let iter = store.scan_prefix(b"pending:", None)?;
-        for (key, value) in iter {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
-                    if !p.is_expired() {
-                        pending.insert(p.user_id.clone(), p);
-                    } else {
-                        // Clean up expired pending feedback from disk
-                        let _ = store.delete_bytes(key_str.as_bytes());
-                    }
-                }
-            }
-        }
-
-        // Load previous context entries
-        let mut previous_context = HashMap::new();
-        let iter = store.scan_prefix(b"prev_ctx:", None)?;
-        for (key, value) in iter {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
-                    let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
-                    previous_context.insert(user_id.to_string(), ctx);
-                }
-            }
-        }
-
-        tracing::info!(
-            "Loaded {} momentum, {} pending, {} previous context from feedback CF",
-            momentum.len(),
-            pending.len(),
-            previous_context.len()
-        );
-
-        Ok(Self {
-            momentum,
-            quality_tracker: RetrievalQualityTracker::default(),
-            pending,
-            previous_context,
-            store: Some(store),
-            dirty: HashSet::new(),
-        })
+        ))
     }
 
     /// Get or create momentum for a memory
