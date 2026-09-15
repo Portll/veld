@@ -12,8 +12,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
-use std::path::Path;
+use rocksdb::{ColumnFamilyDescriptor, Options};
 use std::sync::Arc;
 
 use super::types::{ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus, ProspectiveTrigger};
@@ -90,10 +89,6 @@ pub struct ProspectiveStore {
     /// delete() batch across BOTH families in one commit; the DB-scoped batch API
     /// exists for exactly those two call sites.
     store: Arc<dyn crate::storage::ColumnStore>,
-    /// Present ONLY when rocksdb-backed: migrate_from_separate_dbs (a one-time
-    /// rocksdb-to-rocksdb import) and the rocksdb backup accessor need it; a
-    /// store built over another backend has no engine DB to hold.
-    db: Option<Arc<DB>>,
 }
 
 impl ProspectiveStore {
@@ -111,93 +106,22 @@ impl ProspectiveStore {
         ]
     }
 
-    /// Create a new prospective store backed by the given shared DB.
-    ///
-    /// The DB must have been opened with the column families returned by
-    /// [`column_family_descriptors()`].  On first run after the migration,
-    /// data from the old separate `tasks/` and `index/` sub-DBs is copied
-    /// into the corresponding CFs and the old directories are renamed.
-    pub fn new(db: Arc<DB>, storage_path: &Path) -> Result<Self> {
-        let prospective_path = storage_path.join("prospective");
-        std::fs::create_dir_all(&prospective_path)?;
+    /// Pre-column-family standalone DBs under the data root, imported into these
+    /// families by the rocksdb boot path before the store is bound.
+    pub(crate) const LEGACY_SEPARATE_DBS: &'static [(&'static str, &'static str)] = &[
+        ("prospective/tasks", CF_PROSPECTIVE),
+        ("prospective/index", CF_PROSPECTIVE_INDEX),
+    ];
 
-        Self::migrate_from_separate_dbs(&prospective_path, &db)?;
-
-        let store: Arc<dyn crate::storage::ColumnStore> = Arc::new(
-            crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db)),
-        );
-        migrate_due_key_padding(store.as_ref())?;
-
-        tracing::info!("Prospective memory store initialized");
-        Ok(Self {
-            store,
-            db: Some(db),
-        })
-    }
-
-    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
-    /// Skips migrate_from_separate_dbs (a rocksdb-to-rocksdb import with no
-    /// meaning on another backend) but still runs the logical due-key
-    /// migration, which belongs to whichever backend holds the rows.
+    /// Bind a handle directly. Runs the logical due-key migration, which belongs
+    /// to whichever backend holds the rows.
     pub fn with_store(store: Arc<dyn crate::storage::ColumnStore>) -> Result<Self> {
         for cf in [CF_PROSPECTIVE, CF_PROSPECTIVE_INDEX] {
             store.ensure_cf(cf)?;
         }
         migrate_due_key_padding(store.as_ref())?;
         tracing::info!("Prospective memory store initialized");
-        Ok(Self { store, db: None })
-    }
-
-    /// One-time migration: copy data from legacy separate RocksDB instances
-    /// (`prospective/tasks/` and `prospective/index/`) into the shared DB's
-    /// column families, then rename the old directories so we don't re-migrate.
-    fn migrate_from_separate_dbs(prospective_path: &Path, db: &DB) -> Result<()> {
-        let old_dirs: &[(&str, &str)] =
-            &[("tasks", CF_PROSPECTIVE), ("index", CF_PROSPECTIVE_INDEX)];
-
-        for (old_name, cf_name) in old_dirs {
-            let old_dir = prospective_path.join(old_name);
-            if !old_dir.is_dir() {
-                continue;
-            }
-
-            let cf = db
-                .cf_handle(cf_name)
-                .unwrap_or_else(|| panic!("{cf_name} CF must exist"));
-            let old_opts = Options::default();
-            match DB::open_for_read_only(&old_opts, &old_dir, false) {
-                Ok(old_db) => {
-                    let mut batch = WriteBatch::default();
-                    let mut count = 0usize;
-                    for (key, value) in old_db.iterator(rocksdb::IteratorMode::Start).flatten() {
-                        batch.put_cf(cf, &key, &value);
-                        count += 1;
-                        if count.is_multiple_of(10_000) {
-                            db.write(std::mem::take(&mut batch))?;
-                        }
-                    }
-                    if !batch.is_empty() {
-                        db.write(batch)?;
-                    }
-                    drop(old_db);
-                    tracing::info!(
-                        "  prospective/{old_name}: migrated {count} entries to {cf_name} CF"
-                    );
-
-                    let backup = prospective_path.join(format!("{old_name}.pre_cf_migration"));
-                    if backup.exists() {
-                        let _ = std::fs::remove_dir_all(&backup);
-                    }
-                    if let Err(e) = std::fs::rename(&old_dir, &backup) {
-                        tracing::warn!("Could not rename old {old_name} dir: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Could not open old {old_name} DB for migration: {e}");
-                }
-            }
-        }
-        Ok(())
+        Ok(Self { store })
     }
 
     /// Flush all column families to disk (critical for graceful shutdown)
@@ -210,18 +134,6 @@ impl ProspectiveStore {
                 .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
         }
         Ok(())
-    }
-
-    /// Get references to all RocksDB databases for backup.
-    ///
-    /// Empty when not rocksdb-backed: there is no engine DB to hand a rocksdb
-    /// backup engine, and pretending otherwise is how a backup omits a store
-    /// while reporting success.
-    pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        match &self.db {
-            Some(db) => vec![("prospective_shared", db)],
-            None => Vec::new(),
-        }
     }
 
     /// Store a new prospective task
@@ -812,6 +724,9 @@ impl ProspectiveStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::legacy_rocksdb::RocksDbColumnStore;
+    use rocksdb::DB;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn open_test_db(path: &Path) -> Arc<DB> {
@@ -832,7 +747,7 @@ mod tests {
     fn setup_store() -> (TempDir, ProspectiveStore) {
         let temp_dir = TempDir::new().unwrap();
         let db = open_test_db(temp_dir.path());
-        let store = ProspectiveStore::new(db, temp_dir.path()).unwrap();
+        let store = ProspectiveStore::with_store(Arc::new(RocksDbColumnStore::new(db))).unwrap();
         (temp_dir, store)
     }
 
@@ -873,8 +788,6 @@ mod tests {
         assert!(store.delete("u", &task.id).unwrap());
         assert!(store.get("u", &task.id).unwrap().is_none());
         assert!(store.list_for_user("u", None).unwrap().is_empty());
-        // No engine DB behind this store — the backup accessor must say so.
-        assert!(store.databases().is_empty());
     }
 
     #[test]
@@ -1035,8 +948,8 @@ mod tests {
         )
         .unwrap();
 
-        // Run migration through the trait, as new() does
-        let store = crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db));
+        // Run migration through the trait, as with_store() does
+        let store = RocksDbColumnStore::new(Arc::clone(&db));
         let migrated = migrate_due_key_padding(&store).unwrap();
         assert_eq!(migrated, 2);
 

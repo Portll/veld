@@ -674,6 +674,66 @@ impl BackupStore for RocksDbBackupStore {
     }
 }
 
+/// One-time import of a pre-column-family standalone DB into a shared-DB family; the
+/// old directory is renamed to `<name>.pre_cf_migration` so a later boot finds nothing.
+pub fn import_separate_db_into_cf(db: &DB, old_dir: &Path, cf_name: &str) -> Result<()> {
+    if !old_dir.is_dir() {
+        return Ok(());
+    }
+    let cf = db
+        .cf_handle(cf_name)
+        .ok_or_else(|| anyhow!("this database has no column family '{cf_name}'"))?;
+    let old_db = match DB::open_for_read_only(&rocksdb::Options::default(), old_dir, false) {
+        Ok(old_db) => old_db,
+        Err(e) => {
+            tracing::warn!(
+                "Could not open old DB {} for migration: {e}",
+                old_dir.display()
+            );
+            return Ok(());
+        }
+    };
+    let mut batch = WriteBatch::default();
+    let mut count = 0usize;
+    for (key, value) in old_db.iterator(IteratorMode::Start).flatten() {
+        batch.put_cf(cf, &key, &value);
+        count += 1;
+        if count.is_multiple_of(10_000) {
+            db.write(std::mem::take(&mut batch))?;
+        }
+    }
+    if !batch.is_empty() {
+        db.write(batch)?;
+    }
+    drop(old_db);
+    tracing::info!(
+        "  {}: migrated {count} entries to {cf_name} CF",
+        old_dir.display()
+    );
+
+    let Some(name) = old_dir.file_name() else {
+        return Ok(());
+    };
+    let backup = old_dir.with_file_name(format!("{}.pre_cf_migration", name.to_string_lossy()));
+    if backup.exists() {
+        let _ = std::fs::remove_dir_all(&backup);
+    }
+    if let Err(e) = std::fs::rename(old_dir, &backup) {
+        tracing::warn!("Could not rename old dir {}: {e}", old_dir.display());
+    }
+    Ok(())
+}
+
+/// A standalone pre-column-family rocksdb directory holding `rows`, for import tests.
+#[cfg(test)]
+pub(crate) fn create_separate_db_for_test(path: &Path, rows: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+    let db = DB::open_default(path)?;
+    for (key, value) in rows {
+        db.put(key, value)?;
+    }
+    Ok(())
+}
+
 /// Generic column-family adapter for shared RocksDB-backed stores.
 pub struct RocksDbColumnFamilyStore {
     db: Arc<DB>,

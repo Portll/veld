@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -89,21 +89,9 @@ impl ContextBlockStore {
         vec![ColumnFamilyDescriptor::new(CF_CONTEXT_BLOCKS, cf_opts)]
     }
 
-    /// Create a new context block store backed by the given shared DB.
     /// Bind a handle directly — the constructor a backend-agnostic caller uses.
     pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
         Self { store }
-    }
-
-    pub fn new(db: Arc<DB>) -> Self {
-        Self {
-            store: Arc::new(
-                crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
-                    db,
-                    CF_CONTEXT_BLOCKS,
-                ),
-            ),
-        }
     }
 
     /// Build the RocksDB key for a given user + block key.
@@ -316,6 +304,8 @@ impl ContextBlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore;
+    use rocksdb::DB;
     use tempfile::TempDir;
 
     fn open_test_db() -> (Arc<DB>, TempDir) {
@@ -329,10 +319,17 @@ mod tests {
         (Arc::new(db), tmp)
     }
 
+    fn bind(db: Arc<DB>) -> ContextBlockStore {
+        ContextBlockStore::with_store(Arc::new(RocksDbColumnFamilyStore::new(
+            db,
+            CF_CONTEXT_BLOCKS,
+        )))
+    }
+
     #[test]
     fn test_set_and_get() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
 
         let block = store
             .set("user1", "persona", "You are a helpful assistant.", None)
@@ -349,7 +346,7 @@ mod tests {
     #[test]
     fn test_version_increment() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
 
         store.set("user1", "state", "v1 content", None).unwrap();
         let block = store.set("user1", "state", "v2 content", None).unwrap();
@@ -363,7 +360,7 @@ mod tests {
     #[test]
     fn test_max_tokens_preserved() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
 
         store.set("user1", "x", "content", Some(500)).unwrap();
         // Update without specifying max_tokens — should preserve 500
@@ -378,7 +375,7 @@ mod tests {
     #[test]
     fn test_list() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
 
         store.set("user1", "alpha", "a", None).unwrap();
         store.set("user1", "beta", "b", None).unwrap();
@@ -396,7 +393,7 @@ mod tests {
     #[test]
     fn test_delete() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
 
         store.set("user1", "temp", "data", None).unwrap();
         assert!(store.delete("user1", "temp").unwrap());
@@ -407,7 +404,7 @@ mod tests {
     #[test]
     fn test_get_nonexistent() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
 
         assert!(store.get("user1", "missing").unwrap().is_none());
     }
@@ -419,7 +416,7 @@ mod tests {
     #[test]
     fn new_block_starts_unlocked() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
         let block = store.set("u", "persona", "x", None).unwrap();
         assert!(!block.locked);
     }
@@ -427,7 +424,7 @@ mod tests {
     #[test]
     fn set_locked_persists_across_get() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
         store.set("u", "persona", "x", None).unwrap();
         store.set_locked("u", "persona", true).unwrap();
         let got = store.get("u", "persona").unwrap().unwrap();
@@ -437,7 +434,7 @@ mod tests {
     #[test]
     fn set_preserves_lock_across_content_update() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
         store.set("u", "persona", "v1", None).unwrap();
         store.set_locked("u", "persona", true).unwrap();
         let updated = store.set("u", "persona", "v2", None).unwrap();
@@ -450,7 +447,7 @@ mod tests {
     #[test]
     fn set_locked_idempotent() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
         store.set("u", "persona", "x", None).unwrap();
         store.set_locked("u", "persona", true).unwrap();
         store.set_locked("u", "persona", true).unwrap();
@@ -463,7 +460,7 @@ mod tests {
     #[test]
     fn set_locked_on_missing_block_errors() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
         assert!(store.set_locked("u", "ghost", true).is_err());
     }
 
@@ -474,7 +471,7 @@ mod tests {
     #[test]
     fn occ_applied_on_matching_version() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
         let v1 = store.set("u", "persona", "v1", None).unwrap();
         let out = store
             .set_with_version_check("u", "persona", "v2", v1.version)
@@ -491,7 +488,7 @@ mod tests {
     #[test]
     fn occ_version_conflict_does_not_write() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
         let v1 = store.set("u", "persona", "v1", None).unwrap();
         // Foreground writer bumps version to 2.
         store.set("u", "persona", "v1.5", None).unwrap();
@@ -513,7 +510,7 @@ mod tests {
     #[test]
     fn occ_locked_block_aborts() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
         let v1 = store.set("u", "persona", "v1", None).unwrap();
         store.set_locked("u", "persona", true).unwrap();
         let out = store
@@ -531,7 +528,7 @@ mod tests {
     #[test]
     fn occ_missing_block_returns_missing() {
         let (db, _tmp) = open_test_db();
-        let store = ContextBlockStore::new(db);
+        let store = bind(db);
         let out = store
             .set_with_version_check("u", "ghost", "anything", 1)
             .unwrap();

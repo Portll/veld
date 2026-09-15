@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use glob::Pattern;
-use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -31,11 +31,6 @@ pub struct FileMemoryStore {
     /// Two families — CF_FILES and CF_FILE_INDEX — so this takes the multi-family
     /// handle rather than a KeyValueStore bound to one.
     store: Arc<dyn crate::storage::ColumnStore>,
-    /// Present ONLY when rocksdb-backed: the one-time migration below opens a
-    /// second read-only rocksdb and copies rows across (a rocksdb-to-rocksdb
-    /// import), and the backup accessor hands the engine DB out. A store built
-    /// over another backend has no engine DB to hold.
-    db: Option<Arc<DB>>,
     /// Default configuration
     config: CodebaseConfig,
 }
@@ -56,27 +51,12 @@ impl FileMemoryStore {
         ]
     }
 
-    /// Create a new file memory store backed by a shared DB that already
-    /// contains the required column families (`files`, `file_index`).
-    pub fn new(db: Arc<DB>, storage_path: &Path) -> Result<Self> {
-        let files_path = storage_path.join("files");
-        std::fs::create_dir_all(&files_path)?;
+    /// Pre-column-family standalone DBs under the data root, imported into these
+    /// families by the rocksdb boot path before the store is bound.
+    pub(crate) const LEGACY_SEPARATE_DBS: &'static [(&'static str, &'static str)] =
+        &[("files/memories", CF_FILES), ("files/index", CF_FILE_INDEX)];
 
-        Self::migrate_from_separate_dbs(&files_path, &db)?;
-
-        tracing::info!("File memory store initialized");
-        Ok(Self {
-            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnStore::new(
-                Arc::clone(&db),
-            )),
-            db: Some(db),
-            config: CodebaseConfig::default(),
-        })
-    }
-
-    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
-    /// Skips migrate_from_separate_dbs, a rocksdb-to-rocksdb import with no
-    /// meaning on another backend.
+    /// Bind a handle directly.
     pub fn with_store(store: Arc<dyn crate::storage::ColumnStore>) -> Result<Self> {
         for cf in [CF_FILES, CF_FILE_INDEX] {
             store.ensure_cf(cf)?;
@@ -84,62 +64,8 @@ impl FileMemoryStore {
         tracing::info!("File memory store initialized");
         Ok(Self {
             store,
-            db: None,
             config: CodebaseConfig::default(),
         })
-    }
-
-    /// One-time migration: copy data from the old separate-DB layout
-    /// (`files/memories` and `files/index`) into the column families of the
-    /// shared DB, then rename the old directories so the migration is
-    /// not repeated.
-    fn migrate_from_separate_dbs(files_path: &Path, db: &DB) -> Result<()> {
-        let old_dirs: &[(&str, &str)] = &[("memories", CF_FILES), ("index", CF_FILE_INDEX)];
-
-        for (old_name, cf_name) in old_dirs {
-            let old_dir = files_path.join(old_name);
-            if !old_dir.is_dir() {
-                continue;
-            }
-
-            let cf = db
-                .cf_handle(cf_name)
-                .unwrap_or_else(|| panic!("{cf_name} CF must exist"));
-            let old_opts = Options::default();
-            match DB::open_for_read_only(&old_opts, &old_dir, false) {
-                Ok(old_db) => {
-                    // Concrete rocksdb batch on purpose: this is a one-time
-                    // rocksdb-to-rocksdb import from a superseded directory, not a
-                    // store operation, and it has no meaning on another backend.
-                    let mut batch = WriteBatch::default();
-                    let mut count = 0usize;
-                    for (key, value) in old_db.iterator(rocksdb::IteratorMode::Start).flatten() {
-                        batch.put_cf(cf, &key, &value);
-                        count += 1;
-                        if count.is_multiple_of(10_000) {
-                            db.write(std::mem::take(&mut batch))?;
-                        }
-                    }
-                    if !batch.is_empty() {
-                        db.write(batch)?;
-                    }
-                    drop(old_db);
-                    tracing::info!("  files/{old_name}: migrated {count} entries to {cf_name} CF");
-
-                    let backup = files_path.join(format!("{old_name}.pre_cf_migration"));
-                    if backup.exists() {
-                        let _ = std::fs::remove_dir_all(&backup);
-                    }
-                    if let Err(e) = std::fs::rename(&old_dir, &backup) {
-                        tracing::warn!("Could not rename old {old_name} dir: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Could not open old {old_name} DB for migration: {e}");
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Set custom configuration
@@ -158,18 +84,6 @@ impl FileMemoryStore {
                 .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
         }
         Ok(())
-    }
-
-    /// Get references to all RocksDB databases for backup.
-    ///
-    /// Empty when not rocksdb-backed: there is no engine DB to hand a rocksdb
-    /// backup engine, and pretending otherwise is how a backup omits a store
-    /// while reporting success.
-    pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        match &self.db {
-            Some(db) => vec![("files_shared", db)],
-            None => Vec::new(),
-        }
     }
 
     // =========================================================================
@@ -1267,8 +1181,11 @@ mod tests {
             o
         })];
         cfs.extend(FileMemoryStore::cf_descriptors());
-        let db = Arc::new(DB::open_cf_descriptors(&opts, &db_path, cfs).unwrap());
-        let store = FileMemoryStore::new(db, temp_dir.path()).unwrap();
+        let db = Arc::new(rocksdb::DB::open_cf_descriptors(&opts, &db_path, cfs).unwrap());
+        let store = FileMemoryStore::with_store(Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbColumnStore::new(db),
+        ))
+        .unwrap();
         (store, temp_dir)
     }
 
@@ -1311,8 +1228,6 @@ mod tests {
         assert!(store.delete("test-user", &file.id).unwrap());
         assert!(store.get("test-user", &file.id).unwrap().is_none());
         assert!(store.list_by_user("test-user", None).unwrap().is_empty());
-        // No engine DB behind this store — the backup accessor must say so.
-        assert!(store.databases().is_empty());
     }
 
     #[test]
