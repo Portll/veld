@@ -210,8 +210,7 @@ pub struct WhereFacet {
 ///
 /// Serialized internally-tagged with `kind`, e.g.
 /// `{"kind": "repo", "slug": "Portll/veld", "branch": "main", ...}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Place {
     /// A version-control repository. Absorbs the first-pass `RepositoryContext`.
     Repo {
@@ -284,6 +283,122 @@ pub enum Place {
         /// When the fix was taken — distinct from `WhenFacet.encoded_at`.
         captured_at: Option<DateTime<Utc>>,
     },
+}
+
+// bincode cannot decode an internally tagged enum (it needs deserialize_any), so a
+// stored Place would write and never read back. JSON keeps the `kind` tag.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Place", tag = "kind", rename_all = "snake_case")]
+enum PlaceTagged {
+    Repo {
+        slug: String,
+        branch: Option<String>,
+        commit: Option<String>,
+        remote: Option<String>,
+        pull_request: Option<String>,
+        dirty: Option<bool>,
+    },
+    Module {
+        path: String,
+    },
+    File {
+        path: String,
+        symbol: Option<String>,
+    },
+    Geo {
+        lat: f64,
+        lon: f64,
+        alt: Option<f64>,
+    },
+    Host {
+        name: String,
+        environment: Option<String>,
+    },
+    Url { href: String },
+    Named { label: String },
+    LocalFrame {
+        frame: String,
+        x: f32,
+        y: f32,
+        z: f32,
+        orientation: Option<Orientation>,
+    },
+    GeoFix {
+        lat: f64,
+        lon: f64,
+        alt: Option<f64>,
+        accuracy_m: Option<f32>,
+        speed_m_s: Option<f32>,
+        course_deg: Option<f32>,
+        captured_at: Option<DateTime<Utc>>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Place", rename_all = "snake_case")]
+enum PlaceBinary {
+    Repo {
+        slug: String,
+        branch: Option<String>,
+        commit: Option<String>,
+        remote: Option<String>,
+        pull_request: Option<String>,
+        dirty: Option<bool>,
+    },
+    Module {
+        path: String,
+    },
+    File {
+        path: String,
+        symbol: Option<String>,
+    },
+    Geo {
+        lat: f64,
+        lon: f64,
+        alt: Option<f64>,
+    },
+    Host {
+        name: String,
+        environment: Option<String>,
+    },
+    Url { href: String },
+    Named { label: String },
+    LocalFrame {
+        frame: String,
+        x: f32,
+        y: f32,
+        z: f32,
+        orientation: Option<Orientation>,
+    },
+    GeoFix {
+        lat: f64,
+        lon: f64,
+        alt: Option<f64>,
+        accuracy_m: Option<f32>,
+        speed_m_s: Option<f32>,
+        course_deg: Option<f32>,
+        captured_at: Option<DateTime<Utc>>,
+    },
+}
+
+impl Serialize for Place {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            PlaceTagged::serialize(self, serializer)
+        } else {
+            PlaceBinary::serialize(self, serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Place {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            PlaceTagged::deserialize(deserializer)
+        } else {
+            PlaceBinary::deserialize(deserializer)
+        }
+    }
 }
 
 /// Full 3-axis orientation in a [`Place::LocalFrame`]. Angles in degrees.
@@ -974,6 +1089,56 @@ impl FacetVersioned for AgentSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn every_place() -> Vec<Place> {
+        vec![
+            Place::Repo {
+                slug: "Portll/veld".into(),
+                branch: Some("main".into()),
+                commit: Some("abc".into()),
+                remote: None,
+                pull_request: Some("7".into()),
+                dirty: Some(false),
+            },
+            Place::Module { path: "memory::facets".into() },
+            Place::File { path: "src/lib.rs".into(), symbol: None },
+            Place::Geo { lat: 1.5, lon: -2.25, alt: None },
+            Place::Host { name: "box".into(), environment: Some("prod".into()) },
+            Place::Url { href: "https://example.com".into() },
+            Place::Named { label: "terrain:gravel".into() },
+            Place::LocalFrame { frame: "robot".into(), x: 1.0, y: 2.0, z: 3.0, orientation: None },
+            Place::GeoFix {
+                lat: 3.0,
+                lon: 4.0,
+                alt: Some(5.0),
+                accuracy_m: Some(1.0),
+                speed_m_s: None,
+                course_deg: None,
+                captured_at: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_place_round_trips_through_bincode() {
+        let cfg = bincode::config::standard();
+        let facet = WhereFacet { places: every_place(), ..Default::default() };
+        let bytes = bincode::serde::encode_to_vec(&facet, cfg).unwrap();
+        let (back, used): (WhereFacet, usize) = bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(back.places, facet.places);
+    }
+
+    #[test]
+    fn place_json_keeps_its_kind_tag() {
+        let geo = serde_json::to_string(&Place::Geo { lat: 1.5, lon: -2.25, alt: None }).unwrap();
+        assert_eq!(geo, r#"{"kind":"geo","lat":1.5,"lon":-2.25,"alt":null}"#);
+        for place in every_place() {
+            let json = serde_json::to_value(&place).unwrap();
+            assert!(json.get("kind").is_some(), "{json}");
+            assert_eq!(serde_json::from_value::<Place>(json).unwrap(), place);
+        }
+    }
 
     #[test]
     fn record_kind_defaults_to_memory() {
