@@ -474,12 +474,17 @@ pub enum LtpStatus {
 impl LtpStatus {
     /// Get the decay factor for this LTP status
     pub fn decay_factor(&self) -> f32 {
+        self.decay_factor_at(Utc::now())
+    }
+
+    /// As [`decay_factor`](Self::decay_factor), with burst expiry judged at `now`.
+    pub fn decay_factor_at(&self, now: DateTime<Utc>) -> f32 {
         use crate::constants::*;
         match self {
             Self::None => 1.0,
             Self::Burst { detected_at } => {
                 // Check if burst has expired
-                let hours_since = (Utc::now() - *detected_at).num_hours();
+                let hours_since = (now - *detected_at).num_hours();
                 if hours_since > LTP_BURST_DURATION_HOURS {
                     1.0 // Expired, normal decay
                 } else {
@@ -498,10 +503,15 @@ impl LtpStatus {
 
     /// Check if burst protection has expired
     pub fn is_burst_expired(&self) -> bool {
+        self.is_burst_expired_at(Utc::now())
+    }
+
+    /// As [`is_burst_expired`](Self::is_burst_expired), judged at `now`.
+    pub fn is_burst_expired_at(&self, now: DateTime<Utc>) -> bool {
         use crate::constants::LTP_BURST_DURATION_HOURS;
         match self {
             Self::Burst { detected_at } => {
-                (Utc::now() - *detected_at).num_hours() > LTP_BURST_DURATION_HOURS
+                (now - *detected_at).num_hours() > LTP_BURST_DURATION_HOURS
             }
             _ => false,
         }
@@ -887,6 +897,10 @@ impl RelationshipEdge {
 
     /// Detect weekly pattern: 3+/week for 2+ weeks (PIPE-4)
     fn detect_weekly_pattern(&self) -> bool {
+        self.detect_weekly_pattern_at(Utc::now())
+    }
+
+    fn detect_weekly_pattern_at(&self, now: DateTime<Utc>) -> bool {
         use crate::constants::*;
         use chrono::Duration;
 
@@ -899,7 +913,6 @@ impl RelationshipEdge {
             return false;
         }
 
-        let now = Utc::now();
         let mut weeks_meeting_threshold = 0u32;
 
         // Check each of the last LTP_WEEKLY_MIN_WEEKS weeks
@@ -966,12 +979,17 @@ impl RelationshipEdge {
     ///
     /// Returns true if synapse should be pruned (below tier's threshold)
     pub(crate) fn decay(&mut self) -> bool {
+        self.decay_at(Utc::now())
+    }
+
+    /// As [`decay`](Self::decay), with every clock read taken from `now`, so a
+    /// harness can step an edge through simulated time at a chosen cadence.
+    pub(crate) fn decay_at(&mut self, now: DateTime<Utc>) -> bool {
         use crate::decay::tier_decay_factor_adaptive;
 
         // Computed before any mutation below (immutable borrow of self).
         let typical_interval = self.typical_activation_interval_hours();
 
-        let now = Utc::now();
         let elapsed = now.signed_duration_since(self.last_activated);
         let hours_elapsed = elapsed.num_seconds() as f64 / 3600.0;
 
@@ -988,7 +1006,7 @@ impl RelationshipEdge {
             EdgeTier::L2Episodic => 1,
             EdgeTier::L3Semantic => 2,
         };
-        let ltp_factor = self.ltp_status.decay_factor();
+        let ltp_factor = self.ltp_status.decay_factor_at(now);
         let (decay_factor, exceeded_max_age) =
             tier_decay_factor_adaptive(hours_elapsed, tier_num, ltp_factor, typical_interval);
         self.strength *= decay_factor;
@@ -1021,8 +1039,8 @@ impl RelationshipEdge {
         // Downgrade expired burst LTP before prune decision
         // decay_factor() already returns 1.0 for expired bursts (correct rate),
         // but is_potentiated() still returns true — preventing pruning
-        if self.ltp_status.is_burst_expired() {
-            if self.detect_weekly_pattern() {
+        if self.ltp_status.is_burst_expired_at(now) {
+            if self.detect_weekly_pattern_at(now) {
                 self.ltp_status = LtpStatus::Weekly;
             } else {
                 self.ltp_status = LtpStatus::None;
@@ -1537,6 +1555,47 @@ impl RelationType {
             Self::AssignedTo => "AssignedTo",
             Self::Approves => "Approves",
             Self::Custom(s) => s.as_str(),
+        }
+    }
+
+    /// Whether this edge asserts that its `from_entity` caused its `to_entity`.
+    pub fn is_causal(&self) -> bool {
+        // Exhaustive so a new variant cannot join or leave the causal set by default.
+        match self {
+            Self::Causes | Self::ResultsIn | Self::Triggers => true,
+            Self::WorksWith
+            | Self::WorksAt
+            | Self::EmployedBy
+            | Self::PartOf
+            | Self::Contains
+            | Self::OwnedBy
+            | Self::LocatedIn
+            | Self::LocatedAt
+            | Self::Uses
+            | Self::CreatedBy
+            | Self::DevelopedBy
+            | Self::Learned
+            | Self::Knows
+            | Self::Teaches
+            | Self::RelatedTo
+            | Self::AssociatedWith
+            | Self::CoRetrieved
+            | Self::CoOccurs
+            | Self::Manages
+            | Self::DependsOn
+            | Self::Requires
+            | Self::Configures
+            | Self::Prefers
+            | Self::Recommends
+            | Self::Documents
+            | Self::Implements
+            | Self::DeploysTo
+            | Self::Monitors
+            | Self::SupersededBy
+            | Self::AlternativeTo
+            | Self::AssignedTo
+            | Self::Approves
+            | Self::Custom(_) => false,
         }
     }
 }
@@ -2456,6 +2515,43 @@ impl GraphMemory {
         Ok(true)
     }
 
+    /// Strict entity resolution: exact, case-insensitive and stemmed tiers
+    /// only, with no substring or word-level fuzzing.
+    ///
+    /// For callers that need precision over recall, such as seeds for
+    /// [`trace_causal_origins`](Self::trace_causal_origins): the fuzzy tiers can
+    /// bind a query fragment to an arbitrary hub entity.
+    pub fn find_entity_by_name_strict(&self, name: &str) -> Result<Option<EntityNode>> {
+        let uuid = {
+            let index = self.entity_name_index.read();
+            index.get(name).copied()
+        };
+        if let Some(uuid) = uuid {
+            return self.get_entity(&uuid);
+        }
+
+        let name_lower = name.to_lowercase();
+        let uuid = {
+            let lowercase_index = self.entity_lowercase_index.read();
+            lowercase_index.get(&name_lower).copied()
+        };
+        if let Some(uuid) = uuid {
+            return self.get_entity(&uuid);
+        }
+
+        let stemmer = Stemmer::create(Algorithm::English);
+        let stemmed_name = Self::stem_entity_name(&stemmer, name);
+        let uuid = {
+            let stemmed_index = self.entity_stemmed_index.read();
+            stemmed_index.get(&stemmed_name).copied()
+        };
+        if let Some(uuid) = uuid {
+            return self.get_entity(&uuid);
+        }
+
+        Ok(None)
+    }
+
     /// Find entity by name (case-insensitive, O(1) lookup)
     ///
     /// Uses a multi-tier matching strategy:
@@ -3164,6 +3260,82 @@ impl GraphMemory {
 
         let consolidated = l2 + l3 + ltp;
         Ok(Some(consolidated as f32 / total as f32))
+    }
+
+    /// Trace the causal origins of a set of effect entities.
+    ///
+    /// Walks incoming causal edges (the current node is the `to_entity` of an
+    /// edge whose type [`is_causal`](RelationType::is_causal)) back toward their
+    /// `from_entity`, and returns the terminal sources: nodes with no further
+    /// causal antecedent. A seed with no causal parent is the query subject, not
+    /// an origin, and is omitted.
+    ///
+    /// Each origin is scored by its best backward path: the product of edge
+    /// `effective_strength` along the path, times a per-hop decay. Results are
+    /// strongest first, ties broken by uuid. No edge is strengthened or written;
+    /// like any read through `get_entity_relationships_limited`, it may queue
+    /// already-decayed edges for the next maintenance prune.
+    pub fn trace_causal_origins(
+        &self,
+        seeds: &[Uuid],
+        max_depth: usize,
+    ) -> Result<Vec<(Uuid, f32)>> {
+        use std::collections::HashSet;
+        const HOP_DECAY: f32 = 0.7;
+        const MAX_NODES: usize = 4000;
+
+        let seed_set: HashSet<Uuid> = seeds.iter().copied().collect();
+        let mut best: HashMap<Uuid, f32> = seeds.iter().map(|s| (*s, 1.0_f32)).collect();
+        let mut origins: HashMap<Uuid, f32> = HashMap::new();
+        let mut frontier: Vec<Uuid> = seeds.to_vec();
+
+        for _ in 0..max_depth.max(1) {
+            if frontier.is_empty() || best.len() >= MAX_NODES {
+                break;
+            }
+            let mut next: Vec<Uuid> = Vec::new();
+            for node in std::mem::take(&mut frontier) {
+                let node_score = best.get(&node).copied().unwrap_or(0.0);
+                if node_score <= 0.0 {
+                    continue;
+                }
+                let edges = self.get_entity_relationships_limited(&node, Some(64))?;
+                let parents: Vec<(Uuid, f32)> = edges
+                    .iter()
+                    .filter(|e| {
+                        e.to_entity == node && e.from_entity != node && e.relation_type.is_causal()
+                    })
+                    .map(|e| (e.from_entity, e.effective_strength().clamp(0.0, 1.0)))
+                    .collect();
+                if parents.is_empty() {
+                    if !seed_set.contains(&node) {
+                        let entry = origins.entry(node).or_insert(0.0);
+                        if node_score > *entry {
+                            *entry = node_score;
+                        }
+                    }
+                } else {
+                    for (parent, strength) in parents {
+                        let candidate = node_score * strength * HOP_DECAY;
+                        let entry = best.entry(parent).or_insert(0.0);
+                        // Products of factors below 1 cannot improve around a cycle, so relaxation terminates.
+                        if candidate > *entry {
+                            *entry = candidate;
+                            next.push(parent);
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        let mut out: Vec<(Uuid, f32)> = origins.into_iter().collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(out)
     }
 
     /// Get relationship by UUID (raw, without decay applied)
@@ -5115,7 +5287,11 @@ impl GraphMemory {
     /// Mutates edges directly, serializes results into a WriteBatch, and returns
     /// the UUIDs of edges that should be pruned. Used by `apply_decay()` which
     /// already has the full edge list from `get_all_relationships()`.
-    fn batch_decay_edges_in_place(&self, edges: &mut [RelationshipEdge]) -> Result<Vec<Uuid>> {
+    fn batch_decay_edges_in_place_at(
+        &self,
+        edges: &mut [RelationshipEdge],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Uuid>> {
         if edges.is_empty() {
             return Ok(Vec::new());
         }
@@ -5137,7 +5313,7 @@ impl GraphMemory {
 
         for edge in edges.iter_mut() {
             let strength_before = edge.strength;
-            let mut should_prune = edge.decay();
+            let mut should_prune = edge.decay_at(now);
 
             let m_a = mention_counts.get(&edge.from_entity).copied().unwrap_or(0);
             let m_b = mention_counts.get(&edge.to_entity).copied().unwrap_or(0);
@@ -5200,6 +5376,14 @@ impl GraphMemory {
     /// Returns a `GraphDecayResult` with pruned count and orphaned entity/memory IDs
     /// for Direction 2 coupling (edge pruning → orphan detection).
     pub fn apply_decay(&self) -> Result<crate::memory::types::GraphDecayResult> {
+        self.apply_decay_at(Utc::now())
+    }
+
+    /// As [`apply_decay`](Self::apply_decay), ageing every edge as of `now`.
+    pub fn apply_decay_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<crate::memory::types::GraphDecayResult> {
         // Get all edges (need full data for orphan tracking)
         let mut all_edges = self.get_all_relationships()?;
 
@@ -5208,7 +5392,7 @@ impl GraphMemory {
         }
 
         // Apply decay in-place on already-deserialized edges (avoids double deserialization)
-        let to_prune = self.batch_decay_edges_in_place(&mut all_edges)?;
+        let to_prune = self.batch_decay_edges_in_place_at(&mut all_edges, now)?;
 
         if to_prune.is_empty() {
             return Ok(crate::memory::types::GraphDecayResult::default());
@@ -8802,5 +8986,347 @@ mod tests {
     fn an_unlabelled_entity_is_band_relative() {
         // No labels is no evidence of scope, not evidence of global scope.
         assert_eq!(MergeClass::of(&[]), MergeClass::BandRelative);
+    }
+
+    // =========================================================================
+    // Recall-harness APIs: decay_at, apply_decay_at, is_causal,
+    // find_entity_by_name_strict, trace_causal_origins
+    // =========================================================================
+
+    // Verbatim body of decay() before the clock was injected, `self` renamed; the oracle.
+    fn legacy_decay(edge: &mut RelationshipEdge) -> bool {
+        use crate::decay::tier_decay_factor_adaptive;
+
+        let typical_interval = edge.typical_activation_interval_hours();
+
+        let now = Utc::now();
+        let elapsed = now.signed_duration_since(edge.last_activated);
+        let hours_elapsed = elapsed.num_seconds() as f64 / 3600.0;
+
+        if hours_elapsed <= 0.0 {
+            return false;
+        }
+
+        let hours_elapsed = hours_elapsed.min(8760.0);
+
+        let tier_num = match edge.tier {
+            EdgeTier::L1Working => 0,
+            EdgeTier::L2Episodic => 1,
+            EdgeTier::L3Semantic => 2,
+        };
+        let ltp_factor = edge.ltp_status.decay_factor();
+        let (decay_factor, exceeded_max_age) =
+            tier_decay_factor_adaptive(hours_elapsed, tier_num, ltp_factor, typical_interval);
+        edge.strength *= decay_factor;
+
+        edge.last_activated = now;
+
+        let prune_threshold = edge.tier.prune_threshold();
+        if edge.strength < LTP_MIN_STRENGTH {
+            edge.strength = LTP_MIN_STRENGTH;
+        }
+
+        {
+            use crate::constants::{EDGE_RECOVERY_CAP_FACTOR, EDGE_RECOVERY_RATE};
+            let recovery_cap = prune_threshold * EDGE_RECOVERY_CAP_FACTOR;
+            if edge.strength < recovery_cap {
+                edge.strength = (edge.strength + EDGE_RECOVERY_RATE).min(recovery_cap);
+            }
+        }
+
+        if edge.ltp_status.is_burst_expired() {
+            if edge.detect_weekly_pattern() {
+                edge.ltp_status = LtpStatus::Weekly;
+            } else {
+                edge.ltp_status = LtpStatus::None;
+            }
+        }
+
+        if edge.ltp_status.is_potentiated() && edge.strength <= LTP_PRUNE_FLOOR {
+            edge.ltp_status = LtpStatus::None;
+        }
+
+        if edge.ltp_status.is_potentiated() {
+            false
+        } else {
+            exceeded_max_age || edge.strength <= prune_threshold
+        }
+    }
+
+
+    #[derive(Clone, Copy, Debug)]
+    enum LtpSpec {
+        None,
+        BurstFresh,
+        BurstExpired,
+        Weekly,
+        Full,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum HistorySpec {
+        None,
+        WeeklyHabit,
+        Sparse,
+    }
+
+    fn edge_anchored_at(
+        anchor: DateTime<Utc>,
+        tier: EdgeTier,
+        strength: f32,
+        age_hours: i64,
+        ltp: LtpSpec,
+        history: HistorySpec,
+    ) -> RelationshipEdge {
+        let ltp_status = match ltp {
+            LtpSpec::None => LtpStatus::None,
+            LtpSpec::BurstFresh => LtpStatus::Burst { detected_at: anchor - Duration::hours(10) },
+            LtpSpec::BurstExpired => LtpStatus::Burst { detected_at: anchor - Duration::hours(60) },
+            LtpSpec::Weekly => LtpStatus::Weekly,
+            LtpSpec::Full => LtpStatus::Full,
+        };
+        let activation_timestamps = match history {
+            HistorySpec::None => None,
+            HistorySpec::WeeklyHabit => Some(
+                (0..3)
+                    .flat_map(|w| (0..4).map(move |d| (w, d)))
+                    .map(|(w, d)| anchor - Duration::days(7 * w + d) - Duration::minutes(90))
+                    .rev()
+                    .collect(),
+            ),
+            HistorySpec::Sparse => Some(
+                (0..3)
+                    .map(|i| anchor - Duration::hours(age_hours + 24 * i))
+                    .rev()
+                    .collect(),
+            ),
+        };
+        let mut edge = create_test_edge_with_tier(strength, 0, tier);
+        edge.created_at = anchor - Duration::days(40);
+        edge.valid_at = edge.created_at;
+        edge.last_activated = anchor - Duration::hours(age_hours);
+        edge.ltp_status = ltp_status;
+        edge.activation_timestamps = activation_timestamps;
+        edge.activation_count = 3;
+        edge
+    }
+
+    #[test]
+    fn decay_at_matches_the_pre_injection_decay_at_the_same_effective_time() {
+        // Far from the wall clock, so a decay_at that reads Utc::now() anywhere diverges.
+        let future: DateTime<Utc> = "2031-03-01T00:00:00Z".parse().unwrap();
+        let tiers = [EdgeTier::L1Working, EdgeTier::L2Episodic, EdgeTier::L3Semantic];
+        let ltps = [
+            LtpSpec::None,
+            LtpSpec::BurstFresh,
+            LtpSpec::BurstExpired,
+            LtpSpec::Weekly,
+            LtpSpec::Full,
+        ];
+        let histories = [HistorySpec::None, HistorySpec::WeeklyHabit, HistorySpec::Sparse];
+        let ages_hours = [1, 6, 30, 49, 240, 1100, 9000];
+        let strengths = [0.9_f32, 0.12];
+
+        let mut cases = 0;
+        let (mut pruned, mut changed_ltp) = (0, 0);
+        for tier in tiers {
+            for ltp in ltps {
+                for history in histories {
+                    for age in ages_hours {
+                        for strength in strengths {
+                            let wall = Utc::now();
+                            let mut legacy = edge_anchored_at(wall, tier, strength, age, ltp, history);
+                            let legacy_prune = legacy_decay(&mut legacy);
+
+                            let mut injected = edge_anchored_at(future, tier, strength, age, ltp, history);
+                            let injected_prune = injected.decay_at(future);
+
+                            let case = format!("{tier:?} {ltp:?} {history:?} age={age}h s={strength}");
+                            assert_eq!(injected_prune, legacy_prune, "prune decision: {case}");
+                            assert_eq!(
+                                injected.strength.to_bits(),
+                                legacy.strength.to_bits(),
+                                "strength {} vs {}: {case}",
+                                injected.strength,
+                                legacy.strength
+                            );
+                            assert_eq!(injected.last_activated, future, "{case}");
+                            let shape = |s: &LtpStatus| std::mem::discriminant(s);
+                            assert_eq!(shape(&injected.ltp_status), shape(&legacy.ltp_status), "ltp: {case}");
+                            if legacy_prune {
+                                pruned += 1;
+                            }
+                            if shape(&legacy.ltp_status) != shape(&edge_anchored_at(wall, tier, strength, age, ltp, history).ltp_status) {
+                                changed_ltp += 1;
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Guards against a grid that never reaches the branches it claims to cover.
+        assert!(pruned > 0 && pruned < cases, "pruned {pruned} of {cases}");
+        assert!(changed_ltp > 0, "no case exercised an LTP transition");
+    }
+
+    #[test]
+    fn decay_is_decay_at_the_wall_clock() {
+        for age in [1, 49, 1100] {
+            let wall = Utc::now();
+            let mut a = edge_anchored_at(wall, EdgeTier::L2Episodic, 0.7, age, LtpSpec::BurstExpired, HistorySpec::Sparse);
+            let mut b = a.clone();
+            let pa = legacy_decay(&mut a);
+            let pb = b.decay();
+            assert_eq!((pa, a.strength.to_bits()), (pb, b.strength.to_bits()), "age={age}h");
+        }
+    }
+
+    fn named_entity(name: &str) -> EntityNode {
+        EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        }
+    }
+
+    fn typed_edge(from: Uuid, to: Uuid, relation_type: RelationType, strength: f32) -> RelationshipEdge {
+        let mut edge = create_test_edge_with_tier(strength, 0, EdgeTier::L2Episodic);
+        edge.from_entity = from;
+        edge.to_entity = to;
+        edge.relation_type = relation_type;
+        edge.activation_count = 1;
+        edge
+    }
+
+    #[test]
+    fn apply_decay_at_ages_stored_edges_to_the_injected_time() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let mut ids = Vec::new();
+        for (i, (tier, strength, ltp)) in [
+            (EdgeTier::L1Working, 0.3_f32, LtpStatus::None),
+            (EdgeTier::L2Episodic, 0.25, LtpStatus::None),
+            (EdgeTier::L3Semantic, 0.95, LtpStatus::Full),
+            (EdgeTier::L2Episodic, 0.9, LtpStatus::Full),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let a = graph.add_entity(named_entity(&format!("decay-src-{i}"))).unwrap();
+            let b = graph.add_entity(named_entity(&format!("decay-dst-{i}"))).unwrap();
+            let mut edge = typed_edge(a, b, RelationType::RelatedTo, strength);
+            edge.tier = tier;
+            edge.ltp_status = ltp;
+            ids.push(graph.add_relationship(edge).unwrap());
+        }
+
+        assert_eq!(graph.apply_decay().unwrap().pruned_count, 0, "fresh edges survive the wall clock");
+
+        let stored: Vec<RelationshipEdge> =
+            ids.iter().map(|id| graph.get_relationship(id).unwrap().unwrap()).collect();
+        let at = Utc::now() + Duration::days(60);
+        let expected: Vec<(bool, RelationshipEdge)> = stored
+            .iter()
+            .map(|e| {
+                let mut e = e.clone();
+                (e.decay_at(at), e)
+            })
+            .collect();
+        let expected_pruned = expected.iter().filter(|(p, _)| *p).count();
+        assert!(
+            expected_pruned > 0 && expected_pruned < ids.len(),
+            "fixture must prune some edges and keep others at +60d, pruned {expected_pruned}"
+        );
+
+        let result = graph.apply_decay_at(at).unwrap();
+        assert_eq!(result.pruned_count, expected_pruned);
+        for (id, (should_prune, aged)) in ids.iter().zip(&expected) {
+            match graph.get_relationship(id).unwrap() {
+                None => assert!(*should_prune, "edge {id} removed but decay_at kept it"),
+                Some(edge) => {
+                    assert!(!*should_prune, "edge {id} kept but decay_at pruned it");
+                    assert_eq!(edge.strength.to_bits(), aged.strength.to_bits());
+                    assert_eq!(edge.last_activated, at);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_causal_is_exactly_causes_results_in_and_triggers() {
+        use RelationType::*;
+        let all = [
+            WorksWith, WorksAt, EmployedBy, PartOf, Contains, OwnedBy, LocatedIn, LocatedAt, Uses,
+            CreatedBy, DevelopedBy, Causes, ResultsIn, Learned, Knows, Teaches, RelatedTo,
+            AssociatedWith, CoRetrieved, CoOccurs, Manages, DependsOn, Requires, Configures,
+            Prefers, Recommends, Documents, Implements, DeploysTo, Monitors, Triggers,
+            SupersededBy, AlternativeTo, AssignedTo, Approves,
+            Custom("Causes".to_string()),
+            Custom("Precedes".to_string()),
+        ];
+        let causal: Vec<&str> = all.iter().filter(|r| r.is_causal()).map(|r| r.as_str()).collect();
+        assert_eq!(causal, vec!["Causes", "ResultsIn", "Triggers"]);
+    }
+
+    #[test]
+    fn find_entity_by_name_strict_resolves_exact_case_and_stem_but_never_fuzzes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let reactor = graph.add_entity(named_entity("Vornak Reactors")).unwrap();
+
+        let strict = |n: &str| graph.find_entity_by_name_strict(n).unwrap().map(|e| e.uuid);
+        assert_eq!(strict("Vornak Reactors"), Some(reactor), "exact");
+        assert_eq!(strict("vornak reactors"), Some(reactor), "case-insensitive");
+        assert_eq!(strict("Vornak Reactor"), Some(reactor), "stemmed");
+        assert_eq!(strict("Vornak"), None, "substring must not resolve");
+        assert_eq!(strict("Reactors of Vornak"), None, "word-level must not resolve");
+
+        // The fuzzy resolver does bind the fragment, which is what strict exists to refuse.
+        assert_eq!(graph.find_entity_by_name("Vornak").unwrap().map(|e| e.uuid), Some(reactor));
+    }
+
+    #[test]
+    fn trace_causal_origins_walks_incoming_causal_edges_to_the_root_without_touching_them() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let [root, mid, effect, bystander, downstream] =
+            ["root", "mid", "effect", "bystander", "downstream"]
+                .map(|n| graph.add_entity(named_entity(n)).unwrap());
+
+        graph.add_relationship(typed_edge(root, mid, RelationType::Causes, 0.8)).unwrap();
+        graph.add_relationship(typed_edge(mid, effect, RelationType::Triggers, 0.8)).unwrap();
+        graph.add_relationship(typed_edge(bystander, effect, RelationType::CoOccurs, 0.9)).unwrap();
+        graph.add_relationship(typed_edge(effect, downstream, RelationType::ResultsIn, 0.9)).unwrap();
+
+        let snapshot = |g: &GraphMemory| {
+            let mut edges: Vec<(Uuid, u32, u32, DateTime<Utc>, u32)> = g
+                .get_all_relationships()
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.uuid, e.strength.to_bits(), e.activation_count, e.last_activated, e.forward_strength.to_bits()))
+                .collect();
+            edges.sort();
+            edges
+        };
+        let before = snapshot(&graph);
+
+        let origins = graph.trace_causal_origins(&[effect], 8).unwrap();
+        let ids: Vec<Uuid> = origins.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![root], "root only: not the proximal cause, a non-causal parent, or an effect");
+        let expected = 0.8_f32 * 0.7 * 0.8 * 0.7;
+        assert!((origins[0].1 - expected).abs() < 0.02, "two-hop score {} vs {expected}", origins[0].1);
+
+        assert_eq!(graph.trace_causal_origins(&[root], 8).unwrap(), vec![], "a seed with no cause is not its own origin");
+        assert_eq!(snapshot(&graph), before, "the walk must not strengthen or rewrite edges");
     }
 }
