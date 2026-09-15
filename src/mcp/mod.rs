@@ -42,24 +42,24 @@ impl VeldMcpServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for VeldMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
-                "Veld Memory - persistent cognitive memory with causal reasoning. \
-                 Use proactive_context at session start to surface relevant memories. \
-                 Use remember to store decisions, learnings, errors. \
-                 Use recall to search memories. \
-                 Use lineage_trace to understand 'why' - trace causal chains backward/forward. \
-                 Use lineage_link to explicitly connect cause→effect memories. \
-                 Use lineage_confirm/reject to improve inference accuracy."
-                    .to_string(),
-            ),
-        }
+        let mut info = ServerInfo::default();
+        info.protocol_version = ProtocolVersion::V_2024_11_05;
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.server_info = Implementation::from_build_env();
+        info.instructions = Some(
+            "Veld Memory - persistent cognitive memory with causal reasoning. \
+             Use proactive_context at session start to surface relevant memories. \
+             Use remember to store decisions, learnings, errors. \
+             Use recall to search memories. \
+             Use lineage_trace to understand 'why' - trace causal chains backward/forward. \
+             Use lineage_link to explicitly connect cause→effect memories. \
+             Use lineage_confirm/reject to improve inference accuracy."
+                .to_string(),
+        );
+        info
     }
 }
 
