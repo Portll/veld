@@ -301,14 +301,12 @@ fn parse_memory_id(s: &str) -> Result<MemoryId, WikiProjectionError> {
         .map_err(|e| WikiProjectionError::InvalidMemoryId(format!("{s}: {e}")))
 }
 
-/// Decode a bincoded `Memory` snapshot off an `IntentPayload`. Config
-/// mirrors `handlers/remember.rs` (`bincode::config::standard()`) so a
-/// snapshot from the live-write path round-trips here.
+/// Decode a bincoded `Memory` snapshot off an `IntentPayload`. Goes through the store's
+/// decoder, legacy arms included: a snapshot journaled before a positional
+/// layout change is the old wire, exactly as a stored record would be.
 fn decode_memory(bytes: &[u8]) -> Result<Memory, WikiProjectionError> {
-    let (memory, _consumed): (Memory, usize) =
-        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map_err(|e| WikiProjectionError::MemoryDecode(e.to_string()))?;
-    Ok(memory)
+    crate::memory::storage::decode_memory_snapshot(bytes)
+        .map_err(|e| WikiProjectionError::MemoryDecode(e.to_string()))
 }
 
 /// W-016: only knowledge-bearing memories become wiki pages. Pure
