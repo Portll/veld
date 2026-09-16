@@ -29,29 +29,29 @@ struct Cli {
 enum Cmd {
     /// Re-wrap the master key under a new passphrase (records/index untouched).
     RotatePassphrase {
-        #[arg(long, env = "VELD_MASTER_PASSPHRASE")]
+        #[arg(long, env = "VELD_MASTER_PASSPHRASE", hide_env_values = true)]
         old: String,
-        #[arg(long, env = "VELD_NEW_MASTER_PASSPHRASE")]
+        #[arg(long, env = "VELD_NEW_MASTER_PASSPHRASE", hide_env_values = true)]
         new: String,
     },
     /// Rotate the active data key to a new epoch. Records written under earlier
     /// epochs stay readable — the keystore retains their DEKs and the store
     /// decrypts each record under its own epoch (multi-epoch read).
     RotateDek {
-        #[arg(long, env = "VELD_MASTER_PASSPHRASE")]
+        #[arg(long, env = "VELD_MASTER_PASSPHRASE", hide_env_values = true)]
         passphrase: String,
     },
     /// Add a one-time recovery code (printed once — store it offline).
     AddRecoveryCode {
-        #[arg(long, env = "VELD_MASTER_PASSPHRASE")]
+        #[arg(long, env = "VELD_MASTER_PASSPHRASE", hide_env_values = true)]
         passphrase: String,
     },
     /// Recover from passphrase loss: unseal with a recovery code and install a
     /// new passphrase. The used recovery code is rotated (a fresh one is printed).
     Recover {
-        #[arg(long, env = "VELD_RECOVERY_CODE")]
+        #[arg(long, env = "VELD_RECOVERY_CODE", hide_env_values = true)]
         recovery_code: String,
-        #[arg(long, env = "VELD_NEW_MASTER_PASSPHRASE")]
+        #[arg(long, env = "VELD_NEW_MASTER_PASSPHRASE", hide_env_values = true)]
         new_passphrase: String,
     },
 }

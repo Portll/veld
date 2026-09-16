@@ -195,7 +195,9 @@ pub(crate) struct ListTodosRequest {
 pub(crate) struct RememberRequest {
     pub user_id: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 }
 
@@ -203,7 +205,9 @@ pub(crate) struct RememberRequest {
 pub(crate) struct RecallRequest {
     pub user_id: String,
     pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
 }
 

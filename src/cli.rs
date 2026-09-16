@@ -105,6 +105,7 @@ enum Commands {
         #[arg(
             long,
             env = "VELD_API_KEY",
+            hide_env_values = true,
             default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
@@ -120,6 +121,7 @@ enum Commands {
         #[arg(
             long,
             env = "VELD_API_KEY",
+            hide_env_values = true,
             default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
@@ -152,6 +154,7 @@ enum Commands {
         #[arg(
             long,
             env = "VELD_API_KEY",
+            hide_env_values = true,
             default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
@@ -265,6 +268,7 @@ enum HookType {
         #[arg(
             long,
             env = "VELD_API_KEY",
+            hide_env_values = true,
             default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
@@ -291,6 +295,7 @@ enum HookType {
         #[arg(
             long,
             env = "VELD_API_KEY",
+            hide_env_values = true,
             default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
@@ -310,6 +315,7 @@ enum HookType {
         #[arg(
             long,
             env = "VELD_API_KEY",
+            hide_env_values = true,
             default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
@@ -429,6 +435,9 @@ async fn main() -> Result<()> {
         // =====================================================================
         // EXISTING: veld hook — Claude Code hooks
         // =====================================================================
+        // The hook handlers use reqwest::blocking, which builds its own runtime. Dropping that
+        // runtime inside this #[tokio::main] context panics with "Cannot drop a runtime in a
+        // context where blocking is not allowed", so each handler runs on its own thread.
         Commands::Hook { hook_type } => match hook_type {
             HookType::SessionStart {
                 api_url,
@@ -436,7 +445,9 @@ async fn main() -> Result<()> {
                 user_id,
                 project_dir,
             } => {
-                handle_session_start(&api_url, &api_key, &user_id, project_dir.as_deref());
+                run_off_runtime(move || {
+                    handle_session_start(&api_url, &api_key, &user_id, project_dir.as_deref())
+                });
             }
 
             HookType::Prompt {
@@ -445,7 +456,9 @@ async fn main() -> Result<()> {
                 api_key,
                 user_id,
             } => {
-                handle_prompt_submit(&api_url, &api_key, &user_id, &message);
+                run_off_runtime(move || {
+                    handle_prompt_submit(&api_url, &api_key, &user_id, &message)
+                });
             }
 
             HookType::Commit {
@@ -453,7 +466,7 @@ async fn main() -> Result<()> {
                 api_key,
                 user_id,
             } => {
-                handle_commit(&api_url, &api_key, &user_id);
+                run_off_runtime(move || handle_commit(&api_url, &api_key, &user_id));
             }
         },
 
@@ -1162,12 +1175,17 @@ struct ProactiveContextResponse {
     memories: Vec<SurfacedMemory>,
 }
 
+// /api/proactive_context names the score `score`; the old `relevance_score` mirror failed to
+// deserialise, and the session-start hook discards the error, so it restored no memories at all.
 #[derive(Deserialize)]
 struct SurfacedMemory {
     id: String,
+    #[serde(default)]
     content: String,
+    #[serde(default)]
     memory_type: String,
-    relevance_score: f32,
+    #[serde(default, alias = "relevance_score")]
+    score: f32,
 }
 
 #[derive(Serialize)]
@@ -1192,11 +1210,15 @@ struct Todo {
     project: Option<String>,
 }
 
+// The server fills absent fields from serde defaults but rejects an explicit null for a
+// non-Option field (RecallRequest.mode and limit, RememberRequest.tags), so None is omitted.
 #[derive(Serialize)]
 struct RememberRequest {
     user_id: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     memory_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tags: Option<Vec<String>>,
 }
 
@@ -1209,7 +1231,9 @@ struct RememberResponse {
 struct RecallRequest {
     user_id: String,
     query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
 }
 
@@ -1218,12 +1242,23 @@ struct RecallResponse {
     memories: Vec<RecalledMemory>,
 }
 
+// /api/recall nests the experience and names the score `score`; a flat {content, memory_type,
+// similarity} mirror deserialised nothing and the tool reported "error decoding response body".
 #[derive(Deserialize)]
 struct RecalledMemory {
     id: String,
+    experience: RecalledExperience,
+    #[serde(default)]
+    score: f32,
+}
+
+#[derive(Deserialize)]
+struct RecalledExperience {
+    #[serde(default)]
     content: String,
+    #[serde(default)]
     memory_type: String,
-    similarity: f32,
+    #[serde(default)]
     #[allow(dead_code)]
     tags: Vec<String>,
 }
@@ -1244,6 +1279,14 @@ struct HookSpecificOutput {
     hook_event_name: String,
     #[serde(rename = "additionalContext")]
     additional_context: String,
+}
+
+/// Run a blocking hook handler on its own thread, off the tokio runtime.
+fn run_off_runtime<F: FnOnce() + Send + 'static>(f: F) {
+    match std::thread::spawn(f).join() {
+        Ok(()) => {}
+        Err(e) => std::panic::resume_unwind(e),
+    }
 }
 
 fn output_hook(event_name: &str, context: &str) {
@@ -1363,7 +1406,7 @@ fn handle_prompt_submit(api_url: &str, api_key: &str, user_id: &str, message: &s
         if !ctx.memories.is_empty() {
             context_parts.push("## Relevant Memories (auto-surfaced)\n".to_string());
             for mem in ctx.memories.iter() {
-                let relevance = (mem.relevance_score * 100.0) as u32;
+                let relevance = (mem.score * 100.0) as u32;
                 context_parts.push(format!(
                     "- [{}%] **{}**: {}",
                     relevance,
@@ -1727,10 +1770,10 @@ impl VeldMcpServer {
                 for mem in resp.memories {
                     output.push_str(&format!(
                         "**[{}]** {} (similarity: {:.0}%)\n{}\n\n",
-                        mem.memory_type,
+                        mem.experience.memory_type,
                         &mem.id[..8.min(mem.id.len())],
-                        mem.similarity * 100.0,
-                        mem.content
+                        mem.score * 100.0,
+                        mem.experience.content
                     ));
                 }
                 Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -1769,7 +1812,7 @@ impl VeldMcpServer {
                 for mem in resp.memories {
                     output.push_str(&format!(
                         "- [{}%] **{}**: {}\n",
-                        (mem.relevance_score * 100.0) as u32,
+                        (mem.score * 100.0) as u32,
                         mem.memory_type,
                         mem.content.chars().take(200).collect::<String>()
                     ));
@@ -2136,6 +2179,54 @@ mod tests {
         let body = r#"{"id":"mem-abc123","success":true}"#;
         let resp: RememberResponse = serde_json::from_str(body).expect("must deserialize");
         assert_eq!(resp.id, "mem-abc123");
+    }
+
+    #[test]
+    fn requests_with_no_optional_fields_deserialize_as_the_server_types() {
+        let recall = serde_json::to_value(RecallRequest {
+            user_id: "u".into(),
+            query: "q".into(),
+            limit: None,
+            mode: None,
+        })
+        .unwrap();
+        let parsed: veld::handlers::types::RecallRequest = serde_json::from_value(recall)
+            .expect("server must accept a recall with no limit or mode");
+        assert_eq!(parsed.query, "q");
+
+        let remember = serde_json::to_value(RememberRequest {
+            user_id: "u".into(),
+            content: "c".into(),
+            memory_type: None,
+            tags: None,
+        })
+        .unwrap();
+        let parsed: veld::handlers::types::RememberRequest =
+            serde_json::from_value(remember).expect("server must accept a remember with no tags");
+        assert!(parsed.tags.is_empty());
+    }
+
+    /// Regression: `/api/recall` nests the experience and names the score `score`.
+    /// Keep this body in lockstep with `handlers::recall`'s response.
+    #[test]
+    fn recall_response_deserializes_server_shape() {
+        let body = r#"{"memories":[{"id":"mem-1","experience":{"content":"hello","memory_type":"Context","tags":["a"]},"importance":0.5,"created_at":"2026-09-16T00:00:00Z","score":0.94,"tier":"hot","writer":"portll"}],"count":1,"tokens_estimated":12,"metacognition":null}"#;
+        let resp: RecallResponse = serde_json::from_str(body).expect("must deserialize");
+        assert_eq!(resp.memories.len(), 1);
+        assert_eq!(resp.memories[0].experience.content, "hello");
+        assert_eq!(resp.memories[0].experience.memory_type, "Context");
+        assert!((resp.memories[0].score - 0.94).abs() < f32::EPSILON);
+    }
+
+    /// Regression: `/api/proactive_context` names the score `score`. The session-start hook
+    /// discards a decode error, so a mismatch here restores no memories and says nothing.
+    #[test]
+    fn proactive_context_response_deserializes_server_shape() {
+        let body = r#"{"memories":[{"id":"mem-1","content":"hello","memory_type":"Context","score":0.81,"importance":0.5,"created_at":"2026-09-16T00:00:00Z","tags":["a"],"tier":"hot","relevance_reason":"entity match","hours_since_created":1.0,"access_count":2,"activation_level":0.3,"retrieval_trigger":"entity","intrusion_score":0.0}],"memory_count":1,"reminder_count":0,"todo_count":0,"latency_ms":3}"#;
+        let resp: ProactiveContextResponse = serde_json::from_str(body).expect("must deserialize");
+        assert_eq!(resp.memories.len(), 1);
+        assert_eq!(resp.memories[0].content, "hello");
+        assert!((resp.memories[0].score - 0.81).abs() < f32::EPSILON);
     }
 
     #[test]
