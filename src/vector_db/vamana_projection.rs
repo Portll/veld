@@ -680,14 +680,12 @@ fn reconcile_map_with_index(
     }
 }
 
-/// Decode a bincoded `Memory` snapshot off the wire. Mirrors the
-/// `bincode::config::standard()` config used in `handlers::remember` and
-/// `handlers::crud` when the snapshot was encoded — keep these in sync.
+/// Decode a bincoded `Memory` snapshot off the wire. Goes through the store's
+/// decoder, legacy arms included: a snapshot journaled before a positional
+/// layout change is the old wire, exactly as a stored record would be.
 fn decode_memory(bytes: &[u8]) -> Result<Memory, VamanaProjectionError> {
-    let (memory, _consumed): (Memory, usize) =
-        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map_err(|e| VamanaProjectionError::MemoryDecode(e.to_string()))?;
-    Ok(memory)
+    crate::memory::storage::decode_memory_snapshot(bytes)
+        .map_err(|e| VamanaProjectionError::MemoryDecode(e.to_string()))
 }
 
 /// Dyn-friendly arm: the [`JournaledWriter`] hands us typed payloads at

@@ -966,6 +966,15 @@ fn recover_pre_writer_session(data: &[u8]) -> Option<(Memory, &'static str)> {
     Some((memory, "bincode2_pre_writer_session_v3"))
 }
 
+/// Decodes a `Memory` snapshot carried by an intent-log payload or a projection checkpoint.
+/// Those bytes are the same encoding the store holds, so they age the same way: a payload
+/// journaled before a positional layout change needs the legacy arms, not a bare
+/// `decode_from_slice`. The bm25 projection sat at lsn 12753 from 2026-09-03 to 2026-09-16
+/// because it decoded with the current layout only.
+pub fn decode_memory_snapshot(bytes: &[u8]) -> Result<Memory> {
+    deserialize_memory(bytes).map(|(memory, _)| memory)
+}
+
 /// Try deserializing with multiple format fallbacks
 /// Supports bincode 2.x (current), MessagePack, and bincode 1.x (legacy) wire formats
 ///
@@ -4519,6 +4528,53 @@ impl MemoryStorage {
     }
 }
 
+/// Wire fixtures shared by the decoder tests and the projection tests: a current record with a
+/// populated session, and the same bytes as a pre-4a54053 binary wrote them.
+#[cfg(test)]
+pub(crate) mod wire_fixtures {
+    use super::*;
+
+    /// A current record with a populated context and session. `declared`/`verified` stay at
+    /// their defaults so that, once stripped, the bytes are what a pre-4a54053 binary wrote.
+    pub(crate) fn memory_with_session(content: &str) -> Memory {
+        let mut context = crate::memory::context::ContextBuilder::new().build();
+        context.session = AgentSession {
+            worktree_path: Some(PathBuf::from("/wt/feature")),
+            branch: Some("feature/x".into()),
+            agent_id: None,
+            vscode_window_id: None,
+            started_at: Some(Utc::now()),
+            parent_repo: Some(PathBuf::from("/repo")),
+            declared: Default::default(),
+            verified: Default::default(),
+        };
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: content.to_string(),
+            context: Some(context),
+            embeddings: Some(vec![0.25; 4]),
+            tags: vec!["synthetic".into()],
+            ..Default::default()
+        };
+        let mut memory = Memory::new(MemoryId(uuid::Uuid::new_v4()), experience, 0.7, None, None, None, None);
+        memory.when.episode_ordinal = Some(3);
+        memory
+    }
+
+    pub(crate) fn encode(memory: &Memory) -> Vec<u8> {
+        bincode::serde::encode_to_vec(memory, bincode::config::standard()).unwrap()
+    }
+
+    /// Strips the eight default-writer bytes 4a54053 appended, producing the pre-4a54053 wire.
+    pub(crate) fn strip_writer_structs(current: &[u8]) -> Vec<u8> {
+        let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
+        let (_, gap_at) =
+            bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(current, cfg).unwrap();
+        assert_eq!(&current[gap_at..gap_at + 8], &PRE_WRITER_SESSION_GAP, "fixture must carry default writers");
+        [&current[..gap_at], &current[gap_at + 8..]].concat()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4732,60 +4788,7 @@ mod tests {
         assert!(is_legacy);
     }
 
-    /// A current record with a populated context and session. `declared`/`verified` stay at
-    /// their defaults so that, once stripped, the bytes are what a pre-4a54053 binary wrote.
-    fn memory_with_session(content: &str) -> Memory {
-        let mut context = crate::memory::context::ContextBuilder::new().build();
-        context.session = AgentSession {
-            worktree_path: Some(PathBuf::from("/wt/feature")),
-            branch: Some("feature/x".into()),
-            agent_id: None,
-            vscode_window_id: None,
-            started_at: Some(Utc::now()),
-            parent_repo: Some(PathBuf::from("/repo")),
-            declared: Default::default(),
-            verified: Default::default(),
-        };
-        let experience = Experience {
-            experience_type: ExperienceType::Observation,
-            content: content.to_string(),
-            context: Some(context),
-            embeddings: Some(vec![0.25; 4]),
-            tags: vec!["synthetic".into()],
-            ..Default::default()
-        };
-        let mut memory = Memory::new(
-            MemoryId(uuid::Uuid::new_v4()),
-            experience,
-            0.7,
-            None,
-            None,
-            None,
-            None,
-        );
-        memory.when.episode_ordinal = Some(3);
-        memory
-    }
-
-    fn encode(memory: &Memory) -> Vec<u8> {
-        bincode::serde::encode_to_vec(memory, bincode::config::standard()).unwrap()
-    }
-
-    /// Strips the eight default-writer bytes 4a54053 appended, producing the pre-4a54053 wire.
-    fn strip_writer_structs(current: &[u8]) -> Vec<u8> {
-        let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
-        let (_, gap_at) =
-            bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(
-                current, cfg,
-            )
-            .unwrap();
-        assert_eq!(
-            &current[gap_at..gap_at + 8],
-            &PRE_WRITER_SESSION_GAP,
-            "fixture must carry default writers"
-        );
-        [&current[..gap_at], &current[gap_at + 8..]].concat()
-    }
+    use super::wire_fixtures::{encode, memory_with_session, strip_writer_structs};
 
     #[test]
     fn a_record_with_a_pre_writer_session_recovers_through_the_splice() {

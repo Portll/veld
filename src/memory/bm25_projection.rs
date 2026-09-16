@@ -262,15 +262,12 @@ fn parse_memory_id(s: &str) -> Result<MemoryId, Bm25ProjectionError> {
         .map_err(|e| Bm25ProjectionError::InvalidMemoryId(format!("{s}: {e}")))
 }
 
-/// Decode a bincoded `Memory` snapshot off an `IntentPayload`. Bincode
-/// configuration mirrors what `handlers/remember.rs` uses when it encodes
-/// the snapshot — `bincode::config::standard()` — so a snapshot written
-/// by the live-write path round-trips here without a config mismatch.
+/// Decode a bincoded `Memory` snapshot off an `IntentPayload`. Goes through the store's
+/// decoder, legacy arms included: a snapshot journaled before a positional
+/// layout change is the old wire, exactly as a stored record would be.
 fn decode_memory(bytes: &[u8]) -> Result<Memory, Bm25ProjectionError> {
-    let (memory, _consumed): (Memory, usize) =
-        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map_err(|e| Bm25ProjectionError::MemoryDecode(e.to_string()))?;
-    Ok(memory)
+    crate::memory::storage::decode_memory_snapshot(bytes)
+        .map_err(|e| Bm25ProjectionError::MemoryDecode(e.to_string()))
 }
 
 /// Dyn-friendly arm: the [`crate::intent_log::JournaledWriter`] hands us
@@ -343,6 +340,26 @@ impl Projection for Bm25Projection {
 mod tests {
     use super::*;
     use crate::intent_log::{payload::CURRENT_PAYLOAD_SCHEMA_VERSION, replay, IntentLog};
+
+    /// A payload journaled before 4a54053 carries the old session layout; the projection must
+    /// read it the way the store does, or replay stalls at that lsn forever (lsn 12753,
+    /// 2026-09-03 to 2026-09-16).
+    #[test]
+    fn a_pre_writer_snapshot_decodes_through_the_store_arms() {
+        use crate::memory::storage::wire_fixtures::{
+            encode, memory_with_session, strip_writer_structs,
+        };
+        let original = memory_with_session("journaled before the writer structs existed");
+        let old_wire = strip_writer_structs(&encode(&original));
+        assert!(bincode::serde::decode_from_slice::<Memory, _>(
+            &old_wire,
+            bincode::config::standard()
+        )
+        .is_err());
+        let back = decode_memory(&old_wire).expect("legacy arm through the store decoder");
+        assert_eq!(back.id, original.id);
+        assert_eq!(back.experience.content, original.experience.content);
+    }
     use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId};
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
