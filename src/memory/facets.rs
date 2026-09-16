@@ -48,9 +48,18 @@ use super::types::MemoryId;
 // the shape of bytes it produces, used by the migration layer when a
 // breaking change ships. Today every facet is at version 1.
 //
-// `#[serde(default)]` continues to handle additive forward-compat: when an
-// old wire shape decodes with missing fields, defaults fill them in.
-// [`note_facet_silent_upgrade`] emits one warning the first time such an
+// `#[serde(default)]` fills in a missing field ONLY on a self-describing
+// codec (JSON). The persisted path is bincode, which is positional: a record
+// on disk has no field names, so a field appended or inserted here is read
+// from the next field's bytes and everything after it misreads. Measured
+// 2026-09-16: 4a54053 appended two structs to `AgentSession` and edfb43f
+// inserted `persistent` into `MemoryFlat`, and every stored record with a
+// populated context became undecodable until a legacy arm was written
+// (memory/storage.rs, `recover_pre_writer_session`). Changing the shape of
+// anything reachable from `Memory` therefore needs a legacy decode arm for
+// the old bytes and a new golden fixture, in the same change; a JSON
+// round-trip proves nothing about the store.
+// [`note_facet_silent_upgrade`] emits one warning the first time a JSON
 // up-conversion happens per process, so operators see drift in the logs
 // without the warning storm a per-record log would produce.
 
