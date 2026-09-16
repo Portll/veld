@@ -5,14 +5,47 @@ measured today against this tree, not carried forward from the earlier handoffs.
 Where a number moved in the *wrong* direction it says so, because a migration
 that reports only its wins is how the last stretch of one gets mis-scoped.
 
-> **Status 2026-09-14.** Ordering is now set by
-> [ADR 0006](src/decisions/0006-backend-parity-and-on-demand-migration.md): WP1
-> refuse the false clean, WP2 wire migration, WP3 adoption plus the
-> `tests/rocksdb_ratchet.rs` ratchet, WP4 upstream discipline. §1 below is
-> stale: `7698553` already gave the four sleep_time stores `with_store`; what
-> remains there is their legacy `new(Arc<DB>)` constructors,
-> `orchestrator.rs`'s raw handle and `merge.rs`. The "0 raw calls" figures for
-> `policies` and `graduation` were a single-line grep missing split calls.
+> **Status 2026-09-16.** Ordering is set by
+> [ADR 0006](src/decisions/0006-backend-parity-and-on-demand-migration.md). §1–§5 below
+> predate it and are kept as the measurement record, not as the plan.
+>
+> **Landed**
+> - WP1, refuse the false clean: `5b1ac19` boot guard counts records on both backends
+>   read-only and refuses when the selected one is empty for a tenant whose data is in
+>   the other; `60aaaeb` `/health` reports `tenants_with_data` per backend. Deployed
+>   in `8632b71`; first production boot clean.
+> - WP2, migration: `3a719ba` `veld export` / `import` / `migrate`, verified against
+>   the VELDPORT trailer, dry run writes nothing, source never touched, undecodable
+>   records fail by name or go to `--quarantine-undecodable`.
+> - WP3: `f332116` ratchet (`rocksdb::` outside `src/storage/` may only fall, per
+>   module, exact); `24d3195` sleep_time stores and orchestrator off `Arc<DB>`
+>   (13 → 0).
+> - Guards: `304c7bf` a `.rs` file no `mod` reaches fails the suite.
+> - Recovery, by the storage owner: `661d4ec` decodes the 24 live records broken by
+>   two positional layout changes, `4a54053` (AgentSession fields) and `edfb43f`
+>   (`persistent` inserted mid-MemoryFlat).
+>
+> **In flight**: raw-parse fallback deletion (fabricated a Memory from any UTF-8 tail
+> and `get` rewrote it under a made-up id); recall harness, all eight modules declared;
+> shared stores onto `with_store` with legacy→new compatibility tests, which also
+> fixes `FeedbackStore::with_store` never loading on redb; `Place` bincode fix plus
+> `tests/persisted_layout.rs`.
+>
+> **Findings that are not bugs in the port**
+> - Edge decay: veld is exponential by design, upstream power-law. Three upstream
+>   decay_sim tests are ignored with that reason; do not "fix" them toward upstream.
+> - Lineage: veld ingest types no lineage verb as causal, so the causal walk finds 0
+>   origins in 60 chains. Real parity gap, three tests ignored naming it.
+> - Ablation: ten `SHODH_*` flags the harness's ablation arms set are read nowhere in
+>   veld, so those arms measure the baseline under another name, and `SHODH_EVAL_NOW`
+>   freezes no clock. Treat ablation output as invalid until wired.
+>
+> **Verification discipline measured this cycle**: pin `VELD_EMBEDDER=minilm` on both
+> arms (the default probes LM Studio and made 5 failures look like a branch's);
+> `CARGO_INCREMENTAL=0` with one full build at a time (parallel exclusive targets
+> filled the disk); a lib-only run does not build the ratchet or orphan guards.
+> Baseline failure set at `e6e46e0`: 8 named tests. `handler_tests` can SIGSEGV at
+> exit after all tests pass, on pristine trees too.
 
 Companion: `docs/HANDOFF-storage-remaining-2026-09-02.md` holds the design
 rationale for the trait split and the batch API. This document holds only the
