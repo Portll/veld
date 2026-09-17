@@ -2,7 +2,7 @@
 
 > Product: **Veld — Agentic Memory**. Crate / package IDs remain `veld`.
 > Repository: https://github.com/Portll/veld • License: AGPL-3.0-or-later (or commercial — see LICENSING.md) • Cargo version: see `Cargo.toml` (`0.7.x` line at time of writing).
-> Branch status (per [PROGRESS.md](PROGRESS.md)): `v0.7.6-unstable` stabilizing toward a clean `v0.8` cut; `v0.9` is the public-release / redb-integration target.
+> Branch status (per [PROGRESS.md](PROGRESS.md)): first packaged release cut (repo moved to `Portll/veld`, CI added); the `0.7.x` line on `main` is stabilizing toward a clean `v0.8`. `v0.9` is the public-release / redb-runtime-cutover target.
 
 ---
 
@@ -106,7 +106,7 @@ The retrieval pipeline is **multi-layer hybrid search**, not a single algorithm.
 Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `PrimaryMemoryStore`, `GraphStore`, `KeyValueStore` traits with `StorageCapabilities` per backend.
 
 - **Default-requested backend**: Redb (single-file embedded). Feature flag: `storage-redb` (default).
-- **Effective runtime backend during current build**: still **RocksDB** ([src/storage/legacy_rocksdb.rs](src/storage/legacy_rocksdb.rs)). See `effective_storage_backend_for_current_build` in [src/config.rs](src/config.rs) — the redb runtime lands as part of the v0.9 work.
+- **Effective runtime backend during current build**: still **RocksDB** ([src/storage/legacy_rocksdb.rs](src/storage/legacy_rocksdb.rs)). The redb primary/graph/audit stores are now *implemented* in [src/storage/](src/storage/), but `effective_storage_backend_for_current_build` in [src/config.rs](src/config.rs:65) still maps `Redb → RocksDb`. The runtime *flip* is the remaining v0.9 step — the engine is built, not yet switched on.
 - **Default data path**:
   - Linux: `~/.local/share/veld/`
   - macOS: `~/Library/Application Support/veld/`
@@ -128,7 +128,7 @@ Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `Pri
 - **Background pipeline** ([src/handlers/consolidation.rs](src/handlers/consolidation.rs) `consolidate_memories`): fact extraction → maintenance (replay + tier consolidation + decay) → graph strengthening. Spawned as detached `tokio::task` (survives HTTP timeout). Guarded by per-user `CONSOLIDATION_LOCKS`.
 - **Sleep-phase consolidation**: `/api/consolidation/sleep` — deeper replay pass.
 - **Gap topology** ([src/memory/gap_topology/](src/memory/gap_topology/)): detector, scoring, Voronoi decomposition. Surfaces knowledge gaps in the graph.
-- **Wavelet sessions** ([src/memory/wavelet_sessions.rs](src/memory/wavelet_sessions.rs)): session-segmentation analysis.
+- **Session detection** ([src/memory/wavelet_sessions.rs](src/memory/wavelet_sessions.rs)): gap-based segmentation — a fixed 2h inter-memory gap threshold (`detect_sessions`) plus a partition-theoretic adaptive threshold (`detect_sessions_adaptive`: largest relative jump in the sorted gap distribution, with a Hardy-Ramanujan `(1 − 1/24)` modular correction, clamped to `[300s, 28800s]`). **No wavelet transform despite the module name** — the file name is legacy. Powers ordinal-session resolution in recall ("two sessions ago").
 
 ### Ingest
 
@@ -149,6 +149,11 @@ Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `Pri
 - **Streaming ingest** ([src/streaming.rs](src/streaming.rs), 1577 lines): WebSocket `/api/stream` for high-throughput memory ingestion. Distinct from the SSE endpoints in `handlers/webhooks.rs` (`/api/context/sse`, `/api/events/sse`).
 - **Metrics** ([src/metrics.rs](src/metrics.rs), 989 lines): Prometheus metric registrations (`veld_*` prefix). `/metrics` route in [src/handlers/router.rs](src/handlers/router.rs); visibility controlled by `VELD_METRICS_PUBLIC`.
 - **Visualization / graph viewer** ([src/handlers/visualization.rs](src/handlers/visualization.rs), 405 lines + [src/handlers/graph_view.html](src/handlers/graph_view.html)): in-browser knowledge-graph viewer. Routes: `GET /graph/view` (public HTML shell), `GET /api/brain/{user_id}`, `/api/visualization/*`.
+- **LLM-Wiki** ([src/wiki/](src/wiki/)): wiki render as an **intent-log projection** (`WikiProjection`), exposed via authed `` `POST /api/wiki/render` `` ([src/handlers/router.rs:272](src/handlers/router.rs#L272)). Bidirectional **edit-back**: Obsidian edits flow back to the canonical store, with an optional default-off live watcher ([src/wiki/watcher.rs](src/wiki/watcher.rs)). Consumes the facet page-type taxonomy in [src/memory/facets.rs](src/memory/facets.rs). Now shipped — was the "LLM-Wiki Phase 3" plan.
+- **Veld GUI / monitor** ([monitor/](monitor/), Tauri desktop app): first-run setup panel, multi-instance discovery + tabs, runtime **dials** panel (`get_dials`/`set_dials`), and the server graph viewer embedded in-window. Companion crates: [status-core/](status-core/), [status-tui/](status-tui/), [status-widget/](status-widget/).
+- **Instance registry** ([src/instance_registry.rs](src/instance_registry.rs)): **server-authored** registry of live veld instances (replaces port-guessing). Consumed by the monitor, the statusline hook, and Claude session wiring. See [docs/src/architecture/instance-registry.md](docs/src/architecture/instance-registry.md).
+- **Epistemic hygiene / injection boundary**: source-trust is surfaced at recall, and `injection_suspected` is flagged for non-trusted-source content (W-006). See [docs/src/architecture/epistemic-hygiene.md](docs/src/architecture/epistemic-hygiene.md).
+- **Store↔log durability**: reconcile-on-startup, LSN ordering, and bulk-forget journaling keep the primary store and the intent log consistent; a per-user write-path serialization lock (W-005) generalizes the `CONSOLIDATION_LOCKS` pattern to all write paths.
 - **Auth**: API-key middleware ([src/auth.rs](src/auth.rs)) plus Phase C user-auth (password + TOTP + recovery codes) at `/api/user_auth/*`.
 - **Multi-tenant** ([src/extensions/](src/extensions/), feature `multi-tenant`): hosaka collective-store, PII policy, maintenance.
 - **Fortress** ([src/fortress/](src/fortress/), feature `fortress`): fractal binary obfuscation, anti-debug, integrity checks for distribution builds.
@@ -157,7 +162,7 @@ Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `Pri
 
 ### Alignment (recent work)
 
-Cross-embedder alignment: Procrustes + Ridge fitters, fit/eval bins, retrieval integration. Binaries: `alignment-collect`, `alignment-fit`, `alignment-eval` (see [src/bin/](src/bin/)). Evaluations at [evaluations/alignment/](evaluations/alignment/).
+Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (beyond the original Procrustes + Ridge fitters), with payload hardening, conditioning, and perf-flag config. Fit/eval bins, retrieval integration. Binaries: `alignment-collect`, `alignment-fit`, `alignment-eval` (see [src/bin/](src/bin/)). Evaluations at [evaluations/alignment/](evaluations/alignment/).
 
 ---
 
@@ -188,6 +193,9 @@ Cross-embedder alignment: Procrustes + Ridge fitters, fit/eval bins, retrieval i
 | [src/zenoh_transport/](src/zenoh_transport/) | Zenoh feature — robotics pub/sub |
 | [mcp-server/](mcp-server/) | TypeScript MCP server (`@veld/memory-mcp`) — wraps the HTTP API for Claude/Cursor/Copilot |
 | [tui/](tui/) | Rust TUI dashboard |
+| [monitor/](monitor/) | Tauri desktop GUI (Veld GUI) — multi-instance dashboard, dials panel, embedded graph viewer |
+| [src/wiki/](src/wiki/) | LLM-Wiki — wiki render as an intent-log projection + Obsidian edit-back |
+| [src/instance_registry.rs](src/instance_registry.rs) | Server-authored live-instance registry (replaces port-guessing) |
 | [hooks/](hooks/) | Claude Code hooks — automatic memory pre/post tool |
 | [python/](python/) | Python bindings (maturin/PyO3, feature `python`) |
 | [evaluations/](evaluations/) | Benchmark + alignment evaluation artifacts |
@@ -222,8 +230,9 @@ Cross-embedder alignment: Procrustes + Ridge fitters, fit/eval bins, retrieval i
 The codebase contains the *abstraction* for Redb (default-requested), but the *runtime engine* during current builds is still RocksDB. Specifically:
 
 - `default_requested_storage_backend()` → `Redb` in [src/config.rs](src/config.rs:57).
-- `effective_storage_backend_for_current_build(Redb)` currently returns `RocksDb` ([src/config.rs](src/config.rs:61)).
-- The redb path lands as part of `v0.9` work (per [PROGRESS.md](PROGRESS.md)).
+- `effective_storage_backend_for_current_build(Redb)` currently returns `RocksDb` ([src/config.rs](src/config.rs:65)).
+- The redb primary/graph/audit stores are now **implemented** in [src/storage/](src/storage/) (committed). The match arm above means the *runtime* still loads RocksDB regardless — the v0.9 work is the cutover (flip that arm + first-boot re-index), not new store code.
+- The redb runtime flip lands as part of `v0.9` work (per [PROGRESS.md](PROGRESS.md)).
 
 When writing new storage code: target the trait surface (`PrimaryMemoryStore`, `GraphStore`, `KeyValueStore`) in [src/storage/mod.rs](src/storage/mod.rs), not the legacy concrete types. New code lands ready for the redb cutover.
 

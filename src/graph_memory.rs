@@ -7900,6 +7900,27 @@ mod tests {
     }
 
     #[test]
+    fn test_decay_half_life() {
+        // A SECOND point on the L2 curve, 14 days, beside test_decay_tier_aware's 7 days. Derived from
+        // L2_DECAY_PER_DAY rather than hardcoded, like that test, so it guards the SHAPE (the same
+        // exponential applied over twice the time) instead of pinning a rate that is allowed to change:
+        // a change that preserved the 7-day value by accident, or applied the rate per-call instead of
+        // per-day, fails here. (An earlier draft hardcoded lambda=0.031 and broke when d5047528 made
+        // the rate learned per edge.)
+        use crate::constants::L2_DECAY_PER_DAY;
+
+        let mut edge = create_test_edge_with_tier(1.0, 14, EdgeTier::L2Episodic);
+        edge.decay();
+
+        let expected = (-(L2_DECAY_PER_DAY as f64) * 14.0).exp() as f32;
+        assert!(
+            (edge.strength - expected).abs() < 0.01,
+            "14-day L2 decay should track L2_DECAY_PER_DAY: expected ~{expected}, got {}",
+            edge.strength
+        );
+    }
+
+    #[test]
     fn test_decay_minimum_floor() {
         // Use L3 tier for very old edge testing (L3 has 10 year max age)
         let mut edge = create_test_edge_with_tier(0.02, 100, EdgeTier::L3Semantic);

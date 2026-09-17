@@ -440,6 +440,12 @@ fn bench_reinforce_fact(c: &mut Criterion) {
                     created_at: Utc::now(),
                     last_reinforced: Utc::now(),
                     fact_type: FactType::Pattern,
+                    valid_from: None,
+                    valid_until: None,
+                    superseded_by: None,
+                    supersedes: Vec::new(),
+                    purged_at: None,
+                    purge_reason: None,
                 };
 
                 let exp = create_experience("Evidence", ExperienceType::Learning, vec!["test"]);
@@ -477,6 +483,12 @@ fn bench_should_decay_fact(c: &mut Criterion) {
                     created_at: Utc::now() - Duration::days(age),
                     last_reinforced: Utc::now() - Duration::days(age),
                     fact_type: FactType::Pattern,
+                    valid_from: None,
+                    valid_until: None,
+                    superseded_by: None,
+                    supersedes: Vec::new(),
+                    purged_at: None,
+                    purge_reason: None,
                 };
 
                 b.iter(|| consolidator.should_decay_fact(&fact));
