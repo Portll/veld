@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Veld — Agentic Memory · Visual Model</title>
+<style>
+  :root{
+    --bg:#000; --panel:rgba(26,26,46,.92); --panel2:rgba(22,33,62,.92);
+    --ink:#e6e9f0; --dim:#8a93a6; --line:rgba(255,255,255,.10);
+    --cy:#00d4ff; --gr:#00ff88; --red:#ff6b6b; --yel:#ffd93d; --grn:#6bcb77;
+    --vio:#a78bfa; --org:#ffa657;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+    background:
+      radial-gradient(1200px 700px at 12% -10%, rgba(0,212,255,.10), transparent 60%),
+      radial-gradient(1100px 700px at 100% 0%, rgba(0,255,136,.08), transparent 55%),
+      var(--bg);
+    color:var(--ink); overflow-x:hidden;
+  }
+  a{color:var(--cy);text-decoration:none}
+  code{font-family:'JetBrains Mono','SF Mono',Consolas,monospace;font-size:.82em}
+
+  /* ---------- header ---------- */
+  header{
+    position:sticky;top:0;z-index:50;
+    display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+    padding:14px 26px;
+    background:linear-gradient(135deg,var(--panel) 0%,var(--panel2) 100%);
+    border-bottom:1px solid var(--line);
+    backdrop-filter:blur(12px);
+  }
+  .brand h1{
+    font-size:1.4rem;font-weight:700;letter-spacing:.2px;
+    background:linear-gradient(90deg,var(--cy),var(--gr));
+    -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  }
+  .brand p{font-size:.78rem;color:var(--dim);margin-top:2px}
+  .pill{
+    font-size:.72rem;padding:3px 10px;border-radius:999px;
+    border:1px solid var(--line);color:var(--dim);background:rgba(0,0,0,.25);
+    white-space:nowrap;
+  }
+  .pill b{color:var(--gr)}
+  .spacer{flex:1 1 auto}
+  .btn{
+    font:inherit;font-size:.82rem;cursor:pointer;color:#001018;
+    padding:8px 16px;border:none;border-radius:999px;font-weight:600;
+    background:linear-gradient(90deg,var(--cy),var(--gr));
+    box-shadow:0 4px 18px rgba(0,212,255,.25);transition:transform .15s,box-shadow .15s;
+  }
+  .btn:hover{transform:translateY(-1px);box-shadow:0 6px 24px rgba(0,255,136,.35)}
+  .btn.ghost{background:rgba(0,0,0,.25);color:var(--ink);border:1px solid var(--line);box-shadow:none}
+
+  /* ---------- filters ---------- */
+  #filters{
+    display:flex;gap:8px;flex-wrap:wrap;align-items:center;
+    padding:12px 26px 0;
+  }
+  .chip{
+    font-size:.74rem;cursor:pointer;padding:5px 12px;border-radius:999px;
+    border:1px solid var(--line);color:var(--dim);background:rgba(255,255,255,.03);
+    transition:all .18s;user-select:none;
+  }
+  .chip:hover{color:var(--ink);border-color:rgba(255,255,255,.25)}
+  .chip.active{color:#001018;background:linear-gradient(90deg,var(--cy),var(--gr));border-color:transparent;font-weight:600}
+
+  /* ---------- layout ---------- */
+  #wrap{display:grid;grid-template-columns:1fr 360px;gap:20px;padding:18px 26px 60px}
+  @media(max-width:1100px){#wrap{grid-template-columns:1fr}}
+
+  .flow{display:flex;flex-direction:column;gap:14px}
+  .band{
+    border:1px solid var(--line);border-radius:16px;
+    background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.005));
+    padding:14px 16px;position:relative;transition:opacity .25s;
+  }
+  .band.dim{opacity:.28}
+  .band-head{display:flex;align-items:baseline;gap:10px;margin-bottom:12px}
+  .band-num{
+    font-family:monospace;font-size:.72rem;color:#001018;font-weight:700;
+    background:var(--accent,#888);padding:2px 8px;border-radius:6px;
+  }
+  .band-title{font-size:.95rem;font-weight:600;letter-spacing:.3px}
+  .band-sub{font-size:.74rem;color:var(--dim)}
+  .arrow{
+    text-align:center;color:var(--dim);font-size:1.1rem;line-height:.6;
+    margin:-6px 0;letter-spacing:4px;
+  }
+
+  .grid{display:flex;gap:10px;flex-wrap:wrap}
+  .node{
+    flex:1 1 150px;min-width:140px;
+    border:1px solid var(--line);border-radius:11px;
+    background:rgba(0,0,0,.30);padding:10px 12px;cursor:pointer;
+    transition:transform .15s,border-color .15s,box-shadow .15s,background .15s;
+    position:relative;overflow:hidden;
+  }
+  .node::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent,#666)}
+  .node:hover{transform:translateY(-2px);border-color:var(--accent,#888);background:rgba(0,0,0,.5);box-shadow:0 8px 22px rgba(0,0,0,.5)}
+  .node.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 8px 26px rgba(0,0,0,.6)}
+  .node.hot{animation:pulse 1.05s ease-in-out}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 var(--accent)}50%{box-shadow:0 0 0 5px transparent;transform:translateY(-3px) scale(1.02)}100%{box-shadow:0 0 0 0 transparent}}
+  .node h4{font-size:.86rem;font-weight:600;margin-bottom:3px;display:flex;align-items:center;gap:6px}
+  .node .tag{font-size:.66rem;color:var(--dim);line-height:1.35}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none}
+
+  /* tier ladder inside memory band */
+  .tiers{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .tier{flex:1 1 0;min-width:120px;border-radius:10px;padding:9px 11px;border:1px solid var(--line);background:rgba(0,0,0,.3);text-align:center}
+  .tier b{display:block;font-size:.82rem}
+  .tier span{font-size:.66rem;color:var(--dim)}
+  .tierflow{display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:.7rem;margin-top:6px;gap:6px;flex-wrap:wrap}
+
+  /* ---------- detail panel ---------- */
+  aside{position:sticky;top:84px;align-self:start;height:calc(100vh - 104px)}
+  .panel{
+    height:100%;overflow:auto;border:1px solid var(--line);border-radius:16px;
+    background:linear-gradient(180deg,var(--panel),rgba(13,16,30,.95));
+    padding:18px;backdrop-filter:blur(8px);
+  }
+  .panel::-webkit-scrollbar{width:8px}
+  .panel::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:8px}
+  .panel .kicker{font-size:.7rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--accent,var(--cy))}
+  .panel h2{font-size:1.25rem;margin:6px 0 4px;line-height:1.2}
+  .panel .lead{font-size:.84rem;color:var(--dim);margin-bottom:14px}
+  .panel p{font-size:.86rem;line-height:1.55;color:#cdd3e0;margin:0 0 12px}
+  .panel h5{font-size:.72rem;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin:16px 0 7px}
+  .filelist{display:flex;flex-direction:column;gap:5px}
+  .filelist code{
+    display:block;background:rgba(0,0,0,.4);border:1px solid var(--line);
+    border-radius:7px;padding:6px 9px;color:#bfe9ff;word-break:break-all;
+  }
+  .badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
+  .badge{font-size:.68rem;padding:3px 9px;border-radius:6px;background:rgba(0,0,0,.4);border:1px solid var(--line);color:var(--dim)}
+
+  /* signals grid */
+  .signals{display:grid;grid-template-columns:repeat(2,1fr);gap:5px;margin-top:6px}
+  .sig{font-size:.7rem;padding:5px 7px;border-radius:6px;background:rgba(0,212,255,.06);border:1px solid rgba(0,212,255,.18);color:#bfe9ff}
+  .sig b{color:var(--gr);font-family:monospace;margin-right:4px}
+
+  footer{padding:18px 26px;border-top:1px solid var(--line);color:var(--dim);font-size:.74rem;display:flex;gap:18px;flex-wrap:wrap;align-items:center}
+  .legend{display:flex;gap:14px;flex-wrap:wrap}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .sw{width:10px;height:10px;border-radius:3px}
+
+  /* trace banner */
+  #trace{
+    display:none;margin:0 26px;padding:9px 14px;border-radius:10px;font-size:.8rem;
+    background:rgba(0,255,136,.08);border:1px solid rgba(0,255,136,.3);color:var(--gr);
+  }
+  #trace.on{display:block}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>Veld — Agentic Memory</h1>
+    <p>Edge-native cognitive memory · single binary · offline · no external DBs</p>
+  </div>
+  <span class="pill">crate <b>veld</b></span>
+  <span class="pill">BUSL-1.1</span>
+  <span class="pill"><b>v0.7.37</b> → v0.8 → v0.9 (redb runtime)</span>
+  <div class="spacer"></div>
+  <button class="btn" id="traceBtn">▶ Trace a recall query</button>
+  <button class="btn ghost" id="resetBtn">Reset</button>
+</header>
+
+<div id="filters"></div>
+<div id="trace"></div>
+
+<div id="wrap">
+  <div class="flow" id="flow"></div>
+  <aside>
+    <div class="panel" id="panel"></div>
+  </aside>
+</div>
+
+<footer>
+  <div class="legend" id="legend"></div>
+  <div class="spacer"></div>
+  <span>Click any block for detail · hover to explore</span>
+  <span><a href="https://github.com/Portll/veld" target="_blank">github.com/Portll/veld</a></span>
+</footer>
+
+<script>
+/* ---------------------------------------------------------------
+   Veld architecture data model — sourced from CLAUDE.md / PROGRESS.md
+   Each band = a layer in the request flow. Each node is clickable.
+----------------------------------------------------------------*/
+const C = {
+  client:"#a78bfa", iface:"#00d4ff", ingest:"#ffa657", memory:"#00ff88",
+  retrieval:"#ffd93d", storage:"#6bcb77", consolidate:"#ff6b6b", graph:"#7dd3fc",
+  cross:"#9aa3b8"
+};
+
+const BANDS = [
+  {
+    cat:"client", num:"IN", title:"Clients", accent:C.client,
+    sub:"Three wired integrations share one memory identity",
+    nodes:[
+      {t:"Claude Code", tag:"hooks + MCP · user_id claude-code", d:"<code>.claude/settings.json</code> wires all 6 lifecycle hooks (pre/post tool, session-start, prompt, stop). The hook layer surfaces context before tools and records actions after — invisible to the agent.", files:[".claude/settings.json","hooks/memory-hook.ts"]},
+      {t:"VS Code Copilot", tag:"46 MCP tools · user_id vscode-copilot", d:"<code>.vscode/mcp.json</code> registers the Veld MCP server; <code>.github/copilot-instructions.md</code> carries workspace tool/skill switches.", files:[".vscode/mcp.json",".github/copilot-instructions.md"]},
+      {t:"Claude CLI", tag:"shared memory · user_id claude-code", d:"Reads the same project <code>.claude/settings.json</code>; identical hooks fire. Shares the <code>claude-code</code> identity for cross-surface continuity.", files:[".claude/settings.json"]},
+      {t:"Portable hook config", tag:"external projects", d:"<code>hooks/claude-settings.json</code> — copy to any project, point <code>$VELD_HOOKS_DIR</code> at veld's hooks/.", files:["hooks/claude-settings.json"]},
+      {t:"Veld GUI (monitor)", tag:"Tauri desktop dashboard", d:"Multi-instance discovery + tabs, runtime dials panel (<code>get_dials</code>/<code>set_dials</code>), first-run setup, embedded graph viewer. Companion crates: status-core / status-tui / status-widget.", files:["monitor/","status-core/"]},
+    ]
+  },
+  {
+    cat:"iface", num:"API", title:"Interfaces", accent:C.iface,
+    sub:"~202 HTTP routes · 46 MCP tools · CLI · TUI",
+    nodes:[
+      {t:"HTTP API", tag:"~202 routes · 127.0.0.1:3030", d:"Single source of truth for endpoints is the router. Public routes limited to <code>/health/*</code>; the <code>public_router_has_no_per_user_handlers</code> test is the security contract — no public handler may read <code>?user_id=</code>.", files:["src/handlers/router.rs","src/handlers/state.rs"], badges:["axum","per-user locks"]},
+      {t:"MCP (TypeScript)", tag:"@veld/memory-mcp · 46 tools", d:"Wraps the HTTP API for Claude / Cursor / Copilot. Tool families: core memory, proactive context, index/backups, consolidation, token budget, reminders, todos, projects, seeding.", files:["mcp-server/index.ts"], badges:["npm"]},
+      {t:"MCP (Rust rmcp)", tag:"veld serve · stdio", d:"Alternative path to the HTTP API over an MCP stdio transport. Not the HTTP daemon.", files:["src/mcp/mod.rs","src/cli.rs"]},
+      {t:"CLI", tag:"server·tui·serve·init·status·doctor·hook·claude", d:"Main <code>veld</code> binary. <code>hook session-start|prompt|commit</code> emits Claude Code hook JSON; <code>veld claude</code> launches Claude Code with the proxy wired up.", files:["src/cli.rs"]},
+      {t:"TUI dashboard", tag:"veld tui", d:"Terminal dashboard over the memory store.", files:["tui/"]},
+      {t:"Graph viewer", tag:"/graph/view", d:"In-browser knowledge-graph viewer (D3 + three.js). Routes: <code>/api/brain/{user_id}</code>, <code>/api/visualization/*</code>.", files:["src/handlers/visualization.rs","src/handlers/graph_view.html"]},
+    ]
+  },
+  {
+    cat:"ingest", num:"►", title:"Ingest", accent:C.ingest,
+    sub:"Multi-format extraction → memory store",
+    nodes:[
+      {t:"Text extraction", tag:"generic · PDF (feature) · chunking", d:"Multi-format extractors normalise documents into memories. PDF support behind the <code>pdf</code> feature flag.", files:["src/ingest/"]},
+      {t:"GitHub / Google Drive", tag:"source ingestors", d:"Pull content directly from GitHub repos and Google Drive into the store.", files:["src/ingest/"]},
+      {t:"Project seeding", tag:"cold-start", d:"Bulk-ingest a project's contents to bootstrap a fresh memory store. Exposed as the <code>seed_project</code> MCP tool.", files:["src/handlers/seed.rs"]},
+      {t:"Webhooks", tag:"Linear · GitHub", d:"Authenticated + rate-limited webhook ingest. Routes <code>/webhook/linear</code>, <code>/webhook/github</code>.", files:["src/handlers/webhooks.rs"]},
+      {t:"Streaming ingest", tag:"WebSocket /api/stream", d:"High-throughput memory ingestion over WebSocket (1577 lines). Distinct from the SSE endpoints (<code>/api/context/sse</code>, <code>/api/events/sse</code>).", files:["src/streaming.rs"]},
+      {t:"MIF import/export", tag:"Mem0 · native · markdown", d:"Memory Interchange Format adapters with PII handling — the basis for the spun-out OMIR open standard.", files:["src/mif/"], badges:["PII policy"]},
+    ]
+  },
+  {
+    cat:"memory", num:"3.0", title:"Memory Core — the model", accent:C.memory,
+    sub:"Tiered, faceted, decaying, confidence-calibrated records",
+    tiers:true,
+    nodes:[
+      {t:"Facets", tag:"Who·What·When·Where·Why + 7 more", d:"Page-type taxonomy: <code>Who/What/When/Where/Why</code> plus <code>RecordKind, ContentKind, CausalLink, EngramBinding, Prediction, AgentRef, Place</code>. The taxonomy a wiki view needs already exists here.", files:["src/memory/facets.rs"]},
+      {t:"Context blocks", tag:"Letta-style mutable state", d:"Persistently editable agent state — <code>key, content, max_tokens, version</code>. Distinct from memories: these are mutable, not retrieved-and-decayed.", files:["src/memory/context_blocks.rs"]},
+      {t:"Calibrated confidence", tag:"Bayesian α/β · gate 0.85–1.0", d:"Each memory carries a Bayesian α/β confidence; retrieval gates between 0.85 and 1.0. Confidence observations and feedback momentum feed the scorer.", files:["src/memory/types.rs"]},
+      {t:"Decay", tag:"multi-time-scale", d:"Multi-time-scale decay curves. Anchored memories resist decay (<code>/api/anchor</code>); <code>remember</code>/<code>forget</code> are emphasis signals on the decay rate.", files:["src/decay.rs","src/decay_scales.rs"]},
+      {t:"Prospective memory", tag:"ExperienceType::Intention", d:"Future-facing reminders, filtered from normal recall; surfaced via dedicated reminder queries or spreading activation.", files:["src/memory/types.rs"]},
+    ]
+  },
+  {
+    cat:"retrieval", num:"3.5–5.85", title:"Retrieval Pipeline — the hot path", accent:C.retrieval,
+    sub:"Multi-layer hybrid search · layer numbers (3.5 / 4.527 / 5.85) are real, not typos",
+    nodes:[
+      {t:"① Vector search", tag:"HNSW (active) · Vamana · SPANN · PQ", trace:0, d:"HNSW is the active engine. Vamana/DiskANN, SPANN and PQ codecs all live alongside it for large-collection (500k+) workloads.", files:["src/vector_db/"], badges:["HNSW default"]},
+      {t:"② Dual-embedder", tag:"MiniLM 384d + Nomic 768d", trace:1, d:"<code>CompetitiveEmbedder</code> runs MiniLM 384d against Nomic 768d via LM Studio / Ollama / vLLM (auto-detect), using <code>Arc&lt;dyn Embedder&gt;</code>. Embeddings cache is HTTP+LRU, optionally Zenoh-shared.", files:["src/embeddings/"]},
+      {t:"③ BM25 keyword", tag:"Tantivy full-text", trace:2, d:"Full-text inverted index complements vector recall for exact-term and rare-token matches.", files:["src/memory/"], badges:["Tantivy"]},
+      {t:"④ Graph activation", tag:"Hebbian spreading", trace:3, d:"Spreading activation over Hebbian edges pulls in associated memories — the associative layer of recall.", files:["src/memory/graph_retrieval.rs"]},
+      {t:"⑤ Cross-encoder rerank", tag:"~18% blend · top-20", trace:4, d:"Reranks the top-20 candidates at an ~18% blend weight — the dominant cost at 50k–500k memories. Tune via CognitiveDials to reduce rerank K.", files:["src/embeddings/cross_encoder.rs"]},
+      {t:"⑥ 20-signal scoring", tag:"ScoringSignals", trace:5, signals:true, d:"The final rank fuses 20+ named signals. Each result also carries a <code>SignalAttribution</code> — which signals drove its rank — feeding adaptive weight learning.", files:["src/memory/types.rs"]},
+      {t:"⑦ External dimensions", tag:"Sleight modulation", trace:6, d:"<code>ExternalDimensionScores</code> — density, coherence, closure, confidence, isotropy — from Sleight's evaluation engine modulate rank while fresh. Pushed via <code>/api/sleight/dimensions</code>.", files:["src/memory/types.rs"]},
+    ]
+  },
+  {
+    cat:"storage", num:"DB", title:"Storage", accent:C.storage,
+    sub:"Trait abstraction · Redb requested, RocksDB effective (v0.9 flips it)",
+    nodes:[
+      {t:"Storage traits", tag:"Primary · Graph · KeyValue", d:"<code>PrimaryMemoryStore</code>, <code>GraphStore</code>, <code>KeyValueStore</code> with <code>StorageCapabilities</code> per backend. New code targets these traits so it lands ready for the redb cutover.", files:["src/storage/mod.rs"]},
+      {t:"Redb (requested)", tag:"single-file · feature storage-redb", d:"<code>default_requested_storage_backend() → Redb</code>. The primary/graph/audit redb stores are now <b>implemented</b> in src/storage/; only the runtime flip remains for v0.9.", files:["src/config.rs","src/storage/"], badges:["default-requested","stores built"]},
+      {t:"RocksDB (effective)", tag:"current runtime engine", d:"<code>effective_storage_backend_for_current_build(Redb)</code> currently returns <code>RocksDb</code> (config.rs:65). The legacy path is the engine you actually run today.", files:["src/storage/legacy_rocksdb.rs"], badges:["runtime today"]},
+      {t:"Data paths", tag:"per-OS + legacy fallback", d:"Linux <code>~/.local/share/veld/</code> · macOS <code>~/Library/Application Support/veld/</code> · Windows <code>%APPDATA%\\veld\\</code> · falls back to <code>./veld_data/</code> for ≤0.1.80 dirs.", files:["src/config.rs"]},
+      {t:"Backups", tag:"create · verify · restore · purge", d:"Snapshot before the redb flip; restore to roll back to the legacy backend. <code>POST /api/backup/create</code> and friends.", files:["src/handlers/"]},
+      {t:"Store↔log durability", tag:"reconcile · LSN order · journaling", d:"Reconcile-on-startup, LSN ordering, and bulk-forget journaling keep the primary store consistent with the intent log. A per-user write-path serialization lock (W-005) generalizes CONSOLIDATION_LOCKS to all writes.", files:["src/storage/","src/intent_log/"]},
+    ]
+  },
+  {
+    cat:"consolidate", num:"REM", title:"Consolidation — background cognition", accent:C.consolidate,
+    sub:"Detached tokio task · per-user CONSOLIDATION_LOCKS · returns 202",
+    nodes:[
+      {t:"Consolidation pipeline", tag:"extract → maintain → strengthen", d:"<code>consolidate_memories</code>: fact extraction → maintenance (replay + tier consolidation + decay) → graph strengthening. Spawned detached so it survives the 60s HTTP timeout. Guarded by per-user <code>CONSOLIDATION_LOCKS</code>.", files:["src/handlers/consolidation.rs"], badges:["202 Accepted"]},
+      {t:"Sleep-phase", tag:"/api/consolidation/sleep", d:"A deeper replay pass — the slow-wave consolidation analogue.", files:["src/handlers/consolidation.rs"]},
+      {t:"Gap topology", tag:"detector · scoring · Voronoi", d:"Surfaces knowledge gaps in the graph via Voronoi decomposition of the embedding space.", files:["src/memory/gap_topology/"]},
+      {t:"Wavelet sessions", tag:"session segmentation", d:"Wavelet analysis segments the activity stream into coherent sessions.", files:["src/memory/wavelet_sessions.rs"]},
+      {t:"Compression", tag:"semantic + size-based", d:"Consolidates clusters into facts; size-based compression keeps the store bounded.", files:["src/memory/compression.rs"]},
+    ]
+  },
+  {
+    cat:"graph", num:"KG", title:"Knowledge Graph & Event Log", accent:C.graph,
+    sub:"Entities, relationships, episodes · append-only intent journal",
+    nodes:[
+      {t:"Knowledge graph", tag:"Entity · Relationship · Episodic", d:"<code>EntityNode</code>, <code>RelationshipEdge</code>, <code>EpisodicNode</code>. Hebbian edges strengthened by <code>strengthen_memory_edges</code> during consolidation.", files:["src/graph_memory.rs"]},
+      {t:"Intent log", tag:"event-sourced · bincode", d:"Append-only journal with typed <code>IntentPayload</code> (bincode encode/decode). The system-of-record event stream.", files:["src/intent_log/"]},
+      {t:"LLM-Wiki", tag:"intent-log projection · edit-back", d:"Wiki render as a <code>WikiProjection</code> over the intent log; authed <code>POST /api/wiki/render</code>. Bidirectional edit-back: Obsidian edits flow back to the canonical store, with an optional default-off live watcher. Now shipped (was 'LLM-Wiki Phase 3').", files:["src/wiki/","src/wiki/watcher.rs"]},
+      {t:"Alignment v2", tag:"whitened-Procrustes + CSLS", d:"Cross-embedder alignment v2 engine: whitened-Procrustes + CSLS (beyond Procrustes + Ridge), payload hardening, conditioning, perf-flag config. Fit/eval bins, retrieval integration. Binaries: <code>alignment-collect/fit/eval</code>.", files:["src/bin/","evaluations/alignment/"]},
+    ]
+  },
+  {
+    cat:"cross", num:"⊕", title:"Cross-cutting", accent:C.cross,
+    sub:"Security, metrics, and feature-gated deployment surfaces",
+    nodes:[
+      {t:"Auth", tag:"API key + Phase C TOTP", d:"API-key middleware plus password + TOTP + recovery codes at <code>/api/user_auth/*</code>.", files:["src/auth.rs","src/user_auth/"]},
+      {t:"Metrics", tag:"Prometheus · veld_*", d:"989 lines of <code>veld_*</code> metric registrations; <code>/metrics</code> route gated by <code>VELD_METRICS_PUBLIC</code>.", files:["src/metrics.rs"]},
+      {t:"Multi-tenant", tag:"feature multi-tenant", d:"Hosaka collective-store, PII policy, maintenance.", files:["src/extensions/"], badges:["feature"]},
+      {t:"Fortress", tag:"feature fortress", d:"Fractal binary obfuscation, anti-debug, integrity checks for distribution builds.", files:["src/fortress/"], badges:["feature"]},
+      {t:"Zenoh transport", tag:"feature zenoh", d:"ROS2/robotics-native pub/sub — Veld's edge/robotics path.", files:["src/zenoh_transport/"], badges:["feature"]},
+      {t:"Telemetry", tag:"feature telemetry", d:"OpenTelemetry exporters for cloud / multi-node distributed tracing (~200 extra crates).", files:["src/"], badges:["feature"]},
+      {t:"Epistemic hygiene", tag:"source-trust · injection boundary", d:"Source-trust surfaced at recall; <code>injection_suspected</code> flagged for non-trusted-source content (W-006). The prompt-injection boundary for ingested memories.", files:["docs/src/architecture/epistemic-hygiene.md"]},
+      {t:"Instance registry", tag:"server-authored discovery", d:"Registry of live veld instances (replaces port-guessing). Consumed by the monitor, the statusline hook, and Claude session wiring.", files:["src/instance_registry.rs"]},
+    ]
+  },
+];
+
+const SIGNALS = [
+  "base score","recency","arousal","source credibility","temporal match","session boost",
+  "access count","graph strength","calibrated confidence","confidence observations",
+  "feedback momentum (EMA)","cross-encoder","importance","entity match","tag match",
+  "episode coherence","source-type mult.","emotional valence","sequence proximity",
+  "activation level","temporal fact density","entity density"
+];
+
+/* retrieval trace order: indices into the retrieval band nodes */
+const TRACE = [0,1,2,3,4,5,6];
+
+/* ---------------- render ---------------- */
+const flow = document.getElementById('flow');
+const filters = document.getElementById('filters');
+const legendEl = document.getElementById('legend');
+const panel = document.getElementById('panel');
+
+const CAT_LABEL = {client:"Clients",iface:"Interfaces",ingest:"Ingest",memory:"Memory",
+  retrieval:"Retrieval",storage:"Storage",consolidate:"Consolidation",graph:"Graph/Log",cross:"Cross-cut"};
+
+// filter chips
+let active = "all";
+const chips = [{k:"all",l:"Full system"}].concat(Object.keys(CAT_LABEL).map(k=>({k,l:CAT_LABEL[k]})));
+chips.forEach(c=>{
+  const el=document.createElement('div');
+  el.className='chip'+(c.k==='all'?' active':'');
+  el.textContent=c.l; el.dataset.k=c.k;
+  el.onclick=()=>{active=c.k;document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('active',x.dataset.k===c.k));applyFilter();};
+  filters.appendChild(el);
+});
+
+// legend
+Object.keys(C).forEach(k=>{
+  const s=document.createElement('span');
+  s.innerHTML=`<i class="sw" style="background:${C[k]}"></i>${CAT_LABEL[k]||k}`;
+  legendEl.appendChild(s);
+});
+
+// bands
+BANDS.forEach((b,bi)=>{
+  if(bi>0){const a=document.createElement('div');a.className='arrow';a.textContent='▼';flow.appendChild(a);}
+  const band=document.createElement('div');
+  band.className='band';band.dataset.cat=b.cat;band.style.setProperty('--accent',b.accent);
+  band.innerHTML=`<div class="band-head">
+      <span class="band-num">${b.num}</span>
+      <span class="band-title">${b.title}</span>
+      <span class="band-sub">${b.sub}</span></div>`;
+  const grid=document.createElement('div');grid.className='grid';
+  b.nodes.forEach((n,ni)=>{
+    const node=document.createElement('div');
+    node.className='node';node.style.setProperty('--accent',b.accent);
+    node.dataset.cat=b.cat;
+    if(b.cat==='retrieval'&&typeof n.trace==='number')node.dataset.trace=n.trace;
+    node.innerHTML=`<h4><span class="dot"></span>${n.t}</h4><div class="tag">${n.tag}</div>`;
+    node.onclick=()=>select(b,n,node);
+    grid.appendChild(node);
+  });
+  band.appendChild(grid);
+
+  if(b.tiers){
+    const tw=document.createElement('div');tw.className='tiers';
+    const tiers=[["Working","hot · brute-force",C.red],["Session","active context",C.yel],
+      ["LongTerm","HNSW + BM25",C.grn],["Archive","indexed, off-default",C.cross]];
+    tiers.forEach(([t,s,c])=>{
+      const d=document.createElement('div');d.className='tier';d.style.borderColor=c+'55';
+      d.innerHTML=`<b style="color:${c}">${t}</b><span>${s}</span>`;tw.appendChild(d);
+    });
+    band.appendChild(tw);
+    const tf=document.createElement('div');tf.className='tierflow';
+    tf.innerHTML='promotion = age × importance × access&nbsp; → &nbsp;Working ▸ Session ▸ LongTerm ▸ Archive';
+    band.appendChild(tf);
+  }
+  flow.appendChild(band);
+});
+
+function applyFilter(){
+  document.querySelectorAll('.band').forEach(b=>{
+    b.classList.toggle('dim', active!=='all' && b.dataset.cat!==active);
+  });
+}
+
+let selNode=null;
+function select(b,n,el){
+  if(selNode)selNode.classList.remove('sel');
+  selNode=el;el.classList.add('sel');
+  let html=`<div class="kicker" style="--accent:${b.accent};color:${b.accent}">${b.title}</div>
+    <h2>${n.t}</h2><div class="lead">${n.tag}</div><p>${n.d}</p>`;
+  if(n.signals){
+    html+=`<h5>20-signal scoring · ScoringSignals</h5><div class="signals">`;
+    SIGNALS.forEach((s,i)=>html+=`<div class="sig"><b>${String(i+1).padStart(2,'0')}</b>${s}</div>`);
+    html+=`</div>`;
+  }
+  if(n.badges){html+=`<div class="badges">`+n.badges.map(x=>`<span class="badge">${x}</span>`).join('')+`</div>`;}
+  if(n.files){html+=`<h5>Where to look</h5><div class="filelist">`+n.files.map(f=>`<code>${f}</code>`).join('')+`</div>`;}
+  panel.innerHTML=html;
+  panel.scrollTop=0;
+}
+
+function welcome(){
+  panel.innerHTML=`
+    <div class="kicker">Visual model</div>
+    <h2>Veld in one view</h2>
+    <div class="lead">Edge-native cognitive memory — read top to bottom as a request flows.</div>
+    <p>A client action enters through an <b style="color:${C.iface}">interface</b>, may bring data in via <b style="color:${C.ingest}">ingest</b>, lands in the faceted, tiered, decaying <b style="color:${C.memory}">memory core</b>, and is recalled through the multi-layer hybrid <b style="color:${C.retrieval}">retrieval pipeline</b>. Everything persists to <b style="color:${C.storage}">storage</b>, while <b style="color:${C.consolidate}">consolidation</b> replays and strengthens the <b style="color:${C.graph}">knowledge graph</b> in the background.</p>
+    <h5>Try it</h5>
+    <p>· Click any block for detail and source files.<br>
+       · Use the chips above to isolate one subsystem.<br>
+       · Hit <b style="color:${C.gr}">▶ Trace a recall query</b> to watch a query move through the seven retrieval layers.</p>
+    <div class="badges">
+      <span class="badge">single binary</span><span class="badge">offline</span>
+      <span class="badge">no external DBs</span><span class="badge">no API keys</span>
+      <span class="badge">Zenoh / ROS2-native</span>
+    </div>
+    <h5>Distribution</h5>
+    <div class="filelist">
+      <code>crates.io · veld</code><code>npm · @veld/memory-mcp</code>
+      <code>PyPI · veld</code><code>Docker · varunveld/veld</code>
+    </div>`;
+}
+welcome();
+
+/* ---------------- recall query trace animation ---------------- */
+const traceBanner=document.getElementById('trace');
+let tracing=false;
+document.getElementById('traceBtn').onclick=()=>{
+  if(tracing)return;
+  tracing=true;
+  // isolate retrieval visually
+  active='retrieval';
+  document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('active',x.dataset.k==='retrieval'));
+  applyFilter();
+  traceBanner.classList.add('on');
+  const labels=[
+    "① Vector search — HNSW pulls nearest neighbours",
+    "② Dual-embedder — MiniLM 384d vs Nomic 768d compete",
+    "③ BM25 — Tantivy adds exact-term hits",
+    "④ Graph activation — Hebbian edges spread to associates",
+    "⑤ Cross-encoder — top-20 reranked at ~18% blend",
+    "⑥ 20-signal scoring — signals fuse into final rank + attribution",
+    "⑦ External dimensions — Sleight modulates while fresh → results returned"
+  ];
+  const nodes=[...document.querySelectorAll('.node[data-trace]')]
+    .sort((a,b)=>a.dataset.trace-b.dataset.trace);
+  let i=0;
+  const step=()=>{
+    nodes.forEach(n=>n.classList.remove('hot'));
+    if(i>=TRACE.length){
+      traceBanner.innerHTML='✓ Recall complete — ranked, attributed memories returned to the agent.';
+      setTimeout(()=>{traceBanner.classList.remove('on');tracing=false;},2600);
+      return;
+    }
+    const n=nodes[i];
+    n.classList.add('hot');
+    n.scrollIntoView({behavior:'smooth',block:'center'});
+    traceBanner.textContent=labels[i];
+    i++;
+    setTimeout(step,1150);
+  };
+  step();
+};
+
+document.getElementById('resetBtn').onclick=()=>{
+  active='all';
+  document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('active',x.dataset.k==='all'));
+  applyFilter();
+  if(selNode){selNode.classList.remove('sel');selNode=null;}
+  traceBanner.classList.remove('on');tracing=false;
+  document.querySelectorAll('.node').forEach(n=>n.classList.remove('hot'));
+  welcome();
+  window.scrollTo({top:0,behavior:'smooth'});
+};
+</script>
+</body>
+</html>
