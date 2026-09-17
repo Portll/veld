@@ -58,8 +58,10 @@ veld_config.json
 .env
 !.env.example
 
-# Claude settings
+# Claude settings. .claude/ stays ignored; the few tracked files under it were added with -f.
+# settings.json is per-machine (permissions, local ports): copy .claude/settings.json.example to start.
 .claude/
+.claude/settings.json
 
 # Internal documentation (keep local only)
 COGNITIVE_ARCHITECTURE.md
