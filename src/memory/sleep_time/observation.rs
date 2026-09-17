@@ -149,9 +149,7 @@ fn observation_metadata(draft: &ObservationDraft) -> HashMap<String, String> {
 /// [`MemoryOrigin::visible_to_evidence`].
 pub fn origin_of(experience: &Experience) -> MemoryOrigin {
     match experience.metadata.get("origin").map(|s| s.as_str()) {
-        Some("background_sleep_time_observation") => {
-            MemoryOrigin::BackgroundSleepTimeObservation
-        }
+        Some("background_sleep_time_observation") => MemoryOrigin::BackgroundSleepTimeObservation,
         Some("background_sleep_time_graduated") => MemoryOrigin::BackgroundSleepTimeGraduated,
         Some("foreground_agent") => MemoryOrigin::ForegroundAgent,
         Some("background_maintenance") => MemoryOrigin::BackgroundMaintenance,
@@ -164,8 +162,7 @@ pub fn origin_of(experience: &Experience) -> MemoryOrigin {
 pub fn is_sleep_time_authored(experience: &Experience) -> bool {
     matches!(
         origin_of(experience),
-        MemoryOrigin::BackgroundSleepTimeObservation
-            | MemoryOrigin::BackgroundSleepTimeGraduated
+        MemoryOrigin::BackgroundSleepTimeObservation | MemoryOrigin::BackgroundSleepTimeGraduated
     )
 }
 
@@ -194,7 +191,10 @@ mod tests {
             exp.metadata.get("origin").map(|s| s.as_str()),
             Some("background_sleep_time_observation")
         );
-        assert_eq!(exp.metadata.get("sleep_mode").map(|s| s.as_str()), Some("nrem"));
+        assert_eq!(
+            exp.metadata.get("sleep_mode").map(|s| s.as_str()),
+            Some("nrem")
+        );
         assert_eq!(
             exp.metadata.get("embedder_version").map(|s| s.as_str()),
             Some("minilm-l6-v2")

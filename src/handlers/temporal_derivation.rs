@@ -84,9 +84,9 @@ pub fn derive_answer_for_user_query(
     // in the query. Reuses the same event index `resolve_event_to_date` walks.
     let fact_lookup = |q: &str| -> Vec<crate::memory::temporal_facts::TemporalFact> {
         let stopwords = [
-            "when", "did", "does", "is", "was", "were", "the", "a", "an", "of", "to", "do",
-            "what", "date", "day", "time", "on", "in", "at", "go", "have", "has", "and", "or",
-            "her", "his", "their", "they", "she", "he",
+            "when", "did", "does", "is", "was", "were", "the", "a", "an", "of", "to", "do", "what",
+            "date", "day", "time", "on", "in", "at", "go", "have", "has", "and", "or", "her",
+            "his", "their", "they", "she", "he",
         ];
         let mut seen = std::collections::HashSet::new();
         let mut facts = Vec::new();

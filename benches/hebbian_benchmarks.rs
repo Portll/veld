@@ -8,8 +8,8 @@
 //! - Associative retrieval with learned associations
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use veld::memory::{Experience, MemoryConfig, MemorySystem, Query, RetrievalOutcome};
 use tempfile::TempDir;
+use veld::memory::{Experience, MemoryConfig, MemorySystem, Query, RetrievalOutcome};
 
 /// Create test memory system
 fn setup_memory_system() -> (MemorySystem, TempDir) {

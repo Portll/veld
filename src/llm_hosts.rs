@@ -70,7 +70,10 @@ impl Host {
 
     /// `VELD_LLM_URL_LLAMA_CPP`, `VELD_LLM_URL_LMSTUDIO`, …
     pub fn url_env_var(&self) -> String {
-        format!("VELD_LLM_URL_{}", self.id.to_uppercase().replace(['.', '-'], "_"))
+        format!(
+            "VELD_LLM_URL_{}",
+            self.id.to_uppercase().replace(['.', '-'], "_")
+        )
     }
 
     /// Base URL honouring the per-host override. Read at CALL time, never cached at load: a
@@ -143,7 +146,10 @@ mod tests {
         assert!(d.version >= 1);
         assert!(host(&d.default).is_some(), "default names no declared host");
         for id in &d.probe_order {
-            assert!(host(id).is_some(), "probeOrder names {id}, which no host declares");
+            assert!(
+                host(id).is_some(),
+                "probeOrder names {id}, which no host declares"
+            );
         }
     }
 
@@ -153,7 +159,10 @@ mod tests {
     fn the_default_is_open_source_even_though_it_is_not_probed_first() {
         let d = declaration();
         let def = host(&d.default).expect("default exists");
-        assert!(def.open_source, "the documented default must be nameable in published work");
+        assert!(
+            def.open_source,
+            "the documented default must be nameable in published work"
+        );
         assert_ne!(
             d.default, d.probe_order[0],
             "default and probe order are different questions and were conflated before this file"
@@ -167,8 +176,15 @@ mod tests {
 
     #[test]
     fn a_shared_port_is_not_identified() {
-        let shared: Vec<&Host> = declaration().hosts.iter().filter(|h| h.port_is_shared).collect();
-        assert!(shared.len() >= 2, "the 8080 collision is the case this exists for");
+        let shared: Vec<&Host> = declaration()
+            .hosts
+            .iter()
+            .filter(|h| h.port_is_shared)
+            .collect();
+        assert!(
+            shared.len() >= 2,
+            "the 8080 collision is the case this exists for"
+        );
         let port = port_of(&shared[0].base_url).expect("has a port");
         assert!(
             identify_by_port(port).is_none(),
@@ -176,16 +192,27 @@ mod tests {
         );
 
         // …and the unshared case still resolves, so this is not just "never identify anything".
-        let solo = declaration().hosts.iter().find(|h| !h.port_is_shared).expect("one exists");
+        let solo = declaration()
+            .hosts
+            .iter()
+            .find(|h| !h.port_is_shared)
+            .expect("one exists");
         let solo_port = port_of(&solo.base_url).expect("has a port");
-        assert_eq!(identify_by_port(solo_port).map(|h| h.id.as_str()), Some(solo.id.as_str()));
+        assert_eq!(
+            identify_by_port(solo_port).map(|h| h.id.as_str()),
+            Some(solo.id.as_str())
+        );
     }
 
     #[test]
     fn ollama_is_recorded_as_removed_rather_than_silently_absent() {
         let d = declaration();
         assert!(!d.hosts.iter().any(|h| h.id == "ollama"));
-        let gone = d.removed.iter().find(|r| r.id == "ollama").expect("removal is recorded");
+        let gone = d
+            .removed
+            .iter()
+            .find(|r| r.id == "ollama")
+            .expect("removal is recorded");
         assert!(!gone.reason.is_empty() && gone.removed_on.starts_with("2026-"));
     }
 
@@ -204,11 +231,20 @@ mod tests {
         let h = host("lmstudio").expect("declared");
         assert_eq!(h.url_env_var(), "VELD_LLM_URL_LMSTUDIO");
         // The dot in `llama.cpp` has to survive into a legal variable name.
-        assert_eq!(host("llama.cpp").unwrap().url_env_var(), "VELD_LLM_URL_LLAMA_CPP");
-
-        assert_eq!(h.base_url_with(|_| None), h.base_url, "no override, declared value");
         assert_eq!(
-            h.base_url_with(|k| (k == "VELD_LLM_URL_LMSTUDIO").then(|| "http://127.0.0.1:9999".into())),
+            host("llama.cpp").unwrap().url_env_var(),
+            "VELD_LLM_URL_LLAMA_CPP"
+        );
+
+        assert_eq!(
+            h.base_url_with(|_| None),
+            h.base_url,
+            "no override, declared value"
+        );
+        assert_eq!(
+            h.base_url_with(
+                |k| (k == "VELD_LLM_URL_LMSTUDIO").then(|| "http://127.0.0.1:9999".into())
+            ),
             "http://127.0.0.1:9999"
         );
         // A different host's override must not leak across.

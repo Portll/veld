@@ -40,9 +40,9 @@ pub fn generate_secret() -> Vec<u8> {
 fn build_totp(secret: &[u8], account: &str) -> Result<TOTP, AuthError> {
     // `totp-rs` requires the secret as `Vec<u8>`; we own a copy so the
     // caller's reference outlives the construction.
-    let raw = Secret::Raw(secret.to_vec()).to_bytes().map_err(|e| {
-        AuthError::internal(format!("invalid TOTP secret encoding: {e:?}"))
-    })?;
+    let raw = Secret::Raw(secret.to_vec())
+        .to_bytes()
+        .map_err(|e| AuthError::internal(format!("invalid TOTP secret encoding: {e:?}")))?;
 
     TOTP::new(
         Algorithm::SHA1,
@@ -61,11 +61,7 @@ fn build_totp(secret: &[u8], account: &str) -> Result<TOTP, AuthError> {
 /// `unix_timestamp` is seconds since the UNIX epoch (use [`current_unix_time`]
 /// for "now"). The verification window is `±TOTP_SKEW_STEPS` steps around the
 /// supplied timestamp.
-pub fn verify_code(
-    secret: &[u8],
-    candidate: &str,
-    unix_timestamp: u64,
-) -> Result<bool, AuthError> {
+pub fn verify_code(secret: &[u8], candidate: &str, unix_timestamp: u64) -> Result<bool, AuthError> {
     if candidate.len() != TOTP_DIGITS || !candidate.chars().all(|c| c.is_ascii_digit()) {
         return Ok(false);
     }
@@ -177,10 +173,7 @@ mod tests {
         assert!(uri.starts_with("otpauth://totp/"), "shape: {uri}");
         assert!(uri.contains("Veld"), "issuer in label/query: {uri}");
         // The label is URL-encoded; `alice` is unambiguous before the `@`.
-        assert!(
-            uri.contains("alice"),
-            "account label appears in uri: {uri}"
-        );
+        assert!(uri.contains("alice"), "account label appears in uri: {uri}");
         // Secret + issuer always appear as query params per RFC. totp-rs
         // 5.x omits default algorithm (SHA1) / digits (6) / period (30)
         // from the query string because authenticator apps already assume

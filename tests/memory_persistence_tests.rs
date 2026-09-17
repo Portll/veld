@@ -858,7 +858,10 @@ fn every_stored_memory_is_present_in_both_indexes() {
 
     let (stored, vector_indexed, lexically_indexed) =
         system.index_coverage().expect("index_coverage");
-    assert_eq!(stored, N, "storage did not receive every remembered experience");
+    assert_eq!(
+        stored, N,
+        "storage did not receive every remembered experience"
+    );
     assert_eq!(
         vector_indexed, stored,
         "vector index holds {vector_indexed} of {stored} stored memories — \

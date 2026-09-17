@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use super::graduation::{effective_origin, GraduationStore};
 use super::policies::BudgetTracker;
+#[cfg(test)]
+use super::types::MemoryOrigin;
 use super::types::{
     BlockSnapshot, EvidenceFact, EvidenceMemory, EvidencePack, SleepMode, SleepTimeTrigger,
 };
-#[cfg(test)]
-use super::types::MemoryOrigin;
 use crate::memory::context_blocks::ContextBlockStore;
 use crate::memory::types::{MemoryTier, SharedMemory};
 use crate::memory::MemorySystem;
@@ -212,10 +212,7 @@ fn approx_tokens_of(s: &str) -> u32 {
     chars.div_ceil(APPROX_CHARS_PER_TOKEN)
 }
 
-fn truncate_to_token_budget(
-    memories: Vec<EvidenceMemory>,
-    max_tokens: u32,
-) -> Vec<EvidenceMemory> {
+fn truncate_to_token_budget(memories: Vec<EvidenceMemory>, max_tokens: u32) -> Vec<EvidenceMemory> {
     let mut total = 0u32;
     let mut out = Vec::with_capacity(memories.len());
     for m in memories {

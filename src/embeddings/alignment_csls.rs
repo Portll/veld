@@ -80,7 +80,10 @@ mod tests {
         let query_sims = vec![0.7, 0.7]; // identical raw cosine to both candidates
         let local = vec![0.9, 0.1]; // candidate 0 is a hub, candidate 1 is not
         let adj = csls_adjust(&query_sims, 2, &local);
-        assert!(adj[1] > adj[0], "non-hub should outrank hub after CSLS: {adj:?}");
+        assert!(
+            adj[1] > adj[0],
+            "non-hub should outrank hub after CSLS: {adj:?}"
+        );
     }
 
     #[test]

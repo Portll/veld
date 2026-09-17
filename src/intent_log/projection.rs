@@ -92,10 +92,7 @@ pub fn replay<P: Projection>(
     persist_every: Option<u64>,
 ) -> Result<u64, ReplayError> {
     let projection_name = projection.name().to_string();
-    let resume_at = projection
-        .checkpoint()
-        .map(Lsn::next)
-        .unwrap_or(Lsn::ZERO);
+    let resume_at = projection.checkpoint().map(Lsn::next).unwrap_or(Lsn::ZERO);
     let head_lsn = log.next_lsn();
 
     // INFO-level span around the whole replay driver loop, with structured
@@ -117,10 +114,8 @@ pub fn replay<P: Projection>(
         if record.lsn < resume_at {
             continue;
         }
-        let timer = Timer::new(
-            PROJECTION_APPLY_DURATION
-                .with_label_values(&[projection_name.as_str()]),
-        );
+        let timer =
+            Timer::new(PROJECTION_APPLY_DURATION.with_label_values(&[projection_name.as_str()]));
         let apply_result = projection.apply(&record);
         drop(timer);
         match apply_result {
@@ -201,11 +196,7 @@ pub fn replay<P: Projection>(
     CHECKPOINT_PERSIST_TOTAL
         .with_label_values(&[projection_name.as_str(), "ok"])
         .inc();
-    publish_checkpoint_gauges(
-        projection_name.as_str(),
-        projection.checkpoint(),
-        head_lsn,
-    );
+    publish_checkpoint_gauges(projection_name.as_str(), projection.checkpoint(), head_lsn);
 
     tracing::Span::current().record("applied", applied);
     Ok(applied)
@@ -306,7 +297,10 @@ mod tests {
         fn apply(&mut self, record: &IntentRecord) -> Result<(), FlakyError> {
             if Some(record.lsn) == self.fail_once_at {
                 self.fail_once_at = None;
-                return Err(FlakyError(format!("seeded failure at lsn {:?}", record.lsn)));
+                return Err(FlakyError(format!(
+                    "seeded failure at lsn {:?}",
+                    record.lsn
+                )));
             }
             self.applied.push(record.lsn);
             self.checkpoint = Some(record.lsn);
@@ -329,7 +323,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("veld-intent-log-projection-{name}-{pid}-{stamp}.log"));
+        p.push(format!(
+            "veld-intent-log-projection-{name}-{pid}-{stamp}.log"
+        ));
         p
     }
 
@@ -552,7 +548,10 @@ mod tests {
         let cp_lsn = PROJECTION_CHECKPOINT_LSN
             .with_label_values(&[projection_name.as_str()])
             .get();
-        assert_eq!(cp_lsn, 0, "checkpoint gauge should reflect last applied lsn");
+        assert_eq!(
+            cp_lsn, 0,
+            "checkpoint gauge should reflect last applied lsn"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

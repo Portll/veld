@@ -153,7 +153,10 @@ impl TemporalBound {
             // It intersects [ws, we] iff ws <= x.
             TemporalBound::Before(anchor) => window_start <= *anchor,
             // Fuzzy interval [c-r, c+r] intersects [ws, we] via standard overlap.
-            TemporalBound::Fuzzy { centre, radius_days } => {
+            TemporalBound::Fuzzy {
+                centre,
+                radius_days,
+            } => {
                 let r = Duration::days(*radius_days as i64);
                 let fuzzy_start = *centre - r;
                 let fuzzy_end = *centre + r;
@@ -185,7 +188,10 @@ impl ResolvedTime {
             // Inferential — namespaced to prevent collision with exact-date arms.
             ResolvedTime::After(d) => format!("after:{}", d.format("%Y-%m-%d")),
             ResolvedTime::Before(d) => format!("before:{}", d.format("%Y-%m-%d")),
-            ResolvedTime::Around { centre, radius_days } => {
+            ResolvedTime::Around {
+                centre,
+                radius_days,
+            } => {
                 format!("around:{}:{}d", centre.format("%Y-%m-%d"), radius_days)
             }
         }
@@ -227,7 +233,10 @@ impl ResolvedTime {
             // Inferential → corresponding open/fuzzy bound.
             ResolvedTime::After(d) => TemporalBound::After(*d),
             ResolvedTime::Before(d) => TemporalBound::Before(*d),
-            ResolvedTime::Around { centre, radius_days } => TemporalBound::Fuzzy {
+            ResolvedTime::Around {
+                centre,
+                radius_days,
+            } => TemporalBound::Fuzzy {
                 centre: *centre,
                 radius_days: *radius_days,
             },
@@ -327,9 +336,25 @@ pub fn detect_semantic_opposition(text_a: &str, text_b: &str) -> bool {
     // and they share significant vocabulary (caller already verified similarity > 0.85),
     // that's a strong signal of contradiction.
     let negation_markers = [
-        "not ", "n't ", "no ", "never ", "doesn't ", "don't ", "didn't ",
-        "isn't ", "aren't ", "wasn't ", "weren't ", "won't ", "wouldn't ",
-        "can't ", "cannot ", "couldn't ", "shouldn't ", "hasn't ", "haven't ",
+        "not ",
+        "n't ",
+        "no ",
+        "never ",
+        "doesn't ",
+        "don't ",
+        "didn't ",
+        "isn't ",
+        "aren't ",
+        "wasn't ",
+        "weren't ",
+        "won't ",
+        "wouldn't ",
+        "can't ",
+        "cannot ",
+        "couldn't ",
+        "shouldn't ",
+        "hasn't ",
+        "haven't ",
         "hadn't ",
     ];
 
@@ -406,9 +431,7 @@ pub struct TemporalFactStore {
 impl TemporalFactStore {
     pub fn new(db: Arc<DB>) -> Self {
         Self {
-            store: Arc::new(
-                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
-            ),
+            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),
         }
     }
 
@@ -431,12 +454,14 @@ impl TemporalFactStore {
             fact.entity.to_lowercase(),
             fact.id
         );
-        self.store.put_bytes(entity_key.as_bytes(), fact.id.as_bytes())?;
+        self.store
+            .put_bytes(entity_key.as_bytes(), fact.id.as_bytes())?;
 
         // Event index (by each stem)
         for stem in &fact.event_stems {
             let event_key = format!("temporal_by_event:{}:{}:{}", user_id, stem, fact.id);
-            self.store.put_bytes(event_key.as_bytes(), fact.id.as_bytes())?;
+            self.store
+                .put_bytes(event_key.as_bytes(), fact.id.as_bytes())?;
         }
 
         Ok(())
@@ -648,8 +673,7 @@ impl TemporalFactStore {
         include_expired: bool,
     ) -> Result<Vec<TemporalFact>> {
         // Get facts by entity (already filtered by include_expired)
-        let entity_facts =
-            self.find_by_entity_filtered(user_id, entity, 100, include_expired)?;
+        let entity_facts = self.find_by_entity_filtered(user_id, entity, 100, include_expired)?;
 
         // Filter by event keywords
         let stemmer = Stemmer::create(Algorithm::English);
@@ -687,7 +711,6 @@ impl TemporalFactStore {
 
         // scan_prefix enforces the bound; the hand-written break is gone.
         for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
-
             let fact_id = String::from_utf8_lossy(&value);
             if seen_ids.insert(fact_id.to_string()) {
                 if let Some(fact) = self.get(user_id, &fact_id)? {
@@ -721,7 +744,6 @@ impl TemporalFactStore {
 
         // scan_prefix enforces the bound; the hand-written break is gone.
         for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
-
             if let Ok((fact, _)) = bincode::serde::decode_from_slice::<TemporalFact, _>(
                 &value,
                 bincode::config::standard(),
@@ -753,7 +775,6 @@ impl TemporalFactStore {
 
         // scan_prefix enforces the bound; the hand-written break is gone.
         for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
-
             if let Ok((fact, _)) = bincode::serde::decode_from_slice::<TemporalFact, _>(
                 &value,
                 bincode::config::standard(),
@@ -870,12 +891,10 @@ impl TemporalFactStore {
                                 None => return fact.clone(),
                             }
                         }
-                        ResolvedTime::Year(y) => {
-                            match NaiveDate::from_ymd_opt(*y, 12, 31) {
-                                Some(d) => ResolvedTime::After(d),
-                                None => return fact.clone(),
-                            }
-                        }
+                        ResolvedTime::Year(y) => match NaiveDate::from_ymd_opt(*y, 12, 31) {
+                            Some(d) => ResolvedTime::After(d),
+                            None => return fact.clone(),
+                        },
                         other => other.clone(),
                     }
                 } else {
@@ -887,12 +906,10 @@ impl TemporalFactStore {
                                 None => return fact.clone(),
                             }
                         }
-                        ResolvedTime::Year(y) => {
-                            match NaiveDate::from_ymd_opt(*y, 1, 1) {
-                                Some(d) => ResolvedTime::Before(d),
-                                None => return fact.clone(),
-                            }
-                        }
+                        ResolvedTime::Year(y) => match NaiveDate::from_ymd_opt(*y, 1, 1) {
+                            Some(d) => ResolvedTime::Before(d),
+                            None => return fact.clone(),
+                        },
                         other => other.clone(),
                     }
                 };
@@ -998,7 +1015,9 @@ impl TemporalFactStore {
             // For "before X": use the EARLIEST day covered by the anchor's resolved time.
             match &anchor_resolved {
                 ResolvedTime::ExactDate(d) => Some(*d),
-                ResolvedTime::MonthYear { month, year } => NaiveDate::from_ymd_opt(*year, *month, 1),
+                ResolvedTime::MonthYear { month, year } => {
+                    NaiveDate::from_ymd_opt(*year, *month, 1)
+                }
                 ResolvedTime::Year(y) => NaiveDate::from_ymd_opt(*y, 1, 1),
                 ResolvedTime::After(d) | ResolvedTime::Before(d) => Some(*d),
                 ResolvedTime::Around { centre, .. } => Some(*centre),
@@ -1092,9 +1111,7 @@ impl TemporalFactStore {
         }
 
         // Pick the most recent candidate by conversation_date.
-        let anchor_fact = candidates
-            .iter()
-            .max_by_key(|f| f.conversation_date)?;
+        let anchor_fact = candidates.iter().max_by_key(|f| f.conversation_date)?;
 
         // Cycle guard.
         if visited.contains(&anchor_fact.id) {
@@ -1112,14 +1129,10 @@ impl TemporalFactStore {
                     let lower = anchor_rel.to_lowercase();
                     let after_prefixes = ["since ", "from ", "after "];
                     let before_prefixes = ["prior to ", "before ", "until "];
-                    if let Some(rest) = after_prefixes
-                        .iter()
-                        .find_map(|p| lower.strip_prefix(p))
-                    {
+                    if let Some(rest) = after_prefixes.iter().find_map(|p| lower.strip_prefix(p)) {
                         rest.to_string()
-                    } else if let Some(rest) = before_prefixes
-                        .iter()
-                        .find_map(|p| lower.strip_prefix(p))
+                    } else if let Some(rest) =
+                        before_prefixes.iter().find_map(|p| lower.strip_prefix(p))
                     {
                         rest.to_string()
                     } else {
@@ -1243,8 +1256,8 @@ const PAST_AUX: &[&str] = &["was", "were", "wasn't", "weren't"];
 /// Negators that kill an intent fact when within 3 tokens before the head.
 /// `can't wait to` is whitelisted upstream (positive intent containing `can't`).
 const NEGATORS: &[&str] = &[
-    "not", "n't", "never", "don't", "doesn't", "didn't", "won't", "wouldn't",
-    "couldn't", "cannot", "can't", "refuse", "refused", "no",
+    "not", "n't", "never", "don't", "doesn't", "didn't", "won't", "wouldn't", "couldn't", "cannot",
+    "can't", "refuse", "refused", "no",
 ];
 
 /// Subordinators that turn `get to` into the arrival sense
@@ -1253,62 +1266,114 @@ const ARRIVAL_SUBORDINATORS: &[&str] = &["when", "once", "after", "until", "befo
 
 /// Determiners following a commitment verb signal a noun complement
 /// (`agreed to the terms`), not an event — skip.
-const DETERMINERS: &[&str] =
-    &["the", "a", "an", "my", "his", "her", "their", "our", "this", "that"];
+const DETERMINERS: &[&str] = &[
+    "the", "a", "an", "my", "his", "her", "their", "our", "this", "that",
+];
 
 /// Genuine future-intent phrases (multi-word, matched word-boundary). Present /
 /// future tense → Planned. The PAST and DECISION forms are handled separately so
 /// they route to the PastIntent / DecisionPast classes instead of confident-future.
 const INTENT_PHRASES: &[&str] = &[
     // canonical plan/intent
-    "planning to", "planning on", "plan to", "plans to",
-    "going to", "gonna",
-    "want to", "wants to", "wanting to", "wanna",
-    "hope to", "hopes to", "hoping to",
-    "intend to", "intends to", "intending to",
-    "aim to", "aims to", "aiming to",
-    "wish to", "wishes to", "wishing to",
-    "expect to", "expects to", "expecting to",
-    "thinking about", "thinking of",
-    "looking forward to", "look forward to", "looks forward to",
-    "excited to", "excited about",
+    "planning to",
+    "planning on",
+    "plan to",
+    "plans to",
+    "going to",
+    "gonna",
+    "want to",
+    "wants to",
+    "wanting to",
+    "wanna",
+    "hope to",
+    "hopes to",
+    "hoping to",
+    "intend to",
+    "intends to",
+    "intending to",
+    "aim to",
+    "aims to",
+    "aiming to",
+    "wish to",
+    "wishes to",
+    "wishing to",
+    "expect to",
+    "expects to",
+    "expecting to",
+    "thinking about",
+    "thinking of",
+    "looking forward to",
+    "look forward to",
+    "looks forward to",
+    "excited to",
+    "excited about",
     // polite / strong anticipation
-    "would like to", "'d like to",
-    "would love to", "'d love to",
-    "can't wait to", "cannot wait to",
+    "would like to",
+    "'d like to",
+    "would love to",
+    "'d love to",
+    "can't wait to",
+    "cannot wait to",
     // the requested addition + imminent/scheduled
-    "get to", "gets to", "getting to",
+    "get to",
+    "gets to",
+    "getting to",
     "about to",
-    "set to", "scheduled to", "slated to",
+    "set to",
+    "scheduled to",
+    "slated to",
     // deliberation
     "considering",
-    "decide to", "decides to", "deciding to",
-    "agree to", "agrees to",
-    "promise to", "promises to", "promising to",
+    "decide to",
+    "decides to",
+    "deciding to",
+    "agree to",
+    "agrees to",
+    "promise to",
+    "promises to",
+    "promising to",
 ];
 
 /// Future time markers (word-boundary). Presence alone (verb-less) is a weak
 /// future signal kept for back-compat at lowered confidence.
 const FUTURE_TIME_MARKERS: &[&str] = &[
-    "next month", "next week", "next year", "next weekend",
-    "this weekend", "tomorrow", "soon",
+    "next month",
+    "next week",
+    "next year",
+    "next weekend",
+    "this weekend",
+    "tomorrow",
+    "soon",
 ];
 
 /// Phrases that look like intent but must NEVER trigger a Planned fact.
 /// Checked and rejected before any INTENT_PHRASES match is honoured.
 const INTENT_TRAPS: &[&str] = &[
-    "due to",        // causal preposition ("cancelled due to rain")
-    "used to",       // past habitual ("used to run marathons")
-    "have to", "has to", "had to",   // obligation
-    "need to", "needs to", "needed to",
-    "got to", "gotta",               // obligation / past-opportunity
-    "able to",                        // capability
-    "supposed to",                    // expectation (v1: exclude)
-    "in order to", "so as to",       // purpose adjunct
-    "like to", "love to",            // bare habitual preference
-    "try to", "trying to", "tried to",
-    "ought to", "go to",
-    "happy to", "glad to", "willing to", "ready to",
+    "due to",  // causal preposition ("cancelled due to rain")
+    "used to", // past habitual ("used to run marathons")
+    "have to",
+    "has to",
+    "had to", // obligation
+    "need to",
+    "needs to",
+    "needed to",
+    "got to",
+    "gotta",       // obligation / past-opportunity
+    "able to",     // capability
+    "supposed to", // expectation (v1: exclude)
+    "in order to",
+    "so as to", // purpose adjunct
+    "like to",
+    "love to", // bare habitual preference
+    "try to",
+    "trying to",
+    "tried to",
+    "ought to",
+    "go to",
+    "happy to",
+    "glad to",
+    "willing to",
+    "ready to",
 ];
 
 /// Query-side symmetry: does a (lowercased) query phrase signal a *planned*
@@ -1318,8 +1383,7 @@ const INTENT_TRAPS: &[&str] = &[
 pub fn query_signals_planned_intent(query_lower: &str) -> bool {
     let tokens = sentence_tokens(query_lower);
     // Explicit planning words + the full intent inventory.
-    any_phrase(&tokens, &["planning", "will"])
-        || any_phrase(&tokens, INTENT_PHRASES)
+    any_phrase(&tokens, &["planning", "will"]) || any_phrase(&tokens, INTENT_PHRASES)
 }
 
 /// Classify the tense of an intent match given the sentence tokens.
@@ -1368,7 +1432,10 @@ fn is_arrival_get_to(tokens: &[&str]) -> bool {
     for (idx, tok) in tokens.iter().enumerate() {
         if head.contains(tok) && tokens.get(idx + 1) == Some(&"to") {
             let lo = idx.saturating_sub(2);
-            if tokens[lo..idx].iter().any(|t| ARRIVAL_SUBORDINATORS.contains(t)) {
+            if tokens[lo..idx]
+                .iter()
+                .any(|t| ARRIVAL_SUBORDINATORS.contains(t))
+            {
                 return true;
             }
         }
@@ -1379,7 +1446,9 @@ fn is_arrival_get_to(tokens: &[&str]) -> bool {
 /// Guard: commitment verb followed by a determiner ⇒ noun complement, not an
 /// event (`agreed to the terms`). True ⇒ skip.
 fn is_noun_complement(tokens: &[&str]) -> bool {
-    let commit = ["agree", "agrees", "agreed", "promise", "promises", "promised"];
+    let commit = [
+        "agree", "agrees", "agreed", "promise", "promises", "promised",
+    ];
     for (idx, tok) in tokens.iter().enumerate() {
         if commit.contains(tok)
             && tokens.get(idx + 1) == Some(&"to")
@@ -1394,9 +1463,7 @@ fn is_noun_complement(tokens: &[&str]) -> bool {
 /// Guard: perfect-infinitive complement (`excited to have met you`) references a
 /// PAST event — do not treat as a future plan. True ⇒ skip the Planned reading.
 fn is_perfect_infinitive(tokens: &[&str]) -> bool {
-    tokens
-        .windows(2)
-        .any(|w| w == ["to", "have"])
+    tokens.windows(2).any(|w| w == ["to", "have"])
 }
 
 /// Guard: a second-person question (`Do you want to come hiking?`). The sentence
@@ -1469,13 +1536,27 @@ pub fn extract_temporal_facts(
 
             // Require a past or planning verb form.
             let past_verbs = [
-                "went", "ran", "did", "took", "made", "had", "got", "saw", "met",
-                "was", "were", "attended", "visited", "started", "finished",
-                "completed", "joined", "left",
+                "went",
+                "ran",
+                "did",
+                "took",
+                "made",
+                "had",
+                "got",
+                "saw",
+                "met",
+                "was",
+                "were",
+                "attended",
+                "visited",
+                "started",
+                "finished",
+                "completed",
+                "joined",
+                "left",
             ];
             let planning_verbs = [
-                "planning", "going", "thinking", "want", "hope", "will", "would",
-                "am", "are", "is",
+                "planning", "going", "thinking", "want", "hope", "will", "would", "am", "are", "is",
             ];
             let has_verb = past_verbs.iter().any(|v| {
                 // word-boundary check: surrounded by non-alpha on both sides
@@ -1673,11 +1754,7 @@ fn extract_planning_fact(
     };
 
     // Verb-less future-marker-only sentences get a lowered confidence.
-    let confidence = if !has_intent_verb {
-        0.6
-    } else {
-        confidence
-    };
+    let confidence = if !has_intent_verb { 0.6 } else { confidence };
 
     let entity_stem = stemmer.stem(&entity.to_lowercase()).to_string();
     let event_stems: Vec<String> = event
@@ -1903,7 +1980,8 @@ fn extract_event_and_time(sentence: &str, patterns: &[&str]) -> (String, String)
     // Find which pattern matched (used to verify a pattern exists)
     let _matched_pattern = patterns
         .iter()
-        .find(|p| sentence_lower.contains(*p)).copied()
+        .find(|p| sentence_lower.contains(*p))
+        .copied()
         .unwrap_or("");
 
     // Extract time expression
@@ -1977,18 +2055,39 @@ fn extract_explicit_date_from_sentence(
     conversation_date: DateTime<Utc>,
 ) -> Option<(ResolvedTime, String)> {
     let months = [
-        ("january", 1u32), ("jan", 1), ("february", 2), ("feb", 2),
-        ("march", 3), ("mar", 3), ("april", 4), ("apr", 4), ("may", 5),
-        ("june", 6), ("jun", 6), ("july", 7), ("jul", 7), ("august", 8),
-        ("aug", 8), ("september", 9), ("sep", 9), ("sept", 9),
-        ("october", 10), ("oct", 10), ("november", 11), ("nov", 11),
-        ("december", 12), ("dec", 12),
+        ("january", 1u32),
+        ("jan", 1),
+        ("february", 2),
+        ("feb", 2),
+        ("march", 3),
+        ("mar", 3),
+        ("april", 4),
+        ("apr", 4),
+        ("may", 5),
+        ("june", 6),
+        ("jun", 6),
+        ("july", 7),
+        ("jul", 7),
+        ("august", 8),
+        ("aug", 8),
+        ("september", 9),
+        ("sep", 9),
+        ("sept", 9),
+        ("october", 10),
+        ("oct", 10),
+        ("november", 11),
+        ("nov", 11),
+        ("december", 12),
+        ("dec", 12),
     ];
 
     let conv_year = conversation_date.year();
 
     // -- ISO: YYYY-MM-DD --
-    if let Some(cap) = regex::Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b").ok()?.captures(sentence) {
+    if let Some(cap) = regex::Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+        .ok()?
+        .captures(sentence)
+    {
         let year: i32 = cap[1].parse().ok()?;
         let month: u32 = cap[2].parse().ok()?;
         let day: u32 = cap[3].parse().ok()?;
@@ -2004,7 +2103,10 @@ fn extract_explicit_date_from_sentence(
     // -- Month Day, Year  OR  Month Day Year  ("May 8, 2023" / "May 8 2023") --
     for &(month_name, month_num) in &months {
         // "May 8, 2023" or "May 8 2023"
-        let pat = format!(r"(?i)\b{}\s+(\d{{1,2}}),?\s+(\d{{4}})\b", regex::escape(month_name));
+        let pat = format!(
+            r"(?i)\b{}\s+(\d{{1,2}}),?\s+(\d{{4}})\b",
+            regex::escape(month_name)
+        );
         if let Ok(re) = regex::Regex::new(&pat) {
             if let Some(cap) = re.captures(&s_lower) {
                 let day: u32 = cap[1].parse().ok()?;
@@ -2017,7 +2119,10 @@ fn extract_explicit_date_from_sentence(
             }
         }
         // "8 May 2023" or "8 May, 2023"
-        let pat2 = format!(r"(?i)\b(\d{{1,2}})\s+{},?\s+(\d{{4}})\b", regex::escape(month_name));
+        let pat2 = format!(
+            r"(?i)\b(\d{{1,2}})\s+{},?\s+(\d{{4}})\b",
+            regex::escape(month_name)
+        );
         if let Ok(re) = regex::Regex::new(&pat2) {
             if let Some(cap) = re.captures(&s_lower) {
                 let day: u32 = cap[1].parse().ok()?;
@@ -2036,7 +2141,10 @@ fn extract_explicit_date_from_sentence(
                 let year: i32 = cap[1].parse().ok()?;
                 if (1900..=2100).contains(&year) {
                     return Some((
-                        ResolvedTime::MonthYear { month: month_num, year },
+                        ResolvedTime::MonthYear {
+                            month: month_num,
+                            year,
+                        },
                         cap[0].to_string(),
                     ));
                 }
@@ -2414,7 +2522,9 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
         if let Some(rest) = relative_lower.strip_prefix(prefix) {
             let inner = resolve_relative_time(rest, conversation_date);
             return match &inner {
-                ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => ResolvedTime::Unknown,
+                ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => {
+                    ResolvedTime::Unknown
+                }
                 ResolvedTime::ExactDate(d) => ResolvedTime::After(*d),
                 ResolvedTime::MonthYear { month, year } => {
                     // Take the LATEST day of the month as the anchor.
@@ -2433,7 +2543,10 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
                 // Propagate inferential — After(After(x)) collapses to After(x).
                 ResolvedTime::After(d) => ResolvedTime::After(*d),
                 ResolvedTime::Before(d) => ResolvedTime::Before(*d),
-                ResolvedTime::Around { centre, radius_days } => ResolvedTime::Around {
+                ResolvedTime::Around {
+                    centre,
+                    radius_days,
+                } => ResolvedTime::Around {
                     centre: *centre,
                     radius_days: *radius_days,
                 },
@@ -2446,7 +2559,9 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
         if let Some(rest) = relative_lower.strip_prefix(prefix) {
             let inner = resolve_relative_time(rest, conversation_date);
             return match &inner {
-                ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => ResolvedTime::Unknown,
+                ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => {
+                    ResolvedTime::Unknown
+                }
                 ResolvedTime::ExactDate(d) => ResolvedTime::Before(*d),
                 ResolvedTime::MonthYear { month, year } => {
                     // Take the EARLIEST day of the month as the anchor.
@@ -2464,7 +2579,10 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
                 }
                 ResolvedTime::After(d) => ResolvedTime::After(*d),
                 ResolvedTime::Before(d) => ResolvedTime::Before(*d),
-                ResolvedTime::Around { centre, radius_days } => ResolvedTime::Around {
+                ResolvedTime::Around {
+                    centre,
+                    radius_days,
+                } => ResolvedTime::Around {
                     centre: *centre,
                     radius_days: *radius_days,
                 },
@@ -2478,12 +2596,17 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
             let inner = resolve_relative_time(rest, conversation_date);
             let centre = match &inner {
                 ResolvedTime::ExactDate(d) => Some(*d),
-                ResolvedTime::MonthYear { month, year } => NaiveDate::from_ymd_opt(*year, *month, 1),
+                ResolvedTime::MonthYear { month, year } => {
+                    NaiveDate::from_ymd_opt(*year, *month, 1)
+                }
                 ResolvedTime::Year(y) => NaiveDate::from_ymd_opt(*y, 7, 1),
                 _ => None,
             };
             return match centre {
-                Some(c) => ResolvedTime::Around { centre: c, radius_days: 7 },
+                Some(c) => ResolvedTime::Around {
+                    centre: c,
+                    radius_days: 7,
+                },
                 None => ResolvedTime::Unknown,
             };
         }
@@ -2851,9 +2974,17 @@ mod tests {
     #[test]
     fn test_to_bound_projection() {
         let d = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
-        assert_eq!(ResolvedTime::ExactDate(d).to_bound(), TemporalBound::Point(d));
+        assert_eq!(
+            ResolvedTime::ExactDate(d).to_bound(),
+            TemporalBound::Point(d)
+        );
 
-        match (ResolvedTime::MonthYear { month: 6, year: 2023 }).to_bound() {
+        match (ResolvedTime::MonthYear {
+            month: 6,
+            year: 2023,
+        })
+        .to_bound()
+        {
             TemporalBound::Closed { start, end } => {
                 assert_eq!(start, NaiveDate::from_ymd_opt(2023, 6, 1).unwrap());
                 assert_eq!(end, NaiveDate::from_ymd_opt(2023, 6, 30).unwrap());
@@ -2873,7 +3004,11 @@ mod tests {
         );
         // B1: corrupt month must degrade to Unknown, not panic.
         assert_eq!(
-            (ResolvedTime::MonthYear { month: 13, year: 2023 }).to_bound(),
+            (ResolvedTime::MonthYear {
+                month: 13,
+                year: 2023
+            })
+            .to_bound(),
             TemporalBound::Unknown
         );
     }
@@ -2890,7 +3025,12 @@ mod tests {
         assert!(!p.overlaps_range(jun(20), jun(10)));
 
         // December MonthYear last-day computation crosses into next year.
-        match (ResolvedTime::MonthYear { month: 12, year: 2023 }).to_bound() {
+        match (ResolvedTime::MonthYear {
+            month: 12,
+            year: 2023,
+        })
+        .to_bound()
+        {
             TemporalBound::Closed { end, .. } => {
                 assert_eq!(end, NaiveDate::from_ymd_opt(2023, 12, 31).unwrap());
             }
@@ -3176,7 +3316,10 @@ mod tests {
     fn test_inferential_around_yesterday() {
         let expected_centre = conv().date_naive() - Duration::days(1);
         match resolve_relative_time("around yesterday", conv()) {
-            ResolvedTime::Around { centre, radius_days } => {
+            ResolvedTime::Around {
+                centre,
+                radius_days,
+            } => {
                 assert_eq!(centre, expected_centre);
                 assert_eq!(radius_days, 7);
             }
@@ -3188,7 +3331,10 @@ mod tests {
     #[test]
     fn test_inferential_recently() {
         match resolve_relative_time("recently", conv()) {
-            ResolvedTime::Around { centre, radius_days } => {
+            ResolvedTime::Around {
+                centre,
+                radius_days,
+            } => {
                 assert_eq!(centre, conv().date_naive());
                 assert_eq!(radius_days, 14);
             }
@@ -3225,8 +3371,15 @@ mod tests {
     fn test_to_bound_around() {
         let c = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
         assert_eq!(
-            ResolvedTime::Around { centre: c, radius_days: 7 }.to_bound(),
-            TemporalBound::Fuzzy { centre: c, radius_days: 7 }
+            ResolvedTime::Around {
+                centre: c,
+                radius_days: 7
+            }
+            .to_bound(),
+            TemporalBound::Fuzzy {
+                centre: c,
+                radius_days: 7
+            }
         );
     }
 
@@ -3276,7 +3429,10 @@ mod tests {
     fn test_overlaps_range_fuzzy() {
         // centre = Jun 15, radius = 7 → fuzzy window [Jun 8, Jun 22]
         let centre = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
-        let bound = TemporalBound::Fuzzy { centre, radius_days: 7 };
+        let bound = TemporalBound::Fuzzy {
+            centre,
+            radius_days: 7,
+        };
         let jun = |d: u32| NaiveDate::from_ymd_opt(2023, 6, d).unwrap();
 
         // entirely inside fuzzy window
@@ -3330,7 +3486,11 @@ mod tests {
     #[test]
     fn test_sortable_string_around_format() {
         let c = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
-        let s = ResolvedTime::Around { centre: c, radius_days: 7 }.to_sortable_string();
+        let s = ResolvedTime::Around {
+            centre: c,
+            radius_days: 7,
+        }
+        .to_sortable_string();
         assert_eq!(s, "around:2023-06-15:7d");
     }
 
@@ -3367,7 +3527,10 @@ mod tests {
         let cases: Vec<ResolvedTime> = vec![
             ResolvedTime::After(d),
             ResolvedTime::Before(d),
-            ResolvedTime::Around { centre, radius_days: 7 },
+            ResolvedTime::Around {
+                centre,
+                radius_days: 7,
+            },
         ];
 
         for rt in cases {
@@ -3398,7 +3561,10 @@ mod tests {
 
         let old_variants: Vec<ResolvedTime> = vec![
             ResolvedTime::ExactDate(d),
-            ResolvedTime::MonthYear { month: 5, year: 2023 },
+            ResolvedTime::MonthYear {
+                month: 5,
+                year: 2023,
+            },
             ResolvedTime::Year(2022),
             ResolvedTime::RelativeDescription("some relative phrase".to_string()),
             ResolvedTime::Unknown,
@@ -3743,9 +3909,9 @@ mod tests {
             ResolvedTime::After(d) => {
                 assert_eq!(d, wedding_date, "R5 must still anchor on wedding_date");
             }
-            other => panic!(
-                "R5 behavior must be unchanged: expected After(wedding_date), got {other:?}"
-            ),
+            other => {
+                panic!("R5 behavior must be unchanged: expected After(wedding_date), got {other:?}")
+            }
         }
     }
 
@@ -3811,7 +3977,10 @@ mod tests {
         assert!(
             matches!(
                 fact.resolved_time,
-                ResolvedTime::MonthYear { month: 5, year: 2023 }
+                ResolvedTime::MonthYear {
+                    month: 5,
+                    year: 2023
+                }
             ),
             "expected MonthYear(5, 2023), got {:?}",
             fact.resolved_time
@@ -3904,7 +4073,10 @@ mod tests {
             &[],
         );
 
-        assert!(!facts.is_empty(), "pronoun fallback must produce at least one fact");
+        assert!(
+            !facts.is_empty(),
+            "pronoun fallback must produce at least one fact"
+        );
         let fact = &facts[0];
         assert_eq!(fact.entity, "speaker", "fallback entity must be 'speaker'");
         assert!(
@@ -3990,13 +4162,11 @@ mod tests {
 
         // Attempt to resolve fact_a — must not hang or overflow.
         let mut visited_a = std::collections::HashSet::new();
-        let resolved_a =
-            store.resolve_named_event_hop("user-r5c", &fact_a, &mut visited_a, 0);
+        let resolved_a = store.resolve_named_event_hop("user-r5c", &fact_a, &mut visited_a, 0);
 
         // Attempt to resolve fact_b — must not hang or overflow.
         let mut visited_b = std::collections::HashSet::new();
-        let resolved_b =
-            store.resolve_named_event_hop("user-r5c", &fact_b, &mut visited_b, 0);
+        let resolved_b = store.resolve_named_event_hop("user-r5c", &fact_b, &mut visited_b, 0);
 
         // Both must remain Unknown (cycle broken by depth/visited guards).
         assert!(
@@ -4070,7 +4240,10 @@ mod tests {
         let ran = extract("Melanie ran a marathon yesterday");
         assert!(!ran.is_empty(), "'ran ... yesterday' must still extract");
         let soon = extract("Melanie is planning to visit soon");
-        assert!(!soon.is_empty(), "'planning to ... soon' must still extract");
+        assert!(
+            !soon.is_empty(),
+            "'planning to ... soon' must still extract"
+        );
     }
 
     // ---- New intent families DO create planned facts ------------------------
@@ -4201,9 +4374,15 @@ mod tests {
 
     #[test]
     fn test_query_signals_planned_intent_mirrors_inventory() {
-        assert!(query_signals_planned_intent("when is melanie planning to travel"));
-        assert!(query_signals_planned_intent("what does she want to do next week"));
+        assert!(query_signals_planned_intent(
+            "when is melanie planning to travel"
+        ));
+        assert!(query_signals_planned_intent(
+            "what does she want to do next week"
+        ));
         assert!(query_signals_planned_intent("when does he get to visit"));
-        assert!(!query_signals_planned_intent("the orange monsoon forgot nothing"));
+        assert!(!query_signals_planned_intent(
+            "the orange monsoon forgot nothing"
+        ));
     }
 }

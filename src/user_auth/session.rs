@@ -103,7 +103,11 @@ mod tests {
         let user = Uuid::new_v4();
         let now = Utc::now();
         let (SessionToken(token), record) = issue(user, now);
-        assert_eq!(token.len(), 43, "base64 url-safe no-pad of 32 bytes = 43 chars");
+        assert_eq!(
+            token.len(),
+            43,
+            "base64 url-safe no-pad of 32 bytes = 43 chars"
+        );
         let derived = hash_token(&token).expect("hash plaintext");
         assert_eq!(derived, record.token_hash);
     }

@@ -414,8 +414,7 @@ pub async fn get_graph_data(
 /// Generate the HTML page for graph visualization (includes 2D/3D toggle)
 fn generate_graph_html(user_id: &str, nonce: &str) -> String {
     let html = include_str!("graph_view.html");
-    let user_id_json =
-        serde_json::to_string(user_id).unwrap_or_else(|_| "\"default\"".to_string());
+    let user_id_json = serde_json::to_string(user_id).unwrap_or_else(|_| "\"default\"".to_string());
     html.replace("{{USER_ID_JSON}}", &user_id_json)
         .replace("{{CSP_NONCE}}", nonce)
 }

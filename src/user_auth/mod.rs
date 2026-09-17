@@ -251,9 +251,7 @@ impl AuthError {
             Self::WeakPassword(reason) => format!("Password rejected: {reason}"),
             Self::TooManyAttempts => "Too many login attempts; try again later".to_string(),
             Self::UserNotFound => "No user matches the supplied username".to_string(),
-            Self::LastAdmin => {
-                "Refusing to demote the last remaining administrator".to_string()
-            }
+            Self::LastAdmin => "Refusing to demote the last remaining administrator".to_string(),
             Self::Disabled => "User auth is disabled on this server".to_string(),
             Self::Internal(detail) => {
                 tracing::error!(detail = %detail, "user_auth internal error");
@@ -324,10 +322,7 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(AuthError::Forbidden.status_code(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            AuthError::UsernameTaken.status_code(),
-            StatusCode::CONFLICT
-        );
+        assert_eq!(AuthError::UsernameTaken.status_code(), StatusCode::CONFLICT);
         assert_eq!(
             AuthError::TooManyAttempts.status_code(),
             StatusCode::TOO_MANY_REQUESTS

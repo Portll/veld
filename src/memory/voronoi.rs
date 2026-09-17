@@ -21,10 +21,10 @@
 //! - **Anisotropy**: Directions where knowledge thins out around an entity
 //! - **Density gradients**: Where knowledge drops off across a face
 
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use super::slow_store::SlowStore;
 use crate::similarity::cosine_similarity;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 /// Properties of one entity's approximate Voronoi cell
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,10 +187,7 @@ impl VoronoiAnalyzer {
         };
 
         // Compute stats
-        let max_isolation = cells
-            .iter()
-            .map(|c| c.isolation)
-            .fold(0.0f32, f32::max);
+        let max_isolation = cells.iter().map(|c| c.isolation).fold(0.0f32, f32::max);
         let avg_anisotropy = if cells.is_empty() {
             1.0
         } else {
@@ -230,10 +227,7 @@ impl VoronoiAnalyzer {
     /// Compute k nearest neighbors for each entity using cosine distance.
     ///
     /// Returns: entity_index → [(neighbor_index, cosine_distance)]
-    fn compute_knn(
-        entities: &[(String, String, Vec<f32>)],
-        k: usize,
-    ) -> Vec<Vec<(usize, f32)>> {
+    fn compute_knn(entities: &[(String, String, Vec<f32>)], k: usize) -> Vec<Vec<(usize, f32)>> {
         let n = entities.len();
         if n < 2 {
             return vec![Vec::new(); n];
@@ -296,11 +290,7 @@ impl VoronoiAnalyzer {
                         // Face prominence: closer neighbors share a more prominent face
                         // (larger shared boundary in the Voronoi dual)
                         let prominence = if *dist > 0.0 { 1.0 / dist } else { 1.0 };
-                        (
-                            entities[*j].0.clone(),
-                            entities[*j].1.clone(),
-                            prominence,
-                        )
+                        (entities[*j].0.clone(), entities[*j].1.clone(), prominence)
                     })
                     .collect();
 
@@ -387,11 +377,8 @@ impl VoronoiAnalyzer {
             return 1.0;
         }
 
-        let avg_off_diag =
-            off_diag_values.iter().sum::<f32>() / off_diag_values.len() as f32;
-        let max_off_diag = off_diag_values
-            .iter()
-            .fold(0.0f32, |a, &b| a.max(b));
+        let avg_off_diag = off_diag_values.iter().sum::<f32>() / off_diag_values.len() as f32;
+        let max_off_diag = off_diag_values.iter().fold(0.0f32, |a, &b| a.max(b));
 
         // If max off-diagonal is much larger than average, neighbors cluster in one direction
         if avg_off_diag > 0.001 {
@@ -525,10 +512,7 @@ impl VoronoiAnalyzer {
             let weakest_neighbor = cell
                 .neighbors
                 .iter()
-                .min_by(|a, b| {
-                    a.2.partial_cmp(&b.2)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
             if let Some((neighbor_uuid, neighbor_name, prominence)) = weakest_neighbor {
                 if *prominence > 0.5 {
@@ -536,9 +520,7 @@ impl VoronoiAnalyzer {
                 }
 
                 // Find the neighbor's embedding
-                let neighbor_emb = entities
-                    .iter()
-                    .find(|(uuid, _, _)| uuid == neighbor_uuid);
+                let neighbor_emb = entities.iter().find(|(uuid, _, _)| uuid == neighbor_uuid);
 
                 if let Some((_, _, n_emb)) = neighbor_emb {
                     let cell_emb = entities

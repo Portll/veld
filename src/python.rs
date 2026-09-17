@@ -1246,7 +1246,10 @@ impl PyMemorySystem {
             let mut dict = HashMap::new();
             dict.insert("node_count".to_string(), stats.node_count.into_py_any(py)?);
             dict.insert("edge_count".to_string(), stats.edge_count.into_py_any(py)?);
-            dict.insert("avg_strength".to_string(), stats.avg_strength.into_py_any(py)?);
+            dict.insert(
+                "avg_strength".to_string(),
+                stats.avg_strength.into_py_any(py)?,
+            );
             dict.insert(
                 "potentiated_count".to_string(),
                 stats.potentiated_count.into_py_any(py)?,
@@ -2146,7 +2149,10 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, Py<P
             "metadata".to_string(),
             memory.experience.metadata.clone().into_py_any(py)?,
         );
-        dict.insert("importance".to_string(), memory.importance().into_py_any(py)?);
+        dict.insert(
+            "importance".to_string(),
+            memory.importance().into_py_any(py)?,
+        );
         dict.insert(
             "access_count".to_string(),
             memory.access_count().into_py_any(py)?,
@@ -2163,10 +2169,16 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, Py<P
 
         // Robotics fields
         if let Some(robot_id) = memory.experience.resolved_robot_id() {
-            dict.insert("robot_id".to_string(), robot_id.to_string().into_py_any(py)?);
+            dict.insert(
+                "robot_id".to_string(),
+                robot_id.to_string().into_py_any(py)?,
+            );
         }
         if let Some(mission_id) = memory.experience.resolved_mission_id() {
-            dict.insert("mission_id".to_string(), mission_id.to_string().into_py_any(py)?);
+            dict.insert(
+                "mission_id".to_string(),
+                mission_id.to_string().into_py_any(py)?,
+            );
         }
         // Geo: keep the legacy 3-element [lat, lon, alt] shape. When the
         // facet (`Place::Geo { alt: None }`) has no altitude, surface 0.0
@@ -2184,7 +2196,10 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, Py<P
             dict.insert("heading".to_string(), heading.into_py_any(py)?);
         }
         if let Some(ref action_type) = memory.experience.action_type {
-            dict.insert("action_type".to_string(), action_type.clone().into_py_any(py)?);
+            dict.insert(
+                "action_type".to_string(),
+                action_type.clone().into_py_any(py)?,
+            );
         }
         if let Some(reward) = memory.experience.reward {
             dict.insert("reward".to_string(), reward.into_py_any(py)?);
@@ -2204,10 +2219,16 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, Py<P
             dict.insert("action_params".to_string(), params.clone().into_py_any(py)?);
         }
         if let Some(ref outcome_type) = memory.experience.outcome_type {
-            dict.insert("outcome_type".to_string(), outcome_type.clone().into_py_any(py)?);
+            dict.insert(
+                "outcome_type".to_string(),
+                outcome_type.clone().into_py_any(py)?,
+            );
         }
         if let Some(ref details) = memory.experience.outcome_details {
-            dict.insert("outcome_details".to_string(), details.clone().into_py_any(py)?);
+            dict.insert(
+                "outcome_details".to_string(),
+                details.clone().into_py_any(py)?,
+            );
         }
         if let Some(confidence) = memory.experience.confidence {
             dict.insert("confidence".to_string(), confidence.into_py_any(py)?);
@@ -2228,7 +2249,10 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, Py<P
             dict.insert("weather".to_string(), weather.clone().into_py_any(py)?);
         }
         if let Some(terrain) = memory.experience.resolved_terrain_type() {
-            dict.insert("terrain_type".to_string(), terrain.to_string().into_py_any(py)?);
+            dict.insert(
+                "terrain_type".to_string(),
+                terrain.to_string().into_py_any(py)?,
+            );
         }
         if let Some(ref lighting) = memory.experience.lighting {
             dict.insert("lighting".to_string(), lighting.clone().into_py_any(py)?);
@@ -2253,7 +2277,10 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, Py<P
             dict.insert("severity".to_string(), severity.clone().into_py_any(py)?);
         }
         if let Some(ref recovery) = memory.experience.recovery_action {
-            dict.insert("recovery_action".to_string(), recovery.clone().into_py_any(py)?);
+            dict.insert(
+                "recovery_action".to_string(),
+                recovery.clone().into_py_any(py)?,
+            );
         }
         if let Some(ref cause) = memory.experience.root_cause {
             dict.insert("root_cause".to_string(), cause.clone().into_py_any(py)?);

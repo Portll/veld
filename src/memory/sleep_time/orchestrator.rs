@@ -26,12 +26,12 @@ use super::policies::{BudgetTracker, DebounceTracker, PolicyLimits};
 use super::queue::{Queue, CF_SLEEP_TIME_QUEUE};
 use super::rewriter::Rewriter;
 use super::supersession::{SupersessionStore, CF_SLEEP_TIME_SUPERSESSIONS};
-use crate::storage::FamilyKeyValueStore;
 use super::types::{BudgetState, SleepMode, SleepTimeResult, SleepTimeTrigger};
 use crate::config::SleepTimeConfig;
-use crate::user_memory::SharedUserMemory;
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::memory::context_blocks::ContextBlockStore;
+use crate::storage::FamilyKeyValueStore;
+use crate::user_memory::SharedUserMemory;
 
 // =============================================================================
 // Status reporting
@@ -134,7 +134,9 @@ impl SleepTimeOrchestrator {
             budget: Arc::new(BudgetTracker::with_store(Arc::clone(&column), limits)?),
             debounce: Arc::new(DebounceTracker::new(config.debounce_secs)),
             rewriter: Arc::new(rewriter),
-            graduation: Arc::new(GraduationStore::with_store(family(CF_SLEEP_TIME_GRADUATIONS)?)),
+            graduation: Arc::new(GraduationStore::with_store(family(
+                CF_SLEEP_TIME_GRADUATIONS,
+            )?)),
             supersession: Arc::new(SupersessionStore::with_store(family(
                 CF_SLEEP_TIME_SUPERSESSIONS,
             )?)),
@@ -303,7 +305,10 @@ impl SleepTimeOrchestrator {
 
         // Persistent dedup at the queue layer (survives restart).
         let window = Duration::seconds(self.config.debounce_secs);
-        match self.queue.enqueue_debounced(user_id, mode, trigger, window)? {
+        match self
+            .queue
+            .enqueue_debounced(user_id, mode, trigger, window)?
+        {
             Some(_item) => Ok(true),
             None => Ok(false),
         }
@@ -411,20 +416,52 @@ mod tests {
         for (backend, column, _tmp) in stores {
             let orch = orchestrator(Arc::clone(&column)).unwrap();
 
-            assert!(orch.enqueue("u", SleepMode::Nrem, SleepTimeTrigger::Idle).unwrap(), "{backend:?}");
+            assert!(
+                orch.enqueue("u", SleepMode::Nrem, SleepTimeTrigger::Idle)
+                    .unwrap(),
+                "{backend:?}"
+            );
             let status = orch.status().unwrap();
-            assert_eq!((status.queue_pending_total, status.distinct_users_in_queue), (1, 1), "{backend:?}");
-            assert_eq!(orch.user_status("u").unwrap().budget.calls_today, 0, "{backend:?}");
+            assert_eq!(
+                (status.queue_pending_total, status.distinct_users_in_queue),
+                (1, 1),
+                "{backend:?}"
+            );
+            assert_eq!(
+                orch.user_status("u").unwrap().budget.calls_today,
+                0,
+                "{backend:?}"
+            );
 
-            let (new, old) = (MemoryId(uuid::Uuid::new_v4()), MemoryId(uuid::Uuid::new_v4()));
+            let (new, old) = (
+                MemoryId(uuid::Uuid::new_v4()),
+                MemoryId(uuid::Uuid::new_v4()),
+            );
             orch.graduation_store().record_graduation(&new, 3).unwrap();
             orch.supersession_store().record(&new, &old, 0.9).unwrap();
 
             // Each store landed in its own family of THIS database, read back raw.
             let queue_rows = column.scan_cf(CF_SLEEP_TIME_QUEUE, None, None).unwrap();
-            assert_eq!(queue_rows.len(), 1, "{backend:?}: queue row not in its family");
-            assert!(column.get_cf(CF_SLEEP_TIME_GRADUATIONS, new.0.as_bytes()).unwrap().is_some(), "{backend:?}");
-            assert_eq!(column.scan_cf(CF_SLEEP_TIME_SUPERSESSIONS, None, None).unwrap().len(), 2, "{backend:?}");
+            assert_eq!(
+                queue_rows.len(),
+                1,
+                "{backend:?}: queue row not in its family"
+            );
+            assert!(
+                column
+                    .get_cf(CF_SLEEP_TIME_GRADUATIONS, new.0.as_bytes())
+                    .unwrap()
+                    .is_some(),
+                "{backend:?}"
+            );
+            assert_eq!(
+                column
+                    .scan_cf(CF_SLEEP_TIME_SUPERSESSIONS, None, None)
+                    .unwrap()
+                    .len(),
+                2,
+                "{backend:?}"
+            );
         }
     }
 
@@ -433,7 +470,10 @@ mod tests {
         for (backend, column, _tmp) in column_stores(&[CF_CONTEXT_BLOCKS]) {
             let built = orchestrator(column);
             match backend {
-                StorageBackend::RocksDb => assert!(built.is_err(), "missing families must fail construction, not first use"),
+                StorageBackend::RocksDb => assert!(
+                    built.is_err(),
+                    "missing families must fail construction, not first use"
+                ),
                 // redb tables are created on declaration, so the same call succeeds.
                 StorageBackend::Redb => assert!(built.is_ok(), "{:?}", built.err()),
             }

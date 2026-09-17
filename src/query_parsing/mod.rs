@@ -91,9 +91,7 @@ pub fn create_parser(config: ParserConfig) -> Arc<dyn QueryParser> {
         ParserType::RuleBased => Arc::new(RuleBasedParser::new()),
         ParserType::Llm => {
             let parser = match (config.llm_endpoint, config.llm_model) {
-                (Some(endpoint), Some(model)) => {
-                    LlmParser::new(&endpoint, &model)
-                }
+                (Some(endpoint), Some(model)) => LlmParser::new(&endpoint, &model),
                 _ => LlmParser::from_env(),
             };
             Arc::new(parser)

@@ -124,8 +124,11 @@ pub async fn analyze_gaps(
 ) -> Result<Json<GapAnalysisResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     let min_strength = validate_range_f32(req.min_edge_strength, 0.0, 1.0, "min_edge_strength")?;
-    let max_gaps =
-        validate_range_usize(req.max_gaps_per_type, MAX_GAPS_PER_TYPE, "max_gaps_per_type")?;
+    let max_gaps = validate_range_usize(
+        req.max_gaps_per_type,
+        MAX_GAPS_PER_TYPE,
+        "max_gaps_per_type",
+    )?;
 
     let user_id = req.user_id.clone();
     let user_id_for_event = user_id.clone();
@@ -137,53 +140,60 @@ pub async fn analyze_gaps(
     let offset = req.offset;
     let limit = validate_range_usize(req.limit.max(1), MAX_GAPS_PER_TYPE, "limit")?;
 
-    let result = tokio::task::spawn_blocking(move || -> Result<GapAnalysisResponse, anyhow::Error> {
-        let store = get_or_create_slow_store(&state_clone, &user_id)?;
-        sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<GapAnalysisResponse, anyhow::Error> {
+            let store = get_or_create_slow_store(&state_clone, &user_id)?;
+            sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
 
-        let mut config = GapDetectionConfig {
-            min_edge_strength: min_strength,
-            max_gaps_per_type: max_gaps,
-            ..Default::default()
-        };
-        if let Some(v) = min_embedding_similarity { config.min_embedding_similarity = v.clamp(0.0, 1.0); }
-        if let Some(v) = star_min_spokes { config.star_min_spokes = v.max(2).min(20); }
-        if let Some(v) = orbit_min_cluster_size { config.orbit_min_cluster_size = v.max(2).min(50); }
+            let mut config = GapDetectionConfig {
+                min_edge_strength: min_strength,
+                max_gaps_per_type: max_gaps,
+                ..Default::default()
+            };
+            if let Some(v) = min_embedding_similarity {
+                config.min_embedding_similarity = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = star_min_spokes {
+                config.star_min_spokes = v.max(2).min(20);
+            }
+            if let Some(v) = orbit_min_cluster_size {
+                config.orbit_min_cluster_size = v.max(2).min(50);
+            }
 
-        let result = GapDetector::detect(store.as_ref(), &config)?;
-        let total_count = result.gaps.len();
+            let result = GapDetector::detect(store.as_ref(), &config)?;
+            let total_count = result.gaps.len();
 
-        let gaps: Vec<GapSummary> = result
-            .gaps
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .map(|g| GapSummary {
-                id: g.id.clone(),
-                gap_type: g.gap_type.as_str().to_string(),
-                confidence: g.confidence,
-                embedding_similarity: g.embedding_similarity,
-                impact_score: g.impact_score,
-                entity_names: g.entities.iter().map(|e| e.name.clone()).collect(),
-                shape: ShapeSummary {
-                    node_count: g.shape.node_count,
-                    existing_edges: g.shape.existing_edges,
-                    missing_edges: g.shape.missing_edges,
-                    sparsity: g.shape.sparsity,
-                },
+            let gaps: Vec<GapSummary> = result
+                .gaps
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|g| GapSummary {
+                    id: g.id.clone(),
+                    gap_type: g.gap_type.as_str().to_string(),
+                    confidence: g.confidence,
+                    embedding_similarity: g.embedding_similarity,
+                    impact_score: g.impact_score,
+                    entity_names: g.entities.iter().map(|e| e.name.clone()).collect(),
+                    shape: ShapeSummary {
+                        node_count: g.shape.node_count,
+                        existing_edges: g.shape.existing_edges,
+                        missing_edges: g.shape.missing_edges,
+                        sparsity: g.shape.sparsity,
+                    },
+                })
+                .collect();
+
+            Ok(GapAnalysisResponse {
+                gaps,
+                total_count,
+                type_counts: result.type_counts,
+                duration_ms: result.duration_ms,
             })
-            .collect();
-
-        Ok(GapAnalysisResponse {
-            gaps,
-            total_count,
-            type_counts: result.type_counts,
-            duration_ms: result.duration_ms,
         })
-    })
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("Gap analysis task failed: {e}")))?
-    .map_err(AppError::Internal)?;
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Gap analysis task failed: {e}")))?
+        .map_err(AppError::Internal)?;
 
     state.emit_event(MemoryEvent {
         event_type: "gap_analysis_complete".to_string(),
@@ -268,55 +278,56 @@ pub async fn voronoi_analysis(
     let offset = req.offset;
     let limit = req.limit.max(1);
 
-    let result = tokio::task::spawn_blocking(move || -> Result<VoronoiAnalysisResponse, anyhow::Error> {
-        let store = get_or_create_slow_store(&state_clone, &user_id)?;
-        sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<VoronoiAnalysisResponse, anyhow::Error> {
+            let store = get_or_create_slow_store(&state_clone, &user_id)?;
+            sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
 
-        let config = VoronoiConfig {
-            k,
-            ..Default::default()
-        };
-        let analysis = VoronoiAnalyzer::analyze(&store, &config)?;
+            let config = VoronoiConfig {
+                k,
+                ..Default::default()
+            };
+            let analysis = VoronoiAnalyzer::analyze(&store, &config)?;
 
-        let mut most_isolated: Vec<IsolatedEntity> = analysis
-            .cells
-            .iter()
-            .map(|c| IsolatedEntity {
-                name: c.name.clone(),
-                isolation: c.isolation,
-                anisotropy: c.anisotropy,
+            let mut most_isolated: Vec<IsolatedEntity> = analysis
+                .cells
+                .iter()
+                .map(|c| IsolatedEntity {
+                    name: c.name.clone(),
+                    isolation: c.isolation,
+                    anisotropy: c.anisotropy,
+                })
+                .collect();
+            most_isolated.sort_by(|a, b| {
+                b.isolation
+                    .partial_cmp(&a.isolation)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let total_count = most_isolated.len();
+            most_isolated = most_isolated.into_iter().skip(offset).take(limit).collect();
+
+            let voids: Vec<VoidSummary> = analysis
+                .voids
+                .iter()
+                .map(|v| VoidSummary {
+                    boundary_entities: v.boundary_entities.iter().map(|(_, n)| n.clone()).collect(),
+                    radius: v.radius,
+                    confidence: v.confidence,
+                })
+                .collect();
+
+            Ok(VoronoiAnalysisResponse {
+                entity_count: analysis.stats.entity_count,
+                voids_found: analysis.voids.len(),
+                avg_anisotropy: analysis.stats.avg_anisotropy,
+                total_count,
+                most_isolated,
+                voids,
             })
-            .collect();
-        most_isolated.sort_by(|a, b| {
-            b.isolation
-                .partial_cmp(&a.isolation)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let total_count = most_isolated.len();
-        most_isolated = most_isolated.into_iter().skip(offset).take(limit).collect();
-
-        let voids: Vec<VoidSummary> = analysis
-            .voids
-            .iter()
-            .map(|v| VoidSummary {
-                boundary_entities: v.boundary_entities.iter().map(|(_, n)| n.clone()).collect(),
-                radius: v.radius,
-                confidence: v.confidence,
-            })
-            .collect();
-
-        Ok(VoronoiAnalysisResponse {
-            entity_count: analysis.stats.entity_count,
-            voids_found: analysis.voids.len(),
-            avg_anisotropy: analysis.stats.avg_anisotropy,
-            total_count,
-            most_isolated,
-            voids,
         })
-    })
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("Voronoi analysis task failed: {e}")))?
-    .map_err(AppError::Internal)?;
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Voronoi analysis task failed: {e}")))?
+        .map_err(AppError::Internal)?;
 
     Ok(Json(result))
 }
@@ -394,93 +405,98 @@ pub async fn persistence_analysis(
 ) -> Result<Json<PersistenceResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     let step_size = validate_range_f32(req.step_size, MIN_STEP_SIZE, MAX_STEP_SIZE, "step_size")?;
-    let min_persistence =
-        validate_range_f32(req.min_persistence, MIN_PERSISTENCE, MAX_STEP_SIZE, "min_persistence")?;
+    let min_persistence = validate_range_f32(
+        req.min_persistence,
+        MIN_PERSISTENCE,
+        MAX_STEP_SIZE,
+        "min_persistence",
+    )?;
 
     let user_id = req.user_id.clone();
     let state_clone = state.clone();
     let offset = req.offset;
     let limit = req.limit.max(1);
 
-    let result = tokio::task::spawn_blocking(move || -> Result<PersistenceResponse, anyhow::Error> {
-        let store = get_or_create_slow_store(&state_clone, &user_id)?;
-        sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<PersistenceResponse, anyhow::Error> {
+            let store = get_or_create_slow_store(&state_clone, &user_id)?;
+            sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
 
-        let config = PersistenceConfig {
-            step_size,
-            min_persistence,
-            max_entities: MAX_ENTITIES,
-            ..Default::default()
-        };
+            let config = PersistenceConfig {
+                step_size,
+                min_persistence,
+                max_entities: MAX_ENTITIES,
+                ..Default::default()
+            };
 
-        let diagram = persistence::compute_persistence(&store, &config)?;
+            let diagram = persistence::compute_persistence(&store, &config)?;
 
-        let dim_name = |d: usize| match d {
-            0 => "component",
-            1 => "loop",
-            2 => "void",
-            _ => "higher",
-        };
+            let dim_name = |d: usize| match d {
+                0 => "component",
+                1 => "loop",
+                2 => "void",
+                _ => "higher",
+            };
 
-        let total_count = diagram.pairs.len();
-        let pairs: Vec<PersistencePairSummary> = diagram
-            .pairs
-            .iter()
-            .map(|p| {
-                let entity_names: Vec<String> = p
-                    .birth_simplex
-                    .iter()
-                    .filter_map(|&idx| diagram.vertex_names.get(idx).cloned())
-                    .collect();
+            let total_count = diagram.pairs.len();
+            let pairs: Vec<PersistencePairSummary> = diagram
+                .pairs
+                .iter()
+                .map(|p| {
+                    let entity_names: Vec<String> = p
+                        .birth_simplex
+                        .iter()
+                        .filter_map(|&idx| diagram.vertex_names.get(idx).cloned())
+                        .collect();
 
-                PersistencePairSummary {
-                    dimension: p.dimension,
-                    dimension_name: dim_name(p.dimension).to_string(),
-                    birth: p.birth,
-                    death: p.death,
-                    persistence: if p.persistence.is_infinite() {
-                        -1.0
-                    } else {
-                        p.persistence
-                    },
-                    birth_entities: entity_names,
-                    sandwich_lower: p.birth,
-                    sandwich_upper: (p.birth * 2.0).min(1.0),
-                }
+                    PersistencePairSummary {
+                        dimension: p.dimension,
+                        dimension_name: dim_name(p.dimension).to_string(),
+                        birth: p.birth,
+                        death: p.death,
+                        persistence: if p.persistence.is_infinite() {
+                            -1.0
+                        } else {
+                            p.persistence
+                        },
+                        birth_entities: entity_names,
+                        sandwich_lower: p.birth,
+                        sandwich_upper: (p.birth * 2.0).min(1.0),
+                    }
+                })
+                .skip(offset)
+                .take(limit)
+                .collect();
+
+            let betti_curves: Vec<BettiCurveSummary> = diagram
+                .betti_curves
+                .iter()
+                .map(|b| BettiCurveSummary {
+                    epsilon: b.epsilon,
+                    beta_0: b.beta_0,
+                    beta_1: b.beta_1,
+                    beta_2: b.beta_2,
+                    simplex_count: b.simplex_count,
+                })
+                .collect();
+
+            Ok(PersistenceResponse {
+                total_count,
+                pairs,
+                betti_curves,
+                stats: PersistenceStatsSummary {
+                    entity_count: diagram.stats.entity_count,
+                    filtration_levels: diagram.stats.filtration_levels,
+                    total_pairs: diagram.stats.total_pairs,
+                    persistent_features: diagram.stats.persistent_features,
+                    noise_features: diagram.stats.noise_features,
+                    duration_ms: diagram.stats.duration_ms,
+                },
             })
-            .skip(offset)
-            .take(limit)
-            .collect();
-
-        let betti_curves: Vec<BettiCurveSummary> = diagram
-            .betti_curves
-            .iter()
-            .map(|b| BettiCurveSummary {
-                epsilon: b.epsilon,
-                beta_0: b.beta_0,
-                beta_1: b.beta_1,
-                beta_2: b.beta_2,
-                simplex_count: b.simplex_count,
-            })
-            .collect();
-
-        Ok(PersistenceResponse {
-            total_count,
-            pairs,
-            betti_curves,
-            stats: PersistenceStatsSummary {
-                entity_count: diagram.stats.entity_count,
-                filtration_levels: diagram.stats.filtration_levels,
-                total_pairs: diagram.stats.total_pairs,
-                persistent_features: diagram.stats.persistent_features,
-                noise_features: diagram.stats.noise_features,
-                duration_ms: diagram.stats.duration_ms,
-            },
         })
-    })
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("Persistence analysis failed: {e}")))?
-    .map_err(AppError::Internal)?;
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Persistence analysis failed: {e}")))?
+        .map_err(AppError::Internal)?;
 
     Ok(Json(result))
 }

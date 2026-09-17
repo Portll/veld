@@ -154,11 +154,7 @@ pub async fn end_session(
 /// Collects key entities mentioned, memory types created, and aggregate stats
 /// from the session timeline, then writes a compact summary (max 500 chars)
 /// to the user's `session_summary` context block.
-fn populate_session_summary_block(
-    state: &AppState,
-    user_id: &str,
-    session: &Session,
-) {
+fn populate_session_summary_block(state: &AppState, user_id: &str, session: &Session) {
     use std::collections::{BTreeSet, HashSet};
 
     // Collect entities and topics from timeline events

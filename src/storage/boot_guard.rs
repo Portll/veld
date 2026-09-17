@@ -34,7 +34,10 @@ pub fn user_store_content(user_dir: &Path, backend: StorageBackend) -> Result<St
         }),
         #[cfg(not(feature = "storage-redb"))]
         StorageBackend::Redb => {
-            bail!("this build cannot read redb stores, so {} is unknown", user_dir.display())
+            bail!(
+                "this build cannot read redb stores, so {} is unknown",
+                user_dir.display()
+            )
         }
     }
 }
@@ -65,7 +68,9 @@ pub fn refuse_stranded_data(
     let other = other_backend(selected);
     let can_read_other = other != StorageBackend::Redb || cfg!(feature = "storage-redb");
     if !can_read_other {
-        tracing::warn!("boot guard: this build cannot read redb, so data stranded there is unchecked");
+        tracing::warn!(
+            "boot guard: this build cannot read redb, so data stranded there is unchecked"
+        );
     }
 
     let mut with_data = [0usize; 2];
@@ -193,7 +198,10 @@ mod tests {
 
         let err = refuse_stranded_data(base.path(), StorageBackend::RocksDb, &users(&["bob"]))
             .expect_err("absent rocksdb over populated redb must refuse");
-        assert!(err.to_string().contains("VELD_STORAGE_BACKEND=redb"), "{err}");
+        assert!(
+            err.to_string().contains("VELD_STORAGE_BACKEND=redb"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -241,7 +249,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(msg.contains("1 user(s)") && msg.contains("stranded"), "{msg}");
+        assert!(
+            msg.contains("1 user(s)") && msg.contains("stranded"),
+            "{msg}"
+        );
         assert!(!msg.contains("migrated,"), "{msg}");
     }
 
@@ -252,9 +263,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         for backend in [StorageBackend::Redb, StorageBackend::RocksDb] {
-            assert_eq!(user_store_content(&dir, backend).unwrap(), StoreContent::Absent);
+            assert_eq!(
+                user_store_content(&dir, backend).unwrap(),
+                StoreContent::Absent
+            );
         }
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "a probe must not create a store");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "a probe must not create a store"
+        );
     }
 
     #[test]
@@ -264,7 +282,10 @@ mod tests {
         redb_empty(&dir);
 
         assert!(dir.join("storage.redb").metadata().unwrap().len() > 0);
-        assert_eq!(user_store_content(&dir, StorageBackend::Redb).unwrap(), StoreContent::Empty);
+        assert_eq!(
+            user_store_content(&dir, StorageBackend::Redb).unwrap(),
+            StoreContent::Empty
+        );
     }
 
     #[test]
@@ -274,6 +295,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("storage.redb"), b"not a redb file").unwrap();
 
-        assert!(refuse_stranded_data(base.path(), StorageBackend::RocksDb, &users(&["corrupt"])).is_err());
+        assert!(
+            refuse_stranded_data(base.path(), StorageBackend::RocksDb, &users(&["corrupt"]))
+                .is_err()
+        );
     }
 }

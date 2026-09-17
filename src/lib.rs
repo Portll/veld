@@ -17,15 +17,14 @@
 
 pub mod ab_testing;
 pub mod auth;
-pub mod path_guard;
 pub mod backup;
 pub mod config;
 pub mod constants;
 pub mod datasets;
 pub mod decay;
 pub mod decay_scales;
-pub mod user_memory;
 pub mod embeddings;
+pub mod entity_cap;
 pub mod errors;
 #[cfg(feature = "multi-tenant")]
 pub mod extensions;
@@ -33,33 +32,34 @@ pub mod graph_memory;
 pub mod handlers;
 pub mod ingest;
 pub mod instance_registry;
-pub mod intent_log;
 pub mod integrations;
+pub mod intent_log;
 pub mod keystore;
+pub mod llm_hosts;
 pub mod memory;
 pub mod metrics;
 pub mod middleware;
 pub mod mif;
 pub mod oblivious;
+pub mod path_guard;
 pub mod pir;
 pub mod query_parsing;
 pub mod query_planner;
 pub mod rate_limit_governance;
 pub mod recall_harness;
+pub mod redaction;
 pub mod relevance;
-pub mod server_runtime;
 pub mod server;
+pub mod server_runtime;
 pub mod similarity;
 pub mod storage;
 pub mod streaming;
 pub mod tracing_setup;
 pub mod user_auth;
-pub mod entity_cap;
-pub mod llm_hosts;
-pub mod redaction;
+pub mod user_memory;
 pub mod validation;
-pub mod wiki;
 pub mod vector_db;
+pub mod wiki;
 
 pub mod mcp;
 

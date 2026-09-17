@@ -28,6 +28,6 @@ pub use link_store::{LinkStore, RelationalLinkStore, LINK_TABLE};
 pub use relational_store::{RelationalDatasetStore, CATALOG_TABLE};
 pub use schema::{ColumnDef, ColumnType, DatasetSchema};
 pub use store::{
-    DatasetError, DatasetMeta, DatasetRef, DatasetRow, DatasetStore, InMemoryDatasetStore,
-    MAX_TABLE_NAME_LEN, sanitise_sql_identifier, sanitise_table_name,
+    sanitise_sql_identifier, sanitise_table_name, DatasetError, DatasetMeta, DatasetRef,
+    DatasetRow, DatasetStore, InMemoryDatasetStore, MAX_TABLE_NAME_LEN,
 };

@@ -153,7 +153,8 @@ impl IntentLogHeader {
         if &magic != MAGIC {
             return Err(HeaderError::MagicMismatch { found: magic });
         }
-        let stored_crc = u32::from_le_bytes(bytes[HEADER_PRECRC_BYTES..HEADER_BYTES].try_into().unwrap());
+        let stored_crc =
+            u32::from_le_bytes(bytes[HEADER_PRECRC_BYTES..HEADER_BYTES].try_into().unwrap());
         let computed_crc = crc32fast::hash(&bytes[..HEADER_PRECRC_BYTES]);
         if stored_crc != computed_crc {
             return Err(HeaderError::CrcMismatch {

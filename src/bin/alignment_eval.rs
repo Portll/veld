@@ -70,8 +70,8 @@ fn main() -> Result<()> {
         ),
     };
 
-    let file = File::open(&args.pairs)
-        .with_context(|| format!("opening {}", args.pairs.display()))?;
+    let file =
+        File::open(&args.pairs).with_context(|| format!("opening {}", args.pairs.display()))?;
     let rows: Vec<Row> = BufReader::new(file)
         .lines()
         .map_while(Result::ok)
@@ -81,8 +81,8 @@ fn main() -> Result<()> {
 
     let side = args.side;
 
-    let pairs_sha = sha256_file(&args.pairs)
-        .with_context(|| format!("hashing {}", args.pairs.display()))?;
+    let pairs_sha =
+        sha256_file(&args.pairs).with_context(|| format!("hashing {}", args.pairs.display()))?;
     let cache_path = pairs_vec_path(&args.pairs, &expected_pid, side);
 
     let (pv, sv): (Vec<Vec<f32>>, Vec<Vec<f32>>) =
@@ -162,10 +162,7 @@ fn pairs_vec_path(pairs: &Path, pid: &AlignmentPairId, side: Side) -> PathBuf {
         pid.secondary.replace('/', "_"),
         side_str
     );
-    pairs
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(stem)
+    pairs.parent().unwrap_or_else(|| Path::new(".")).join(stem)
 }
 
 fn sha256_file(path: &Path) -> Result<[u8; 32]> {

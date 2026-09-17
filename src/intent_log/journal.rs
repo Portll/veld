@@ -30,7 +30,7 @@
 
 use std::error::Error;
 
-use crate::metrics::{PROJECTION_APPLY_DURATION, PROJECTION_APPLY_TOTAL, Timer};
+use crate::metrics::{Timer, PROJECTION_APPLY_DURATION, PROJECTION_APPLY_TOTAL};
 
 use super::payload::{self, IntentPayload, PayloadError};
 use super::{IntentLog, IntentLogError, Lsn};
@@ -201,7 +201,8 @@ impl JournaledWriter {
                 );
                 return Err(JournalError::Payload(e));
             }
-            #[allow(unreachable_patterns)] // defensive: documents decode-side variants on the append path
+            #[allow(unreachable_patterns)]
+            // defensive: documents decode-side variants on the append path
             Err(e @ (PayloadError::UnknownSchemaVersion { .. } | PayloadError::Migration(_))) => {
                 // Decode-side variants — shouldn't fire on the append/encode
                 // path. If they do, it's a programming error (someone wired
@@ -228,8 +229,7 @@ impl JournaledWriter {
         for p in &mut self.projections {
             let projection_name = p.name().to_string();
             let timer = Timer::new(
-                PROJECTION_APPLY_DURATION
-                    .with_label_values(&[projection_name.as_str()]),
+                PROJECTION_APPLY_DURATION.with_label_values(&[projection_name.as_str()]),
             );
             let apply_result = p.apply(lsn, payload);
             drop(timer);
@@ -391,9 +391,7 @@ mod tests {
         let log = IntentLog::open(&path).unwrap();
         let mut writer = JournaledWriter::new(log);
         let good_seen = Arc::new(Mutex::new(Vec::new()));
-        writer.add_projection(Box::new(FailingProjection {
-            name: "bad".into(),
-        }));
+        writer.add_projection(Box::new(FailingProjection { name: "bad".into() }));
         writer.add_projection(Box::new(RecordingProjection {
             name: "good".into(),
             applied: good_seen.clone(),
@@ -421,9 +419,7 @@ mod tests {
         {
             let log = IntentLog::open(&path).unwrap();
             let mut writer = JournaledWriter::new(log);
-            writer.add_projection(Box::new(FailingProjection {
-                name: "x".into(),
-            }));
+            writer.add_projection(Box::new(FailingProjection { name: "x".into() }));
             let payload = IntentPayload::Forget {
                 user_id: "u".into(),
                 memory_id: "m".into(),

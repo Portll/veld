@@ -493,7 +493,9 @@ impl NeuralNer {
         if all_encodings.iter().any(|e| e.get_ids().len() > max_length) {
             // No session lock is held yet at this point, so nothing to release before the
             // per-text path takes its own.
-            tracing::debug!("NER batch holds text longer than one window; routing to the windowed path");
+            tracing::debug!(
+                "NER batch holds text longer than one window; routing to the windowed path"
+            );
             return texts.iter().map(|t| self.extract_neural(t)).collect();
         }
 
@@ -704,116 +706,118 @@ impl NeuralNer {
                 .into_iter()
                 .enumerate()
         {
-        let mut input_ids = vec![0i64; max_length];
-        let mut attention = vec![0i64; max_length];
+            let mut input_ids = vec![0i64; max_length];
+            let mut attention = vec![0i64; max_length];
 
-        for (i, &token) in tokens[win_start..win_end].iter().enumerate() {
-            input_ids[i] = token as i64;
-        }
-        for (i, &mask) in attention_mask[win_start..win_end].iter().enumerate() {
-            attention[i] = mask as i64;
-        }
-
-        // Create ONNX input tensors
-        // token_type_ids: all zeros for single sentence (BERT segment embedding)
-        let token_type_ids = vec![0i64; max_length];
-
-        let input_ids_value = Value::from_array((vec![1, max_length], input_ids))
-            .context("Failed to create input_ids tensor")?;
-        let attention_mask_value = Value::from_array((vec![1, max_length], attention.clone()))
-            .context("Failed to create attention_mask tensor")?;
-        let token_type_ids_value = Value::from_array((vec![1, max_length], token_type_ids))
-            .context("Failed to create token_type_ids tensor")?;
-
-        // Run inference
-        let outputs = session
-            .run(ort::inputs![
-                "input_ids" => &input_ids_value,
-                "attention_mask" => &attention_mask_value,
-                "token_type_ids" => &token_type_ids_value,
-            ])
-            .context("NER inference failed")?;
-
-        // Extract logits - shape: [1, seq_len, num_labels]
-        let output_tensor = outputs[0]
-            .try_extract_tensor::<f32>()
-            .context("Failed to extract NER output tensor")?;
-        let (_shape, logits) = output_tensor;
-
-        // Decode BIO tags to entities
-        let num_labels = 9; // O, B-MISC, I-MISC, B-PER, I-PER, B-ORG, I-ORG, B-LOC, I-LOC
-        let seq_len = win_end - win_start;
-
-        let mut current_entity: Option<(NerTag, Vec<usize>, f32)> = None;
-
-        #[allow(clippy::needless_range_loop)] // Index used for both array access and arithmetic
-        for i in 0..seq_len {
-            // `i` indexes THIS WINDOW's logits; `gi` is the token's place in the whole text and is
-            // what `build_entity` needs, because it reads the full encoding's offsets.
-            let gi = win_start + i;
-            // [CLS] is only at index 0 of the FIRST window. Skipping `i == 0` in every window would
-            // drop the first real token of each one — a truncation fix that truncates.
-            if (window == 0 && i == 0) || attention[i] == 0 {
-                continue;
+            for (i, &token) in tokens[win_start..win_end].iter().enumerate() {
+                input_ids[i] = token as i64;
+            }
+            for (i, &mask) in attention_mask[win_start..win_end].iter().enumerate() {
+                attention[i] = mask as i64;
             }
 
-            // Get logits for this position
-            let start_idx = i * num_labels;
-            let token_logits = &logits[start_idx..start_idx + num_labels];
+            // Create ONNX input tensors
+            // token_type_ids: all zeros for single sentence (BERT segment embedding)
+            let token_type_ids = vec![0i64; max_length];
 
-            // Find best label without allocating a Vec
-            let Some((best_idx, best_prob)) = argmax_softmax(token_logits) else {
-                continue; // Empty probs (shouldn't happen, but defensive)
-            };
+            let input_ids_value = Value::from_array((vec![1, max_length], input_ids))
+                .context("Failed to create input_ids tensor")?;
+            let attention_mask_value = Value::from_array((vec![1, max_length], attention.clone()))
+                .context("Failed to create attention_mask tensor")?;
+            let token_type_ids_value = Value::from_array((vec![1, max_length], token_type_ids))
+                .context("Failed to create token_type_ids tensor")?;
 
-            let tag = NerTag::from_index(best_idx);
+            // Run inference
+            let outputs = session
+                .run(ort::inputs![
+                    "input_ids" => &input_ids_value,
+                    "attention_mask" => &attention_mask_value,
+                    "token_type_ids" => &token_type_ids_value,
+                ])
+                .context("NER inference failed")?;
 
-            // Handle BIO tagging
-            match (&current_entity, tag.is_begin(), tag.is_inside()) {
-                // Begin new entity
-                (None, true, _) => {
-                    current_entity = Some((tag, vec![gi], best_prob));
+            // Extract logits - shape: [1, seq_len, num_labels]
+            let output_tensor = outputs[0]
+                .try_extract_tensor::<f32>()
+                .context("Failed to extract NER output tensor")?;
+            let (_shape, logits) = output_tensor;
+
+            // Decode BIO tags to entities
+            let num_labels = 9; // O, B-MISC, I-MISC, B-PER, I-PER, B-ORG, I-ORG, B-LOC, I-LOC
+            let seq_len = win_end - win_start;
+
+            let mut current_entity: Option<(NerTag, Vec<usize>, f32)> = None;
+
+            #[allow(clippy::needless_range_loop)] // Index used for both array access and arithmetic
+            for i in 0..seq_len {
+                // `i` indexes THIS WINDOW's logits; `gi` is the token's place in the whole text and is
+                // what `build_entity` needs, because it reads the full encoding's offsets.
+                let gi = win_start + i;
+                // [CLS] is only at index 0 of the FIRST window. Skipping `i == 0` in every window would
+                // drop the first real token of each one — a truncation fix that truncates.
+                if (window == 0 && i == 0) || attention[i] == 0 {
+                    continue;
                 }
-                // Continue current entity
-                (Some((prev_tag, _indices, _acc_prob)), _, true) if tag.matches_type(prev_tag) => {
-                    // Take ownership to extend indices in-place (avoids clone)
-                    if let Some((prev_tag, mut indices, acc_prob)) = current_entity.take() {
-                        indices.push(gi);
-                        current_entity = Some((prev_tag, indices, acc_prob + best_prob));
+
+                // Get logits for this position
+                let start_idx = i * num_labels;
+                let token_logits = &logits[start_idx..start_idx + num_labels];
+
+                // Find best label without allocating a Vec
+                let Some((best_idx, best_prob)) = argmax_softmax(token_logits) else {
+                    continue; // Empty probs (shouldn't happen, but defensive)
+                };
+
+                let tag = NerTag::from_index(best_idx);
+
+                // Handle BIO tagging
+                match (&current_entity, tag.is_begin(), tag.is_inside()) {
+                    // Begin new entity
+                    (None, true, _) => {
+                        current_entity = Some((tag, vec![gi], best_prob));
                     }
-                }
-                // End current entity, possibly start new
-                (Some((_prev_tag, _indices, _acc_prob)), _, _) => {
-                    // Save previous entity
-                    if let Some((prev_tag, indices, acc_prob)) = current_entity.take() {
-                        if let Some(entity) =
-                            self.build_entity(text, &prev_tag, &indices, acc_prob, offsets)
-                        {
-                            if entity.confidence >= self.config.confidence_threshold {
-                                entities.push(entity);
-                            }
+                    // Continue current entity
+                    (Some((prev_tag, _indices, _acc_prob)), _, true)
+                        if tag.matches_type(prev_tag) =>
+                    {
+                        // Take ownership to extend indices in-place (avoids clone)
+                        if let Some((prev_tag, mut indices, acc_prob)) = current_entity.take() {
+                            indices.push(gi);
+                            current_entity = Some((prev_tag, indices, acc_prob + best_prob));
                         }
                     }
+                    // End current entity, possibly start new
+                    (Some((_prev_tag, _indices, _acc_prob)), _, _) => {
+                        // Save previous entity
+                        if let Some((prev_tag, indices, acc_prob)) = current_entity.take() {
+                            if let Some(entity) =
+                                self.build_entity(text, &prev_tag, &indices, acc_prob, offsets)
+                            {
+                                if entity.confidence >= self.config.confidence_threshold {
+                                    entities.push(entity);
+                                }
+                            }
+                        }
 
-                    // Start new entity if this is a B- tag
-                    if tag.is_begin() {
-                        current_entity = Some((tag, vec![gi], best_prob));
-                    } else {
-                        current_entity = None;
+                        // Start new entity if this is a B- tag
+                        if tag.is_begin() {
+                            current_entity = Some((tag, vec![gi], best_prob));
+                        } else {
+                            current_entity = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Don't forget the last entity IN THIS WINDOW
+            if let Some((tag, indices, acc_prob)) = current_entity {
+                if let Some(entity) = self.build_entity(text, &tag, &indices, acc_prob, offsets) {
+                    if entity.confidence >= self.config.confidence_threshold {
+                        entities.push(entity);
                     }
                 }
-                _ => {}
             }
-        }
-
-        // Don't forget the last entity IN THIS WINDOW
-        if let Some((tag, indices, acc_prob)) = current_entity {
-            if let Some(entity) = self.build_entity(text, &tag, &indices, acc_prob, offsets) {
-                if entity.confidence >= self.config.confidence_threshold {
-                    entities.push(entity);
-                }
-            }
-        }
         } // end window loop
 
         // Deduplicate and merge overlapping entities. This already existed and now earns its keep
@@ -1500,17 +1504,16 @@ mod tests {
 /// - Version numbers (v1.2.3)
 /// - CamelCase tech names (PostgreSQL, FastAPI)
 /// - Uppercase acronyms (API, AWS, CI)
-pub fn cold_start_extract_entities(
-    text: &str,
-    existing_entities: &[String],
-) -> Vec<NerEntity> {
+pub fn cold_start_extract_entities(text: &str, existing_entities: &[String]) -> Vec<NerEntity> {
     let existing_lower: std::collections::HashSet<String> =
         existing_entities.iter().map(|e| e.to_lowercase()).collect();
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     for word in text.split_whitespace() {
-        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '@' && c != '/' && c != '-' && c != '_');
+        let clean = word.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '.' && c != '@' && c != '/' && c != '-' && c != '_'
+        });
         if clean.is_empty() || clean.len() < 2 {
             continue;
         }
@@ -1535,9 +1538,11 @@ pub fn cold_start_extract_entities(
         {
             // Proper noun heuristic — but skip common English words
             let lower = clean.to_lowercase();
-            let common = ["the", "this", "that", "with", "from", "into", "when", "what",
-                "where", "which", "while", "after", "before", "should", "could", "would",
-                "their", "there", "these", "those", "about", "above", "below", "between"];
+            let common = [
+                "the", "this", "that", "with", "from", "into", "when", "what", "where", "which",
+                "while", "after", "before", "should", "could", "would", "their", "there", "these",
+                "those", "about", "above", "below", "between",
+            ];
             if common.contains(&lower.as_str()) {
                 None
             } else {
@@ -1563,7 +1568,9 @@ pub fn cold_start_extract_entities(
 }
 
 fn is_camel_case(s: &str) -> bool {
-    if s.len() < 4 { return false; }
+    if s.len() < 4 {
+        return false;
+    }
     let has_upper = s.chars().any(|c| c.is_uppercase());
     let has_lower = s.chars().any(|c| c.is_lowercase());
     let starts_upper = s.chars().next().is_some_and(|c| c.is_uppercase());
@@ -1572,15 +1579,18 @@ fn is_camel_case(s: &str) -> bool {
 }
 
 fn is_acronym(s: &str) -> bool {
-    s.len() >= 2 && s.len() <= 6 && s.chars().all(|c| c.is_uppercase() || c.is_numeric())
+    s.len() >= 2
+        && s.len() <= 6
+        && s.chars().all(|c| c.is_uppercase() || c.is_numeric())
         && s.chars().any(|c| c.is_alphabetic())
 }
 
 fn is_version_number(s: &str) -> bool {
     let s = s.strip_prefix('v').unwrap_or(s);
     let parts: Vec<&str> = s.split('.').collect();
-    parts.len() >= 2 && parts.iter().all(|p| {
-        let base = p.split('-').next().unwrap_or(p);
-        !base.is_empty() && base.chars().all(|c| c.is_numeric())
-    })
+    parts.len() >= 2
+        && parts.iter().all(|p| {
+            let base = p.split('-').next().unwrap_or(p);
+            !base.is_empty() && base.chars().all(|c| c.is_numeric())
+        })
 }

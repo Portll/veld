@@ -87,9 +87,7 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
 /// any unauthenticated caller. The structural rule is: nothing on the public
 /// router reads `?user_id=` for per-tenant data — see `PUBLIC_PATHS` in
 /// `router.rs` and the `public_router_has_no_per_user_handlers` test.
-pub async fn health_ready(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let ready = state.is_ready();
     let status_code = if ready {
         StatusCode::OK
@@ -232,9 +230,7 @@ pub async fn health_ready_user(
 /// failure path) has been moved behind auth in `health_index_user`. Same
 /// disclosure class as the readiness probe: enumerating cached user IDs and
 /// returning rebuild-threshold ratios is per-tenant metadata.
-pub async fn health_index(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health_index(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     // Read health across cached users only — never trigger lazy init from a
     // public probe (otherwise every probe opens RocksDB for every on-disk
     // user, exhausting FDs).

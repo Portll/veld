@@ -90,10 +90,14 @@ fn unreachable(manifest_dir: &Path, src: &Path) -> BTreeSet<String> {
     let mut seen: HashSet<PathBuf> = roots.iter().cloned().collect();
     let mut stack = roots;
     while let Some(file) = stack.pop() {
-        let source = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let source = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         let dir = child_dir(&file);
         for name in declared_modules(&source) {
-            for candidate in [dir.join(format!("{name}.rs")), dir.join(&name).join("mod.rs")] {
+            for candidate in [
+                dir.join(format!("{name}.rs")),
+                dir.join(&name).join("mod.rs"),
+            ] {
                 if candidate.is_file() && seen.insert(candidate.clone()) {
                     stack.push(candidate);
                 }
@@ -104,7 +108,12 @@ fn unreachable(manifest_dir: &Path, src: &Path) -> BTreeSet<String> {
     files
         .into_iter()
         .filter(|f| !seen.contains(f))
-        .map(|f| f.strip_prefix(src).unwrap().to_string_lossy().replace('\\', "/"))
+        .map(|f| {
+            f.strip_prefix(src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
         .collect()
 }
 
@@ -115,7 +124,11 @@ fn the_walker_finds_a_planted_orphan_and_follows_every_declaration_form() {
     std::fs::write(root.join("Cargo.toml"), "[lib]\npath = \"src/lib.rs\"\n").unwrap();
     let src = root.join("src");
     std::fs::create_dir_all(src.join("a/b")).unwrap();
-    std::fs::write(src.join("lib.rs"), "pub mod a;\n// mod commented;\npub(crate) mod c;\n").unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod a;\n// mod commented;\npub(crate) mod c;\n",
+    )
+    .unwrap();
     std::fs::write(src.join("a/mod.rs"), "mod b;\n").unwrap();
     std::fs::write(src.join("a/b/mod.rs"), "").unwrap();
     std::fs::write(src.join("c.rs"), "").unwrap();
@@ -123,7 +136,10 @@ fn the_walker_finds_a_planted_orphan_and_follows_every_declaration_form() {
     std::fs::write(src.join("a/orphan.rs"), "").unwrap();
 
     let found: Vec<String> = unreachable(root, &src).into_iter().collect();
-    assert_eq!(found, vec!["a/orphan.rs".to_string(), "commented.rs".to_string()]);
+    assert_eq!(
+        found,
+        vec!["a/orphan.rs".to_string(), "commented.rs".to_string()]
+    );
 }
 
 #[test]

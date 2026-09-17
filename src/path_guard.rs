@@ -30,17 +30,40 @@ mod tests {
     /// unicode alphanumerics the old inline charset refused.
     #[test]
     fn accepts_everything_the_api_layer_accepts() {
-        for ok in ["all", "user-1", "a.b", "X_9", "someone@example.com", "名前", "müller"] {
+        for ok in [
+            "all",
+            "user-1",
+            "a.b",
+            "X_9",
+            "someone@example.com",
+            "名前",
+            "müller",
+        ] {
             assert!(sanitize_component(ok, "user id").is_ok(), "{ok}");
-            assert!(crate::validation::validate_user_id(ok).is_ok(), "{ok}: the API layer disagrees");
+            assert!(
+                crate::validation::validate_user_id(ok).is_ok(),
+                "{ok}: the API layer disagrees"
+            );
         }
     }
 
     #[test]
     fn rejects_everything_that_could_leave_the_directory() {
         for bad in [
-            "", ".", "..", "../x", "a/b", "a\\b", "/etc", "a\0b", ".hidden", "..%2f", "a b",
-            "a..b", "trailing.", &"x".repeat(129),
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "/etc",
+            "a\0b",
+            ".hidden",
+            "..%2f",
+            "a b",
+            "a..b",
+            "trailing.",
+            &"x".repeat(129),
         ] {
             assert!(sanitize_component(bad, "user id").is_err(), "{bad:?}");
         }

@@ -154,11 +154,7 @@ impl BudgetTracker {
     /// daily envelope? If so, return [`SleepTimeError::BudgetExhausted`].
     /// On pass, reserve one call slot (does not yet debit tokens — token spend
     /// is settled in [`Self::record_actual_spend`]).
-    pub fn try_charge_call(
-        &self,
-        user_id: &str,
-        projected_tokens: u32,
-    ) -> SleepTimeResult<()> {
+    pub fn try_charge_call(&self, user_id: &str, projected_tokens: u32) -> SleepTimeResult<()> {
         // Serialise per-user.
         let lock = self.user_lock(user_id);
         let _guard = lock.lock();
@@ -170,9 +166,7 @@ impl BudgetTracker {
                 what: format!("calls/day cap {}", self.limits.calls_per_day),
             });
         }
-        if state.tokens_this_hour.saturating_add(projected_tokens)
-            > self.limits.tokens_per_hour
-        {
+        if state.tokens_this_hour.saturating_add(projected_tokens) > self.limits.tokens_per_hour {
             return Err(SleepTimeError::BudgetExhausted {
                 user_id: user_id.to_string(),
                 what: format!(
@@ -344,7 +338,11 @@ mod tests {
         let out: Vec<_> = column_stores(&[CF_SLEEP_TIME_BUDGET, CF_SLEEP_TIME_GLOBAL_BUDGET])
             .into_iter()
             .map(|(backend, column, tmp)| {
-                (backend, BudgetTracker::with_store(column, limits).unwrap(), tmp)
+                (
+                    backend,
+                    BudgetTracker::with_store(column, limits).unwrap(),
+                    tmp,
+                )
             })
             .collect();
         assert_both_backends(&out);
@@ -441,8 +439,16 @@ mod tests {
             t.record_actual_spend("other", 5).unwrap();
             let user = t.user_state("global").unwrap();
             let global = t.global_state().unwrap();
-            assert_eq!((user.calls_today, user.tokens_this_hour), (1, 70), "{backend:?}");
-            assert_eq!((global.calls_today, global.tokens_today), (2, 75), "{backend:?}");
+            assert_eq!(
+                (user.calls_today, user.tokens_this_hour),
+                (1, 70),
+                "{backend:?}"
+            );
+            assert_eq!(
+                (global.calls_today, global.tokens_today),
+                (2, 75),
+                "{backend:?}"
+            );
         }
     }
 }

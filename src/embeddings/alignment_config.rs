@@ -142,17 +142,26 @@ impl Default for AlignmentConfig {
 
 fn env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => default,
     }
 }
 
 fn env_f32(key: &str, default: f32) -> f32 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 impl AlignmentConfig {
@@ -222,14 +231,20 @@ impl AlignmentConfig {
 
     /// Reject contradictory combinations and capabilities the build can't honor.
     /// `gradient_runtime_available` and `vec2vec_compiled` reflect actual build capability.
-    pub fn validate(&self, gradient_runtime_available: bool, vec2vec_compiled: bool) -> Result<(), String> {
+    pub fn validate(
+        &self,
+        gradient_runtime_available: bool,
+        vec2vec_compiled: bool,
+    ) -> Result<(), String> {
         if !self.v2_enabled {
             return Ok(()); // master off ⇒ nothing to validate
         }
         // Closed-form fitters cannot honor a gradient objective.
         let closed_form = matches!(
             self.method,
-            AlignmentMethod::Procrustes | AlignmentMethod::WhitenedProcrustes | AlignmentMethod::Cca
+            AlignmentMethod::Procrustes
+                | AlignmentMethod::WhitenedProcrustes
+                | AlignmentMethod::Cca
         );
         let gradient_obj = matches!(
             self.objective,

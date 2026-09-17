@@ -307,7 +307,8 @@ impl LinkStore for RelationalLinkStore {
         row_pk: &RowPk,
         entity_id: &str,
     ) -> Result<(), DatasetError> {
-        self.insert(dataset, row_pk, LinkKind::Entity, entity_id).await
+        self.insert(dataset, row_pk, LinkKind::Entity, entity_id)
+            .await
     }
 
     async fn link_row_to_memory(
@@ -316,7 +317,8 @@ impl LinkStore for RelationalLinkStore {
         row_pk: &RowPk,
         memory_id: &str,
     ) -> Result<(), DatasetError> {
-        self.insert(dataset, row_pk, LinkKind::Memory, memory_id).await
+        self.insert(dataset, row_pk, LinkKind::Memory, memory_id)
+            .await
     }
 
     async fn rows_for_entity(
@@ -324,7 +326,8 @@ impl LinkStore for RelationalLinkStore {
         dataset: &DatasetRef,
         entity_id: &str,
     ) -> Result<Vec<RowLink>, DatasetError> {
-        self.select_links(dataset, LinkKind::Entity, entity_id).await
+        self.select_links(dataset, LinkKind::Entity, entity_id)
+            .await
     }
 
     async fn rows_for_memory(
@@ -332,7 +335,8 @@ impl LinkStore for RelationalLinkStore {
         dataset: &DatasetRef,
         memory_id: &str,
     ) -> Result<Vec<RowLink>, DatasetError> {
-        self.select_links(dataset, LinkKind::Memory, memory_id).await
+        self.select_links(dataset, LinkKind::Memory, memory_id)
+            .await
     }
 }
 
@@ -348,16 +352,10 @@ mod tests {
     impl RelationalStore for BoxErrorSqlite {
         type Error = BoxError;
         async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64, BoxError> {
-            self.0
-                .execute(sql, params)
-                .await
-                .map_err(BoxError::new)
+            self.0.execute(sql, params).await.map_err(BoxError::new)
         }
         async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, BoxError> {
-            self.0
-                .query(sql, params)
-                .await
-                .map_err(BoxError::new)
+            self.0.query(sql, params).await.map_err(BoxError::new)
         }
         fn backend(&self) -> RelationalBackend {
             self.0.backend()
@@ -368,9 +366,10 @@ mod tests {
         let sqlite = SqliteRelationalStore::in_memory()
             .await
             .expect("open sqlite");
-        let store: Arc<dyn RelationalStore<Error = BoxError>> =
-            Arc::new(BoxErrorSqlite(sqlite));
-        RelationalLinkStore::new(store).await.expect("init link store")
+        let store: Arc<dyn RelationalStore<Error = BoxError>> = Arc::new(BoxErrorSqlite(sqlite));
+        RelationalLinkStore::new(store)
+            .await
+            .expect("init link store")
     }
 
     fn dref(table: &str) -> DatasetRef {
@@ -393,11 +392,20 @@ mod tests {
         let d = dref("alice__dataset__events");
         let entity = "550e8400-e29b-41d4-a716-446655440000";
 
-        ls.link_row_to_entity(&d, &pk(1), entity).await.expect("link 1");
-        ls.link_row_to_entity(&d, &pk(2), entity).await.expect("link 2");
-        ls.link_row_to_entity(&d, &pk(3), entity).await.expect("link 3");
+        ls.link_row_to_entity(&d, &pk(1), entity)
+            .await
+            .expect("link 1");
+        ls.link_row_to_entity(&d, &pk(2), entity)
+            .await
+            .expect("link 2");
+        ls.link_row_to_entity(&d, &pk(3), entity)
+            .await
+            .expect("link 3");
 
-        let rows = ls.rows_for_entity(&d, entity).await.expect("rows_for_entity");
+        let rows = ls
+            .rows_for_entity(&d, entity)
+            .await
+            .expect("rows_for_entity");
         assert_eq!(rows.len(), 3);
         let ids: Vec<i64> = rows
             .iter()
@@ -421,8 +429,12 @@ mod tests {
         let memory = "mem-1";
         let entity = "ent-1";
 
-        ls.link_row_to_memory(&d, &pk(1), memory).await.expect("mem link");
-        ls.link_row_to_entity(&d, &pk(2), entity).await.expect("ent link");
+        ls.link_row_to_memory(&d, &pk(1), memory)
+            .await
+            .expect("mem link");
+        ls.link_row_to_entity(&d, &pk(2), entity)
+            .await
+            .expect("ent link");
 
         let mem_rows = ls.rows_for_memory(&d, memory).await.expect("mem query");
         assert_eq!(mem_rows.len(), 1);
@@ -442,10 +454,18 @@ mod tests {
         let d = dref("alice__dataset__events");
         let entity = "ent-1";
 
-        ls.link_row_to_entity(&d, &pk(1), entity).await.expect("first");
-        ls.link_row_to_entity(&d, &pk(1), entity).await.expect("second");
+        ls.link_row_to_entity(&d, &pk(1), entity)
+            .await
+            .expect("first");
+        ls.link_row_to_entity(&d, &pk(1), entity)
+            .await
+            .expect("second");
 
         let rows = ls.rows_for_entity(&d, entity).await.expect("query");
-        assert_eq!(rows.len(), 1, "duplicate link should not produce duplicates");
+        assert_eq!(
+            rows.len(),
+            1,
+            "duplicate link should not produce duplicates"
+        );
     }
 }

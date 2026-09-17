@@ -6,12 +6,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use super::facets::CausalRelation;
 pub use super::facets::{
     validate_agent_id, AgentRef, AgentRole, AgentSession, CausalLink, ContentKind, EngramBinding,
     GoalRef, Orientation, Place, Prediction, RecordKind, WhatFacet, WhenFacet, WhereFacet,
     WhoFacet, WhyFacet, KNOWN_AGENT_BRANDS,
 };
-use super::facets::CausalRelation;
 use crate::constants::{
     DEFAULT_MAX_RESULTS, IMPORTANCE_FLOOR, RECENCY_FULL_DAYS, RECENCY_HIGH_DAYS,
     RECENCY_HIGH_WEIGHT, RECENCY_LOW_WEIGHT, RECENCY_MEDIUM_DAYS, RECENCY_MEDIUM_WEIGHT,
@@ -91,7 +91,13 @@ impl ExternalDimensionScores {
     /// Aggregate score: geometric mean of available dimensions.
     /// Returns 1.0 (neutral) if no scores are set.
     pub fn aggregate(&self) -> f32 {
-        let vals = [self.density, self.coherence, self.closure, self.confidence, self.isotropy];
+        let vals = [
+            self.density,
+            self.coherence,
+            self.closure,
+            self.confidence,
+            self.isotropy,
+        ];
         let nonzero: Vec<f32> = vals.iter().copied().filter(|&v| v > 0.0).collect();
         if nonzero.is_empty() {
             return 1.0; // neutral — no external evaluator data available
@@ -248,10 +254,16 @@ impl ScoringSignals {
             access_count: (mem.access_count() as f64).ln_1p() as f32 / 5.0,
             recency: (-0.01 * hours_old).exp(),
             arousal: ctx.map(|c| c.emotional.arousal).unwrap_or(0.0),
-            credibility: ctx.map(|c| (c.source.credibility - 0.5).max(0.0)).unwrap_or(0.0),
+            credibility: ctx
+                .map(|c| (c.source.credibility - 0.5).max(0.0))
+                .unwrap_or(0.0),
             calibrated_confidence: mem.calibrated_confidence(),
             confidence_observations: mem.confidence_observations(),
-            session_boost: if (now - mem.created_at).num_hours() <= 2 { 0.03 } else { 0.0 },
+            session_boost: if (now - mem.created_at).num_hours() <= 2 {
+                0.03
+            } else {
+                0.0
+            },
             ..Default::default()
         }
     }
@@ -1298,7 +1310,8 @@ impl Experience {
                 }
             }
         }
-        self.geo_location.map(|[lat, lon, alt]| (lat, lon, Some(alt)))
+        self.geo_location
+            .map(|[lat, lon, alt]| (lat, lon, Some(alt)))
     }
 
     /// Resolved heading — prefers `WhereFacet.heading` over the flat field.
@@ -1672,8 +1685,7 @@ pub struct EntityRef {
 }
 
 /// Memory tier in the cognitive hierarchy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MemoryTier {
     /// Active, immediate context (Cowan's focus of attention)
     #[default]
@@ -1685,7 +1697,6 @@ pub enum MemoryTier {
     /// Compressed archival storage
     Archive,
 }
-
 
 /// Type of change made to a memory
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2267,8 +2278,8 @@ impl Memory {
             return 1.0;
         }
         let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
-        let variance = intervals.iter().map(|&i| (i - mean).powi(2)).sum::<f64>()
-            / intervals.len() as f64;
+        let variance =
+            intervals.iter().map(|&i| (i - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
         let std_dev = variance.sqrt();
         if mean > 0.0 {
             (std_dev / mean) as f32
@@ -2386,8 +2397,7 @@ impl Memory {
     /// Check if this memory has been temporally invalidated (superseded by contradiction).
     /// Returns true if `valid_until` is set and the expiry timestamp has passed.
     pub fn is_expired(&self) -> bool {
-        self.valid_until
-            .is_some_and(|dt| dt <= Utc::now())
+        self.valid_until.is_some_and(|dt| dt <= Utc::now())
     }
 
     /// R6 bi-temporal "as-of": was this memory valid at instant `dt`?
@@ -2747,8 +2757,12 @@ impl<'de> Deserialize<'de> for Memory {
                 activation: flat.activation,
                 anchored: flat.anchored,
                 access_history: flat.access_history.unwrap_or_default(),
-                calibrated_confidence: flat.calibrated_confidence.unwrap_or_else(default_calibrated_confidence),
-                confidence_alpha: flat.confidence_alpha.unwrap_or_else(default_confidence_alpha),
+                calibrated_confidence: flat
+                    .calibrated_confidence
+                    .unwrap_or_else(default_calibrated_confidence),
+                confidence_alpha: flat
+                    .confidence_alpha
+                    .unwrap_or_else(default_confidence_alpha),
                 confidence_beta: flat.confidence_beta.unwrap_or_else(default_confidence_beta),
                 elaboration_score: flat.elaboration_score.unwrap_or(0.0),
                 fragment_demotion: flat.fragment_demotion.unwrap_or(1.0),
@@ -3417,10 +3431,9 @@ impl Query {
         }
 
         // Anomalies only filter
-        if self.anomalies_only
-            && !memory.experience.is_anomaly {
-                return false;
-            }
+        if self.anomalies_only && !memory.experience.is_anomaly {
+            return false;
+        }
 
         // Severity filter
         if let Some(severity) = &self.severity {
@@ -4299,7 +4312,6 @@ pub enum ProspectiveTaskStatus {
     /// Task expired without being triggered (optional cleanup)
     Expired,
 }
-
 
 /// A prospective memory task (reminder/intention)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5249,8 +5261,7 @@ impl Default for FileType {
 }
 
 /// How we learned about this file
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum LearnedFrom {
     /// User triggered batch indexing
     #[default]
@@ -5262,7 +5273,6 @@ pub enum LearnedFrom {
     /// File was mentioned in conversation
     Mentioned,
 }
-
 
 /// Learned knowledge about a file in a codebase
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5388,7 +5398,15 @@ impl FileMemory {
         self.updated_at = Utc::now();
         // Upgrade the learned_from if more meaningful
         // EditAccess > ReadAccess > Mentioned > ManualIndex
-        let should_upgrade = matches!((&self.learned_from, &learned_from), (LearnedFrom::ManualIndex, _) | (LearnedFrom::Mentioned, LearnedFrom::ReadAccess | LearnedFrom::EditAccess) | (LearnedFrom::ReadAccess, LearnedFrom::EditAccess));
+        let should_upgrade = matches!(
+            (&self.learned_from, &learned_from),
+            (LearnedFrom::ManualIndex, _)
+                | (
+                    LearnedFrom::Mentioned,
+                    LearnedFrom::ReadAccess | LearnedFrom::EditAccess
+                )
+                | (LearnedFrom::ReadAccess, LearnedFrom::EditAccess)
+        );
         if should_upgrade {
             self.learned_from = learned_from;
         }
@@ -5599,7 +5617,14 @@ mod tests {
         let keys: Vec<&str> = LayerMode::ALL.iter().map(|m| m.report_key()).collect();
         assert_eq!(
             keys,
-            vec!["vamana_only", "+spreading", "+bm25", "+rerank", "+facts", "full"]
+            vec![
+                "vamana_only",
+                "+spreading",
+                "+bm25",
+                "+rerank",
+                "+facts",
+                "full"
+            ]
         );
         let unique: std::collections::BTreeSet<_> = keys.iter().collect();
         assert_eq!(unique.len(), keys.len());

@@ -224,10 +224,22 @@ mod tests {
         assert_eq!(schema.columns[0].name, ROW_ID_COLUMN);
         assert_eq!(schema.primary_key, vec![ROW_ID_COLUMN.to_string()]);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values.get("name").unwrap(), &Value::String("alice".into()));
-        assert_eq!(rows[0].values.get(ROW_ID_COLUMN).unwrap(), &Value::from(0i64));
-        assert_eq!(rows[1].values.get("age").unwrap(), &Value::String("25".into()));
-        assert_eq!(rows[1].values.get(ROW_ID_COLUMN).unwrap(), &Value::from(1i64));
+        assert_eq!(
+            rows[0].values.get("name").unwrap(),
+            &Value::String("alice".into())
+        );
+        assert_eq!(
+            rows[0].values.get(ROW_ID_COLUMN).unwrap(),
+            &Value::from(0i64)
+        );
+        assert_eq!(
+            rows[1].values.get("age").unwrap(),
+            &Value::String("25".into())
+        );
+        assert_eq!(
+            rows[1].values.get(ROW_ID_COLUMN).unwrap(),
+            &Value::from(1i64)
+        );
     }
 
     #[test]
@@ -235,8 +247,14 @@ mod tests {
         let csv = "a,b\n\"x,y\",\"line1\nline2\"\n";
         let (_schema, rows) = to_dataset(InputFormat::Csv, csv, "d").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values.get("a").unwrap(), &Value::String("x,y".into()));
-        assert_eq!(rows[0].values.get("b").unwrap(), &Value::String("line1\nline2".into()));
+        assert_eq!(
+            rows[0].values.get("a").unwrap(),
+            &Value::String("x,y".into())
+        );
+        assert_eq!(
+            rows[0].values.get("b").unwrap(),
+            &Value::String("line1\nline2".into())
+        );
     }
 
     #[test]
@@ -244,9 +262,15 @@ mod tests {
         let csv = "a,b\n\"he said \"\"hi\"\"\",only_a\nsolo";
         let (_s, rows) = to_dataset(InputFormat::Csv, csv, "d").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values.get("a").unwrap(), &Value::String("he said \"hi\"".into()));
+        assert_eq!(
+            rows[0].values.get("a").unwrap(),
+            &Value::String("he said \"hi\"".into())
+        );
         // Short row: missing 'b' padded to Null.
-        assert_eq!(rows[1].values.get("a").unwrap(), &Value::String("solo".into()));
+        assert_eq!(
+            rows[1].values.get("a").unwrap(),
+            &Value::String("solo".into())
+        );
         assert_eq!(rows[1].values.get("b").unwrap(), &Value::Null);
     }
 
@@ -259,11 +283,20 @@ mod tests {
         assert_eq!(col_names, vec![ROW_ID_COLUMN, "id", "name", "city"]);
         assert_eq!(rows.len(), 2);
         // Numbers stringified into TEXT cells.
-        assert_eq!(rows[0].values.get("id").unwrap(), &Value::String("1".into()));
-        assert_eq!(rows[0].values.get("name").unwrap(), &Value::String("a".into()));
+        assert_eq!(
+            rows[0].values.get("id").unwrap(),
+            &Value::String("1".into())
+        );
+        assert_eq!(
+            rows[0].values.get("name").unwrap(),
+            &Value::String("a".into())
+        );
         // Missing key → Null.
         assert_eq!(rows[0].values.get("city").unwrap(), &Value::Null);
-        assert_eq!(rows[1].values.get("city").unwrap(), &Value::String("NYC".into()));
+        assert_eq!(
+            rows[1].values.get("city").unwrap(),
+            &Value::String("NYC".into())
+        );
     }
 
     #[test]

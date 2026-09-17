@@ -206,7 +206,10 @@ mod tests {
 
     #[test]
     fn parse_relation_unknown_falls_back_to_co_occurs() {
-        assert_eq!(parse_relation("not_a_real_relation"), RelationType::CoOccurs);
+        assert_eq!(
+            parse_relation("not_a_real_relation"),
+            RelationType::CoOccurs
+        );
         assert_eq!(parse_relation(""), RelationType::CoOccurs);
     }
 
@@ -236,12 +239,7 @@ mod tests {
 
     #[test]
     fn make_l1_edge_scales_with_low_confidence() {
-        let e = make_l1_edge(
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            RelationType::CoOccurs,
-            0.6,
-        );
+        let e = make_l1_edge(Uuid::new_v4(), Uuid::new_v4(), RelationType::CoOccurs, 0.6);
         let initial = EdgeTier::L1Working.initial_weight();
         // strength = initial * 0.6
         assert!((e.strength - initial * 0.6).abs() < 1e-5);

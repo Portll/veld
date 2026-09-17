@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::{
-    AuditLogEntry, AuditStore, BackupStore, BatchOp, BatchWriter, GraphStore, KeyValueStore,
-    ColumnStore, MigrationStore, PrimaryMemoryStore, StorageFactory,
+    AuditLogEntry, AuditStore, BackupStore, BatchOp, BatchWriter, ColumnStore, GraphStore,
+    KeyValueStore, MigrationStore, PrimaryMemoryStore, StorageFactory,
     WriteBatch as StorageWriteBatch,
 };
 use crate::backup::{BackupMetadata, VeldBackupEngine};
@@ -216,7 +216,8 @@ pub fn user_has_memories(user_dir: &Path) -> Result<Option<bool>> {
 /// column families, for offline diagnostics over a copied store. Nothing is written.
 pub fn visit_records_read_only(path: &Path, mut visit: impl FnMut(&[u8], &[u8])) -> Result<()> {
     let opts = rocksdb::Options::default();
-    let cfs = DB::list_cf(&opts, path).with_context(|| format!("list column families {}", path.display()))?;
+    let cfs = DB::list_cf(&opts, path)
+        .with_context(|| format!("list column families {}", path.display()))?;
     let db = DB::open_cf_for_read_only(&opts, path, &cfs, false)
         .with_context(|| format!("open read-only {}", path.display()))?;
     for item in db.iterator(IteratorMode::Start) {
@@ -257,14 +258,30 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
     //    purpose: this adapter's whole job is to preserve current runtime behaviour
     //    while call sites move off the concrete type, so anything cleverer here
     //    would change behaviour in the commit whose point is that nothing changes.
-    fn get(&self, id: &MemoryId) -> Result<Memory> { self.inner.get(id) }
-    fn store(&self, memory: &Memory) -> Result<()> { self.inner.store(memory) }
-    fn update(&self, memory: &Memory) -> Result<()> { self.inner.update(memory) }
-    fn delete(&self, id: &MemoryId) -> Result<()> { self.inner.delete(id) }
-    fn get_all(&self) -> Result<Vec<Memory>> { self.inner.get_all() }
-    fn get_all_ids(&self) -> Result<Vec<MemoryId>> { self.inner.get_all_ids() }
-    fn increment_retrieval_count(&self) -> Result<usize> { self.inner.increment_retrieval_count() }
-    fn get_stats(&self) -> Result<crate::memory::storage::StorageStats> { self.inner.get_stats() }
+    fn get(&self, id: &MemoryId) -> Result<Memory> {
+        self.inner.get(id)
+    }
+    fn store(&self, memory: &Memory) -> Result<()> {
+        self.inner.store(memory)
+    }
+    fn update(&self, memory: &Memory) -> Result<()> {
+        self.inner.update(memory)
+    }
+    fn delete(&self, id: &MemoryId) -> Result<()> {
+        self.inner.delete(id)
+    }
+    fn get_all(&self) -> Result<Vec<Memory>> {
+        self.inner.get_all()
+    }
+    fn get_all_ids(&self) -> Result<Vec<MemoryId>> {
+        self.inner.get_all_ids()
+    }
+    fn increment_retrieval_count(&self) -> Result<usize> {
+        self.inner.increment_retrieval_count()
+    }
+    fn get_stats(&self) -> Result<crate::memory::storage::StorageStats> {
+        self.inner.get_stats()
+    }
     fn find_by_external_id(&self, external_id: &str) -> Result<Option<Memory>> {
         self.inner.find_by_external_id(external_id)
     }
@@ -305,8 +322,12 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
     fn clear_all_interference_records(&self) -> Result<usize> {
         self.inner.clear_all_interference_records()
     }
-    fn cleanup_corrupted(&self) -> Result<usize> { self.inner.cleanup_corrupted() }
-    fn migrate_legacy(&self) -> Result<(usize, usize, usize)> { self.inner.migrate_legacy() }
+    fn cleanup_corrupted(&self) -> Result<usize> {
+        self.inner.cleanup_corrupted()
+    }
+    fn migrate_legacy(&self) -> Result<(usize, usize, usize)> {
+        self.inner.migrate_legacy()
+    }
     fn run_merge_pass(&self, user_id: &str, limit: usize) -> Result<usize> {
         Ok(self.inner.run_merge_pass(user_id, limit))
     }
@@ -356,9 +377,8 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
 
     fn put_vector_mapping(&self, id: &MemoryId, mapping: &VectorMappingEntry) -> Result<()> {
         let mapping_key = format!("vmapping:{}", id.0);
-        let mapping_value =
-            bincode::serde::encode_to_vec(mapping, bincode::config::standard())
-                .context("Failed to serialize vector mapping for legacy RocksDB store")?;
+        let mapping_value = bincode::serde::encode_to_vec(mapping, bincode::config::standard())
+            .context("Failed to serialize vector mapping for legacy RocksDB store")?;
 
         self.inner
             .db()
@@ -536,8 +556,8 @@ impl MigrationStore for RocksDbMigrationStore {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let file =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let mut writer = PortableWriter::new(std::io::BufWriter::new(file))?;
 
         // Every failure below removes the partial file. Leaving it puts a
@@ -649,7 +669,8 @@ impl BackupStore for RocksDbBackupStore {
     }
 
     fn restore_backup(&self, user_id: &str, backup_id: u32, target_path: &Path) -> Result<()> {
-        self.inner.restore_backup(user_id, Some(backup_id), target_path)
+        self.inner
+            .restore_backup(user_id, Some(backup_id), target_path)
     }
 }
 
@@ -757,7 +778,6 @@ impl KeyValueStore for RocksDbDefaultKeyValueStore {
         self.db.write(wb)?;
         Ok(())
     }
-
 }
 
 impl KeyValueStore for RocksDbColumnFamilyStore {
@@ -823,7 +843,6 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
         self.db.write(wb)?;
         Ok(())
     }
-
 }
 
 /// Audit adapter for the shared RocksDB-backed audit log column family.
@@ -841,9 +860,12 @@ impl RocksDbAuditStore {
     }
 
     fn cf(&self) -> Result<&ColumnFamily> {
-        self.db
-            .cf_handle(&self.column_family)
-            .with_context(|| format!("Missing RocksDB audit column family '{}'", self.column_family))
+        self.db.cf_handle(&self.column_family).with_context(|| {
+            format!(
+                "Missing RocksDB audit column family '{}'",
+                self.column_family
+            )
+        })
     }
 }
 
@@ -864,7 +886,11 @@ impl AuditStore for RocksDbAuditStore {
 
     fn list_user_ids(&self) -> Result<Vec<String>> {
         let mut ids = std::collections::HashSet::new();
-        for (key, _) in self.db.iterator_cf(self.cf()?, rocksdb::IteratorMode::Start).flatten() {
+        for (key, _) in self
+            .db
+            .iterator_cf(self.cf()?, rocksdb::IteratorMode::Start)
+            .flatten()
+        {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if let Some(user_id) = key_str.split(':').next() {
                     ids.insert(user_id.to_string());
@@ -1039,8 +1065,10 @@ mod migration_export_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = db_with_families(dir.path());
         db.put(b"acl:alice:1", b"in-default").unwrap();
-        db.put_cf(db.cf_handle("memory_index").unwrap(), b"i1", b"in-index").unwrap();
-        db.put_cf(db.cf_handle("kv").unwrap(), b"dials", b"in-kv").unwrap();
+        db.put_cf(db.cf_handle("memory_index").unwrap(), b"i1", b"in-index")
+            .unwrap();
+        db.put_cf(db.cf_handle("kv").unwrap(), b"dials", b"in-kv")
+            .unwrap();
 
         let out = dir.path().join("export.veldport");
         RocksDbMigrationStore::new(db.clone())
@@ -1048,8 +1076,10 @@ mod migration_export_tests {
             .expect("export");
 
         let records = read_all(std::fs::File::open(&out).unwrap()).expect("verify + read");
-        let mut seen: Vec<(String, Vec<u8>)> =
-            records.iter().map(|r| (r.cf.clone(), r.value.clone())).collect();
+        let mut seen: Vec<(String, Vec<u8>)> = records
+            .iter()
+            .map(|r| (r.cf.clone(), r.value.clone()))
+            .collect();
         seen.sort();
         assert_eq!(
             seen,
@@ -1069,7 +1099,9 @@ mod migration_export_tests {
         RocksDbMigrationStore::new(db)
             .export_portable("alice", &out)
             .expect("export");
-        assert!(read_all(std::fs::File::open(&out).unwrap()).unwrap().is_empty());
+        assert!(read_all(std::fs::File::open(&out).unwrap())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1080,8 +1112,14 @@ mod migration_export_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = db_with_families(dir.path());
         for i in 0..50u32 {
-            db.put(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
-            db.put_cf(db.cf_handle("kv").unwrap(), format!("x{i:03}").as_bytes(), b"y").unwrap();
+            db.put(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
+            db.put_cf(
+                db.cf_handle("kv").unwrap(),
+                format!("x{i:03}").as_bytes(),
+                b"y",
+            )
+            .unwrap();
         }
         let store = RocksDbMigrationStore::new(db);
         let a = dir.path().join("a.veldport");
@@ -1102,7 +1140,10 @@ mod migration_export_tests {
             .export_portable("alice", &out)
             .expect_err("a missing keyspace must refuse");
         assert!(err.to_string().contains("column family"), "got: {err}");
-        assert!(!out.exists(), "a refused export must leave no file to be mistaken for one");
+        assert!(
+            !out.exists(),
+            "a refused export must leave no file to be mistaken for one"
+        );
         assert!(
             !out.with_extension("partial").exists(),
             "the partial was left on disk — a half-written dump beside where a complete one goes"

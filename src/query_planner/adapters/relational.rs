@@ -38,13 +38,8 @@ use std::sync::Arc;
 ///
 /// Anything outside this list is treated as "unknown" — the adapter returns
 /// empty / false rather than embedding the unknown identifier in SQL.
-pub const ALLOWED_RELATIONAL_COLUMNS: &[&str] = &[
-    "user_id",
-    "memory_id",
-    "lsn",
-    "importance",
-    "updated_at",
-];
+pub const ALLOWED_RELATIONAL_COLUMNS: &[&str] =
+    &["user_id", "memory_id", "lsn", "importance", "updated_at"];
 
 /// Adapter that translates `RelationalPredicate`s into SQL against the
 /// slow-store `memories` table.
@@ -135,7 +130,10 @@ fn build_scan<'a>(
 
 /// Build only the WHERE-clause fragment + its bound parameters. Returns
 /// `None` if the predicate's column is not whitelisted.
-fn build_where<'a>(user_id: &'a str, p: &'a RelationalPredicate) -> Option<(String, Vec<Param<'a>>)> {
+fn build_where<'a>(
+    user_id: &'a str,
+    p: &'a RelationalPredicate,
+) -> Option<(String, Vec<Param<'a>>)> {
     // Every clause is tenant-scoped — the planner's tenant binding lands
     // here as the leading filter regardless of the predicate.
     let mut params: Vec<Param<'a>> = vec![Param::Text(user_id)];
@@ -240,25 +238,15 @@ mod tests {
     #[async_trait]
     impl RelationalStore for BoxErrorSqlite {
         type Error = BoxError;
-        async fn execute(
-            &self,
-            sql: &str,
-            params: &[Param<'_>],
-        ) -> Result<u64, BoxError> {
-            self.0
-                .execute(sql, params)
-                .await
-                .map_err(BoxError::new)
+        async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64, BoxError> {
+            self.0.execute(sql, params).await.map_err(BoxError::new)
         }
         async fn query(
             &self,
             sql: &str,
             params: &[Param<'_>],
         ) -> Result<Vec<crate::storage::relational::Row>, BoxError> {
-            self.0
-                .query(sql, params)
-                .await
-                .map_err(BoxError::new)
+            self.0.query(sql, params).await.map_err(BoxError::new)
         }
         fn backend(&self) -> crate::storage::relational::RelationalBackend {
             self.0.backend()

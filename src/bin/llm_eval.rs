@@ -282,8 +282,7 @@ fn main() -> Result<()> {
 
     let json = serde_json::to_string_pretty(&report)?;
     if let Some(path) = &args.out {
-        std::fs::write(path, &json)
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(path, &json).with_context(|| format!("writing {}", path.display()))?;
         eprintln!("\nResults written to {}", path.display());
     } else {
         println!("{json}");
@@ -328,7 +327,10 @@ fn run_variant(
     // configured, leave it unattached; the engine then degrades cleanly per
     // RefinerMode semantics (Llm -> RRF-only; Stacked -> cross-encoder-only).
     let mut refiner_attached = false;
-    if matches!(variant.refiner_mode(), RefinerMode::Llm | RefinerMode::Stacked) {
+    if matches!(
+        variant.refiner_mode(),
+        RefinerMode::Llm | RefinerMode::Stacked
+    ) {
         if let Some(refiner) = LlmRefiner::from_env()? {
             engine = engine.with_refiner(Box::new(refiner));
             refiner_attached = true;

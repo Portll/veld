@@ -566,17 +566,34 @@ mod tests {
             let memory = harness.manager.get_user_memory(user_id).unwrap();
             let guard = memory.read();
             guard
-                .remember(Experience { content: "MIF export happy-path memory".to_string(), ..Default::default() }, None)
+                .remember(
+                    Experience {
+                        content: "MIF export happy-path memory".to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
                 .unwrap();
         }
         let project = Project::new(user_id.to_string(), "Export Test Project".to_string());
         harness.manager.todo_store.store_project(&project).unwrap();
 
-        let req = test_helpers::post_json("/api/export/mif", &serde_json::json!({ "user_id": user_id }));
+        let req = test_helpers::post_json(
+            "/api/export/mif",
+            &serde_json::json!({ "user_id": user_id }),
+        );
         let (status, body) = test_helpers::send(harness.router(), req).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["memories"].as_array().unwrap().len(), 1, "export must include the seeded memory");
-        assert_eq!(body["projects"].as_array().unwrap().len(), 1, "export must include the seeded project");
+        assert_eq!(
+            body["memories"].as_array().unwrap().len(),
+            1,
+            "export must include the seeded memory"
+        );
+        assert_eq!(
+            body["projects"].as_array().unwrap().len(),
+            1,
+            "export must include the seeded project"
+        );
         assert_eq!(body["projects"][0]["name"], "Export Test Project");
     }
 }

@@ -63,8 +63,10 @@ impl HttpEmbedderConfig {
         // An insecure plain-http override to a non-localhost host is rejected
         // (fall back to the localhost default) because the embedder POSTs user
         // text to that URL. Opt back in with VELD_ALLOW_INSECURE_REMOTE_EMBEDDER=true.
-        let mut base_url =
-            crate::integrations::resolve_api_url_override("VELD_EMBEDDING_API_URL", DEFAULT_BASE_URL);
+        let mut base_url = crate::integrations::resolve_api_url_override(
+            "VELD_EMBEDDING_API_URL",
+            DEFAULT_BASE_URL,
+        );
         if crate::integrations::is_insecure_remote_url(&base_url)
             && !std::env::var("VELD_ALLOW_INSECURE_REMOTE_EMBEDDER")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -238,9 +240,18 @@ impl HttpEmbedder {
         }
         let v = self
             .encode_http(&self.document_text("veld embedder probe"))
-            .with_context(|| format!("{}/v1/embeddings with model {:?}", self.config.base_url, self.config.model))?;
+            .with_context(|| {
+                format!(
+                    "{}/v1/embeddings with model {:?}",
+                    self.config.base_url, self.config.model
+                )
+            })?;
         if v.is_empty() {
-            anyhow::bail!("{} returned an empty vector for model {:?}", self.config.base_url, self.config.model);
+            anyhow::bail!(
+                "{} returned an empty vector for model {:?}",
+                self.config.base_url,
+                self.config.model
+            );
         }
         let _ = self.cached_dimension.set(v.len());
         Ok(v.len())
@@ -276,7 +287,9 @@ impl HttpEmbedder {
             builder = builder.header("Authorization", &format!("Bearer {key}"));
         }
 
-        let resp = builder.send_json(&req).context("HTTP embedding request failed")?;
+        let resp = builder
+            .send_json(&req)
+            .context("HTTP embedding request failed")?;
 
         let parsed: EmbeddingResponse = resp
             .into_body()
@@ -326,7 +339,8 @@ impl Embedder for HttpEmbedder {
     fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         // Use batch endpoint if available
         let url = format!("{}/v1/embeddings", self.config.base_url);
-        let prefixed: Vec<std::borrow::Cow<'_, str>> = texts.iter().map(|t| self.document_text(t)).collect();
+        let prefixed: Vec<std::borrow::Cow<'_, str>> =
+            texts.iter().map(|t| self.document_text(t)).collect();
         let req = BatchEmbeddingRequest {
             model: &self.config.model,
             input: prefixed.iter().map(|c| c.as_ref()).collect(),
@@ -379,7 +393,10 @@ mod tests {
         let config = HttpEmbedderConfig::from_env();
         assert!(config.base_url.contains("127.0.0.1"));
         assert!(config.model.contains("nomic"));
-        assert!(config.task_prefixes, "a nomic model gets its task prefixes by default");
+        assert!(
+            config.task_prefixes,
+            "a nomic model gets its task prefixes by default"
+        );
     }
 
     #[test]
@@ -392,7 +409,10 @@ mod tests {
     #[test]
     fn id_names_url_and_model_and_round_trips_through_from_id() {
         let e = HttpEmbedder::new(cfg("text-embedding-nomic-embed-text-v1.5"));
-        assert_eq!(e.id(), "http://localhost:9#text-embedding-nomic-embed-text-v1.5");
+        assert_eq!(
+            e.id(),
+            "http://localhost:9#text-embedding-nomic-embed-text-v1.5"
+        );
         let back = HttpEmbedderConfig::from_id(e.id());
         assert_eq!(back.base_url, "http://localhost:9");
         assert_eq!(back.model, "text-embedding-nomic-embed-text-v1.5");
@@ -407,7 +427,10 @@ mod tests {
         let nomic = HttpEmbedder::new(cfg("text-embedding-nomic-embed-text-v1.5"));
         assert_eq!(nomic.document_text("hello"), "search_document: hello");
         assert_eq!(nomic.query_text("hello"), "search_query: hello");
-        assert_eq!(nomic.document_text("search_document: hello"), "search_document: hello");
+        assert_eq!(
+            nomic.document_text("search_document: hello"),
+            "search_document: hello"
+        );
 
         let other = HttpEmbedder::new(cfg("bge-m3"));
         assert_eq!(other.document_text("hello"), "hello");

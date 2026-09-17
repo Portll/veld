@@ -155,10 +155,7 @@ impl Bm25Projection {
     /// Construct a projection around an open BM25 index. Reads the
     /// last-persisted checkpoint from `checkpoint_store` so subsequent
     /// `replay` / live `apply` calls resume from the right LSN.
-    pub fn new(
-        index: Arc<BM25Index>,
-        checkpoint_store: Arc<Mutex<CheckpointStore>>,
-    ) -> Self {
+    pub fn new(index: Arc<BM25Index>, checkpoint_store: Arc<Mutex<CheckpointStore>>) -> Self {
         let checkpoint = checkpoint_store.lock().get(PROJECTION_NAME);
         Self {
             index,
@@ -345,9 +342,7 @@ impl Projection for Bm25Projection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_log::{
-        payload::CURRENT_PAYLOAD_SCHEMA_VERSION, replay, IntentLog,
-    };
+    use crate::intent_log::{payload::CURRENT_PAYLOAD_SCHEMA_VERSION, replay, IntentLog};
     use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId};
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -358,8 +353,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let base = std::env::temp_dir()
-            .join(format!("veld-bm25-proj-{stem}-{pid}-{stamp}"));
+        let base = std::env::temp_dir().join(format!("veld-bm25-proj-{stem}-{pid}-{stamp}"));
         std::fs::create_dir_all(&base).unwrap();
         (
             base.join("bm25_index"),
@@ -374,9 +368,7 @@ mod tests {
     ) -> (Arc<BM25Index>, Arc<Mutex<CheckpointStore>>, Bm25Projection) {
         std::fs::create_dir_all(bm25_path).unwrap();
         let index = Arc::new(BM25Index::new(bm25_path).unwrap());
-        let ckpt = Arc::new(Mutex::new(
-            CheckpointStore::open(checkpoint_path).unwrap(),
-        ));
+        let ckpt = Arc::new(Mutex::new(CheckpointStore::open(checkpoint_path).unwrap()));
         let proj = Bm25Projection::new(index.clone(), ckpt.clone());
         (index, ckpt, proj)
     }
@@ -393,8 +385,7 @@ mod tests {
     }
 
     fn remember_payload(memory: &Memory) -> IntentPayload {
-        let bytes =
-            bincode::serde::encode_to_vec(memory, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(memory, bincode::config::standard()).unwrap();
         IntentPayload::Remember {
             user_id: "alice".into(),
             memory_id: memory.id.0.to_string(),
@@ -525,14 +516,9 @@ mod tests {
             for i in 0..5 {
                 let id = Uuid::new_v4();
                 ids.push(id);
-                let memory = mk_memory(
-                    id,
-                    &format!("replay body {i}"),
-                    &[&format!("tag-{i}")],
-                    &[],
-                );
-                crate::intent_log::payload::append(&mut log, &remember_payload(&memory))
-                    .unwrap();
+                let memory =
+                    mk_memory(id, &format!("replay body {i}"), &[&format!("tag-{i}")], &[]);
+                crate::intent_log::payload::append(&mut log, &remember_payload(&memory)).unwrap();
             }
             log.sync().unwrap();
         }
@@ -547,9 +533,7 @@ mod tests {
         assert_eq!(index.len(), 5);
 
         for (i, id) in ids.iter().enumerate() {
-            let hits = index
-                .search(&format!("replay body {i}"), 10)
-                .unwrap();
+            let hits = index.search(&format!("replay body {i}"), 10).unwrap();
             assert!(!hits.is_empty(), "expected hit for memory {i}");
             assert_eq!(hits[0].0, MemoryId(*id), "memory {i} ranked first");
         }
@@ -569,16 +553,14 @@ mod tests {
                 let id = Uuid::new_v4();
                 ids.push(id);
                 let memory = mk_memory(id, &format!("body-{i}"), &[], &[]);
-                crate::intent_log::payload::append(&mut log, &remember_payload(&memory))
-                    .unwrap();
+                crate::intent_log::payload::append(&mut log, &remember_payload(&memory)).unwrap();
             }
             log.sync().unwrap();
         }
 
         {
             let log = IntentLog::open(&log_path).unwrap();
-            let (_index, _ckpt, mut proj) =
-                open_projection(&bm25_path, &checkpoint_path);
+            let (_index, _ckpt, mut proj) = open_projection(&bm25_path, &checkpoint_path);
             let records: Vec<_> = log
                 .iter()
                 .unwrap()
@@ -595,8 +577,7 @@ mod tests {
         // Reopen — checkpoint must be recovered, replay applies only the
         // tail (lsn 3..=5).
         let log = IntentLog::open(&log_path).unwrap();
-        let (index, _ckpt, mut proj) =
-            open_projection(&bm25_path, &checkpoint_path);
+        let (index, _ckpt, mut proj) = open_projection(&bm25_path, &checkpoint_path);
         assert_eq!(proj.checkpoint(), Some(Lsn(2)));
         let applied = replay(&log, &mut proj, None).unwrap();
         assert_eq!(applied, 3);
@@ -614,8 +595,7 @@ mod tests {
     #[test]
     fn anchor_is_a_noop_but_advances_checkpoint() {
         let (bm25_path, _, checkpoint_path) = tmp_paths("anchor");
-        let (index, _ckpt, mut proj) =
-            open_projection(&bm25_path, &checkpoint_path);
+        let (index, _ckpt, mut proj) = open_projection(&bm25_path, &checkpoint_path);
 
         let id = Uuid::new_v4();
         let memory = mk_memory(id, "body before anchor", &[], &[]);
@@ -646,12 +626,10 @@ mod tests {
     #[test]
     fn malformed_memory_id_produces_structured_error() {
         let (bm25_path, _, checkpoint_path) = tmp_paths("bad_uuid");
-        let (_index, _ckpt, mut proj) =
-            open_projection(&bm25_path, &checkpoint_path);
+        let (_index, _ckpt, mut proj) = open_projection(&bm25_path, &checkpoint_path);
 
         let memory = mk_memory(Uuid::new_v4(), "doesn't matter", &[], &[]);
-        let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard())
-            .unwrap();
+        let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
         let payload = IntentPayload::Remember {
             user_id: "alice".into(),
             memory_id: "not-a-uuid".into(),
@@ -685,7 +663,9 @@ mod tests {
     struct NoopEmbedder;
 
     impl crate::embeddings::Embedder for NoopEmbedder {
-        fn id(&self) -> &str { "stub-noop" }
+        fn id(&self) -> &str {
+            "stub-noop"
+        }
 
         fn encode(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             // Reranking is disabled in these tests, so this is never invoked.
@@ -794,8 +774,7 @@ mod tests {
         let unified_index_dir = tenant.join(crate::memory::BM25_INDEX_DIR);
         let legacy_index_dir = tenant.join("bm25_index");
 
-        let (_index, _ckpt, mut proj) =
-            open_projection(&unified_index_dir, &checkpoint_path);
+        let (_index, _ckpt, mut proj) = open_projection(&unified_index_dir, &checkpoint_path);
 
         let id = Uuid::new_v4();
         let memory = mk_memory(id, "tenant body", &[], &[]);

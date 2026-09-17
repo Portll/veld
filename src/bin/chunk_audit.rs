@@ -33,7 +33,10 @@ use tokenizers::Tokenizer;
 use veld::embeddings::chunking::{chunk_text, ChunkConfig};
 
 #[derive(Parser)]
-#[command(name = "chunk-audit", about = "Verify chunk_text output fits the encoder window")]
+#[command(
+    name = "chunk-audit",
+    about = "Verify chunk_text output fits the encoder window"
+)]
 struct Args {
     /// 0x1E-delimited text records.
     #[arg(long)]
@@ -76,7 +79,9 @@ fn main() -> Result<()> {
         .with_truncation(None)
         .map_err(|e| anyhow::anyhow!("disabling tokenizer truncation: {e}"))?;
     if let Some(limit) = shipped_truncation {
-        println!("  NOTE: tokenizer.json ships truncation at {limit} tokens; disabled for measuring.");
+        println!(
+            "  NOTE: tokenizer.json ships truncation at {limit} tokens; disabled for measuring."
+        );
         if limit < args.max_length {
             println!(
                 "        That is BELOW the configured window of {}, so {limit} — not {} — is the\n\
@@ -86,8 +91,15 @@ fn main() -> Result<()> {
         }
     }
 
-    let records: Vec<&str> = raw.split('\u{1e}').map(str::trim).filter(|s| !s.is_empty()).collect();
-    anyhow::ensure!(!records.is_empty(), "corpus parsed to 0 records — that is a failed read");
+    let records: Vec<&str> = raw
+        .split('\u{1e}')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    anyhow::ensure!(
+        !records.is_empty(),
+        "corpus parsed to 0 records — that is a failed read"
+    );
 
     let mut config = ChunkConfig::default();
     if let Some(size) = args.chunk_size {
@@ -98,11 +110,21 @@ fn main() -> Result<()> {
     }
 
     if args.sweep {
-        println!("sweep: largest chunk_size whose every chunk fits {} tokens\n", args.max_length);
-        println!("  {:>10}  {:>8}  {:>8}  {:>9}", "chunk_size", "chunks", "over", "max tokens");
+        println!(
+            "sweep: largest chunk_size whose every chunk fits {} tokens\n",
+            args.max_length
+        );
+        println!(
+            "  {:>10}  {:>8}  {:>8}  {:>9}",
+            "chunk_size", "chunks", "over", "max tokens"
+        );
         let mut best = None;
         for size in [400usize, 480, 560, 640, 720, 800, 900, 1000] {
-            let cfg = ChunkConfig { chunk_size: size, overlap: size / 4, min_chunk_size: size / 4 };
+            let cfg = ChunkConfig {
+                chunk_size: size,
+                overlap: size / 4,
+                min_chunk_size: size / 4,
+            };
             let (mut n, mut over, mut worst) = (0usize, 0usize, 0usize);
             for record in &records {
                 for chunk in chunk_text(record, &cfg).chunks {
@@ -129,7 +151,8 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let (mut chunks_total, mut over, mut records_affected, mut tokens_lost) = (0usize, 0usize, 0usize, 0usize);
+    let (mut chunks_total, mut over, mut records_affected, mut tokens_lost) =
+        (0usize, 0usize, 0usize, 0usize);
     let mut lengths: Vec<usize> = Vec::new();
     let mut worst: Vec<(usize, f64, String)> = Vec::new();
 
@@ -171,7 +194,10 @@ fn main() -> Result<()> {
         lengths[0]
     );
 
-    println!("chunk-audit  (chunk_size {} chars, window {} tokens)", config.chunk_size, args.max_length);
+    println!(
+        "chunk-audit  (chunk_size {} chars, window {} tokens)",
+        config.chunk_size, args.max_length
+    );
     println!("  records            {}", records.len());
     println!("  chunks             {chunks_total}");
     println!(
@@ -189,7 +215,9 @@ fn main() -> Result<()> {
     // Says "spilled", not "dropped". Since `minilm.rs` pools across windows these tokens are
     // embedded, just in a second window that blurs into the chunk's mean. Leaving the old wording
     // would have this tool reporting a loss that the fix it verifies has already removed.
-    println!("  tokens spilled     {tokens_lost} into a second window (embedded, not lost — pooled)");
+    println!(
+        "  tokens spilled     {tokens_lost} into a second window (embedded, not lost — pooled)"
+    );
 
     if !worst.is_empty() {
         println!("\n  densest offenders (tokens, chars/token, opening):");

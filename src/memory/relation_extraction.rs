@@ -63,33 +63,96 @@ fn build_patterns() -> Vec<Pattern> {
 
     let raw_patterns: &[(&str, RelationType, f32)] = &[
         // Work patterns
-        (&format!(r"{np}\s+works?\s+at\s+{obj}"), RelationType::WorksAt, 0.85),
-        (&format!(r"{np}\s+(?:is|was)\s+employed\s+by\s+{obj}"), RelationType::EmployedBy, 0.9),
-        (&format!(r"{np}\s+works?\s+(?:with|alongside)\s+{obj}"), RelationType::WorksWith, 0.8),
-
+        (
+            &format!(r"{np}\s+works?\s+at\s+{obj}"),
+            RelationType::WorksAt,
+            0.85,
+        ),
+        (
+            &format!(r"{np}\s+(?:is|was)\s+employed\s+by\s+{obj}"),
+            RelationType::EmployedBy,
+            0.9,
+        ),
+        (
+            &format!(r"{np}\s+works?\s+(?:with|alongside)\s+{obj}"),
+            RelationType::WorksWith,
+            0.8,
+        ),
         // Structural
-        (&format!(r"{np}\s+(?:is|are)\s+part\s+of\s+{obj}"), RelationType::PartOf, 0.85),
-        (&format!(r"{np}\s+belongs?\s+to\s+{obj}"), RelationType::PartOf, 0.8),
-        (&format!(r"{np}\s+contains?\s+{obj}"), RelationType::Contains, 0.8),
-        (&format!(r"{np}\s+(?:is|are)\s+owned\s+by\s+{obj}"), RelationType::OwnedBy, 0.85),
-
+        (
+            &format!(r"{np}\s+(?:is|are)\s+part\s+of\s+{obj}"),
+            RelationType::PartOf,
+            0.85,
+        ),
+        (
+            &format!(r"{np}\s+belongs?\s+to\s+{obj}"),
+            RelationType::PartOf,
+            0.8,
+        ),
+        (
+            &format!(r"{np}\s+contains?\s+{obj}"),
+            RelationType::Contains,
+            0.8,
+        ),
+        (
+            &format!(r"{np}\s+(?:is|are)\s+owned\s+by\s+{obj}"),
+            RelationType::OwnedBy,
+            0.85,
+        ),
         // Location
-        (&format!(r"{np}\s+(?:is|are)\s+(?:located\s+)?in\s+{obj}"), RelationType::LocatedIn, 0.75),
-        (&format!(r"{np}\s+(?:is|are)\s+(?:located\s+)?at\s+{obj}"), RelationType::LocatedAt, 0.75),
-
+        (
+            &format!(r"{np}\s+(?:is|are)\s+(?:located\s+)?in\s+{obj}"),
+            RelationType::LocatedIn,
+            0.75,
+        ),
+        (
+            &format!(r"{np}\s+(?:is|are)\s+(?:located\s+)?at\s+{obj}"),
+            RelationType::LocatedAt,
+            0.75,
+        ),
         // Usage / creation
-        (&format!(r"{np}\s+(?:uses?|relies?\s+on|depends?\s+on)\s+{obj}"), RelationType::Uses, 0.8),
-        (&format!(r"{np}\s+(?:was|were|is|are)\s+(?:created|built|made|developed)\s+by\s+{obj}"), RelationType::CreatedBy, 0.85),
-        (&format!(r"{np}\s+(?:created|built|made|developed)\s+{obj}"), RelationType::DevelopedBy, 0.8),
-
+        (
+            &format!(r"{np}\s+(?:uses?|relies?\s+on|depends?\s+on)\s+{obj}"),
+            RelationType::Uses,
+            0.8,
+        ),
+        (
+            &format!(r"{np}\s+(?:was|were|is|are)\s+(?:created|built|made|developed)\s+by\s+{obj}"),
+            RelationType::CreatedBy,
+            0.85,
+        ),
+        (
+            &format!(r"{np}\s+(?:created|built|made|developed)\s+{obj}"),
+            RelationType::DevelopedBy,
+            0.8,
+        ),
         // Causal
-        (&format!(r"{np}\s+causes?\s+{obj}"), RelationType::Causes, 0.85),
-        (&format!(r"{np}\s+(?:leads?\s+to|results?\s+in)\s+{obj}"), RelationType::ResultsIn, 0.8),
-
+        (
+            &format!(r"{np}\s+causes?\s+{obj}"),
+            RelationType::Causes,
+            0.85,
+        ),
+        (
+            &format!(r"{np}\s+(?:leads?\s+to|results?\s+in)\s+{obj}"),
+            RelationType::ResultsIn,
+            0.8,
+        ),
         // Learning
-        (&format!(r"{np}\s+(?:learned|learnt)\s+{obj}"), RelationType::Learned, 0.8),
-        (&format!(r"{np}\s+(?:knows?|understands?)\s+{obj}"), RelationType::Knows, 0.7),
-        (&format!(r"{np}\s+teaches?\s+{obj}"), RelationType::Teaches, 0.8),
+        (
+            &format!(r"{np}\s+(?:learned|learnt)\s+{obj}"),
+            RelationType::Learned,
+            0.8,
+        ),
+        (
+            &format!(r"{np}\s+(?:knows?|understands?)\s+{obj}"),
+            RelationType::Knows,
+            0.7,
+        ),
+        (
+            &format!(r"{np}\s+teaches?\s+{obj}"),
+            RelationType::Teaches,
+            0.8,
+        ),
     ];
 
     raw_patterns
@@ -127,7 +190,10 @@ pub fn extract_relations(text: &str) -> Vec<ExtractedRelation> {
     for sentence in split_sentences(text) {
         for pattern in catalog {
             for caps in pattern.regex.captures_iter(sentence) {
-                let subject = caps.name("subject").map(|m| m.as_str().trim()).unwrap_or("");
+                let subject = caps
+                    .name("subject")
+                    .map(|m| m.as_str().trim())
+                    .unwrap_or("");
                 let object = caps.name("object").map(|m| m.as_str().trim()).unwrap_or("");
                 if subject.is_empty() || object.is_empty() {
                     continue;
@@ -157,11 +223,15 @@ mod tests {
     #[test]
     fn test_extracts_works_at() {
         let r = extract_relations("Alice works at Acme Corp.");
-        assert!(r.iter().any(|x| {
-            x.predicate == RelationType::WorksAt
-                && x.subject.contains("Alice")
-                && x.object.to_lowercase().contains("acme")
-        }), "expected WorksAt triple, got {:?}", r);
+        assert!(
+            r.iter().any(|x| {
+                x.predicate == RelationType::WorksAt
+                    && x.subject.contains("Alice")
+                    && x.object.to_lowercase().contains("acme")
+            }),
+            "expected WorksAt triple, got {:?}",
+            r
+        );
     }
 
     #[test]
@@ -215,6 +285,10 @@ mod tests {
     #[test]
     fn test_multiple_sentences() {
         let r = extract_relations("Alice works at Acme. Bob uses Linux.");
-        assert!(r.len() >= 2, "expected ≥2 triples across two sentences, got {:?}", r);
+        assert!(
+            r.len() >= 2,
+            "expected ≥2 triples across two sentences, got {:?}",
+            r
+        );
     }
 }

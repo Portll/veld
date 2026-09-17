@@ -39,7 +39,13 @@ fn setup_store() -> (Arc<SemanticFactStore>, TempDir) {
     (Arc::new(store), temp_dir)
 }
 
-fn fact(id: &str, content: &str, entities: &[&str], support: usize, confidence: f32) -> SemanticFact {
+fn fact(
+    id: &str,
+    content: &str,
+    entities: &[&str],
+    support: usize,
+    confidence: f32,
+) -> SemanticFact {
     SemanticFact {
         id: id.to_string(),
         fact: content.to_string(),
@@ -127,10 +133,16 @@ fn reader_methods_exclude_purged_facts() {
 
     // 3. list_filtered(include_inactive=true) — surfaces purged.
     let all = store.list_filtered(user, 100, true).expect("list_filtered");
-    assert_eq!(all.len(), 2, "list_filtered(include_inactive=true) must include purged");
+    assert_eq!(
+        all.len(),
+        2,
+        "list_filtered(include_inactive=true) must include purged"
+    );
 
     // 4. find_by_entity() — default active-only.
-    let by_entity = store.find_by_entity(user, "alpha", 100).expect("find_by_entity");
+    let by_entity = store
+        .find_by_entity(user, "alpha", 100)
+        .expect("find_by_entity");
     assert_eq!(by_entity.len(), 1, "find_by_entity must hide purged");
 
     // 5. find_by_entity_filtered(include_inactive=true) — surfaces purged.

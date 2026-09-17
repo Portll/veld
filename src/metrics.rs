@@ -103,10 +103,7 @@ pub static MEMORY_STORE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
 /// Memory retrieve operations
 pub static MEMORY_RETRIEVE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new(
-            "veld_retrieve_total",
-            "Total memory retrieve operations",
-        ),
+        Opts::new("veld_retrieve_total", "Total memory retrieve operations"),
         &["retrieval_mode", "result"],
     )
     .expect("MEMORY_RETRIEVE_TOTAL metric must be valid at compile time")
@@ -317,10 +314,7 @@ pub static VECTOR_INDEX_SIZE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
 /// Vector search operations
 pub static VECTOR_SEARCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new(
-            "veld_vector_search_total",
-            "Total vector search operations",
-        ),
+        Opts::new("veld_vector_search_total", "Total vector search operations"),
         &["result"],
     )
     .expect("VECTOR_SEARCH_TOTAL metric must be valid at compile time")
@@ -390,12 +384,15 @@ pub static INTENT_LOG_APPEND_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 /// Intent log append duration
 pub static INTENT_LOG_APPEND_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
-    Histogram::with_opts(HistogramOpts::new(
-        "veld_intent_log_append_duration_seconds",
-        "Intent log append duration",
-    ).buckets(vec![
-        0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
-    ]))
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "veld_intent_log_append_duration_seconds",
+            "Intent log append duration",
+        )
+        .buckets(vec![
+            0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+        ]),
+    )
     .expect("INTENT_LOG_APPEND_DURATION metric must be valid at compile time")
 });
 
@@ -413,12 +410,15 @@ pub static INTENT_LOG_SYNC_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 /// Intent log sync duration
 pub static INTENT_LOG_SYNC_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
-    Histogram::with_opts(HistogramOpts::new(
-        "veld_intent_log_sync_duration_seconds",
-        "Intent log sync (fsync) duration",
-    ).buckets(vec![
-        0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
-    ]))
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "veld_intent_log_sync_duration_seconds",
+            "Intent log sync (fsync) duration",
+        )
+        .buckets(vec![
+            0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+        ]),
+    )
     .expect("INTENT_LOG_SYNC_DURATION metric must be valid at compile time")
 });
 

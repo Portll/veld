@@ -913,10 +913,20 @@ mod tests {
         let mut readonly = InterferenceDetector::new();
         let silent = readonly.apply_retrieval_competition(&candidates, "q", false);
 
-        assert_eq!(recorded.winners, silent.winners, "ranking must not depend on the flag");
+        assert_eq!(
+            recorded.winners, silent.winners,
+            "ranking must not depend on the flag"
+        );
         assert_eq!(recorded.suppressed, silent.suppressed);
-        assert!(recorded_history > 0, "the recording run must have written something for the test to mean anything");
-        assert_eq!(readonly.interference_history_len(), 0, "read-only recall taught the detector");
+        assert!(
+            recorded_history > 0,
+            "the recording run must have written something for the test to mean anything"
+        );
+        assert_eq!(
+            readonly.interference_history_len(),
+            0,
+            "read-only recall taught the detector"
+        );
     }
 
     // =========================================================================

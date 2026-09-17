@@ -157,7 +157,8 @@ pub fn classify(entity: &str) -> Option<Redacted> {
 /// time — and must NOT be wired to a drop at write time without a new ruling. The hub effect
 /// described above is a known and accepted property, not an open defect.
 static BARE_UUID: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").expect("literal")
+    Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+        .expect("literal")
 });
 
 /// True for an entity that is a bare machine identifier with no semantic content.
@@ -300,7 +301,12 @@ mod tests {
         let report = redact_entities(&mut v);
         assert_eq!(
             v,
-            vec!["automated", "redacted:key", "scope:claude-code", "redacted:login"]
+            vec![
+                "automated",
+                "redacted:key",
+                "scope:claude-code",
+                "redacted:login"
+            ]
         );
         assert_eq!(report.key, 1);
         assert_eq!(report.login, 1);
@@ -331,8 +337,12 @@ mod tests {
     #[test]
     fn a_uuid_with_a_human_prefix_is_a_legitimate_entity() {
         // The anchors are load-bearing: only the BARE id is meaningless.
-        assert!(!is_non_semantic_id("session-3301d4ef-ecd8-4743-af4a-bb50590a1fbe"));
-        assert!(!is_non_semantic_id("3301d4ef-ecd8-4743-af4a-bb50590a1fbe/report"));
+        assert!(!is_non_semantic_id(
+            "session-3301d4ef-ecd8-4743-af4a-bb50590a1fbe"
+        ));
+        assert!(!is_non_semantic_id(
+            "3301d4ef-ecd8-4743-af4a-bb50590a1fbe/report"
+        ));
         assert!(!is_non_semantic_id("veld-project:commitwork"));
     }
 

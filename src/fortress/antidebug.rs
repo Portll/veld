@@ -42,9 +42,16 @@ fn platform_check() -> bool {
         let comm = String::from_utf8_lossy(&output.stdout);
         let comm_lower = comm.trim().to_lowercase();
         // Known debugger process names
-        return ["lldb", "gdb", "debugserver", "dtrace", "instruments", "frida"]
-            .iter()
-            .any(|d| comm_lower.contains(d));
+        return [
+            "lldb",
+            "gdb",
+            "debugserver",
+            "dtrace",
+            "instruments",
+            "frida",
+        ]
+        .iter()
+        .any(|d| comm_lower.contains(d));
     }
     false
 }

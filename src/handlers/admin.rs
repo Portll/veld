@@ -97,7 +97,10 @@ pub(crate) fn require_admin_key(headers: &HeaderMap) -> Result<(), Response> {
     };
 
     // 2) Header present?
-    let provided = match headers.get(ADMIN_API_KEY_HEADER).and_then(|v| v.to_str().ok()) {
+    let provided = match headers
+        .get(ADMIN_API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
         Some(s) if !s.is_empty() => s,
         _ => {
             return Err((

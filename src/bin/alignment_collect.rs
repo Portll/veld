@@ -20,11 +20,7 @@ use walkdir::WalkDir;
 #[command(name = "alignment-collect")]
 struct Args {
     /// Output file (.jsonl)
-    #[arg(
-        short,
-        long,
-        default_value = "evaluations/alignment/pairs/pairs.jsonl"
-    )]
+    #[arg(short, long, default_value = "evaluations/alignment/pairs/pairs.jsonl")]
     out: PathBuf,
 
     /// Per-domain target row count (rows past the quota are dropped).
@@ -120,7 +116,13 @@ fn main() -> Result<()> {
                 )?;
             }
             "jsonl" => {
-                collect_jsonl(&spec, &mut seen, &mut per_domain, args.quota, &mut out_writer)?;
+                collect_jsonl(
+                    &spec,
+                    &mut seen,
+                    &mut per_domain,
+                    args.quota,
+                    &mut out_writer,
+                )?;
             }
             other => bail!("unknown source kind: {other}"),
         }
@@ -215,8 +217,8 @@ fn collect_jsonl<W: Write>(
     struct Incoming {
         text: String,
     }
-    let file = File::open(&spec.path)
-        .with_context(|| format!("opening {}", spec.path.display()))?;
+    let file =
+        File::open(&spec.path).with_context(|| format!("opening {}", spec.path.display()))?;
     for line in BufReader::new(file).lines() {
         let line = line?;
         if line.trim().is_empty() {

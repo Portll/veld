@@ -348,6 +348,9 @@ mod tests {
         )
         .expect("eps floor should keep the fit finite");
         let p = a.project(&secondary[0]).unwrap();
-        assert!(p.iter().all(|v| v.is_finite()), "non-finite projection: {p:?}");
+        assert!(
+            p.iter().all(|v| v.is_finite()),
+            "non-finite projection: {p:?}"
+        );
     }
 }

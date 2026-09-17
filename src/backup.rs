@@ -239,9 +239,10 @@ impl VeldBackupEngine {
     /// path in it would escape `backup_path` at every join below. Every user-scoped path in this
     /// engine goes through here.
     fn user_backup_dir(&self, user_id: &str) -> Result<PathBuf> {
-        Ok(self
-            .backup_path
-            .join(crate::path_guard::sanitize_component(user_id, "backup user id")?))
+        Ok(self.backup_path.join(crate::path_guard::sanitize_component(
+            user_id,
+            "backup user id",
+        )?))
     }
 
     /// Create a full backup of a RocksDB database
@@ -485,8 +486,11 @@ impl VeldBackupEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let staging_dir =
-            backup_dir.join(format!("intent_log_staging_{}_{}", std::process::id(), stamp));
+        let staging_dir = backup_dir.join(format!(
+            "intent_log_staging_{}_{}",
+            std::process::id(),
+            stamp
+        ));
         fs::create_dir_all(&staging_dir)?;
 
         let files = match self.copy_intent_log_into_archive(spec, &staging_dir) {
@@ -545,8 +549,7 @@ impl VeldBackupEngine {
 
         if let Some(staged) = staged {
             let backup_dir = self.user_backup_dir(user_id)?;
-            let intent_log_dir =
-                backup_dir.join(format!("intent_log_{}", metadata.backup_id));
+            let intent_log_dir = backup_dir.join(format!("intent_log_{}", metadata.backup_id));
             if intent_log_dir.exists() {
                 fs::remove_dir_all(&intent_log_dir)?;
             }
@@ -561,8 +564,7 @@ impl VeldBackupEngine {
             metadata.journal_cut_lsn = staged.journal_cut_lsn;
 
             // Recompute checksum now that the intent-log tree is in place.
-            metadata.checksum =
-                self.calculate_backup_checksum(&backup_dir, metadata.backup_id)?;
+            metadata.checksum = self.calculate_backup_checksum(&backup_dir, metadata.backup_id)?;
             self.save_metadata(&metadata)?;
 
             tracing::info!(
@@ -593,12 +595,7 @@ impl VeldBackupEngine {
 
         let mut metas = Vec::new();
         let mut entries: Vec<_> = fs::read_dir(&spec.source_dir)
-            .with_context(|| {
-                format!(
-                    "failed to read intent log directory {:?}",
-                    spec.source_dir
-                )
-            })?
+            .with_context(|| format!("failed to read intent log directory {:?}", spec.source_dir))?
             .filter_map(|e| e.ok())
             .collect();
         entries.sort_by_key(|e| e.file_name());
@@ -624,12 +621,7 @@ impl VeldBackupEngine {
             // can decide whether the operator-requested LSN is in range.
             let lsn_range = if file_name == spec.log_filename {
                 scan_lsn_range(&dst)
-                    .with_context(|| {
-                        format!(
-                            "failed to scan LSN range for intent log {:?}",
-                            dst
-                        )
-                    })?
+                    .with_context(|| format!("failed to scan LSN range for intent log {:?}", dst))?
             } else {
                 None
             };
@@ -963,11 +955,7 @@ impl VeldBackupEngine {
             let mut log = IntentLog::open(&journal_path)?;
             log.truncate_to_lsn(Lsn(max_lsn_u64)).map_err(|e| {
                 let _ = fs::remove_dir_all(&staging);
-                anyhow!(
-                    "PITR truncate_to_lsn({}) failed: {}",
-                    max_lsn_u64,
-                    e
-                )
+                anyhow!("PITR truncate_to_lsn({}) failed: {}", max_lsn_u64, e)
             })?;
             log.sync().context("failed to sync truncated intent log")?;
         }
@@ -1317,8 +1305,8 @@ fn copy_and_hash(src: &Path, dst: &Path) -> Result<(String, u64)> {
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Write};
 
-    let in_file = File::open(src)
-        .with_context(|| format!("open source intent log file {src:?}"))?;
+    let in_file =
+        File::open(src).with_context(|| format!("open source intent log file {src:?}"))?;
     let mut reader = BufReader::new(in_file);
 
     if let Some(parent) = dst.parent() {
@@ -1697,14 +1685,8 @@ mod tests {
         let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
         let metadata = engine.create_backup(&db, user_id).unwrap();
 
-        assert!(metadata
-            .column_families
-            .iter()
-            .any(|c| c == CF_USER_AUTH));
-        assert!(metadata
-            .column_families
-            .iter()
-            .any(|c| c == "default"));
+        assert!(metadata.column_families.iter().any(|c| c == CF_USER_AUTH));
+        assert!(metadata.column_families.iter().any(|c| c == "default"));
     }
 
     #[test]
@@ -1722,14 +1704,8 @@ mod tests {
         let engine = VeldBackupEngine::new(backup_root).unwrap();
         let metadata = engine.create_backup(&db, user_id).unwrap();
 
-        assert!(!metadata
-            .column_families
-            .iter()
-            .any(|c| c == CF_USER_AUTH));
-        assert!(metadata
-            .column_families
-            .iter()
-            .any(|c| c == "default"));
+        assert!(!metadata.column_families.iter().any(|c| c == CF_USER_AUTH));
+        assert!(metadata.column_families.iter().any(|c| c == "default"));
     }
 
     #[test]
@@ -1750,20 +1726,11 @@ mod tests {
 
         let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
         let metadata = engine
-            .create_comprehensive_backup_with_intent_log(
-                &db,
-                user_id,
-                &[],
-                None,
-                Some(&spec),
-            )
+            .create_comprehensive_backup_with_intent_log(&db, user_id, &[], None, Some(&spec))
             .unwrap();
 
         // Manifest carries both new fields.
-        assert!(metadata
-            .column_families
-            .iter()
-            .any(|c| c == CF_USER_AUTH));
+        assert!(metadata.column_families.iter().any(|c| c == CF_USER_AUTH));
         assert_eq!(metadata.intent_log_files.len(), 2);
         let journal_meta = metadata
             .intent_log_files
@@ -1823,8 +1790,7 @@ mod tests {
             ColumnFamilyDescriptor::new("memory_index", RocksOptions::default()),
             ColumnFamilyDescriptor::new(CF_USER_AUTH, RocksOptions::default()),
         ];
-        let restored_db =
-            rocksdb::DB::open_cf_descriptors(&opts, &restored_db_path, cfs).unwrap();
+        let restored_db = rocksdb::DB::open_cf_descriptors(&opts, &restored_db_path, cfs).unwrap();
         let cf = restored_db.cf_handle(CF_USER_AUTH).unwrap();
         let val = restored_db.get_cf(cf, b"user-row-key").unwrap();
         assert_eq!(val.unwrap(), b"argon2id-hash-bytes");
@@ -1889,7 +1855,11 @@ mod tests {
         let leftover_staging = fs::read_dir(backup_root.join(user_id))
             .unwrap()
             .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().starts_with("intent_log_staging"));
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("intent_log_staging")
+            });
         assert!(!leftover_staging, "staging dir must not survive the backup");
 
         // Checksum covers the moved-into-place intent log tree.
@@ -1908,27 +1878,17 @@ mod tests {
 
         // Five frames written (LSNs 0..=4).
         let db = open_db_with_user_auth(&db_path);
-        let (spec, _) = build_intent_log_dir(
-            &intent_source,
-            &[b"f0", b"f1", b"f2", b"f3", b"f4"],
-        );
+        let (spec, _) = build_intent_log_dir(&intent_source, &[b"f0", b"f1", b"f2", b"f3", b"f4"]);
 
         let engine = VeldBackupEngine::new(backup_root).unwrap();
         let metadata = engine
-            .create_comprehensive_backup_with_intent_log(
-                &db,
-                user_id,
-                &[],
-                None,
-                Some(&spec),
-            )
+            .create_comprehensive_backup_with_intent_log(&db, user_id, &[], None, Some(&spec))
             .unwrap();
         drop(db);
 
         // Restore with --max-lsn=2 → final log must have exactly N+1 = 3
         // frames (LSNs 0, 1, 2).
-        let restore_spec =
-            IntentLogBackupSpec::with_default_log_name(intent_restore.clone());
+        let restore_spec = IntentLogBackupSpec::with_default_log_name(intent_restore.clone());
         let options = RestoreOptions { max_lsn: Some(2) };
         engine
             .restore_comprehensive_backup_with_intent_log(
@@ -1959,18 +1919,11 @@ mod tests {
         let user_id = "corrupt";
 
         let db = open_db_with_user_auth(&db_path);
-        let (spec, _) =
-            build_intent_log_dir(&intent_source, &[b"good-0", b"good-1", b"good-2"]);
+        let (spec, _) = build_intent_log_dir(&intent_source, &[b"good-0", b"good-1", b"good-2"]);
 
         let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
         let metadata = engine
-            .create_comprehensive_backup_with_intent_log(
-                &db,
-                user_id,
-                &[],
-                None,
-                Some(&spec),
-            )
+            .create_comprehensive_backup_with_intent_log(&db, user_id, &[], None, Some(&spec))
             .unwrap();
         drop(db);
 
@@ -1987,8 +1940,7 @@ mod tests {
         bytes[target_idx] ^= 0xff;
         fs::write(&archive_journal, &bytes).unwrap();
 
-        let restore_spec =
-            IntentLogBackupSpec::with_default_log_name(intent_restore.clone());
+        let restore_spec = IntentLogBackupSpec::with_default_log_name(intent_restore.clone());
         let err = engine
             .restore_comprehensive_backup_with_intent_log(
                 user_id,
@@ -2033,13 +1985,7 @@ mod tests {
         let engine = VeldBackupEngine::new(backup_root).unwrap();
         let spec = IntentLogBackupSpec::with_default_log_name(missing_intent);
         let metadata = engine
-            .create_comprehensive_backup_with_intent_log(
-                &db,
-                user_id,
-                &[],
-                None,
-                Some(&spec),
-            )
+            .create_comprehensive_backup_with_intent_log(&db, user_id, &[], None, Some(&spec))
             .unwrap();
         assert!(metadata.intent_log_files.is_empty());
     }

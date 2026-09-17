@@ -202,7 +202,11 @@ pub fn load_config_file_into_env() {
 
     if !applied.is_empty() {
         // Key names only — the API key value is never written to the log.
-        eprintln!("[veld] Loaded {} from {}", applied.join(", "), path.display());
+        eprintln!(
+            "[veld] Loaded {} from {}",
+            applied.join(", "),
+            path.display()
+        );
     }
 }
 
@@ -832,8 +836,7 @@ impl ServerConfig {
         } else {
             info!(
                 "   Backend: requested {}, running {} (compatibility path)",
-                self.requested_storage_backend,
-                self.effective_storage_backend
+                self.requested_storage_backend, self.effective_storage_backend
             );
         }
         info!("   Max users in memory: {}", self.max_users_in_memory);
@@ -879,14 +882,14 @@ pub fn print_env_help() {
     println!("Veld Configuration Environment Variables:");
     println!();
     println!("  VELD_ENV              - Set to 'production' or 'prod' for production mode");
-    println!(
-        "  VELD_HOST             - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)"
-    );
+    println!("  VELD_HOST             - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)");
     println!("  VELD_PORT             - Server port (default: 3030)");
     println!("  VELD_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/veld/)");
     println!("  VELD_STORAGE_BACKEND  - Requested backend: redb (target default) or rocksdb (legacy compatibility)");
     println!("  VELD_API_KEYS         - Comma-separated API keys (required in production)");
-    println!("  VELD_DEV_API_KEY      - Development API key (required in dev if VELD_API_KEYS not set)");
+    println!(
+        "  VELD_DEV_API_KEY      - Development API key (required in dev if VELD_API_KEYS not set)"
+    );
     println!("  VELD_KEYSTORE_PATH    - Keystore file enabling encryption-at-rest (required for encrypted production)");
     println!("  VELD_MASTER_PASSPHRASE - Passphrase that unseals the keystore (required when VELD_KEYSTORE_PATH is set)");
     println!("  VELD_SLOW_STORE_ENCRYPT_GRAPH / _EMBEDDINGS - Also encrypt the slow-store graph content / embeddings (default off; payload on)");
@@ -904,7 +907,9 @@ pub fn print_env_help() {
     println!("                                 False = reject unsigned webhooks with 503. True = warn and process.");
     println!("  VELD_PUBLIC_RATE_LIMIT       - Apply rate limiting to non-probe public routes (default: true).");
     println!("                                 Set to false to exempt public routes (probe routes are never limited).");
-    println!("  VELD_METRICS_PUBLIC          - Expose /metrics without authentication (default: false).");
+    println!(
+        "  VELD_METRICS_PUBLIC          - Expose /metrics without authentication (default: false)."
+    );
     println!("                                 True = /metrics is public (for unauthenticated Prometheus scrapers).");
     println!("  VELD_ADMIN_API_KEY           - API key for /api/admin/* endpoints (separate from VELD_API_KEYS).");
     println!("                                 Required to use admin operations such as rate-limit reset.");
@@ -1075,7 +1080,6 @@ impl SleepTimeProfile {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,7 +1173,10 @@ mod tests {
         let cors = CorsConfig::from_env();
         assert!(!cors.deny_all);
         assert!(cors.is_restricted());
-        assert_eq!(cors.allowed_origins, vec!["https://app.example.com".to_string()]);
+        assert_eq!(
+            cors.allowed_origins,
+            vec!["https://app.example.com".to_string()]
+        );
 
         env::remove_var("VELD_ENV");
         env::remove_var("VELD_CORS_ORIGINS");

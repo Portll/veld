@@ -28,8 +28,8 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use veld::config::StorageBackend;
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
+use veld::config::StorageBackend;
 
 // =============================================================================
 // CLI STRUCTURE
@@ -98,11 +98,7 @@ enum Commands {
     /// Launch the TUI dashboard
     Tui {
         /// API URL for the Veld server
-        #[arg(
-            long,
-            env = "VELD_SERVER_URL",
-            default_value = "http://127.0.0.1:3030"
-        )]
+        #[arg(long, env = "VELD_SERVER_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
         /// API key for authentication
@@ -389,9 +385,7 @@ async fn main() -> Result<()> {
         } => {
             if !mcp_enabled {
                 eprintln!("Veld MCP component is disabled — not starting `veld serve`.");
-                eprintln!(
-                    "  Enable it with `mcp = true` in config.toml or VELD_MCP_ENABLED=true."
-                );
+                eprintln!("  Enable it with `mcp = true` in config.toml or VELD_MCP_ENABLED=true.");
                 return Ok(());
             }
 
@@ -477,10 +471,22 @@ async fn main() -> Result<()> {
             handle_version();
         }
 
-        Commands::Export { user, out, backend, quarantine, storage_path } => {
+        Commands::Export {
+            user,
+            out,
+            backend,
+            quarantine,
+            storage_path,
+        } => {
             let scope = veld::storage::migrate::Scope::parse(&user)?;
             let reports = tokio::task::spawn_blocking(move || {
-                veld::storage::migrate::export(&storage_path, backend, &scope, &out, quarantine.as_deref())
+                veld::storage::migrate::export(
+                    &storage_path,
+                    backend,
+                    &scope,
+                    &out,
+                    quarantine.as_deref(),
+                )
             })
             .await??;
             println!("{}", serde_json::to_string_pretty(&reports)?);
@@ -489,7 +495,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Import { input, backend, storage_path } => {
+        Commands::Import {
+            input,
+            backend,
+            storage_path,
+        } => {
             let reports = tokio::task::spawn_blocking(move || {
                 veld::storage::migrate::import(&storage_path, backend, &input)
             })
@@ -497,10 +507,24 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&reports)?);
         }
 
-        Commands::Migrate { from, to, user, dry_run, quarantine, storage_path } => {
+        Commands::Migrate {
+            from,
+            to,
+            user,
+            dry_run,
+            quarantine,
+            storage_path,
+        } => {
             let scope = veld::storage::migrate::Scope::parse(&user)?;
             let report = tokio::task::spawn_blocking(move || {
-                veld::storage::migrate::migrate(&storage_path, from, to, &scope, dry_run, quarantine.as_deref())
+                veld::storage::migrate::migrate(
+                    &storage_path,
+                    from,
+                    to,
+                    &scope,
+                    dry_run,
+                    quarantine.as_deref(),
+                )
             })
             .await??;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -509,13 +533,20 @@ async fn main() -> Result<()> {
             }
             if dry_run && report.quarantine_requested {
                 for u in &report.units {
-                    if let Some(n) = u.source.as_ref().map(|s| s.decode_failures).filter(|n| *n > 0) {
+                    if let Some(n) = u
+                        .source
+                        .as_ref()
+                        .map(|s| s.decode_failures)
+                        .filter(|n| *n > 0)
+                    {
                         eprintln!("WARNING: {}: {n} undecodable record(s) would be QUARANTINED, not migrated", u.unit);
                     }
                 }
             }
             if report.blocked() {
-                anyhow::bail!("dry run: at least one unit is blocked; a real migration would refuse");
+                anyhow::bail!(
+                    "dry run: at least one unit is blocked; a real migration would refuse"
+                );
             }
         }
     }
@@ -808,7 +839,9 @@ fn handle_stop(port: u16) -> Result<()> {
         println!("✓ stopped veld on port {port} (pid {pid})");
         Ok(())
     } else {
-        anyhow::bail!("failed to terminate pid {pid} (port {port}) — it may need elevated permissions")
+        anyhow::bail!(
+            "failed to terminate pid {pid} (port {port}) — it may need elevated permissions"
+        )
     }
 }
 
@@ -843,7 +876,9 @@ fn pid_listening_on_port(port: u16) -> Option<u32> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().next().and_then(|l| l.trim().parse::<u32>().ok())
+    text.lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u32>().ok())
 }
 
 fn handle_doctor() -> Result<()> {
@@ -952,8 +987,16 @@ fn handle_version() {
     eprintln!("veld {}", env!("VELD_VERSION_FULL"));
     eprintln!("  Platform: {}", std::env::consts::OS);
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
-    eprintln!("  Target backend: {}", veld::config::default_requested_storage_backend());
-    eprintln!("  Runtime backend: {}", veld::config::effective_storage_backend_for_current_build(veld::config::default_requested_storage_backend()));
+    eprintln!(
+        "  Target backend: {}",
+        veld::config::default_requested_storage_backend()
+    );
+    eprintln!(
+        "  Runtime backend: {}",
+        veld::config::effective_storage_backend_for_current_build(
+            veld::config::default_requested_storage_backend()
+        )
+    );
     eprintln!("  License:  AGPL-3.0-or-later (or commercial — see LICENSING.md)");
     eprintln!("  Repo:     https://github.com/Portll/veld");
 }
@@ -1412,12 +1455,7 @@ fn handle_commit(api_url: &str, api_key: &str, user_id: &str) {
     };
     let content = format!(
         "Git commit {} on branch {} of {} by {}\n\n{}{}",
-        commit.short_hash,
-        commit.branch,
-        commit.repo,
-        commit.author,
-        commit.message,
-        files_section
+        commit.short_hash, commit.branch, commit.repo, commit.author, commit.message, files_section
     );
 
     let client = BlockingApiClient::with_timeout(

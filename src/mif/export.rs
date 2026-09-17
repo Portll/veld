@@ -613,8 +613,7 @@ mod tests {
 
             let restored = parse_relation_type(&wire);
             assert_eq!(
-                restored,
-                original,
+                restored, original,
                 "round trip changed the relation's identity for {name}"
             );
         }

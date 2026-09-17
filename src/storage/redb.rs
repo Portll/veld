@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    AuditLogEntry, AuditStore, BackupStore, BatchOp, BatchWriter, GraphStore, KeyValueStore,
-    ColumnStore, MigrationStore, PrimaryMemoryStore, StorageFactory,
+    AuditLogEntry, AuditStore, BackupStore, BatchOp, BatchWriter, ColumnStore, GraphStore,
+    KeyValueStore, MigrationStore, PrimaryMemoryStore, StorageFactory,
     WriteBatch as StorageWriteBatch,
 };
 use crate::backup::BackupMetadata;
@@ -81,8 +81,7 @@ impl BatchWriter for RedbBatchWriter {
         {
             let read = self.database.begin_read()?;
             for name in batch.column_families() {
-                let def: redb::TableDefinition<'_, &[u8], &[u8]> =
-                    redb::TableDefinition::new(name);
+                let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(name);
                 read.open_table(def).map_err(|e| {
                     anyhow!(
                         "write_batch names table '{}', which this database does not have \
@@ -569,9 +568,15 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         self.get_memory(id)?
             .ok_or_else(|| anyhow!("Memory not found: {}", id.0))
     }
-    fn store(&self, memory: &Memory) -> Result<()> { self.put_memory(memory) }
-    fn update(&self, memory: &Memory) -> Result<()> { self.update_memory(memory) }
-    fn delete(&self, id: &MemoryId) -> Result<()> { self.delete_memory(id) }
+    fn store(&self, memory: &Memory) -> Result<()> {
+        self.put_memory(memory)
+    }
+    fn update(&self, memory: &Memory) -> Result<()> {
+        self.update_memory(memory)
+    }
+    fn delete(&self, id: &MemoryId) -> Result<()> {
+        self.delete_memory(id)
+    }
     fn get_all(&self) -> Result<Vec<Memory>> {
         self.scan_all_memories()
     }
@@ -605,7 +610,12 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
             .and_then(|b| b.try_into().ok().map(usize::from_le_bytes))
             .unwrap_or(0);
         let next = current + 1;
-        table_put(&self.database, DEFAULT_TABLE, RETRIEVAL_KEY, &next.to_le_bytes())?;
+        table_put(
+            &self.database,
+            DEFAULT_TABLE,
+            RETRIEVAL_KEY,
+            &next.to_le_bytes(),
+        )?;
         Ok(next)
     }
     fn get_stats(&self) -> Result<crate::memory::storage::StorageStats> {
@@ -738,8 +748,14 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
                     continue;
                 }
                 flagged.push(memory.id.clone());
-                memory.experience.metadata.insert("forgotten".into(), "true".into());
-                memory.experience.metadata.insert("forgotten_at".into(), now.clone());
+                memory
+                    .experience
+                    .metadata
+                    .insert("forgotten".into(), "true".into());
+                memory
+                    .experience
+                    .metadata
+                    .insert("forgotten_at".into(), now.clone());
                 table.insert(key.as_slice(), encode(&memory)?.as_slice())?;
             }
         }
@@ -756,8 +772,8 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         // serde_json, not bincode — matching rocksdb, because these bytes have to be
         // readable by whichever backend is live after a cutover.
         let key = format!("interference:{memory_id}");
-        let value = serde_json::to_vec(records)
-            .context("Failed to serialize interference records")?;
+        let value =
+            serde_json::to_vec(records).context("Failed to serialize interference records")?;
         table_put(&self.database, DEFAULT_TABLE, key.as_bytes(), &value)
     }
     fn delete_interference_records(&self, memory_id: &str) -> Result<()> {
@@ -827,10 +843,12 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         }
         txn.commit()?;
         if foreign > 0 {
-            tracing::error!(foreign,
+            tracing::error!(
+                foreign,
                 "MEMORIES_TABLE holds keys that are not 16-byte memory ids — left in place. \
                  Something is writing non-memory rows into the memories table, which is the \
-                 invariant this cleanup relies on to be safe without an allowlist.");
+                 invariant this cleanup relies on to be safe without an allowlist."
+            );
         }
         Ok(deleted)
     }
@@ -904,7 +922,12 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
 
     fn put_memory(&self, memory: &Memory) -> Result<()> {
         let bytes = encode(memory)?;
-        table_put(&self.database, MEMORIES_TABLE, memory.id.0.as_bytes(), &bytes)
+        table_put(
+            &self.database,
+            MEMORIES_TABLE,
+            memory.id.0.as_bytes(),
+            &bytes,
+        )
     }
 
     fn update_memory(&self, memory: &Memory) -> Result<()> {
@@ -1229,7 +1252,6 @@ impl KeyValueStore for RedbTableKeyValueStore {
         txn.commit()?;
         Ok(())
     }
-
 }
 
 pub struct RedbGraphStore {
@@ -1263,7 +1285,12 @@ impl GraphStore for RedbGraphStore {
         // Persistence only: entity de-duplication is the graph engine's
         // responsibility (it owns the name/embedding indexes), not the store's.
         let bytes = encode(entity)?;
-        table_put(&self.database, ENTITIES_TABLE, entity.uuid.as_bytes(), &bytes)
+        table_put(
+            &self.database,
+            ENTITIES_TABLE,
+            entity.uuid.as_bytes(),
+            &bytes,
+        )
     }
 
     fn get_relationship(&self, uuid: &uuid::Uuid) -> Result<Option<RelationshipEdge>> {
@@ -1309,7 +1336,12 @@ impl GraphStore for RedbGraphStore {
 
     fn put_episode(&self, episode: &EpisodicNode) -> Result<()> {
         let bytes = encode(episode)?;
-        table_put(&self.database, EPISODES_TABLE, episode.uuid.as_bytes(), &bytes)
+        table_put(
+            &self.database,
+            EPISODES_TABLE,
+            episode.uuid.as_bytes(),
+            &bytes,
+        )
     }
 
     fn stats(&self) -> Result<GraphStats> {
@@ -1332,8 +1364,7 @@ impl GraphStore for RedbGraphStore {
 /// Single table backing each namespace's key-value `.redb` file. Keys and values
 /// are opaque byte strings (the trait's contract); callers serialize above this.
 /// The `kv` family. NOT derived from `DEFAULT_TABLE_NAME` — see that constant.
-const KV_TABLE: redb::TableDefinition<'static, &[u8], &[u8]> =
-    redb::TableDefinition::new("kv");
+const KV_TABLE: redb::TableDefinition<'static, &[u8], &[u8]> = redb::TableDefinition::new("kv");
 
 /// redb-backed [`KeyValueStore`]. Each namespace is its own `<namespace>.redb` file
 /// holding a single `kv` table. Operations are one transaction each (redb commits are
@@ -1441,7 +1472,6 @@ impl KeyValueStore for RedbKeyValueStore {
         txn.commit()?;
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -1461,11 +1491,17 @@ mod redb_kv_tests {
         kv.put_bytes(b"dials:a", b"one").unwrap();
         kv.put_bytes(b"dials:b", b"two").unwrap();
         kv.put_bytes(b"other:c", b"three").unwrap();
-        assert_eq!(kv.get_bytes(b"dials:a").unwrap().as_deref(), Some(&b"one"[..]));
+        assert_eq!(
+            kv.get_bytes(b"dials:a").unwrap().as_deref(),
+            Some(&b"one"[..])
+        );
 
         // Overwrite.
         kv.put_bytes(b"dials:a", b"ONE").unwrap();
-        assert_eq!(kv.get_bytes(b"dials:a").unwrap().as_deref(), Some(&b"ONE"[..]));
+        assert_eq!(
+            kv.get_bytes(b"dials:a").unwrap().as_deref(),
+            Some(&b"ONE"[..])
+        );
 
         // Prefix scan (ordered, prefix-bounded) + limit.
         let scan = kv.scan_prefix(b"dials:", None).unwrap();
@@ -1482,7 +1518,10 @@ mod redb_kv_tests {
         // Durability across reopen.
         drop(kv);
         let kv2 = RedbKeyValueStore::open(tmp.path(), "test_ns").expect("reopen");
-        assert_eq!(kv2.get_bytes(b"dials:b").unwrap().as_deref(), Some(&b"two"[..]));
+        assert_eq!(
+            kv2.get_bytes(b"dials:b").unwrap().as_deref(),
+            Some(&b"two"[..])
+        );
         assert_eq!(kv2.get_bytes(b"dials:a").unwrap(), None);
     }
 }
@@ -1676,7 +1715,12 @@ mod redb_domain_tests {
         drop(store);
         let reopened = RedbPrimaryMemoryStore::open(tmp.path()).expect("reopen");
         assert_eq!(
-            reopened.get_memory(&id2).unwrap().unwrap().experience.content,
+            reopened
+                .get_memory(&id2)
+                .unwrap()
+                .unwrap()
+                .experience
+                .content,
             "persisted"
         );
     }
@@ -1783,7 +1827,10 @@ mod redb_domain_tests {
         assert_eq!(for_alice.len(), 1);
         assert_eq!(for_alice[0].uuid, edge.uuid);
         assert_eq!(
-            store.list_relationships_for_entity(&bob.uuid).unwrap().len(),
+            store
+                .list_relationships_for_entity(&bob.uuid)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -1932,7 +1979,10 @@ impl RedbBackupStore {
 
     /// Share a live handle — the constructor a running server must use.
     pub fn from_database(database: Arc<redb::Database>, path: &Path) -> Self {
-        Self { path: path.to_path_buf(), database }
+        Self {
+            path: path.to_path_buf(),
+            database,
+        }
     }
 
     /// Open standalone. Only valid when nothing else holds the database: an offline
@@ -2008,7 +2058,13 @@ impl BackupStore for RedbBackupStore {
             dir.join(format!("{backup_id}.meta.json")),
             serde_json::to_vec_pretty(&meta)?,
         )?;
-        tracing::info!(user_id, backup_id, records, memory_count, "redb backup written");
+        tracing::info!(
+            user_id,
+            backup_id,
+            records,
+            memory_count,
+            "redb backup written"
+        );
         Ok(meta)
     }
 
@@ -2047,8 +2103,10 @@ impl BackupStore for RedbBackupStore {
                 Ok((_, digest)) if crate::storage::portable::hex(&digest) == meta.checksum => {
                     out.push(meta)
                 }
-                Ok(_) => tracing::error!(backup_id = meta.backup_id,
-                    "backup checksum does not match its metadata — NOT listed as restorable"),
+                Ok(_) => tracing::error!(
+                    backup_id = meta.backup_id,
+                    "backup checksum does not match its metadata — NOT listed as restorable"
+                ),
                 Err(e) => tracing::error!(backup_id = meta.backup_id, error = %e,
                     "backup dump is unreadable — NOT listed as restorable"),
             }
@@ -2058,9 +2116,14 @@ impl BackupStore for RedbBackupStore {
     }
 
     fn restore_backup(&self, user_id: &str, backup_id: u32, target_path: &Path) -> Result<()> {
-        let dump = self.backup_dir(user_id).join(format!("{backup_id}.veldport"));
+        let dump = self
+            .backup_dir(user_id)
+            .join(format!("{backup_id}.veldport"));
         if !dump.exists() {
-            bail!("no backup {backup_id} for '{user_id}' at {}", dump.display());
+            bail!(
+                "no backup {backup_id} for '{user_id}' at {}",
+                dump.display()
+            );
         }
         // Into a TARGET, never over the source. import_portable refuses a target that
         // already holds rows, so a restore cannot merge into a live store — the
@@ -2090,7 +2153,10 @@ impl RedbMigrationStore {
     /// over an already-open database — the rocksdb side reached the same place and
     /// made `open_backup_store` refuse outright.
     pub fn from_database(database: Arc<redb::Database>, path: &Path) -> Self {
-        Self { path: path.to_path_buf(), database }
+        Self {
+            path: path.to_path_buf(),
+            database,
+        }
     }
 
     /// Open standalone. Valid only when nothing else holds the database: an offline
@@ -2098,7 +2164,10 @@ impl RedbMigrationStore {
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let database = create_redb_database(&path.join("storage.redb"))?;
-        Ok(Self { path: path.to_path_buf(), database })
+        Ok(Self {
+            path: path.to_path_buf(),
+            database,
+        })
     }
 }
 
@@ -2121,8 +2190,8 @@ impl RedbMigrationStore {
     pub fn verify_portable(&self, source: &Path) -> Result<()> {
         use crate::storage::portable::read_all;
 
-        let file = std::fs::File::open(source)
-            .with_context(|| format!("opening {}", source.display()))?;
+        let file =
+            std::fs::File::open(source).with_context(|| format!("opening {}", source.display()))?;
         let records = read_all(file)?;
         let database = Arc::clone(&self.database);
         let read = database.begin_read()?;
@@ -2191,10 +2260,7 @@ impl MigrationStore for RedbMigrationStore {
         // known tables are present: a missing one is still an error, an extra one is
         // still exported. Strictly the safer half of each.
         let read = database.begin_read()?;
-        let mut names: Vec<String> = read
-            .list_tables()?
-            .map(|t| t.name().to_string())
-            .collect();
+        let mut names: Vec<String> = read.list_tables()?.map(|t| t.name().to_string()).collect();
         names.sort(); // fixed order, so two exports of one store are byte-identical
         for required in [DEFAULT_TABLE_NAME, "memories", "vector_mappings"] {
             if !names.iter().any(|n| n == required) {
@@ -2209,8 +2275,8 @@ impl MigrationStore for RedbMigrationStore {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let file =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let mut writer = PortableWriter::new(std::io::BufWriter::new(file))?;
 
         let written = (|| -> Result<(u64, [u8; 32])> {
@@ -2247,8 +2313,8 @@ impl MigrationStore for RedbMigrationStore {
     fn import_portable(&self, user_id: &str, source: &Path) -> Result<()> {
         use crate::storage::portable::read_all;
 
-        let file = std::fs::File::open(source)
-            .with_context(|| format!("opening {}", source.display()))?;
+        let file =
+            std::fs::File::open(source).with_context(|| format!("opening {}", source.display()))?;
         // Verified in full before a single row is applied. read_all checks the
         // trailer, the digest and the count, so a truncated or corrupt dump fails
         // here rather than half-way through writing.
@@ -2482,8 +2548,11 @@ mod keyspace_agreement_tests {
         // in two different places depending on the backend, and nothing said so.
         let tmp = tempfile::tempdir().expect("tempdir");
         let database = create_redb_database(&tmp.path().join("agree.redb")).expect("db");
-        init_table(&database, redb::TableDefinition::<&[u8], &[u8]>::new(DEFAULT_TABLE_NAME))
-            .expect("init default");
+        init_table(
+            &database,
+            redb::TableDefinition::<&[u8], &[u8]>::new(DEFAULT_TABLE_NAME),
+        )
+        .expect("init default");
 
         let writer = RedbBatchWriter::new(database.clone());
         let mut unlabelled = StorageWriteBatch::new();
@@ -2497,7 +2566,10 @@ mod keyspace_agreement_tests {
             redb::TableDefinition::new(DEFAULT_TABLE_NAME);
         let table = read.open_table(def).expect("open default");
         assert_eq!(
-            table.get(b"k".as_slice()).unwrap().map(|v| v.value().to_vec()),
+            table
+                .get(b"k".as_slice())
+                .unwrap()
+                .map(|v| v.value().to_vec()),
             Some(b"v".to_vec())
         );
     }
@@ -2531,7 +2603,11 @@ mod import_portable_tests {
     }
 
     fn rec(cf: &str, k: &[u8], v: &[u8]) -> PortableRecord {
-        PortableRecord { cf: cf.into(), key: k.to_vec(), value: v.to_vec() }
+        PortableRecord {
+            cf: cf.into(),
+            key: k.to_vec(),
+            value: v.to_vec(),
+        }
     }
 
     fn write_dump(dir: &Path, bytes: &[u8]) -> PathBuf {
@@ -2579,8 +2655,13 @@ mod import_portable_tests {
             ("kv", b"dials", b"c"),
         ] {
             let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(cf);
-            let t = read.open_table(def).unwrap_or_else(|e| panic!("table {cf} missing: {e}"));
-            assert_eq!(t.get(key).unwrap().map(|v| v.value().to_vec()), Some(want.to_vec()));
+            let t = read
+                .open_table(def)
+                .unwrap_or_else(|e| panic!("table {cf} missing: {e}"));
+            assert_eq!(
+                t.get(key).unwrap().map(|v| v.value().to_vec()),
+                Some(want.to_vec())
+            );
         }
     }
 
@@ -2591,7 +2672,10 @@ mod import_portable_tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("target");
         let first = write_dump(tmp.path(), &dump_of(&[rec("kv", b"already", b"here")]));
-        RedbMigrationStore::open(&target).unwrap().import_portable("a", &first).unwrap();
+        RedbMigrationStore::open(&target)
+            .unwrap()
+            .import_portable("a", &first)
+            .unwrap();
         assert_eq!(row_count(&target), 1);
 
         let second = tmp.path().join("second.veldport");
@@ -2625,7 +2709,10 @@ mod import_portable_tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = write_dump(tmp.path(), &dump_of(&[]));
         let target = tmp.path().join("target");
-        RedbMigrationStore::open(&target).unwrap().import_portable("a", &src).expect("import");
+        RedbMigrationStore::open(&target)
+            .unwrap()
+            .import_portable("a", &src)
+            .expect("import");
         assert_eq!(row_count(&target), 0);
     }
 }
@@ -2636,13 +2723,19 @@ mod verify_portable_tests {
     use crate::storage::portable::{PortableRecord, PortableWriter};
 
     fn rec(cf: &str, k: &[u8], v: &[u8]) -> PortableRecord {
-        PortableRecord { cf: cf.into(), key: k.to_vec(), value: v.to_vec() }
+        PortableRecord {
+            cf: cf.into(),
+            key: k.to_vec(),
+            value: v.to_vec(),
+        }
     }
 
     fn dump_at(dir: &Path, records: &[PortableRecord]) -> PathBuf {
         let mut buf = Vec::new();
         let mut w = PortableWriter::new(&mut buf).unwrap();
-        for r in records { w.write_record(r).unwrap(); }
+        for r in records {
+            w.write_record(r).unwrap();
+        }
         w.finish().unwrap();
         let p = dir.join("d.veldport");
         std::fs::write(&p, &buf).unwrap();
@@ -2652,18 +2745,24 @@ mod verify_portable_tests {
     fn imported(dir: &Path, records: &[PortableRecord]) -> (PathBuf, PathBuf) {
         let src = dump_at(dir, records);
         let target = dir.join("t");
-        RedbMigrationStore::open(&target).unwrap().import_portable("u", &src).unwrap();
+        RedbMigrationStore::open(&target)
+            .unwrap()
+            .import_portable("u", &src)
+            .unwrap();
         (src, target)
     }
 
     #[test]
     fn a_faithful_import_verifies() {
         let tmp = tempfile::tempdir().unwrap();
-        let (src, target) = imported(tmp.path(), &[
-            rec("default", b"a", b"1"),
-            rec("kv", b"b", b"2"),
-        ]);
-        RedbMigrationStore::open(&target).unwrap().verify_portable(&src).expect("verify");
+        let (src, target) = imported(
+            tmp.path(),
+            &[rec("default", b"a", b"1"), rec("kv", b"b", b"2")],
+        );
+        RedbMigrationStore::open(&target)
+            .unwrap()
+            .verify_portable(&src)
+            .expect("verify");
     }
 
     #[test]
@@ -2741,7 +2840,9 @@ mod verify_portable_tests {
         let store = RedbMigrationStore::open(&target).unwrap();
         store.verify_portable(&src).unwrap();
         store.verify_portable(&src).unwrap();
-        store.verify_portable(&src).expect("verify must be idempotent");
+        store
+            .verify_portable(&src)
+            .expect("verify must be idempotent");
     }
 }
 
@@ -2758,9 +2859,26 @@ mod redb_hierarchy_tests {
             ..Default::default()
         };
         let mut m = Memory::from_legacy(
-            MemoryId(uuid::Uuid::new_v4()), experience, 0.5, 0, now, now, false,
-            MemoryTier::LongTerm, Vec::new(), 1.0, None, None, None, None, 0.0, None, None, 1,
-            Vec::new(), Vec::new(),
+            MemoryId(uuid::Uuid::new_v4()),
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
         );
         m.parent_id = parent;
         m.external_id = external.map(|s| s.to_string());
@@ -2775,12 +2893,22 @@ mod redb_hierarchy_tests {
     fn get_all_and_get_all_ids_agree_on_the_same_population() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
-        let ids: Vec<_> = (0..5).map(|_| { let m = mem(None, None); s.put_memory(&m).unwrap(); m.id }).collect();
+        let ids: Vec<_> = (0..5)
+            .map(|_| {
+                let m = mem(None, None);
+                s.put_memory(&m).unwrap();
+                m.id
+            })
+            .collect();
         assert_eq!(s.get_all().unwrap().len(), 5);
         let mut got = s.get_all_ids().unwrap();
         let mut want = ids;
-        got.sort_by_key(|i| i.0); want.sort_by_key(|i| i.0);
-        assert_eq!(got, want, "get_all_ids must be the same set get_all returns, not a subset");
+        got.sort_by_key(|i| i.0);
+        want.sort_by_key(|i| i.0);
+        assert_eq!(
+            got, want,
+            "get_all_ids must be the same set get_all returns, not a subset"
+        );
     }
 
     #[test]
@@ -2792,13 +2920,18 @@ mod redb_hierarchy_tests {
         let a = mem(Some(parent.id.clone()), None);
         let b = mem(Some(parent.id.clone()), None);
         let unrelated = mem(None, None);
-        for m in [&a, &b, &unrelated] { s.put_memory(m).unwrap(); }
+        for m in [&a, &b, &unrelated] {
+            s.put_memory(m).unwrap();
+        }
 
         let kids = s.get_children(&parent.id).unwrap();
         assert_eq!(kids.len(), 2);
         // Both directions: the two are present AND the unrelated one is not.
         assert!(kids.iter().any(|m| m.id == a.id) && kids.iter().any(|m| m.id == b.id));
-        assert!(!kids.iter().any(|m| m.id == unrelated.id), "an unparented memory was returned as a child");
+        assert!(
+            !kids.iter().any(|m| m.id == unrelated.id),
+            "an unparented memory was returned as a child"
+        );
     }
 
     #[test]
@@ -2808,12 +2941,20 @@ mod redb_hierarchy_tests {
         let root = mem(None, None);
         let mid = mem(Some(root.id.clone()), None);
         let leaf = mem(Some(mid.id.clone()), None);
-        for m in [&root, &mid, &leaf] { s.put_memory(m).unwrap(); }
+        for m in [&root, &mid, &leaf] {
+            s.put_memory(m).unwrap();
+        }
 
         let anc = s.get_ancestors(&leaf.id).unwrap();
-        assert_eq!(anc.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![mid.id.clone(), root.id.clone()],
-            "ancestors must be nearest-first, matching the rocksdb walk");
-        assert!(s.get_ancestors(&root.id).unwrap().is_empty(), "a root has no ancestors");
+        assert_eq!(
+            anc.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            vec![mid.id.clone(), root.id.clone()],
+            "ancestors must be nearest-first, matching the rocksdb walk"
+        );
+        assert!(
+            s.get_ancestors(&root.id).unwrap().is_empty(),
+            "a root has no ancestors"
+        );
     }
 
     #[test]
@@ -2831,7 +2972,11 @@ mod redb_hierarchy_tests {
         s.put_memory(&b).unwrap();
 
         let anc = s.get_ancestors(&a.id).unwrap();
-        assert_eq!(anc.len(), 100, "the walk must stop at the rocksdb bound, not run forever");
+        assert_eq!(
+            anc.len(),
+            100,
+            "the walk must stop at the rocksdb bound, not run forever"
+        );
     }
 
     #[test]
@@ -2841,11 +2986,18 @@ mod redb_hierarchy_tests {
         let tagged = mem(None, Some("ext-42"));
         let other = mem(None, Some("ext-99"));
         let untagged = mem(None, None);
-        for m in [&tagged, &other, &untagged] { s.put_memory(m).unwrap(); }
+        for m in [&tagged, &other, &untagged] {
+            s.put_memory(m).unwrap();
+        }
 
-        assert_eq!(s.find_by_external_id("ext-42").unwrap().map(|m| m.id), Some(tagged.id));
-        assert!(s.find_by_external_id("ext-nothing").unwrap().is_none(),
-            "an unknown external id must be None, never the first memory scanned");
+        assert_eq!(
+            s.find_by_external_id("ext-42").unwrap().map(|m| m.id),
+            Some(tagged.id)
+        );
+        assert!(
+            s.find_by_external_id("ext-nothing").unwrap().is_none(),
+            "an unknown external id must be None, never the first memory scanned"
+        );
     }
 
     #[test]
@@ -2855,12 +3007,20 @@ mod redb_hierarchy_tests {
         let root = mem(None, None);
         let target = mem(Some(root.id.clone()), None);
         let kid = mem(Some(target.id.clone()), None);
-        for m in [&root, &target, &kid] { s.put_memory(m).unwrap(); }
+        for m in [&root, &target, &kid] {
+            s.put_memory(m).unwrap();
+        }
 
         let (anc, me, kids) = s.get_hierarchy_context(&target.id).unwrap();
         assert_eq!(me.id, target.id);
-        assert_eq!(anc.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![root.id]);
-        assert_eq!(kids.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![kid.id]);
+        assert_eq!(
+            anc.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            vec![root.id]
+        );
+        assert_eq!(
+            kids.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            vec![kid.id]
+        );
     }
 }
 
@@ -2875,9 +3035,29 @@ mod redb_backup_tests {
         for _ in 0..n {
             let m = Memory::from_legacy(
                 MemoryId(uuid::Uuid::new_v4()),
-                Experience { experience_type: ExperienceType::Observation, content: "x".into(), ..Default::default() },
-                0.5, 0, now, now, false, MemoryTier::LongTerm, Vec::new(), 1.0,
-                None, None, None, None, 0.0, None, None, 1, Vec::new(), Vec::new(),
+                Experience {
+                    experience_type: ExperienceType::Observation,
+                    content: "x".into(),
+                    ..Default::default()
+                },
+                0.5,
+                0,
+                now,
+                now,
+                false,
+                MemoryTier::LongTerm,
+                Vec::new(),
+                1.0,
+                None,
+                None,
+                None,
+                None,
+                0.0,
+                None,
+                None,
+                1,
+                Vec::new(),
+                Vec::new(),
             );
             s.put_memory(&m).unwrap();
         }
@@ -2901,9 +3081,15 @@ mod redb_backup_tests {
         assert_eq!(listed[0].checksum, meta.checksum);
 
         let target = tmp.path().join("restored");
-        backups.restore_backup("alice", 1, &target).expect("restore");
+        backups
+            .restore_backup("alice", 1, &target)
+            .expect("restore");
         let restored = RedbPrimaryMemoryStore::open(&target).unwrap();
-        assert_eq!(restored.get_all().unwrap().len(), 4, "the restore did not carry the memories");
+        assert_eq!(
+            restored.get_all().unwrap().len(),
+            4,
+            "the restore did not carry the memories"
+        );
     }
 
     #[test]
@@ -2921,8 +3107,10 @@ mod redb_backup_tests {
         let bytes = std::fs::read(&dump).unwrap();
         std::fs::write(&dump, &bytes[..bytes.len() - 12]).unwrap();
 
-        assert!(backups.list_backups("alice").unwrap().is_empty(),
-            "a truncated dump was offered as restorable");
+        assert!(
+            backups.list_backups("alice").unwrap().is_empty(),
+            "a truncated dump was offered as restorable"
+        );
     }
 
     #[test]
@@ -2937,10 +3125,13 @@ mod redb_backup_tests {
         std::fs::write(
             store_dir.join("backups").join("alice").join("1.meta.json"),
             serde_json::to_vec_pretty(&meta).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(backups.list_backups("alice").unwrap().is_empty(),
-            "a backup whose metadata disagrees with its bytes was listed as usable");
+        assert!(
+            backups.list_backups("alice").unwrap().is_empty(),
+            "a backup whose metadata disagrees with its bytes was listed as usable"
+        );
     }
 
     #[test]
@@ -2949,7 +3140,10 @@ mod redb_backup_tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_dir = tmp.path().join("store");
         let _s = seeded_store(&store_dir, 1);
-        assert!(RedbBackupStore::from_database(_s.database(), &store_dir).list_backups("nobody").unwrap().is_empty());
+        assert!(RedbBackupStore::from_database(_s.database(), &store_dir)
+            .list_backups("nobody")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2964,8 +3158,11 @@ mod redb_backup_tests {
         assert_eq!(backups.create_backup("alice").unwrap().backup_id, 2);
         std::fs::remove_file(store_dir.join("backups").join("alice").join("2.veldport")).unwrap();
         std::fs::remove_file(store_dir.join("backups").join("alice").join("2.meta.json")).unwrap();
-        assert_eq!(backups.create_backup("alice").unwrap().backup_id, 3,
-            "id 2 was reused after its files were removed");
+        assert_eq!(
+            backups.create_backup("alice").unwrap().backup_id,
+            3,
+            "id 2 was reused after its files were removed"
+        );
     }
 
     #[test]
@@ -2983,7 +3180,8 @@ mod redb_backup_tests {
         {
             let _existing = seeded_store(&target, 1);
         }
-        let err = backups.restore_backup("alice", 1, &target)
+        let err = backups
+            .restore_backup("alice", 1, &target)
             .expect_err("restoring over a populated store must refuse");
         assert!(err.to_string().contains("already holds rows"), "got: {err}");
     }

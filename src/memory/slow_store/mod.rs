@@ -25,14 +25,14 @@ pub use storage::{StoredGap, StoredMemoryRow, StoredThought};
 
 use super::gap_topology::GapStore;
 
+use crate::graph_memory::{EdgeTier, EntityNode, LtpStatus, RelationshipEdge};
+use crate::keystore::SecretCryptor;
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use crate::graph_memory::{EdgeTier, EntityNode, LtpStatus, RelationshipEdge};
-use crate::keystore::SecretCryptor;
 
 /// Statistics from a graph → SQLite sync operation
 #[derive(Debug, Default)]
@@ -444,11 +444,9 @@ impl SlowStore {
         let conn = self.conn.lock();
 
         let current_version: Option<i32> = conn
-            .query_row(
-                "SELECT MAX(version) FROM schema_version",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
             .context("Failed to query schema version")?;
 
         match current_version {
@@ -459,7 +457,10 @@ impl SlowStore {
                     "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                     params![CURRENT_SCHEMA_VERSION, now],
                 )?;
-                tracing::info!("SlowStore: initialized schema version {}", CURRENT_SCHEMA_VERSION);
+                tracing::info!(
+                    "SlowStore: initialized schema version {}",
+                    CURRENT_SCHEMA_VERSION
+                );
             }
             Some(v) if v < CURRENT_SCHEMA_VERSION => {
                 // Run forward migrations. `create_schema` is idempotent
@@ -563,7 +564,13 @@ impl SlowStore {
         tx.execute("DELETE FROM edges", [])?;
         tx.execute("DELETE FROM entities", [])?;
 
-        Self::sync_entities(&tx, entities, &mut stats, self.encryptor.as_ref(), &self.enc)?;
+        Self::sync_entities(
+            &tx,
+            entities,
+            &mut stats,
+            self.encryptor.as_ref(),
+            &self.enc,
+        )?;
         Self::sync_edges(&tx, edges, &mut stats, self.encryptor.as_ref(), &self.enc)?;
 
         tx.commit()?;
@@ -603,8 +610,8 @@ impl SlowStore {
         )?;
 
         for entity in entities {
-            let labels_json = serde_json::to_string(&entity.labels)
-                .unwrap_or_else(|_| "[]".to_string());
+            let labels_json =
+                serde_json::to_string(&entity.labels).unwrap_or_else(|_| "[]".to_string());
             // Graph free-text content (labels, summary) is encrypted when the
             // graph toggle is on — these have no SQL readers. `entity.name` stays
             // PLAINTEXT: the gap-detection queries (find_star_gaps etc.) read and
@@ -612,7 +619,8 @@ impl SlowStore {
             // (tracked follow-up). `uuid` stays plaintext for JOINs.
             // AAD-bind the sealed columns to this entity's uuid.
             let entity_uuid = entity.uuid.to_string();
-            let labels_col = seal_text_value(enc, &labels_json, toggles.graph, entity_uuid.as_bytes())?;
+            let labels_col =
+                seal_text_value(enc, &labels_json, toggles.graph, entity_uuid.as_bytes())?;
             let summary_col =
                 seal_text_value(enc, &entity.summary, toggles.graph, entity_uuid.as_bytes())?;
             // Embedding BLOB: encrypted when the embeddings toggle is on.
@@ -686,7 +694,8 @@ impl SlowStore {
             // (no SQL readers). `relation_type` stays PLAINTEXT — the gap queries
             // read/group on it; from/to/strength are structural.
             let edge_uuid = edge.uuid.to_string();
-            let context_col = seal_text_value(enc, &edge.context, toggles.graph, edge_uuid.as_bytes())?;
+            let context_col =
+                seal_text_value(enc, &edge.context, toggles.graph, edge_uuid.as_bytes())?;
             stmt.execute(params![
                 edge.uuid.to_string(),
                 edge.from_entity.to_string(),
@@ -711,25 +720,46 @@ impl SlowStore {
     }
 }
 
-
 /// SlowStore implements GapStore for SQL-backed gap detection.
 impl GapStore for SlowStore {
-    fn find_open_triads(&self, min_strength: f32, limit: usize) -> anyhow::Result<Vec<super::slow_store::RawOpenTriad>> {
+    fn find_open_triads(
+        &self,
+        min_strength: f32,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::slow_store::RawOpenTriad>> {
         SlowStore::find_open_triads(self, min_strength, limit)
     }
-    fn find_diamond_gaps(&self, min_strength: f32, limit: usize) -> anyhow::Result<Vec<super::slow_store::RawDiamondGap>> {
+    fn find_diamond_gaps(
+        &self,
+        min_strength: f32,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::slow_store::RawDiamondGap>> {
         SlowStore::find_diamond_gaps(self, min_strength, limit)
     }
-    fn find_star_gaps(&self, min_spokes: usize, max_connectivity: f32, limit: usize) -> anyhow::Result<Vec<super::slow_store::RawStarGap>> {
+    fn find_star_gaps(
+        &self,
+        min_spokes: usize,
+        max_connectivity: f32,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::slow_store::RawStarGap>> {
         SlowStore::find_star_gaps(self, min_spokes, max_connectivity, limit)
     }
-    fn get_adjacency_list(&self, min_strength: f32) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
+    fn get_adjacency_list(
+        &self,
+        min_strength: f32,
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
         SlowStore::get_adjacency_list(self, min_strength)
     }
-    fn get_entity_names(&self, uuids: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    fn get_entity_names(
+        &self,
+        uuids: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
         SlowStore::get_entity_names(self, uuids)
     }
-    fn load_embeddings(&self, uuids: &[&str]) -> anyhow::Result<std::collections::HashMap<String, Vec<f32>>> {
+    fn load_embeddings(
+        &self,
+        uuids: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<f32>>> {
         SlowStore::load_embeddings(self, uuids)
     }
 }
@@ -751,8 +781,19 @@ mod tests {
     fn test_store_and_get_thought() {
         let tmp = NamedTempFile::new().unwrap();
         let store = SlowStore::open(tmp.path()).unwrap();
-        store.store_thought("t-001", "missing_connection", "content", 0.85,
-            "A and C should connect", Some("B mediates"), "[]", 0.7, "[]").unwrap();
+        store
+            .store_thought(
+                "t-001",
+                "missing_connection",
+                "content",
+                0.85,
+                "A and C should connect",
+                Some("B mediates"),
+                "[]",
+                0.7,
+                "[]",
+            )
+            .unwrap();
         let thoughts = store.get_active_thoughts(10).unwrap();
         assert_eq!(thoughts.len(), 1);
         assert_eq!(thoughts[0].id, "t-001");
@@ -763,7 +804,11 @@ mod tests {
     fn test_dismiss_thought() {
         let tmp = NamedTempFile::new().unwrap();
         let store = SlowStore::open(tmp.path()).unwrap();
-        store.store_thought("t-002", "silo", "content", 0.5, "desc", None, "[]", 0.3, "[]").unwrap();
+        store
+            .store_thought(
+                "t-002", "silo", "content", 0.5, "desc", None, "[]", 0.3, "[]",
+            )
+            .unwrap();
         assert_eq!(store.get_active_thoughts(10).unwrap().len(), 1);
         store.dismiss_thought("t-002").unwrap();
         assert_eq!(store.get_active_thoughts(10).unwrap().len(), 0);
@@ -773,17 +818,39 @@ mod tests {
     fn test_store_and_resolve_gap() {
         let tmp = NamedTempFile::new().unwrap();
         let store = SlowStore::open(tmp.path()).unwrap();
-        store.store_gap("g-001", "open_triad", "A-B-C", "[]", "[]", 0.9, Some(0.45), 0.8, "content").unwrap();
-        assert_eq!(store.get_unresolved_gaps("open_triad", 10).unwrap().len(), 1);
+        store
+            .store_gap(
+                "g-001",
+                "open_triad",
+                "A-B-C",
+                "[]",
+                "[]",
+                0.9,
+                Some(0.45),
+                0.8,
+                "content",
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_unresolved_gaps("open_triad", 10).unwrap().len(),
+            1
+        );
         store.resolve_gap("g-001").unwrap();
-        assert!(store.get_unresolved_gaps("open_triad", 10).unwrap().is_empty());
+        assert!(store
+            .get_unresolved_gaps("open_triad", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn test_mark_thought_surfaced() {
         let tmp = NamedTempFile::new().unwrap();
         let store = SlowStore::open(tmp.path()).unwrap();
-        store.store_thought("t-003", "golden", "content", 0.6, "desc", None, "[]", 0.5, "[]").unwrap();
+        store
+            .store_thought(
+                "t-003", "golden", "content", 0.6, "desc", None, "[]", 0.5, "[]",
+            )
+            .unwrap();
         store.mark_thought_surfaced("t-003").unwrap();
         store.mark_thought_surfaced("t-003").unwrap();
         assert_eq!(store.get_active_thoughts(10).unwrap()[0].surfaced_count, 2);
@@ -998,9 +1065,14 @@ mod tests {
         assert!(names.get("missing").is_none());
 
         // Only Carol carries an embedding; Alice has none, so it's absent.
-        let embs = store.load_embeddings(&[c_id.as_str(), a_id.as_str()]).unwrap();
+        let embs = store
+            .load_embeddings(&[c_id.as_str(), a_id.as_str()])
+            .unwrap();
         assert_eq!(embs.len(), 1);
-        assert_eq!(embs.get(&c_id).map(Vec::as_slice), Some(&[0.5f32, -0.25][..]));
+        assert_eq!(
+            embs.get(&c_id).map(Vec::as_slice),
+            Some(&[0.5f32, -0.25][..])
+        );
 
         // Empty input short-circuits.
         assert!(store.get_entity_names(&[]).unwrap().is_empty());
@@ -1126,7 +1198,10 @@ mod tests {
                 crate::keystore::SecretCryptor::is_encrypted(&emb_raw),
                 "entity embedding must be encrypted on disk"
             );
-            assert_eq!(name_raw, "alice-entity", "entity name stays plaintext (gap-query input)");
+            assert_eq!(
+                name_raw, "alice-entity",
+                "entity name stays plaintext (gap-query input)"
+            );
 
             let (ctx_raw, rel_raw): (Vec<u8>, String) = conn
                 .query_row(
@@ -1139,7 +1214,10 @@ mod tests {
                 crate::keystore::SecretCryptor::is_encrypted(&ctx_raw),
                 "edge context must be encrypted on disk"
             );
-            assert!(!rel_raw.is_empty(), "relation_type stays plaintext + readable");
+            assert!(
+                !rel_raw.is_empty(),
+                "relation_type stays plaintext + readable"
+            );
         }
 
         // Read path: the embedding decrypts and the name round-trips.

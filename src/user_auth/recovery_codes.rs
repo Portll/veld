@@ -97,7 +97,10 @@ fn encode_base32(raw: &[u8]) -> String {
     // 10 bytes * 8 = 80 bits, divisible by 5 → no leftover. (Defensive: if
     // a future caller changes CODE_RAW_BYTES to a non-multiple of 5 we'd
     // pad here, but the assert below makes the invariant explicit.)
-    debug_assert_eq!(bits_in_buffer, 0, "10 bytes packs evenly into 16 base32 chars");
+    debug_assert_eq!(
+        bits_in_buffer, 0,
+        "10 bytes packs evenly into 16 base32 chars"
+    );
     out
 }
 
@@ -425,7 +428,9 @@ mod tests {
             }
             // No lowercase letters.
             assert!(
-                code.chars().filter(|c| *c != '-').all(|c| !c.is_ascii_lowercase()),
+                code.chars()
+                    .filter(|c| *c != '-')
+                    .all(|c| !c.is_ascii_lowercase()),
                 "code {code} contains lowercase characters"
             );
             // Every payload char is from the canonical alphabet

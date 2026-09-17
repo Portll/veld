@@ -38,13 +38,12 @@ use crate::constants::{
     DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1, EDGE_TIER_TRUST_L2, EDGE_TIER_TRUST_L3,
     EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT, HYBRID_SEMANTIC_WEIGHT,
     IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN, MEMORY_TIER_GRAPH_MULT_ARCHIVE,
-    QUERY_TYPE_ATTRIBUTE_GRAPH, QUERY_TYPE_ATTRIBUTE_LINGUISTIC, QUERY_TYPE_ATTRIBUTE_SEMANTIC,
-    QUERY_TYPE_EXPLORATORY_GRAPH, QUERY_TYPE_EXPLORATORY_LINGUISTIC,
-    QUERY_TYPE_EXPLORATORY_SEMANTIC, QUERY_TYPE_TEMPORAL_GRAPH, QUERY_TYPE_TEMPORAL_LINGUISTIC,
-    QUERY_TYPE_TEMPORAL_SEMANTIC,
     MEMORY_TIER_GRAPH_MULT_LONGTERM, MEMORY_TIER_GRAPH_MULT_SESSION,
     MEMORY_TIER_GRAPH_MULT_WORKING, ONTOLOGICAL_DENSITY_THRESHOLD, ONTOLOGICAL_ENTITY_PENALTY,
-    ONTOLOGICAL_MIN_CONFIDENCE, ONTOLOGICAL_RELATION_PENALTY, SALIENCE_BOOST_FACTOR,
+    ONTOLOGICAL_MIN_CONFIDENCE, ONTOLOGICAL_RELATION_PENALTY, QUERY_TYPE_ATTRIBUTE_GRAPH,
+    QUERY_TYPE_ATTRIBUTE_LINGUISTIC, QUERY_TYPE_ATTRIBUTE_SEMANTIC, QUERY_TYPE_EXPLORATORY_GRAPH,
+    QUERY_TYPE_EXPLORATORY_LINGUISTIC, QUERY_TYPE_EXPLORATORY_SEMANTIC, QUERY_TYPE_TEMPORAL_GRAPH,
+    QUERY_TYPE_TEMPORAL_LINGUISTIC, QUERY_TYPE_TEMPORAL_SEMANTIC, SALIENCE_BOOST_FACTOR,
     SPREADING_ACTIVATION_THRESHOLD, SPREADING_DEGREE_NORMALIZATION,
     SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS,
     SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
@@ -390,9 +389,8 @@ fn spread_single_direction(
                     // Uses hierarchical matching: Team matches Organization, Service matches Technology
                     // Cached: each entity is read from RocksDB at most once across all hops.
                     if !intent.expected_labels.is_empty() {
-                        let cached_labels = entity_label_cache
-                            .entry(target_uuid)
-                            .or_insert_with(|| {
+                        let cached_labels =
+                            entity_label_cache.entry(target_uuid).or_insert_with(|| {
                                 graph
                                     .get_entity(&target_uuid)
                                     .ok()
@@ -768,19 +766,23 @@ pub fn spreading_activation_retrieve_with_stats(
                 entity_node.salience,
             ));
             // FIX-09: Track entity resolution success
-            stats.entity_resolution.push(crate::memory::types::EntityResolution {
-                name: entity.text.clone(),
-                status: "found".to_string(),
-                resolved_to: Some(entity_node.uuid.to_string()),
-            });
+            stats
+                .entity_resolution
+                .push(crate::memory::types::EntityResolution {
+                    name: entity.text.clone(),
+                    status: "found".to_string(),
+                    resolved_to: Some(entity_node.uuid.to_string()),
+                });
         } else {
             tracing::debug!("  ✗ Entity '{}' not found in graph", entity.text);
             // FIX-09: Track entity resolution failure
-            stats.entity_resolution.push(crate::memory::types::EntityResolution {
-                name: entity.text.clone(),
-                status: "not_found".to_string(),
-                resolved_to: None,
-            });
+            stats
+                .entity_resolution
+                .push(crate::memory::types::EntityResolution {
+                    name: entity.text.clone(),
+                    status: "not_found".to_string(),
+                    resolved_to: None,
+                });
         }
     }
 
@@ -958,9 +960,8 @@ pub fn spreading_activation_retrieve_with_stats(
                             penalty *= ONTOLOGICAL_RELATION_PENALTY;
                         }
                         if !intent.expected_labels.is_empty() {
-                            let cached_labels = entity_label_cache
-                                .entry(target_uuid)
-                                .or_insert_with(|| {
+                            let cached_labels =
+                                entity_label_cache.entry(target_uuid).or_insert_with(|| {
                                     graph
                                         .get_entity(&target_uuid)
                                         .ok()
@@ -1143,7 +1144,8 @@ pub fn spreading_activation_retrieve_with_stats(
                 let norm_graph = graph_weight / weight_sum;
                 let norm_linguistic = linguistic_weight / weight_sum;
                 total_semantic_contrib += (semantic_score * norm_semantic) / hybrid_score;
-                total_graph_contrib += (graph_activation * tier_graph_trust * norm_graph) / hybrid_score;
+                total_graph_contrib +=
+                    (graph_activation * tier_graph_trust * norm_graph) / hybrid_score;
                 total_linguistic_contrib += (linguistic_score * norm_linguistic) / hybrid_score;
                 variance_sample_count += 1;
             }
@@ -1190,8 +1192,7 @@ pub fn spreading_activation_retrieve_with_stats(
 
         crate::metrics::RETRIEVAL_VARIANCE_SEMANTIC.observe(stats.semantic_variance_pct as f64);
         crate::metrics::RETRIEVAL_VARIANCE_GRAPH.observe(stats.graph_variance_pct as f64);
-        crate::metrics::RETRIEVAL_VARIANCE_LINGUISTIC
-            .observe(stats.linguistic_variance_pct as f64);
+        crate::metrics::RETRIEVAL_VARIANCE_LINGUISTIC.observe(stats.linguistic_variance_pct as f64);
     }
 
     // Step 6: Sort by final score (descending), memory id as the tie-break: the truncate below
@@ -1216,8 +1217,7 @@ pub fn spreading_activation_retrieve_with_stats(
     // contributions, then store raw sums in stats.  GraphMemory::apply_path_credit will
     // perform the final normalisation to 1.0 when called at feedback time.
     {
-        let mut credit_map: std::collections::HashMap<Uuid, f32> =
-            std::collections::HashMap::new();
+        let mut credit_map: std::collections::HashMap<Uuid, f32> = std::collections::HashMap::new();
         for (edge_uuid, contrib) in raw_credit_edges {
             *credit_map.entry(edge_uuid).or_insert(0.0) += contrib;
         }
@@ -1792,7 +1792,10 @@ mod fusion_tests {
         // (0.5·0.5/0.79 = 0.3165 vs 0.5·0.5/1.0 = 0.25, a 27% spread driven purely by tier).
         let low = fuse_hybrid_score(0.5, 0.0, 0.4, W_SEM, W_GRAPH, W_LING, 0.3);
         let high = fuse_hybrid_score(0.5, 0.0, 0.4, W_SEM, W_GRAPH, W_LING, 1.0);
-        assert_eq!(low, high, "with no graph evidence, tier trust must not move the score");
+        assert_eq!(
+            low, high,
+            "with no graph evidence, tier trust must not move the score"
+        );
         assert!((low - (0.5 * 0.5 + 0.4 * 0.2)).abs() < 1e-6, "got {low}");
     }
 
@@ -1803,7 +1806,10 @@ mod fusion_tests {
         let at_06 = fuse_hybrid_score(0.2, 0.8, 0.1, W_SEM, W_GRAPH, W_LING, 0.6);
         let at_10 = fuse_hybrid_score(0.2, 0.8, 0.1, W_SEM, W_GRAPH, W_LING, 1.0);
         assert!((at_03 - base - 0.8 * 0.3 * 0.3).abs() < 1e-6);
-        assert!(((at_06 - base) - 2.0 * (at_03 - base)).abs() < 1e-6, "graph contribution must be linear in trust");
+        assert!(
+            ((at_06 - base) - 2.0 * (at_03 - base)).abs() < 1e-6,
+            "graph contribution must be linear in trust"
+        );
         assert!(((at_10 - base) - 0.8 * 1.0 * 0.3).abs() < 1e-6);
     }
 
@@ -1813,22 +1819,50 @@ mod fusion_tests {
         // Working. The renormalising form ranked the Working candidate ABOVE whenever
         // semantic evidence dominated, because discounting its graph leg inflated its semantic leg.
         let (sem, graph, ling) = (0.72_f32, 0.05_f32, 0.30_f32);
-        let working = fuse_hybrid_score(sem, graph, ling, W_SEM, W_GRAPH, W_LING, memory_tier_graph_trust(MemoryTier::Working));
-        let longterm = fuse_hybrid_score(sem, graph, ling, W_SEM, W_GRAPH, W_LING, memory_tier_graph_trust(MemoryTier::LongTerm));
-        assert!(longterm >= working, "equal evidence: longterm={longterm} working={working}");
+        let working = fuse_hybrid_score(
+            sem,
+            graph,
+            ling,
+            W_SEM,
+            W_GRAPH,
+            W_LING,
+            memory_tier_graph_trust(MemoryTier::Working),
+        );
+        let longterm = fuse_hybrid_score(
+            sem,
+            graph,
+            ling,
+            W_SEM,
+            W_GRAPH,
+            W_LING,
+            memory_tier_graph_trust(MemoryTier::LongTerm),
+        );
+        assert!(
+            longterm >= working,
+            "equal evidence: longterm={longterm} working={working}"
+        );
 
         // The old form really did invert it, so this pins a regression and not a tautology.
         let legacy = |trust: f32| {
             let sum = W_SEM + W_GRAPH * trust + W_LING;
             sem * (W_SEM / sum) + graph * (W_GRAPH * trust / sum) + ling * (W_LING / sum)
         };
-        assert!(legacy(0.3) > legacy(1.0), "the renormalising form is expected to invert the ordering here");
+        assert!(
+            legacy(0.3) > legacy(1.0),
+            "the renormalising form is expected to invert the ordering here"
+        );
     }
 
     #[test]
     fn longterm_is_the_undiscounted_reference() {
-        assert_eq!(memory_tier_graph_trust(MemoryTier::LongTerm), MEMORY_TIER_GRAPH_MULT_LONGTERM);
-        assert!(memory_tier_graph_trust(MemoryTier::Working) < memory_tier_graph_trust(MemoryTier::LongTerm));
+        assert_eq!(
+            memory_tier_graph_trust(MemoryTier::LongTerm),
+            MEMORY_TIER_GRAPH_MULT_LONGTERM
+        );
+        assert!(
+            memory_tier_graph_trust(MemoryTier::Working)
+                < memory_tier_graph_trust(MemoryTier::LongTerm)
+        );
     }
 
     #[test]

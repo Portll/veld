@@ -257,8 +257,9 @@ mod tests {
     }
 
     fn mock_store() -> BlockingRelationalStore {
-        let inner: Arc<dyn RelationalStore<Error = BoxError>> =
-            Arc::new(MockStore { executes: AtomicU64::new(0) });
+        let inner: Arc<dyn RelationalStore<Error = BoxError>> = Arc::new(MockStore {
+            executes: AtomicU64::new(0),
+        });
         BlockingRelationalStore::new(inner)
     }
 
@@ -268,13 +269,20 @@ mod tests {
         // Synchronous calls made directly on a runtime worker thread — the
         // exact shape of SqliteProjection::apply. A naive Handle::block_on
         // here would panic; the bridge must not.
-        let n1 = store.execute_blocking("INSERT 1", &[Param::I64(1)]).expect("execute 1");
-        let n2 = store.execute_blocking("INSERT 2", &[Param::Text("x")]).expect("execute 2");
+        let n1 = store
+            .execute_blocking("INSERT 1", &[Param::I64(1)])
+            .expect("execute 1");
+        let n2 = store
+            .execute_blocking("INSERT 2", &[Param::Text("x")])
+            .expect("execute 2");
         assert_eq!((n1, n2), (1, 2), "counter advances across bridged calls");
 
         // Params survive the owned round-trip into the spawned future.
         let rows = store
-            .query_blocking("SELECT ?, ?, ?", &[Param::I64(1), Param::Null, Param::Bool(true)])
+            .query_blocking(
+                "SELECT ?, ?, ?",
+                &[Param::I64(1), Param::Null, Param::Bool(true)],
+            )
             .expect("query");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<i64>(0).expect("param_count"), 3);
@@ -284,7 +292,10 @@ mod tests {
     async fn backend_error_propagates_as_boxerror() {
         let store = mock_store();
         let result = store.execute_blocking("FAIL please", &[]);
-        assert!(result.is_err(), "backend error must surface as Err, not a panic");
+        assert!(
+            result.is_err(),
+            "backend error must surface as Err, not a panic"
+        );
         assert!(format!("{}", result.unwrap_err()).contains("mock failure"));
     }
 
@@ -293,7 +304,9 @@ mod tests {
         // Called from a plain test thread with no ambient runtime at all —
         // the bridge runtime must still drive the work to completion.
         let store = mock_store();
-        let n = store.execute_blocking("INSERT", &[]).expect("execute without ambient runtime");
+        let n = store
+            .execute_blocking("INSERT", &[])
+            .expect("execute without ambient runtime");
         assert_eq!(n, 1);
     }
 }

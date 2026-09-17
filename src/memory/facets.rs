@@ -93,9 +93,7 @@ pub enum FacetVersionError {
     /// The provided version is not in [`KNOWN_FACET_SCHEMA_VERSIONS`].
     /// The reader must either be upgraded or run a migration before it
     /// attempts to interpret the bytes.
-    #[error(
-        "unknown facet '{facet}' schema version {found} (this binary knows {known:?})"
-    )]
+    #[error("unknown facet '{facet}' schema version {found} (this binary knows {known:?})")]
     Unknown {
         facet: &'static str,
         found: u16,
@@ -699,8 +697,9 @@ pub struct RecurrencePattern {
 /// detection helper that fails to identify the parent process still has a
 /// valid value to record instead of forcing `None` and losing the fact
 /// that the field was probed.
-pub const KNOWN_AGENT_BRANDS: &[&str] =
-    &["Claude", "Copilot", "Cursor", "Aider", "Continue", "unknown"];
+pub const KNOWN_AGENT_BRANDS: &[&str] = &[
+    "Claude", "Copilot", "Cursor", "Aider", "Continue", "unknown",
+];
 
 /// Validate an agent-brand identifier against [`KNOWN_AGENT_BRANDS`].
 ///
@@ -1206,8 +1205,7 @@ mod tests {
         // before any agent-identity probe has run. Must round-trip cleanly
         // through the project's chosen binary format.
         let session = AgentSession::default();
-        let bytes =
-            bincode::serde::encode_to_vec(&session, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&session, bincode::config::standard()).unwrap();
         let (back, _): (AgentSession, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(back, session);
@@ -1238,8 +1236,7 @@ mod tests {
             declared: Default::default(),
             verified: Default::default(),
         };
-        let bytes =
-            bincode::serde::encode_to_vec(&session, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&session, bincode::config::standard()).unwrap();
         let (back, _): (AgentSession, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(back, session);
@@ -1280,8 +1277,14 @@ mod tests {
         // has to consult documentation to learn which fields were verified will
         // eventually read a claim as evidence, so the nesting carries that and
         // the flat shape is what this pins against.
-        assert!(json.contains("\"declared\":{"), "declared half must be nested, not flattened");
-        assert!(json.contains("\"verified\":{"), "verified half must be nested, not flattened");
+        assert!(
+            json.contains("\"declared\":{"),
+            "declared half must be nested, not flattened"
+        );
+        assert!(
+            json.contains("\"verified\":{"),
+            "verified half must be nested, not flattened"
+        );
         assert!(json.contains("\"model_id\":\"claude-opus-5\""));
         assert!(json.contains("\"session_name\":\"commitwork-11\""));
         let back: AgentSession = serde_json::from_str(&json).unwrap();
@@ -1387,7 +1390,11 @@ mod tests {
     fn unknown_facet_version_returns_structured_error() {
         let err = check_facet_version("where", Some(999)).unwrap_err();
         match err {
-            FacetVersionError::Unknown { facet, found, known } => {
+            FacetVersionError::Unknown {
+                facet,
+                found,
+                known,
+            } => {
                 assert_eq!(facet, "where");
                 assert_eq!(found, 999);
                 assert_eq!(known, KNOWN_FACET_SCHEMA_VERSIONS);

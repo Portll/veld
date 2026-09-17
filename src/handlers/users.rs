@@ -51,9 +51,7 @@ pub async fn get_stats_query(
         authenticated_user.as_ref().map(|extension| &extension.0),
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
-    let stats = state
-        .get_stats(&user_id)
-        .map_err(AppError::Internal)?;
+    let stats = state.get_stats(&user_id).map_err(AppError::Internal)?;
     Ok(Json(stats))
 }
 

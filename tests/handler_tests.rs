@@ -69,9 +69,8 @@ impl Harness {
         // Mirror main.rs: auth middleware only wraps protected routes.
         let probes = build_probe_routes(self.mgr.clone());
         let public = build_public_routes(self.mgr.clone(), false);
-        let protected = build_protected_routes(self.mgr.clone(), false).layer(axum::middleware::from_fn(
-            veld::auth::auth_middleware,
-        ));
+        let protected = build_protected_routes(self.mgr.clone(), false)
+            .layer(axum::middleware::from_fn(veld::auth::auth_middleware));
         Router::new().merge(probes).merge(public).merge(protected)
     }
 }
@@ -226,8 +225,15 @@ async fn health_endpoint() {
         "health response needs 'status' field"
     );
     let census = &body["tenants_with_data"];
-    assert_eq!(census["rocksdb"].as_u64(), Some(0), "fresh install has no tenant data: {body}");
-    assert!(census["measured_at"].is_string(), "census must say when it was measured: {body}");
+    assert_eq!(
+        census["rocksdb"].as_u64(),
+        Some(0),
+        "fresh install has no tenant data: {body}"
+    );
+    assert!(
+        census["measured_at"].is_string(),
+        "census must say when it was measured: {body}"
+    );
 }
 
 #[tokio::test]

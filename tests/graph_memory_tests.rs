@@ -9,14 +9,14 @@
 //! - NER integration for entity extraction
 
 use chrono::{DateTime, Duration, Utc};
-use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
-use veld::graph_memory::{
-    EdgeSource, EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, LtpStatus,
-    RelationType, RelationshipEdge,
-};
-use veld::uuid::Uuid;
 use std::collections::HashMap;
 use tempfile::TempDir;
+use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
+use veld::graph_memory::{
+    EdgeSource, EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory,
+    LtpStatus, RelationType, RelationshipEdge,
+};
+use veld::uuid::Uuid;
 
 /// Create fallback NER instance for testing
 fn setup_fallback_ner() -> NeuralNer {

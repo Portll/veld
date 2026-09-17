@@ -658,7 +658,8 @@ fn deserialize_memory_with(data: &[u8], allow_raw_parse: bool) -> Result<(Memory
     if data.len() > BINCODE_ALLOC_LIMIT {
         return Err(anyhow!(
             "Memory data too large: {} bytes (limit: {} bytes). Likely corrupt.",
-            data.len(), BINCODE_ALLOC_LIMIT
+            data.len(),
+            BINCODE_ALLOC_LIMIT
         ));
     }
 
@@ -703,7 +704,9 @@ fn deserialize_memory_with(data: &[u8], allow_raw_parse: bool) -> Result<(Memory
 /// the original bytes on the target.
 pub(crate) fn portable_memory_value(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     if crate::keystore::is_encrypted_record(data) {
-        return Err(anyhow!("record is encrypted; a portable dump cannot carry it"));
+        return Err(anyhow!(
+            "record is encrypted; a portable dump cannot carry it"
+        ));
     }
     let limited = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
     if let Ok((_, used)) = bincode::serde::decode_from_slice::<Memory, _>(data, limited) {
@@ -931,7 +934,8 @@ const PRE_WRITER_SESSION_GAP: [u8; 8] = [0; 8];
 fn recover_pre_writer_session(data: &[u8]) -> Option<(Memory, &'static str)> {
     let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
     let (prefix, gap_at) =
-        bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(data, cfg).ok()?;
+        bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(data, cfg)
+            .ok()?;
     // Without a context the session never reaches the wire and the layouts are identical.
     prefix.experience.context.as_ref()?;
     let mut spliced = Vec::with_capacity(data.len() + PRE_WRITER_SESSION_GAP.len());
@@ -947,8 +951,11 @@ fn recover_pre_writer_session(data: &[u8]) -> Option<(Memory, &'static str)> {
     // edfb43f (2026-09-02) inserted `persistent` mid-struct, so the same window of records is
     // also V3-shaped, with the W3.4 facets trailing.
     let (v3, n) = bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&spliced, cfg).ok()?;
-    let ((kind, what, when), m) =
-        bincode::serde::decode_from_slice::<(RecordKind, WhatFacet, WhenFacet), _>(&spliced[n..], cfg).ok()?;
+    let ((kind, what, when), m) = bincode::serde::decode_from_slice::<
+        (RecordKind, WhatFacet, WhenFacet),
+        _,
+    >(&spliced[n..], cfg)
+    .ok()?;
     if n + m != spliced.len() {
         return None;
     }
@@ -977,10 +984,11 @@ fn deserialize_with_fallback_with(data: &[u8], allow_raw_parse: bool) -> Result<
 
     // Try current format first (bincode 2.x with current Memory/Experience)
     // This is the hot path — avoid any allocations before this check.
-    match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>()) {
-        Ok((memory, _)) => {
-            Ok((memory, false))
-        } // Current format, no migration needed
+    match bincode::serde::decode_from_slice::<Memory, _>(
+        data,
+        bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
+    ) {
+        Ok((memory, _)) => Ok((memory, false)), // Current format, no migration needed
         Err(e) => {
             // Current format failed — enter fallback chain.
             // From here on we collect errors for diagnostics.
@@ -1005,7 +1013,8 @@ fn deserialize_legacy_fallback(
     if data.len() > BINCODE_ALLOC_LIMIT {
         return Err(anyhow!(
             "Data too large for memory deserialization: {} bytes (limit: {} bytes)",
-            data.len(), BINCODE_ALLOC_LIMIT
+            data.len(),
+            BINCODE_ALLOC_LIMIT
         ));
     }
     // Log detailed errors for first entry only to help debug format issues
@@ -1051,7 +1060,10 @@ fn deserialize_legacy_fallback(
         record_branch(branch);
         return Ok((memory, true));
     }
-    errors.push(("bincode2 pre-writer AgentSession splice", "no layout consumed the spliced record".to_string()));
+    errors.push((
+        "bincode2 pre-writer AgentSession splice",
+        "no layout consumed the spliced record".to_string(),
+    ));
 
     // Try bincode 2.x MINIMAL format (just UUID + content string)
     // This matches the hex pattern: 16-byte UUID + varint length + string bytes
@@ -1431,7 +1443,8 @@ impl MemoryStorage {
         // passphrase and no keystore creates one. A keystore present without the
         // passphrase is a hard error (it would otherwise serve ciphertext as
         // plaintext). No keystore + no passphrase = plaintext (backward compatible).
-        let (record_cryptors, index_blinder) = match Self::open_record_cryptor(&db, &storage_path)? {
+        let (record_cryptors, index_blinder) = match Self::open_record_cryptor(&db, &storage_path)?
+        {
             Some((cryptors, blinder)) => (Some(cryptors), Some(blinder)),
             None => (None, None),
         };
@@ -1450,7 +1463,12 @@ impl MemoryStorage {
     fn open_record_cryptor(
         db: &DB,
         storage_path: &Path,
-    ) -> Result<Option<(crate::keystore::RecordCryptors, crate::keystore::IndexBlinder)>> {
+    ) -> Result<
+        Option<(
+            crate::keystore::RecordCryptors,
+            crate::keystore::IndexBlinder,
+        )>,
+    > {
         use crate::keystore::{IndexBlinder, KdfParams, Keystore, LocalAeadKms, RecordCryptors};
 
         let keystore_path = storage_path.join("keystore.json");
@@ -1878,7 +1896,11 @@ impl MemoryStorage {
         // Index by entities (case-insensitive for tag search compatibility)
         for entity in &memory.experience.entities {
             let normalized_entity = entity.to_lowercase();
-            let entity_key = format!("entity:{}:{}", self.blind_term(&normalized_entity), memory.id.0);
+            let entity_key = format!(
+                "entity:{}:{}",
+                self.blind_term(&normalized_entity),
+                memory.id.0
+            );
             batch.put_cf(idx, entity_key.as_bytes(), b"1");
         }
 
@@ -1893,8 +1915,11 @@ impl MemoryStorage {
         // Episode is the primary temporal grouping - memories in same episode are highly related
         if let Some(ctx) = &memory.experience.context {
             if let Some(episode_id) = &ctx.episode.episode_id {
-                let episode_key =
-                    format!("episode:{}:{}", self.blind_term(&episode_id.to_string()), memory.id.0);
+                let episode_key = format!(
+                    "episode:{}:{}",
+                    self.blind_term(&episode_id.to_string()),
+                    memory.id.0
+                );
                 batch.put_cf(idx, episode_key.as_bytes(), b"1");
 
                 // Also index by sequence within episode for temporal ordering
@@ -1915,15 +1940,22 @@ impl MemoryStorage {
         // Index by robot_id (for multi-robot systems). Read via
         // resolved_robot_id so the W3 WhoFacet SelfAgent indexes too.
         if let Some(robot_id) = memory.experience.resolved_robot_id() {
-            let robot_key = format!("robot:{}:{}", self.blind_term(&robot_id.to_string()), memory.id.0);
+            let robot_key = format!(
+                "robot:{}:{}",
+                self.blind_term(&robot_id.to_string()),
+                memory.id.0
+            );
             batch.put_cf(idx, robot_key.as_bytes(), b"1");
         }
 
         // Index by mission_id (for mission context retrieval). Read via
         // resolved_mission_id so the W3 WhyFacet goal_stack first entry counts.
         if let Some(mission_id) = memory.experience.resolved_mission_id() {
-            let mission_key =
-                format!("mission:{}:{}", self.blind_term(&mission_id.to_string()), memory.id.0);
+            let mission_key = format!(
+                "mission:{}:{}",
+                self.blind_term(&mission_id.to_string()),
+                memory.id.0
+            );
             batch.put_cf(idx, mission_key.as_bytes(), b"1");
         }
 
@@ -1947,8 +1979,11 @@ impl MemoryStorage {
 
         // Index by action_type (for action-based retrieval)
         if let Some(ref action_type) = memory.experience.action_type {
-            let action_key =
-                format!("action:{}:{}", self.blind_term(&action_type.to_string()), memory.id.0);
+            let action_key = format!(
+                "action:{}:{}",
+                self.blind_term(&action_type.to_string()),
+                memory.id.0
+            );
             batch.put_cf(idx, action_key.as_bytes(), b"1");
         }
 
@@ -1967,7 +2002,10 @@ impl MemoryStorage {
         // Enables O(1) duplicate detection on remember()
         {
             let content_hash = Self::sha256_content_hash(&memory.experience.content);
-            let hash_key = format!("content_hash:{}", self.blind_term(&content_hash.to_string()));
+            let hash_key = format!(
+                "content_hash:{}",
+                self.blind_term(&content_hash.to_string())
+            );
             batch.put_cf(idx, hash_key.as_bytes(), memory.id.0.as_bytes());
         }
 
@@ -1976,8 +2014,11 @@ impl MemoryStorage {
         // Key format: external:{source}:{id}:{memory_id} -> memory_id
         // Enables O(1) lookup when syncing from external systems
         if let Some(ref external_id) = memory.external_id {
-            let external_key =
-                format!("external:{}:{}", self.blind_term(&external_id.to_string()), memory.id.0);
+            let external_key = format!(
+                "external:{}:{}",
+                self.blind_term(&external_id.to_string()),
+                memory.id.0
+            );
             // Store memory_id as value for direct lookup
             batch.put_cf(idx, external_key.as_bytes(), memory.id.0.as_bytes());
         }
@@ -1987,8 +2028,11 @@ impl MemoryStorage {
         // Key format: parent:{parent_id}:{child_id} -> 1
         // Enables O(1) lookup of all children for a parent
         if let Some(ref parent_id) = memory.parent_id {
-            let parent_key =
-                format!("parent:{}:{}", self.blind_term(&parent_id.0.to_string()), memory.id.0);
+            let parent_key = format!(
+                "parent:{}:{}",
+                self.blind_term(&parent_id.0.to_string()),
+                memory.id.0
+            );
             batch.put_cf(idx, parent_key.as_bytes(), b"1");
         }
 
@@ -2246,7 +2290,10 @@ impl MemoryStorage {
     /// Returns the MemoryId if identical content was already stored.
     pub fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
         let content_hash = Self::sha256_content_hash(content);
-        let hash_key = format!("content_hash:{}", self.blind_term(&content_hash.to_string()));
+        let hash_key = format!(
+            "content_hash:{}",
+            self.blind_term(&content_hash.to_string())
+        );
         let idx = self.index_cf();
         match self.db.get_cf(idx, hash_key.as_bytes()) {
             Ok(Some(value)) if value.len() == 16 => {
@@ -2274,9 +2321,10 @@ impl MemoryStorage {
         let key = id.0.as_bytes();
         match self.db.get(key)? {
             Some(value) => {
-                let (memory, needs_migration) = self.decode_stored(key, &value).with_context(|| {
-                    format!("Failed to decode memory {} ({} bytes)", id.0, value.len())
-                })?;
+                let (memory, needs_migration) =
+                    self.decode_stored(key, &value).with_context(|| {
+                        format!("Failed to decode memory {} ({} bytes)", id.0, value.len())
+                    })?;
 
                 // Lazy migration: re-write legacy formats in current format
                 if needs_migration {
@@ -2416,8 +2464,11 @@ impl MemoryStorage {
         // Episode indices
         if let Some(ctx) = &memory.experience.context {
             if let Some(episode_id) = &ctx.episode.episode_id {
-                let episode_key =
-                    format!("episode:{}:{}", self.blind_term(&episode_id.to_string()), id.0);
+                let episode_key = format!(
+                    "episode:{}:{}",
+                    self.blind_term(&episode_id.to_string()),
+                    id.0
+                );
                 batch.delete_cf(idx, episode_key.as_bytes());
 
                 if let Some(seq) = ctx.episode.sequence_number {
@@ -2440,7 +2491,11 @@ impl MemoryStorage {
 
         // Mission index — must mirror update_indices's resolved_mission_id read.
         if let Some(mission_id) = memory.experience.resolved_mission_id() {
-            let mission_key = format!("mission:{}:{}", self.blind_term(&mission_id.to_string()), id.0);
+            let mission_key = format!(
+                "mission:{}:{}",
+                self.blind_term(&mission_id.to_string()),
+                id.0
+            );
             batch.delete_cf(idx, mission_key.as_bytes());
         }
 
@@ -2453,7 +2508,11 @@ impl MemoryStorage {
 
         // Action index
         if let Some(ref action_type) = memory.experience.action_type {
-            let action_key = format!("action:{}:{}", self.blind_term(&action_type.to_string()), id.0);
+            let action_key = format!(
+                "action:{}:{}",
+                self.blind_term(&action_type.to_string()),
+                id.0
+            );
             batch.delete_cf(idx, action_key.as_bytes());
         }
 
@@ -2468,19 +2527,30 @@ impl MemoryStorage {
         // Content hash index (idempotency dedup)
         {
             let content_hash = Self::sha256_content_hash(&memory.experience.content);
-            let hash_key = format!("content_hash:{}", self.blind_term(&content_hash.to_string()));
+            let hash_key = format!(
+                "content_hash:{}",
+                self.blind_term(&content_hash.to_string())
+            );
             batch.delete_cf(idx, hash_key.as_bytes());
         }
 
         // External linking index
         if let Some(ref external_id) = memory.external_id {
-            let external_key = format!("external:{}:{}", self.blind_term(&external_id.to_string()), id.0);
+            let external_key = format!(
+                "external:{}:{}",
+                self.blind_term(&external_id.to_string()),
+                id.0
+            );
             batch.delete_cf(idx, external_key.as_bytes());
         }
 
         // Parent index (hierarchy)
         if let Some(ref parent_id) = memory.parent_id {
-            let parent_key = format!("parent:{}:{}", self.blind_term(&parent_id.0.to_string()), id.0);
+            let parent_key = format!(
+                "parent:{}:{}",
+                self.blind_term(&parent_id.0.to_string()),
+                id.0
+            );
             batch.delete_cf(idx, parent_key.as_bytes());
         }
 
@@ -3712,16 +3782,13 @@ impl MemoryStorage {
     /// column family. Data written before the column families exists here, and
     /// moving it is a migration, not a refactor — see the type's own note.
     pub fn default_key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
-        Arc::new(
-            crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(self.db.clone()),
-        )
+        Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(self.db.clone()))
     }
 
     pub fn key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
-        Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
-            self.db.clone(),
-            CF_KV,
-        ))
+        Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(self.db.clone(), CF_KV),
+        )
     }
 }
 
@@ -4053,9 +4120,11 @@ impl MemoryStorage {
         let mapping_key = format!("vmapping:{}", memory_id.0);
         match self.db.get(mapping_key.as_bytes())? {
             Some(data) => {
-                let (entry, _): (VectorMappingEntry, _) =
-                    bincode::serde::decode_from_slice(&data, bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>())
-                        .context("Failed to deserialize vector mapping")?;
+                let (entry, _): (VectorMappingEntry, _) = bincode::serde::decode_from_slice(
+                    &data,
+                    bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
+                )
+                .context("Failed to deserialize vector mapping")?;
                 Ok(Some(entry))
             }
             None => Ok(None),
@@ -4391,9 +4460,9 @@ impl MemoryStorage {
         let key = format!("_watermark:fact_extraction:{user_id}");
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        if let Err(e) =
-            self.db
-                .put_opt(key.as_bytes(), timestamp_millis.to_le_bytes(), &write_opts)
+        if let Err(e) = self
+            .db
+            .put_opt(key.as_bytes(), timestamp_millis.to_le_bytes(), &write_opts)
         {
             tracing::warn!("Failed to persist fact extraction watermark: {e}");
         }
@@ -4467,7 +4536,9 @@ mod tests {
     // company". Every test that touches the decoder's counters takes this lock.
     static FALLBACK_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
-        FALLBACK_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        FALLBACK_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     fn sample_memory(id: MemoryId, content: &str) -> Memory {
@@ -4550,13 +4621,22 @@ mod tests {
     #[test]
     fn test_bincode1_minimal_fixture_is_not_misread_by_a_varint_candidate() {
         let _serial = counter_guard();
-        let bytes16 = [0x2fu8, 0x4b, 0xff, 0x82, 0x3e, 0x81, 0x4a, 0x0a, 0xb3, 0x00, 0x33, 0x37, 0xeb, 0x6f, 0xf4, 0x3c];
+        let bytes16 = [
+            0x2fu8, 0x4b, 0xff, 0x82, 0x3e, 0x81, 0x4a, 0x0a, 0xb3, 0x00, 0x33, 0x37, 0xeb, 0x6f,
+            0xf4, 0x3c,
+        ];
         let id = MemoryId(uuid::Uuid::from_bytes(bytes16));
-        let fixture = LegacyMinimalFixture { id: id.clone(), content: "legacy bincode1 minimal".to_string() };
+        let fixture = LegacyMinimalFixture {
+            id: id.clone(),
+            content: "legacy bincode1 minimal".to_string(),
+        };
         let bytes = bincode1::serialize(&fixture).unwrap();
 
         let (decoded, is_legacy) = deserialize_with_fallback(&bytes).unwrap();
-        assert_eq!(decoded.id, id, "the id came back displaced: a varint candidate misread the fixint prefix");
+        assert_eq!(
+            decoded.id, id,
+            "the id came back displaced: a varint candidate misread the fixint prefix"
+        );
         assert_eq!(decoded.experience.content, "legacy bincode1 minimal");
         assert!(is_legacy);
     }
@@ -4606,7 +4686,10 @@ mod tests {
         let now = Utc::now();
         let fixture = V3PlusAppendedFields {
             id: id.clone(),
-            experience: Experience { content: "a record from a schema between V3 and today".to_string(), ..Default::default() },
+            experience: Experience {
+                content: "a record from a schema between V3 and today".to_string(),
+                ..Default::default()
+            },
             importance: 0.5,
             access_count: 0,
             created_at: now,
@@ -4642,7 +4725,10 @@ mod tests {
         let (decoded, is_legacy) = deserialize_with_fallback(&bytes)
             .expect("a V3 record with appended fields must still decode through the V3 arm");
         assert_eq!(decoded.id, id);
-        assert_eq!(decoded.experience.content, "a record from a schema between V3 and today");
+        assert_eq!(
+            decoded.experience.content,
+            "a record from a schema between V3 and today"
+        );
         assert!(is_legacy);
     }
 
@@ -4668,7 +4754,15 @@ mod tests {
             tags: vec!["synthetic".into()],
             ..Default::default()
         };
-        let mut memory = Memory::new(MemoryId(uuid::Uuid::new_v4()), experience, 0.7, None, None, None, None);
+        let mut memory = Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            experience,
+            0.7,
+            None,
+            None,
+            None,
+            None,
+        );
         memory.when.episode_ordinal = Some(3);
         memory
     }
@@ -4681,8 +4775,15 @@ mod tests {
     fn strip_writer_structs(current: &[u8]) -> Vec<u8> {
         let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
         let (_, gap_at) =
-            bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(current, cfg).unwrap();
-        assert_eq!(&current[gap_at..gap_at + 8], &PRE_WRITER_SESSION_GAP, "fixture must carry default writers");
+            bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(
+                current, cfg,
+            )
+            .unwrap();
+        assert_eq!(
+            &current[gap_at..gap_at + 8],
+            &PRE_WRITER_SESSION_GAP,
+            "fixture must carry default writers"
+        );
         [&current[..gap_at], &current[gap_at + 8..]].concat()
     }
 
@@ -4691,8 +4792,11 @@ mod tests {
         let original = memory_with_session("written with a six-field session");
         let old = strip_writer_structs(&encode(&original));
 
-        assert!(bincode::serde::decode_from_slice::<Memory, _>(&old, bincode::config::standard()).is_err(),
-            "the current layout must refuse the old wire, or this test guards nothing");
+        assert!(
+            bincode::serde::decode_from_slice::<Memory, _>(&old, bincode::config::standard())
+                .is_err(),
+            "the current layout must refuse the old wire, or this test guards nothing"
+        );
         let (back, is_legacy) = deserialize_with_fallback(&old).expect("recovery arm");
         assert!(is_legacy, "must be re-serialised on the way back");
         assert_eq!(back.id, original.id);
@@ -4709,23 +4813,58 @@ mod tests {
         let current = encode(&original);
         let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
         let (_, persistent_at) = bincode::serde::decode_from_slice::<
-            (MemoryId, Experience, f32, u32, DateTime<Utc>, DateTime<Utc>, bool), _>(&current, cfg).unwrap();
-        assert_eq!(current[persistent_at], 1, "persistent=true sits after compressed");
-        let without_persistent = [&current[..persistent_at], &current[persistent_at + 1..]].concat();
+            (
+                MemoryId,
+                Experience,
+                f32,
+                u32,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                bool,
+            ),
+            _,
+        >(&current, cfg)
+        .unwrap();
+        assert_eq!(
+            current[persistent_at], 1,
+            "persistent=true sits after compressed"
+        );
+        let without_persistent =
+            [&current[..persistent_at], &current[persistent_at + 1..]].concat();
         let old = strip_writer_structs(&without_persistent);
 
         let (back, is_legacy) = deserialize_with_fallback(&old).expect("V3 recovery arm");
         assert!(is_legacy);
         assert_eq!(back.experience.content, original.experience.content);
-        assert_eq!(back.experience.context.as_ref().unwrap().session.branch.as_deref(), Some("feature/x"));
-        assert_eq!(back.when.episode_ordinal, Some(3), "trailing W3.4 facets must survive, not default");
+        assert_eq!(
+            back.experience
+                .context
+                .as_ref()
+                .unwrap()
+                .session
+                .branch
+                .as_deref(),
+            Some("feature/x")
+        );
+        assert_eq!(
+            back.when.episode_ordinal,
+            Some(3),
+            "trailing W3.4 facets must survive, not default"
+        );
         assert_eq!(back.kind, original.kind);
     }
 
     #[test]
     fn the_splice_refuses_records_that_already_carry_the_writer_structs() {
         let mut populated = memory_with_session("current layout, writer populated");
-        populated.experience.context.as_mut().unwrap().session.declared.session_name = Some("commitwork-11".into());
+        populated
+            .experience
+            .context
+            .as_mut()
+            .unwrap()
+            .session
+            .declared
+            .session_name = Some("commitwork-11".into());
         assert!(recover_pre_writer_session(&encode(&populated)).is_none());
 
         let defaults = memory_with_session("current layout, writer defaulted");
@@ -4914,60 +5053,199 @@ mod tests {
         let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
         let mut verdicts: std::collections::BTreeMap<String, usize> = Default::default();
         for id in &ids {
-            let v = records.get(id.0.as_bytes().as_slice()).expect("record present in default CF");
+            let v = records
+                .get(id.0.as_bytes().as_slice())
+                .expect("record present in default CF");
             let verdict = match deserialize_memory(&v) {
-                Ok((m, legacy)) => format!("DECODES legacy={legacy} content_len={}", m.experience.content.len()),
+                Ok((m, legacy)) => format!(
+                    "DECODES legacy={legacy} content_len={}",
+                    m.experience.content.len()
+                ),
                 Err(_) => {
                     let mut parts = Vec::new();
-                    parts.push(format!("Memory: {}", bincode::serde::decode_from_slice::<Memory, _>(&v, cfg).err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into())));
-                    parts.push(format!("V3: {}", bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, cfg).map(|(_, n)| format!("ok consumed {n}/{}", v.len())).unwrap_or_else(|e| e.to_string())));
-                    parts.push(format!("V2: {}", bincode::serde::decode_from_slice::<LegacyMemoryFlatV2, _>(&v, cfg).map(|(_, n)| format!("ok consumed {n}/{}", v.len())).unwrap_or_else(|e| e.to_string())));
-                    parts.push(format!("bincode1 V1: {}", bincode1::deserialize::<LegacyMemoryV1>(&v).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string())));
-                    let fix = bincode::config::standard().with_fixed_int_encoding().with_limit::<BINCODE_ALLOC_LIMIT>();
+                    parts.push(format!(
+                        "Memory: {}",
+                        bincode::serde::decode_from_slice::<Memory, _>(&v, cfg)
+                            .err()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "ok".into())
+                    ));
+                    parts.push(format!(
+                        "V3: {}",
+                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, cfg)
+                            .map(|(_, n)| format!("ok consumed {n}/{}", v.len()))
+                            .unwrap_or_else(|e| e.to_string())
+                    ));
+                    parts.push(format!(
+                        "V2: {}",
+                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV2, _>(&v, cfg)
+                            .map(|(_, n)| format!("ok consumed {n}/{}", v.len()))
+                            .unwrap_or_else(|e| e.to_string())
+                    ));
+                    parts.push(format!(
+                        "bincode1 V1: {}",
+                        bincode1::deserialize::<LegacyMemoryV1>(&v)
+                            .map(|_| "ok".to_string())
+                            .unwrap_or_else(|e| e.to_string())
+                    ));
+                    let fix = bincode::config::standard()
+                        .with_fixed_int_encoding()
+                        .with_limit::<BINCODE_ALLOC_LIMIT>();
                     let leg = bincode::config::legacy().with_limit::<BINCODE_ALLOC_LIMIT>();
-                    parts.push(format!("Memory FIXINT: {}", bincode::serde::decode_from_slice::<Memory, _>(&v, fix).map(|(m, n)| format!("ok consumed {n}/{} content_len={}", v.len(), m.experience.content.len())).unwrap_or_else(|e| e.to_string())));
-                    parts.push(format!("V3 FIXINT: {}", bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, fix).map(|(_, n)| format!("ok consumed {n}/{}", v.len())).unwrap_or_else(|e| e.to_string())));
-                    parts.push(format!("Memory LEGACY(bincode1-compatible): {}", bincode::serde::decode_from_slice::<Memory, _>(&v, leg).map(|(m, n)| format!("ok consumed {n}/{} content_len={}", v.len(), m.experience.content.len())).unwrap_or_else(|e| e.to_string())));
-                    parts.push(format!("V3 LEGACY: {}", bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, leg).map(|(_, n)| format!("ok consumed {n}/{}", v.len())).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!(
+                        "Memory FIXINT: {}",
+                        bincode::serde::decode_from_slice::<Memory, _>(&v, fix)
+                            .map(|(m, n)| format!(
+                                "ok consumed {n}/{} content_len={}",
+                                v.len(),
+                                m.experience.content.len()
+                            ))
+                            .unwrap_or_else(|e| e.to_string())
+                    ));
+                    parts.push(format!(
+                        "V3 FIXINT: {}",
+                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, fix)
+                            .map(|(_, n)| format!("ok consumed {n}/{}", v.len()))
+                            .unwrap_or_else(|e| e.to_string())
+                    ));
+                    parts.push(format!(
+                        "Memory LEGACY(bincode1-compatible): {}",
+                        bincode::serde::decode_from_slice::<Memory, _>(&v, leg)
+                            .map(|(m, n)| format!(
+                                "ok consumed {n}/{} content_len={}",
+                                v.len(),
+                                m.experience.content.len()
+                            ))
+                            .unwrap_or_else(|e| e.to_string())
+                    ));
+                    parts.push(format!(
+                        "V3 LEGACY: {}",
+                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, leg)
+                            .map(|(_, n)| format!("ok consumed {n}/{}", v.len()))
+                            .unwrap_or_else(|e| e.to_string())
+                    ));
                     parts.push(format!("V3 + PRE-WRITER AgentSession (before edfb43f and 4a54053): {}", bincode::serde::decode_from_slice::<ProbeMemoryFlatPreWriter, _>(&v, cfg).map(|(m, n)| format!("ok consumed {n}/{} content_len={} emb={} emb2={} created={} session_started={}", v.len(), m.experience.content.len(), m.experience.embeddings.as_ref().map(|e| e.len()).unwrap_or(0), m.experience.embeddings_secondary.as_ref().map(|e| e.len()).unwrap_or(0), m.created_at.format("%Y-%m-%d"), m.experience.context.as_ref().and_then(|c| c.session.started_at).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "none".into()))).unwrap_or_else(|e| e.to_string())));
-                    parts.push(format!("recover_pre_writer_session: {}", recover_pre_writer_session(&v).map(|(m, branch)| format!("{branch} content_len={} kind={:?} when.encoded_at={}", m.experience.content.len(), m.kind, m.when.encoded_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "none".into()))).unwrap_or_else(|| "none".into())));
-                    parts.push(format!("V3 with an Experience lacking embeddings_secondary/embedding_degraded: {}", bincode::serde::decode_from_slice::<ProbeMemoryNoSecondary, _>(&v, cfg).map(|(m, n)| format!("ok consumed {n}/{} content_len={} entities={}", v.len(), m.experience.content.len(), m.experience.entities.len())).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!(
+                        "recover_pre_writer_session: {}",
+                        recover_pre_writer_session(&v)
+                            .map(|(m, branch)| format!(
+                                "{branch} content_len={} kind={:?} when.encoded_at={}",
+                                m.experience.content.len(),
+                                m.kind,
+                                m.when
+                                    .encoded_at
+                                    .map(|d| d.format("%Y-%m-%d").to_string())
+                                    .unwrap_or_else(|| "none".into())
+                            ))
+                            .unwrap_or_else(|| "none".into())
+                    ));
+                    parts.push(format!(
+                        "V3 with an Experience lacking embeddings_secondary/embedding_degraded: {}",
+                        bincode::serde::decode_from_slice::<ProbeMemoryNoSecondary, _>(&v, cfg)
+                            .map(|(m, n)| format!(
+                                "ok consumed {n}/{} content_len={} entities={}",
+                                v.len(),
+                                m.experience.content.len(),
+                                m.experience.entities.len()
+                            ))
+                            .unwrap_or_else(|e| e.to_string())
+                    ));
                     // Structural walk of the prefix, numbers only: uuid, experience_type varint,
                     // content length, then the raw tag bytes that follow the content.
                     fn varint(b: &[u8], i: &mut usize) -> u64 {
-                        let x = b[*i]; *i += 1;
-                        match x { 0..=250 => x as u64, 251 => { let v = u16::from_le_bytes([b[*i], b[*i+1]]) as u64; *i += 2; v }
-                            252 => { let v = u32::from_le_bytes([b[*i], b[*i+1], b[*i+2], b[*i+3]]) as u64; *i += 4; v }
-                            _ => { let v = u64::from_le_bytes(b[*i..*i+8].try_into().unwrap()); *i += 8; v } }
+                        let x = b[*i];
+                        *i += 1;
+                        match x {
+                            0..=250 => x as u64,
+                            251 => {
+                                let v = u16::from_le_bytes([b[*i], b[*i + 1]]) as u64;
+                                *i += 2;
+                                v
+                            }
+                            252 => {
+                                let v = u32::from_le_bytes([b[*i], b[*i + 1], b[*i + 2], b[*i + 3]])
+                                    as u64;
+                                *i += 4;
+                                v
+                            }
+                            _ => {
+                                let v = u64::from_le_bytes(b[*i..*i + 8].try_into().unwrap());
+                                *i += 8;
+                                v
+                            }
+                        }
                     }
                     let mut i = 0usize;
-                    let uuid_len = varint(&v, &mut i); i += uuid_len as usize;
+                    let uuid_len = varint(&v, &mut i);
+                    i += uuid_len as usize;
                     let etype = varint(&v, &mut i);
-                    let clen = varint(&v, &mut i); i += clen as usize;
+                    let clen = varint(&v, &mut i);
+                    i += clen as usize;
                     // Deeper walk past Some(RichContext { id }): 48 bytes, printable runs masked.
                     let deep = &v[(i + 2 + 16).min(v.len())..(i + 2 + 16 + 48).min(v.len())];
                     let mut masked = String::new();
                     let mut run = 0usize;
                     for b in deep {
-                        if (0x20..0x7f).contains(b) { run += 1; if run == 4 { masked.push_str("…txt… "); } else if run < 4 { masked.push_str(&format!("{b:02x} ")); } }
-                        else { run = 0; masked.push_str(&format!("{b:02x} ")); }
+                        if (0x20..0x7f).contains(b) {
+                            run += 1;
+                            if run == 4 {
+                                masked.push_str("…txt… ");
+                            } else if run < 4 {
+                                masked.push_str(&format!("{b:02x} "));
+                            }
+                        } else {
+                            run = 0;
+                            masked.push_str(&format!("{b:02x} "));
+                        }
                     }
                     parts.push(format!("after RichContext.id: [{}]", masked.trim_end()));
                     let start = (i + 2 + 16).min(v.len());
                     let zeros = v[start..].iter().take_while(|b| **b == 0).count();
-                    let next: Vec<String> = v[(start + zeros).min(v.len())..(start + zeros + 8).min(v.len())].iter().map(|b| format!("{b:02x}")).collect();
-                    parts.push(format!("zero-run after RichContext.id = {zeros} bytes, then [{}]", next.join(" ")));
-                    let after: Vec<String> = v[i..(i + 12).min(v.len())].iter().map(|b| format!("{b:02x}")).collect();
+                    let next: Vec<String> = v
+                        [(start + zeros).min(v.len())..(start + zeros + 8).min(v.len())]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    parts.push(format!(
+                        "zero-run after RichContext.id = {zeros} bytes, then [{}]",
+                        next.join(" ")
+                    ));
+                    let after: Vec<String> = v[i..(i + 12).min(v.len())]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
                     parts.push(format!("walk: uuid_len={uuid_len} experience_type={etype} content_len={clen} bytes_after_content=[{}] total={}", after.join(" "), v.len()));
                     // Field-by-field decode of RichContext then the Experience tail, each step
                     // reporting bytes consumed, so the first refusing field is named not guessed.
-                    use crate::memory::facets::{AgentSession, EngramBinding, WhereFacet, WhoFacet, WhyFacet};
-                    fn step<'a, T: serde::de::DeserializeOwned>(v: &'a [u8], off: &mut usize, name: &str, log: &mut Vec<String>) -> bool {
-                        match bincode::serde::decode_from_slice::<T, _>(&v[*off..], bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>()) {
-                            Ok((_, n)) => { log.push(format!("{name}+{n}")); *off += n; true }
+                    use crate::memory::facets::{
+                        AgentSession, EngramBinding, WhereFacet, WhoFacet, WhyFacet,
+                    };
+                    fn step<'a, T: serde::de::DeserializeOwned>(
+                        v: &'a [u8],
+                        off: &mut usize,
+                        name: &str,
+                        log: &mut Vec<String>,
+                    ) -> bool {
+                        match bincode::serde::decode_from_slice::<T, _>(
+                            &v[*off..],
+                            bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
+                        ) {
+                            Ok((_, n)) => {
+                                log.push(format!("{name}+{n}"));
+                                *off += n;
+                                true
+                            }
                             Err(e) => {
-                                let peek: Vec<String> = v[*off..(*off + 8).min(v.len())].iter().map(|b| format!("{b:02x}")).collect();
-                                log.push(format!("{name} FAILS at offset {} of {}: {e} peek=[{}]", *off, v.len(), peek.join(" ")));
+                                let peek: Vec<String> = v[*off..(*off + 8).min(v.len())]
+                                    .iter()
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect();
+                                log.push(format!(
+                                    "{name} FAILS at offset {} of {}: {e} peek=[{}]",
+                                    *off,
+                                    v.len(),
+                                    peek.join(" ")
+                                ));
                                 false
                             }
                         }
@@ -4990,14 +5268,22 @@ mod tests {
                         && step::<WhoFacet>(&v, &mut off, "who", &mut log)
                         && step::<WhyFacet>(&v, &mut off, "why", &mut log)
                         && step::<EngramBinding>(&v, &mut off, "binding", &mut log)
-                        && (step::<AgentSession>(&v, &mut off, "session", &mut log) || step::<ProbeAgentSessionPreWriter>(&v, &mut off, "session(pre-writer)", &mut log))
+                        && (step::<AgentSession>(&v, &mut off, "session", &mut log)
+                            || step::<ProbeAgentSessionPreWriter>(
+                                &v,
+                                &mut off,
+                                "session(pre-writer)",
+                                &mut log,
+                            ))
                         && step::<Option<Box<RichContext>>>(&v, &mut off, "parent", &mut log)
                         && step::<Option<Vec<f32>>>(&v, &mut off, "ctx.embeddings", &mut log)
                         && step::<f32>(&v, &mut off, "decay_rate", &mut log)
                         && step::<DateTime<Utc>>(&v, &mut off, "ctx.created_at", &mut log)
                         && step::<DateTime<Utc>>(&v, &mut off, "ctx.updated_at", &mut log)
                         && step::<Vec<String>>(&v, &mut off, "entities", &mut log)
-                        && step::<std::collections::HashMap<String, String>>(&v, &mut off, "metadata", &mut log)
+                        && step::<std::collections::HashMap<String, String>>(
+                            &v, &mut off, "metadata", &mut log,
+                        )
                         && step::<Option<Vec<f32>>>(&v, &mut off, "embeddings", &mut log)
                         && step::<Option<Vec<f32>>>(&v, &mut off, "embeddings_secondary", &mut log)
                         && step::<bool>(&v, &mut off, "embedding_degraded", &mut log)
@@ -5016,16 +5302,33 @@ mod tests {
                         && step::<Option<String>>(&v, &mut off, "action_type", &mut log)
                         && step::<Option<f32>>(&v, &mut off, "reward", &mut log)
                         && step::<HashMap<String, f64>>(&v, &mut off, "sensor_data", &mut log)
-                        && step::<Option<HashMap<String, String>>>(&v, &mut off, "decision_context", &mut log)
-                        && step::<Option<HashMap<String, String>>>(&v, &mut off, "action_params", &mut log)
+                        && step::<Option<HashMap<String, String>>>(
+                            &v,
+                            &mut off,
+                            "decision_context",
+                            &mut log,
+                        )
+                        && step::<Option<HashMap<String, String>>>(
+                            &v,
+                            &mut off,
+                            "action_params",
+                            &mut log,
+                        )
                         && step::<Option<String>>(&v, &mut off, "outcome_type", &mut log)
                         && step::<Option<String>>(&v, &mut off, "outcome_details", &mut log)
                         && step::<Option<f32>>(&v, &mut off, "confidence", &mut log)
                         && step::<Vec<String>>(&v, &mut off, "alternatives_considered", &mut log)
-                        && step::<Option<HashMap<String, String>>>(&v, &mut off, "weather", &mut log)
+                        && step::<Option<HashMap<String, String>>>(
+                            &v, &mut off, "weather", &mut log,
+                        )
                         && step::<Option<String>>(&v, &mut off, "terrain_type", &mut log)
                         && step::<Option<String>>(&v, &mut off, "lighting", &mut log)
-                        && step::<Vec<HashMap<String, String>>>(&v, &mut off, "nearby_agents", &mut log)
+                        && step::<Vec<HashMap<String, String>>>(
+                            &v,
+                            &mut off,
+                            "nearby_agents",
+                            &mut log,
+                        )
                         && step::<bool>(&v, &mut off, "is_failure", &mut log)
                         && step::<bool>(&v, &mut off, "is_anomaly", &mut log)
                         && step::<Option<String>>(&v, &mut off, "severity", &mut log)
@@ -5037,7 +5340,12 @@ mod tests {
                         && step::<Vec<String>>(&v, &mut off, "tags", &mut log)
                         && step::<Vec<String>>(&v, &mut off, "temporal_refs", &mut log)
                         && step::<Vec<NerEntityRecord>>(&v, &mut off, "ner_entities", &mut log)
-                        && step::<Vec<(String, String)>>(&v, &mut off, "cooccurrence_pairs", &mut log)
+                        && step::<Vec<(String, String)>>(
+                            &v,
+                            &mut off,
+                            "cooccurrence_pairs",
+                            &mut log,
+                        )
                         && step::<f32>(&v, &mut off, "importance", &mut log)
                         && step::<u32>(&v, &mut off, "access_count", &mut log)
                         && step::<DateTime<Utc>>(&v, &mut off, "created_at", &mut log)
@@ -5062,7 +5370,12 @@ mod tests {
                         && step::<Option<f32>>(&v, &mut off, "confidence_alpha", &mut log)
                         && step::<Option<f32>>(&v, &mut off, "confidence_beta", &mut log)
                         && step::<Option<DateTime<Utc>>>(&v, &mut off, "valid_until", &mut log)
-                        && step::<Option<Vec<DateTime<Utc>>>>(&v, &mut off, "access_history", &mut log)
+                        && step::<Option<Vec<DateTime<Utc>>>>(
+                            &v,
+                            &mut off,
+                            "access_history",
+                            &mut log,
+                        )
                         && step::<Option<f32>>(&v, &mut off, "elaboration_score", &mut log)
                         && step::<Option<f32>>(&v, &mut off, "fragment_demotion", &mut log)
                         && step::<RecordKind>(&v, &mut off, "kind", &mut log)
@@ -5085,17 +5398,37 @@ mod tests {
         let mut good_recovered = 0usize;
         let mut good_with_context = 0usize;
         for (k, v) in &records {
-            if k.len() != 16 || ids.iter().any(|i| i.0.as_bytes() == &k[..]) { continue; }
+            if k.len() != 16 || ids.iter().any(|i| i.0.as_bytes() == &k[..]) {
+                continue;
+            }
             good += 1;
             let has_context = match deserialize_memory(&v) {
-                Err(_) => { good_bad += 1; false }
-                Ok((m, _)) => { if m.experience.context.is_some() { good_with_context += 1 }; m.experience.context.is_some() }
+                Err(_) => {
+                    good_bad += 1;
+                    false
+                }
+                Ok((m, _)) => {
+                    if m.experience.context.is_some() {
+                        good_with_context += 1
+                    };
+                    m.experience.context.is_some()
+                }
             };
-            let fix = bincode::config::standard().with_fixed_int_encoding().with_limit::<BINCODE_ALLOC_LIMIT>();
-            if bincode::serde::decode_from_slice::<Memory, _>(&v, fix).is_ok() { good_fixint += 1; }
+            let fix = bincode::config::standard()
+                .with_fixed_int_encoding()
+                .with_limit::<BINCODE_ALLOC_LIMIT>();
+            if bincode::serde::decode_from_slice::<Memory, _>(&v, fix).is_ok() {
+                good_fixint += 1;
+            }
             // The two layouts only differ inside a populated context, so ambiguity is measured there.
-            if has_context && matches!(bincode::serde::decode_from_slice::<ProbeMemoryFlatPreWriter, _>(&v, cfg), Ok((_, n)) if n == v.len()) { good_prewriter += 1; }
-            if recover_pre_writer_session(&v).is_some() { good_recovered += 1; }
+            if has_context
+                && matches!(bincode::serde::decode_from_slice::<ProbeMemoryFlatPreWriter, _>(&v, cfg), Ok((_, n)) if n == v.len())
+            {
+                good_prewriter += 1;
+            }
+            if recover_pre_writer_session(&v).is_some() {
+                good_recovered += 1;
+            }
         }
         eprintln!("control: {good} other records ({good_with_context} with context=Some), {good_bad} undecodable, {good_fixint} ALSO accepted by the fixint candidate (must be 0), {good_prewriter} of the context=Some records ALSO fully consumed by the pre-writer candidate (must be 0), {good_recovered} accepted by recover_pre_writer_session (must be 0)");
     }
@@ -5441,7 +5774,9 @@ mod tests {
         let a = MemoryId(uuid::Uuid::new_v4());
         let m = MemoryId(uuid::Uuid::new_v4());
 
-        storage.store(&memory_referencing(m.clone(), &[a.clone()])).unwrap();
+        storage
+            .store(&memory_referencing(m.clone(), &[a.clone()]))
+            .unwrap();
         assert!(storage.has_inbound_refs(&a).unwrap());
 
         storage.delete(&m).unwrap();
@@ -5464,12 +5799,16 @@ mod tests {
         let m = MemoryId(uuid::Uuid::new_v4());
 
         // M references A and B.
-        storage.store(&memory_referencing(m.clone(), &[a.clone(), b.clone()])).unwrap();
+        storage
+            .store(&memory_referencing(m.clone(), &[a.clone(), b.clone()]))
+            .unwrap();
         assert!(storage.inbound_refs(&a).unwrap().contains(&m));
         assert!(storage.inbound_refs(&b).unwrap().contains(&m));
 
         // Update M to reference only B (drops A).
-        storage.update(&memory_referencing(m.clone(), &[b.clone()])).unwrap();
+        storage
+            .update(&memory_referencing(m.clone(), &[b.clone()]))
+            .unwrap();
 
         assert!(
             !storage.inbound_refs(&a).unwrap().contains(&m),
@@ -5495,16 +5834,34 @@ mod tests {
         let holder_a = MemoryId(uuid::Uuid::new_v4());
         let holder_b = MemoryId(uuid::Uuid::new_v4());
 
-        store_a.store(&memory_referencing(holder_a.clone(), &[target.clone()])).unwrap();
-        store_b.store(&memory_referencing(holder_b.clone(), &[target.clone()])).unwrap();
+        store_a
+            .store(&memory_referencing(holder_a.clone(), &[target.clone()]))
+            .unwrap();
+        store_b
+            .store(&memory_referencing(holder_b.clone(), &[target.clone()]))
+            .unwrap();
 
         let a_holders = store_a.inbound_refs(&target).unwrap();
         let b_holders = store_b.inbound_refs(&target).unwrap();
 
-        assert_eq!(a_holders, vec![holder_a.clone()], "store A sees only its holder");
-        assert_eq!(b_holders, vec![holder_b.clone()], "store B sees only its holder");
-        assert!(!a_holders.contains(&holder_b), "no cross-tenant leader leak");
-        assert!(!b_holders.contains(&holder_a), "no cross-tenant holder leak");
+        assert_eq!(
+            a_holders,
+            vec![holder_a.clone()],
+            "store A sees only its holder"
+        );
+        assert_eq!(
+            b_holders,
+            vec![holder_b.clone()],
+            "store B sees only its holder"
+        );
+        assert!(
+            !a_holders.contains(&holder_b),
+            "no cross-tenant leader leak"
+        );
+        assert!(
+            !b_holders.contains(&holder_a),
+            "no cross-tenant holder leak"
+        );
     }
 
     // ========================================================================
@@ -5572,7 +5929,9 @@ mod tests {
     /// has_any_inbound_refs == true.
     #[test]
     fn r7b_temporal_fact_source_memory_id_detected() {
-        use super::super::temporal_facts::{EventType, ResolvedTime, TemporalFact, TemporalFactStore};
+        use super::super::temporal_facts::{
+            EventType, ResolvedTime, TemporalFact, TemporalFactStore,
+        };
 
         let (storage, _dir) = test_storage();
         let target = MemoryId(uuid::Uuid::new_v4());

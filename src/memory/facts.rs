@@ -130,10 +130,7 @@ impl LegacySemanticFactV2 {
 /// the record in the current shape to amortize future reads. Matches the
 /// [crate::memory::storage::deserialize_with_fallback] pattern on `Memory`.
 fn decode_semantic_fact_with_fallback(data: &[u8]) -> Result<(SemanticFact, bool)> {
-    match bincode::serde::decode_from_slice::<SemanticFact, _>(
-        data,
-        bincode::config::standard(),
-    ) {
+    match bincode::serde::decode_from_slice::<SemanticFact, _>(data, bincode::config::standard()) {
         Ok((fact, _)) => Ok((fact, false)),
         Err(_) => {
             if let Ok((v2, _)) = bincode::serde::decode_from_slice::<LegacySemanticFactV2, _>(
@@ -198,9 +195,7 @@ impl SemanticFactStore {
     /// Create a new fact store backed by RocksDB
     pub fn new(db: Arc<DB>) -> Self {
         Self {
-            store: Arc::new(
-                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
-            ),
+            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),
         }
     }
 
@@ -224,13 +219,15 @@ impl SemanticFactStore {
                 entity.to_lowercase(),
                 fact.id
             );
-            self.store.put_bytes(entity_key.as_bytes(), fact.id.as_bytes())?;
+            self.store
+                .put_bytes(entity_key.as_bytes(), fact.id.as_bytes())?;
         }
 
         // Type index
         let type_name = format!("{:?}", fact.fact_type);
         let type_key = format!("facts_by_type:{}:{}:{}", user_id, type_name, fact.id);
-        self.store.put_bytes(type_key.as_bytes(), fact.id.as_bytes())?;
+        self.store
+            .put_bytes(type_key.as_bytes(), fact.id.as_bytes())?;
 
         Ok(())
     }
@@ -340,7 +337,11 @@ impl SemanticFactStore {
         }
 
         // Sort by confidence (highest first); id breaks ties so the order is repeatable
-        facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence).then_with(|| a.id.cmp(&b.id)));
+        facts.sort_by(|a, b| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         Ok(facts)
     }
@@ -494,7 +495,11 @@ impl SemanticFactStore {
             }
         }
 
-        facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence).then_with(|| a.id.cmp(&b.id)));
+        facts.sort_by(|a, b| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(facts)
     }
 
@@ -707,9 +712,7 @@ impl SemanticFactStore {
         };
 
         let new_polarity = detect_polarity(&new_fact.fact.to_lowercase());
-        let new_from = new_fact
-            .valid_from
-            .unwrap_or(new_fact.created_at);
+        let new_from = new_fact.valid_from.unwrap_or(new_fact.created_at);
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut invalidated: Vec<SemanticFact> = Vec::new();
@@ -768,8 +771,7 @@ impl SemanticFactStore {
         new_embedding: Option<&[f32]>,
     ) -> Result<Vec<String>> {
         let mut to_invalidate = self.find_contradictions(user_id, new_fact, new_embedding)?;
-        let invalidated_ids: Vec<String> =
-            to_invalidate.iter().map(|f| f.id.clone()).collect();
+        let invalidated_ids: Vec<String> = to_invalidate.iter().map(|f| f.id.clone()).collect();
 
         // Stamp the new fact with the forward-pointer to the facts it supersedes.
         let mut new_fact_owned = new_fact.clone();
@@ -811,20 +813,24 @@ impl SemanticFactStore {
                 entity.to_lowercase(),
                 new_fact_owned.id
             );
-            pairs.push((entity_key.into_bytes(), new_fact_owned.id.as_bytes().to_vec()));
+            pairs.push((
+                entity_key.into_bytes(),
+                new_fact_owned.id.as_bytes().to_vec(),
+            ));
         }
 
         // Type index for the new fact.
         let type_name = format!("{:?}", new_fact_owned.fact_type);
-        let type_key =
-            format!("facts_by_type:{}:{}:{}", user_id, type_name, new_fact_owned.id);
+        let type_key = format!(
+            "facts_by_type:{}:{}:{}",
+            user_id, type_name, new_fact_owned.id
+        );
         pairs.push((type_key.into_bytes(), new_fact_owned.id.as_bytes().to_vec()));
 
         // Optional embedding for the new fact.
         if let Some(emb) = new_embedding {
             let emb_key = format!("facts_embedding:{}:{}", user_id, new_fact_owned.id);
-            let emb_value =
-                bincode::serde::encode_to_vec(emb, bincode::config::standard())?;
+            let emb_value = bincode::serde::encode_to_vec(emb, bincode::config::standard())?;
             pairs.push((emb_key.into_bytes(), emb_value));
         }
 

@@ -187,7 +187,9 @@ fn next_claim(
         }
     }
 
-    let Some(candidate) = best else { return Ok(None) };
+    let Some(candidate) = best else {
+        return Ok(None);
+    };
     queue.claim(&candidate, worker_id, lease_secs)
 }
 
@@ -309,8 +311,7 @@ async fn process_item(
                 "rewriter call failed"
             );
             match e {
-                SleepTimeError::OutputValidation(reason)
-                | SleepTimeError::ParseError(reason) => {
+                SleepTimeError::OutputValidation(reason) | SleepTimeError::ParseError(reason) => {
                     emit_aborted(mem_sys, user_id, None, mode, &reason);
                     return ProcessOutcome::Drop;
                 }

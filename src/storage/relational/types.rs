@@ -190,7 +190,11 @@ impl Row {
     /// Backend adapters use this after converting native row data to the
     /// neutral [`OwnedColumnValue`] representation.
     pub(crate) fn new(columns: Vec<ColumnMeta>, values: Vec<OwnedColumnValue>) -> Self {
-        debug_assert_eq!(columns.len(), values.len(), "row column/value arity mismatch");
+        debug_assert_eq!(
+            columns.len(),
+            values.len(),
+            "row column/value arity mismatch"
+        );
         Self { columns, values }
     }
 
@@ -201,7 +205,11 @@ impl Row {
     /// public [`OwnedColumn`] enum is converted into the internal
     /// representation here.
     pub fn from_owned(columns: Vec<ColumnMeta>, values: Vec<OwnedColumn>) -> Self {
-        debug_assert_eq!(columns.len(), values.len(), "row column/value arity mismatch");
+        debug_assert_eq!(
+            columns.len(),
+            values.len(),
+            "row column/value arity mismatch"
+        );
         let values = values.into_iter().map(OwnedColumn::into_internal).collect();
         Self { columns, values }
     }
@@ -344,7 +352,9 @@ impl FromColumn for serde_json::Value {
             ColumnValue::F64(f) => serde_json::Number::from_f64(f)
                 .map(serde_json::Value::Number)
                 .ok_or_else(|| {
-                    ColumnError::InvalidJson(format!("non-finite f64 {f} not representable as JSON"))
+                    ColumnError::InvalidJson(format!(
+                        "non-finite f64 {f} not representable as JSON"
+                    ))
                 }),
         }
     }
@@ -366,13 +376,16 @@ mod tests {
     #[test]
     fn row_from_owned_constructible_from_public_api() {
         let columns = vec![
-            ColumnMeta { name: "id".into(), sql_type: "INT".into() },
-            ColumnMeta { name: "name".into(), sql_type: "TEXT".into() },
+            ColumnMeta {
+                name: "id".into(),
+                sql_type: "INT".into(),
+            },
+            ColumnMeta {
+                name: "name".into(),
+                sql_type: "TEXT".into(),
+            },
         ];
-        let values = vec![
-            OwnedColumn::I64(7),
-            OwnedColumn::Text("hello".into()),
-        ];
+        let values = vec![OwnedColumn::I64(7), OwnedColumn::Text("hello".into())];
         let row = Row::from_owned(columns, values);
         assert_eq!(row.len(), 2);
         assert_eq!(row.get::<i64>(0).unwrap(), 7);

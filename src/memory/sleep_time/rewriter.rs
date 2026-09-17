@@ -508,11 +508,10 @@ If the evidence is insufficient, emit:
             };
             let source_memory_ids = parse_memory_ids(&o.source_memory_ids, pack)?;
             for ent in &o.entity_refs {
-                let present = pack.memories.iter().any(|m| {
-                    m.entity_refs
-                        .iter()
-                        .any(|e| e.eq_ignore_ascii_case(ent))
-                });
+                let present = pack
+                    .memories
+                    .iter()
+                    .any(|m| m.entity_refs.iter().any(|e| e.eq_ignore_ascii_case(ent)));
                 if !present {
                     return Err(SleepTimeError::OutputValidation(format!(
                         "observation.entity_refs `{ent}` not present in any evidence memory"

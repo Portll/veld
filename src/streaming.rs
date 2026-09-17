@@ -39,11 +39,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::user_memory::SharedUserMemory;
 use crate::embeddings::{NerEntity, NeuralNer};
 use crate::graph_memory::GraphMemory;
 use crate::memory::{Experience, ExperienceType, Query as MemoryQuery};
 use crate::similarity::cosine_similarity;
+use crate::user_memory::SharedUserMemory;
 
 /// Case-insensitive substring search without allocation.
 /// Returns true if `haystack` contains `needle` (ASCII case-insensitive).
@@ -120,7 +120,6 @@ pub enum StreamMode {
     /// Discrete system events - logs, errors, state changes
     Event,
 }
-
 
 /// Configuration for automatic memory extraction from streams
 #[derive(Debug, Clone, Serialize, Deserialize)]

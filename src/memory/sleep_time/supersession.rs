@@ -179,12 +179,7 @@ impl SupersessionStore {
     pub fn forget(&self, superseder: &MemoryId, superseded: &MemoryId) -> Result<bool> {
         let f = Self::key_for(Direction::Forward, superseder);
         let r = Self::key_for(Direction::Reverse, superseded);
-        let existed = self
-            .store
-            .get_bytes(&f)
-            .ok()
-            .flatten()
-            .is_some()
+        let existed = self.store.get_bytes(&f).ok().flatten().is_some()
             || self.store.get_bytes(&r).ok().flatten().is_some();
         self.store
             .delete_many(&[f.to_vec(), r.to_vec()])

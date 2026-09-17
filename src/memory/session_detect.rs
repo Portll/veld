@@ -144,14 +144,21 @@ fn build_session() -> AgentSession {
     let agent_id = detect_agent_id(worktree_str.as_deref());
 
     let (branch, parent_repo) = match worktree_str.as_deref() {
-        Some(dir) => (git_branch(dir), git_parent_repo(dir, worktree_path.as_deref())),
+        Some(dir) => (
+            git_branch(dir),
+            git_parent_repo(dir, worktree_path.as_deref()),
+        ),
         None => (None, None),
     };
 
     let vscode_window_id = env::var("VSCODE_PID")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| env::var("TERM_PROGRAM_VERSION").ok().filter(|s| !s.is_empty()));
+        .or_else(|| {
+            env::var("TERM_PROGRAM_VERSION")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
 
     AgentSession {
         worktree_path,
@@ -421,7 +428,9 @@ mod tests {
             // Poisoned guard is acceptable — the previous test panicked, but
             // the env is whatever that test left, and we're about to reset
             // it. Either side of the result is a valid guard.
-            let lock = ENV_GUARD.lock().unwrap_or_else(|poison| poison.into_inner());
+            let lock = ENV_GUARD
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let original_cwd = env::current_dir().expect("cwd readable");
             let original_agent_id = env::var_os("VELD_AGENT_ID");
             // Tests run on a single thread inside ENV_GUARD; no other code in

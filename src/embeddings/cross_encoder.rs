@@ -285,15 +285,14 @@ static REGISTRY: LazyLock<RwLock<HashMap<String, CrossEncoderConfig>>> = LazyLoc
 /// Look up a cross-encoder config by id. Built-ins are seeded from
 /// [`built_ins`]; additional entries can be added with [`register`].
 pub fn lookup(id: &str) -> Result<CrossEncoderConfig> {
-    REGISTRY
-        .read()
-        .get(id)
-        .cloned()
-        .with_context(|| {
-            let mut ids: Vec<String> = REGISTRY.read().keys().cloned().collect();
-            ids.sort();
-            format!("unknown cross-encoder id `{id}` (known: {})", ids.join(", "))
-        })
+    REGISTRY.read().get(id).cloned().with_context(|| {
+        let mut ids: Vec<String> = REGISTRY.read().keys().cloned().collect();
+        ids.sort();
+        format!(
+            "unknown cross-encoder id `{id}` (known: {})",
+            ids.join(", ")
+        )
+    })
 }
 
 /// Register (or override) a custom cross-encoder config. Useful for
@@ -334,7 +333,15 @@ pub fn list_registered() -> Vec<(String, u32, u32, u16, &'static str)> {
     let r = REGISTRY.read();
     let mut entries: Vec<_> = r
         .values()
-        .map(|c| (c.id.clone(), c.params_millions, c.download_mb, c.year, c.notes))
+        .map(|c| {
+            (
+                c.id.clone(),
+                c.params_millions,
+                c.download_mb,
+                c.year,
+                c.notes,
+            )
+        })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries
@@ -364,13 +371,10 @@ enum OutputHead {
 impl OutputHead {
     /// Probe the session's first output and decide which head it is.
     fn detect(session: &Session, ce_id: &str) -> Self {
-        let last_dim = session
-            .outputs()
-            .first()
-            .and_then(|o| match o.dtype() {
-                ort::value::ValueType::Tensor { shape, .. } => shape.last().copied(),
-                _ => None,
-            });
+        let last_dim = session.outputs().first().and_then(|o| match o.dtype() {
+            ort::value::ValueType::Tensor { shape, .. } => shape.last().copied(),
+            _ => None,
+        });
         match last_dim {
             Some(1) => Self::Regression,
             Some(2) => Self::BinaryClassifier,
@@ -446,7 +450,12 @@ impl OnnxCrossEncoder {
     pub fn prewarm(self_arc: Arc<Self>) {
         let lazy = std::env::var("VELD_LAZY_CROSS_ENCODER")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
         if lazy {
             tracing::debug!(
@@ -549,7 +558,10 @@ impl OnnxCrossEncoder {
                 Err(e) => {
                     self.available
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    return Err(format!("Failed to load tokenizer for {}: {e}", self.config.id));
+                    return Err(format!(
+                        "Failed to load tokenizer for {}: {e}",
+                        self.config.id
+                    ));
                 }
             };
 
@@ -597,7 +609,10 @@ impl OnnxCrossEncoder {
                 Err(e) => {
                     self.available
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    return Err(format!("Failed to load ONNX model for {}: {e}", self.config.id));
+                    return Err(format!(
+                        "Failed to load ONNX model for {}: {e}",
+                        self.config.id
+                    ));
                 }
             };
 
@@ -613,12 +628,16 @@ impl OnnxCrossEncoder {
                 tracing::debug!(
                     "cross-encoder `{}`: registry has_token_type_ids={} but graph says {}; \
                      using graph value",
-                    self.config.id, self.config.has_token_type_ids, has_token_type_ids
+                    self.config.id,
+                    self.config.has_token_type_ids,
+                    has_token_type_ids
                 );
             }
             tracing::info!(
                 "cross-encoder `{}` loaded: head={:?} token_type_ids={}",
-                self.config.id, output_head, has_token_type_ids
+                self.config.id,
+                output_head,
+                has_token_type_ids
             );
 
             Ok(LazyOnnx {
@@ -673,7 +692,9 @@ impl CrossEncoderModel for OnnxCrossEncoder {
         let mut session = model
             .session
             .try_lock_for(std::time::Duration::from_secs(30))
-            .ok_or_else(|| anyhow::anyhow!("Cross-encoder session lock timeout ({})", self.config.id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cross-encoder session lock timeout ({})", self.config.id)
+            })?;
 
         let n = documents.len();
         let total_elements = n * MAX_PAIR_LENGTH;
@@ -712,15 +733,12 @@ impl CrossEncoderModel for OnnxCrossEncoder {
         }
 
         // Build [N, MAX_PAIR_LENGTH] tensors.
-        let input_ids_val =
-            Value::from_array((vec![n, MAX_PAIR_LENGTH], input_ids_flat))?;
-        let attention_val =
-            Value::from_array((vec![n, MAX_PAIR_LENGTH], attention_flat))?;
+        let input_ids_val = Value::from_array((vec![n, MAX_PAIR_LENGTH], input_ids_flat))?;
+        let attention_val = Value::from_array((vec![n, MAX_PAIR_LENGTH], attention_flat))?;
 
         // Single batched forward pass — N pairs, one ONNX kernel launch.
         let outputs = if model.has_token_type_ids {
-            let token_type_val =
-                Value::from_array((vec![n, MAX_PAIR_LENGTH], token_types_flat))?;
+            let token_type_val = Value::from_array((vec![n, MAX_PAIR_LENGTH], token_types_flat))?;
             session.run(ort::inputs![
                 "input_ids"      => &input_ids_val,
                 "attention_mask" => &attention_val,
@@ -748,7 +766,9 @@ impl CrossEncoderModel for OnnxCrossEncoder {
         let scores: Vec<f32> = (0..n)
             .map(|i| {
                 let start = i * head_size;
-                model.output_head.extract_score(&data[start..start + head_size])
+                model
+                    .output_head
+                    .extract_score(&data[start..start + head_size])
             })
             .collect();
 
@@ -851,9 +871,7 @@ pub fn load_cross_encoder_from_env() -> Arc<dyn CrossEncoderModel> {
         match lookup(id.trim()) {
             Ok(cfg) => return Arc::new(OnnxCrossEncoder::new(cfg)),
             Err(e) => {
-                tracing::warn!(
-                    "VELD_CROSS_ENCODER=`{id}` invalid: {e}; falling back to default"
-                );
+                tracing::warn!("VELD_CROSS_ENCODER=`{id}` invalid: {e}; falling back to default");
             }
         }
     }
@@ -874,9 +892,12 @@ fn parse_ensemble_spec(spec: &str) -> Result<Arc<dyn CrossEncoderModel>> {
             continue;
         }
         let (id, weight) = match raw.split_once(':') {
-            Some((id, w)) => (id.trim(), w.trim().parse::<f32>().with_context(|| {
-                format!("invalid weight in ensemble entry `{raw}`")
-            })?),
+            Some((id, w)) => (
+                id.trim(),
+                w.trim()
+                    .parse::<f32>()
+                    .with_context(|| format!("invalid weight in ensemble entry `{raw}`"))?,
+            ),
             None => (raw, 1.0),
         };
         let cfg = lookup(id)?;
@@ -902,7 +923,12 @@ fn parse_ensemble_spec(spec: &str) -> Result<Arc<dyn CrossEncoderModel>> {
 pub fn prewarm(model: Arc<dyn CrossEncoderModel>) {
     let lazy = std::env::var("VELD_LAZY_CROSS_ENCODER")
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     if lazy {
         tracing::debug!("cross-encoder pre-warm skipped ({})", model.id());
@@ -940,8 +966,8 @@ fn download_file(url: &str, path: &PathBuf) -> Result<()> {
     }
 
     let mut reader = resp.into_body().into_reader();
-    let mut file = std::fs::File::create(path)
-        .with_context(|| format!("Failed to create file: {path:?}"))?;
+    let mut file =
+        std::fs::File::create(path).with_context(|| format!("Failed to create file: {path:?}"))?;
 
     std::io::copy(&mut reader, &mut file)?;
     Ok(())
@@ -1093,7 +1119,11 @@ mod tests {
             OutputHead::Regression => 1_usize,
             OutputHead::BinaryClassifier => 2_usize,
         };
-        assert_eq!(flat_output.len(), n * head_size, "flat buffer length mismatch");
+        assert_eq!(
+            flat_output.len(),
+            n * head_size,
+            "flat buffer length mismatch"
+        );
         (0..n)
             .map(|i| {
                 let start = i * head_size;
@@ -1114,7 +1144,10 @@ mod tests {
         let batch_scores =
             extract_batch_scores(OutputHead::Regression, &flat, sequential_logits.len());
 
-        for (i, (&expected, &got)) in sequential_logits.iter().zip(batch_scores.iter()).enumerate()
+        for (i, (&expected, &got)) in sequential_logits
+            .iter()
+            .zip(batch_scores.iter())
+            .enumerate()
         {
             assert!(
                 (expected - got).abs() < f32::EPSILON,

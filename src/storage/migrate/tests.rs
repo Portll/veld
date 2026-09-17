@@ -17,8 +17,24 @@ fn memory(content: &str, tag: &str) -> Memory {
             tags: vec![tag.to_string()],
             ..Default::default()
         },
-        0.5, 0, now, now, false, MemoryTier::LongTerm, Vec::new(), 1.0,
-        None, None, None, None, 0.0, None, None, 1, Vec::new(), Vec::new(),
+        0.5,
+        0,
+        now,
+        now,
+        false,
+        MemoryTier::LongTerm,
+        Vec::new(),
+        1.0,
+        None,
+        None,
+        None,
+        None,
+        0.0,
+        None,
+        None,
+        1,
+        Vec::new(),
+        Vec::new(),
     )
 }
 
@@ -56,13 +72,21 @@ fn mapping(id: u32) -> VectorMappingEntry {
 fn rocks_user(base: &Path, id: &str, tags: &[&str]) -> (Vec<Memory>, uuid::Uuid) {
     let dir = base.join(id);
     let store = RocksDbPrimaryMemoryStore::open(&dir, None).unwrap();
-    let memories: Vec<Memory> = tags.iter().map(|t| memory(&format!("about {t}"), t)).collect();
+    let memories: Vec<Memory> = tags
+        .iter()
+        .map(|t| memory(&format!("about {t}"), t))
+        .collect();
     for (i, m) in memories.iter().enumerate() {
         store.put_memory(m).unwrap();
-        store.put_vector_mapping(&m.id, &mapping(i as u32 * 10)).unwrap();
+        store
+            .put_vector_mapping(&m.id, &mapping(i as u32 * 10))
+            .unwrap();
     }
     store.set_fact_watermark(id, 1_726_000_000_000);
-    store.key_value_store().put_bytes(b"dials", b"tuned").unwrap();
+    store
+        .key_value_store()
+        .put_bytes(b"dials", b"tuned")
+        .unwrap();
     store.flush().unwrap();
     drop(store);
     let graph = GraphMemory::new(&dir.join("graph"), None).unwrap();
@@ -76,7 +100,10 @@ fn rocks_rows(dir: &Path) -> u64 {
     let mut n = 0;
     for cf in &store.column_families {
         let handle = store.db.cf_handle(cf).unwrap();
-        n += store.db.iterator_cf(handle, rocksdb::IteratorMode::Start).count() as u64;
+        n += store
+            .db
+            .iterator_cf(handle, rocksdb::IteratorMode::Start)
+            .count() as u64;
     }
     n
 }
@@ -91,7 +118,10 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
             } else {
                 let bytes = std::fs::read(&path).unwrap();
                 let digest: [u8; 32] = Sha256::digest(&bytes).into();
-                out.insert(path.strip_prefix(root).unwrap().to_path_buf(), portable::hex(&digest));
+                out.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    portable::hex(&digest),
+                );
             }
         }
     }
@@ -110,8 +140,12 @@ fn logical_dump(path: &Path, frames: &[(&str, &[u8], &[u8])]) {
     let mut buf = Vec::new();
     let mut w = PortableWriter::new(&mut buf).unwrap();
     for (cf, key, value) in frames {
-        w.write_record(&PortableRecord { cf: cf.to_string(), key: key.to_vec(), value: value.to_vec() })
-            .unwrap();
+        w.write_record(&PortableRecord {
+            cf: cf.to_string(),
+            key: key.to_vec(),
+            value: value.to_vec(),
+        })
+        .unwrap();
     }
     w.finish().unwrap();
     std::fs::write(path, buf).unwrap();
@@ -127,21 +161,40 @@ fn rocks_to_redb_is_read_back_by_the_redb_stores_themselves() {
     let base = tmp.path();
     let (memories, entity_id) = rocks_user(base, "alice", &["rust", "redb", "cutover"]);
 
-    let report = migrate(base, StorageBackend::RocksDb, StorageBackend::Redb, &user("alice"), false, None)
-        .expect("migrate");
+    let report = migrate(
+        base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &user("alice"),
+        false,
+        None,
+    )
+    .expect("migrate");
     assert_eq!(report.imported.len(), 1);
     let imported = &report.imported[0];
-    assert_eq!((imported.verified_frames, &imported.verified_digest), (imported.frames, &imported.digest));
+    assert_eq!(
+        (imported.verified_frames, &imported.verified_digest),
+        (imported.frames, &imported.digest)
+    );
 
     let redb = RedbPrimaryMemoryStore::open(&base.join("alice")).unwrap();
     assert_eq!(sorted_ids(&redb.get_all().unwrap()), sorted_ids(&memories));
     for m in &memories {
-        assert_eq!(redb.get(&m.id).unwrap().experience.content, m.experience.content);
+        assert_eq!(
+            redb.get(&m.id).unwrap().experience.content,
+            m.experience.content
+        );
     }
-    let got = redb.get_vector_mapping(&memories[1].id).unwrap().expect("mapping carried");
+    let got = redb
+        .get_vector_mapping(&memories[1].id)
+        .unwrap()
+        .expect("mapping carried");
     assert_eq!(got.modalities.len(), 1);
     assert_eq!(redb.get_fact_watermark("alice"), Some(1_726_000_000_000));
-    assert_eq!(redb.key_value_store().get_bytes(b"dials").unwrap(), Some(b"tuned".to_vec()));
+    assert_eq!(
+        redb.key_value_store().get_bytes(b"dials").unwrap(),
+        Some(b"tuned".to_vec())
+    );
     drop(redb);
 
     let graph_db = crate::storage::redb::open_graph_database(&base.join("alice/graph")).unwrap();
@@ -149,7 +202,10 @@ fn rocks_to_redb_is_read_back_by_the_redb_stores_themselves() {
         crate::storage::redb::RedbColumnStore::new(graph_db),
     ))
     .unwrap();
-    assert_eq!(graph.get_entity(&entity_id).unwrap().map(|e| e.name), Some("Rust".to_string()));
+    assert_eq!(
+        graph.get_entity(&entity_id).unwrap().map(|e| e.name),
+        Some("Rust".to_string())
+    );
 }
 
 #[test]
@@ -164,12 +220,26 @@ fn redb_to_rocks_rebuilds_the_index_rocksdb_search_depends_on() {
         redb.put_memory(&memory("other", "elsewhere")).unwrap();
     }
 
-    migrate(base, StorageBackend::Redb, StorageBackend::RocksDb, &user("bob"), false, None).expect("migrate");
+    migrate(
+        base,
+        StorageBackend::Redb,
+        StorageBackend::RocksDb,
+        &user("bob"),
+        false,
+        None,
+    )
+    .expect("migrate");
 
     let rocks = RocksDbPrimaryMemoryStore::open(&dir, None).unwrap();
     assert_eq!(rocks.get_all().unwrap().len(), 2);
-    let found = rocks.search(SearchCriteria::ByTags(vec!["findable".into()])).unwrap();
-    assert_eq!(sorted_ids(&found), vec![tagged.id.0], "memory_index was not rebuilt on the rocksdb target");
+    let found = rocks
+        .search(SearchCriteria::ByTags(vec!["findable".into()]))
+        .unwrap();
+    assert_eq!(
+        sorted_ids(&found),
+        vec![tagged.id.0],
+        "memory_index was not rebuilt on the rocksdb target"
+    );
 }
 
 #[test]
@@ -180,24 +250,58 @@ fn shared_stores_cross_backends_with_audit_in_its_own_file() {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        let db = rocksdb::DB::open_cf(&opts, base.join("shared"), ["default", "audit", "todos"]).unwrap();
-        db.put_cf(db.cf_handle("audit").unwrap(), b"alice:00000000000000000001", b"event").unwrap();
-        db.put_cf(db.cf_handle("todos").unwrap(), b"todo-1", b"write the migration").unwrap();
+        let db = rocksdb::DB::open_cf(&opts, base.join("shared"), ["default", "audit", "todos"])
+            .unwrap();
+        db.put_cf(
+            db.cf_handle("audit").unwrap(),
+            b"alice:00000000000000000001",
+            b"event",
+        )
+        .unwrap();
+        db.put_cf(
+            db.cf_handle("todos").unwrap(),
+            b"todo-1",
+            b"write the migration",
+        )
+        .unwrap();
         db.flush().unwrap();
     }
 
-    let report = migrate(base, StorageBackend::RocksDb, StorageBackend::Redb, &Scope::All, false, None).unwrap();
-    assert_eq!(report.imported.iter().map(|r| r.unit.clone()).collect::<Vec<_>>(), vec![Unit::Shared]);
+    let report = migrate(
+        base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &Scope::All,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .imported
+            .iter()
+            .map(|r| r.unit.clone())
+            .collect::<Vec<_>>(),
+        vec![Unit::Shared]
+    );
 
     let read_row = |file: &str, table: &str, key: &[u8]| -> Option<Vec<u8>> {
         let db = redb::Database::open(base.join(file)).unwrap();
         let read = db.begin_read().unwrap();
         let t = read.open_table(RawTable::new(table)).unwrap();
-        let v = redb::ReadableTable::get(&t, key).unwrap().map(|v| v.value().to_vec());
+        let v = redb::ReadableTable::get(&t, key)
+            .unwrap()
+            .map(|v| v.value().to_vec());
         v
     };
-    assert_eq!(read_row("audit.redb", "audit", b"alice:00000000000000000001"), Some(b"event".to_vec()));
-    assert_eq!(read_row("shared.redb", "todos", b"todo-1"), Some(b"write the migration".to_vec()));
+    assert_eq!(
+        read_row("audit.redb", "audit", b"alice:00000000000000000001"),
+        Some(b"event".to_vec())
+    );
+    assert_eq!(
+        read_row("shared.redb", "todos", b"todo-1"),
+        Some(b"write the migration".to_vec())
+    );
 }
 
 #[test]
@@ -212,18 +316,46 @@ fn an_undecodable_record_fails_the_export_and_is_counted_not_skipped() {
         .expect_err("an export with an undecodable record must fail");
     let msg = format!("{err:#}");
     assert!(msg.contains("1 record(s) failed to decode"), "{msg}");
-    assert!(msg.contains(&bad.to_string()), "the failing key must be named: {msg}");
-    assert_eq!(snapshot(&out), BTreeMap::new(), "a failed export left files behind");
+    assert!(
+        msg.contains(&bad.to_string()),
+        "the failing key must be named: {msg}"
+    );
+    assert_eq!(
+        snapshot(&out),
+        BTreeMap::new(),
+        "a failed export left files behind"
+    );
 
-    let plan = migrate(base, StorageBackend::RocksDb, StorageBackend::Redb, &user("carol"), true, None).unwrap();
+    let plan = migrate(
+        base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &user("carol"),
+        true,
+        None,
+    )
+    .unwrap();
     assert!(plan.blocked());
     let source = plan.units[0].source.as_ref().unwrap();
     assert_eq!(source.decode_failures, 1);
-    assert_eq!(source.records, 2 * 2 + 2 + rocks_rows(&base.join("carol/graph/graph")));
-    let err = migrate(base, StorageBackend::RocksDb, StorageBackend::Redb, &user("carol"), false, None)
-        .expect_err("a real migration must refuse");
+    assert_eq!(
+        source.records,
+        2 * 2 + 2 + rocks_rows(&base.join("carol/graph/graph"))
+    );
+    let err = migrate(
+        base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &user("carol"),
+        false,
+        None,
+    )
+    .expect_err("a real migration must refuse");
     assert!(format!("{err:#}").contains("refused before writing anything"));
-    assert!(!base.join("carol/storage.redb").exists(), "a refused migration created the target");
+    assert!(
+        !base.join("carol/storage.redb").exists(),
+        "a refused migration created the target"
+    );
 }
 
 #[test]
@@ -241,7 +373,13 @@ fn a_sixteen_byte_row_under_a_subsystem_prefix_is_not_mistaken_for_a_memory() {
         db.put(b"facts:0123456789", b"not a memory").unwrap();
         db.flush().unwrap();
     }
-    let seen = extract(base, StorageBackend::RocksDb, &Unit::User("cory".into()), std::io::sink()).unwrap();
+    let seen = extract(
+        base,
+        StorageBackend::RocksDb,
+        &Unit::User("cory".into()),
+        std::io::sink(),
+    )
+    .unwrap();
     assert_eq!(seen.decode_failures, 0, "{:?}", seen.failed_keys);
 }
 
@@ -251,14 +389,18 @@ fn an_import_whose_rows_do_not_land_as_declared_fails_verification() {
     let base = tmp.path();
     let dump = tmp.path().join("dup.veldport");
     // Two frames for one key: the codec accepts it, the store keeps one row.
-    logical_dump(&dump, &[
-        (META, b"format", FORMAT.as_bytes()),
-        (META, b"unit", b"user"),
-        (META, b"user_id", b"dave"),
-        ("primary/kv", b"k", b"first"),
-        ("primary/kv", b"k", b"second"),
-    ]);
-    let err = import(base, StorageBackend::Redb, &dump).expect_err("a mismatch must not report success");
+    logical_dump(
+        &dump,
+        &[
+            (META, b"format", FORMAT.as_bytes()),
+            (META, b"unit", b"user"),
+            (META, b"user_id", b"dave"),
+            ("primary/kv", b"k", b"first"),
+            ("primary/kv", b"k", b"second"),
+        ],
+    );
+    let err =
+        import(base, StorageBackend::Redb, &dump).expect_err("a mismatch must not report success");
     let msg = format!("{err:#}");
     assert!(msg.contains("verification FAILED"), "{msg}");
     assert!(msg.contains("declares 5 frames"), "{msg}");
@@ -298,7 +440,15 @@ fn dry_run_writes_nothing_on_either_side() {
     drop(RedbPrimaryMemoryStore::open(&base.join("frank")).unwrap());
     let before = snapshot(base);
 
-    let plan = migrate(base, StorageBackend::RocksDb, StorageBackend::Redb, &user("frank"), true, None).unwrap();
+    let plan = migrate(
+        base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &user("frank"),
+        true,
+        None,
+    )
+    .unwrap();
     assert!(!plan.blocked(), "{:?}", plan.units[0].blocked);
     let source = plan.units[0].source.as_ref().unwrap();
     let graph_rows = rocks_rows(&base.join("frank/graph/graph"));
@@ -307,7 +457,11 @@ fn dry_run_writes_nothing_on_either_side() {
     assert_eq!(plan.units[0].target.as_ref().unwrap().records, 0);
     assert!(plan.imported.is_empty());
 
-    assert_eq!(snapshot(base), before, "a dry run changed the data directory");
+    assert_eq!(
+        snapshot(base),
+        before,
+        "a dry run changed the data directory"
+    );
 }
 
 #[test]
@@ -316,7 +470,15 @@ fn a_dry_run_never_creates_an_absent_target() {
     let base = tmp.path();
     rocks_user(base, "gina", &["only"]);
     let before = snapshot(base);
-    migrate(base, StorageBackend::RocksDb, StorageBackend::Redb, &Scope::All, true, None).unwrap();
+    migrate(
+        base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &Scope::All,
+        true,
+        None,
+    )
+    .unwrap();
     assert_eq!(snapshot(base), before);
     assert!(!base.join("gina/storage.redb").exists());
 }
@@ -329,21 +491,50 @@ fn migrate_leaves_the_source_byte_identical() {
     let source_before = snapshot(&base.join("hank/storage"));
     let graph_before = snapshot(&base.join("hank/graph/graph"));
 
-    migrate(base, StorageBackend::RocksDb, StorageBackend::Redb, &user("hank"), false, None).unwrap();
+    migrate(
+        base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &user("hank"),
+        false,
+        None,
+    )
+    .unwrap();
 
-    assert_eq!(snapshot(&base.join("hank/storage")), source_before, "the rocksdb source was modified");
-    assert_eq!(snapshot(&base.join("hank/graph/graph")), graph_before, "the rocksdb graph source was modified");
+    assert_eq!(
+        snapshot(&base.join("hank/storage")),
+        source_before,
+        "the rocksdb source was modified"
+    );
+    assert_eq!(
+        snapshot(&base.join("hank/graph/graph")),
+        graph_before,
+        "the rocksdb graph source was modified"
+    );
 }
 
 #[test]
 fn a_redb_source_is_read_without_touching_its_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("ivy");
-    RedbPrimaryMemoryStore::open(&dir).unwrap().put_memory(&memory("m", "t")).unwrap();
+    RedbPrimaryMemoryStore::open(&dir)
+        .unwrap()
+        .put_memory(&memory("m", "t"))
+        .unwrap();
     let before = snapshot(tmp.path());
-    let seen = extract(tmp.path(), StorageBackend::Redb, &Unit::User("ivy".into()), std::io::sink()).unwrap();
+    let seen = extract(
+        tmp.path(),
+        StorageBackend::Redb,
+        &Unit::User("ivy".into()),
+        std::io::sink(),
+    )
+    .unwrap();
     assert_eq!(seen.records, 1);
-    assert_eq!(snapshot(tmp.path()), before, "reading a redb store wrote to it");
+    assert_eq!(
+        snapshot(tmp.path()),
+        before,
+        "reading a redb store wrote to it"
+    );
 }
 
 #[test]
@@ -352,9 +543,17 @@ fn a_redb_store_held_by_a_writer_is_refused_not_read_mid_write() {
     let dir = tmp.path().join("jack");
     let live = RedbPrimaryMemoryStore::open(&dir).unwrap();
     live.put_memory(&memory("m", "t")).unwrap();
-    let err = extract(tmp.path(), StorageBackend::Redb, &Unit::User("jack".into()), std::io::sink())
-        .expect_err("a store held open for writing must refuse");
-    assert!(format!("{err:#}").contains("held open for writing"), "{err:#}");
+    let err = extract(
+        tmp.path(),
+        StorageBackend::Redb,
+        &Unit::User("jack".into()),
+        std::io::sink(),
+    )
+    .expect_err("a store held open for writing must refuse");
+    assert!(
+        format!("{err:#}").contains("held open for writing"),
+        "{err:#}"
+    );
     drop(live);
 }
 
@@ -364,13 +563,27 @@ fn a_populated_target_refuses_the_whole_migration_before_writing() {
     let base = tmp.path();
     rocks_user(base, "kate", &["a"]);
     rocks_user(base, "liam", &["b"]);
-    RedbPrimaryMemoryStore::open(&base.join("liam")).unwrap().put_memory(&memory("already", "here")).unwrap();
+    RedbPrimaryMemoryStore::open(&base.join("liam"))
+        .unwrap()
+        .put_memory(&memory("already", "here"))
+        .unwrap();
     let before = snapshot(base);
 
-    let err = migrate(base, StorageBackend::RocksDb, StorageBackend::Redb, &Scope::All, false, None)
-        .expect_err("a populated target must refuse");
+    let err = migrate(
+        base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &Scope::All,
+        false,
+        None,
+    )
+    .expect_err("a populated target must refuse");
     assert!(format!("{err:#}").contains("liam"), "{err:#}");
-    assert_eq!(snapshot(base), before, "kate was migrated even though liam refused");
+    assert_eq!(
+        snapshot(base),
+        before,
+        "kate was migrated even though liam refused"
+    );
 }
 
 #[test]
@@ -412,16 +625,31 @@ fn an_encrypted_rocks_store_is_refused_rather_than_decrypted_to_disk() {
     let base = tmp.path();
     rocks_user(base, "pia", &["secret"]);
     std::fs::write(base.join("pia/storage/keystore.json"), b"{}").unwrap();
-    let err = export(base, StorageBackend::RocksDb, &user("pia"), &tmp.path().join("out"), None)
-        .expect_err("encrypted stores must refuse");
-    assert!(format!("{err:#}").contains("record-level encryption"), "{err:#}");
+    let err = export(
+        base,
+        StorageBackend::RocksDb,
+        &user("pia"),
+        &tmp.path().join("out"),
+        None,
+    )
+    .expect_err("encrypted stores must refuse");
+    assert!(
+        format!("{err:#}").contains("record-level encryption"),
+        "{err:#}"
+    );
 }
 
 #[test]
 fn a_named_user_with_no_store_is_an_error_not_an_empty_dump() {
     let tmp = tempfile::tempdir().unwrap();
-    let err = export(tmp.path(), StorageBackend::RocksDb, &user("nobody"), &tmp.path().join("out"), None)
-        .expect_err("absent user");
+    let err = export(
+        tmp.path(),
+        StorageBackend::RocksDb,
+        &user("nobody"),
+        &tmp.path().join("out"),
+        None,
+    )
+    .expect_err("absent user");
     assert!(format!("{err:#}").contains("no rocksdb store for user 'nobody'"));
 }
 
@@ -431,12 +659,25 @@ fn quarantine_sets_undecodable_records_aside_byte_for_byte_and_accounts_for_them
     let base = tmp.path().join("data");
     let (memories, _) = rocks_user(&base, "quinn", &["kept", "also kept"]);
     let bad = plant_undecodable_memory(&base, "quinn");
-    let source = extract(&base, StorageBackend::RocksDb, &Unit::User("quinn".into()), std::io::sink()).unwrap();
+    let source = extract(
+        &base,
+        StorageBackend::RocksDb,
+        &Unit::User("quinn".into()),
+        std::io::sink(),
+    )
+    .unwrap();
     assert_eq!(source.decode_failures, 1);
 
     let out = tmp.path().join("export");
     let qdir = tmp.path().join("quarantine");
-    let reports = export(&base, StorageBackend::RocksDb, &user("quinn"), &out, Some(&qdir)).expect("quarantined export");
+    let reports = export(
+        &base,
+        StorageBackend::RocksDb,
+        &user("quinn"),
+        &out,
+        Some(&qdir),
+    )
+    .expect("quarantined export");
     let r = &reports[0];
     assert_eq!(r.quarantined, 1);
     assert_eq!(r.records + r.quarantined, source.source_records());
@@ -447,19 +688,33 @@ fn quarantine_sets_undecodable_records_aside_byte_for_byte_and_accounts_for_them
     let (trailer_frames, _) = portable::read_trailer(&r.path).unwrap();
     assert_eq!(trailer_frames, r.frames);
     let exported = portable::read_all(std::fs::File::open(&r.path).unwrap()).unwrap();
-    assert!(exported.iter().all(|rec| rec.key != bad.as_bytes()), "a quarantined record was exported");
+    assert!(
+        exported.iter().all(|rec| rec.key != bad.as_bytes()),
+        "a quarantined record was exported"
+    );
 
     let held = portable::read_all(std::fs::File::open(&q.dump).unwrap()).unwrap();
     assert_eq!(held.len(), 1);
-    assert_eq!((held[0].cf.as_str(), held[0].key.as_slice(), held[0].value.as_slice()),
-        ("primary/memories", &bad.as_bytes()[..], UNDECODABLE_VALUE));
-    let listing: serde_json::Value = serde_json::from_slice(&std::fs::read(&q.listing).unwrap()).unwrap();
+    assert_eq!(
+        (
+            held[0].cf.as_str(),
+            held[0].key.as_slice(),
+            held[0].value.as_slice()
+        ),
+        ("primary/memories", &bad.as_bytes()[..], UNDECODABLE_VALUE)
+    );
+    let listing: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&q.listing).unwrap()).unwrap();
     let digest: [u8; 32] = Sha256::digest(UNDECODABLE_VALUE).into();
-    assert_eq!(listing["entries"][0]["value_sha256"], portable::hex(&digest));
+    assert_eq!(
+        listing["entries"][0]["value_sha256"],
+        portable::hex(&digest)
+    );
 
     let target = tmp.path().join("target");
     std::fs::create_dir_all(&target).unwrap();
-    let imported = import(&target, StorageBackend::Redb, &out).expect("the shortened dump still verifies");
+    let imported =
+        import(&target, StorageBackend::Redb, &out).expect("the shortened dump still verifies");
     assert_eq!(imported[0].verified_frames, r.frames);
     let redb = RedbPrimaryMemoryStore::open(&target.join("quinn")).unwrap();
     assert_eq!(sorted_ids(&redb.get_all().unwrap()), sorted_ids(&memories));
@@ -474,19 +729,43 @@ fn migrate_with_quarantine_migrates_the_rest_and_reports_what_it_set_aside() {
     let source_before = snapshot(&base.join("rhea/storage"));
     let qdir = tmp.path().join("quarantine");
 
-    let plan = migrate(&base, StorageBackend::RocksDb, StorageBackend::Redb, &user("rhea"), true, Some(&qdir)).unwrap();
+    let plan = migrate(
+        &base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &user("rhea"),
+        true,
+        Some(&qdir),
+    )
+    .unwrap();
     assert!(!plan.blocked(), "{:?}", plan.units[0].blocked);
     assert!(!qdir.exists(), "a dry run wrote a quarantine directory");
 
-    let report = migrate(&base, StorageBackend::RocksDb, StorageBackend::Redb, &user("rhea"), false, Some(&qdir))
-        .expect("migrate with quarantine");
+    let report = migrate(
+        &base,
+        StorageBackend::RocksDb,
+        StorageBackend::Redb,
+        &user("rhea"),
+        false,
+        Some(&qdir),
+    )
+    .expect("migrate with quarantine");
     assert_eq!(report.quarantined.len(), 1);
-    assert_eq!(report.quarantined[0].ids, vec![format!("primary/memories {bad}")]);
-    assert_eq!(report.imported[0].records + report.quarantined[0].records,
-        plan.units[0].source.as_ref().unwrap().source_records());
+    assert_eq!(
+        report.quarantined[0].ids,
+        vec![format!("primary/memories {bad}")]
+    );
+    assert_eq!(
+        report.imported[0].records + report.quarantined[0].records,
+        plan.units[0].source.as_ref().unwrap().source_records()
+    );
     let redb = RedbPrimaryMemoryStore::open(&base.join("rhea")).unwrap();
     assert_eq!(sorted_ids(&redb.get_all().unwrap()), sorted_ids(&memories));
-    assert_eq!(snapshot(&base.join("rhea/storage")), source_before, "the source was modified");
+    assert_eq!(
+        snapshot(&base.join("rhea/storage")),
+        source_before,
+        "the source was modified"
+    );
 }
 
 #[test]

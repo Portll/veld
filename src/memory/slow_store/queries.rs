@@ -165,7 +165,12 @@ impl SlowStore {
 
         let hubs: Vec<(String, String, usize, f32)> = hub_stmt
             .query_map(params![min_spokes, limit * 2], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get::<_, usize>(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get(3)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -212,7 +217,9 @@ impl SlowStore {
                 let mut bind: Vec<&str> = Vec::with_capacity(spoke_ids.len() * 2);
                 bind.extend_from_slice(&spoke_ids);
                 bind.extend_from_slice(&spoke_ids);
-                conn.query_row(&inter_sql, rusqlite::params_from_iter(bind), |row| row.get(0))?
+                conn.query_row(&inter_sql, rusqlite::params_from_iter(bind), |row| {
+                    row.get(0)
+                })?
             } else {
                 0
             };
@@ -302,9 +309,8 @@ impl SlowStore {
     /// Get all entity neighbors (both directions) for orbit detection
     pub fn get_adjacency_list(&self, min_strength: f32) -> Result<HashMap<String, Vec<String>>> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT from_entity, to_entity FROM edges WHERE strength >= ?1",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT from_entity, to_entity FROM edges WHERE strength >= ?1")?;
 
         let mut adj: HashMap<String, Vec<String>> = HashMap::new();
         let rows = stmt.query_map(params![min_strength], |row| {
@@ -350,8 +356,7 @@ impl SlowStore {
     /// Get entity count in the slow store
     pub fn entity_count(&self) -> Result<usize> {
         let conn = self.read()?;
-        let count: usize =
-            conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+        let count: usize = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
         Ok(count)
     }
 

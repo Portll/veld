@@ -29,7 +29,10 @@ pub(crate) fn open_rocks(dir: &Path) -> Result<Option<RocksReadOnly>> {
     column_families.sort();
     let db = rocksdb::DB::open_cf_for_read_only(&opts, dir, &column_families, false)
         .with_context(|| format!("opening {} read-only", dir.display()))?;
-    Ok(Some(RocksReadOnly { db, column_families }))
+    Ok(Some(RocksReadOnly {
+        db,
+        column_families,
+    }))
 }
 
 #[cfg(feature = "storage-redb")]
@@ -73,7 +76,11 @@ mod redb_read_only {
         }
         let backend = OverlayBackend {
             file: Mutex::new(std::fs::File::open(path)?),
-            state: Mutex::new(Overlay { len, file_visible: len, writes: Vec::new() }),
+            state: Mutex::new(Overlay {
+                len,
+                file_visible: len,
+                writes: Vec::new(),
+            }),
         };
         let db = redb::Database::builder()
             .create_with_backend(backend)

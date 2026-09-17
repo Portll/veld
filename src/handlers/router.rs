@@ -15,8 +15,7 @@ use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
     memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time,
-    storage_migration, todos, user_auth,
-    users, visualization, webhooks,
+    storage_migration, todos, user_auth, users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -37,12 +36,7 @@ pub type AppState = Arc<MultiUserMemoryManager>;
 /// `/metrics` is conditionally public via `ServerConfig::metrics_public` and is
 /// listed in `METRICS_PATH_IF_PUBLIC`; it is not in `PUBLIC_PATHS` because its
 /// presence depends on runtime config.
-pub const PROBE_PATHS: &[&str] = &[
-    "/health",
-    "/health/live",
-    "/health/ready",
-    "/health/index",
-];
+pub const PROBE_PATHS: &[&str] = &["/health", "/health/live", "/health/ready", "/health/index"];
 
 /// Non-probe public paths (no authentication required). See `PROBE_PATHS` for
 /// the security contract and `public_router_has_no_per_user_handlers` for the
@@ -97,10 +91,7 @@ pub fn build_public_routes(state: AppState, metrics_public: bool) -> Router {
         // stuck rate limiter can never block its own recovery. The endpoint
         // enforces its own separate auth via X-Admin-API-Key +
         // VELD_ADMIN_API_KEY env var (handlers/admin.rs).
-        .route(
-            "/api/admin/reset-rate-limit",
-            post(admin::reset_rate_limit),
-        );
+        .route("/api/admin/reset-rate-limit", post(admin::reset_rate_limit));
 
     // STATIC DOCS (mdBook output at docs/book/, or VELD_DOCS_DIR). Carries
     // no per-tenant data; safe to mount on the public router. Falls back to
@@ -157,10 +148,7 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
                 "/api/user_auth/admin/promote",
                 post(user_auth::admin_promote),
             )
-            .route(
-                "/api/user_auth/admin/demote",
-                post(user_auth::admin_demote),
-            )
+            .route("/api/user_auth/admin/demote", post(user_auth::admin_demote))
             // Session revocation — admin "kill all sessions for username"
             // and user "log out every other device".
             .route(
@@ -187,8 +175,7 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         )
     };
 
-    r
-        .merge(user_auth_routes)
+    r.merge(user_auth_routes)
         // =================================================================
         // PER-USER HEALTH (auth required — tenant-bound via
         // resolve_request_user_id; replaces the leaked ?user_id= branches
@@ -244,7 +231,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/prompt/gen", post(prompt_gen::prompt_gen))
         .route("/api/prompt/generate", post(prompt_gen::prompt_gen)) // alias
         .route("/api/entity/resolve", post(prompt_gen::resolve_entity))
-        .route("/api/entity/attribute", post(prompt_gen::set_entity_attribute))
+        .route(
+            "/api/entity/attribute",
+            post(prompt_gen::set_entity_attribute),
+        )
         .route("/api/entity/merge", post(prompt_gen::merge_entities))
         .route("/api/entity/alias", post(prompt_gen::add_entity_alias))
         // =================================================================
@@ -252,7 +242,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         .route("/api/memory/{memory_id}", get(crud::get_memory))
         .route("/api/memories/{memory_id}", get(crud::get_memory)) // Cloudflare compat alias
-        .route("/api/memory/{memory_id}/health", get(crud::get_memory_health)) // FIX-02: observability
+        .route(
+            "/api/memory/{memory_id}/health",
+            get(crud::get_memory_health),
+        ) // FIX-02: observability
         .route("/api/memory/{memory_id}", put(crud::update_memory))
         .route("/api/memory/{memory_id}", delete(crud::delete_memory))
         .route("/api/forget/{memory_id}", delete(crud::delete_memory)) // OpenAPI alias
@@ -316,7 +309,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         .route("/api/admin/storage/export", post(storage_migration::export))
         .route("/api/admin/storage/import", post(storage_migration::import))
-        .route("/api/admin/storage/migrate", post(storage_migration::migrate))
+        .route(
+            "/api/admin/storage/migrate",
+            post(storage_migration::migrate),
+        )
         // =================================================================
         // ADVANCED SEARCH
         // =================================================================
@@ -458,7 +454,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/gap/analyze", post(gap_analysis::analyze_gaps))
         .route("/api/gap/stats", post(gap_analysis::gap_stats))
         .route("/api/gap/voronoi", post(gap_analysis::voronoi_analysis))
-        .route("/api/gap/persistence", post(gap_analysis::persistence_analysis))
+        .route(
+            "/api/gap/persistence",
+            post(gap_analysis::persistence_analysis),
+        )
         .route("/api/gap/mapper", post(gap_analysis::mapper_analysis))
         // =================================================================
         // KNOWLEDGE GRAPH (BASIC)
@@ -502,8 +501,14 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/todos/{todo_id}/complete", post(todos::complete_todo)) // TUI path style
         .route("/api/todos/{todo_id}/reorder", post(todos::reorder_todo)) // TUI path style
         .route("/api/todos/{todo_id}/subtasks", get(todos::list_subtasks))
-        .route("/api/todos/{todo_id}/dependents", get(todos::list_dependents))
-        .route("/api/todos/{todo_id}/dependency_chain", get(todos::dependency_chain))
+        .route(
+            "/api/todos/{todo_id}/dependents",
+            get(todos::list_dependents),
+        )
+        .route(
+            "/api/todos/{todo_id}/dependency_chain",
+            get(todos::dependency_chain),
+        )
         .route("/api/todos/ready", post(todos::list_ready_todos))
         .route(
             "/api/todos/{todo_id}/comments",
@@ -647,10 +652,7 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             post(external_dimensions::push_dimensions),
         )
         // Cognitive dials — runtime tuning (reconsolidation layers + retrieval knobs)
-        .route(
-            "/api/dials",
-            get(dials::get_dials).put(dials::set_dials),
-        )
+        .route("/api/dials", get(dials::get_dials).put(dials::set_dials))
         .route("/api/dials/schema", get(dials::get_dials_schema))
         // backward-compat aliases
         .route(
@@ -742,13 +744,19 @@ mod public_router_structural_guard {
     use super::*;
 
     fn router_source() -> String {
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers/router.rs"))
-            .expect("read router.rs")
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/handlers/router.rs"
+        ))
+        .expect("read router.rs")
     }
 
     fn health_source() -> String {
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers/health.rs"))
-            .expect("read health.rs")
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/handlers/health.rs"
+        ))
+        .expect("read health.rs")
     }
 
     fn extract_routed_paths(source: &str, fn_name: &str) -> Vec<String> {
@@ -798,13 +806,16 @@ mod public_router_structural_guard {
         // to prevent.
         let resolve_const = |ident: &str| -> String {
             let decl = format!("const {}: &str = \"", ident);
-            let at = source.get(..).and_then(|s| s.find(&decl)).unwrap_or_else(|| {
-                panic!(
-                    "`.route({ident}, …)` in `{fn_name}` is neither a string literal nor a \
+            let at = source
+                .get(..)
+                .and_then(|s| s.find(&decl))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`.route({ident}, …)` in `{fn_name}` is neither a string literal nor a \
                      `const {ident}: &str` declared in router.rs — the structural guard cannot \
                      resolve it, and skipping it would let a public route go unchecked"
-                )
-            });
+                    )
+                });
             let after_decl = &source[at + decl.len()..];
             let end = after_decl.find('"').expect("closing quote on const decl");
             after_decl[..end].to_string()
@@ -898,9 +909,9 @@ mod public_router_structural_guard {
         ];
         let src = health_source();
         for sig in PUBLIC_PROBE_HANDLERS {
-            let start = src.find(sig).unwrap_or_else(|| {
-                panic!("public probe handler `{}` not found in health.rs", sig)
-            });
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("public probe handler `{}` not found in health.rs", sig));
             // Walk braces to find the matching close of THIS function only.
             let after = &src[start..];
             let body_start = after.find('{').expect("function body opening brace");

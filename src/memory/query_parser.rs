@@ -26,7 +26,9 @@
 //! - Based on TEMPR approach (Hindsight paper achieving 89.6% on LoCoMo)
 
 use crate::constants::{IC_ADJECTIVE, IC_NOUN, IC_VERB};
-use crate::memory::temporal_facts::{last_weekday, next_weekday, resolve_relative_time, TemporalBound};
+use crate::memory::temporal_facts::{
+    last_weekday, next_weekday, resolve_relative_time, TemporalBound,
+};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
@@ -385,9 +387,8 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
         });
 
         // 2. "the day before|after <anchor>"
-        static DAY_REL: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?i)\bthe\s+day\s+(before|after)\s+(.+)").unwrap()
-        });
+        static DAY_REL: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)\bthe\s+day\s+(before|after)\s+(.+)").unwrap());
 
         // 3. "<N> day|days|week|weeks before|after <anchor>"
         static N_UNIT_REL: LazyLock<Regex> = LazyLock::new(|| {
@@ -400,26 +401,25 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
         // `filter_facts_by_time_window`).  Both signals are needed: query_bounds
         // drives session-level scoring boosts; refs/earliest/latest allow Layer 0.6
         // to surface the temporal facts closest to the derived date.
-        let mut emit_anchor_result =
-            |computed: NaiveDate, matched_text: &str, pos: usize| {
-                let bound = TemporalBound::Point(computed);
-                if !query_bounds
-                    .iter()
-                    .any(|b| matches!(b, TemporalBound::Point(p) if *p == computed))
-                {
-                    query_bounds.push(bound);
-                }
-                if !refs.iter().any(|r: &TemporalRef| r.date == computed) {
-                    refs.push(TemporalRef {
-                        date: computed,
-                        original_text: matched_text.to_string(),
-                        confidence: 0.92,
-                        position: pos,
-                        ref_type: TemporalRefType::Relative,
-                    });
-                    update_bounds(&mut earliest, &mut latest, computed);
-                }
-            };
+        let mut emit_anchor_result = |computed: NaiveDate, matched_text: &str, pos: usize| {
+            let bound = TemporalBound::Point(computed);
+            if !query_bounds
+                .iter()
+                .any(|b| matches!(b, TemporalBound::Point(p) if *p == computed))
+            {
+                query_bounds.push(bound);
+            }
+            if !refs.iter().any(|r: &TemporalRef| r.date == computed) {
+                refs.push(TemporalRef {
+                    date: computed,
+                    original_text: matched_text.to_string(),
+                    confidence: 0.92,
+                    position: pos,
+                    ref_type: TemporalRefType::Relative,
+                });
+                update_bounds(&mut earliest, &mut latest, computed);
+            }
+        };
 
         // Check pattern 1: "the <weekday> before|after <anchor>"
         if let Some(caps) = WEEKDAY_REL.captures(&text_lower) {
@@ -564,7 +564,13 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
 
     // Pass 3: "last/next <weekday>" compounds.
     let weekday_names = [
-        "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+        "sunday",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
     ];
     for day in weekday_names {
         for prefix in ["last ", "next ", "this "] {
@@ -759,9 +765,8 @@ pub fn extract_temporal_refs_with_events(
         )
         .unwrap()
     });
-    static DAY_REL_B2: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\bthe\s+day\s+(before|after)\s+(.+)").unwrap()
-    });
+    static DAY_REL_B2: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bthe\s+day\s+(before|after)\s+(.+)").unwrap());
     static N_UNIT_REL_B2: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)\b(\d+)\s+(days?|weeks?)\s+(before|after)\s+(.+)").unwrap()
     });
@@ -816,7 +821,10 @@ pub fn extract_temporal_refs_with_events(
             None
         }
     } else if let Some(caps) = N_UNIT_REL_B2.captures(&text_lower) {
-        let n: i64 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let n: i64 = caps
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
         let unit = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
         let direction = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
         let anchor_str = caps.get(4).map(|m| m.as_str()).unwrap_or("").to_string();
@@ -1711,9 +1719,7 @@ fn extract_entity_after_verb(query: &str) -> Option<String> {
 
 /// Normalize an attribute name (e.g., "relationship status" → "relationship_status")
 fn normalize_attribute(attr: &str) -> String {
-    attr.trim()
-        .to_lowercase()
-        .replace([' ', '-'], "_")
+    attr.trim().to_lowercase().replace([' ', '-'], "_")
 }
 
 /// Get synonyms for common attributes
@@ -2671,8 +2677,7 @@ pub struct Relation {
 /// - Needle: Looking for specific facts → favor BM25/Vector (high precision)
 /// - Exploratory: Seeking related concepts → favor Graph (high recall)
 /// - Hybrid: Balanced query → use all retrieval methods equally
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QueryIntent {
     /// Needle query: Seeking specific information
     /// Examples: "What is John's email?", "When did we deploy v2.0?"
@@ -2690,7 +2695,6 @@ pub enum QueryIntent {
     #[default]
     Hybrid,
 }
-
 
 /// Complete linguistic analysis of a query
 #[derive(Debug, Clone)]
@@ -4789,31 +4793,76 @@ pub fn expand_abstract_terms_for_bm25(query: &str) -> Option<String> {
     // overwhelming the original query terms.
     const EXPANSION_BOOST: &str = "^0.3";
     static EXPANSIONS: &[(&str, &[&str])] = &[
-        ("pattern", &["decisions", "choices", "recurring", "repeated", "trend"]),
-        ("prioriti", &["goals", "focus", "important", "urgent", "next"]),
-        ("risk", &["concerns", "issues", "problems", "challenges", "threats"]),
+        (
+            "pattern",
+            &["decisions", "choices", "recurring", "repeated", "trend"],
+        ),
+        (
+            "prioriti",
+            &["goals", "focus", "important", "urgent", "next"],
+        ),
+        (
+            "risk",
+            &["concerns", "issues", "problems", "challenges", "threats"],
+        ),
         ("strategi", &["plan", "approach", "direction", "roadmap"]),
         ("lesson", &["learned", "mistakes", "insights", "takeaways"]),
-        ("progress", &["status", "milestone", "completed", "remaining"]),
+        (
+            "progress",
+            &["status", "milestone", "completed", "remaining"],
+        ),
         ("impact", &["effect", "consequence", "result", "outcome"]),
         ("blocker", &["obstacle", "impediment", "stuck", "waiting"]),
         ("tradeoff", &["compromise", "versus", "cost", "benefit"]),
-        ("retrospect", &["review", "reflection", "improvement", "feedback"]),
+        (
+            "retrospect",
+            &["review", "reflection", "improvement", "feedback"],
+        ),
         ("evolv", &["changed", "grew", "adapted", "shifted"]),
         ("evolut", &["changed", "grew", "adapted", "shifted"]),
         ("theme", &["recurring", "common", "trend", "motif"]),
         // Open-domain / aggregative vocabulary (v0.7.1)
-        ("perform", &["speed", "latency", "throughput", "faster", "optimized"]),
-        ("improv", &["better", "faster", "fixed", "enhanced", "upgraded"]),
-        ("achiev", &["completed", "accomplished", "reached", "delivered"]),
-        ("key", &["important", "critical", "main", "primary", "essential"]),
-        ("peopl", &["team", "member", "responsible", "leading", "working"]),
-        ("person", &["team", "member", "responsible", "leading", "working"]),
-        ("infrastructur", &["deploy", "server", "cloud", "hosting", "kubernetes"]),
-        ("decis", &["chose", "decided", "selected", "picked", "adopted"]),
-        ("deploy", &["infrastructure", "kubernetes", "server", "hosting", "cloud"]),
+        (
+            "perform",
+            &["speed", "latency", "throughput", "faster", "optimized"],
+        ),
+        (
+            "improv",
+            &["better", "faster", "fixed", "enhanced", "upgraded"],
+        ),
+        (
+            "achiev",
+            &["completed", "accomplished", "reached", "delivered"],
+        ),
+        (
+            "key",
+            &["important", "critical", "main", "primary", "essential"],
+        ),
+        (
+            "peopl",
+            &["team", "member", "responsible", "leading", "working"],
+        ),
+        (
+            "person",
+            &["team", "member", "responsible", "leading", "working"],
+        ),
+        (
+            "infrastructur",
+            &["deploy", "server", "cloud", "hosting", "kubernetes"],
+        ),
+        (
+            "decis",
+            &["chose", "decided", "selected", "picked", "adopted"],
+        ),
+        (
+            "deploy",
+            &["infrastructure", "kubernetes", "server", "hosting", "cloud"],
+        ),
         ("moral", &["team", "mood", "happy", "celebrate", "social"]),
-        ("dynamic", &["interaction", "relationship", "team", "collaboration"]),
+        (
+            "dynamic",
+            &["interaction", "relationship", "team", "collaboration"],
+        ),
     ];
 
     let stemmer = Stemmer::create(Algorithm::English);
@@ -4884,18 +4933,20 @@ fn has_relationship_signal(query: &str) -> bool {
     let query_lower = query.to_lowercase();
 
     let relationship_patterns = [
-        "from ", " to ",   // "switch from X to Y"
-        "between ",        // "between X and Y"
-        "switch",          // "switch from X to Y"
-        "change",          // "changed from X to Y"
-        "compare",         // "compare X and Y"
-        "replace",         // "replaced X with Y"
-        "migrat",          // "migrate/migration from X to Y"
-        "convert",         // "converted from X to Y"
-        "transition",      // "transition from X to Y"
-        "moved from",      // "moved from X to Y"
-        "versus", " vs ",  // "X versus Y"
-        "differ",          // "difference between X and Y"
+        "from ",
+        " to ",       // "switch from X to Y"
+        "between ",   // "between X and Y"
+        "switch",     // "switch from X to Y"
+        "change",     // "changed from X to Y"
+        "compare",    // "compare X and Y"
+        "replace",    // "replaced X with Y"
+        "migrat",     // "migrate/migration from X to Y"
+        "convert",    // "converted from X to Y"
+        "transition", // "transition from X to Y"
+        "moved from", // "moved from X to Y"
+        "versus",
+        " vs ",   // "X versus Y"
+        "differ", // "difference between X and Y"
     ];
 
     // Require at least one relationship pattern
@@ -5195,7 +5246,11 @@ mod tests {
         let query = "Why did we change the database AND what was the impact on the timeline?";
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
-        assert!(subs.len() >= 3, "Should produce original + 2 parts, got {:?}", subs);
+        assert!(
+            subs.len() >= 3,
+            "Should produce original + 2 parts, got {:?}",
+            subs
+        );
         assert_eq!(subs[0], query); // original always first
     }
 
@@ -5204,7 +5259,11 @@ mod tests {
         let query = "What framework did we pick and also what ORM are we using?";
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
-        assert!(subs.len() >= 3, "Should split on 'and also', got {:?}", subs);
+        assert!(
+            subs.len() >= 3,
+            "Should split on 'and also', got {:?}",
+            subs
+        );
     }
 
     #[test]
@@ -5213,7 +5272,11 @@ mod tests {
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
         // Should produce original + entity sub-queries
-        assert!(subs.len() >= 2, "Should decompose multi-entity query, got {:?}", subs);
+        assert!(
+            subs.len() >= 2,
+            "Should decompose multi-entity query, got {:?}",
+            subs
+        );
         assert_eq!(subs[0], query);
     }
 
@@ -5222,7 +5285,12 @@ mod tests {
         let query = "What programming language did we choose?";
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
-        assert_eq!(subs.len(), 1, "Simple query should not decompose: {:?}", subs);
+        assert_eq!(
+            subs.len(),
+            1,
+            "Simple query should not decompose: {:?}",
+            subs
+        );
         assert_eq!(subs[0], query);
     }
 
@@ -5252,7 +5320,11 @@ mod tests {
         let query = "Compare the performance of React versus Vue";
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
-        assert!(subs.len() >= 2, "Should decompose comparison query, got {:?}", subs);
+        assert!(
+            subs.len() >= 2,
+            "Should decompose comparison query, got {:?}",
+            subs
+        );
     }
 
     // =====================================================================
@@ -5554,10 +5626,8 @@ mod tests {
             called.set(true);
             None
         };
-        let extraction = extract_temporal_refs_with_events(
-            "the Sunday before 2023-05-25",
-            Some(&resolver),
-        );
+        let extraction =
+            extract_temporal_refs_with_events("the Sunday before 2023-05-25", Some(&resolver));
         // B1 already resolved this; resolver must not have been called.
         assert!(
             !called.get(),
@@ -5604,8 +5674,18 @@ mod tests {
         );
         // Also record what refs/earliest/latest dateparser emitted (can be noise)
         // This is informational — we don't assert on refs here.
-        eprintln!("q53 refs: {:?}", extraction.refs.iter().map(|r| (r.date, r.original_text.clone())).collect::<Vec<_>>());
-        eprintln!("q53 earliest: {:?}, latest: {:?}", extraction.earliest, extraction.latest);
+        eprintln!(
+            "q53 refs: {:?}",
+            extraction
+                .refs
+                .iter()
+                .map(|r| (r.date, r.original_text.clone()))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "q53 earliest: {:?}, latest: {:?}",
+            extraction.earliest, extraction.latest
+        );
     }
 
     /// q63: "How many weeks passed between Maria adopting Coco and Shadow?"
@@ -5629,8 +5709,18 @@ mod tests {
             "q63: duration question with no date must produce no date_range; got: {:?}",
             extraction.date_range()
         );
-        eprintln!("q63 refs: {:?}", extraction.refs.iter().map(|r| (r.date, r.original_text.clone())).collect::<Vec<_>>());
-        eprintln!("q63 earliest: {:?}, latest: {:?}", extraction.earliest, extraction.latest);
+        eprintln!(
+            "q63 refs: {:?}",
+            extraction
+                .refs
+                .iter()
+                .map(|r| (r.date, r.original_text.clone()))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "q63 earliest: {:?}, latest: {:?}",
+            extraction.earliest, extraction.latest
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -5649,8 +5739,12 @@ mod tests {
 
         // Derived date must be in bounds() for the B3 boost path.
         assert!(
-            extraction.bounds().iter().any(|b| matches!(b, TemporalBound::Point(p) if *p == derived)),
-            "derived date must be in bounds(); got: {:?}", extraction.bounds()
+            extraction
+                .bounds()
+                .iter()
+                .any(|b| matches!(b, TemporalBound::Point(p) if *p == derived)),
+            "derived date must be in bounds(); got: {:?}",
+            extraction.bounds()
         );
         // Derived date must also be in refs for the Layer 0.6 temporal-fact boost.
         assert!(
@@ -5793,9 +5887,12 @@ mod tests {
         let resolver = |phrase: &str| -> Option<chrono::NaiveDate> {
             phrase.contains("wedding").then_some(wedding)
         };
-        let answer =
-            derive_temporal_answer("when was the Monday after the wedding?", Some(&resolver), None)
-                .expect("event-anchor must derive an answer");
+        let answer = derive_temporal_answer(
+            "when was the Monday after the wedding?",
+            Some(&resolver),
+            None,
+        )
+        .expect("event-anchor must derive an answer");
         assert_eq!(
             answer.derived_date, "2023-05-29",
             "Monday after Thu 2023-05-25 must be 2023-05-29"
@@ -5825,9 +5922,8 @@ mod tests {
         let lookup = move |_q: &str| -> Vec<TemporalFact> { vec![fact.clone()] };
         // No anchor pattern in this query, so priority-1 yields nothing and we
         // fall through to the fact lookup.
-        let answer =
-            derive_temporal_answer("when did Melanie go camping?", None, Some(&lookup))
-                .expect("stored temporal fact must derive an answer");
+        let answer = derive_temporal_answer("when did Melanie go camping?", None, Some(&lookup))
+            .expect("stored temporal fact must derive an answer");
         assert_eq!(
             answer.derived_date, "2023-07-04",
             "derived_date must equal the fact's resolved_time"
@@ -5866,6 +5962,8 @@ mod tests {
             "Non-temporal query must derive no answer (got {answer:?})"
         );
         // Sanity: it is genuinely classified as non-temporal-answer.
-        assert!(!asks_for_temporal_answer("What did Melanie think about camping?"));
+        assert!(!asks_for_temporal_answer(
+            "What did Melanie think about camping?"
+        ));
     }
 }

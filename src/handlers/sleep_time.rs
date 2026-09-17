@@ -143,11 +143,15 @@ pub async fn enqueue(
     };
     let mode = match parse_mode(&body.mode) {
         Ok(m) => m,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response(),
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response()
+        }
     };
     let trigger = match parse_trigger(&body.trigger) {
         Ok(t) => t,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response(),
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response()
+        }
     };
 
     match orch.enqueue(&body.user_id, mode, trigger) {
@@ -184,11 +188,7 @@ pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
         Err(resp) => return resp.into_response(),
     };
     match orch.status() {
-        Ok(s) => (
-            StatusCode::OK,
-            Json(OrchestratorStatusResponse::from(s)),
-        )
-            .into_response(),
+        Ok(s) => (StatusCode::OK, Json(OrchestratorStatusResponse::from(s))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

@@ -118,10 +118,7 @@ impl CompetitiveEmbedder {
             Some(embedder) => match embedder.encode(text) {
                 Ok(emb) => Some(emb),
                 Err(e) => {
-                    tracing::warn!(
-                        "Secondary embedder failed (graceful degradation): {}",
-                        e
-                    );
+                    tracing::warn!("Secondary embedder failed (graceful degradation): {}", e);
                     None
                 }
             },
@@ -285,7 +282,9 @@ impl Embedder for CompetitiveEmbedder {
     // The PRIMARY names the pair. A corpus is embedded by the primary, so that is
     // the identity the stored vectors have; the secondary is a parallel opinion and
     // swapping it does not invalidate anything already written.
-    fn id(&self) -> &str { self.primary.id() }
+    fn id(&self) -> &str {
+        self.primary.id()
+    }
 
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         self.encode_primary(text)
@@ -331,7 +330,9 @@ mod tests {
     }
 
     impl Embedder for StubEmbedder {
-        fn id(&self) -> &str { "stub" }
+        fn id(&self) -> &str {
+            "stub"
+        }
         fn encode(&self, text: &str) -> Result<Vec<f32>> {
             let seed = text.len() as f32;
             let mut v = vec![0.0f32; self.dim];
@@ -356,7 +357,9 @@ mod tests {
     struct FailingEmbedder;
 
     impl Embedder for FailingEmbedder {
-        fn id(&self) -> &str { "stub-failing" }
+        fn id(&self) -> &str {
+            "stub-failing"
+        }
         fn encode(&self, _text: &str) -> Result<Vec<f32>> {
             anyhow::bail!("secondary model unavailable")
         }

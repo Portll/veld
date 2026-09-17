@@ -92,7 +92,15 @@ fn index_terms_are_blinded_on_disk() {
             entities: vec![SECRET_ENTITY.to_string()],
             ..Default::default()
         };
-        let memory = Memory::new(MemoryId(Uuid::new_v4()), experience, 0.5, None, None, None, None);
+        let memory = Memory::new(
+            MemoryId(Uuid::new_v4()),
+            experience,
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
         storage.store(&memory).expect("store");
     }
 
@@ -108,7 +116,10 @@ fn index_terms_are_blinded_on_disk() {
     for item in db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
         let (key, _) = item.expect("iter");
         let ks = String::from_utf8_lossy(&key);
-        assert!(!ks.contains(SECRET_TAG), "plaintext tag leaked in index key: {ks}");
+        assert!(
+            !ks.contains(SECRET_TAG),
+            "plaintext tag leaked in index key: {ks}"
+        );
         assert!(
             !ks.contains(SECRET_ENTITY),
             "plaintext entity leaked in index key: {ks}"
@@ -117,7 +128,10 @@ fn index_terms_are_blinded_on_disk() {
             saw_tag_prefix = true;
         }
     }
-    assert!(saw_tag_prefix, "expected a blinded `tag:` index entry to exist");
+    assert!(
+        saw_tag_prefix,
+        "expected a blinded `tag:` index entry to exist"
+    );
 
     env::remove_var("VELD_MASTER_PASSPHRASE");
 }
@@ -137,7 +151,10 @@ fn rebuild_index_is_record_safe() {
     let n = storage.rebuild_index().expect("rebuild");
     assert_eq!(n, 2, "rebuild should re-derive all records");
     // Records survive the rebuild unchanged.
-    assert!(storage.get(&id1).is_ok(), "record must survive index rebuild");
+    assert!(
+        storage.get(&id1).is_ok(),
+        "record must survive index rebuild"
+    );
 }
 
 #[test]
@@ -176,7 +193,11 @@ fn dek_rotation_keeps_old_records_readable() {
         let storage = MemoryStorage::new(temp.path(), None).expect("open storage");
         storage.store(&old_mem).expect("store pre-rotation record");
         assert_eq!(
-            storage.get(&old_id).expect("get pre-rotation").experience.content,
+            storage
+                .get(&old_id)
+                .expect("get pre-rotation")
+                .experience
+                .content,
             "record-written-before-rotation"
         );
     }
@@ -191,7 +212,8 @@ fn dek_rotation_keeps_old_records_readable() {
         let kek = ks.unseal_with_passphrase(PASSPHRASE).expect("unseal");
         let new_epoch = ks.rotate_dek(&kek).expect("rotate dek");
         assert_eq!(new_epoch, 1, "rotation should produce epoch 1");
-        ks.save_to_path(&keystore_path).expect("persist rotated keystore");
+        ks.save_to_path(&keystore_path)
+            .expect("persist rotated keystore");
     }
 
     // 3. Reopen: the pre-rotation record (epoch 0) must still decrypt via its
@@ -200,13 +222,21 @@ fn dek_rotation_keeps_old_records_readable() {
     {
         let storage = MemoryStorage::new(temp.path(), None).expect("reopen after rotation");
         assert_eq!(
-            storage.get(&old_id).expect("read old record after rotation").experience.content,
+            storage
+                .get(&old_id)
+                .expect("read old record after rotation")
+                .experience
+                .content,
             "record-written-before-rotation",
             "pre-rotation record must remain readable under its retired epoch key"
         );
         storage.store(&new_mem).expect("store post-rotation record");
         assert_eq!(
-            storage.get(&new_id).expect("read new record").experience.content,
+            storage
+                .get(&new_id)
+                .expect("read new record")
+                .experience
+                .content,
             "record-written-after-rotation"
         );
     }
@@ -220,11 +250,22 @@ fn dek_rotation_keeps_old_records_readable() {
         .expect("reopen read-only");
     let epoch_of = |id: &MemoryId| -> u32 {
         let raw = db.get(id.0.as_bytes()).expect("get").expect("present");
-        assert!(raw.starts_with(b"ENC\0"), "record must be an ENC\\0 envelope");
+        assert!(
+            raw.starts_with(b"ENC\0"),
+            "record must be an ENC\\0 envelope"
+        );
         u32::from_le_bytes([raw[5], raw[6], raw[7], raw[8]])
     };
-    assert_eq!(epoch_of(&old_id), 0, "pre-rotation record should be epoch 0");
-    assert_eq!(epoch_of(&new_id), 1, "post-rotation record should be epoch 1");
+    assert_eq!(
+        epoch_of(&old_id),
+        0,
+        "pre-rotation record should be epoch 0"
+    );
+    assert_eq!(
+        epoch_of(&new_id),
+        1,
+        "post-rotation record should be epoch 1"
+    );
 
     env::remove_var("VELD_MASTER_PASSPHRASE");
 }
@@ -277,7 +318,11 @@ fn keystore_rollback_is_rejected_then_overridable() {
         let storage = MemoryStorage::new(temp.path(), None)
             .expect("override should accept the restored keystore");
         assert_eq!(
-            storage.get(&id).expect("read after override").experience.content,
+            storage
+                .get(&id)
+                .expect("read after override")
+                .experience
+                .content,
             "rollback-test-record"
         );
     }
@@ -321,8 +366,12 @@ fn relocated_record_is_rejected_by_identity_binding() {
             .get(id_b.0.as_bytes())
             .expect("rocksdb get B")
             .expect("B present");
-        assert!(b_bytes.starts_with(b"ENC\0"), "B must be an ENC\\0 envelope");
-        db.put(id_a.0.as_bytes(), &b_bytes).expect("relocate B onto A's key");
+        assert!(
+            b_bytes.starts_with(b"ENC\0"),
+            "B must be an ENC\\0 envelope"
+        );
+        db.put(id_a.0.as_bytes(), &b_bytes)
+            .expect("relocate B onto A's key");
     } // drop -> release the lock before reopening through storage
 
     // Reading A must now be a hard error: B's ciphertext is bound to B's id, so

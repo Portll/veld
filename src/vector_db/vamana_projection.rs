@@ -182,9 +182,7 @@ impl VamanaEmbeddingKind {
     pub fn extract_embedding(self, memory: &Memory) -> Option<Vec<f32>> {
         match self {
             VamanaEmbeddingKind::TextPrimary => memory.experience.embeddings.clone(),
-            VamanaEmbeddingKind::TextSecondary => {
-                memory.experience.embeddings_secondary.clone()
-            }
+            VamanaEmbeddingKind::TextSecondary => memory.experience.embeddings_secondary.clone(),
             VamanaEmbeddingKind::Image => memory.experience.image_embeddings.clone(),
             VamanaEmbeddingKind::Audio => memory.experience.audio_embeddings.clone(),
             VamanaEmbeddingKind::Video => memory.experience.video_embeddings.clone(),
@@ -566,18 +564,10 @@ impl VamanaProjection {
             // later open can restore it without replaying the log.
             // Encoded with `bincode::config::standard()` to match every
             // other on-disk encoding in this codebase.
-            let encoded = bincode::serde::encode_to_vec(
-                &self.memories,
-                bincode::config::standard(),
-            )
-            .map_err(|e| {
-                VamanaProjectionError::Vamana(format!("encode id_map: {e}"))
-            })?;
-            store.set_side_data(
-                self.kind.projection_name(),
-                SIDE_DATA_KEY_ID_MAP,
-                &encoded,
-            )?;
+            let encoded =
+                bincode::serde::encode_to_vec(&self.memories, bincode::config::standard())
+                    .map_err(|e| VamanaProjectionError::Vamana(format!("encode id_map: {e}")))?;
+            store.set_side_data(self.kind.projection_name(), SIDE_DATA_KEY_ID_MAP, &encoded)?;
             store.sync()?;
         }
         Ok(())
@@ -831,8 +821,7 @@ mod tests {
             ..Experience::default()
         };
         let memory = Memory::new(id.clone(), experience, 0.5, None, None, None, None);
-        let bytes =
-            bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
         (id, bytes)
     }
 
@@ -857,8 +846,7 @@ mod tests {
             ..Experience::default()
         };
         let memory = Memory::new(id.clone(), experience, 0.5, None, None, None, None);
-        let bytes =
-            bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
         (id, bytes)
     }
 
@@ -893,12 +881,9 @@ mod tests {
         let (mid_b, b_b) = mk_memory_with_embedding(axis_vec(2));
         let (mid_c, b_c) = mk_memory_with_embedding(axis_vec(5));
 
-        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&mid_a.0.to_string(), b_a))
-            .unwrap();
-        TypedProjection::apply(&mut proj, Lsn(1), &mk_remember(&mid_b.0.to_string(), b_b))
-            .unwrap();
-        TypedProjection::apply(&mut proj, Lsn(2), &mk_remember(&mid_c.0.to_string(), b_c))
-            .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&mid_a.0.to_string(), b_a)).unwrap();
+        TypedProjection::apply(&mut proj, Lsn(1), &mk_remember(&mid_b.0.to_string(), b_b)).unwrap();
+        TypedProjection::apply(&mut proj, Lsn(2), &mk_remember(&mid_c.0.to_string(), b_c)).unwrap();
 
         // Vamana now holds three vectors, projection tracks three ids.
         assert_eq!(index.read().len(), 3);
@@ -962,11 +947,7 @@ mod tests {
         let log = IntentLog::open(&log_path).unwrap();
         let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
         let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
-        let mut proj = VamanaProjection::new(
-            VamanaEmbeddingKind::TextPrimary,
-            index.clone(),
-            ckpt,
-        );
+        let mut proj = VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index.clone(), ckpt);
 
         let applied = replay(&log, &mut proj, Some(2)).unwrap();
         assert_eq!(applied, 5);
@@ -986,8 +967,7 @@ mod tests {
         let (index, _ckpt, mut proj, _log, _ckptp) = open_projection();
 
         let (mid, bytes) = mk_memory_with_embedding(axis_vec(3));
-        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&mid.0.to_string(), bytes))
-            .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&mid.0.to_string(), bytes)).unwrap();
         assert_eq!(index.read().len(), 1);
 
         let forget = IntentPayload::Forget {
@@ -1004,7 +984,11 @@ mod tests {
         // Apply the same Forget again — no row in the mapping anymore,
         // no error.
         TypedProjection::apply(&mut proj, Lsn(2), &forget).unwrap();
-        assert_eq!(index.read().deleted_count(), 1, "second forget must not add a delete");
+        assert_eq!(
+            index.read().deleted_count(),
+            1,
+            "second forget must not add a delete"
+        );
 
         // And a Forget for a memory the projection has never seen is
         // also a no-op.
@@ -1129,12 +1113,7 @@ mod tests {
         let (index, _ckpt, mut proj, _log, _ckptp) = open_projection();
 
         let (mid, bytes) = mk_memory_with_embedding(axis_vec(6));
-        TypedProjection::apply(
-            &mut proj,
-            Lsn(0),
-            &mk_remember(&mid.0.to_string(), bytes),
-        )
-        .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&mid.0.to_string(), bytes)).unwrap();
 
         let before = (
             index.read().len(),
@@ -1175,15 +1154,9 @@ mod tests {
             ..Experience::default()
         };
         let memory = Memory::new(id.clone(), experience, 0.5, None, None, None, None);
-        let bytes =
-            bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
 
-        TypedProjection::apply(
-            &mut proj,
-            Lsn(0),
-            &mk_remember(&id.0.to_string(), bytes),
-        )
-        .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&id.0.to_string(), bytes)).unwrap();
 
         // No vector landed in Vamana, no mapping, but the checkpoint
         // moved forward so replay doesn't loop on this frame.
@@ -1234,11 +1207,7 @@ mod tests {
             };
             let index = Arc::new(RwLock::new(VamanaIndex::new(config).unwrap()));
             let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
-            let mut proj = VamanaProjection::new(
-                VamanaEmbeddingKind::TextPrimary,
-                index,
-                ckpt,
-            );
+            let mut proj = VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index, ckpt);
             let records: Vec<_> = log
                 .iter()
                 .unwrap()
@@ -1263,11 +1232,7 @@ mod tests {
         let log = IntentLog::open(&log_path).unwrap();
         let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
         let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
-        let mut proj = VamanaProjection::new(
-            VamanaEmbeddingKind::TextPrimary,
-            index.clone(),
-            ckpt,
-        );
+        let mut proj = VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index.clone(), ckpt);
         assert_eq!(proj.checkpoint(), Some(Lsn(2)));
         let applied = replay(&log, &mut proj, None).unwrap();
         assert_eq!(applied, 3, "replay should only touch lsn 3,4,5");
@@ -1362,10 +1327,13 @@ mod tests {
             let log = IntentLog::open(&log_path).unwrap();
             let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
             let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
-            let mut proj =
-                VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index, ckpt);
-            let records: Vec<_> =
-                log.iter().unwrap().take(3).collect::<Result<_, _>>().unwrap();
+            let mut proj = VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index, ckpt);
+            let records: Vec<_> = log
+                .iter()
+                .unwrap()
+                .take(3)
+                .collect::<Result<_, _>>()
+                .unwrap();
             for r in &records {
                 Projection::apply(&mut proj, r).unwrap();
             }
@@ -1374,13 +1342,11 @@ mod tests {
         let log = IntentLog::open(&log_path).unwrap();
         let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
         let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
-        let mut proj =
-            VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index.clone(), ckpt);
+        let mut proj = VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index.clone(), ckpt);
         replay(&log, &mut proj, None).unwrap();
 
         // Every live memory_id must own a DISTINCT vector_id. It does not.
-        let mut seen: std::collections::HashMap<u32, String> =
-            std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         for mid in &memory_ids {
             if let Some(vid) = proj.vector_id_for(mid) {
                 if let Some(prev) = seen.insert(vid, mid.clone()) {
@@ -1402,19 +1368,14 @@ mod tests {
             storage_path: None,
             config_template: test_config(),
         };
-        let mut proj = VamanaProjection::lazy(
-            VamanaEmbeddingKind::TextPrimary,
-            bootstrap,
-            ckpt,
-        );
+        let mut proj = VamanaProjection::lazy(VamanaEmbeddingKind::TextPrimary, bootstrap, ckpt);
 
         // Before any embedded memory arrives, the index is still
         // pending — `.index()` reports `None`.
         assert!(proj.index().is_none());
 
         let (mid, bytes) = mk_memory_with_embedding(axis_vec(0));
-        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&mid.0.to_string(), bytes))
-            .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&mid.0.to_string(), bytes)).unwrap();
 
         // After the first apply with an embedding, the index exists and
         // holds exactly one vector.
@@ -1431,11 +1392,7 @@ mod tests {
             storage_path: None,
             config_template: test_config(),
         };
-        let mut proj = VamanaProjection::lazy(
-            VamanaEmbeddingKind::TextPrimary,
-            bootstrap,
-            ckpt,
-        );
+        let mut proj = VamanaProjection::lazy(VamanaEmbeddingKind::TextPrimary, bootstrap, ckpt);
 
         // A memory with no embedding must not force the index to
         // materialise (we don't know the dim yet). Checkpoint still
@@ -1450,8 +1407,7 @@ mod tests {
         let m = Memory::new(id.clone(), experience, 0.5, None, None, None, None);
         let bytes = bincode::serde::encode_to_vec(&m, bincode::config::standard()).unwrap();
 
-        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&id.0.to_string(), bytes))
-            .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&id.0.to_string(), bytes)).unwrap();
         assert!(proj.index().is_none());
         assert_eq!(proj.checkpoint(), Some(Lsn(0)));
     }
@@ -1468,8 +1424,7 @@ mod tests {
             ..Experience::default()
         };
         let memory = Memory::new(id.clone(), experience, 0.5, None, None, None, None);
-        let bytes =
-            bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
 
         let err = proj
             .apply_typed(Lsn(0), &mk_remember(&id.0.to_string(), bytes))
@@ -1505,8 +1460,7 @@ mod tests {
             (index, proj)
         };
         let (idx_primary, mut p_primary) = mk_proj(VamanaEmbeddingKind::TextPrimary);
-        let (idx_secondary, mut p_secondary) =
-            mk_proj(VamanaEmbeddingKind::TextSecondary);
+        let (idx_secondary, mut p_secondary) = mk_proj(VamanaEmbeddingKind::TextSecondary);
         let (idx_image, mut p_image) = mk_proj(VamanaEmbeddingKind::Image);
         let (idx_audio, mut p_audio) = mk_proj(VamanaEmbeddingKind::Audio);
         let (idx_video, mut p_video) = mk_proj(VamanaEmbeddingKind::Video);
@@ -1520,13 +1474,7 @@ mod tests {
             None,
         );
         // Memory B: primary + audio only.
-        let (_, m_b) = mk_memory_multi(
-            Some(axis_vec(3)),
-            None,
-            None,
-            Some(axis_vec(4)),
-            None,
-        );
+        let (_, m_b) = mk_memory_multi(Some(axis_vec(3)), None, None, Some(axis_vec(4)), None);
         // Memory C: primary + secondary + video.
         let (_, m_c) = mk_memory_multi(
             Some(axis_vec(5)),
@@ -1589,13 +1537,7 @@ mod tests {
             None,
             None,
         );
-        let (id_b, m_b) = mk_memory_multi(
-            Some(axis_vec(3)),
-            None,
-            None,
-            Some(axis_vec(4)),
-            None,
-        );
+        let (id_b, m_b) = mk_memory_multi(Some(axis_vec(3)), None, None, Some(axis_vec(4)), None);
         let (id_c, m_c) = mk_memory_multi(
             Some(axis_vec(5)),
             Some(axis_vec(6)),
@@ -1632,7 +1574,8 @@ mod tests {
             let mut proj = VamanaProjection::new(kind, index.clone(), ckpt);
             let applied = replay(&log, &mut proj, Some(2)).unwrap();
             assert_eq!(
-                applied, 3,
+                applied,
+                3,
                 "{} replay must touch every frame (skipped or applied)",
                 kind.projection_name()
             );
@@ -1705,24 +1648,12 @@ mod tests {
                 Arc::clone(&index),
                 ckpt.clone(),
             );
-            TypedProjection::apply(
-                &mut proj,
-                Lsn(0),
-                &mk_remember(&id_a.0.to_string(), b_a),
-            )
-            .unwrap();
-            TypedProjection::apply(
-                &mut proj,
-                Lsn(1),
-                &mk_remember(&id_b.0.to_string(), b_b),
-            )
-            .unwrap();
-            TypedProjection::apply(
-                &mut proj,
-                Lsn(2),
-                &mk_remember(&id_c.0.to_string(), b_c),
-            )
-            .unwrap();
+            TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&id_a.0.to_string(), b_a))
+                .unwrap();
+            TypedProjection::apply(&mut proj, Lsn(1), &mk_remember(&id_b.0.to_string(), b_b))
+                .unwrap();
+            TypedProjection::apply(&mut proj, Lsn(2), &mk_remember(&id_c.0.to_string(), b_c))
+                .unwrap();
             // Capture the assigned vector ids before the projection drops.
             vec![
                 (
@@ -1743,11 +1674,8 @@ mod tests {
         // Re-open with a NEW projection but the SURVIVING index, same checkpoint
         // store. No replay runs — the side data alone must carry the map back.
         let ckpt2 = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
-        let proj2 = VamanaProjection::new(
-            VamanaEmbeddingKind::TextPrimary,
-            Arc::clone(&index),
-            ckpt2,
-        );
+        let proj2 =
+            VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, Arc::clone(&index), ckpt2);
         assert_eq!(proj2.checkpoint(), Some(Lsn(2)));
         assert_eq!(proj2.tracked_memory_count(), 3);
         for (mid, expected_vid) in &saved_ids {
@@ -1774,11 +1702,7 @@ mod tests {
         // case where a vector_id meant anything.
         let empty_index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
         let ckpt3 = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
-        let proj3 = VamanaProjection::new(
-            VamanaEmbeddingKind::TextPrimary,
-            empty_index,
-            ckpt3,
-        );
+        let proj3 = VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, empty_index, ckpt3);
         assert_eq!(
             proj3.checkpoint(),
             Some(Lsn(2)),
@@ -1808,32 +1732,17 @@ mod tests {
 
         {
             let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
-            let mut proj = VamanaProjection::new(
-                VamanaEmbeddingKind::TextPrimary,
-                index,
-                ckpt.clone(),
-            );
+            let mut proj =
+                VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index, ckpt.clone());
             let (id_a, b_a) = mk_memory_with_embedding(axis_vec(0));
             let (id_b, b_b) = mk_memory_with_embedding(axis_vec(2));
             let (id_c, b_c) = mk_memory_with_embedding(axis_vec(5));
-            TypedProjection::apply(
-                &mut proj,
-                Lsn(0),
-                &mk_remember(&id_a.0.to_string(), b_a),
-            )
-            .unwrap();
-            TypedProjection::apply(
-                &mut proj,
-                Lsn(1),
-                &mk_remember(&id_b.0.to_string(), b_b),
-            )
-            .unwrap();
-            TypedProjection::apply(
-                &mut proj,
-                Lsn(2),
-                &mk_remember(&id_c.0.to_string(), b_c),
-            )
-            .unwrap();
+            TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&id_a.0.to_string(), b_a))
+                .unwrap();
+            TypedProjection::apply(&mut proj, Lsn(1), &mk_remember(&id_b.0.to_string(), b_b))
+                .unwrap();
+            TypedProjection::apply(&mut proj, Lsn(2), &mk_remember(&id_c.0.to_string(), b_c))
+                .unwrap();
             // proj drops; checkpoint store now has lsn=2 + side data
             // stamped at lsn=2.
         }
@@ -1858,11 +1767,7 @@ mod tests {
         // checkpoint comes from disk.
         let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
         let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
-        let proj = VamanaProjection::new(
-            VamanaEmbeddingKind::TextPrimary,
-            index,
-            ckpt,
-        );
+        let proj = VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index, ckpt);
         assert_eq!(proj.checkpoint(), Some(Lsn(9)));
         assert_eq!(
             proj.tracked_memory_count(),
@@ -1905,12 +1810,7 @@ mod tests {
         // collide with the Vamana allocator's choice for the first
         // insert).
         let (mid, bytes) = mk_memory_with_embedding(axis_vec(1));
-        TypedProjection::apply(
-            &mut proj,
-            Lsn(0),
-            &mk_remember(&mid.0.to_string(), bytes),
-        )
-        .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&mid.0.to_string(), bytes)).unwrap();
         let assigned = proj.vector_id_for(&mid.0.to_string()).unwrap();
         let bogus = assigned.wrapping_add(1).max(999_999);
         assert!(
@@ -1942,24 +1842,12 @@ mod tests {
                 Arc::clone(&index),
                 ckpt.clone(),
             );
-            TypedProjection::apply(
-                &mut proj,
-                Lsn(0),
-                &mk_remember(&id_a.0.to_string(), b_a),
-            )
-            .unwrap();
-            TypedProjection::apply(
-                &mut proj,
-                Lsn(1),
-                &mk_remember(&id_b.0.to_string(), b_b),
-            )
-            .unwrap();
-            TypedProjection::apply(
-                &mut proj,
-                Lsn(2),
-                &mk_remember(&id_c.0.to_string(), b_c),
-            )
-            .unwrap();
+            TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&id_a.0.to_string(), b_a))
+                .unwrap();
+            TypedProjection::apply(&mut proj, Lsn(1), &mk_remember(&id_b.0.to_string(), b_b))
+                .unwrap();
+            TypedProjection::apply(&mut proj, Lsn(2), &mk_remember(&id_c.0.to_string(), b_c))
+                .unwrap();
             vec![
                 (
                     id_a.0.to_string(),
@@ -1986,11 +1874,8 @@ mod tests {
         // so the reverse lookup was resolving vector ids the index did not have. See
         // `restored_id_map_is_discarded_when_the_index_cannot_back_it`.
         let ckpt2 = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
-        let proj2 = VamanaProjection::new(
-            VamanaEmbeddingKind::TextPrimary,
-            Arc::clone(&index),
-            ckpt2,
-        );
+        let proj2 =
+            VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, Arc::clone(&index), ckpt2);
         assert_eq!(proj2.tracked_memory_count(), 3);
         for (expected_mid, vid) in saved {
             assert_eq!(

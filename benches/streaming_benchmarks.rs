@@ -11,19 +11,19 @@
 //! Run with: cargo bench --bench streaming_benchmarks
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use veld::embeddings::ner::{NerConfig, NeuralNer};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use tempfile::TempDir;
+use tokio::runtime::Runtime;
 use veld::earth::Earth;
+use veld::embeddings::ner::{NerConfig, NeuralNer};
 use veld::memory::MemoryConfig;
 use veld::parking_lot;
 use veld::streaming::{
     contains_ignore_ascii_case, content_hash, ExtractionConfig, StreamHandshake, StreamMessage,
     StreamMode, StreamingMemoryExtractor,
 };
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
-use tempfile::TempDir;
-use tokio::runtime::Runtime;
 
 // ==============================================================================
 // Test Data: Realistic Streaming Content
@@ -411,9 +411,9 @@ fn bench_message_processing(c: &mut Criterion) {
     // Content message processing
     group.bench_function("process_content_message", |b| {
         let extractor = StreamingMemoryExtractor::new(Arc::clone(&ner));
-        let session_id =
-            rt.block_on(extractor.create_session(create_handshake(StreamMode::Conversation)))
-                .expect("Failed to create session");
+        let session_id = rt
+            .block_on(extractor.create_session(create_handshake(StreamMode::Conversation)))
+            .expect("Failed to create session");
 
         b.iter(|| {
             let msg = create_content_message(CONVERSATION_MESSAGES[0]);
@@ -438,9 +438,9 @@ fn bench_message_processing(c: &mut Criterion) {
     // Sensor message processing
     group.bench_function("process_sensor_message", |b| {
         let extractor = StreamingMemoryExtractor::new(Arc::clone(&ner));
-        let session_id =
-            rt.block_on(extractor.create_session(create_handshake(StreamMode::Sensor)))
-                .expect("Failed to create session");
+        let session_id = rt
+            .block_on(extractor.create_session(create_handshake(StreamMode::Sensor)))
+            .expect("Failed to create session");
 
         b.iter(|| {
             let (sensor_id, value, unit) = SENSOR_READINGS[0];
@@ -452,9 +452,9 @@ fn bench_message_processing(c: &mut Criterion) {
     // Ping message (baseline)
     group.bench_function("process_ping", |b| {
         let extractor = StreamingMemoryExtractor::new(Arc::clone(&ner));
-        let session_id =
-            rt.block_on(extractor.create_session(create_handshake(StreamMode::Conversation)))
-                .expect("Failed to create session");
+        let session_id = rt
+            .block_on(extractor.create_session(create_handshake(StreamMode::Conversation)))
+            .expect("Failed to create session");
 
         b.iter(|| {
             rt.block_on(extractor.process_message(
@@ -722,9 +722,9 @@ fn bench_streaming_summary(c: &mut Criterion) {
 
         // Session creation
         let start = Instant::now();
-        let session_id =
-            rt.block_on(extractor.create_session(create_handshake(StreamMode::Conversation)))
-                .expect("Failed to create session");
+        let session_id = rt
+            .block_on(extractor.create_session(create_handshake(StreamMode::Conversation)))
+            .expect("Failed to create session");
         session_times.push(start.elapsed());
 
         // Message buffering

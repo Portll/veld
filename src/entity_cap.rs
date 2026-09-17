@@ -67,7 +67,12 @@ pub fn cap_by_selectivity(
     if considered <= cap {
         return (
             entities,
-            CapReport { considered, authored, dropped: 0, rescued_by_ordering: 0 },
+            CapReport {
+                considered,
+                authored,
+                dropped: 0,
+                rescued_by_ordering: 0,
+            },
         );
     }
 
@@ -88,7 +93,11 @@ pub fn cap_by_selectivity(
     });
 
     let room = cap - authored;
-    let kept_derived: Vec<String> = derived.iter().take(room).map(|(_, s)| (*s).clone()).collect();
+    let kept_derived: Vec<String> = derived
+        .iter()
+        .take(room)
+        .map(|(_, s)| (*s).clone())
+        .collect();
 
     let rescued = kept_derived
         .iter()
@@ -121,7 +130,10 @@ mod tests {
     fn under_the_cap_nothing_is_reordered_or_dropped() {
         let input = v(&["a", "b", "c"]);
         let (out, rep) = cap_by_selectivity(input.clone(), 1, 10, &m(&[("c", 9999)]));
-        assert_eq!(out, input, "no cut means no reordering — the record is left alone");
+        assert_eq!(
+            out, input,
+            "no cut means no reordering — the record is left alone"
+        );
         assert_eq!(rep.dropped, 0);
         assert_eq!(rep.rescued_by_ordering, 0);
     }
@@ -132,17 +144,32 @@ mod tests {
         // thousands of records and would sort last on selectivity — but it is the one thing on the
         // record somebody chose, and it exists to filter rather than to retrieve.
         let input = v(&["scope:claude-code", "rare-thing", "another"]);
-        let mentions = m(&[("scope:claude-code", 5000), ("rare-thing", 1), ("another", 2)]);
+        let mentions = m(&[
+            ("scope:claude-code", 5000),
+            ("rare-thing", 1),
+            ("another", 2),
+        ]);
         let (out, rep) = cap_by_selectivity(input, 1, 2, &mentions);
-        assert_eq!(out[0], "scope:claude-code", "authored is kept in place regardless of rank");
-        assert_eq!(out[1], "rare-thing", "the rarest derived entry takes the remaining slot");
+        assert_eq!(
+            out[0], "scope:claude-code",
+            "authored is kept in place regardless of rank"
+        );
+        assert_eq!(
+            out[1], "rare-thing",
+            "the rarest derived entry takes the remaining slot"
+        );
         assert_eq!(rep.authored, 1);
     }
 
     #[test]
     fn the_rarest_derived_entries_win_the_remaining_slots() {
         let input = v(&["generic", "alsogeneric", "rare", "rarest"]);
-        let mentions = m(&[("generic", 2000), ("alsogeneric", 1500), ("rare", 12), ("rarest", 1)]);
+        let mentions = m(&[
+            ("generic", 2000),
+            ("alsogeneric", 1500),
+            ("rare", 12),
+            ("rarest", 1),
+        ]);
         let (out, rep) = cap_by_selectivity(input, 0, 2, &mentions);
         assert_eq!(out, v(&["rarest", "rare"]));
         assert_eq!(rep.dropped, 2);
@@ -155,7 +182,11 @@ mod tests {
     fn a_never_seen_entity_is_treated_as_maximally_selective() {
         let input = v(&["known", "brand-new"]);
         let (out, _) = cap_by_selectivity(input, 0, 1, &m(&[("known", 40)]));
-        assert_eq!(out, v(&["brand-new"]), "absent from the graph means novel, not unknown-so-last");
+        assert_eq!(
+            out,
+            v(&["brand-new"]),
+            "absent from the graph means novel, not unknown-so-last"
+        );
     }
 
     #[test]
@@ -165,7 +196,10 @@ mod tests {
         let (a, _) = cap_by_selectivity(input.clone(), 0, 2, &mentions);
         let (b, _) = cap_by_selectivity(input, 0, 2, &mentions);
         assert_eq!(a, v(&["first", "second"]));
-        assert_eq!(a, b, "same inputs, byte-identical output — this repo's determinism rule");
+        assert_eq!(
+            a, b,
+            "same inputs, byte-identical output — this repo's determinism rule"
+        );
     }
 
     #[test]
@@ -176,14 +210,21 @@ mod tests {
         let mentions = m(&[("rarest", 1), ("rare", 12), ("generic", 2000)]);
         let (out, rep) = cap_by_selectivity(input, 0, 2, &mentions);
         assert_eq!(out, v(&["rarest", "rare"]));
-        assert_eq!(rep.rescued_by_ordering, 0, "arrival order already kept the right two");
+        assert_eq!(
+            rep.rescued_by_ordering, 0,
+            "arrival order already kept the right two"
+        );
     }
 
     #[test]
     fn authored_never_exceeds_the_cap_itself() {
         let input = v(&["a", "b", "c", "d"]);
         let (out, rep) = cap_by_selectivity(input, 10, 2, &m(&[]));
-        assert_eq!(out.len(), 2, "an authored count larger than the cap cannot overflow it");
+        assert_eq!(
+            out.len(),
+            2,
+            "an authored count larger than the cap cannot overflow it"
+        );
         assert_eq!(rep.authored, 2);
     }
 }

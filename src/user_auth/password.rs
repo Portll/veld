@@ -42,8 +42,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 fn password_params() -> Params {
     // 32 MiB = 32 * 1024 KiB. The `output_len = None` lets argon2 pick the
     // default 32-byte tag, which is what the encoded format expects.
-    Params::new(32 * 1024, 2, 1, None)
-        .expect("Argon2 password params are statically valid")
+    Params::new(32 * 1024, 2, 1, None).expect("Argon2 password params are statically valid")
 }
 
 /// Build the Argon2id hasher used for password operations.
@@ -96,10 +95,7 @@ pub async fn hash_password_async(plaintext: &str) -> Result<String, AuthError> {
 
 /// Async wrapper around [`verify_password`] with the same concurrency
 /// semantics as [`hash_password_async`].
-pub async fn verify_password_async(
-    plaintext: &str,
-    stored_hash: &str,
-) -> Result<bool, AuthError> {
+pub async fn verify_password_async(plaintext: &str, stored_hash: &str) -> Result<bool, AuthError> {
     let plain = plaintext.to_owned();
     let stored = stored_hash.to_owned();
     argon2_pool::run_blocking(move || verify_password(&plain, &stored)).await
@@ -159,8 +155,12 @@ mod tests {
         let pw = "async-correct-horse";
         let hash = hash_password_async(pw).await.expect("hash_async");
         assert!(hash.starts_with("$argon2id$"));
-        assert!(verify_password_async(pw, &hash).await.expect("verify_async"));
-        assert!(!verify_password_async("nope", &hash).await.expect("mismatch"));
+        assert!(verify_password_async(pw, &hash)
+            .await
+            .expect("verify_async"));
+        assert!(!verify_password_async("nope", &hash)
+            .await
+            .expect("mismatch"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
