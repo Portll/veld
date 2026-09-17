@@ -30,8 +30,8 @@ fn sensitivity_from_labels(labels: &[EntityLabel]) -> PiiSensitivity {
 }
 
 pub fn classify_entity_pii(entity: &EntityNode) -> PiiSensitivity {
-        sensitivity_from_classification(&entity.pii_classification)
-            .max(sensitivity_from_labels(&entity.labels))
+    sensitivity_from_classification(&entity.pii_classification)
+        .max(sensitivity_from_labels(&entity.labels))
 }
 
 pub fn is_edge_safe_for_collective(
@@ -46,8 +46,13 @@ pub fn is_edge_safe_for_collective(
     let source_pii = classify_entity_pii(source_entity);
     let target_pii = classify_entity_pii(target_entity);
 
-    !matches!(source_pii, PiiSensitivity::Direct | PiiSensitivity::Sensitive)
-        && !matches!(target_pii, PiiSensitivity::Direct | PiiSensitivity::Sensitive)
+    !matches!(
+        source_pii,
+        PiiSensitivity::Direct | PiiSensitivity::Sensitive
+    ) && !matches!(
+        target_pii,
+        PiiSensitivity::Direct | PiiSensitivity::Sensitive
+    )
 }
 
 pub fn pii_aware_decay_factor(source_entity: &EntityNode, target_entity: &EntityNode) -> f32 {

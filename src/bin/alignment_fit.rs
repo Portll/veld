@@ -41,10 +41,7 @@ enum Method {
 #[derive(Parser)]
 #[command(name = "alignment-fit")]
 struct Args {
-    #[arg(
-        long,
-        default_value = "evaluations/alignment/pairs/pairs.jsonl"
-    )]
+    #[arg(long, default_value = "evaluations/alignment/pairs/pairs.jsonl")]
     pairs: PathBuf,
 
     #[arg(long, default_value = "evaluations/alignment/fitted")]
@@ -114,8 +111,9 @@ fn main() -> Result<()> {
 
     let primary: Arc<dyn Embedder> = veld::embeddings::load_primary_embedder(&args.primary_id)
         .context("loading primary embedder")?;
-    let secondary: Arc<dyn Embedder> = veld::embeddings::load_secondary_embedder(&args.secondary_id)
-        .context("loading secondary embedder")?;
+    let secondary: Arc<dyn Embedder> =
+        veld::embeddings::load_secondary_embedder(&args.secondary_id)
+            .context("loading secondary embedder")?;
 
     // pair_id.secondary must equal the runtime `secondary.model_id()` so the
     // onboarding loader (retrieval.rs builds its pair_id from `model_id()`)
@@ -138,8 +136,8 @@ fn main() -> Result<()> {
         args.secondary_id
     );
 
-    let file = File::open(&args.pairs)
-        .with_context(|| format!("opening {}", args.pairs.display()))?;
+    let file =
+        File::open(&args.pairs).with_context(|| format!("opening {}", args.pairs.display()))?;
     let rows: Vec<PairRow> = BufReader::new(file)
         .lines()
         .map_while(Result::ok)
@@ -163,8 +161,8 @@ fn main() -> Result<()> {
     // Try the encoded-vector cache first. Cache key is the SHA-256 of
     // pairs.jsonl bytes + the embedder pair-id + side; the cache invalidates
     // automatically when any of those change.
-    let pairs_sha = sha256_file(&args.pairs)
-        .with_context(|| format!("hashing {}", args.pairs.display()))?;
+    let pairs_sha =
+        sha256_file(&args.pairs).with_context(|| format!("hashing {}", args.pairs.display()))?;
     let cache_path = pairs_vec_path(&args.pairs, &pair_id, side);
 
     let (primary_vecs, secondary_vecs): (Vec<Vec<f32>>, Vec<Vec<f32>>) =
@@ -248,9 +246,8 @@ fn main() -> Result<()> {
 
             let mut best: Option<(f32, f32, std::path::PathBuf)> = None;
             for lam in &lambdas {
-                let mut alignment =
-                    RidgeAlignment::fit(pair_id.clone(), &train_p, &train_s, *lam)
-                        .with_context(|| format!("Ridge fit at lambda={lam}"))?;
+                let mut alignment = RidgeAlignment::fit(pair_id.clone(), &train_p, &train_s, *lam)
+                    .with_context(|| format!("Ridge fit at lambda={lam}"))?;
                 let lam_cos = mean_paired_cosine(&alignment, &hold_p, &hold_s)?;
                 tracing::info!(
                     "held-out mean paired cosine: {:.4} (lambda={})",
@@ -263,9 +260,7 @@ fn main() -> Result<()> {
                 if lambdas.len() > 1 {
                     let snap_name = format!(
                         "{}.ridge-{}.bin",
-                        pair_id
-                            .cache_filename()
-                            .trim_end_matches(".bin"),
+                        pair_id.cache_filename().trim_end_matches(".bin"),
                         format_lambda(*lam)
                     );
                     let snap_path = args.out_dir.join(snap_name);
@@ -334,10 +329,7 @@ fn pairs_vec_path(pairs: &Path, pid: &AlignmentPairId, side: Side) -> PathBuf {
         pid.secondary.replace('/', "_"),
         side_str
     );
-    pairs
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(stem)
+    pairs.parent().unwrap_or_else(|| Path::new(".")).join(stem)
 }
 
 fn sha256_file(path: &Path) -> Result<[u8; 32]> {

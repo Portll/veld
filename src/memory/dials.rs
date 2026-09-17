@@ -210,20 +210,160 @@ pub struct RecallSliderSpec {
 /// historical constants; recommended bands are anchored on veld's value and shodh's
 /// tuned counterpart; absolute bounds are where the stage no-ops or the math breaks.
 pub const RECALL_SLIDER_SPECS: &[RecallSliderSpec] = &[
-    RecallSliderSpec { id: "rrf_k_outer", group: "Fusion", label: "RRF k (graph+hybrid)", default: 20.0, rec_lo: 20.0, rec_hi: 35.0, abs_lo: 5.0, abs_hi: 100.0, step: 1.0 },
-    RecallSliderSpec { id: "rrf_k_decomp", group: "Fusion", label: "RRF k (sub-query)", default: 20.0, rec_lo: 20.0, rec_hi: 30.0, abs_lo: 5.0, abs_hi: 100.0, step: 1.0 },
-    RecallSliderSpec { id: "rrf_k_inner", group: "Fusion", label: "RRF k (BM25+vector)", default: 45.0, rec_lo: 30.0, rec_hi: 60.0, abs_lo: 5.0, abs_hi: 100.0, step: 1.0 },
-    RecallSliderSpec { id: "secondary_rrf_ratio", group: "Fusion", label: "Secondary index weight", default: 0.5, rec_lo: 0.3, rec_hi: 0.7, abs_lo: 0.0, abs_hi: 2.0, step: 0.05 },
-    RecallSliderSpec { id: "bm25_min_score", group: "Candidates", label: "BM25 min score", default: 0.1, rec_lo: 0.0, rec_hi: 0.2, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
-    RecallSliderSpec { id: "onto_rerank_boost", group: "Rerank", label: "Ontological boost / match", default: 0.15, rec_lo: 0.05, rec_hi: 0.15, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
-    RecallSliderSpec { id: "onto_rerank_max", group: "Rerank", label: "Ontological boost cap", default: 0.40, rec_lo: 0.20, rec_hi: 0.40, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
-    RecallSliderSpec { id: "onto_rerank_penalty", group: "Rerank", label: "Ontological mismatch penalty", default: -0.08, rec_lo: -0.20, rec_hi: 0.0, abs_lo: -1.0, abs_hi: 0.0, step: 0.01 },
-    RecallSliderSpec { id: "ce_blend", group: "Rerank", label: "Cross-encoder blend", default: 0.4, rec_lo: 0.0, rec_hi: 0.6, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "temporal_recall_boost", group: "Temporal", label: "Temporal source boost", default: 0.20, rec_lo: 0.10, rec_hi: 0.40, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
-    RecallSliderSpec { id: "mmr_lambda_exploratory", group: "Diversity", label: "MMR λ exploratory", default: 0.6, rec_lo: 0.5, rec_hi: 0.9, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "mmr_lambda_abstract", group: "Diversity", label: "MMR λ abstract", default: 0.5, rec_lo: 0.5, rec_hi: 0.9, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "mmr_lambda_relationship", group: "Diversity", label: "MMR λ relationship", default: 0.7, rec_lo: 0.5, rec_hi: 0.9, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "density_linguistic_w", group: "Weights", label: "Linguistic weight", default: 0.15, rec_lo: 0.05, rec_hi: 0.25, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
+    RecallSliderSpec {
+        id: "rrf_k_outer",
+        group: "Fusion",
+        label: "RRF k (graph+hybrid)",
+        default: 20.0,
+        rec_lo: 20.0,
+        rec_hi: 35.0,
+        abs_lo: 5.0,
+        abs_hi: 100.0,
+        step: 1.0,
+    },
+    RecallSliderSpec {
+        id: "rrf_k_decomp",
+        group: "Fusion",
+        label: "RRF k (sub-query)",
+        default: 20.0,
+        rec_lo: 20.0,
+        rec_hi: 30.0,
+        abs_lo: 5.0,
+        abs_hi: 100.0,
+        step: 1.0,
+    },
+    RecallSliderSpec {
+        id: "rrf_k_inner",
+        group: "Fusion",
+        label: "RRF k (BM25+vector)",
+        default: 45.0,
+        rec_lo: 30.0,
+        rec_hi: 60.0,
+        abs_lo: 5.0,
+        abs_hi: 100.0,
+        step: 1.0,
+    },
+    RecallSliderSpec {
+        id: "secondary_rrf_ratio",
+        group: "Fusion",
+        label: "Secondary index weight",
+        default: 0.5,
+        rec_lo: 0.3,
+        rec_hi: 0.7,
+        abs_lo: 0.0,
+        abs_hi: 2.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "bm25_min_score",
+        group: "Candidates",
+        label: "BM25 min score",
+        default: 0.1,
+        rec_lo: 0.0,
+        rec_hi: 0.2,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.01,
+    },
+    RecallSliderSpec {
+        id: "onto_rerank_boost",
+        group: "Rerank",
+        label: "Ontological boost / match",
+        default: 0.15,
+        rec_lo: 0.05,
+        rec_hi: 0.15,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.01,
+    },
+    RecallSliderSpec {
+        id: "onto_rerank_max",
+        group: "Rerank",
+        label: "Ontological boost cap",
+        default: 0.40,
+        rec_lo: 0.20,
+        rec_hi: 0.40,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.01,
+    },
+    RecallSliderSpec {
+        id: "onto_rerank_penalty",
+        group: "Rerank",
+        label: "Ontological mismatch penalty",
+        default: -0.08,
+        rec_lo: -0.20,
+        rec_hi: 0.0,
+        abs_lo: -1.0,
+        abs_hi: 0.0,
+        step: 0.01,
+    },
+    RecallSliderSpec {
+        id: "ce_blend",
+        group: "Rerank",
+        label: "Cross-encoder blend",
+        default: 0.4,
+        rec_lo: 0.0,
+        rec_hi: 0.6,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "temporal_recall_boost",
+        group: "Temporal",
+        label: "Temporal source boost",
+        default: 0.20,
+        rec_lo: 0.10,
+        rec_hi: 0.40,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.01,
+    },
+    RecallSliderSpec {
+        id: "mmr_lambda_exploratory",
+        group: "Diversity",
+        label: "MMR λ exploratory",
+        default: 0.6,
+        rec_lo: 0.5,
+        rec_hi: 0.9,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "mmr_lambda_abstract",
+        group: "Diversity",
+        label: "MMR λ abstract",
+        default: 0.5,
+        rec_lo: 0.5,
+        rec_hi: 0.9,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "mmr_lambda_relationship",
+        group: "Diversity",
+        label: "MMR λ relationship",
+        default: 0.7,
+        rec_lo: 0.5,
+        rec_hi: 0.9,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "density_linguistic_w",
+        group: "Weights",
+        label: "Linguistic weight",
+        default: 0.15,
+        rec_lo: 0.05,
+        rec_hi: 0.25,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.01,
+    },
 ];
 
 /// Outcome of one reconsolidation-expiry pass (a single `run_maintenance` cycle).
@@ -395,17 +535,25 @@ impl CognitiveDials {
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
         d.rrf_k_decomp = env_parse::<f32>("VELD_TUNE_RRF_K_DECOMP").or(d.rrf_k_decomp);
         d.rrf_k_inner = env_parse::<f32>("VELD_TUNE_RRF_K_INNER").or(d.rrf_k_inner);
-        d.secondary_rrf_ratio = env_parse::<f32>("VELD_TUNE_SECONDARY_RRF_RATIO").or(d.secondary_rrf_ratio);
+        d.secondary_rrf_ratio =
+            env_parse::<f32>("VELD_TUNE_SECONDARY_RRF_RATIO").or(d.secondary_rrf_ratio);
         d.bm25_min_score = env_parse::<f32>("VELD_TUNE_BM25_MIN_SCORE").or(d.bm25_min_score);
-        d.onto_rerank_boost = env_parse::<f32>("VELD_TUNE_ONTO_RERANK_BOOST").or(d.onto_rerank_boost);
+        d.onto_rerank_boost =
+            env_parse::<f32>("VELD_TUNE_ONTO_RERANK_BOOST").or(d.onto_rerank_boost);
         d.onto_rerank_max = env_parse::<f32>("VELD_TUNE_ONTO_RERANK_MAX").or(d.onto_rerank_max);
-        d.onto_rerank_penalty = env_parse::<f32>("VELD_TUNE_ONTO_RERANK_PENALTY").or(d.onto_rerank_penalty);
+        d.onto_rerank_penalty =
+            env_parse::<f32>("VELD_TUNE_ONTO_RERANK_PENALTY").or(d.onto_rerank_penalty);
         d.ce_blend = env_parse::<f32>("VELD_TUNE_CE_BLEND").or(d.ce_blend);
-        d.temporal_recall_boost = env_parse::<f32>("VELD_TUNE_TEMPORAL_RECALL_BOOST").or(d.temporal_recall_boost);
-        d.mmr_lambda_exploratory = env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_EXPLORATORY").or(d.mmr_lambda_exploratory);
-        d.mmr_lambda_abstract = env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_ABSTRACT").or(d.mmr_lambda_abstract);
-        d.mmr_lambda_relationship = env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_RELATIONSHIP").or(d.mmr_lambda_relationship);
-        d.density_linguistic_w = env_parse::<f32>("VELD_TUNE_DENSITY_LINGUISTIC_W").or(d.density_linguistic_w);
+        d.temporal_recall_boost =
+            env_parse::<f32>("VELD_TUNE_TEMPORAL_RECALL_BOOST").or(d.temporal_recall_boost);
+        d.mmr_lambda_exploratory =
+            env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_EXPLORATORY").or(d.mmr_lambda_exploratory);
+        d.mmr_lambda_abstract =
+            env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_ABSTRACT").or(d.mmr_lambda_abstract);
+        d.mmr_lambda_relationship =
+            env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_RELATIONSHIP").or(d.mmr_lambda_relationship);
+        d.density_linguistic_w =
+            env_parse::<f32>("VELD_TUNE_DENSITY_LINGUISTIC_W").or(d.density_linguistic_w);
         // Disable-signals: VELD_DIALS_DISABLE_SIGNALS=id1,id2,...
         // Empty string or unset → empty set (every signal enabled, default behaviour).
         if let Ok(raw) = std::env::var("VELD_DIALS_DISABLE_SIGNALS") {
@@ -487,7 +635,10 @@ mod tests {
         };
 
         // These two must be disabled.
-        assert!(!d.signal_enabled("seq_proximity"), "seq_proximity should be disabled");
+        assert!(
+            !d.signal_enabled("seq_proximity"),
+            "seq_proximity should be disabled"
+        );
         assert!(!d.signal_enabled("valence"), "valence should be disabled");
 
         // All others must remain enabled.
@@ -527,8 +678,14 @@ mod tests {
         let d = CognitiveDials::from_env();
         std::env::remove_var("VELD_DIALS_DISABLE_SIGNALS");
 
-        assert!(!d.signal_enabled("seq_proximity"), "seq_proximity must be disabled via env");
-        assert!(!d.signal_enabled("valence"), "valence must be disabled via env");
+        assert!(
+            !d.signal_enabled("seq_proximity"),
+            "seq_proximity must be disabled via env"
+        );
+        assert!(
+            !d.signal_enabled("valence"),
+            "valence must be disabled via env"
+        );
         assert!(d.signal_enabled("arousal"), "arousal must remain enabled");
         assert!(d.signal_enabled("hebbian"), "hebbian must remain enabled");
         // Default reconsolidation state must be preserved.

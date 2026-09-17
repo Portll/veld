@@ -98,7 +98,10 @@ impl ContextBlockStore {
     pub fn new(db: Arc<DB>) -> Self {
         Self {
             store: Arc::new(
-                crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(db, CF_CONTEXT_BLOCKS),
+                crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
+                    db,
+                    CF_CONTEXT_BLOCKS,
+                ),
             ),
         }
     }
@@ -331,7 +334,9 @@ mod tests {
         let (db, _tmp) = open_test_db();
         let store = ContextBlockStore::new(db);
 
-        let block = store.set("user1", "persona", "You are a helpful assistant.", None).unwrap();
+        let block = store
+            .set("user1", "persona", "You are a helpful assistant.", None)
+            .unwrap();
         assert_eq!(block.key, "persona");
         assert_eq!(block.version, 1);
         assert_eq!(block.max_tokens, DEFAULT_MAX_TOKENS);

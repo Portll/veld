@@ -158,13 +158,8 @@ pub enum PayloadError {
     /// `schema_version` this binary does not recognise. The caller is
     /// expected to either upgrade the binary or pipe the bytes through
     /// [`super::migrations::migrate_payload`] before re-decoding.
-    #[error(
-        "unknown payload schema_version: {found} (this binary knows {known:?})"
-    )]
-    UnknownSchemaVersion {
-        found: u16,
-        known: &'static [u16],
-    },
+    #[error("unknown payload schema_version: {found} (this binary knows {known:?})")]
+    UnknownSchemaVersion { found: u16, known: &'static [u16] },
     /// A migration step failed while decoding an older payload shape.
     /// Wraps [`MigrationError`] verbatim so the caller can match on it.
     #[error("payload migration failed: {0}")]
@@ -173,10 +168,8 @@ pub enum PayloadError {
 
 /// Bincode configuration used for every payload. Pinned so the same bytes
 /// always come out — change this only behind a format-version bump.
-fn bincode_cfg() -> bincode::config::Configuration<
-    bincode::config::LittleEndian,
-    bincode::config::Fixint,
-> {
+fn bincode_cfg(
+) -> bincode::config::Configuration<bincode::config::LittleEndian, bincode::config::Fixint> {
     bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding()
@@ -271,9 +264,7 @@ pub fn latest_lsn_per_memory(
 /// [`latest_lsn_per_memory`] for callers that only need membership — e.g.
 /// the store↔log reconcile (C2 / W-001) deciding which store records the
 /// log has never recorded.
-pub fn live_memory_ids(
-    log: &IntentLog,
-) -> Result<std::collections::HashSet<String>, PayloadError> {
+pub fn live_memory_ids(log: &IntentLog) -> Result<std::collections::HashSet<String>, PayloadError> {
     Ok(latest_lsn_per_memory(log)?.into_keys().collect())
 }
 
@@ -380,7 +371,10 @@ mod tests {
         let bytes = encode(&original).unwrap();
         let restored = decode(&bytes).unwrap();
         assert_eq!(original, restored);
-        assert_eq!(restored.schema_version(), Some(CURRENT_PAYLOAD_SCHEMA_VERSION));
+        assert_eq!(
+            restored.schema_version(),
+            Some(CURRENT_PAYLOAD_SCHEMA_VERSION)
+        );
     }
 
     #[test]
@@ -501,7 +495,11 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].0, Lsn(0));
         match &records[0].1 {
-            IntentPayload::Remember { memory_id, memory_bincode, .. } => {
+            IntentPayload::Remember {
+                memory_id,
+                memory_bincode,
+                ..
+            } => {
                 assert_eq!(memory_id, "m-0");
                 assert_eq!(memory_bincode, b"first");
             }

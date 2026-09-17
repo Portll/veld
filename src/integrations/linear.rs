@@ -504,10 +504,7 @@ impl LinearClient {
                 );
             }
             if let Some(after) = updated_after {
-                f.insert(
-                    "updatedAt".to_string(),
-                    serde_json::json!({ "gte": after }),
-                );
+                f.insert("updatedAt".to_string(), serde_json::json!({ "gte": after }));
             }
             serde_json::Value::Object(f)
         } else {

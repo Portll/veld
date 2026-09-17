@@ -125,10 +125,7 @@ pub fn compute_persistence(
 
     let n = entities.len();
     if n < 2 {
-        return Ok(empty_diagram(
-            &entities,
-            start.elapsed().as_millis() as u64,
-        ));
+        return Ok(empty_diagram(&entities, start.elapsed().as_millis() as u64));
     }
 
     let vertex_names: Vec<String> = entities.iter().map(|(_, name, _)| name.clone()).collect();
@@ -147,7 +144,8 @@ pub fn compute_persistence(
 
     // Phase 3: Z₂ boundary matrix reduction → persistence pairs
     let pairs = {
-        let _span = tracing::info_span!("persistence.reduce", simplices = all_simplices.len()).entered();
+        let _span =
+            tracing::info_span!("persistence.reduce", simplices = all_simplices.len()).entered();
         reduce_boundary_matrix(&all_simplices)
     };
 
@@ -251,10 +249,8 @@ fn build_rips_complex(
     }
 
     // Edges sorted by distance (natural filtration order)
-    let mut sorted_edges: Vec<(f32, usize, usize)> = distances
-        .iter()
-        .map(|(&(i, j), &d)| (d, i, j))
-        .collect();
+    let mut sorted_edges: Vec<(f32, usize, usize)> =
+        distances.iter().map(|(&(i, j), &d)| (d, i, j)).collect();
     sorted_edges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     // Add edges and expand to higher simplices (triangles, tetrahedra).
@@ -263,7 +259,15 @@ fn build_rips_complex(
         simplices.push((dist, BTreeSet::from([i, j])));
 
         if MAX_SIMPLEX_DIM >= 2 && simplices.len() < config.max_simplices {
-            expand_cliques(i, j, dist, distances, n, &mut simplices, config.max_simplices);
+            expand_cliques(
+                i,
+                j,
+                dist,
+                distances,
+                n,
+                &mut simplices,
+                config.max_simplices,
+            );
         }
     }
 
@@ -501,10 +505,7 @@ fn compute_betti_curves(
 // =============================================================================
 
 /// Empty diagram for degenerate inputs (< 2 entities).
-fn empty_diagram(
-    entities: &[(String, String, Vec<f32>)],
-    duration_ms: u64,
-) -> PersistenceDiagram {
+fn empty_diagram(entities: &[(String, String, Vec<f32>)], duration_ms: u64) -> PersistenceDiagram {
     PersistenceDiagram {
         pairs: Vec::new(),
         betti_curves: Vec::new(),
@@ -580,7 +581,10 @@ mod tests {
             .iter()
             .filter(|p| p.dimension == 1 && p.death.is_none())
             .collect();
-        assert!(h1_persistent.is_empty(), "Filled triangle = no persistent H₁");
+        assert!(
+            h1_persistent.is_empty(),
+            "Filled triangle = no persistent H₁"
+        );
     }
 
     #[test]
@@ -638,7 +642,11 @@ mod tests {
         let distances = HashMap::from([((0, 1), 0.3), ((0, 2), 0.4), ((1, 2), 0.5)]);
         let config = PersistenceConfig::default();
         let (simplices, _) = build_rips_complex(3, &distances, &config);
-        assert!(simplices.len() >= 7, "Expected ≥7 simplices, got {}", simplices.len());
+        assert!(
+            simplices.len() >= 7,
+            "Expected ≥7 simplices, got {}",
+            simplices.len()
+        );
     }
 
     /// Randomised invariant test: any set of embeddings produces a valid diagram.
@@ -656,14 +664,21 @@ mod tests {
                 .collect();
 
             let distances = compute_sparse_distances(&entities, 1.0);
-            let config = PersistenceConfig { max_entities: n, ..Default::default() };
+            let config = PersistenceConfig {
+                max_entities: n,
+                ..Default::default()
+            };
             let (simplices, filt) = build_rips_complex(n, &distances, &config);
             let pairs = reduce_boundary_matrix(&simplices);
             let betti = compute_betti_curves(&pairs, &simplices, &filt);
 
             // Invariant 1: all persistence values are non-negative
             for p in &pairs {
-                assert!(p.persistence >= 0.0, "Negative persistence: {}", p.persistence);
+                assert!(
+                    p.persistence >= 0.0,
+                    "Negative persistence: {}",
+                    p.persistence
+                );
             }
 
             // Invariant 2: birth <= death (when death exists)

@@ -619,9 +619,7 @@ impl SessionStore {
 
             // Move to completed
             let mut completed = self.completed.write();
-            let user_sessions = completed
-                .entry(session.user_id.clone())
-                .or_default();
+            let user_sessions = completed.entry(session.user_id.clone()).or_default();
             user_sessions.push(session.clone());
 
             // Trim to max

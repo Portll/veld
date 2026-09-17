@@ -99,12 +99,7 @@ impl GraphQuerier for RealGraphQuerier {
         Ok(ids)
     }
 
-    async fn matches(
-        &self,
-        user_id: &str,
-        memory_id: &str,
-        p: &GraphPredicate,
-    ) -> Result<bool> {
+    async fn matches(&self, user_id: &str, memory_id: &str, p: &GraphPredicate) -> Result<bool> {
         let hit = match p {
             GraphPredicate::LinkedToEntity { entity_id } => self
                 .provider

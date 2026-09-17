@@ -11,10 +11,7 @@ use super::remember::parse_experience_type;
 use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::ingest;
-use crate::memory::{
-    types::NerEntityRecord,
-    Experience, SessionEvent,
-};
+use crate::memory::{types::NerEntityRecord, Experience, SessionEvent};
 use crate::metrics;
 use crate::validation;
 use std::collections::HashSet;
@@ -215,8 +212,8 @@ pub async fn ingest(
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         // Ordered by selectivity, same as handlers/remember.rs. A separate door to the same graph
         // gets the same rule, for the same reason the redaction above is duplicated here.
-        let mentions = crate::handlers::remember::mention_counts_for(
-            &state, &req.user_id, &merged_entities);
+        let mentions =
+            crate::handlers::remember::mention_counts_for(&state, &req.user_id, &merged_entities);
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,
@@ -329,10 +326,7 @@ pub async fn ingest(
 /// `.`) of the final path component. Empty / dotfile inputs fall back to the
 /// caller's default.
 fn dataset_name_from_filename(filename: &str) -> Option<String> {
-    let base = filename
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(filename);
+    let base = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
     let stem = base.split('.').next().unwrap_or(base);
     if stem.is_empty() {
         None
@@ -363,10 +357,12 @@ async fn ingest_tabular(
         .or_else(|| req.filename.as_deref().and_then(dataset_name_from_filename))
         .unwrap_or_else(|| "ingest_dataset".to_string());
 
-    let (schema, rows) = ingest::tabular::to_dataset(format, &req.content, &dataset_name)
-        .map_err(|e| AppError::InvalidInput {
-            field: "content".to_string(),
-            reason: e.to_string(),
+    let (schema, rows) =
+        ingest::tabular::to_dataset(format, &req.content, &dataset_name).map_err(|e| {
+            AppError::InvalidInput {
+                field: "content".to_string(),
+                reason: e.to_string(),
+            }
         })?;
 
     let dref = store
@@ -375,7 +371,9 @@ async fn ingest_tabular(
         .map_err(|e| match e {
             crate::datasets::DatasetError::AlreadyExists(name) => AppError::InvalidInput {
                 field: "dataset_name".to_string(),
-                reason: format!("dataset '{name}' already exists — choose a different dataset_name"),
+                reason: format!(
+                    "dataset '{name}' already exists — choose a different dataset_name"
+                ),
             },
             other => AppError::Internal(anyhow::anyhow!("create dataset: {other}")),
         })?;

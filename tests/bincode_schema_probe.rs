@@ -32,8 +32,8 @@ fn bincode_schema_evolution_probe() {
         support: 3,
     };
 
-    let bytes = bincode::serde::encode_to_vec(&old, bincode::config::standard())
-        .expect("encode OldShape");
+    let bytes =
+        bincode::serde::encode_to_vec(&old, bincode::config::standard()).expect("encode OldShape");
 
     eprintln!("Encoded OldShape -> {} bytes: {:?}", bytes.len(), bytes);
 
@@ -51,14 +51,21 @@ fn bincode_schema_evolution_probe() {
             assert_eq!(decoded.valid_from, None);
             assert_eq!(decoded.valid_until, None);
             assert_eq!(decoded.superseded_by, None);
-            eprintln!("VERDICT: serde(default) HANDLES trailing Options under bincode 2 std config.");
+            eprintln!(
+                "VERDICT: serde(default) HANDLES trailing Options under bincode 2 std config."
+            );
             eprintln!("STRATEGY: PR 1 B1 mitigation NOT required for additive Option fields.");
         }
         Err(e) => {
             eprintln!("DECODE FAILED — error: {}", e);
-            eprintln!("VERDICT: bincode 2 IS positional; serde(default) does NOT cover trailing Options.");
+            eprintln!(
+                "VERDICT: bincode 2 IS positional; serde(default) does NOT cover trailing Options."
+            );
             eprintln!("STRATEGY: PR 1 B1 mitigation REQUIRED — use versioned read shim.");
-            panic!("bincode cannot decode old-shape bytes into new-shape struct: {}", e);
+            panic!(
+                "bincode cannot decode old-shape bytes into new-shape struct: {}",
+                e
+            );
         }
     }
 }

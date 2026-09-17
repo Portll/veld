@@ -10,7 +10,9 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub use crate::config::StorageBackend;
-pub use crate::graph_memory::{EntityNode, EpisodicNode, GraphMemory, GraphStats, RelationshipEdge};
+pub use crate::graph_memory::{
+    EntityNode, EpisodicNode, GraphMemory, GraphStats, RelationshipEdge,
+};
 pub use crate::memory::hybrid_search::BM25Index;
 pub use crate::memory::storage::MemoryStorage;
 pub use crate::memory::{Experience, Memory, MemoryConfig, MemoryId, MemoryStats};

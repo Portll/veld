@@ -24,9 +24,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use super::distance_inline::{
-    cosine_similarity_inline, euclidean_squared_inline,
-};
+use super::distance_inline::{cosine_similarity_inline, euclidean_squared_inline};
 use super::vamana::DistanceMetric;
 
 /// Default max neighbors per node per layer
@@ -362,18 +360,20 @@ impl HnswIndex {
         // Phase 2: ef-construction search at each layer ≤ min(level, max_level_before),
         // then connect bi-directionally.
         for layer in (0..=level.min(max_level_before)).rev() {
-            let candidates =
-                Self::search_layer_ef(&inner, &vector, ep, self.config.ef_construction, layer, metric);
+            let candidates = Self::search_layer_ef(
+                &inner,
+                &vector,
+                ep,
+                self.config.ef_construction,
+                layer,
+                metric,
+            );
             let m_for_layer = if layer == 0 {
                 self.config.m_max_0
             } else {
                 self.config.m
             };
-            let selected: Vec<u32> = candidates
-                .iter()
-                .take(m_for_layer)
-                .map(|s| s.id)
-                .collect();
+            let selected: Vec<u32> = candidates.iter().take(m_for_layer).map(|s| s.id).collect();
 
             inner.nodes[new_id as usize].neighbors[layer as usize] = selected.clone();
 
@@ -385,7 +385,14 @@ impl HnswIndex {
                 }
                 inner.nodes[nb_idx].neighbors[layer as usize].push(new_id);
                 let mut pruned = Vec::new();
-                Self::prune_neighbors(&inner, *nb, layer as usize, m_for_layer, metric, &mut pruned);
+                Self::prune_neighbors(
+                    &inner,
+                    *nb,
+                    layer as usize,
+                    m_for_layer,
+                    metric,
+                    &mut pruned,
+                );
                 inner.nodes[nb_idx].neighbors[layer as usize] = pruned;
             }
 

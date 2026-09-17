@@ -10,14 +10,12 @@
 //! Run with: cargo bench --bench pipeline_benchmarks
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use std::time::Instant;
+use tempfile::TempDir;
 use veld::embeddings::minilm::{EmbeddingConfig, MiniLMEmbedder};
 use veld::embeddings::ner::{NerConfig, NeuralNer};
 use veld::embeddings::Embedder;
-use veld::memory::{
-    Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalMode,
-};
-use std::time::Instant;
-use tempfile::TempDir;
+use veld::memory::{Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalMode};
 
 // ==============================================================================
 // Test Data: Realistic AI Agent Memory Content

@@ -24,13 +24,33 @@ fn request(uri: &str, body: Value, api_key: bool, admin_key: Option<&str>) -> Re
 
 fn seeded_harness() -> TestHarness {
     let harness = TestHarness::new();
-    let store = RocksDbPrimaryMemoryStore::open(&harness.manager.base_path.join("una"), None).unwrap();
+    let store =
+        RocksDbPrimaryMemoryStore::open(&harness.manager.base_path.join("una"), None).unwrap();
     let now = chrono::Utc::now();
     let m = crate::memory::types::Memory::from_legacy(
         crate::memory::types::MemoryId(uuid::Uuid::new_v4()),
-        crate::memory::types::Experience { content: "over http".into(), ..Default::default() },
-        0.5, 0, now, now, false, crate::memory::types::MemoryTier::LongTerm, Vec::new(), 1.0,
-        None, None, None, None, 0.0, None, None, 1, Vec::new(), Vec::new(),
+        crate::memory::types::Experience {
+            content: "over http".into(),
+            ..Default::default()
+        },
+        0.5,
+        0,
+        now,
+        now,
+        false,
+        crate::memory::types::MemoryTier::LongTerm,
+        Vec::new(),
+        1.0,
+        None,
+        None,
+        None,
+        None,
+        0.0,
+        None,
+        None,
+        1,
+        Vec::new(),
+        Vec::new(),
     );
     store.put_memory(&m).unwrap();
     store.flush().unwrap();
@@ -49,7 +69,11 @@ async fn every_route_is_503_when_no_admin_key_is_configured() {
     std::env::remove_var(ADMIN_API_KEY_ENV);
     let harness = TestHarness::new();
     for uri in ROUTES {
-        let (status, body) = send(harness.router(), request(uri, json!({}), true, Some("anything"))).await;
+        let (status, body) = send(
+            harness.router(),
+            request(uri, json!({}), true, Some("anything")),
+        )
+        .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
         assert_eq!(body["error"], "admin_key_not_configured");
     }
@@ -63,9 +87,21 @@ async fn a_regular_api_key_alone_is_refused_on_every_route() {
     let body = json!({"from": "rocksdb", "to": "redb", "user": "una", "dry_run": true});
     for uri in ROUTES {
         let (status, _) = send(harness.router(), request(uri, body.clone(), true, None)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} without the admin key");
-        let (status, _) = send(harness.router(), request(uri, body.clone(), true, Some("wrong"))).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} with a wrong admin key");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{uri} without the admin key"
+        );
+        let (status, _) = send(
+            harness.router(),
+            request(uri, body.clone(), true, Some("wrong")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{uri} with a wrong admin key"
+        );
     }
     std::env::remove_var(ADMIN_API_KEY_ENV);
 }
@@ -98,10 +134,19 @@ async fn writing_into_the_backend_being_served_is_refused() {
     let _env = ADMIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var(ADMIN_API_KEY_ENV, ADMIN_KEY);
     let harness = seeded_harness();
-    let serving = harness.manager.server_config.effective_storage_backend.to_string();
+    let serving = harness
+        .manager
+        .server_config
+        .effective_storage_backend
+        .to_string();
     let (status, body) = send(
         harness.router(),
-        request("/api/admin/storage/import", json!({"name": "x", "backend": serving}), true, Some(ADMIN_KEY)),
+        request(
+            "/api/admin/storage/import",
+            json!({"name": "x", "backend": serving}),
+            true,
+            Some(ADMIN_KEY),
+        ),
     )
     .await;
     std::env::remove_var(ADMIN_API_KEY_ENV);
@@ -115,7 +160,12 @@ async fn an_export_name_cannot_leave_the_exports_directory() {
     let harness = seeded_harness();
     let (status, body) = send(
         harness.router(),
-        request("/api/admin/storage/export", json!({"user": "una", "name": "../escape"}), true, Some(ADMIN_KEY)),
+        request(
+            "/api/admin/storage/export",
+            json!({"user": "una", "name": "../escape"}),
+            true,
+            Some(ADMIN_KEY),
+        ),
     )
     .await;
     std::env::remove_var(ADMIN_API_KEY_ENV);
@@ -141,5 +191,11 @@ async fn an_export_failure_is_an_error_response_never_a_success() {
     .await;
     std::env::remove_var(ADMIN_API_KEY_ENV);
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert!(body["detail"].as_str().unwrap().contains("failed to decode"), "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("failed to decode"),
+        "{body}"
+    );
 }

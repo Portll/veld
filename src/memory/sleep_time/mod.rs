@@ -54,27 +54,26 @@ pub mod types;
 pub mod worker;
 
 pub use diff::classify;
-pub use policies::{
-    BudgetTracker, DebounceTracker, PolicyLimits, CF_SLEEP_TIME_BUDGET,
-    CF_SLEEP_TIME_GLOBAL_BUDGET,
+pub use edge_proposals::{apply_edge_proposals, EdgeApplicationResult};
+pub use graduation::{
+    effective_origin, graduate_eligible_observations, GraduationPassResult, GraduationRecord,
+    GraduationStore, CF_SLEEP_TIME_GRADUATIONS, DEFAULT_GRADUATION_ACCESS_THRESHOLD,
 };
 pub use observation::{
     build_experience, is_sleep_time_authored, origin_of, persist_observation, PersistOutcome,
     DEFAULT_OBSERVATION_IMPORTANCE,
 };
-pub use graduation::{
-    effective_origin, graduate_eligible_observations, GraduationPassResult, GraduationRecord,
-    GraduationStore, CF_SLEEP_TIME_GRADUATIONS, DEFAULT_GRADUATION_ACCESS_THRESHOLD,
+pub use observer::{assemble_evidence_pack, MAX_EVIDENCE_MEMORIES, MAX_EVIDENCE_TOKENS};
+pub use orchestrator::{OrchestratorStatus, SleepTimeOrchestrator, UserStatus};
+pub use policies::{
+    BudgetTracker, DebounceTracker, PolicyLimits, CF_SLEEP_TIME_BUDGET, CF_SLEEP_TIME_GLOBAL_BUDGET,
 };
-pub use edge_proposals::{apply_edge_proposals, EdgeApplicationResult};
+pub use queue::{Queue, CF_SLEEP_TIME_QUEUE, DEFAULT_CLAIM_LEASE_SECS};
+pub use rewriter::{AnthropicRewriter, Rewriter};
 pub use supersession::{
     SupersessionRecord, SupersessionStore, CF_SLEEP_TIME_SUPERSESSIONS,
     DEFAULT_SUPERSESSION_CONFIDENCE, DEFAULT_SUPERSESSION_DECAY, SUPERSESSION_EXPIRY_FLOOR,
 };
-pub use observer::{assemble_evidence_pack, MAX_EVIDENCE_MEMORIES, MAX_EVIDENCE_TOKENS};
-pub use orchestrator::{OrchestratorStatus, SleepTimeOrchestrator, UserStatus};
-pub use queue::{Queue, CF_SLEEP_TIME_QUEUE, DEFAULT_CLAIM_LEASE_SECS};
-pub use rewriter::{AnthropicRewriter, Rewriter};
 pub use types::{
     BlockSnapshot, BudgetState, CostSample, DiffClass, DiffSummary, EvidenceFact, EvidenceMemory,
     EvidencePack, GlobalBudgetState, MemoryOrigin, ObservationDraft, ObservationPriority,

@@ -69,9 +69,7 @@ fn create_test_system_with_graph() -> (MemorySystem, TempDir) {
     let mut system = MemorySystem::new(config, None).expect("Failed to create memory system");
     let graph_path = temp_dir.path().join("graph");
     let graph_memory = GraphMemory::new(&graph_path, None).expect("Failed to create graph memory");
-    system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(
-        graph_memory,
-    )));
+    system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(graph_memory)));
     (system, temp_dir)
 }
 

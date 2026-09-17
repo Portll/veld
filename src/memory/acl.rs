@@ -45,9 +45,7 @@ impl MemoryAcl {
     /// True if `viewer` can read this memory (is owner, explicit reader,
     /// or writer — writers always include read).
     pub fn can_read(&self, owner: &str, viewer: &str) -> bool {
-        owner == viewer
-            || self.readers.contains(viewer)
-            || self.writers.contains(viewer)
+        owner == viewer || self.readers.contains(viewer) || self.writers.contains(viewer)
     }
 
     /// True if `actor` can modify this memory.
@@ -120,12 +118,7 @@ impl MemoryAclStore {
     }
 
     /// Revoke any read or write grant for `target_user_id`.
-    pub fn revoke(
-        &self,
-        owner: &str,
-        memory_id: &MemoryId,
-        target_user_id: &str,
-    ) -> Result<bool> {
+    pub fn revoke(&self, owner: &str, memory_id: &MemoryId, target_user_id: &str) -> Result<bool> {
         let mut acl = self.get(owner, memory_id)?;
         let r = acl.readers.remove(target_user_id);
         let w = acl.writers.remove(target_user_id);
@@ -145,22 +138,12 @@ impl MemoryAclStore {
     }
 
     /// True if `viewer` can read the memory owned by `owner`.
-    pub fn can_read(
-        &self,
-        owner: &str,
-        memory_id: &MemoryId,
-        viewer: &str,
-    ) -> Result<bool> {
+    pub fn can_read(&self, owner: &str, memory_id: &MemoryId, viewer: &str) -> Result<bool> {
         Ok(self.get(owner, memory_id)?.can_read(owner, viewer))
     }
 
     /// True if `actor` can modify the memory owned by `owner`.
-    pub fn can_write(
-        &self,
-        owner: &str,
-        memory_id: &MemoryId,
-        actor: &str,
-    ) -> Result<bool> {
+    pub fn can_write(&self, owner: &str, memory_id: &MemoryId, actor: &str) -> Result<bool> {
         Ok(self.get(owner, memory_id)?.can_write(owner, actor))
     }
 

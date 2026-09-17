@@ -1219,7 +1219,11 @@ mod tests {
         let resaved = temp_dir.path().join("resaved.spann");
         loaded.save_to_file(&resaved).unwrap();
         let reloaded = SpannIndex::load_from_file(&resaved).unwrap();
-        assert_eq!(reloaded.len(), 501, "a save after insert must keep the loaded postings");
+        assert_eq!(
+            reloaded.len(),
+            501,
+            "a save after insert must keep the loaded postings"
+        );
         let again = reloaded.search(&vectors[0], 10).unwrap();
         assert!(again.iter().take(3).any(|(id, _)| *id == 0));
     }

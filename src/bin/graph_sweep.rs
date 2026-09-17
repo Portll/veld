@@ -75,8 +75,12 @@ fn main() -> Result<()> {
     let raw = std::fs::read_to_string(&args.dump)
         .with_context(|| format!("reading dump {}", args.dump.display()))?;
     // A dump that will not parse is an unknown graph, never an empty one.
-    let dump: Dump = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing dump {} — refusing to report an empty sweep over an unreadable file", args.dump.display()))?;
+    let dump: Dump = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "parsing dump {} — refusing to report an empty sweep over an unreadable file",
+            args.dump.display()
+        )
+    })?;
 
     if dump.entities.is_empty() && args.graph_total > 0 {
         bail!(
@@ -108,7 +112,10 @@ fn main() -> Result<()> {
 
     println!("graph-sweep");
     if complete {
-        println!("  coverage   {seen} of {} entities (COMPLETE)", args.graph_total);
+        println!(
+            "  coverage   {seen} of {} entities (COMPLETE)",
+            args.graph_total
+        );
     } else {
         println!(
             "  coverage   {seen} of {} entities — PARTIAL, {} unread",
@@ -156,7 +163,10 @@ fn main() -> Result<()> {
             }
         }
         w.flush()?;
-        println!("\n  plan written: {} ({flagged} entries, uuids only)", path.display());
+        println!(
+            "\n  plan written: {} ({flagged} entries, uuids only)",
+            path.display()
+        );
         println!("  apply it yourself; this tool does not delete.");
     }
 

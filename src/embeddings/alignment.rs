@@ -93,8 +93,8 @@ pub fn save_alignment(path: &Path, alignment: &dyn Alignment) -> Result<()> {
     }
     let tmp = path.with_extension("bin.tmp");
     {
-        let file = File::create(&tmp)
-            .with_context(|| format!("opening {} for write", tmp.display()))?;
+        let file =
+            File::create(&tmp).with_context(|| format!("opening {} for write", tmp.display()))?;
         let mut w = BufWriter::new(file);
 
         w.write_all(MAGIC)?;

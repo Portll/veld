@@ -8,13 +8,14 @@
 //! - Bounds calculation
 
 use chrono::Utc;
-use veld::embeddings::ner::{NerConfig, NeuralNer};
-use veld::graph_memory::{
-    EdgeSource, EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType, RelationshipEdge,
-};
-use veld::uuid::Uuid;
 use std::collections::HashMap;
 use tempfile::TempDir;
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::graph_memory::{
+    EdgeSource, EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType,
+    RelationshipEdge,
+};
+use veld::uuid::Uuid;
 
 /// Create fallback NER for testing (rule-based, no ONNX required)
 fn setup_fallback_ner() -> NeuralNer {

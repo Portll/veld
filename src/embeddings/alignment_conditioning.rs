@@ -90,7 +90,9 @@ impl Conditioning {
 
         let xc = DMatrix::<f32>::from_fn(n, d, |i, j| data[i][j] - mean[j]);
         let svd = xc.svd(true, true);
-        let vt = svd.v_t.ok_or_else(|| anyhow!("SVD v_t missing in conditioning fit"))?; // r × d
+        let vt = svd
+            .v_t
+            .ok_or_else(|| anyhow!("SVD v_t missing in conditioning fit"))?; // r × d
         let sv = &svd.singular_values; // r (sorted desc)
         let r = sv.len();
         let denom = n.saturating_sub(1).max(1) as f32;

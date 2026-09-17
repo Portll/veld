@@ -33,14 +33,10 @@ pub mod planner;
 pub mod predicate;
 
 pub use adapters::{
-    GraphProvider, RealGraphQuerier, RealRelationalQuerier, RealVectorQuerier,
-    StubGraphQuerier, VamanaProvider,
+    GraphProvider, RealGraphQuerier, RealRelationalQuerier, RealVectorQuerier, StubGraphQuerier,
+    VamanaProvider,
 };
-pub use executor::{
-    Executor, GraphQuerier, RelationalQuerier, ScoredMemoryId, VectorQuerier,
-};
+pub use executor::{Executor, GraphQuerier, RelationalQuerier, ScoredMemoryId, VectorQuerier};
 pub use plan::{PhysicalOp, PhysicalPlan};
 pub use planner::plan as build_plan;
-pub use predicate::{
-    GraphPredicate, Query, RelationalPredicate, StageCaps, VectorPredicate,
-};
+pub use predicate::{GraphPredicate, Query, RelationalPredicate, StageCaps, VectorPredicate};

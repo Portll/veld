@@ -43,7 +43,6 @@ pub struct FileMemoryStore {
 impl FileMemoryStore {
     /// CF accessor for the files column family
 
-
     /// CF accessor for the file_index column family
 
     /// Return CF descriptors needed by this store. The caller must include
@@ -298,7 +297,10 @@ impl FileMemoryStore {
         let mut files = Vec::new();
 
         // scan_cf enforces the prefix bound; the hand-written break is gone.
-        for (key, file_id_bytes) in self.store.scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)? {
+        for (key, file_id_bytes) in
+            self.store
+                .scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
             let _ = &key_str;
 
@@ -334,7 +336,10 @@ impl FileMemoryStore {
         let mut files = Vec::new();
 
         // scan_cf enforces the prefix bound; the hand-written break is gone.
-        for (key, file_id_bytes) in self.store.scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)? {
+        for (key, file_id_bytes) in
+            self.store
+                .scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
             let _ = &key_str;
 
@@ -372,7 +377,10 @@ impl FileMemoryStore {
         let mut files = Vec::new();
 
         // scan_cf enforces the prefix bound; the hand-written break is gone.
-        for (key, file_id_bytes) in self.store.scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)? {
+        for (key, file_id_bytes) in
+            self.store
+                .scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
             let _ = &key_str;
 
@@ -400,7 +408,10 @@ impl FileMemoryStore {
         let mut count = 0;
 
         // scan_cf enforces the prefix bound; the hand-written break is gone.
-        for (key, _) in self.store.scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)? {
+        for (key, _) in self
+            .store
+            .scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
             let _ = &key_str;
 
@@ -1097,15 +1108,22 @@ impl FileMemoryStore {
     fn update_indices(&self, file: &FileMemory) -> Result<()> {
         let mut batch = crate::storage::WriteBatch::new();
         let id_str = file.id.0.to_string();
-        
 
         // Index by user
         let user_key = format!("user:{}:{}", file.user_id, id_str);
-        batch.put_cf(CF_FILE_INDEX, user_key.as_bytes().to_vec(), id_str.as_bytes().to_vec());
+        batch.put_cf(
+            CF_FILE_INDEX,
+            user_key.as_bytes().to_vec(),
+            id_str.as_bytes().to_vec(),
+        );
 
         // Index by project
         let project_key = format!("project:{}:{}:{}", file.user_id, file.project_id.0, id_str);
-        batch.put_cf(CF_FILE_INDEX, project_key.as_bytes().to_vec(), id_str.as_bytes().to_vec());
+        batch.put_cf(
+            CF_FILE_INDEX,
+            project_key.as_bytes().to_vec(),
+            id_str.as_bytes().to_vec(),
+        );
 
         // Index by path (for fast lookup)
         let path_key = format!(
@@ -1114,7 +1132,11 @@ impl FileMemoryStore {
             file.project_id.0,
             Self::hash_path(&file.path)
         );
-        batch.put_cf(CF_FILE_INDEX, path_key.as_bytes().to_vec(), id_str.as_bytes().to_vec());
+        batch.put_cf(
+            CF_FILE_INDEX,
+            path_key.as_bytes().to_vec(),
+            id_str.as_bytes().to_vec(),
+        );
 
         // Index by file type
         let type_str = format!("{:?}", file.file_type);
@@ -1122,7 +1144,11 @@ impl FileMemoryStore {
             "type:{}:{}:{}:{}",
             file.user_id, file.project_id.0, type_str, id_str
         );
-        batch.put_cf(CF_FILE_INDEX, type_key.as_bytes().to_vec(), id_str.as_bytes().to_vec());
+        batch.put_cf(
+            CF_FILE_INDEX,
+            type_key.as_bytes().to_vec(),
+            id_str.as_bytes().to_vec(),
+        );
 
         self.store
             .write_batch(&batch)
@@ -1134,7 +1160,6 @@ impl FileMemoryStore {
     fn remove_indices(&self, file: &FileMemory) -> Result<()> {
         let mut batch = crate::storage::WriteBatch::new();
         let id_str = file.id.0.to_string();
-        
 
         let user_key = format!("user:{}:{}", file.user_id, id_str);
         batch.delete_cf(CF_FILE_INDEX, user_key.as_bytes().to_vec());

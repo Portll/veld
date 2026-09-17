@@ -81,12 +81,24 @@ pub struct PromptGenRequest {
     pub mode: String,
 }
 
-fn default_max_memories() -> usize { 10 }
-fn default_max_facts() -> usize { 10 }
-fn default_max_entities() -> usize { 15 }
-fn default_max_todos() -> usize { 5 }
-fn default_true() -> bool { true }
-fn default_mode() -> String { "hybrid".to_string() }
+fn default_max_memories() -> usize {
+    10
+}
+fn default_max_facts() -> usize {
+    10
+}
+fn default_max_entities() -> usize {
+    15
+}
+fn default_max_todos() -> usize {
+    5
+}
+fn default_true() -> bool {
+    true
+}
+fn default_mode() -> String {
+    "hybrid".to_string()
+}
 
 // ─── Response ───────────────────────────────────────────────────────────────
 
@@ -227,9 +239,7 @@ pub async fn prompt_gen(
             ..Default::default()
         };
 
-        let memories = memory_guard
-            .recall(&query)
-            .unwrap_or_default();
+        let memories = memory_guard.recall(&query).unwrap_or_default();
 
         if !memories.is_empty() {
             let mut memory_lines = Vec::new();
@@ -270,10 +280,8 @@ pub async fn prompt_gen(
         // We look up each memory's associated entity episodes through the
         // entity graph, finding entities that appear in those episodes.
         if include_graph {
-            let mut seen_uuids: std::collections::HashSet<String> = all_entities
-                .iter()
-                .map(|e| e.id.clone())
-                .collect();
+            let mut seen_uuids: std::collections::HashSet<String> =
+                all_entities.iter().map(|e| e.id.clone()).collect();
 
             for mem in &memories {
                 // Try to find entities mentioned in this memory by searching the
@@ -281,7 +289,9 @@ pub async fn prompt_gen(
                 // that could be entity names extracted from the memory content.
                 // This is a lightweight approach — full NER extraction would
                 // require the NER extractor which lives outside GraphMemory.
-                let content_words: Vec<&str> = mem.experience.content
+                let content_words: Vec<&str> = mem
+                    .experience
+                    .content
                     .split_whitespace()
                     .filter(|w| w.len() > 2 && w.chars().next().is_some_and(|c| c.is_uppercase()))
                     .collect();
@@ -348,10 +358,7 @@ pub async fn prompt_gen(
         if !all_entities.is_empty() {
             let mut entity_lines = Vec::new();
             for entity in &all_entities {
-                let mut line = format!(
-                    "- **{}** [{}]",
-                    entity.canonical_name, entity.entity_type
-                );
+                let mut line = format!("- **{}** [{}]", entity.canonical_name, entity.entity_type);
                 if !entity.aliases.is_empty() {
                     line.push_str(&format!(" (aka: {})", entity.aliases.join(", ")));
                 }
@@ -433,7 +440,11 @@ pub async fn prompt_gen(
         // ── 6. Fetch active todos ──────────────────────────────────
 
         if include_todos {
-            let active_statuses = [TodoStatus::Todo, TodoStatus::InProgress, TodoStatus::Blocked];
+            let active_statuses = [
+                TodoStatus::Todo,
+                TodoStatus::InProgress,
+                TodoStatus::Blocked,
+            ];
             let todos = todo_store
                 .list_todos_for_user(&user_id, Some(&active_statuses))
                 .unwrap_or_default();
@@ -618,11 +629,9 @@ pub async fn set_entity_attribute(
         let node = graph_guard
             .find_entity_by_name(&entity_name)
             .map_err(AppError::Internal)?
-            .ok_or_else(|| {
-                AppError::InvalidInput {
-                    field: "entity_name".to_string(),
-                    reason: format!("Entity not found: {}", entity_name),
-                }
+            .ok_or_else(|| AppError::InvalidInput {
+                field: "entity_name".to_string(),
+                reason: format!("Entity not found: {}", entity_name),
             })?;
 
         // Re-add with the attribute set. add_entity merges into existing entities
@@ -630,7 +639,8 @@ pub async fn set_entity_attribute(
         // the stored data. The attribute we set here will be part of the merged entity.
         let mut updated = node.clone();
         updated.attributes.insert(key.clone(), value.clone());
-        graph_guard.add_entity(updated)
+        graph_guard
+            .add_entity(updated)
             .map_err(AppError::Internal)?;
 
         Ok::<_, AppError>(serde_json::json!({
@@ -676,21 +686,17 @@ pub async fn merge_entities(
         let source = graph_guard
             .find_entity_by_name(&source_name)
             .map_err(AppError::Internal)?
-            .ok_or_else(|| {
-                AppError::InvalidInput {
-                    field: "source_name".to_string(),
-                    reason: format!("Source entity not found: {}", source_name),
-                }
+            .ok_or_else(|| AppError::InvalidInput {
+                field: "source_name".to_string(),
+                reason: format!("Source entity not found: {}", source_name),
             })?;
 
         let target = graph_guard
             .find_entity_by_name(&target_name)
             .map_err(AppError::Internal)?
-            .ok_or_else(|| {
-                AppError::InvalidInput {
-                    field: "target_name".to_string(),
-                    reason: format!("Target entity not found: {}", target_name),
-                }
+            .ok_or_else(|| AppError::InvalidInput {
+                field: "target_name".to_string(),
+                reason: format!("Target entity not found: {}", target_name),
             })?;
 
         if source.uuid == target.uuid {
@@ -710,8 +716,16 @@ pub async fn merge_entities(
         let mut edges_moved: usize = 0;
         for edge in &source_edges {
             // Skip self-referential edges that would become after redirect
-            let new_from = if edge.from_entity == source.uuid { target.uuid } else { edge.from_entity };
-            let new_to = if edge.to_entity == source.uuid { target.uuid } else { edge.to_entity };
+            let new_from = if edge.from_entity == source.uuid {
+                target.uuid
+            } else {
+                edge.from_entity
+            };
+            let new_to = if edge.to_entity == source.uuid {
+                target.uuid
+            } else {
+                edge.to_entity
+            };
             if new_from == new_to {
                 continue;
             }
@@ -752,7 +766,10 @@ pub async fn merge_entities(
         }
         for (k, v) in &source.attributes {
             if k != "merged_into" {
-                target_updated.attributes.entry(k.clone()).or_insert_with(|| v.clone());
+                target_updated
+                    .attributes
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
             }
         }
         graph_guard
@@ -810,11 +827,9 @@ pub async fn add_entity_alias(
         let node = graph_guard
             .find_entity_by_name(&entity_name)
             .map_err(AppError::Internal)?
-            .ok_or_else(|| {
-                AppError::InvalidInput {
-                    field: "entity_name".to_string(),
-                    reason: format!("Entity not found: {}", entity_name),
-                }
+            .ok_or_else(|| AppError::InvalidInput {
+                field: "entity_name".to_string(),
+                reason: format!("Entity not found: {}", entity_name),
             })?;
 
         // Add alias to attributes and re-add via add_entity to persist
@@ -870,11 +885,7 @@ fn resolve_entity_by_name(
 
 /// Convert a raw EntityNode into a ResolvedEntity with aliases.
 fn entity_node_to_resolved(node: &EntityNode) -> ResolvedEntity {
-    let aliases_str = node
-        .attributes
-        .get("aliases")
-        .cloned()
-        .unwrap_or_default();
+    let aliases_str = node.attributes.get("aliases").cloned().unwrap_or_default();
     let aliases: Vec<String> = if aliases_str.is_empty() {
         Vec::new()
     } else {

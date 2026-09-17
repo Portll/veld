@@ -105,8 +105,8 @@ fn decode_sqlite_row(row: &SqliteRow) -> Result<Row, sqlx::Error> {
             "JSON" | "JSONB" => {
                 // Stored as text; parse so downstream code receives structured JSON.
                 let raw_text: String = row.try_get(idx)?;
-                let parsed: serde_json::Value =
-                    serde_json::from_str(&raw_text).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                let parsed: serde_json::Value = serde_json::from_str(&raw_text)
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
                 OwnedColumnValue::Json(parsed)
             }
             _ => {

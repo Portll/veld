@@ -79,8 +79,7 @@ impl PrefetchUserState {
             Some(cached) => {
                 let age = now.signed_duration_since(cached.computed_at);
                 let stale = age.num_hours() >= PREFETCH_SCALES_STALE_HOURS;
-                let grew = current_sample_count
-                    .saturating_sub(cached.sample_count)
+                let grew = current_sample_count.saturating_sub(cached.sample_count)
                     >= PREFETCH_SCALES_RECOMPUTE_SAMPLE_DELTA;
                 stale || grew
             }
@@ -214,7 +213,10 @@ mod tests {
         for _ in 0..50 {
             st.record_precision(0.0);
         }
-        assert!(!st.enabled, "kill-switch should disable after sustained 0 precision");
+        assert!(
+            !st.enabled,
+            "kill-switch should disable after sustained 0 precision"
+        );
 
         // While disabled it should not run until the re-probe window elapses.
         assert!(!st.should_run_this_tick());
@@ -254,7 +256,10 @@ mod tests {
             sample_count: 100,
             computed_at: now,
         });
-        assert!(!st.scales_need_recompute(110, now), "small growth -> reuse cache");
+        assert!(
+            !st.scales_need_recompute(110, now),
+            "small growth -> reuse cache"
+        );
         assert!(
             st.scales_need_recompute(200, now),
             "large sample growth -> recompute"
@@ -280,7 +285,10 @@ mod tests {
         ];
 
         let due = predict_due_memories(&last, period, now, 10);
-        assert!(due.contains(&due_id), "memory at one full period should be due");
+        assert!(
+            due.contains(&due_id),
+            "memory at one full period should be due"
+        );
         assert!(
             !due.contains(&not_due_id),
             "mid-cycle memory should not be due"

@@ -56,11 +56,11 @@ pub fn detect_format(filename: Option<&str>, content: &str) -> InputFormat {
                 "html" | "htm" => return InputFormat::Html,
                 "pdf" => return InputFormat::Pdf,
                 "txt" | "log" => return InputFormat::PlainText,
-                "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp"
-                | "cc" | "h" | "hpp" | "rb" | "sh" | "bash" | "zsh" | "sql" | "toml" | "yaml"
-                | "yml" | "swift" | "kt" | "scala" | "lua" | "r" | "pl" | "ex" | "exs"
-                | "zig" | "nim" | "v" | "d" | "cs" | "fs" | "ml" | "hs" | "erl" | "elm"
-                | "clj" | "lisp" | "proto" | "graphql" | "tf" | "hcl" => {
+                "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp" | "cc"
+                | "h" | "hpp" | "rb" | "sh" | "bash" | "zsh" | "sql" | "toml" | "yaml" | "yml"
+                | "swift" | "kt" | "scala" | "lua" | "r" | "pl" | "ex" | "exs" | "zig" | "nim"
+                | "v" | "d" | "cs" | "fs" | "ml" | "hs" | "erl" | "elm" | "clj" | "lisp"
+                | "proto" | "graphql" | "tf" | "hcl" => {
                     return InputFormat::Code;
                 }
                 _ => {}
@@ -160,10 +160,7 @@ mod tests {
             detect_format(Some("main.rs"), "anything"),
             InputFormat::Code
         );
-        assert_eq!(
-            detect_format(Some("app.py"), "anything"),
-            InputFormat::Code
-        );
+        assert_eq!(detect_format(Some("app.py"), "anything"), InputFormat::Code);
         assert_eq!(
             detect_format(Some("readme.txt"), "anything"),
             InputFormat::PlainText
@@ -176,10 +173,7 @@ mod tests {
             detect_format(None, r#"{"key": "value"}"#),
             InputFormat::Json
         );
-        assert_eq!(
-            detect_format(None, r#"[{"a":1}]"#),
-            InputFormat::Json
-        );
+        assert_eq!(detect_format(None, r#"[{"a":1}]"#), InputFormat::Json);
         assert_eq!(
             detect_format(None, "<!DOCTYPE html><html></html>"),
             InputFormat::Html

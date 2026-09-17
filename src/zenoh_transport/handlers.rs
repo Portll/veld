@@ -18,7 +18,6 @@ use zenoh::bytes::ZBytes;
 use zenoh::query::Query;
 use zenoh::sample::Sample;
 
-use crate::user_memory::SharedUserMemory;
 use crate::errors::ValidationErrorExt;
 use crate::handlers::remember::{build_rich_context, parse_experience_type};
 use crate::handlers::state::MultiUserMemoryManager;
@@ -27,11 +26,10 @@ use crate::handlers::types::{
 };
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
 use crate::memory::types::{ForgetCriteria, GeoFilter, MemoryId};
-use crate::memory::{
-    Experience, Query as MemoryQuery, RetrievalMode, SessionEvent, TodoStatus,
-};
+use crate::memory::{Experience, Query as MemoryQuery, RetrievalMode, SessionEvent, TodoStatus};
 use crate::metrics;
 use crate::streaming::{ExtractionConfig, StreamHandshake, StreamMessage, StreamMode};
+use crate::user_memory::SharedUserMemory;
 use crate::validation;
 
 // =============================================================================
@@ -383,8 +381,8 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         // Selectivity-ordered, same as the HTTP paths. `manager` IS the AppState type, so the same
         // helper serves — a fourth door to one graph gets the same rule as the other three.
-        let mentions = crate::handlers::remember::mention_counts_for(
-            &manager, &req.user_id, &merged_entities);
+        let mentions =
+            crate::handlers::remember::mention_counts_for(&manager, &req.user_id, &merged_entities);
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,

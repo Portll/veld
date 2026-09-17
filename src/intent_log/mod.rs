@@ -79,9 +79,7 @@ pub mod migrations;
 pub mod payload;
 pub mod projection;
 pub use checkpoint_store::{CheckpointStore, CheckpointStoreError};
-pub use header::{
-    HeaderError, IntentLogHeader, CURRENT_FORMAT_VERSION, HEADER_BYTES, MAGIC,
-};
+pub use header::{HeaderError, IntentLogHeader, CURRENT_FORMAT_VERSION, HEADER_BYTES, MAGIC};
 pub use journal::{ApplyError, JournalError, JournaledWriter, TypedProjection, WriteOutcome};
 pub use migrations::{migrate_payload, MigrationError};
 pub use payload::{IntentPayload, PayloadError};
@@ -98,7 +96,9 @@ pub use projection::{replay, Projection, ReplayError};
 /// `Lsn` field in their snapshot type without a manual impl per call
 /// site. Wire format is the inner `u64` (serde's transparent treatment
 /// of a single-field tuple struct).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Lsn(pub u64);
 
 impl Lsn {
@@ -341,7 +341,10 @@ impl IntentLog {
         let staged = OpenOptions::new().read(true).append(true).open(&tmp_path)?;
         self.writer = BufWriter::new(staged);
         std::fs::rename(&tmp_path, &self.path)?;
-        let live = OpenOptions::new().read(true).append(true).open(&self.path)?;
+        let live = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
         self.writer = BufWriter::new(live);
 
         // The frame region just shifted by HEADER_BYTES, so durable_end
@@ -503,23 +506,20 @@ impl IntentLog {
         // `set_len` returns ERROR_ACCESS_DENIED. Use a transient
         // read+write handle to perform the truncate, then resume our
         // own append handle. Cross-platform — POSIX behaves identically.
-        let trunc_handle = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
+        let trunc_handle = OpenOptions::new().read(true).write(true).open(&self.path)?;
         trunc_handle.set_len(target)?;
         trunc_handle.sync_data()?;
         drop(trunc_handle);
 
         // Reopen so BufWriter's seek matches the new EOF.
-        let file = OpenOptions::new().read(true).append(true).open(&self.path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
         self.writer = BufWriter::new(file);
         INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL.inc();
         INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(target as i64);
-        tracing::info!(
-            target_offset = target,
-            "intent log truncated corrupt tail",
-        );
+        tracing::info!(target_offset = target, "intent log truncated corrupt tail",);
         Ok(target)
     }
 
@@ -599,17 +599,17 @@ impl IntentLog {
         // calling `set_len` on it returns ERROR_ACCESS_DENIED. Reopen
         // with read+write so the truncate succeeds, then reattach the
         // append handle afterwards.
-        let trunc_handle = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
+        let trunc_handle = OpenOptions::new().read(true).write(true).open(&self.path)?;
         trunc_handle.set_len(last_good_offset)?;
         trunc_handle.sync_data()?;
         drop(trunc_handle);
 
         // Reopen so BufWriter's append position matches the new EOF, and
         // refresh the in-memory tail bookkeeping.
-        let file = OpenOptions::new().read(true).append(true).open(&self.path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
         self.writer = BufWriter::new(file);
         self.durable_end_offset = last_good_offset;
         self.next_lsn = max_lsn.next();
@@ -1002,8 +1002,11 @@ mod tests {
     #[test]
     fn encrypted_journal_seals_on_disk_and_opens_on_read() {
         let path = tmp_log_path("enc");
-        let cryptor =
-            || Some(crate::keystore::SecretCryptor::new(zeroize::Zeroizing::new([7u8; 32])));
+        let cryptor = || {
+            Some(crate::keystore::SecretCryptor::new(
+                zeroize::Zeroizing::new([7u8; 32]),
+            ))
+        };
         const SECRET: &[u8] = b"sensitive-memory-snapshot-do-not-leak-into-the-journal";
         {
             let mut log = IntentLog::open_with_cryptor(&path, cryptor()).unwrap();
@@ -1084,7 +1087,7 @@ mod tests {
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
             f.write_all(&[7u8, 0, 0, 0]).unwrap(); // len=7
             f.write_all(&[42u8, 0, 0, 0, 0, 0, 0, 0]).unwrap(); // lsn=42
-            // missing payload + crc
+                                                                // missing payload + crc
             f.sync_data().unwrap();
         }
 
@@ -1126,7 +1129,11 @@ mod tests {
         }
         // Flip one byte inside the second payload.
         {
-            let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
             // Layout: [HEADER_BYTES][first frame: 4+8+9+4=25][second frame…].
             // Second frame starts at HEADER_BYTES + 25; the first byte of
             // its payload is at HEADER_BYTES + 25 + 12.
@@ -1174,11 +1181,7 @@ mod tests {
         let mut log = IntentLog::open(&path).unwrap();
         let new_len = log.truncate_to_lsn(Lsn(1)).unwrap();
         // Verify only frames 0 and 1 remain, in order.
-        let records: Vec<_> = log
-            .iter()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<_> = log.iter().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].lsn, Lsn(0));
         assert_eq!(records[0].payload, b"frame-0");
@@ -1225,11 +1228,7 @@ mod tests {
             log.sync().unwrap();
         }
         let log = IntentLog::open(&path).unwrap();
-        let lsns: Vec<_> = log
-            .iter()
-            .unwrap()
-            .map(|r| r.unwrap().lsn)
-            .collect();
+        let lsns: Vec<_> = log.iter().unwrap().map(|r| r.unwrap().lsn).collect();
         assert_eq!(lsns, vec![Lsn(0), Lsn(1), Lsn(2)]);
         let _ = std::fs::remove_file(&path);
     }

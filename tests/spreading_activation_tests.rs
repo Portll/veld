@@ -8,13 +8,13 @@
 //! - Concurrent activation updates
 //! - NER integration for entity extraction
 
+use tempfile::TempDir;
 use veld::embeddings::ner::{NerConfig, NeuralNer};
 use veld::memory::{
     Experience, ExperienceType, Memory, MemoryConfig, MemoryId, MemorySystem, MemoryTier, Query,
     RetrievalOutcome,
 };
 use veld::uuid::Uuid;
-use tempfile::TempDir;
 
 /// Create fallback NER instance for testing
 fn setup_fallback_ner() -> NeuralNer {

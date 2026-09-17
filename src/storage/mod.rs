@@ -543,7 +543,10 @@ pub trait GraphStore: Send + Sync {
     fn put_entity(&self, entity: &EntityNode) -> Result<()>;
     fn get_relationship(&self, uuid: &uuid::Uuid) -> Result<Option<RelationshipEdge>>;
     fn put_relationship(&self, edge: &RelationshipEdge) -> Result<()>;
-    fn list_relationships_for_entity(&self, entity_uuid: &uuid::Uuid) -> Result<Vec<RelationshipEdge>>;
+    fn list_relationships_for_entity(
+        &self,
+        entity_uuid: &uuid::Uuid,
+    ) -> Result<Vec<RelationshipEdge>>;
     fn get_episode(&self, uuid: &uuid::Uuid) -> Result<Option<EpisodicNode>>;
     fn put_episode(&self, episode: &EpisodicNode) -> Result<()>;
     fn stats(&self) -> Result<GraphStats>;
@@ -721,7 +724,11 @@ mod backend_coverage_matrix {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    enum Outcome { Works, Refuses, Panics }
+    enum Outcome {
+        Works,
+        Refuses,
+        Panics,
+    }
 
     fn probe<T>(f: impl FnOnce() -> Result<T>) -> Outcome {
         match catch_unwind(AssertUnwindSafe(f)) {
@@ -735,9 +742,29 @@ mod backend_coverage_matrix {
         let now = chrono::Utc::now();
         Memory::from_legacy(
             MemoryId(uuid::Uuid::new_v4()),
-            Experience { experience_type: ExperienceType::Observation, content: "probe".into(), ..Default::default() },
-            0.5, 0, now, now, false, MemoryTier::LongTerm, Vec::new(), 1.0,
-            None, None, None, None, 0.0, None, None, 1, Vec::new(), Vec::new(),
+            Experience {
+                experience_type: ExperienceType::Observation,
+                content: "probe".into(),
+                ..Default::default()
+            },
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -747,61 +774,131 @@ mod backend_coverage_matrix {
         let id = m.id.clone();
         let cutoff = chrono::Utc::now();
         let mut out = vec![
-            ("backend",                       probe(|| Ok::<_, anyhow::Error>(s.backend()))),
-            ("put_memory",                    probe(|| s.put_memory(&m))),
-            ("get_memory",                    probe(|| s.get_memory(&id))),
-            ("update_memory",                 probe(|| s.update_memory(&m))),
-            ("search",                        probe(|| s.search(crate::memory::storage::SearchCriteria::ByTags(vec!["x".into()])))),
-            ("get_vector_mapping",            probe(|| s.get_vector_mapping(&id))),
-            ("put_vector_mapping",            probe(|| s.put_vector_mapping(&id, &Default::default()))),
-            ("delete_vector_mapping",         probe(|| s.delete_vector_mapping(&id))),
-            ("flush",                         probe(|| s.flush())),
-            ("get",                           probe(|| s.get(&id))),
-            ("store",                         probe(|| s.store(&m))),
-            ("update",                        probe(|| s.update(&m))),
-            ("get_all",                       probe(|| s.get_all())),
-            ("get_all_ids",                   probe(|| s.get_all_ids())),
-            ("increment_retrieval_count",     probe(|| s.increment_retrieval_count())),
-            ("get_stats",                     probe(|| s.get_stats())),
-            ("find_by_external_id",           probe(|| s.find_by_external_id("nope"))),
-            ("get_children",                  probe(|| s.get_children(&id))),
-            ("get_ancestors",                 probe(|| s.get_ancestors(&id))),
-            ("get_hierarchy_context",         probe(|| s.get_hierarchy_context(&id))),
-            ("get_uncompressed_older_than",   probe(|| s.get_uncompressed_older_than(cutoff))),
-            ("mark_forgotten_by_age",         probe(|| s.mark_forgotten_by_age(cutoff))),
-            ("save_interference_records",     probe(|| s.save_interference_records("m", &[]))),
-            ("load_all_interference_records", probe(|| s.load_all_interference_records())),
-            ("delete_interference_records",   probe(|| s.delete_interference_records("m"))),
-            ("clear_all_interference_records",probe(|| s.clear_all_interference_records())),
-            ("cleanup_corrupted",             probe(|| s.cleanup_corrupted())),
-            ("migrate_legacy",                probe(|| s.migrate_legacy())),
-            ("scan_prefix_keys",              probe(|| s.scan_prefix_keys(b"x"))),
-            ("write_batch",                   probe(|| s.write_batch(&crate::storage::WriteBatch::new()))),
-            ("run_merge_pass",                probe(|| s.run_merge_pass("u", 1))),
-            ("gc_merge_tombstones",           probe(|| s.gc_merge_tombstones("u"))),
+            ("backend", probe(|| Ok::<_, anyhow::Error>(s.backend()))),
+            ("put_memory", probe(|| s.put_memory(&m))),
+            ("get_memory", probe(|| s.get_memory(&id))),
+            ("update_memory", probe(|| s.update_memory(&m))),
+            (
+                "search",
+                probe(|| {
+                    s.search(crate::memory::storage::SearchCriteria::ByTags(vec![
+                        "x".into()
+                    ]))
+                }),
+            ),
+            ("get_vector_mapping", probe(|| s.get_vector_mapping(&id))),
+            (
+                "put_vector_mapping",
+                probe(|| s.put_vector_mapping(&id, &Default::default())),
+            ),
+            (
+                "delete_vector_mapping",
+                probe(|| s.delete_vector_mapping(&id)),
+            ),
+            ("flush", probe(|| s.flush())),
+            ("get", probe(|| s.get(&id))),
+            ("store", probe(|| s.store(&m))),
+            ("update", probe(|| s.update(&m))),
+            ("get_all", probe(|| s.get_all())),
+            ("get_all_ids", probe(|| s.get_all_ids())),
+            (
+                "increment_retrieval_count",
+                probe(|| s.increment_retrieval_count()),
+            ),
+            ("get_stats", probe(|| s.get_stats())),
+            (
+                "find_by_external_id",
+                probe(|| s.find_by_external_id("nope")),
+            ),
+            ("get_children", probe(|| s.get_children(&id))),
+            ("get_ancestors", probe(|| s.get_ancestors(&id))),
+            (
+                "get_hierarchy_context",
+                probe(|| s.get_hierarchy_context(&id)),
+            ),
+            (
+                "get_uncompressed_older_than",
+                probe(|| s.get_uncompressed_older_than(cutoff)),
+            ),
+            (
+                "mark_forgotten_by_age",
+                probe(|| s.mark_forgotten_by_age(cutoff)),
+            ),
+            (
+                "save_interference_records",
+                probe(|| s.save_interference_records("m", &[])),
+            ),
+            (
+                "load_all_interference_records",
+                probe(|| s.load_all_interference_records()),
+            ),
+            (
+                "delete_interference_records",
+                probe(|| s.delete_interference_records("m")),
+            ),
+            (
+                "clear_all_interference_records",
+                probe(|| s.clear_all_interference_records()),
+            ),
+            ("cleanup_corrupted", probe(|| s.cleanup_corrupted())),
+            ("migrate_legacy", probe(|| s.migrate_legacy())),
+            ("scan_prefix_keys", probe(|| s.scan_prefix_keys(b"x"))),
+            (
+                "write_batch",
+                probe(|| s.write_batch(&crate::storage::WriteBatch::new())),
+            ),
+            ("run_merge_pass", probe(|| s.run_merge_pass("u", 1))),
+            ("gc_merge_tombstones", probe(|| s.gc_merge_tombstones("u"))),
             // The eight surfaced by the long_term_memory flip. The KV probes
             // exercise the handle they get back, not just its construction —
             // a handle over the wrong keyspace constructs fine.
-            ("get_all_vector_mappings",       probe(|| s.get_all_vector_mappings())),
-            ("update_vector_mapping",         probe(|| s.update_vector_mapping(&id, vec![1]))),
-            ("get_by_content_hash",           probe(|| Ok::<_, anyhow::Error>(s.get_by_content_hash("probe")))),
-            ("update_access",                 probe(|| s.update_access(&id))),
-            ("mark_forgotten_by_importance",  probe(|| s.mark_forgotten_by_importance(0.0))),
-            ("save_interference_event_count", probe(|| s.save_interference_event_count(1))),
-            ("get_fact_watermark",            probe(|| Ok::<_, anyhow::Error>(s.get_fact_watermark("u")))),
-            ("set_fact_watermark",            probe(|| Ok::<_, anyhow::Error>(s.set_fact_watermark("u", 1)))),
-            ("key_value_store",               probe(|| {
-                let kv = s.key_value_store();
-                kv.put_bytes(b"matrix-probe", b"1")?;
-                kv.get_bytes(b"matrix-probe")
-            })),
-            ("default_key_value_store",       probe(|| {
-                let kv = s.default_key_value_store();
-                kv.put_bytes(b"matrix-probe-default", b"1")?;
-                kv.get_bytes(b"matrix-probe-default")
-            })),
-            ("delete_memory",                 probe(|| s.delete_memory(&id))),
-            ("delete",                        probe(|| s.delete(&id))),
+            (
+                "get_all_vector_mappings",
+                probe(|| s.get_all_vector_mappings()),
+            ),
+            (
+                "update_vector_mapping",
+                probe(|| s.update_vector_mapping(&id, vec![1])),
+            ),
+            (
+                "get_by_content_hash",
+                probe(|| Ok::<_, anyhow::Error>(s.get_by_content_hash("probe"))),
+            ),
+            ("update_access", probe(|| s.update_access(&id))),
+            (
+                "mark_forgotten_by_importance",
+                probe(|| s.mark_forgotten_by_importance(0.0)),
+            ),
+            (
+                "save_interference_event_count",
+                probe(|| s.save_interference_event_count(1)),
+            ),
+            (
+                "get_fact_watermark",
+                probe(|| Ok::<_, anyhow::Error>(s.get_fact_watermark("u"))),
+            ),
+            (
+                "set_fact_watermark",
+                probe(|| Ok::<_, anyhow::Error>(s.set_fact_watermark("u", 1))),
+            ),
+            (
+                "key_value_store",
+                probe(|| {
+                    let kv = s.key_value_store();
+                    kv.put_bytes(b"matrix-probe", b"1")?;
+                    kv.get_bytes(b"matrix-probe")
+                }),
+            ),
+            (
+                "default_key_value_store",
+                probe(|| {
+                    let kv = s.default_key_value_store();
+                    kv.put_bytes(b"matrix-probe-default", b"1")?;
+                    kv.get_bytes(b"matrix-probe-default")
+                }),
+            ),
+            ("delete_memory", probe(|| s.delete_memory(&id))),
+            ("delete", probe(|| s.delete(&id))),
         ];
         out.sort_by_key(|(n, _)| *n);
         out
@@ -811,9 +908,12 @@ mod backend_coverage_matrix {
     fn every_trait_method_is_called_on_both_backends_and_the_gap_is_exact() {
         let td = tempfile::tempdir().unwrap();
         let rocks = crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::open(
-            &td.path().join("rocks"), None).expect("rocks open");
-        let redb = crate::storage::redb::RedbPrimaryMemoryStore::open(
-            &td.path().join("redb")).expect("redb open");
+            &td.path().join("rocks"),
+            None,
+        )
+        .expect("rocks open");
+        let redb = crate::storage::redb::RedbPrimaryMemoryStore::open(&td.path().join("redb"))
+            .expect("redb open");
 
         let r = matrix(&rocks);
         let b = matrix(&redb);
@@ -821,18 +921,33 @@ mod backend_coverage_matrix {
         assert_eq!(r.len(), b.len());
 
         let rocks_ok = r.iter().filter(|(_, o)| *o == Outcome::Works).count();
-        let redb_ok  = b.iter().filter(|(_, o)| *o == Outcome::Works).count();
-        let gap: Vec<&str> = r.iter().zip(&b)
+        let redb_ok = b.iter().filter(|(_, o)| *o == Outcome::Works).count();
+        let gap: Vec<&str> = r
+            .iter()
+            .zip(&b)
             .filter(|((_, ro), (_, bo))| *ro == Outcome::Works && *bo != Outcome::Works)
-            .map(|((n, _), _)| *n).collect();
+            .map(|((n, _), _)| *n)
+            .collect();
 
-        eprintln!("COVERAGE  rocksdb {rocks_ok}/44   redb {redb_ok}/44   gap {}", gap.len());
-        for name in &gap { eprintln!("  redb missing: {name}"); }
+        eprintln!(
+            "COVERAGE  rocksdb {rocks_ok}/44   redb {redb_ok}/44   gap {}",
+            gap.len()
+        );
+        for name in &gap {
+            eprintln!("  redb missing: {name}");
+        }
 
         // The direction that matters: redb must never be ahead in a way that hides a
         // rocksdb regression, and the gap list must be exactly what is claimed.
-        assert!(rocks_ok >= redb_ok, "redb reports more working methods than rocksdb — check the probe, not the backends");
-        assert_eq!(gap.len(), 44 - redb_ok, "a redb method failed that rocksdb also fails — the gap list is not the whole story");
+        assert!(
+            rocks_ok >= redb_ok,
+            "redb reports more working methods than rocksdb — check the probe, not the backends"
+        );
+        assert_eq!(
+            gap.len(),
+            44 - redb_ok,
+            "a redb method failed that rocksdb also fails — the gap list is not the whole story"
+        );
     }
 }
 
@@ -862,10 +977,19 @@ mod column_store_conformance {
         s.put_cf("alpha", b"k2", b"v2").unwrap();
         s.put_cf("beta", b"k1", b"OTHER").unwrap();
 
-        note("get alpha/k1", format!("{:?}", s.get_cf("alpha", b"k1").unwrap()));
+        note(
+            "get alpha/k1",
+            format!("{:?}", s.get_cf("alpha", b"k1").unwrap()),
+        );
         // Isolation: the same key in another family must not be visible here.
-        note("get beta/k1", format!("{:?}", s.get_cf("beta", b"k1").unwrap()));
-        note("get alpha/missing", format!("{:?}", s.get_cf("alpha", b"nope").unwrap()));
+        note(
+            "get beta/k1",
+            format!("{:?}", s.get_cf("beta", b"k1").unwrap()),
+        );
+        note(
+            "get alpha/missing",
+            format!("{:?}", s.get_cf("alpha", b"nope").unwrap()),
+        );
 
         s.put_cf("alpha", b"pre:a", b"1").unwrap();
         s.put_cf("alpha", b"pre:b", b"2").unwrap();
@@ -873,7 +997,13 @@ mod column_store_conformance {
 
         // The prefix bound: `qqq` sorts after `pre:` and must NOT be returned.
         let pre = s.scan_cf("alpha", Some(b"pre:"), None).unwrap();
-        note("scan prefix", format!("{:?}", pre.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()));
+        note(
+            "scan prefix",
+            format!(
+                "{:?}",
+                pre.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()
+            ),
+        );
         // Ascending order is contract, not accident — the due-index early exit
         // depends on it. A hard assert, not a note: two backends agreeing on a
         // wrong order would pass the equality comparison.
@@ -881,8 +1011,17 @@ mod column_store_conformance {
             pre.windows(2).all(|w| w[0].0 < w[1].0),
             "scan_cf must return keys in ascending order"
         );
-        note("scan prefix limit 1", format!("{}", s.scan_cf("alpha", Some(b"pre:"), Some(1)).unwrap().len()));
-        note("scan whole family", format!("{}", s.scan_cf("alpha", None, None).unwrap().len()));
+        note(
+            "scan prefix limit 1",
+            format!(
+                "{}",
+                s.scan_cf("alpha", Some(b"pre:"), Some(1)).unwrap().len()
+            ),
+        );
+        note(
+            "scan whole family",
+            format!("{}", s.scan_cf("alpha", None, None).unwrap().len()),
+        );
 
         let mut b = WriteBatch::new();
         b.put_cf("alpha", b"batched".to_vec(), b"A".to_vec());
@@ -890,9 +1029,18 @@ mod column_store_conformance {
         b.delete_cf("alpha", b"k2".to_vec());
         s.write_batch(&b).unwrap();
 
-        note("after batch alpha/batched", format!("{:?}", s.get_cf("alpha", b"batched").unwrap()));
-        note("after batch beta/batched", format!("{:?}", s.get_cf("beta", b"batched").unwrap()));
-        note("after batch alpha/k2 deleted", format!("{:?}", s.get_cf("alpha", b"k2").unwrap()));
+        note(
+            "after batch alpha/batched",
+            format!("{:?}", s.get_cf("alpha", b"batched").unwrap()),
+        );
+        note(
+            "after batch beta/batched",
+            format!("{:?}", s.get_cf("beta", b"batched").unwrap()),
+        );
+        note(
+            "after batch alpha/k2 deleted",
+            format!("{:?}", s.get_cf("alpha", b"k2").unwrap()),
+        );
 
         // A family whose FIRST touch is a batched write — the case a put-first
         // script structurally cannot compare: redb's put_cf creates tables on
@@ -903,12 +1051,21 @@ mod column_store_conformance {
         let mut g = WriteBatch::new();
         g.put_cf("gamma", b"gk".to_vec(), b"gv".to_vec());
         s.write_batch(&g).unwrap();
-        note("fresh family, first touch batched", format!("{:?}", s.get_cf("gamma", b"gk").unwrap()));
+        note(
+            "fresh family, first touch batched",
+            format!("{:?}", s.get_cf("gamma", b"gk").unwrap()),
+        );
 
         s.delete_cf("alpha", b"k1").unwrap();
-        note("after delete alpha/k1", format!("{:?}", s.get_cf("alpha", b"k1").unwrap()));
+        note(
+            "after delete alpha/k1",
+            format!("{:?}", s.get_cf("alpha", b"k1").unwrap()),
+        );
         // Deleting an absent key is not an error on either backend.
-        note("delete absent is ok", format!("{:?}", s.delete_cf("alpha", b"never").is_ok()));
+        note(
+            "delete absent is ok",
+            format!("{:?}", s.delete_cf("alpha", b"never").is_ok()),
+        );
         note("flush", format!("{:?}", s.flush_cf("alpha").is_ok()));
         out
     }
@@ -925,9 +1082,13 @@ mod column_store_conformance {
                 .iter()
                 .map(|n| rocksdb::ColumnFamilyDescriptor::new(*n, rocksdb::Options::default()))
                 .collect();
-            std::sync::Arc::new(rocksdb::DB::open_cf_descriptors(&opts, tmp.path().join("rocks"), cfs).unwrap())
+            std::sync::Arc::new(
+                rocksdb::DB::open_cf_descriptors(&opts, tmp.path().join("rocks"), cfs).unwrap(),
+            )
         };
-        let redb_db = crate::storage::redb::create_redb_database_for_test(&tmp.path().join("redb.redb")).unwrap();
+        let redb_db =
+            crate::storage::redb::create_redb_database_for_test(&tmp.path().join("redb.redb"))
+                .unwrap();
 
         let r = script(&RocksDbColumnStore::new(rocks_db));
         let b = script(&RedbColumnStore::new(redb_db));
@@ -937,30 +1098,52 @@ mod column_store_conformance {
         for ((rk, rv), (_, bv)) in r.iter().zip(&b) {
             // The backend name is the one answer that SHOULD differ.
             if rk == "backend-differs-on-purpose" {
-                assert_ne!(rv, bv, "the two stores reported the same backend — the test built one twice");
+                assert_ne!(
+                    rv, bv,
+                    "the two stores reported the same backend — the test built one twice"
+                );
                 continue;
             }
             if rv != bv {
                 diffs.push(format!("  {rk}:  rocksdb={rv}  redb={bv}"));
             }
         }
-        assert!(diffs.is_empty(), "the backends disagree:\n{}", diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "the backends disagree:\n{}",
+            diffs.join("\n")
+        );
 
         // NOT VACUOUS. Two backends that both returned None to everything would agree
         // perfectly, so the comparison above is only worth running if the script
         // actually observed something. These pin the answers that carry the meaning.
-        let find = |k: &str| r.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
-        assert_eq!(find("get alpha/k1"), "Some([118, 49])", "the round trip returned nothing to compare");
-        assert_eq!(find("get beta/k1"), "Some([79, 84, 72, 69, 82])",
-            "families are not isolated — the same key read back the other family's value");
+        let find = |k: &str| {
+            r.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            find("get alpha/k1"),
+            "Some([118, 49])",
+            "the round trip returned nothing to compare"
+        );
+        assert_eq!(
+            find("get beta/k1"),
+            "Some([79, 84, 72, 69, 82])",
+            "families are not isolated — the same key read back the other family's value"
+        );
         assert_eq!(find("get alpha/missing"), "None");
         assert_eq!(find("scan prefix"), "[[112, 114, 101, 58, 97], [112, 114, 101, 58, 98]]",
             "the prefix scan did not return exactly the two pre: keys — `qqq` sorts after them and \
              must not be included");
         assert_eq!(find("scan prefix limit 1"), "1");
         assert_eq!(find("after batch alpha/batched"), "Some([65])");
-        assert_eq!(find("after batch beta/batched"), "Some([66])",
-            "the cross-family batch did not reach the second family");
+        assert_eq!(
+            find("after batch beta/batched"),
+            "Some([66])",
+            "the cross-family batch did not reach the second family"
+        );
         assert_eq!(find("after batch alpha/k2 deleted"), "None");
         assert_eq!(find("after delete alpha/k1"), "None");
     }

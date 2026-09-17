@@ -26,7 +26,9 @@ pub fn is_insecure_remote_url(url: &str) -> bool {
     let rest = &url["http://".len()..];
     let authority = rest.split('/').next().unwrap_or(rest);
     // Strip userinfo — take the part AFTER the first '@' as the true host+port.
-    let host_and_port = authority.split_once('@').map_or(authority, |(_, after)| after);
+    let host_and_port = authority
+        .split_once('@')
+        .map_or(authority, |(_, after)| after);
     let host = if host_and_port.starts_with('[') {
         // IPv6 bracket notation: `[::1]` or `[::1]:port`
         host_and_port
@@ -35,7 +37,9 @@ pub fn is_insecure_remote_url(url: &str) -> bool {
             .next()
             .unwrap_or(host_and_port)
     } else {
-        host_and_port.rsplit_once(':').map_or(host_and_port, |(h, _)| h)
+        host_and_port
+            .rsplit_once(':')
+            .map_or(host_and_port, |(h, _)| h)
     };
     !matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
 }
@@ -76,7 +80,9 @@ mod tests {
         assert!(is_insecure_remote_url("http://remote.example.com/api"));
         assert!(is_insecure_remote_url("http://remote.example.com:8080/"));
         // userinfo with remote host → still insecure
-        assert!(is_insecure_remote_url("http://user:pass@remote.example.com/"));
+        assert!(is_insecure_remote_url(
+            "http://user:pass@remote.example.com/"
+        ));
         // localhost variants → not insecure
         assert!(!is_insecure_remote_url("http://localhost:3030"));
         assert!(!is_insecure_remote_url("http://127.0.0.1:3030"));

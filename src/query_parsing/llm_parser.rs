@@ -142,8 +142,8 @@ impl LlmParser {
                 }
             }
         });
-        let model = std::env::var("VELD_LLM_MODEL")
-            .unwrap_or_else(|_| "qwq-32b-preview".to_string());
+        let model =
+            std::env::var("VELD_LLM_MODEL").unwrap_or_else(|_| "qwq-32b-preview".to_string());
         Self::new(&endpoint, &model)
     }
 

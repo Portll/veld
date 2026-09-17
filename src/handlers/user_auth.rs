@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use super::state::MultiUserMemoryManager;
 use crate::user_auth::{
-    password, recovery_codes, session as session_mod, store::UserAuthStore, totp,
-    AuthError, UserRecord, UserRole,
+    password, recovery_codes, session as session_mod, store::UserAuthStore, totp, AuthError,
+    UserRecord, UserRole,
 };
 use crate::validation::validate_user_id;
 
@@ -165,7 +165,9 @@ async fn register_inner(
     validate_user_id(&req.username)
         .map_err(|e| AuthError::weak_password(format!("invalid username: {e}")))?;
     if req.password.len() < 8 {
-        return Err(AuthError::weak_password("password must be at least 8 characters"));
+        return Err(AuthError::weak_password(
+            "password must be at least 8 characters",
+        ));
     }
 
     // Decide whether this call is the first-user bootstrap or an
@@ -213,20 +215,14 @@ async fn register_inner(
 // ─────────────────────────────────────────────────────────────────────────
 
 /// `POST /api/user_auth/login`
-pub async fn login(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> Response {
+pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
     match login_inner(&state, req).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => e.into_response(),
     }
 }
 
-async fn login_inner(
-    state: &AppState,
-    req: LoginRequest,
-) -> Result<LoginResponse, AuthError> {
+async fn login_inner(state: &AppState, req: LoginRequest) -> Result<LoginResponse, AuthError> {
     let runtime = runtime(state)?;
     let now = Utc::now();
 
@@ -419,27 +415,23 @@ async fn confirm_2fa_inner(
 // ─────────────────────────────────────────────────────────────────────────
 
 /// `POST /api/user_auth/recover` — public, consumes one recovery code.
-pub async fn recover(
-    State(state): State<AppState>,
-    Json(req): Json<RecoverRequest>,
-) -> Response {
+pub async fn recover(State(state): State<AppState>, Json(req): Json<RecoverRequest>) -> Response {
     match recover_inner(&state, req).await {
         Ok(()) => (StatusCode::OK, Json(json!({"success": true}))).into_response(),
         Err(e) => e.into_response(),
     }
 }
 
-async fn recover_inner(
-    state: &AppState,
-    req: RecoverRequest,
-) -> Result<(), AuthError> {
+async fn recover_inner(state: &AppState, req: RecoverRequest) -> Result<(), AuthError> {
     let runtime = runtime(state)?;
     // Throttle by username, same bucket as login.
     if runtime.login_limiter.check(&req.username).is_err() {
         return Err(AuthError::TooManyAttempts);
     }
     if req.new_password.len() < 8 {
-        return Err(AuthError::weak_password("password must be at least 8 characters"));
+        return Err(AuthError::weak_password(
+            "password must be at least 8 characters",
+        ));
     }
 
     let mut record = runtime
@@ -464,9 +456,7 @@ async fn recover_inner(
 
     // Drop every existing session for this user — anyone who had one is
     // no longer trusted.
-    let killed = runtime
-        .store
-        .delete_all_sessions_for_user(&record.id)?;
+    let killed = runtime.store.delete_all_sessions_for_user(&record.id)?;
     tracing::info!(
         user_id = %record.id,
         sessions_killed = killed,
@@ -700,8 +690,8 @@ pub async fn revoke_all_sessions(
     Extension(caller): Extension<crate::user_auth::SessionUser>,
     Json(req): Json<UsernameRequest>,
 ) -> Response {
-    let result =
-        runtime(&state).and_then(|rt| revoke_all_sessions_with_runtime(rt, &caller.0, &req.username));
+    let result = runtime(&state)
+        .and_then(|rt| revoke_all_sessions_with_runtime(rt, &caller.0, &req.username));
     match result {
         Ok(removed) => (
             StatusCode::OK,
@@ -792,12 +782,9 @@ mod tests {
         let mut opts = RocksOptions::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        let db = DB::open_cf_descriptors(
-            &opts,
-            dir,
-            vec![crate::user_auth::store::cf_descriptor()],
-        )
-        .unwrap();
+        let db =
+            DB::open_cf_descriptors(&opts, dir, vec![crate::user_auth::store::cf_descriptor()])
+                .unwrap();
         let store = UserAuthStore::new(Arc::new(db)).unwrap();
         // Loose throttle (100 attempts / 1s) so tests don't trip it.
         UserAuthRuntime::with_limiter(store, LoginLimiter::new(100, Duration::from_secs(1)), None)
@@ -863,8 +850,8 @@ mod tests {
 
         // ── Step 6: recover using one of the printed codes.
         let new_password = "another-strong-passphrase";
-        let outcome = recovery_codes::redeem(&record.recovery_code_hashes, &recovery_plain[0])
-            .unwrap();
+        let outcome =
+            recovery_codes::redeem(&record.recovery_code_hashes, &recovery_plain[0]).unwrap();
         let recovery_codes::RedeemOutcome::Consumed { remaining } = outcome else {
             panic!("recovery redemption must succeed");
         };
@@ -884,7 +871,10 @@ mod tests {
 
         // ── Step 7: post-recovery state.
         let final_record = runtime.store.get_user(&record.id).unwrap().unwrap();
-        assert!(!final_record.has_active_totp(), "2FA must be cleared by recovery");
+        assert!(
+            !final_record.has_active_totp(),
+            "2FA must be cleared by recovery"
+        );
         assert_eq!(
             final_record.recovery_code_hashes.len(),
             recoverycodes_count() - 1
@@ -930,8 +920,7 @@ mod tests {
         use axum::Router;
         use tower::ServiceExt;
 
-        let app: Router =
-            Router::new().route("/api/user_auth/{*path}", any(disabled_fallback));
+        let app: Router = Router::new().route("/api/user_auth/{*path}", any(disabled_fallback));
 
         let req = Request::builder()
             .method(Method::POST)
@@ -949,10 +938,7 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], "user_auth_disabled");
-        assert_eq!(
-            body["detail"],
-            "Set VELD_USER_AUTH_ENABLED=true to enable"
-        );
+        assert_eq!(body["detail"], "Set VELD_USER_AUTH_ENABLED=true to enable");
 
         let req = Request::builder()
             .method(Method::GET)
@@ -1007,8 +993,8 @@ mod tests {
         runtime.store.create_user(&alice).unwrap();
         runtime.store.create_user(&bob).unwrap();
 
-        let err = admin_set_role_with_runtime(&runtime, &alice, "bob", UserRole::Admin)
-            .unwrap_err();
+        let err =
+            admin_set_role_with_runtime(&runtime, &alice, "bob", UserRole::Admin).unwrap_err();
         assert!(matches!(err, AuthError::Forbidden), "{err:?}");
         // bob's role unchanged.
         let bob_after = runtime.store.find_user_by_username("bob").unwrap().unwrap();
@@ -1022,8 +1008,8 @@ mod tests {
         let admin = fixture_user("root", UserRole::Admin);
         runtime.store.create_user(&admin).unwrap();
 
-        let err = admin_set_role_with_runtime(&runtime, &admin, "nobody", UserRole::Admin)
-            .unwrap_err();
+        let err =
+            admin_set_role_with_runtime(&runtime, &admin, "nobody", UserRole::Admin).unwrap_err();
         assert!(matches!(err, AuthError::UserNotFound), "{err:?}");
     }
 
@@ -1039,14 +1025,18 @@ mod tests {
 
         // An admin self-demoting themselves while they're the only admin
         // must be refused.
-        let err = admin_set_role_with_runtime(&runtime, &admin, "root", UserRole::User)
-            .unwrap_err();
+        let err =
+            admin_set_role_with_runtime(&runtime, &admin, "root", UserRole::User).unwrap_err();
         assert!(matches!(err, AuthError::LastAdmin), "{err:?}");
         assert_eq!(err.status_code(), StatusCode::CONFLICT);
         assert_eq!(err.code(), "LAST_ADMIN");
 
         // root still has Admin role.
-        let still = runtime.store.find_user_by_username("root").unwrap().unwrap();
+        let still = runtime
+            .store
+            .find_user_by_username("root")
+            .unwrap()
+            .unwrap();
         assert_eq!(still.role, UserRole::Admin);
     }
 
@@ -1070,8 +1060,8 @@ mod tests {
         assert_eq!(after.role, UserRole::User);
 
         // Now there's exactly one admin again — demoting root must fail.
-        let err = admin_set_role_with_runtime(&runtime, &admin, "root", UserRole::User)
-            .unwrap_err();
+        let err =
+            admin_set_role_with_runtime(&runtime, &admin, "root", UserRole::User).unwrap_err();
         assert!(matches!(err, AuthError::LastAdmin), "{err:?}");
     }
 
@@ -1136,14 +1126,8 @@ mod tests {
         let removed = runtime.store.delete_all_sessions_for_user(&bob.id).unwrap();
         assert_eq!(removed, 2);
         // Both tokens are now dead.
-        assert!(runtime
-            .store
-            .validate_and_refresh(&token_a, now)
-            .is_err());
-        assert!(runtime
-            .store
-            .validate_and_refresh(&token_b, now)
-            .is_err());
+        assert!(runtime.store.validate_and_refresh(&token_a, now).is_err());
+        assert!(runtime.store.validate_and_refresh(&token_b, now).is_err());
     }
 
     #[test]
@@ -1172,9 +1156,6 @@ mod tests {
         let still = runtime.store.validate_and_refresh(&token_a, now).unwrap();
         assert_eq!(still.id, bob.id);
         // token_b is gone.
-        assert!(runtime
-            .store
-            .validate_and_refresh(&token_b, now)
-            .is_err());
+        assert!(runtime.store.validate_and_refresh(&token_b, now).is_err());
     }
 }

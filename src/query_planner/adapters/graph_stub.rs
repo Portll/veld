@@ -33,12 +33,7 @@ impl GraphQuerier for StubGraphQuerier {
         Ok(Vec::new())
     }
 
-    async fn matches(
-        &self,
-        _user_id: &str,
-        _memory_id: &str,
-        _p: &GraphPredicate,
-    ) -> Result<bool> {
+    async fn matches(&self, _user_id: &str, _memory_id: &str, _p: &GraphPredicate) -> Result<bool> {
         Ok(false)
     }
 }

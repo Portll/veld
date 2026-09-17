@@ -759,40 +759,37 @@ fn extract_onnx_runtime(archive_path: &Path, dest_dir: &Path) -> Result<()> {
             }
             tracing::info!("Extracted {} from {} ({} bytes)", lib_name, file_name, size);
 
-                // macOS Gatekeeper blocks unsigned dylibs downloaded from the internet.
-                // Remove the quarantine xattr and ad-hoc sign so dlopen succeeds.
-                #[cfg(target_os = "macos")]
-                {
-                    // Remove com.apple.quarantine attribute (silent fail if not present)
-                    let _ = std::process::Command::new("xattr")
-                        .args(["-d", "com.apple.quarantine"])
-                        .arg(&dest_path)
-                        .output();
+            // macOS Gatekeeper blocks unsigned dylibs downloaded from the internet.
+            // Remove the quarantine xattr and ad-hoc sign so dlopen succeeds.
+            #[cfg(target_os = "macos")]
+            {
+                // Remove com.apple.quarantine attribute (silent fail if not present)
+                let _ = std::process::Command::new("xattr")
+                    .args(["-d", "com.apple.quarantine"])
+                    .arg(&dest_path)
+                    .output();
 
-                    // Ad-hoc code sign (no identity needed, just removes the unsigned flag)
-                    match std::process::Command::new("codesign")
-                        .args(["--force", "--deep", "-s", "-"])
-                        .arg(&dest_path)
-                        .output()
-                    {
-                        Ok(output) if output.status.success() => {
-                            tracing::info!("Ad-hoc signed {} for macOS Gatekeeper", lib_name);
-                        }
-                        Ok(output) => {
-                            tracing::warn!(
-                                "codesign returned non-zero for {}: {}",
-                                lib_name,
-                                String::from_utf8_lossy(&output.stderr)
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "codesign not available ({}), dlopen may fail on macOS",
-                                e
-                            );
-                        }
+                // Ad-hoc code sign (no identity needed, just removes the unsigned flag)
+                match std::process::Command::new("codesign")
+                    .args(["--force", "--deep", "-s", "-"])
+                    .arg(&dest_path)
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {
+                        tracing::info!("Ad-hoc signed {} for macOS Gatekeeper", lib_name);
+                    }
+                    Ok(output) => {
+                        tracing::warn!(
+                            "codesign returned non-zero for {}: {}",
+                            lib_name,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("codesign not available ({}), dlopen may fail on macOS", e);
                     }
                 }
+            }
 
             return Ok(());
         }
@@ -842,16 +839,36 @@ mod runtime_library_predicate_tests {
     #[test]
     fn the_predicate_takes_the_library_and_leaves_the_stubs() {
         for (name, want, why) in [
-            ("libonnxruntime.1.23.2.dylib", true, "the real macOS library"),
-            ("libonnxruntime.dylib", true, "unversioned name — real file on some layouts"),
+            (
+                "libonnxruntime.1.23.2.dylib",
+                true,
+                "the real macOS library",
+            ),
+            (
+                "libonnxruntime.dylib",
+                true,
+                "unversioned name — real file on some layouts",
+            ),
             ("libonnxruntime.so.1.23.2", true, "the real Linux library"),
             ("libonnxruntime.so", true, "unversioned Linux name"),
             // The one that made the first fix wrong: a REGULAR FILE, ~14KB, which
             // starts_with("libonnxruntime") and contains(".so").
-            ("libonnxruntime_providers_shared.so", false, "provider stub, would clobber a 35MB lib"),
+            (
+                "libonnxruntime_providers_shared.so",
+                false,
+                "provider stub, would clobber a 35MB lib",
+            ),
             ("libonnxruntime_providers_cuda.so", false, "provider stub"),
-            ("libonnxruntime.pc", false, "330-byte pkgconfig, carries the dot but is not a library"),
-            ("libonnxruntime_test.dylib", false, "underscore, not the library"),
+            (
+                "libonnxruntime.pc",
+                false,
+                "330-byte pkgconfig, carries the dot but is not a library",
+            ),
+            (
+                "libonnxruntime_test.dylib",
+                false,
+                "underscore, not the library",
+            ),
             ("onnxruntime.dylib", false, "missing the lib prefix"),
             ("README.md", false, "unrelated"),
         ] {
@@ -870,7 +887,10 @@ mod runtime_library_predicate_tests {
         let stub = ("libonnxruntime_providers_shared.so".to_string(), 14_000u64);
         let real = ("libonnxruntime.so.1.23.2".to_string(), 35_138_784u64);
 
-        for candidates in [vec![stub.clone(), real.clone()], vec![real.clone(), stub.clone()]] {
+        for candidates in [
+            vec![stub.clone(), real.clone()],
+            vec![real.clone(), stub.clone()],
+        ] {
             let mut kept: Vec<_> = candidates
                 .into_iter()
                 .filter(|(n, _)| is_runtime_library(n, "libonnxruntime.so"))

@@ -232,11 +232,7 @@ impl DatasetStore for RelationalDatasetStore {
         // (user_id, name), so an INSERT would fail anyway — but the catalog
         // error path is opaque (driver-specific); a structured check first
         // gives callers a clean `AlreadyExists`.
-        if self
-            .catalog_lookup(user_id, &schema.name)
-            .await?
-            .is_some()
-        {
+        if self.catalog_lookup(user_id, &schema.name).await?.is_some() {
             return Err(DatasetError::AlreadyExists(schema.name.clone()));
         }
 
@@ -287,13 +283,11 @@ impl DatasetStore for RelationalDatasetStore {
     }
 
     async fn drop_dataset(&self, dataset: &DatasetRef) -> Result<(), DatasetError> {
-        let (table, _schema, _ts) = match self
-            .catalog_lookup(&dataset.user_id, &dataset.name)
-            .await?
-        {
-            Some(found) => found,
-            None => return Err(DatasetError::NotFound(dataset.name.clone())),
-        };
+        let (table, _schema, _ts) =
+            match self.catalog_lookup(&dataset.user_id, &dataset.name).await? {
+                Some(found) => found,
+                None => return Err(DatasetError::NotFound(dataset.name.clone())),
+            };
 
         // Drop the data table first; if the catalog row remains after a
         // failed DROP, a retry will eventually clean both up. The reverse
@@ -328,13 +322,11 @@ impl DatasetStore for RelationalDatasetStore {
             return Ok(0);
         }
 
-        let (table, schema, _ts) = match self
-            .catalog_lookup(&dataset.user_id, &dataset.name)
-            .await?
-        {
-            Some(found) => found,
-            None => return Err(DatasetError::NotFound(dataset.name.clone())),
-        };
+        let (table, schema, _ts) =
+            match self.catalog_lookup(&dataset.user_id, &dataset.name).await? {
+                Some(found) => found,
+                None => return Err(DatasetError::NotFound(dataset.name.clone())),
+            };
 
         // Validate every row's columns against the schema. We use the
         // schema's declared column order to drive the INSERT, so missing
@@ -428,22 +420,20 @@ impl DatasetStore for RelationalDatasetStore {
     }
 
     async fn count_rows(&self, dataset: &DatasetRef) -> Result<u64, DatasetError> {
-        let (table, _schema, _ts) = match self
-            .catalog_lookup(&dataset.user_id, &dataset.name)
-            .await?
-        {
-            Some(found) => found,
-            None => return Err(DatasetError::NotFound(dataset.name.clone())),
-        };
+        let (table, _schema, _ts) =
+            match self.catalog_lookup(&dataset.user_id, &dataset.name).await? {
+                Some(found) => found,
+                None => return Err(DatasetError::NotFound(dataset.name.clone())),
+            };
         let sql = format!("SELECT COUNT(*) FROM \"{table}\"");
         let rows = self
             .store
             .query(&sql, &[])
             .await
             .map_err(|e| DatasetError::Internal(format!("count query failed: {e}")))?;
-        let row = rows.first().ok_or_else(|| {
-            DatasetError::Internal("count query returned no rows".into())
-        })?;
+        let row = rows
+            .first()
+            .ok_or_else(|| DatasetError::Internal("count query returned no rows".into()))?;
         let count: i64 = row
             .get(0)
             .map_err(|e| DatasetError::Internal(format!("count decode: {e}")))?;
@@ -477,13 +467,10 @@ impl DatasetStore for RelationalDatasetStore {
                 .get(3)
                 .map_err(|e| DatasetError::Internal(format!("list decode table_name: {e}")))?;
 
-            let schema: DatasetSchema = serde_json::from_str(&schema_json).map_err(|e| {
-                DatasetError::Internal(format!("list decode schema_json: {e}"))
-            })?;
+            let schema: DatasetSchema = serde_json::from_str(&schema_json)
+                .map_err(|e| DatasetError::Internal(format!("list decode schema_json: {e}")))?;
             let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                .map_err(|e| {
-                    DatasetError::Internal(format!("list decode created_at parse: {e}"))
-                })?
+                .map_err(|e| DatasetError::Internal(format!("list decode created_at parse: {e}")))?
                 .with_timezone(&chrono::Utc);
 
             let count_sql = format!("SELECT COUNT(*) FROM \"{table_name}\"");
@@ -531,15 +518,8 @@ mod tests {
     impl RelationalStore for BoxErrorSqlite {
         type Error = BoxError;
 
-        async fn execute(
-            &self,
-            sql: &str,
-            params: &[Param<'_>],
-        ) -> Result<u64, BoxError> {
-            self.0
-                .execute(sql, params)
-                .await
-                .map_err(BoxError::new)
+        async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64, BoxError> {
+            self.0.execute(sql, params).await.map_err(BoxError::new)
         }
 
         async fn query(
@@ -547,10 +527,7 @@ mod tests {
             sql: &str,
             params: &[Param<'_>],
         ) -> Result<Vec<crate::storage::relational::Row>, BoxError> {
-            self.0
-                .query(sql, params)
-                .await
-                .map_err(BoxError::new)
+            self.0.query(sql, params).await.map_err(BoxError::new)
         }
 
         fn backend(&self) -> RelationalBackend {
@@ -562,8 +539,7 @@ mod tests {
         let sqlite = SqliteRelationalStore::in_memory()
             .await
             .expect("open in-memory sqlite");
-        let store: Arc<dyn RelationalStore<Error = BoxError>> =
-            Arc::new(BoxErrorSqlite(sqlite));
+        let store: Arc<dyn RelationalStore<Error = BoxError>> = Arc::new(BoxErrorSqlite(sqlite));
         RelationalDatasetStore::new(store)
             .await
             .expect("init relational dataset store")
@@ -665,10 +641,7 @@ mod tests {
             Err(DatasetError::NotFound(_)) => {}
             other => panic!("expected NotFound for cross-tenant drop, got {other:?}"),
         }
-        match ds
-            .insert_rows(&spoof, &[row(99, "evil")])
-            .await
-        {
+        match ds.insert_rows(&spoof, &[row(99, "evil")]).await {
             Err(DatasetError::NotFound(_)) => {}
             other => panic!("expected NotFound for cross-tenant insert, got {other:?}"),
         }

@@ -670,8 +670,7 @@ pub struct SemanticFact {
 }
 
 /// Types of semantic facts
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FactType {
     /// User preference: "prefers concise code"
     Preference,
@@ -902,9 +901,7 @@ impl SemanticConsolidator {
         let now = chrono::Utc::now();
         let mut added = 0usize;
         for llm_fact in llm_facts {
-            if llm_fact.fact.trim().is_empty()
-                || existing.contains(&llm_fact.fact.to_lowercase())
-            {
+            if llm_fact.fact.trim().is_empty() || existing.contains(&llm_fact.fact.to_lowercase()) {
                 continue;
             }
             let fact_type = self.classify_fact(&llm_fact.fact);
@@ -1325,8 +1322,7 @@ impl SemanticConsolidator {
                 let subject = &content[subject_start..pos];
 
                 if subject.len() >= 2 {
-                    let def_end = content[pos + marker.len()..]
-                        .find(['.', '!', '?', ',']);
+                    let def_end = content[pos + marker.len()..].find(['.', '!', '?', ',']);
                     let def_end = def_end
                         .map(|i| pos + marker.len() + i)
                         .unwrap_or(content.len().min(pos + marker.len() + 100));
@@ -1705,7 +1701,10 @@ mod tests {
         let c_low = pipeline.compress(&low).unwrap();
         assert_eq!(pipeline.get_strategy(&c_low), Some("semantic"));
         assert_eq!(c_low.experience.content, body);
-        assert_eq!(pipeline.decompress(&c_low).unwrap().experience.content, body);
+        assert_eq!(
+            pipeline.decompress(&c_low).unwrap().experience.content,
+            body
+        );
     }
 
     /// A record the pre-fix compressor wrote: body replaced by a `...` summary, `keywords` present,
@@ -1716,19 +1715,36 @@ mod tests {
     fn legacy_lossy_record_is_detected_under_any_label_and_refuses_to_decompress() {
         let pipeline = CompressionPipeline::new();
         for label in ["lz4", "hybrid", "semantic"] {
-            let mut legacy = create_test_memory("first fifty words of a document that is gone...", 0.3);
+            let mut legacy =
+                create_test_memory("first fifty words of a document that is gone...", 0.3);
             legacy.compressed = true;
             let meta = &mut legacy.experience.metadata;
             meta.insert("keywords".to_string(), "document,gone".to_string());
             meta.insert("compression_strategy".to_string(), label.to_string());
             if label != "semantic" {
                 // A blob is present on the old lz4/hybrid records; it holds the summary experience.
-                let blob = pipeline.compress_lz4(&create_test_memory("first fifty words of a document that is gone...", 0.3)).unwrap();
-                let data = blob.experience.metadata.get("compressed_data").unwrap().clone();
-                legacy.experience.metadata.insert("compressed_data".to_string(), data);
+                let blob = pipeline
+                    .compress_lz4(&create_test_memory(
+                        "first fifty words of a document that is gone...",
+                        0.3,
+                    ))
+                    .unwrap();
+                let data = blob
+                    .experience
+                    .metadata
+                    .get("compressed_data")
+                    .unwrap()
+                    .clone();
+                legacy
+                    .experience
+                    .metadata
+                    .insert("compressed_data".to_string(), data);
             }
 
-            assert!(!pipeline.is_lossless(&legacy), "label {label}: a destroyed body is not lossless");
+            assert!(
+                !pipeline.is_lossless(&legacy),
+                "label {label}: a destroyed body is not lossless"
+            );
             let err = pipeline.decompress(&legacy).unwrap_err().to_string();
             assert!(err.contains("not recoverable"), "label {label}: got {err}");
         }
@@ -1741,7 +1757,10 @@ mod tests {
         let memory = create_test_memory("To be continued...", 0.9);
         let compressed = pipeline.compress_lz4(&memory).unwrap();
         assert!(pipeline.is_lossless(&compressed));
-        assert_eq!(pipeline.decompress(&compressed).unwrap().experience.content, "To be continued...");
+        assert_eq!(
+            pipeline.decompress(&compressed).unwrap().experience.content,
+            "To be continued..."
+        );
     }
 
     /// The fallthrough default decided the fate of every ordinary memory. Hybrid meant lossy.
@@ -1818,7 +1837,10 @@ mod tests {
         let memory = create_test_memory("Written before the flag existed", 0.1);
         let mut json: serde_json::Value = serde_json::to_value(&memory).unwrap();
         json.as_object_mut().unwrap().remove("persistent");
-        assert!(json.get("persistent").is_none(), "field removed for the test");
+        assert!(
+            json.get("persistent").is_none(),
+            "field removed for the test"
+        );
 
         let restored: Memory = serde_json::from_value(json).unwrap();
         assert!(

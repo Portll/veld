@@ -249,9 +249,7 @@ impl Queue {
             }
         }
         for k in to_delete {
-            self.store
-                .delete_bytes(&k)
-                .context("cold-start delete")?;
+            self.store.delete_bytes(&k).context("cold-start delete")?;
             purged += 1;
         }
         if purged > 0 {
@@ -290,10 +288,9 @@ impl Queue {
 /// callers can `continue` past stale entries (R32). Hard decode failures
 /// surface as `Err`.
 fn decode_item(bytes: &[u8]) -> Result<Option<QueueItem>> {
-    let item: QueueItem =
-        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map(|(s, _)| s)
-            .context("decode QueueItem")?;
+    let item: QueueItem = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+        .map(|(s, _)| s)
+        .context("decode QueueItem")?;
     if item.schema_version != QUEUE_ITEM_SCHEMA_VERSION {
         return Ok(None);
     }
@@ -340,16 +337,34 @@ mod tests {
     fn enqueue_debounced_drops_duplicates() {
         for (backend, q, _tmp) in queues() {
             let first = q
-                .enqueue_debounced("u", SleepMode::Nrem, SleepTimeTrigger::Idle, Duration::seconds(60))
+                .enqueue_debounced(
+                    "u",
+                    SleepMode::Nrem,
+                    SleepTimeTrigger::Idle,
+                    Duration::seconds(60),
+                )
                 .unwrap();
             assert!(first.is_some(), "{backend:?}");
             let second = q
-                .enqueue_debounced("u", SleepMode::Nrem, SleepTimeTrigger::Idle, Duration::seconds(60))
+                .enqueue_debounced(
+                    "u",
+                    SleepMode::Nrem,
+                    SleepTimeTrigger::Idle,
+                    Duration::seconds(60),
+                )
                 .unwrap();
-            assert!(second.is_none(), "{backend:?}: duplicate within window should be dropped");
+            assert!(
+                second.is_none(),
+                "{backend:?}: duplicate within window should be dropped"
+            );
             // Different mode bypasses the debounce.
             let third = q
-                .enqueue_debounced("u", SleepMode::Rem, SleepTimeTrigger::Idle, Duration::seconds(60))
+                .enqueue_debounced(
+                    "u",
+                    SleepMode::Rem,
+                    SleepTimeTrigger::Idle,
+                    Duration::seconds(60),
+                )
                 .unwrap();
             assert!(third.is_some(), "{backend:?}");
         }
@@ -362,14 +377,25 @@ mod tests {
             let stored = q.enqueue(item).unwrap();
 
             let claimed = q.claim(&stored, "worker-1", 300).unwrap().unwrap();
-            assert_eq!(claimed.claimed_by.as_deref(), Some("worker-1"), "{backend:?}");
+            assert_eq!(
+                claimed.claimed_by.as_deref(),
+                Some("worker-1"),
+                "{backend:?}"
+            );
             // Re-claim attempt should fail while leased.
             let racey = q.claim(&claimed, "worker-2", 300).unwrap();
-            assert!(racey.is_none(), "{backend:?}: a leased item was claimed twice");
+            assert!(
+                racey.is_none(),
+                "{backend:?}: a leased item was claimed twice"
+            );
 
             q.release(&claimed).unwrap();
             let re_claimed = q.claim(&claimed, "worker-2", 300).unwrap().unwrap();
-            assert_eq!(re_claimed.claimed_by.as_deref(), Some("worker-2"), "{backend:?}");
+            assert_eq!(
+                re_claimed.claimed_by.as_deref(),
+                Some("worker-2"),
+                "{backend:?}"
+            );
         }
     }
 
@@ -406,15 +432,31 @@ mod tests {
     #[test]
     fn distinct_users_returns_unique_set() {
         for (backend, q, _tmp) in queues() {
-            q.enqueue(QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Nrem))
-                .unwrap();
-            q.enqueue(QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Rem))
-                .unwrap();
-            q.enqueue(QueueItem::new("bob", SleepTimeTrigger::Manual, SleepMode::Nrem))
-                .unwrap();
+            q.enqueue(QueueItem::new(
+                "alice",
+                SleepTimeTrigger::Idle,
+                SleepMode::Nrem,
+            ))
+            .unwrap();
+            q.enqueue(QueueItem::new(
+                "alice",
+                SleepTimeTrigger::Idle,
+                SleepMode::Rem,
+            ))
+            .unwrap();
+            q.enqueue(QueueItem::new(
+                "bob",
+                SleepTimeTrigger::Manual,
+                SleepMode::Nrem,
+            ))
+            .unwrap();
             let mut users = q.distinct_users().unwrap();
             users.sort();
-            assert_eq!(users, vec!["alice".to_string(), "bob".to_string()], "{backend:?}");
+            assert_eq!(
+                users,
+                vec!["alice".to_string(), "bob".to_string()],
+                "{backend:?}"
+            );
         }
     }
 
@@ -422,10 +464,18 @@ mod tests {
     fn scan_user_does_not_leak_a_neighbouring_prefix() {
         // `al:` must not match `alice:` rows; the bound is the store's, not a hand break.
         for (backend, q, _tmp) in queues() {
-            q.enqueue(QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Nrem))
-                .unwrap();
-            q.enqueue(QueueItem::new("al", SleepTimeTrigger::Idle, SleepMode::Nrem))
-                .unwrap();
+            q.enqueue(QueueItem::new(
+                "alice",
+                SleepTimeTrigger::Idle,
+                SleepMode::Nrem,
+            ))
+            .unwrap();
+            q.enqueue(QueueItem::new(
+                "al",
+                SleepTimeTrigger::Idle,
+                SleepMode::Nrem,
+            ))
+            .unwrap();
             assert_eq!(q.scan_user("al").unwrap().len(), 1, "{backend:?}");
             assert_eq!(q.pending_count("alice").unwrap(), 1, "{backend:?}");
         }

@@ -19,7 +19,10 @@ use clap::Parser;
 use veld::embeddings::downloader;
 
 #[derive(Parser)]
-#[command(name = "model-fetch", about = "Download veld's ONNX models, checksum-verified")]
+#[command(
+    name = "model-fetch",
+    about = "Download veld's ONNX models, checksum-verified"
+)]
 struct Args {
     /// all-MiniLM-L6-v2 — the sentence embedder. Without it the server silently runs a
     /// hash-bigram fallback that produces vectors of the right shape and no semantic meaning.
@@ -67,10 +70,34 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.status || !(args.minilm || args.ner || args.nomic || args.onnxruntime) {
-        println!("minilm  {}", present(downloader::are_models_downloaded(), downloader::get_models_dir()));
-        println!("ner     {}", present(downloader::are_ner_models_downloaded(), downloader::get_ner_models_dir()));
-        println!("nomic   {}", present(downloader::are_nomic_models_downloaded(), downloader::get_nomic_models_dir()));
-        println!("onnxrt  {}", present(downloader::is_onnx_runtime_downloaded(), downloader::get_onnx_runtime_dir()));
+        println!(
+            "minilm  {}",
+            present(
+                downloader::are_models_downloaded(),
+                downloader::get_models_dir()
+            )
+        );
+        println!(
+            "ner     {}",
+            present(
+                downloader::are_ner_models_downloaded(),
+                downloader::get_ner_models_dir()
+            )
+        );
+        println!(
+            "nomic   {}",
+            present(
+                downloader::are_nomic_models_downloaded(),
+                downloader::get_nomic_models_dir()
+            )
+        );
+        println!(
+            "onnxrt  {}",
+            present(
+                downloader::is_onnx_runtime_downloaded(),
+                downloader::get_onnx_runtime_dir()
+            )
+        );
         if !args.status {
             println!("\nnothing selected; pass --minilm / --ner / --nomic to fetch.");
         }
@@ -102,10 +129,34 @@ fn main() -> Result<()> {
     // A downloader that reports its own success is reporting that it finished, not that the server
     // will find anything.
     println!();
-    println!("minilm  {}", present(downloader::are_models_downloaded(), downloader::get_models_dir()));
-    println!("ner     {}", present(downloader::are_ner_models_downloaded(), downloader::get_ner_models_dir()));
-    println!("nomic   {}", present(downloader::are_nomic_models_downloaded(), downloader::get_nomic_models_dir()));
-    println!("onnxrt  {}", present(downloader::is_onnx_runtime_downloaded(), downloader::get_onnx_runtime_dir()));
+    println!(
+        "minilm  {}",
+        present(
+            downloader::are_models_downloaded(),
+            downloader::get_models_dir()
+        )
+    );
+    println!(
+        "ner     {}",
+        present(
+            downloader::are_ner_models_downloaded(),
+            downloader::get_ner_models_dir()
+        )
+    );
+    println!(
+        "nomic   {}",
+        present(
+            downloader::are_nomic_models_downloaded(),
+            downloader::get_nomic_models_dir()
+        )
+    );
+    println!(
+        "onnxrt  {}",
+        present(
+            downloader::is_onnx_runtime_downloaded(),
+            downloader::get_onnx_runtime_dir()
+        )
+    );
     Ok(())
 }
 

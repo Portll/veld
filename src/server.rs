@@ -16,9 +16,9 @@ use crate::{
     auth,
     config::{ServerConfig, StorageBackend},
     embeddings::minilm::pre_init_ort_runtime,
+    metrics, middleware,
     rate_limit_governance::{RateLimitGovernanceLayer, ResetHandle},
     server_runtime::{AppState, ServerRuntime},
-    metrics, middleware,
 };
 
 #[cfg(feature = "telemetry")]
@@ -56,11 +56,10 @@ pub struct ServerRunConfig {
 /// Environment variables are set **before** the tokio runtime is created, so no
 /// threads exist yet. This avoids the `set_var` unsoundness on multi-threaded runtimes.
 pub fn run(config: ServerRunConfig) -> Result<()> {
-    let local_dev_rate_limit_default =
-        !config.production
-            && crate::config::is_local_bind_host(&config.host)
-            && std::env::var("VELD_RATE_LIMIT").is_err()
-            && config.rate_limit == 4000;
+    let local_dev_rate_limit_default = !config.production
+        && crate::config::is_local_bind_host(&config.host)
+        && std::env::var("VELD_RATE_LIMIT").is_err()
+        && config.rate_limit == 4000;
     let effective_rate_limit = if local_dev_rate_limit_default {
         0
     } else {
@@ -379,22 +378,22 @@ async fn async_main() -> Result<()> {
             let requested_storage_backend = requested_storage_backend.clone();
             let effective_storage_backend = effective_storage_backend.clone();
             async move {
-            axum::Json(serde_json::json!({
-                "name": "veld",
-                "version": env!("VELD_VERSION_FULL"),
-                "description": "Cognitive Memory for AI Agents",
-                "requested_storage_backend": requested_storage_backend,
-                "effective_storage_backend": effective_storage_backend,
-                "health": "/health",
-                "api": {
-                    "remember": "POST /api/remember",
-                    "recall": "POST /api/recall",
-                    "forget": "POST /api/forget",
-                    "todos": "GET /api/todos",
-                    "graph": "GET /api/graph/stats"
-                },
-                "docs": "https://github.com/Portll/veld"
-            }))
+                axum::Json(serde_json::json!({
+                    "name": "veld",
+                    "version": env!("VELD_VERSION_FULL"),
+                    "description": "Cognitive Memory for AI Agents",
+                    "requested_storage_backend": requested_storage_backend,
+                    "effective_storage_backend": effective_storage_backend,
+                    "health": "/health",
+                    "api": {
+                        "remember": "POST /api/remember",
+                        "recall": "POST /api/recall",
+                        "forget": "POST /api/forget",
+                        "todos": "GET /api/todos",
+                        "graph": "GET /api/graph/stats"
+                    },
+                    "docs": "https://github.com/Portll/veld"
+                }))
             }
         }),
     );
@@ -910,7 +909,11 @@ fn print_config(config: &ServerConfig) {
     }
     eprintln!(
         "     Encryption: {}",
-        if encryption_enabled { "enabled" } else { "disabled" }
+        if encryption_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     if config.cors.deny_all {
         eprintln!("     CORS:    deny-all (set VELD_CORS_ORIGINS)");
@@ -942,9 +945,7 @@ fn log_production_security_warnings(config: &ServerConfig) {
     }
 
     if config.rate_limit_per_second == 0 {
-        warn!(
-            "PRODUCTION WARNING: rate limiting is disabled (VELD_RATE_LIMIT=0)."
-        );
+        warn!("PRODUCTION WARNING: rate limiting is disabled (VELD_RATE_LIMIT=0).");
     }
 
     // TLS posture: Veld does not terminate TLS itself. Binding to a non-local
@@ -1011,8 +1012,7 @@ fn print_ready_message(addr: SocketAddr) {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
         if zenoh_enabled {
-            let prefix =
-                std::env::var("VELD_ZENOH_PREFIX").unwrap_or_else(|_| "veld".to_string());
+            let prefix = std::env::var("VELD_ZENOH_PREFIX").unwrap_or_else(|_| "veld".to_string());
             eprintln!(
                 "     Zenoh:     {}/*/{{remember,recall,forget,stream,mission}}",
                 prefix

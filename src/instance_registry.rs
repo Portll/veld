@@ -348,7 +348,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let now = Utc::now();
         write_atomic(&dir, &sample(101, 3030, now)).unwrap();
-        write_atomic(&dir, &sample(102, 3031, now - chrono::Duration::seconds(300))).unwrap();
+        write_atomic(
+            &dir,
+            &sample(102, 3031, now - chrono::Duration::seconds(300)),
+        )
+        .unwrap();
 
         assert_eq!(read_all(&dir).len(), 2);
         let live: Vec<_> = read_all(&dir)

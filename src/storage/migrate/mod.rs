@@ -42,10 +42,21 @@ const VMAPPING: &[u8] = b"vmapping:";
 /// `MemoryStorage::cleanup_corrupted`'s list: rows in the rocksdb default family that are
 /// not memories even when their key happens to be 16 bytes long.
 const NON_MEMORY_PREFIXES: &[&[u8]] = &[
-    b"stats:", b"vmapping:", b"interference:", b"interference_meta:", b"_watermark:",
-    b"facts:", b"facts_by_entity:", b"facts_by_type:", b"facts_embedding:",
-    b"temporal_facts:", b"temporal_by_time:", b"temporal_by_entity:", b"lineage:",
-    b"learning:", b"geo:",
+    b"stats:",
+    b"vmapping:",
+    b"interference:",
+    b"interference_meta:",
+    b"_watermark:",
+    b"facts:",
+    b"facts_by_entity:",
+    b"facts_by_type:",
+    b"facts_embedding:",
+    b"temporal_facts:",
+    b"temporal_by_time:",
+    b"temporal_by_entity:",
+    b"lineage:",
+    b"learning:",
+    b"geo:",
 ];
 const ROCKS_BATCH_OPS: usize = 10_000;
 
@@ -223,7 +234,10 @@ pub fn resolve_units(base: &Path, backend: StorageBackend, scope: &Scope) -> Res
         Scope::User(id) => {
             let unit = Unit::User(id.clone());
             if !unit_present(base, backend, &unit)? {
-                bail!("no {backend} store for user '{id}' under {}", base.display());
+                bail!(
+                    "no {backend} store for user '{id}' under {}",
+                    base.display()
+                );
             }
             Ok(vec![unit])
         }
@@ -238,7 +252,10 @@ pub fn resolve_units(base: &Path, backend: StorageBackend, scope: &Scope) -> Res
                 }
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else {
-                    bail!("{} holds a directory whose name is not utf-8", base.display());
+                    bail!(
+                        "{} holds a directory whose name is not utf-8",
+                        base.display()
+                    );
                 };
                 let candidate = Unit::User(name.to_string());
                 if crate::validation::validate_user_id(name).is_err() {
@@ -365,7 +382,11 @@ fn extract_with<W: Write>(
     out: W,
     quarantine: Option<&mut QuarantineWriter>,
 ) -> Result<Extraction> {
-    let mut sink = Sink { writer: PortableWriter::new(out)?, stats: Extraction::default(), quarantine };
+    let mut sink = Sink {
+        writer: PortableWriter::new(out)?,
+        stats: Extraction::default(),
+        quarantine,
+    };
     for (key, value) in meta_frames(unit) {
         sink.frame(META, key.as_bytes(), &value)?;
     }
@@ -373,18 +394,26 @@ fn extract_with<W: Write>(
         (StorageBackend::RocksDb, Unit::User(id)) => {
             let dir = user_dir(base, id)?;
             rocks_primary(&mut sink, &dir.join("storage"))?;
-            rocks_families(&mut sink, &dir.join("graph/graph"), |cf| format!("graph/{cf}"))?;
+            rocks_families(&mut sink, &dir.join("graph/graph"), |cf| {
+                format!("graph/{cf}")
+            })?;
         }
         (StorageBackend::RocksDb, Unit::Shared) => {
             rocks_families(&mut sink, &base.join("shared"), |cf| {
-                if cf == "audit" { "audit/audit".to_string() } else { format!("shared/{cf}") }
+                if cf == "audit" {
+                    "audit/audit".to_string()
+                } else {
+                    format!("shared/{cf}")
+                }
             })?;
         }
         #[cfg(feature = "storage-redb")]
         (StorageBackend::Redb, Unit::User(id)) => {
             let dir = user_dir(base, id)?;
             redb_primary(&mut sink, &dir.join("storage.redb"))?;
-            redb_tables_raw(&mut sink, &dir.join("graph/graph.redb"), |t| Some(format!("graph/{t}")))?;
+            redb_tables_raw(&mut sink, &dir.join("graph/graph.redb"), |t| {
+                Some(format!("graph/{t}"))
+            })?;
         }
         #[cfg(feature = "storage-redb")]
         (StorageBackend::Redb, Unit::Shared) => {
@@ -422,7 +451,9 @@ fn refuse_if_encrypted(storage_dir: &Path) -> Result<()> {
 fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
     use rocksdb::{Direction, IteratorMode};
     refuse_if_encrypted(dir)?;
-    let Some(store) = readonly::open_rocks(dir)? else { return Ok(()) };
+    let Some(store) = readonly::open_rocks(dir)? else {
+        return Ok(());
+    };
     if let Some(cf) = store
         .column_families
         .iter()
@@ -434,9 +465,8 @@ fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
     let default = db
         .cf_handle("default")
         .ok_or_else(|| anyhow!("{} has no default column family", dir.display()))?;
-    let is_memory = |key: &[u8]| {
-        key.len() == 16 && !NON_MEMORY_PREFIXES.iter().any(|p| key.starts_with(p))
-    };
+    let is_memory =
+        |key: &[u8]| key.len() == 16 && !NON_MEMORY_PREFIXES.iter().any(|p| key.starts_with(p));
 
     for item in db.iterator_cf(default, IteratorMode::Start) {
         let (key, value) = item?;
@@ -462,7 +492,12 @@ fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
                 "primary/memories",
                 &key,
                 &value,
-                format!("primary/memories {}", uuid::Uuid::from_slice(&key).map(|u| u.to_string()).unwrap_or_default()),
+                format!(
+                    "primary/memories {}",
+                    uuid::Uuid::from_slice(&key)
+                        .map(|u| u.to_string())
+                        .unwrap_or_default()
+                ),
             )?,
         }
     }
@@ -475,7 +510,10 @@ fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
         let id = std::str::from_utf8(&key[VMAPPING.len()..])
             .ok()
             .and_then(|s| uuid::Uuid::parse_str(s).ok().filter(|u| u.to_string() == s));
-        match (id, crate::memory::storage::check_vector_mapping_value(&value)) {
+        match (
+            id,
+            crate::memory::storage::check_vector_mapping_value(&value),
+        ) {
             (Some(id), Ok(())) => mappings.push((id.into_bytes(), value.to_vec())),
             _ => sink.fail(
                 "primary/vector_mappings",
@@ -503,9 +541,14 @@ fn rocks_families<W: Write>(
     dir: &Path,
     logical: impl Fn(&str) -> String,
 ) -> Result<()> {
-    let Some(store) = readonly::open_rocks(dir)? else { return Ok(()) };
-    let mut families: Vec<(String, &String)> =
-        store.column_families.iter().map(|cf| (logical(cf), cf)).collect();
+    let Some(store) = readonly::open_rocks(dir)? else {
+        return Ok(());
+    };
+    let mut families: Vec<(String, &String)> = store
+        .column_families
+        .iter()
+        .map(|cf| (logical(cf), cf))
+        .collect();
     families.sort();
     for (name, cf) in families {
         let handle = store
@@ -537,7 +580,9 @@ fn redb_table_names(read: &redb::ReadTransaction, path: &Path) -> Result<Vec<Str
 #[cfg(feature = "storage-redb")]
 fn redb_primary<W: Write>(sink: &mut Sink<W>, path: &Path) -> Result<()> {
     use redb::ReadableTable;
-    let Some(store) = readonly::open_redb(path)? else { return Ok(()) };
+    let Some(store) = readonly::open_redb(path)? else {
+        return Ok(());
+    };
     let read = store.db.begin_read()?;
     let names = redb_table_names(&read, path)?;
     if let Some(t) = names
@@ -557,12 +602,24 @@ fn redb_primary<W: Write>(sink: &mut Sink<W>, path: &Path) -> Result<()> {
             match table {
                 "memories" => match crate::memory::storage::portable_memory_value(value) {
                     Ok(bytes) if key.len() == 16 => sink.put("primary/memories", key, &bytes)?,
-                    _ => sink.fail("primary/memories", key, value, format!("primary/memories {}", redb_label(key)))?,
+                    _ => sink.fail(
+                        "primary/memories",
+                        key,
+                        value,
+                        format!("primary/memories {}", redb_label(key)),
+                    )?,
                 },
                 "vector_mappings" => {
                     match crate::memory::storage::check_vector_mapping_value(value) {
-                        Ok(()) if key.len() == 16 => sink.put("primary/vector_mappings", key, value)?,
-                        _ => sink.fail("primary/vector_mappings", key, value, format!("primary/vector_mappings {}", redb_label(key)))?,
+                        Ok(()) if key.len() == 16 => {
+                            sink.put("primary/vector_mappings", key, value)?
+                        }
+                        _ => sink.fail(
+                            "primary/vector_mappings",
+                            key,
+                            value,
+                            format!("primary/vector_mappings {}", redb_label(key)),
+                        )?,
                     }
                 }
                 other => sink.put(&format!("primary/{other}"), key, value)?,
@@ -581,7 +638,9 @@ fn redb_tables_raw<W: Write>(
     logical: impl Fn(&str) -> Option<String>,
 ) -> Result<()> {
     use redb::{ReadableTable, ReadableTableMetadata};
-    let Some(store) = readonly::open_redb(path)? else { return Ok(()) };
+    let Some(store) = readonly::open_redb(path)? else {
+        return Ok(());
+    };
     let read = store.db.begin_read()?;
     let mut tables = Vec::new();
     for name in redb_table_names(&read, path)? {
@@ -636,7 +695,10 @@ pub struct QuarantineReport {
 fn quarantine_paths(dir: &Path, unit: &Unit) -> (PathBuf, PathBuf) {
     let stem = dump_file_name(unit);
     let stem = stem.trim_end_matches(".veldport");
-    (dir.join(format!("{stem}.quarantine.veldport")), dir.join(format!("{stem}.quarantine.json")))
+    (
+        dir.join(format!("{stem}.quarantine.veldport")),
+        dir.join(format!("{stem}.quarantine.json")),
+    )
 }
 
 /// The directory must be absent or empty, and is created owner-only: it holds raw records.
@@ -653,7 +715,9 @@ fn prepare_private_dir(dir: &Path, what: &str) -> Result<()> {
             builder.recursive(true);
             #[cfg(unix)]
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            builder.create(dir).with_context(|| format!("creating {what} {}", dir.display()))
+            builder
+                .create(dir)
+                .with_context(|| format!("creating {what} {}", dir.display()))
         }
         Err(e) => Err(e).with_context(|| format!("reading {what} {}", dir.display())),
     }
@@ -709,7 +773,10 @@ fn export_unit(
             (Some(q), Some((dump, listing))) if stats.quarantined > 0 => {
                 let (count, digest) = q.writer.finish()?;
                 if count != stats.quarantined {
-                    bail!("{unit}: quarantine wrote {count} records but {} were set aside", stats.quarantined);
+                    bail!(
+                        "{unit}: quarantine wrote {count} records but {} were set aside",
+                        stats.quarantined
+                    );
                 }
                 std::fs::rename(dump.with_extension("partial"), dump)?;
                 let body = serde_json::json!({
@@ -738,7 +805,10 @@ fn export_unit(
             .with_context(|| format!("renaming {} into place", partial.display()))?;
         let (frames, digest) = portable::read_trailer(path)?;
         if frames != stats.frames || portable::hex(&digest) != stats.digest {
-            bail!("{}: the trailer on disk disagrees with what was written", path.display());
+            bail!(
+                "{}: the trailer on disk disagrees with what was written",
+                path.display()
+            );
         }
         Ok((stats, quarantine_report))
     })();
@@ -768,7 +838,10 @@ pub fn export(
     match std::fs::read_dir(out_dir) {
         Ok(mut entries) => {
             if entries.next().is_some() {
-                bail!("{} is not empty — an export directory holds exactly one export", out_dir.display());
+                bail!(
+                    "{} is not empty — an export directory holds exactly one export",
+                    out_dir.display()
+                );
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(out_dir)?,
@@ -811,7 +884,10 @@ pub fn export(
                 })
                 .collect(),
         };
-        write_atomic(&out_dir.join(MANIFEST), &serde_json::to_vec_pretty(&manifest)?)
+        write_atomic(
+            &out_dir.join(MANIFEST),
+            &serde_json::to_vec_pretty(&manifest)?,
+        )
     } else {
         Ok(())
     };
@@ -830,7 +906,10 @@ pub fn export(
         if let Some(q) = quarantine_dir {
             let _ = std::fs::remove_dir(q.join("users"));
         }
-        bail!("export failed; no dump was left behind:\n  {}", failures.join("\n  "));
+        bail!(
+            "export failed; no dump was left behind:\n  {}",
+            failures.join("\n  ")
+        );
     }
     Ok(reports)
 }
@@ -875,10 +954,15 @@ fn parse_dump(records: Vec<PortableRecord>) -> Result<(Unit, Vec<PortableRecord>
         Unit::Shared => &["audit/", "shared/"],
     };
     if let Some(rec) = data.iter().find(|r| {
-        !allowed.iter().any(|p| r.cf.starts_with(p) && r.cf.len() > p.len())
+        !allowed
+            .iter()
+            .any(|p| r.cf.starts_with(p) && r.cf.len() > p.len())
             || r.cf == META
     }) {
-        bail!("dump for {unit} carries keyspace '{}', which does not belong to it", rec.cf);
+        bail!(
+            "dump for {unit} carries keyspace '{}', which does not belong to it",
+            rec.cf
+        );
     }
     Ok((unit, data))
 }
@@ -898,18 +982,30 @@ fn collect_dumps(input: &Path) -> Result<Vec<PathBuf>> {
         return Ok(vec![input.to_path_buf()]);
     }
     let manifest_path = input.join(MANIFEST);
-    let manifest: Manifest = serde_json::from_slice(
-        &std::fs::read(&manifest_path)
-            .with_context(|| format!("{} has no readable {MANIFEST} — not a complete export", input.display()))?,
-    )
-    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let manifest: Manifest =
+        serde_json::from_slice(&std::fs::read(&manifest_path).with_context(|| {
+            format!(
+                "{} has no readable {MANIFEST} — not a complete export",
+                input.display()
+            )
+        })?)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
     if manifest.format != FORMAT {
-        bail!("{} declares format '{}', this build reads '{FORMAT}'", manifest_path.display(), manifest.format);
+        bail!(
+            "{} declares format '{}', this build reads '{FORMAT}'",
+            manifest_path.display(),
+            manifest.format
+        );
     }
     let mut listed = Vec::new();
     for entry in &manifest.dumps {
         if entry.file != dump_file_name(&entry.unit) {
-            bail!("{MANIFEST} lists '{}' for {}, expected '{}'", entry.file, entry.unit, dump_file_name(&entry.unit));
+            bail!(
+                "{MANIFEST} lists '{}' for {}, expected '{}'",
+                entry.file,
+                entry.unit,
+                dump_file_name(&entry.unit)
+            );
         }
         let path = input.join(&entry.file);
         let (frames, digest) = portable::read_trailer(&path)?;
@@ -958,12 +1054,20 @@ pub fn import(base: &Path, backend: StorageBackend, input: &Path) -> Result<Vec<
             bail!("two dumps name {unit}");
         }
         refuse_populated_target(base, backend, &unit)?;
-        pending.push(PendingImport { path, unit, frames, digest });
+        pending.push(PendingImport {
+            path,
+            unit,
+            frames,
+            digest,
+        });
     }
     let mut reports = Vec::new();
     for p in pending {
         reports.push(import_one(base, backend, &p).with_context(|| {
-            let done: Vec<String> = reports.iter().map(|r: &ImportReport| r.unit.to_string()).collect();
+            let done: Vec<String> = reports
+                .iter()
+                .map(|r: &ImportReport| r.unit.to_string())
+                .collect();
             format!(
                 "importing {} from {} (already imported and verified: [{}])",
                 p.unit,
@@ -994,7 +1098,10 @@ fn import_one(base: &Path, backend: StorageBackend, p: &PendingImport) -> Result
     let records = portable::read_all(std::fs::File::open(&p.path)?)?;
     let (unit, data) = parse_dump(records)?;
     if unit != p.unit {
-        bail!("{} changed between the preflight and the import", p.path.display());
+        bail!(
+            "{} changed between the preflight and the import",
+            p.path.display()
+        );
     }
     let record_count = data.len() as u64;
     apply(base, backend, &unit, data)?;
@@ -1035,10 +1142,16 @@ pub fn verify(
 }
 
 fn split_keyspace<'a>(cf: &'a str, component: &str) -> Option<&'a str> {
-    cf.strip_prefix(component).and_then(|rest| rest.strip_prefix('/'))
+    cf.strip_prefix(component)
+        .and_then(|rest| rest.strip_prefix('/'))
 }
 
-fn apply(base: &Path, backend: StorageBackend, unit: &Unit, data: Vec<PortableRecord>) -> Result<()> {
+fn apply(
+    base: &Path,
+    backend: StorageBackend,
+    unit: &Unit,
+    data: Vec<PortableRecord>,
+) -> Result<()> {
     match (backend, unit) {
         (StorageBackend::RocksDb, Unit::User(id)) => {
             let dir = user_dir(base, id)?;
@@ -1058,7 +1171,9 @@ fn apply(base: &Path, backend: StorageBackend, unit: &Unit, data: Vec<PortableRe
                 if cf == "audit/audit" {
                     Some("audit".to_string())
                 } else {
-                    split_keyspace(cf, "shared").filter(|t| *t != "audit").map(str::to_string)
+                    split_keyspace(cf, "shared")
+                        .filter(|t| *t != "audit")
+                        .map(str::to_string)
                 }
             })?;
         }
@@ -1074,7 +1189,9 @@ fn apply(base: &Path, backend: StorageBackend, unit: &Unit, data: Vec<PortableRe
                 })?;
             }
             if !graph.is_empty() {
-                apply_redb(&dir.join("graph/graph.redb"), &graph, |cf| split_keyspace(cf, "graph"))?;
+                apply_redb(&dir.join("graph/graph.redb"), &graph, |cf| {
+                    split_keyspace(cf, "graph")
+                })?;
             }
         }
         #[cfg(feature = "storage-redb")]
@@ -1114,7 +1231,10 @@ fn apply_redb<'a>(
         let names: Vec<String> = txn.list_tables()?.map(|t| t.name().to_string()).collect();
         for name in names {
             if txn.open_table(RawTable::new(&name))?.len()? > 0 {
-                bail!("{} gained rows in table '{name}' after the preflight — refusing to merge", path.display());
+                bail!(
+                    "{} gained rows in table '{name}' after the preflight — refusing to merge",
+                    path.display()
+                );
             }
         }
         let mut current: Option<(&str, redb::Table<'_, &'static [u8], &'static [u8]>)> = None;
@@ -1148,15 +1268,27 @@ fn open_rocks_for_import(dir: &Path, families: &[String]) -> Result<rocksdb::DB>
     let db = rocksdb::DB::open_cf(&opts, dir, &names)
         .with_context(|| format!("opening {} for import", dir.display()))?;
     for name in &names {
-        let cf = db.cf_handle(name).ok_or_else(|| anyhow!("column family '{name}' did not open"))?;
-        if db.iterator_cf(cf, rocksdb::IteratorMode::Start).next().is_some() {
-            bail!("{} gained rows in '{name}' after the preflight — refusing to merge", dir.display());
+        let cf = db
+            .cf_handle(name)
+            .ok_or_else(|| anyhow!("column family '{name}' did not open"))?;
+        if db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .next()
+            .is_some()
+        {
+            bail!(
+                "{} gained rows in '{name}' after the preflight — refusing to merge",
+                dir.display()
+            );
         }
     }
     Ok(db)
 }
 
-fn write_rocks(db: &rocksdb::DB, rows: impl Iterator<Item = Result<(String, Vec<u8>, Vec<u8>)>>) -> Result<()> {
+fn write_rocks(
+    db: &rocksdb::DB,
+    rows: impl Iterator<Item = Result<(String, Vec<u8>, Vec<u8>)>>,
+) -> Result<()> {
     let mut batch = rocksdb::WriteBatch::default();
     for row in rows {
         let (family, key, value) = row?;
@@ -1207,10 +1339,7 @@ fn apply_rocks_primary(user_dir: &Path, records: Vec<PortableRecord>) -> Result<
     let storage = user_dir.join("storage");
     refuse_if_encrypted(&storage)?;
     {
-        let db = open_rocks_for_import(
-            &storage,
-            &["kv".to_string(), "memory_index".to_string()],
-        )?;
+        let db = open_rocks_for_import(&storage, &["kv".to_string(), "memory_index".to_string()])?;
         write_rocks(
             &db,
             records.into_iter().map(|r| {
@@ -1218,12 +1347,21 @@ fn apply_rocks_primary(user_dir: &Path, records: Vec<PortableRecord>) -> Result<
                 match r.cf.as_str() {
                     "primary/default" => Ok(("default".to_string(), key, r.value)),
                     "primary/kv" => Ok(("kv".to_string(), key, r.value)),
-                    "primary/memories" if key.len() == 16 => Ok(("default".to_string(), key, r.value)),
+                    "primary/memories" if key.len() == 16 => {
+                        Ok(("default".to_string(), key, r.value))
+                    }
                     "primary/vector_mappings" if key.len() == 16 => {
                         let id = uuid::Uuid::from_slice(&key)?;
-                        Ok(("default".to_string(), format!("vmapping:{id}").into_bytes(), r.value))
+                        Ok((
+                            "default".to_string(),
+                            format!("vmapping:{id}").into_bytes(),
+                            r.value,
+                        ))
                     }
-                    other => Err(anyhow!("dump row in '{other}' has a key rocksdb cannot hold ({} bytes)", key.len())),
+                    other => Err(anyhow!(
+                        "dump row in '{other}' has a key rocksdb cannot hold ({} bytes)",
+                        key.len()
+                    )),
                 }
             }),
         )?;
@@ -1267,7 +1405,12 @@ pub fn migrate(
         quarantined: Vec::new(),
     };
     for unit in units {
-        let mut plan = UnitPlan { unit: unit.clone(), source: None, target: None, blocked: Vec::new() };
+        let mut plan = UnitPlan {
+            unit: unit.clone(),
+            source: None,
+            target: None,
+            blocked: Vec::new(),
+        };
         match extract(base, from, &unit, std::io::sink()) {
             Ok(source) => {
                 if source.decode_failures > 0 && quarantine_dir.is_none() {
@@ -1305,7 +1448,10 @@ pub fn migrate(
             .filter(|u| !u.blocked.is_empty())
             .map(|u| format!("{}: {}", u.unit, u.blocked.join("; ")))
             .collect();
-        bail!("migration refused before writing anything:\n  {}", reasons.join("\n  "));
+        bail!(
+            "migration refused before writing anything:\n  {}",
+            reasons.join("\n  ")
+        );
     }
 
     if let Some(q) = quarantine_dir {
@@ -1315,7 +1461,11 @@ pub fn migrate(
     for plan in &report.units {
         let path = work.path.join(dump_file_name(&plan.unit));
         let (exported, quarantine) = export_unit(base, from, &plan.unit, &path, quarantine_dir)?;
-        let planned = plan.source.as_ref().map(Extraction::source_records).unwrap_or(0);
+        let planned = plan
+            .source
+            .as_ref()
+            .map(Extraction::source_records)
+            .unwrap_or(0);
         if exported.source_records() != planned {
             bail!(
                 "{}: the source held {planned} records when planned and {} when exported — it changed during the migration",
@@ -1332,10 +1482,17 @@ pub fn migrate(
         };
         let imported = import_one(base, to, &pending).with_context(|| {
             let done: Vec<String> = report.imported.iter().map(|r| r.unit.to_string()).collect();
-            format!("migrating {} (already migrated and verified: [{}])", plan.unit, done.join(", "))
+            format!(
+                "migrating {} (already migrated and verified: [{}])",
+                plan.unit,
+                done.join(", ")
+            )
         })?;
         let _ = std::fs::remove_file(&path);
-        report.imported.push(ImportReport { source: PathBuf::new(), ..imported });
+        report.imported.push(ImportReport {
+            source: PathBuf::new(),
+            ..imported
+        });
     }
     Ok(report)
 }
@@ -1352,7 +1509,8 @@ impl WorkDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("veld-migrate-{}-{nanos}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("veld-migrate-{}-{nanos}", std::process::id()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

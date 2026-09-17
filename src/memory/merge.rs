@@ -187,7 +187,11 @@ impl MemoryStorage {
             }
         }
 
-        candidates.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         candidates.truncate(limit);
         Ok(candidates)
     }
@@ -198,7 +202,10 @@ impl MemoryStorage {
         // Scan `merge_tombstone:*:{id}` — cheap: each key includes the id.
         let id_str = id.0.to_string();
         let db = self.db();
-        let iter = db.iterator(IteratorMode::From(TOMBSTONE_PREFIX.as_bytes(), rocksdb::Direction::Forward));
+        let iter = db.iterator(IteratorMode::From(
+            TOMBSTONE_PREFIX.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
         for item in iter {
             let Ok((key, _)) = item else { continue };
             let key_str = String::from_utf8_lossy(&key);
@@ -735,7 +742,11 @@ pub(super) mod tests {
 
         // Resolve loser → winner via audit.
         let resolved = storage.resolve_loser(&loser_id, USER);
-        assert_eq!(resolved.as_ref(), Some(&winner_id), "(a) loser resolves to winner");
+        assert_eq!(
+            resolved.as_ref(),
+            Some(&winner_id),
+            "(a) loser resolves to winner"
+        );
 
         // Winner is still readable.
         let winner_got = storage.get(&winner_id).expect("winner must be readable");
@@ -790,7 +801,11 @@ pub(super) mod tests {
 
         // Remap must still work post-replay.
         let resolved = storage.resolve_loser(&loser_id, USER);
-        assert_eq!(resolved.as_ref(), Some(&winner_id), "(b) remap survives replay");
+        assert_eq!(
+            resolved.as_ref(),
+            Some(&winner_id),
+            "(b) remap survives replay"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -832,11 +847,19 @@ pub(super) mod tests {
 
         // Resolve A — must compress to C.
         let resolved = storage.resolve_loser(&id_a, USER);
-        assert_eq!(resolved.as_ref(), Some(&id_c), "(c) A resolves to C after path compression");
+        assert_eq!(
+            resolved.as_ref(),
+            Some(&id_c),
+            "(c) A resolves to C after path compression"
+        );
 
         // Resolve B — must still resolve to C.
         let resolved_b = storage.resolve_loser(&id_b, USER);
-        assert_eq!(resolved_b.as_ref(), Some(&id_c), "(c) B still resolves to C");
+        assert_eq!(
+            resolved_b.as_ref(),
+            Some(&id_c),
+            "(c) B still resolves to C"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -891,14 +914,18 @@ pub(super) mod tests {
         let aged_ts = TombstoneRecord {
             loser_id: loser_id.clone(),
             winner_id: winner_id.clone(),
-            tombstoned_at: Utc::now() - chrono::Duration::seconds(SEMANTIC_MERGE_GC_MAX_AGE_SECS + 10),
+            tombstoned_at: Utc::now()
+                - chrono::Duration::seconds(SEMANTIC_MERGE_GC_MAX_AGE_SECS + 10),
             user_id: USER.to_string(),
         };
         let aged_bytes = serde_json::to_vec(&aged_ts).unwrap();
         storage.db().put(ts_key.as_bytes(), &aged_bytes).unwrap();
 
         let reclaimed_with_ref = storage.gc_merge_tombstones(USER);
-        assert_eq!(reclaimed_with_ref, 0, "(d) GC must not reclaim while inbound ref exists");
+        assert_eq!(
+            reclaimed_with_ref, 0,
+            "(d) GC must not reclaim while inbound ref exists"
+        );
 
         // Remove the citing fact by storing a version without the loser in source_memories.
         // (SemanticFactStore has no delete API in this codebase, so we use a raw DB delete.)
@@ -907,7 +934,10 @@ pub(super) mod tests {
 
         // Now has_any_inbound_refs should be false → GC reclaims.
         let reclaimed_no_ref = storage.gc_merge_tombstones(USER);
-        assert_eq!(reclaimed_no_ref, 1, "(d) GC must reclaim when inbound refs are gone");
+        assert_eq!(
+            reclaimed_no_ref, 1,
+            "(d) GC must reclaim when inbound refs are gone"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -930,14 +960,23 @@ pub(super) mod tests {
 
         // The flag is OFF by default — run_merge_pass must be a no-op.
         let merged = storage.run_merge_pass(USER, 10);
-        assert_eq!(merged, 0, "(e) no merges when SEMANTIC_MERGE_ENABLED is false");
+        assert_eq!(
+            merged, 0,
+            "(e) no merges when SEMANTIC_MERGE_ENABLED is false"
+        );
 
         // Both memories must still be independently readable.
         assert!(storage.get(&id_a).is_ok(), "(e) memory A must be intact");
         assert!(storage.get(&id_b).is_ok(), "(e) memory B must be intact");
 
         // resolve_loser must return None (no audits written).
-        assert!(storage.resolve_loser(&id_a, USER).is_none(), "(e) no audit for A");
-        assert!(storage.resolve_loser(&id_b, USER).is_none(), "(e) no audit for B");
+        assert!(
+            storage.resolve_loser(&id_a, USER).is_none(),
+            "(e) no audit for A"
+        );
+        assert!(
+            storage.resolve_loser(&id_b, USER).is_none(),
+            "(e) no audit for B"
+        );
     }
 }

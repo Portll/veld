@@ -450,11 +450,11 @@ impl TodoStore {
 
         // Index by user (for listing)
         let user_key = format!("user:{}:{}", todo.user_id, id_str);
-        batch.put_cf(CF_TODO_INDEX,user_key.as_bytes(), b"1");
+        batch.put_cf(CF_TODO_INDEX, user_key.as_bytes(), b"1");
 
         // Index by status
         let status_key = format!("status:{:?}:{}:{}", todo.status, todo.user_id, id_str);
-        batch.put_cf(CF_TODO_INDEX,status_key.as_bytes(), b"1");
+        batch.put_cf(CF_TODO_INDEX, status_key.as_bytes(), b"1");
 
         // Index by priority
         let priority_key = format!(
@@ -463,36 +463,40 @@ impl TodoStore {
             todo.user_id,
             id_str
         );
-        batch.put_cf(CF_TODO_INDEX,priority_key.as_bytes(), b"1");
+        batch.put_cf(CF_TODO_INDEX, priority_key.as_bytes(), b"1");
 
         // Index by project
         if let Some(ref project_id) = todo.project_id {
             let project_key = format!("project:{}:{}:{}", project_id.0, todo.user_id, id_str);
-            batch.put_cf(CF_TODO_INDEX,project_key.as_bytes(), b"1");
+            batch.put_cf(CF_TODO_INDEX, project_key.as_bytes(), b"1");
         }
 
         // Index by due date (zero-padded for correct lexicographic ordering)
         if let Some(ref due) = todo.due_date {
             let due_key = format!("due:{:020}:{}:{}", due.timestamp(), todo.user_id, id_str);
-            batch.put_cf(CF_TODO_INDEX,due_key.as_bytes(), b"1");
+            batch.put_cf(CF_TODO_INDEX, due_key.as_bytes(), b"1");
         }
 
         // Index by context
         for ctx in &todo.contexts {
             let ctx_key = format!("context:{}:{}:{}", ctx.to_lowercase(), todo.user_id, id_str);
-            batch.put_cf(CF_TODO_INDEX,ctx_key.as_bytes(), b"1");
+            batch.put_cf(CF_TODO_INDEX, ctx_key.as_bytes(), b"1");
         }
 
         // Index by parent (for subtasks)
         if let Some(ref parent_id) = todo.parent_id {
             let parent_key = format!("parent:{}:{}", parent_id.0, id_str);
-            batch.put_cf(CF_TODO_INDEX,parent_key.as_bytes(), todo.user_id.as_bytes());
+            batch.put_cf(
+                CF_TODO_INDEX,
+                parent_key.as_bytes(),
+                todo.user_id.as_bytes(),
+            );
         }
 
         // Index dependencies: forward (dep:{dep_id}:{this_id}) for "who depends on dep_id?"
         for dep_id in &todo.depends_on {
             let dep_key = format!("dep:{}:{}", dep_id.0, id_str);
-            batch.put_cf(CF_TODO_INDEX,dep_key.as_bytes(), todo.user_id.as_bytes());
+            batch.put_cf(CF_TODO_INDEX, dep_key.as_bytes(), todo.user_id.as_bytes());
         }
 
         self.store
@@ -508,10 +512,10 @@ impl TodoStore {
         let id_str = todo.id.0.to_string();
 
         let user_key = format!("user:{}:{}", todo.user_id, id_str);
-        batch.delete_cf(CF_TODO_INDEX,user_key.as_bytes());
+        batch.delete_cf(CF_TODO_INDEX, user_key.as_bytes());
 
         let status_key = format!("status:{:?}:{}:{}", todo.status, todo.user_id, id_str);
-        batch.delete_cf(CF_TODO_INDEX,status_key.as_bytes());
+        batch.delete_cf(CF_TODO_INDEX, status_key.as_bytes());
 
         let priority_key = format!(
             "priority:{}:{}:{}",
@@ -519,32 +523,32 @@ impl TodoStore {
             todo.user_id,
             id_str
         );
-        batch.delete_cf(CF_TODO_INDEX,priority_key.as_bytes());
+        batch.delete_cf(CF_TODO_INDEX, priority_key.as_bytes());
 
         if let Some(ref project_id) = todo.project_id {
             let project_key = format!("project:{}:{}:{}", project_id.0, todo.user_id, id_str);
-            batch.delete_cf(CF_TODO_INDEX,project_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX, project_key.as_bytes());
         }
 
         if let Some(ref due) = todo.due_date {
             let due_key = format!("due:{:020}:{}:{}", due.timestamp(), todo.user_id, id_str);
-            batch.delete_cf(CF_TODO_INDEX,due_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX, due_key.as_bytes());
         }
 
         for ctx in &todo.contexts {
             let ctx_key = format!("context:{}:{}:{}", ctx.to_lowercase(), todo.user_id, id_str);
-            batch.delete_cf(CF_TODO_INDEX,ctx_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX, ctx_key.as_bytes());
         }
 
         if let Some(ref parent_id) = todo.parent_id {
             let parent_key = format!("parent:{}:{}", parent_id.0, id_str);
-            batch.delete_cf(CF_TODO_INDEX,parent_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX, parent_key.as_bytes());
         }
 
         // Remove dependency index entries
         for dep_id in &todo.depends_on {
             let dep_key = format!("dep:{}:{}", dep_id.0, id_str);
-            batch.delete_cf(CF_TODO_INDEX,dep_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX, dep_key.as_bytes());
         }
 
         // Clean up vector index mapping: look up vector_id from reverse mapping
@@ -562,10 +566,10 @@ impl TodoStore {
 
                 // Remove forward mapping
                 let fwd_key = format!("vector_id:{}:{}", todo.user_id, vector_id);
-                batch.delete_cf(CF_TODO_INDEX,fwd_key.as_bytes());
+                batch.delete_cf(CF_TODO_INDEX, fwd_key.as_bytes());
             }
             // Remove reverse mapping
-            batch.delete_cf(CF_TODO_INDEX,rev_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX, rev_key.as_bytes());
         }
 
         self.store.write_batch(&batch)?;
@@ -1453,12 +1457,10 @@ impl TodoStore {
 
             // Delete indices
             let user_key = format!("user:{}:{}", user_id, project_id.0);
-            self.store
-                .delete_cf(CF_TODO_INDEX, user_key.as_bytes())?;
+            self.store.delete_cf(CF_TODO_INDEX, user_key.as_bytes())?;
 
             let name_key = format!("project_name:{}:{}", project.name.to_lowercase(), user_id);
-            self.store
-                .delete_cf(CF_TODO_INDEX, name_key.as_bytes())?;
+            self.store.delete_cf(CF_TODO_INDEX, name_key.as_bytes())?;
 
             // Delete parent index (if this was a sub-project)
             if let Some(ref parent_id) = project.parent_id {
@@ -1466,8 +1468,7 @@ impl TodoStore {
                     "project_parent:{}:{}:{}",
                     user_id, parent_id.0, project_id.0
                 );
-                self.store
-                    .delete_cf(CF_TODO_INDEX, parent_key.as_bytes())?;
+                self.store.delete_cf(CF_TODO_INDEX, parent_key.as_bytes())?;
             }
 
             Ok(true)
@@ -1619,7 +1620,10 @@ mod tests {
 
         let todo = Todo::new("u".to_string(), "task".to_string());
         let stored = store.store_todo(&todo).unwrap();
-        assert!(stored.seq_num > 0, "seq_num allocation crosses the index CF");
+        assert!(
+            stored.seq_num > 0,
+            "seq_num allocation crosses the index CF"
+        );
         assert!(store.get_todo("u", &stored.id).unwrap().is_some());
         assert_eq!(store.list_todos_for_user("u", None).unwrap().len(), 1);
 

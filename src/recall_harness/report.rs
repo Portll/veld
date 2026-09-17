@@ -513,7 +513,10 @@ pub fn compare_to_baseline(
     // A value nothing reads is not a check. Both reports carry `embedder`; a diff across
     // two embedders is a diff of two systems, and calling its result a regression or an
     // improvement describes neither. Refuse before any metric is compared.
-    for (which, e) in [("baseline", &baseline.embedder), ("current", &current.embedder)] {
+    for (which, e) in [
+        ("baseline", &baseline.embedder),
+        ("current", &current.embedder),
+    ] {
         if e.is_empty() || e == EMBEDDER_UNKNOWN {
             return vec![Failure {
                 kind: "infrastructure".to_string(),
@@ -985,14 +988,23 @@ mod tests {
         let failures = compare_to_baseline(&baseline, &current, 2.0);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(failures[0].kind, "infrastructure");
-        assert!(failures[0].detail.contains("embedder differs"), "{}", failures[0].detail);
+        assert!(
+            failures[0].detail.contains("embedder differs"),
+            "{}",
+            failures[0].detail
+        );
     }
 
     /// A report that cannot say what embedded it is refused on either side, even against
     /// another unknown — two unknowns are not the same embedder, they are no information.
     #[test]
     fn unknown_embedder_is_refused_on_either_side() {
-        for (b, c) in [(EMBEDDER_UNKNOWN, "minilm-l6-v2"), ("minilm-l6-v2", EMBEDDER_UNKNOWN), (EMBEDDER_UNKNOWN, EMBEDDER_UNKNOWN), ("", "")] {
+        for (b, c) in [
+            (EMBEDDER_UNKNOWN, "minilm-l6-v2"),
+            ("minilm-l6-v2", EMBEDDER_UNKNOWN),
+            (EMBEDDER_UNKNOWN, EMBEDDER_UNKNOWN),
+            ("", ""),
+        ] {
             let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
             let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
             baseline.embedder = b.to_string();
@@ -1000,7 +1012,11 @@ mod tests {
             let failures = compare_to_baseline(&baseline, &current, 2.0);
             assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
             assert_eq!(failures[0].kind, "infrastructure");
-            assert!(failures[0].detail.contains("provenance"), "{}", failures[0].detail);
+            assert!(
+                failures[0].detail.contains("provenance"),
+                "{}",
+                failures[0].detail
+            );
         }
     }
 

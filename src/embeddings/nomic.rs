@@ -964,10 +964,7 @@ impl NomicEmbedder {
             )
         })?;
         let queue_ms = queue_start.elapsed().as_secs_f64() * 1000.0;
-        tracing::debug!(
-            "Nomic ONNX: session lock acquired after {:.1}ms",
-            queue_ms
-        );
+        tracing::debug!("Nomic ONNX: session lock acquired after {:.1}ms", queue_ms);
 
         // Create input tensors
         let input_ids_value = Value::from_array((vec![1, seq_len], input_ids))?;
@@ -1102,8 +1099,7 @@ impl NomicEmbedder {
         let input_ids_value = Value::from_array((vec![batch_size, seq_len], input_ids))?;
         let attention_mask_value =
             Value::from_array((vec![batch_size, seq_len], attention_masks.clone()))?;
-        let token_type_ids_value =
-            Value::from_array((vec![batch_size, seq_len], token_type_ids))?;
+        let token_type_ids_value = Value::from_array((vec![batch_size, seq_len], token_type_ids))?;
 
         // Run batch inference. `outputs` borrows from `session`, so the lock
         // stays held through pooling below; pool size (VELD_NOMIC_POOL_SIZE)
@@ -1169,7 +1165,9 @@ impl NomicEmbedder {
 }
 
 impl Embedder for NomicEmbedder {
-    fn id(&self) -> &str { "nomic" }
+    fn id(&self) -> &str {
+        "nomic"
+    }
 
     fn model_id(&self) -> &str {
         "nomic-embed-text-v1.5"
@@ -1367,7 +1365,9 @@ mod tests {
             assert_eq!(embedder.dimension(), dim);
 
             // A non-trivial native-width vector.
-            let mut full: Vec<f32> = (0..NOMIC_NATIVE_DIM).map(|i| (i as f32) * 0.013 + 1.0).collect();
+            let mut full: Vec<f32> = (0..NOMIC_NATIVE_DIM)
+                .map(|i| (i as f32) * 0.013 + 1.0)
+                .collect();
             NomicEmbedder::normalize(&mut full);
 
             let truncated = embedder.apply_matryoshka(full.clone());
@@ -1375,12 +1375,14 @@ mod tests {
 
             // Result must be unit-normalized.
             let norm: f32 = truncated.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!((norm - 1.0).abs() < 1e-5, "truncated embedding must be re-normalized");
+            assert!(
+                (norm - 1.0).abs() < 1e-5,
+                "truncated embedding must be re-normalized"
+            );
 
             // The truncated vector is the renormalized prefix of the original.
             if dim < NOMIC_NATIVE_DIM {
-                let prefix_norm: f32 =
-                    full[..dim].iter().map(|x| x * x).sum::<f32>().sqrt();
+                let prefix_norm: f32 = full[..dim].iter().map(|x| x * x).sum::<f32>().sqrt();
                 for (t, f) in truncated.iter().zip(full[..dim].iter()) {
                     assert!((t - f / prefix_norm).abs() < 1e-5);
                 }

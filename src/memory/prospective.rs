@@ -497,7 +497,10 @@ impl ProspectiveStore {
         // NOTE: the break below is an ORDERING early-exit, not a prefix guard — it
         // relies on scan_cf returning keys in lexicographic order (zero-padded
         // timestamps make lex order chronological). It stays.
-        for (key, value) in self.store.scan_cf(CF_PROSPECTIVE_INDEX, Some(b"due:"), None)? {
+        for (key, value) in self
+            .store
+            .scan_cf(CF_PROSPECTIVE_INDEX, Some(b"due:"), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
 
             // Parse key: due:{timestamp}:{task_id}
@@ -558,7 +561,10 @@ impl ProspectiveStore {
         let mut due_tasks = Vec::new();
 
         // Same ordering early-exit as get_due_tasks — the break is load-bearing.
-        for (key, value) in self.store.scan_cf(CF_PROSPECTIVE_INDEX, Some(b"due:"), None)? {
+        for (key, value) in self
+            .store
+            .scan_cf(CF_PROSPECTIVE_INDEX, Some(b"due:"), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
 
             let parts: Vec<&str> = key_str.splitn(3, ':').collect();
@@ -853,7 +859,10 @@ mod tests {
             },
         );
         store.store(&task).unwrap();
-        assert_eq!(store.get("u", &task.id).unwrap().unwrap().content, "remember");
+        assert_eq!(
+            store.get("u", &task.id).unwrap().unwrap().content,
+            "remember"
+        );
 
         // Past-due pending task must surface through the ordered due scan.
         let due = store.get_all_due_tasks().unwrap();

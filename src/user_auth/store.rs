@@ -200,11 +200,7 @@ impl UserAuthStore {
 
     pub fn find_user_by_username(&self, name: &str) -> Result<Option<UserRecord>, AuthError> {
         let cf = self.cf()?;
-        let bytes = match self
-            .db
-            .get_cf(cf, username_key(name))
-            .map_err(rocks_err)?
-        {
+        let bytes = match self.db.get_cf(cf, username_key(name)).map_err(rocks_err)? {
             Some(b) => b,
             None => return Ok(None),
         };
@@ -226,7 +222,10 @@ impl UserAuthStore {
     /// bootstrap the very first admin without prior credentials.
     pub fn has_any_user(&self) -> Result<bool, AuthError> {
         let cf = self.cf()?;
-        let mut iter = self.db.iterator_cf(cf, IteratorMode::From(USER_PREFIX, rocksdb::Direction::Forward));
+        let mut iter = self.db.iterator_cf(
+            cf,
+            IteratorMode::From(USER_PREFIX, rocksdb::Direction::Forward),
+        );
         if let Some(item) = iter.next() {
             let (k, _) = item.map_err(rocks_err)?;
             return Ok(k.starts_with(USER_PREFIX));
@@ -249,8 +248,9 @@ impl UserAuthStore {
                 break;
             }
             let (record, _): (UserRecord, _) =
-                bincode::serde::decode_from_slice(&v, bincode::config::standard())
-                    .map_err(|e| AuthError::internal(format!("decode UserRecord in admin sweep: {e}")))?;
+                bincode::serde::decode_from_slice(&v, bincode::config::standard()).map_err(
+                    |e| AuthError::internal(format!("decode UserRecord in admin sweep: {e}")),
+                )?;
             if record.role == UserRole::Admin {
                 admins += 1;
             }
@@ -262,10 +262,7 @@ impl UserAuthStore {
 
     /// Read the persistent login throttle row for `username`. Returns the
     /// default (all-zero, never-locked) record when no row exists yet.
-    pub fn get_login_throttle(
-        &self,
-        username: &str,
-    ) -> Result<LoginThrottleRecord, AuthError> {
+    pub fn get_login_throttle(&self, username: &str) -> Result<LoginThrottleRecord, AuthError> {
         let cf = self.cf()?;
         let raw = match self
             .db
@@ -563,19 +560,10 @@ mod tests {
         let n = store.delete_all_sessions_for_user(&alice.id).unwrap();
         assert_eq!(n, 2);
         // Bob's session survives.
-        assert!(store
-            .get_session_by_hash(&b1.token_hash)
-            .unwrap()
-            .is_some());
+        assert!(store.get_session_by_hash(&b1.token_hash).unwrap().is_some());
         // Alice's are gone.
-        assert!(store
-            .get_session_by_hash(&a1.token_hash)
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_session_by_hash(&a2.token_hash)
-            .unwrap()
-            .is_none());
+        assert!(store.get_session_by_hash(&a1.token_hash).unwrap().is_none());
+        assert!(store.get_session_by_hash(&a2.token_hash).unwrap().is_none());
     }
 
     #[test]
@@ -684,7 +672,10 @@ mod tests {
         let store = open_store(dir.path());
         let now = Utc::now();
         store.record_login_failure("alice", now).unwrap();
-        assert_eq!(store.get_login_throttle("alice").unwrap().failed_attempts, 1);
+        assert_eq!(
+            store.get_login_throttle("alice").unwrap().failed_attempts,
+            1
+        );
         store.clear_login_throttle("alice").unwrap();
         let row = store.get_login_throttle("alice").unwrap();
         assert_eq!(row, LoginThrottleRecord::default());

@@ -69,11 +69,7 @@ impl GithubClient {
         }
         let resp = req.send()?;
         if !resp.status().is_success() {
-            return Err(anyhow!(
-                "GitHub API {} → {}",
-                url,
-                resp.status().as_u16()
-            ));
+            return Err(anyhow!("GitHub API {} → {}", url, resp.status().as_u16()));
         }
         Ok(resp.json::<T>()?)
     }
@@ -85,8 +81,7 @@ impl GithubClient {
         let body = issue.body.unwrap_or_default();
         let mut combined = format!("# {}\n\n{}", issue.title, body);
         if !issue.labels.is_empty() {
-            let labels: Vec<String> =
-                issue.labels.iter().map(|l| l.name.clone()).collect();
+            let labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
             combined.push_str(&format!("\n\nLabels: {}", labels.join(", ")));
         }
         Ok(GithubContent {

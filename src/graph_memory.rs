@@ -608,7 +608,6 @@ pub struct RelationshipEdge {
     // M&I bidirectional memory-identity coupling: direction matters.
     // When memory A triggers recall of B (but not vice versa), the edge
     // should reflect this asymmetry for spreading activation.
-
     /// Forward activation strength (from_entity triggered, to_entity co-retrieved)
     /// Increases when from_entity is the query match and to_entity is co-retrieved.
     #[serde(default)]
@@ -1649,7 +1648,10 @@ pub struct GraphMemory {
     /// insert, NOT during the actual edge-strength mutations.  Per-edge
     /// mutation is still serialised by `synapse_update_lock` (fine-grained),
     /// so no coarse graph-write lock is introduced.
-    seen_retrievals: parking_lot::Mutex<(std::collections::HashSet<Uuid>, std::collections::VecDeque<Uuid>)>,
+    seen_retrievals: parking_lot::Mutex<(
+        std::collections::HashSet<Uuid>,
+        std::collections::VecDeque<Uuid>,
+    )>,
 }
 
 impl GraphMemory {
@@ -1991,7 +1993,11 @@ impl GraphMemory {
         if index.is_empty() && !name_index.is_empty() {
             for (name, uuid) in name_index {
                 let lowercase_name = name.to_lowercase();
-                store.put_cf(CF_LOWERCASE_INDEX, lowercase_name.as_bytes(), uuid.as_bytes())?;
+                store.put_cf(
+                    CF_LOWERCASE_INDEX,
+                    lowercase_name.as_bytes(),
+                    uuid.as_bytes(),
+                )?;
                 index.insert(lowercase_name, *uuid);
             }
             tracing::info!(
@@ -2146,9 +2152,10 @@ impl GraphMemory {
                 for (uuid, existing_emb) in cache.iter() {
                     let sim = crate::similarity::cosine_similarity(new_emb, existing_emb);
                     if sim >= ENTITY_CONCEPT_MERGE_THRESHOLD
-                        && best_match.is_none_or(|(_, best_sim)| sim > best_sim) {
-                            best_match = Some((*uuid, sim));
-                        }
+                        && best_match.is_none_or(|(_, best_sim)| sim > best_sim)
+                    {
+                        best_match = Some((*uuid, sim));
+                    }
                 }
                 if let Some((matched_uuid, sim)) = best_match {
                     tracing::debug!(
@@ -2621,19 +2628,15 @@ impl GraphMemory {
     /// Index an entity pair → edge UUID for O(1) dedup lookups
     fn index_entity_pair(&self, entity_a: &Uuid, entity_b: &Uuid, edge_uuid: &Uuid) -> Result<()> {
         let key = Self::pair_key(entity_a, entity_b);
-        self.store.put_cf(
-            CF_ENTITY_PAIR_INDEX,
-            key.as_bytes(),
-            edge_uuid.as_bytes(),
-        )?;
+        self.store
+            .put_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes(), edge_uuid.as_bytes())?;
         Ok(())
     }
 
     /// Remove entity pair from the pair index
     fn remove_entity_pair_index(&self, entity_a: &Uuid, entity_b: &Uuid) -> Result<()> {
         let key = Self::pair_key(entity_a, entity_b);
-        self.store
-            .delete_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes())?;
+        self.store.delete_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes())?;
         Ok(())
     }
 
@@ -2648,20 +2651,14 @@ impl GraphMemory {
     ) -> Result<Option<RelationshipEdge>> {
         // Fast path: O(1) pair index lookup
         let key = Self::pair_key(entity_a, entity_b);
-        if let Some(edge_uuid_bytes) = self
-            .store
-            .get_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes())?
-        {
+        if let Some(edge_uuid_bytes) = self.store.get_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes())? {
             if edge_uuid_bytes.len() == 16 {
                 let edge_uuid = Uuid::from_slice(&edge_uuid_bytes)?;
                 if let Some(edge) = self.get_relationship(&edge_uuid)? {
                     return Ok(Some(edge));
                 }
                 // Edge was deleted but pair index is stale — clean up and fall through
-                if let Err(e) = self
-                    .store
-                    .delete_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes())
-                {
+                if let Err(e) = self.store.delete_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes()) {
                     tracing::warn!("Failed to clean stale pair index entry: {e}");
                 }
             }
@@ -2775,19 +2772,14 @@ impl GraphMemory {
         if let Err(e) = self
             .index_entity_edge(&edge.from_entity, &edge.uuid)
             .and_then(|_| self.index_entity_edge(&edge.to_entity, &edge.uuid))
-            .and_then(|_| {
-                self.index_entity_pair(&edge.from_entity, &edge.to_entity, &edge.uuid)
-            })
+            .and_then(|_| self.index_entity_pair(&edge.from_entity, &edge.to_entity, &edge.uuid))
         {
             tracing::warn!(
                 "Rolling back relationship {} due to index failure: {}",
                 edge.uuid,
                 e
             );
-            if let Err(del_err) = self
-                .store
-                .delete_cf(CF_RELATIONSHIPS, edge.uuid.as_bytes())
-            {
+            if let Err(del_err) = self.store.delete_cf(CF_RELATIONSHIPS, edge.uuid.as_bytes()) {
                 tracing::warn!(
                     "Rollback delete failed for relationship {}: {del_err}",
                     edge.uuid
@@ -2809,8 +2801,7 @@ impl GraphMemory {
     /// Index an edge for an entity
     fn index_entity_edge(&self, entity_uuid: &Uuid, edge_uuid: &Uuid) -> Result<()> {
         let key = format!("{entity_uuid}:{edge_uuid}");
-        self.store
-            .put_cf(CF_ENTITY_EDGES, key.as_bytes(), b"1")?;
+        self.store.put_cf(CF_ENTITY_EDGES, key.as_bytes(), b"1")?;
         Ok(())
     }
 
@@ -3240,10 +3231,7 @@ impl GraphMemory {
         // Remove from entity_edges index for BOTH entities
         // (add_relationship indexes both from_entity and to_entity)
         let from_key = format!("{}:{}", edge.from_entity, uuid);
-        if let Err(e) = self
-            .store
-            .delete_cf(CF_ENTITY_EDGES, from_key.as_bytes())
-        {
+        if let Err(e) = self.store.delete_cf(CF_ENTITY_EDGES, from_key.as_bytes()) {
             tracing::warn!(edge = %uuid, key = %from_key, error = %e, "Failed to delete from entity_edges index");
         }
         let to_key = format!("{}:{}", edge.to_entity, uuid);
@@ -3274,8 +3262,7 @@ impl GraphMemory {
         };
 
         // Delete episode from main storage
-        self.store
-            .delete_cf(CF_EPISODES, episode_uuid.as_bytes())?;
+        self.store.delete_cf(CF_EPISODES, episode_uuid.as_bytes())?;
         self.episode_count.fetch_sub(1, Ordering::Relaxed);
 
         // Remove from entity_episodes inverted index
@@ -4388,8 +4375,7 @@ impl GraphMemory {
                 }
 
                 let key = edge.uuid.as_bytes();
-                if let Ok(value) =
-                    bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
                     batch.put_cf(CF_RELATIONSHIPS, key, value);
                     edges_updated += 1;
@@ -4423,8 +4409,7 @@ impl GraphMemory {
                 };
 
                 let key = edge.uuid.as_bytes();
-                if let Ok(value) =
-                    bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
                     batch.put_cf(CF_RELATIONSHIPS, key, value);
 
@@ -4652,10 +4637,7 @@ impl GraphMemory {
     ) -> Result<Option<RelationshipEdge>> {
         // Check forward index
         let idx_key = format!("mem_edge:{entity_a}:{entity_b}");
-        if let Some(edge_uuid_bytes) = self
-            .store
-            .get_cf(CF_RELATIONSHIPS, idx_key.as_bytes())?
-        {
+        if let Some(edge_uuid_bytes) = self.store.get_cf(CF_RELATIONSHIPS, idx_key.as_bytes())? {
             if edge_uuid_bytes.len() == 16 {
                 let edge_uuid = Uuid::from_slice(&edge_uuid_bytes)?;
                 return self.get_relationship(&edge_uuid);
@@ -5187,9 +5169,7 @@ impl GraphMemory {
             // Only write back edges whose strength actually changed, LTP status
             // changed, or need pruning. With 300s maintenance intervals, most edges
             // won't have meaningful decay, so this skips unchanged edges.
-            if should_prune
-                || (edge.strength - strength_before).abs() > f32::EPSILON
-                || ltp_changed
+            if should_prune || (edge.strength - strength_before).abs() > f32::EPSILON || ltp_changed
             {
                 let key = edge.uuid.as_bytes();
                 match bincode::serde::encode_to_vec(&*edge, bincode::config::standard()) {
@@ -5486,7 +5466,9 @@ impl GraphMemory {
         // after the iterator advances, reducing peak C++ heap usage.
         // scan_cf materializes the rows; the fill_cache(false) block-cache
         // courtesy was a rocksdb-specific transient-read hint.
-        let iter = self.store.scan_cf(CF_RELATIONSHIPS, None, None)?
+        let iter = self
+            .store
+            .scan_cf(CF_RELATIONSHIPS, None, None)?
             .into_iter()
             .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for (_, value) in iter.flatten() {
@@ -5514,13 +5496,13 @@ impl GraphMemory {
     /// Returns L3-tier edges where both endpoints are PII-clean.
     /// Each tuple: (from_name, to_name, strength, relation_type).
     #[allow(dead_code)]
-    pub fn export_collective_edges(
-        &self,
-    ) -> Result<Vec<(String, String, f32, String)>> {
+    pub fn export_collective_edges(&self) -> Result<Vec<(String, String, f32, String)>> {
         let mut safe_edges = Vec::new();
         // scan_cf materializes the rows; the fill_cache(false) block-cache
         // courtesy was a rocksdb-specific transient-read hint.
-        let iter = self.store.scan_cf(CF_RELATIONSHIPS, None, None)?
+        let iter = self
+            .store
+            .scan_cf(CF_RELATIONSHIPS, None, None)?
             .into_iter()
             .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for (_, value) in iter.flatten() {
@@ -7521,7 +7503,10 @@ mod tests {
             .collect(),
         );
         let interval = edge.typical_activation_interval_hours().unwrap();
-        assert!((interval - 24.0).abs() < 0.01, "expected 24h, got {interval}");
+        assert!(
+            (interval - 24.0).abs() < 0.01,
+            "expected 24h, got {interval}"
+        );
     }
 
     #[test]
@@ -8055,7 +8040,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::PersonalIdentity,
+            pii_classification: PiiClassification::PersonalIdentity,
         };
         let entity2 = EntityNode {
             uuid: Uuid::new_v4(),
@@ -8069,7 +8054,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::OrganizationIdentity,
+            pii_classification: PiiClassification::OrganizationIdentity,
         };
 
         let entity1_uuid = graph.add_entity(entity1.clone()).unwrap();
@@ -8119,7 +8104,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::PersonalIdentity,
+            pii_classification: PiiClassification::PersonalIdentity,
         };
         let entity2 = EntityNode {
             uuid: entity2_uuid,
@@ -8133,7 +8118,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::OrganizationIdentity,
+            pii_classification: PiiClassification::OrganizationIdentity,
         };
 
         graph.add_entity(entity1).unwrap();
@@ -8253,7 +8238,11 @@ mod tests {
         // Verify it's in the expected range for L2 promotion gate (>= 0.45) and
         // below LTP readiness bonus threshold (0.75)
         assert!(npmi >= 0.45, "NPMI {} should pass L2 promotion gate", npmi);
-        assert!(npmi < 0.75, "NPMI {} should be below LTP bonus threshold", npmi);
+        assert!(
+            npmi < 0.75,
+            "NPMI {} should be below LTP bonus threshold",
+            npmi
+        );
     }
 
     #[test]
@@ -8338,9 +8327,15 @@ mod tests {
 
     #[test]
     fn test_npmi_prune_thresholds() {
-        assert!((GraphMemory::npmi_prune_threshold(&EdgeTier::L1Working) - 0.30).abs() < f32::EPSILON);
-        assert!((GraphMemory::npmi_prune_threshold(&EdgeTier::L2Episodic) - 0.40).abs() < f32::EPSILON);
-        assert!((GraphMemory::npmi_prune_threshold(&EdgeTier::L3Semantic) - 0.50).abs() < f32::EPSILON);
+        assert!(
+            (GraphMemory::npmi_prune_threshold(&EdgeTier::L1Working) - 0.30).abs() < f32::EPSILON
+        );
+        assert!(
+            (GraphMemory::npmi_prune_threshold(&EdgeTier::L2Episodic) - 0.40).abs() < f32::EPSILON
+        );
+        assert!(
+            (GraphMemory::npmi_prune_threshold(&EdgeTier::L3Semantic) - 0.50).abs() < f32::EPSILON
+        );
     }
 
     #[test]
@@ -8369,7 +8364,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::Clean,
+            pii_classification: PiiClassification::Clean,
         };
         let node_b = EntityNode {
             uuid: entity_b,
@@ -8383,7 +8378,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::Clean,
+            pii_classification: PiiClassification::Clean,
         };
         graph.add_entity(node_a).unwrap();
         graph.add_entity(node_b).unwrap();
@@ -8404,7 +8399,7 @@ mod tests {
             ltp_status: LtpStatus::None,
             activation_timestamps: None,
             tier: EdgeTier::L2Episodic,
-                created_by: EdgeSource::CoOccurrence,
+            created_by: EdgeSource::CoOccurrence,
             entity_confidence: None,
             forward_strength: 0.5,
             backward_strength: 0.5,
@@ -8530,8 +8525,8 @@ mod tests {
             let id = Uuid::new_v4();
             let guard = graph.seen_retrievals.lock();
             drop(guard); // just ensure lock is accessible
-            // We exercise the code path through apply_reinforcement without needing
-            // real entities — a missing trigger simply returns Ok with 0 edges.
+                         // We exercise the code path through apply_reinforcement without needing
+                         // real entities — a missing trigger simply returns Ok with 0 edges.
             let _ = graph.apply_reinforcement(id, &Uuid::new_v4(), &[Uuid::new_v4()]);
         }
 
@@ -8667,9 +8662,7 @@ mod tests {
     /// of how many recovery nudges it has received.
     #[test]
     fn test_recovery_cannot_rescue_prune_eligible_edge() {
-        use crate::constants::{
-            EDGE_RECOVERY_CAP_FACTOR, EDGE_RECOVERY_RATE, L2_PRUNE_THRESHOLD,
-        };
+        use crate::constants::{EDGE_RECOVERY_CAP_FACTOR, EDGE_RECOVERY_RATE, L2_PRUNE_THRESHOLD};
 
         // Create an L2 edge at exactly the prune threshold (prune-eligible by <=).
         let mut edge = create_test_edge_with_tier(L2_PRUNE_THRESHOLD, 15, EdgeTier::L2Episodic);
@@ -8698,8 +8691,7 @@ mod tests {
             should_prune,
             "A recovering edge at/below prune threshold must still be marked for pruning \
              (strength={}, prune_threshold={})",
-            edge.strength,
-            L2_PRUNE_THRESHOLD
+            edge.strength, L2_PRUNE_THRESHOLD
         );
     }
 

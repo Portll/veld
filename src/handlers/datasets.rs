@@ -210,7 +210,10 @@ async fn locate_dataset(
     user_id: &str,
     name: &str,
 ) -> Result<DatasetRef, AppError> {
-    let listed = store.list_datasets(user_id).await.map_err(map_dataset_error)?;
+    let listed = store
+        .list_datasets(user_id)
+        .await
+        .map_err(map_dataset_error)?;
     let found = listed.iter().any(|m| m.name == name);
     if !found {
         return Err(AppError::InvalidInput {
@@ -298,18 +301,23 @@ pub async fn get_dataset_metadata(
         .list_datasets(&user_id)
         .await
         .map_err(map_dataset_error)?;
-    let meta = listed.into_iter().find(|m| m.name == name).ok_or_else(|| {
-        AppError::InvalidInput {
-            field: "name".to_string(),
-            reason: format!("dataset '{name}' not found"),
-        }
-    })?;
+    let meta =
+        listed
+            .into_iter()
+            .find(|m| m.name == name)
+            .ok_or_else(|| AppError::InvalidInput {
+                field: "name".to_string(),
+                reason: format!("dataset '{name}' not found"),
+            })?;
     let dref = DatasetRef {
         user_id: user_id.clone(),
         name: name.clone(),
         table: crate::datasets::sanitise_table_name(&user_id, &name),
     };
-    Ok(Json(DatasetMetadataResponse { dataset: dref, meta }))
+    Ok(Json(DatasetMetadataResponse {
+        dataset: dref,
+        meta,
+    }))
 }
 
 /// DELETE /api/datasets/{name} — drop a dataset.
@@ -389,14 +397,9 @@ pub async fn query_dataset(
     // The DatasetStore trait does not expose raw SELECT — that path goes
     // through the relational executor handle the manager keeps alongside
     // the trait object. Both point at the same database.
-    let executor = state
-        .dataset_executor
-        .clone()
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable(
-                "query endpoint requires a relational executor".to_string(),
-            )
-        })?;
+    let executor = state.dataset_executor.clone().ok_or_else(|| {
+        AppError::ServiceUnavailable("query endpoint requires a relational executor".to_string())
+    })?;
 
     // Build the SQL. Every value is bound via `Param` — the only
     // user-supplied string interpolated into the SQL is the WHERE clause
@@ -561,9 +564,7 @@ fn dataset_event(
 mod tests {
     use super::*;
     use crate::datasets::schema::{ColumnDef, ColumnType};
-    use crate::datasets::{
-        DatasetStore, LinkStore, RelationalDatasetStore, RelationalLinkStore,
-    };
+    use crate::datasets::{DatasetStore, LinkStore, RelationalDatasetStore, RelationalLinkStore};
     use crate::handlers::test_helpers::{post_json, send_typed, TestHarness};
     use crate::storage::relational::{BoxError, RelationalStore, Row, SqliteRelationalStore};
     use async_trait::async_trait;
@@ -577,11 +578,7 @@ mod tests {
         async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64, BoxError> {
             self.0.execute(sql, params).await.map_err(BoxError::new)
         }
-        async fn query(
-            &self,
-            sql: &str,
-            params: &[Param<'_>],
-        ) -> Result<Vec<Row>, BoxError> {
+        async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, BoxError> {
             self.0.query(sql, params).await.map_err(BoxError::new)
         }
         fn backend(&self) -> crate::storage::relational::RelationalBackend {
@@ -593,8 +590,7 @@ mod tests {
         let sqlite = SqliteRelationalStore::in_memory()
             .await
             .expect("sqlite open");
-        let backing: Arc<dyn RelationalStore<Error = BoxError>> =
-            Arc::new(BoxErrorSqlite(sqlite));
+        let backing: Arc<dyn RelationalStore<Error = BoxError>> = Arc::new(BoxErrorSqlite(sqlite));
         let ds: Arc<dyn DatasetStore> = Arc::new(
             RelationalDatasetStore::new(backing.clone())
                 .await
@@ -665,25 +661,20 @@ mod tests {
                 "rows": rows,
             }),
         );
-        let (status, body): (StatusCode, InsertRowsResponse) =
-            send_typed(app.clone(), req).await;
+        let (status, body): (StatusCode, InsertRowsResponse) = send_typed(app.clone(), req).await;
         assert_eq!(status, StatusCode::OK, "insert");
         assert_eq!(body.inserted, 5);
 
         // List — single dataset with row_count = 5.
         let req = crate::handlers::test_helpers::get("/api/datasets?user_id=alice");
-        let (status, body): (StatusCode, ListDatasetsResponse) =
-            send_typed(app.clone(), req).await;
+        let (status, body): (StatusCode, ListDatasetsResponse) = send_typed(app.clone(), req).await;
         assert_eq!(status, StatusCode::OK, "list");
         assert_eq!(body.total, 1);
         assert_eq!(body.datasets[0].row_count, 5);
 
         // Drop.
-        let req = crate::handlers::test_helpers::delete(
-            "/api/datasets/events?user_id=alice",
-        );
-        let (status, body): (StatusCode, DropDatasetResponse) =
-            send_typed(app.clone(), req).await;
+        let req = crate::handlers::test_helpers::delete("/api/datasets/events?user_id=alice");
+        let (status, body): (StatusCode, DropDatasetResponse) = send_typed(app.clone(), req).await;
         assert_eq!(status, StatusCode::OK, "drop");
         assert!(body.dropped);
     }

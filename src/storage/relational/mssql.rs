@@ -150,10 +150,14 @@ fn decode_cell(row: &tiberius::Row, idx: usize) -> OwnedColumnValue {
         return v.map_or(OwnedColumnValue::Null, OwnedColumnValue::Bool);
     }
     if let Ok(v) = row.try_get::<&[u8], _>(idx) {
-        return v.map_or(OwnedColumnValue::Null, |x| OwnedColumnValue::Bytes(x.to_vec()));
+        return v.map_or(OwnedColumnValue::Null, |x| {
+            OwnedColumnValue::Bytes(x.to_vec())
+        });
     }
     if let Ok(v) = row.try_get::<&str, _>(idx) {
-        return v.map_or(OwnedColumnValue::Null, |x| OwnedColumnValue::Text(x.to_string()));
+        return v.map_or(OwnedColumnValue::Null, |x| {
+            OwnedColumnValue::Text(x.to_string())
+        });
     }
     OwnedColumnValue::Null
 }

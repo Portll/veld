@@ -122,9 +122,8 @@ impl WikiProjection {
         target_dir: PathBuf,
         checkpoint_store: Arc<Mutex<CheckpointStore>>,
     ) -> Result<Self, WikiProjectionError> {
-        std::fs::create_dir_all(&target_dir).map_err(|e| {
-            WikiProjectionError::Io(format!("create wiki dir {target_dir:?}: {e}"))
-        })?;
+        std::fs::create_dir_all(&target_dir)
+            .map_err(|e| WikiProjectionError::Io(format!("create wiki dir {target_dir:?}: {e}")))?;
         // Canonicalise the root once so `confine_under` can compare every
         // page path against a normalised absolute root.
         let target_dir = std::fs::canonicalize(&target_dir).map_err(|e| {
@@ -141,7 +140,11 @@ impl WikiProjection {
     }
 
     /// One code path for both trait arms (dyn live-write + static replay).
-    fn apply_typed(&mut self, lsn: Lsn, payload: &IntentPayload) -> Result<(), WikiProjectionError> {
+    fn apply_typed(
+        &mut self,
+        lsn: Lsn,
+        payload: &IntentPayload,
+    ) -> Result<(), WikiProjectionError> {
         match payload {
             IntentPayload::Remember {
                 memory_id,
@@ -584,7 +587,15 @@ mod tests {
                 entities: entities.iter().map(|s| s.to_string()).collect(),
                 ..Experience::default()
             };
-            Memory::new(MemoryId(Uuid::new_v4()), experience, 0.9, None, None, None, None)
+            Memory::new(
+                MemoryId(Uuid::new_v4()),
+                experience,
+                0.9,
+                None,
+                None,
+                None,
+                None,
+            )
         };
         let remember = |m: &Memory| -> IntentPayload {
             IntentPayload::Remember {
@@ -638,7 +649,10 @@ mod tests {
         );
         TypedProjection::apply(&mut wp, Lsn(3), &remember(&m2)).unwrap();
         let page2 = std::fs::read_to_string(wiki_dir.join(format!("{}.md", m2.id.0))).unwrap();
-        assert!(page2.contains("[REDACTED:email]"), "W-008: email redacted on disk");
+        assert!(
+            page2.contains("[REDACTED:email]"),
+            "W-008: email redacted on disk"
+        );
         assert!(!page2.contains("alice@example.com"));
         assert!(page2.contains("redacted: true"));
         println!("PII: email redacted to [REDACTED:email]; frontmatter redacted: true (edit-back skips it).");

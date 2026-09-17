@@ -130,9 +130,7 @@ impl LearningHistoryStore {
     /// Create a new learning history store
     pub fn new(db: Arc<DB>) -> Self {
         Self {
-            store: Arc::new(
-                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
-            ),
+            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),
         }
     }
 

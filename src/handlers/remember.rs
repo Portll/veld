@@ -8,7 +8,6 @@ use axum::{extract::State, response::Json};
 
 use super::health::AppState;
 use super::types::MemoryEvent;
-use crate::user_memory::SharedUserMemory;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{
     types::{
@@ -18,6 +17,7 @@ use crate::memory::{
     Experience, ExperienceType, SessionEvent,
 };
 use crate::metrics;
+use crate::user_memory::SharedUserMemory;
 use crate::validation;
 
 // =============================================================================
@@ -457,7 +457,11 @@ pub async fn file_answer(
     }))
     .map_err(|e| AppError::Internal(anyhow::anyhow!("file_answer: build remember request: {e}")))?;
 
-    let resp = remember(State(state), crate::handlers::lenient_json::LenientJson(remember_req)).await?;
+    let resp = remember(
+        State(state),
+        crate::handlers::lenient_json::LenientJson(remember_req),
+    )
+    .await?;
     Ok(Json(serde_json::json!({
         "success": true,
         "id": resp.0.id,
@@ -500,7 +504,9 @@ pub(crate) fn mention_counts_for(
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn remember(
     State(state): State<AppState>,
-    crate::handlers::lenient_json::LenientJson(req): crate::handlers::lenient_json::LenientJson<RememberRequest>,
+    crate::handlers::lenient_json::LenientJson(req): crate::handlers::lenient_json::LenientJson<
+        RememberRequest,
+    >,
 ) -> Result<Json<RememberResponse>, AppError> {
     let op_start = std::time::Instant::now();
 
@@ -513,8 +519,7 @@ pub async fn remember(
         let fmt = crate::ingest::detect_format(None, &req.content);
         fmt != crate::ingest::InputFormat::PlainText
     } {
-        let format =
-            crate::ingest::detect_format(req.filename.as_deref(), &req.content);
+        let format = crate::ingest::detect_format(req.filename.as_deref(), &req.content);
         if format != crate::ingest::InputFormat::PlainText {
             match crate::ingest::extract_text(&req.content, format) {
                 Ok(extracted) => {
@@ -626,8 +631,7 @@ pub async fn remember(
         .ok()
         .map(|g| g.read().get_stats().map(|s| s.entity_count).unwrap_or(0))
         .unwrap_or(0);
-    if graph_entity_count < crate::constants::ENTITY_COLD_START_THRESHOLD
-        && ner_entities.len() < 2
+    if graph_entity_count < crate::constants::ENTITY_COLD_START_THRESHOLD && ner_entities.len() < 2
     {
         let cold_entities =
             crate::embeddings::ner::cold_start_extract_entities(&req.content, &merged_entities);
@@ -728,7 +732,11 @@ pub async fn remember(
             // Fast path: persist + BM25 only (~10ms), embedding deferred to background
             if agent_id.is_some() || run_id.is_some() {
                 memory_guard.remember_with_agent_deferred(
-                    exp_clone, created_at, agent_id, run_id, external_id,
+                    exp_clone,
+                    created_at,
+                    agent_id,
+                    run_id,
+                    external_id,
                 )
             } else {
                 memory_guard.remember_deferred(exp_clone, created_at, external_id)
@@ -780,20 +788,19 @@ pub async fn remember(
             let bincode = {
                 let guard = memory_for_journal.read();
                 match guard.get_memory(&mid) {
-                    Ok(mem) => match bincode::serde::encode_to_vec(
-                        &mem,
-                        bincode::config::standard(),
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            tracing::warn!(
-                                memory_id = %mid.0,
-                                error = %e,
-                                "skipping intent-log journal: failed to bincode memory snapshot",
-                            );
-                            return;
+                    Ok(mem) => {
+                        match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(
+                                    memory_id = %mid.0,
+                                    error = %e,
+                                    "skipping intent-log journal: failed to bincode memory snapshot",
+                                );
+                                return;
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
                         tracing::warn!(
                             memory_id = %mid.0,
@@ -808,9 +815,7 @@ pub async fn remember(
                 user_id: user_id.clone(),
                 memory_id: mid.0.to_string(),
                 memory_bincode: bincode,
-                schema_version: Some(
-                    crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION,
-                ),
+                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
             };
             if let Err(e) = state.journal_and_apply(&user_id, &payload) {
                 tracing::warn!(
@@ -1176,7 +1181,8 @@ fn detect_and_resolve_conflicts(
         // Create SupersededBy edge in graph
         let now = chrono::Utc::now();
         // Find entity pairs to link
-        let old_entities: Vec<uuid::Uuid> = candidate.entity_refs.iter().map(|e| e.entity_id).collect();
+        let old_entities: Vec<uuid::Uuid> =
+            candidate.entity_refs.iter().map(|e| e.entity_id).collect();
         if let (Some(&new_ent), Some(&old_ent)) = (focal_entities.first(), old_entities.first()) {
             let edge = crate::graph_memory::RelationshipEdge {
                 uuid: uuid::Uuid::new_v4(),
@@ -1297,8 +1303,7 @@ pub async fn batch_remember(
         Experience,
         Option<chrono::DateTime<chrono::Utc>>,
     )> = Vec::with_capacity(valid_items.len());
-    let mut parent_ids: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
+    let mut parent_ids: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
 
     for (index, item) in valid_items {
         if let Some(ref pid) = item.parent_id {
@@ -1495,9 +1500,7 @@ pub async fn batch_remember(
                                 {
                                     Ok(result) => result,
                                     Err(e) => {
-                                        tracing::debug!(
-                                            "Parent resolve panicked (non-fatal): {e}"
-                                        );
+                                        tracing::debug!("Parent resolve panicked (non-fatal): {e}");
                                         None
                                     }
                                 }
@@ -1514,10 +1517,7 @@ pub async fn batch_remember(
                                 tracing::debug!("Parent set task panicked (non-fatal): {e}");
                             }
                         } else {
-                            tracing::warn!(
-                                "Could not resolve parent_id: {}",
-                                parent_id_str
-                            );
+                            tracing::warn!("Could not resolve parent_id: {}", parent_id_str);
                         }
                     }
                 }
@@ -1578,16 +1578,14 @@ pub async fn batch_remember(
                             if let Ok(episodes) = graph.get_episodes_by_entity(entity_uuid) {
                                 for ep in &episodes {
                                     if ep.created_at >= cutoff {
-                                        candidate_ids
-                                            .insert(crate::memory::MemoryId(ep.uuid));
+                                        candidate_ids.insert(crate::memory::MemoryId(ep.uuid));
                                     }
                                 }
                             }
                         }
 
                         candidate_ids.remove(&mid);
-                        let candidate_ids: Vec<_> =
-                            candidate_ids.into_iter().take(20).collect();
+                        let candidate_ids: Vec<_> = candidate_ids.into_iter().take(20).collect();
                         if candidate_ids.is_empty() {
                             return;
                         }
@@ -1601,11 +1599,8 @@ pub async fn batch_remember(
                             return;
                         };
 
-                        match memory_guard.infer_lineage_for_memory(
-                            &uid,
-                            &new_memory,
-                            &candidates,
-                        ) {
+                        match memory_guard.infer_lineage_for_memory(&uid, &new_memory, &candidates)
+                        {
                             Ok(edges) if !edges.is_empty() => {
                                 tracing::info!(
                                     user_id = %uid,
@@ -1617,10 +1612,7 @@ pub async fn batch_remember(
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                tracing::debug!(
-                                    "Lineage inference failed (non-fatal): {}",
-                                    e
-                                );
+                                tracing::debug!("Lineage inference failed (non-fatal): {}", e);
                             }
                         }
                     })
@@ -1646,9 +1638,7 @@ pub async fn batch_remember(
                         detect_and_resolve_conflicts(&state, &memory_arc, &uid, &mid)
                     })
                     .await
-                    .unwrap_or_else(|e| {
-                        Err(anyhow::anyhow!("Conflict detection panicked: {e}"))
-                    })
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Conflict detection panicked: {e}")))
                     {
                         tracing::debug!(
                             "Conflict detection failed for {} (non-fatal): {}",
@@ -1687,14 +1677,12 @@ pub async fn batch_remember(
                                         continue; // Same entity, skip self-loop
                                     }
                                     let init_weight =
-                                        crate::graph_memory::EdgeTier::L1Working
-                                            .initial_weight();
+                                        crate::graph_memory::EdgeTier::L1Working.initial_weight();
                                     let edge = crate::graph_memory::RelationshipEdge {
                                         uuid: uuid::Uuid::new_v4(),
                                         from_entity: ent_i,
                                         to_entity: ent_j,
-                                        relation_type:
-                                            crate::graph_memory::RelationType::RelatedTo,
+                                        relation_type: crate::graph_memory::RelationType::RelatedTo,
                                         strength: init_weight,
                                         created_at: now,
                                         valid_at: now,
@@ -1707,8 +1695,7 @@ pub async fn batch_remember(
                                         tier: Default::default(),
                                         activation_timestamps: None,
                                         entity_confidence: None,
-                                        created_by:
-                                            crate::graph_memory::EdgeSource::CoOccurrence,
+                                        created_by: crate::graph_memory::EdgeSource::CoOccurrence,
                                         forward_strength: init_weight,
                                         backward_strength: init_weight,
                                     };
@@ -1904,20 +1891,19 @@ pub async fn upsert_memory(
             let bincode = {
                 let guard = memory_system_for_journal.read();
                 match guard.get_memory(&mid) {
-                    Ok(mem) => match bincode::serde::encode_to_vec(
-                        &mem,
-                        bincode::config::standard(),
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            tracing::warn!(
-                                memory_id = %mid.0,
-                                error = %e,
-                                "skipping intent-log journal (upsert): bincode encode failed",
-                            );
-                            return;
+                    Ok(mem) => {
+                        match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(
+                                    memory_id = %mid.0,
+                                    error = %e,
+                                    "skipping intent-log journal (upsert): bincode encode failed",
+                                );
+                                return;
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
                         tracing::warn!(
                             memory_id = %mid.0,
@@ -2084,7 +2070,10 @@ mod client_source_type_tests {
     fn the_unguarded_parser_still_maps_trusted_values_and_the_guarded_one_does_not() {
         let system = "system".to_string();
         assert_eq!(parse_source_type(Some(&system)), SourceType::System);
-        assert_eq!(parse_client_source_type(Some(&system)), SourceType::ExternalApi);
+        assert_eq!(
+            parse_client_source_type(Some(&system)),
+            SourceType::ExternalApi
+        );
     }
 
     /// A regression pin on the actual coupling. This asserts the SET, not the

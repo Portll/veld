@@ -65,7 +65,10 @@ fn respond(status: StatusCode, body: serde_json::Value) -> Response {
 }
 
 fn bad_request(detail: impl std::fmt::Display) -> Response {
-    respond(StatusCode::BAD_REQUEST, json!({"error": "bad_request", "detail": detail.to_string()}))
+    respond(
+        StatusCode::BAD_REQUEST,
+        json!({"error": "bad_request", "detail": detail.to_string()}),
+    )
 }
 
 fn failed(e: anyhow::Error) -> Response {
@@ -139,7 +142,9 @@ pub async fn export(State(state): State<AppState>, headers: HeaderMap, body: Byt
         Err(r) => return r,
     };
     let base = state.base_path.clone();
-    match blocking(move || migrate::export(&base, source, &scope, &out, quarantine.as_deref())).await {
+    match blocking(move || migrate::export(&base, source, &scope, &out, quarantine.as_deref()))
+        .await
+    {
         Ok(reports) => respond(StatusCode::OK, json!({"dumps": reports})),
         Err(e) => failed(e),
     }
@@ -186,10 +191,15 @@ pub async fn migrate(State(state): State<AppState>, headers: HeaderMap, body: By
         Err(r) => return r,
     };
     let base = state.base_path.clone();
-    match blocking(move || migrate::migrate(&base, from, to, &scope, dry_run, quarantine.as_deref())).await {
-        Ok(report) if report.blocked() => {
-            respond(StatusCode::CONFLICT, json!({"error": "blocked", "report": report}))
-        }
+    match blocking(move || {
+        migrate::migrate(&base, from, to, &scope, dry_run, quarantine.as_deref())
+    })
+    .await
+    {
+        Ok(report) if report.blocked() => respond(
+            StatusCode::CONFLICT,
+            json!({"error": "blocked", "report": report}),
+        ),
         Ok(report) => respond(StatusCode::OK, json!({"report": report})),
         Err(e) => failed(e),
     }

@@ -84,7 +84,10 @@ impl KeyUserBindings {
 
     pub fn lookup_user(&self, plaintext_key: &str) -> Option<String> {
         let hash = hash_api_key(plaintext_key);
-        self.bindings.read().get(&hash).map(|binding| binding.user_id.clone())
+        self.bindings
+            .read()
+            .get(&hash)
+            .map(|binding| binding.user_id.clone())
     }
 
     fn persist(&self) -> std::io::Result<()> {

@@ -15,9 +15,7 @@
 //! with backend-reported statistics (rowcount, recall@k, edge fan-out).
 
 use super::plan::{PhysicalOp, PhysicalPlan};
-use super::predicate::{
-    GraphPredicate, Query, RelationalPredicate, StageCaps, VectorPredicate,
-};
+use super::predicate::{GraphPredicate, Query, RelationalPredicate, StageCaps, VectorPredicate};
 use std::fmt::Write as _;
 
 // ─── Selectivity constants ────────────────────────────────────────────────────
@@ -207,18 +205,35 @@ fn append_explain(buf: &mut String, op: &PhysicalOp) {
         buf.push_str(" → ");
     }
     match op {
-        PhysicalOp::ScanRelational { predicate, est_card } => {
-            let _ = write!(buf, "ScanRelational({}) [est={est_card}]", describe_relational(predicate));
+        PhysicalOp::ScanRelational {
+            predicate,
+            est_card,
+        } => {
+            let _ = write!(
+                buf,
+                "ScanRelational({}) [est={est_card}]",
+                describe_relational(predicate)
+            );
         }
-        PhysicalOp::ScanVector { predicate, est_card } => {
+        PhysicalOp::ScanVector {
+            predicate,
+            est_card,
+        } => {
             let _ = write!(
                 buf,
                 "ScanVector(kind={}, top_k={}) [est={est_card}]",
                 predicate.kind, predicate.top_k
             );
         }
-        PhysicalOp::ScanGraph { predicate, est_card } => {
-            let _ = write!(buf, "ScanGraph({}) [est={est_card}]", describe_graph(predicate));
+        PhysicalOp::ScanGraph {
+            predicate,
+            est_card,
+        } => {
+            let _ = write!(
+                buf,
+                "ScanGraph({}) [est={est_card}]",
+                describe_graph(predicate)
+            );
         }
         PhysicalOp::FilterRelational { predicate } => {
             let _ = write!(buf, "FilterRelational({})", describe_relational(predicate));
@@ -244,8 +259,14 @@ fn describe_relational(p: &RelationalPredicate) -> String {
         RelationalPredicate::Equals { column, value } => format!("{column}={value}"),
         RelationalPredicate::In { column, values } => format!("{column} IN [{}]", values.len()),
         RelationalPredicate::Range { column, lo, hi } => {
-            let lo_s = lo.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "-∞".into());
-            let hi_s = hi.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "+∞".into());
+            let lo_s = lo
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-∞".into());
+            let hi_s = hi
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "+∞".into());
             format!("{column} ∈ [{lo_s},{hi_s}]")
         }
         RelationalPredicate::UserIdEquals(u) => format!("user_id={u}"),

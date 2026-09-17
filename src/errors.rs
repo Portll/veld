@@ -203,7 +203,9 @@ impl AppError {
             Self::UserNotFound(id) => format!("User not found: {}", sanitize_id(id)),
             Self::TodoNotFound(id) => format!("Todo not found: {}", sanitize_id(id)),
             Self::ProjectNotFound(id) => format!("Project not found: {}", sanitize_id(id)),
-            Self::ContextBlockNotFound(key) => format!("Context block not found: {}", sanitize_id(key)),
+            Self::ContextBlockNotFound(key) => {
+                format!("Context block not found: {}", sanitize_id(key))
+            }
             Self::MemoryAlreadyExists(id) => format!("Memory already exists: {}", sanitize_id(id)),
             Self::StorageError(msg) => {
                 tracing::error!(error = %msg, "Storage error");

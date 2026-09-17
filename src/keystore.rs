@@ -14,10 +14,10 @@
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use anyhow::{anyhow, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -112,7 +112,12 @@ fn generate_recovery_code() -> String {
 }
 
 /// AES-256-GCM key-wrap: encrypt `key` under `wrapping_key` with `aad` bound in.
-fn wrap_key(wrapping_key: &[u8; KEY_LEN], key: &[u8], aad: &[u8], provider: &str) -> Result<Wrapped> {
+fn wrap_key(
+    wrapping_key: &[u8; KEY_LEN],
+    key: &[u8],
+    aad: &[u8],
+    provider: &str,
+) -> Result<Wrapped> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrapping_key));
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ciphertext = cipher
@@ -135,8 +140,16 @@ fn unwrap_key(wrapping_key: &[u8; KEY_LEN], w: &Wrapped, aad: &[u8]) -> Result<S
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = b64d(&w.ciphertext)?;
     let mut plaintext = cipher
-        .decrypt(nonce, Payload { msg: &ciphertext, aad })
-        .map_err(|e| anyhow!("key unwrap failed (wrong key/passphrase or tampered keystore): {e}"))?;
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| {
+            anyhow!("key unwrap failed (wrong key/passphrase or tampered keystore): {e}")
+        })?;
     if plaintext.len() != KEY_LEN {
         return Err(anyhow!("unwrapped key has wrong length"));
     }
@@ -155,7 +168,10 @@ fn decode_32(s: &str) -> Result<[u8; KEY_LEN]> {
         b64d(t)?
     };
     if bytes.len() != KEY_LEN {
-        return Err(anyhow!("key must decode to {KEY_LEN} bytes, got {}", bytes.len()));
+        return Err(anyhow!(
+            "key must decode to {KEY_LEN} bytes, got {}",
+            bytes.len()
+        ));
     }
     let mut k = [0u8; KEY_LEN];
     k.copy_from_slice(&bytes);
@@ -582,7 +598,8 @@ impl Keystore {
 
         let tmp = path.with_extension("json.tmp");
         {
-            let mut f = std::fs::File::create(&tmp).context("failed to create keystore temp file")?;
+            let mut f =
+                std::fs::File::create(&tmp).context("failed to create keystore temp file")?;
             f.write_all(json.as_bytes())
                 .context("failed to write keystore temp file")?;
             f.sync_all().context("failed to fsync keystore temp file")?;
@@ -654,8 +671,8 @@ impl IndexBlinder {
 
     /// Derive the stable index-blinding key from the master key (KEK).
     pub fn derive_from_kek(kek: &SecretKey) -> Self {
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(kek.as_slice()).expect("HMAC accepts any key length");
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(kek.as_slice())
+            .expect("HMAC accepts any key length");
         Mac::update(&mut mac, INDEX_KEY_LABEL);
         let tag = Mac::finalize(mac).into_bytes();
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
@@ -665,8 +682,8 @@ impl IndexBlinder {
 
     /// Blind a single index term to a hex token (safe for ':'-delimited index keys).
     pub fn blind(&self, term: &str) -> String {
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(self.key.as_slice()).expect("HMAC accepts any key length");
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(self.key.as_slice())
+            .expect("HMAC accepts any key length");
         Mac::update(&mut mac, term.as_bytes());
         hex::encode(Mac::finalize(mac).into_bytes())
     }
@@ -737,7 +754,13 @@ pub fn decrypt_record(dek: &SecretKey, data: &[u8], aad_ctx: &[u8]) -> Result<Ve
     let ciphertext = &data[RECORD_HEADER_LEN..];
     let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(dek.as_slice()));
     cipher
-        .decrypt(nonce, Payload { msg: ciphertext, aad: &record_aad(epoch, aad_ctx) })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &record_aad(epoch, aad_ctx),
+            },
+        )
         .map_err(|e| anyhow!("record decrypt failed (wrong key/epoch/identity or tampered): {e}"))
 }
 
@@ -766,7 +789,13 @@ impl RecordCryptor {
         let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(self.dek.as_slice()));
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ciphertext = cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad: &record_aad(self.epoch, aad_ctx) })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &record_aad(self.epoch, aad_ctx),
+                },
+            )
             .map_err(|e| anyhow!("record encrypt failed: {e}"))?;
         let mut out = Vec::with_capacity(RECORD_HEADER_LEN + ciphertext.len());
         out.extend_from_slice(RECORD_MARKER);
@@ -927,8 +956,11 @@ mod tests {
 
     #[test]
     fn create_unseal_roundtrip() {
-        let ks = Keystore::create("correct horse battery staple", KdfParams::fast_for_tests()).unwrap();
-        let kek = ks.unseal_with_passphrase("correct horse battery staple").unwrap();
+        let ks =
+            Keystore::create("correct horse battery staple", KdfParams::fast_for_tests()).unwrap();
+        let kek = ks
+            .unseal_with_passphrase("correct horse battery staple")
+            .unwrap();
         let (epoch, dek) = ks.active_data_key(&kek).unwrap();
         assert_eq!(epoch, 0);
         assert_eq!(dek.len(), KEY_LEN);
@@ -998,7 +1030,10 @@ mod tests {
         // Encrypt a record under the original epoch (0).
         let pre = RecordCryptors::from_keystore(&ks, &kek).unwrap();
         assert_eq!(pre.active_epoch(), 0);
-        let ct0 = pre.active().encrypt_record(b"pre-rotation-blob", b"").unwrap();
+        let ct0 = pre
+            .active()
+            .encrypt_record(b"pre-rotation-blob", b"")
+            .unwrap();
         assert_eq!(record_epoch(&ct0), Some(0));
 
         // Rotate the DEK -> epoch 1.
@@ -1009,14 +1044,23 @@ mod tests {
         assert_eq!(post.active_epoch(), 1, "writes now use epoch 1");
         // The pre-rotation record still decrypts under its retired epoch-0 DEK.
         assert_eq!(
-            post.for_epoch(0).unwrap().decrypt_record(&ct0, b"").unwrap(),
+            post.for_epoch(0)
+                .unwrap()
+                .decrypt_record(&ct0, b"")
+                .unwrap(),
             b"pre-rotation-blob"
         );
         // New writes go out at epoch 1 and round-trip.
-        let ct1 = post.active().encrypt_record(b"post-rotation-blob", b"").unwrap();
+        let ct1 = post
+            .active()
+            .encrypt_record(b"post-rotation-blob", b"")
+            .unwrap();
         assert_eq!(record_epoch(&ct1), Some(1));
         assert_eq!(
-            post.for_epoch(1).unwrap().decrypt_record(&ct1, b"").unwrap(),
+            post.for_epoch(1)
+                .unwrap()
+                .decrypt_record(&ct1, b"")
+                .unwrap(),
             b"post-rotation-blob"
         );
     }
@@ -1047,7 +1091,10 @@ mod tests {
         let ct = slow.encrypt_bytes(b"a-sensitive-blob", b"id-42").unwrap();
         assert!(SecretCryptor::is_encrypted(&ct));
         assert_ne!(ct, b"a-sensitive-blob");
-        assert_eq!(slow.decrypt_bytes(&ct, b"id-42").unwrap(), b"a-sensitive-blob");
+        assert_eq!(
+            slow.decrypt_bytes(&ct, b"id-42").unwrap(),
+            b"a-sensitive-blob"
+        );
 
         // Identity binding: decrypting under a different AAD context fails.
         assert!(slow.decrypt_bytes(&ct, b"id-99").is_err());
@@ -1225,7 +1272,9 @@ mod tests {
         let blob = kms.kms_encrypt(b"master-key-bytes").unwrap();
         assert_ne!(blob, b"master-key-bytes");
         assert_eq!(kms.kms_decrypt(&blob).unwrap(), b"master-key-bytes");
-        assert!(LocalAeadKms::new([4u8; KEY_LEN]).kms_decrypt(&blob).is_err());
+        assert!(LocalAeadKms::new([4u8; KEY_LEN])
+            .kms_decrypt(&blob)
+            .is_err());
     }
 
     #[test]
@@ -1256,7 +1305,10 @@ mod tests {
 
         ks.save_to_path(&path).unwrap();
         assert!(path.exists());
-        assert!(!path.with_extension("json.tmp").exists(), "no leftover temp");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "no leftover temp"
+        );
         let loaded = Keystore::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(loaded.unseal_with_passphrase("pw").is_ok());
 

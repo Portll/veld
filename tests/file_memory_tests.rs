@@ -14,11 +14,11 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use rocksdb::Options;
+use uuid::Uuid;
 use veld::memory::files::FileMemoryStore;
 use veld::memory::types::{
     CodebaseConfig, FileMemory, FileMemoryId, FileType, LearnedFrom, ProjectId,
 };
-use uuid::Uuid;
 
 // ============================================================================
 // TEST HELPERS

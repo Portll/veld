@@ -135,8 +135,7 @@ impl HttpLlmConsolidator {
             _ => return Ok(None),
         };
         let api_key = std::env::var("VELD_LLM_API_KEY").unwrap_or_default();
-        let model = std::env::var("VELD_LLM_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let model = std::env::var("VELD_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
         Ok(Some(Self::new(endpoint, api_key, model)?))
     }
 }
@@ -224,10 +223,9 @@ impl LlmConsolidator for HttpLlmConsolidator {
 
         let content = self.chat(&prompt)?;
         let trimmed = strip_fences(&content);
-        let values: Vec<serde_json::Value> = serde_json::from_str(trimmed)
-            .map_err(|e| anyhow!(
-                "LLM returned non-JSON-array payload under schema: {e}\nRaw: {content}"
-            ))?;
+        let values: Vec<serde_json::Value> = serde_json::from_str(trimmed).map_err(|e| {
+            anyhow!("LLM returned non-JSON-array payload under schema: {e}\nRaw: {content}")
+        })?;
         Ok(values)
     }
 
@@ -327,12 +325,9 @@ mod tests {
 
     #[test]
     fn name_is_descriptive() {
-        let llm = HttpLlmConsolidator::new(
-            "http://x".to_string(),
-            String::new(),
-            "test".to_string(),
-        )
-        .unwrap();
+        let llm =
+            HttpLlmConsolidator::new("http://x".to_string(), String::new(), "test".to_string())
+                .unwrap();
         assert_eq!(llm.name(), "http-llm");
     }
 
@@ -349,23 +344,16 @@ mod tests {
 
     #[test]
     fn llm_version_empty_model_returns_not_provided() {
-        let llm = HttpLlmConsolidator::new(
-            "http://x".to_string(),
-            String::new(),
-            "".to_string(),
-        )
-        .unwrap();
+        let llm = HttpLlmConsolidator::new("http://x".to_string(), String::new(), "".to_string())
+            .unwrap();
         assert_eq!(llm.llm_version(), LLM_VERSION_NOT_PROVIDED);
     }
 
     #[test]
     fn llm_version_whitespace_model_returns_not_provided() {
-        let llm = HttpLlmConsolidator::new(
-            "http://x".to_string(),
-            String::new(),
-            "   ".to_string(),
-        )
-        .unwrap();
+        let llm =
+            HttpLlmConsolidator::new("http://x".to_string(), String::new(), "   ".to_string())
+                .unwrap();
         assert_eq!(llm.llm_version(), LLM_VERSION_NOT_PROVIDED);
     }
 
@@ -373,10 +361,7 @@ mod tests {
     fn default_trait_llm_version_is_unknown() {
         struct FakeLlm;
         impl LlmConsolidator for FakeLlm {
-            fn extract_facts(
-                &self,
-                _: &[String],
-            ) -> Result<Vec<LlmExtractedFact>> {
+            fn extract_facts(&self, _: &[String]) -> Result<Vec<LlmExtractedFact>> {
                 Ok(Vec::new())
             }
         }

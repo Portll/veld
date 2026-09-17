@@ -74,11 +74,7 @@ impl GraduationStore {
     /// graduated memory updates `graduated_at` to now and the access count
     /// to the most recent observation. Callers should check
     /// [`Self::is_graduated`] first if they want to avoid the overwrite.
-    pub fn record_graduation(
-        &self,
-        memory_id: &MemoryId,
-        access_count: u32,
-    ) -> Result<()> {
+    pub fn record_graduation(&self, memory_id: &MemoryId, access_count: u32) -> Result<()> {
         let record = GraduationRecord {
             graduated_at: Utc::now(),
             access_count_at_graduation: access_count,
@@ -325,9 +321,9 @@ mod tests {
             eprintln!("backend: {backend:?}");
             let id = fresh_id();
             let exp = Experience::default(); // no origin metadata → ForegroundUser
-            // Even if we record a graduation against a non-observation memory
-            // (shouldn't happen in practice), the effective origin only
-            // overrides Observation. Foreground stays Foreground.
+                                             // Even if we record a graduation against a non-observation memory
+                                             // (shouldn't happen in practice), the effective origin only
+                                             // overrides Observation. Foreground stays Foreground.
             store.record_graduation(&id, 5).unwrap();
             assert_eq!(
                 effective_origin(&id, &exp, &store),

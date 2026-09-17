@@ -83,7 +83,10 @@ macro_rules! obf {
         };
         // Find the sentinel and decrypt only the meaningful bytes
         {
-            let end = ENCRYPTED.iter().position(|&b| b == 0xFF).unwrap_or(ENCRYPTED.len());
+            let end = ENCRYPTED
+                .iter()
+                .position(|&b| b == 0xFF)
+                .unwrap_or(ENCRYPTED.len());
             $crate::fortress::strings::decrypt(&ENCRYPTED[..end])
         }
     }};

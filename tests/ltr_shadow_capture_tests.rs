@@ -190,7 +190,11 @@ fn test_recall_then_feedback_graduates_to_training() {
     let store = memory.retrieval_trace_store();
     let pending_before = store.pending_count();
     assert!(pending_before > 0, "recall captured pending rows");
-    assert_eq!(store.training_count(), 0, "no training rows before feedback");
+    assert_eq!(
+        store.training_count(),
+        0,
+        "no training rows before feedback"
+    );
 
     // Feed back a positive outcome for the top returned memories — the live path.
     let fed: Vec<_> = results.iter().take(2).map(|m| m.id.clone()).collect();

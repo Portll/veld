@@ -120,10 +120,7 @@ impl SqliteProjection {
     /// Construct a projection around an open `SlowStore`. Reads the
     /// last-persisted checkpoint from `checkpoint_store` so subsequent
     /// `replay` / live `apply` calls resume from the right LSN.
-    pub fn new(
-        store: Arc<SlowStore>,
-        checkpoint_store: Arc<Mutex<CheckpointStore>>,
-    ) -> Self {
+    pub fn new(store: Arc<SlowStore>, checkpoint_store: Arc<Mutex<CheckpointStore>>) -> Self {
         let checkpoint = checkpoint_store.lock().get(PROJECTION_NAME);
         Self {
             store,
@@ -200,9 +197,7 @@ impl SqliteProjection {
                 }
             }
             IntentPayload::Forget {
-                user_id,
-                memory_id,
-                ..
+                user_id, memory_id, ..
             } => {
                 if let Some(rel) = &self.relational {
                     rel.delete_memory_blocking(user_id, memory_id)
@@ -316,9 +311,7 @@ impl Projection for SqliteProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_log::{
-        payload::CURRENT_PAYLOAD_SCHEMA_VERSION, replay, IntentLog,
-    };
+    use crate::intent_log::{payload::CURRENT_PAYLOAD_SCHEMA_VERSION, replay, IntentLog};
     use std::path::PathBuf;
 
     fn tmp_paths(stem: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -339,7 +332,11 @@ mod tests {
     fn open_projection(
         sqlite_path: &std::path::Path,
         checkpoint_path: &std::path::Path,
-    ) -> (Arc<SlowStore>, Arc<Mutex<CheckpointStore>>, SqliteProjection) {
+    ) -> (
+        Arc<SlowStore>,
+        Arc<Mutex<CheckpointStore>>,
+        SqliteProjection,
+    ) {
         let store = Arc::new(SlowStore::open(sqlite_path).unwrap());
         let ckpt = Arc::new(Mutex::new(CheckpointStore::open(checkpoint_path).unwrap()));
         let proj = SqliteProjection::new(store.clone(), ckpt.clone());
@@ -361,24 +358,9 @@ mod tests {
         let (store, _ckpt, mut proj) = open_projection(&sqlite_path, &checkpoint_path);
 
         // Three live writes through the TypedProjection arm.
-        TypedProjection::apply(
-            &mut proj,
-            Lsn(0),
-            &mk_remember("alice", "m-1", b"first"),
-        )
-        .unwrap();
-        TypedProjection::apply(
-            &mut proj,
-            Lsn(1),
-            &mk_remember("alice", "m-2", b"second"),
-        )
-        .unwrap();
-        TypedProjection::apply(
-            &mut proj,
-            Lsn(2),
-            &mk_remember("alice", "m-3", b"third"),
-        )
-        .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember("alice", "m-1", b"first")).unwrap();
+        TypedProjection::apply(&mut proj, Lsn(1), &mk_remember("alice", "m-2", b"second")).unwrap();
+        TypedProjection::apply(&mut proj, Lsn(2), &mk_remember("alice", "m-3", b"third")).unwrap();
 
         // All three present in the SQLite memories table.
         assert_eq!(store.count_memories("alice").unwrap(), 3);
@@ -475,7 +457,12 @@ mod tests {
             // Manually apply first three records to simulate a partial
             // batch — we use the static Projection trait so we can call
             // replay with a checkpoint-style early stop.
-            let records: Vec<_> = log.iter().unwrap().take(3).collect::<Result<_, _>>().unwrap();
+            let records: Vec<_> = log
+                .iter()
+                .unwrap()
+                .take(3)
+                .collect::<Result<_, _>>()
+                .unwrap();
             for r in &records {
                 Projection::apply(&mut proj, r).unwrap();
             }
@@ -494,7 +481,10 @@ mod tests {
         assert_eq!(store.count_memories("u").unwrap(), 6);
         // All six bodies present.
         for i in 0..6 {
-            let r = store.get_memory_blob("u", &format!("m-{i}")).unwrap().unwrap();
+            let r = store
+                .get_memory_blob("u", &format!("m-{i}"))
+                .unwrap()
+                .unwrap();
             assert_eq!(r.memory_bincode, format!("v-{i}").into_bytes());
         }
     }
@@ -507,19 +497,9 @@ mod tests {
         let (sqlite_path, _, checkpoint_path) = tmp_paths("higher_wins");
         let (store, _ckpt, mut proj) = open_projection(&sqlite_path, &checkpoint_path);
 
-        TypedProjection::apply(
-            &mut proj,
-            Lsn(5),
-            &mk_remember("u", "m", b"newer"),
-        )
-        .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(5), &mk_remember("u", "m", b"newer")).unwrap();
         // Stale re-apply at LSN 1 — must not overwrite the newer body.
-        TypedProjection::apply(
-            &mut proj,
-            Lsn(1),
-            &mk_remember("u", "m", b"older"),
-        )
-        .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(1), &mk_remember("u", "m", b"older")).unwrap();
 
         let r = store.get_memory_blob("u", "m").unwrap().unwrap();
         assert_eq!(r.memory_bincode, b"newer");
@@ -531,12 +511,7 @@ mod tests {
         let (sqlite_path, _, checkpoint_path) = tmp_paths("anchor");
         let (store, _ckpt, mut proj) = open_projection(&sqlite_path, &checkpoint_path);
 
-        TypedProjection::apply(
-            &mut proj,
-            Lsn(0),
-            &mk_remember("u", "m", b"body-bytes"),
-        )
-        .unwrap();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember("u", "m", b"body-bytes")).unwrap();
         TypedProjection::apply(
             &mut proj,
             Lsn(1),

@@ -59,11 +59,7 @@ impl DriveClient {
     /// Fetch file metadata (name + mimeType).
     pub fn fetch_metadata(&self, file_id: &str) -> Result<DriveMetadata> {
         let url = format!("{DRIVE_API}/files/{file_id}?fields=id,name,mimeType");
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()?;
+        let resp = self.client.get(&url).bearer_auth(&self.token).send()?;
         if !resp.status().is_success() {
             return Err(anyhow!(
                 "GDrive metadata {} → {}",
@@ -86,11 +82,7 @@ impl DriveClient {
             format!("{DRIVE_API}/files/{file_id}?alt=media")
         };
 
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()?;
+        let resp = self.client.get(&url).bearer_auth(&self.token).send()?;
         if !resp.status().is_success() {
             return Err(anyhow!(
                 "GDrive content {} → {}",

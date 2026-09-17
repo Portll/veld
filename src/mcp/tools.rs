@@ -19,7 +19,9 @@ use super::VeldMcpServer;
 impl VeldMcpServer {
     pub(crate) fn create(api_url: String, api_key: String, user_id: String) -> Self {
         Self {
-            client: Arc::new(super::client::AsyncApiClient::new(api_url, api_key, user_id)),
+            client: Arc::new(super::client::AsyncApiClient::new(
+                api_url, api_key, user_id,
+            )),
             tool_router: Self::tool_router(),
         }
     }
@@ -64,7 +66,9 @@ impl VeldMcpServer {
         let path = format!("/api/dials?user_id={}", self.client.user_id);
         let result: Result<crate::memory::CognitiveDials> = self.client.get(&path).await;
         match result {
-            Ok(d) => Ok(CallToolResult::success(vec![Content::text(format_dials(&d))])),
+            Ok(d) => Ok(CallToolResult::success(vec![Content::text(format_dials(
+                &d,
+            ))])),
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
                 message: Cow::from(e.to_string()),
@@ -843,7 +847,8 @@ impl VeldMcpServer {
             .await;
         match result {
             Ok(resp) => {
-                let mut output = format!("{} | {} row(s)\n", resp.columns.join(", "), resp.rows.len());
+                let mut output =
+                    format!("{} | {} row(s)\n", resp.columns.join(", "), resp.rows.len());
                 for row in resp.rows.iter().take(50) {
                     let cells: Vec<String> = row.iter().map(render_query_cell).collect();
                     output.push_str(&cells.join(", "));

@@ -55,12 +55,19 @@ fn a_redb_server_over_rocksdb_data_refuses_to_start() {
         Ok(_) => panic!("a redb server over rocksdb-only data must not start"),
         Err(e) => format!("{e:#}"),
     };
-    assert!(err.contains("portll") && err.contains("VELD_STORAGE_BACKEND=rocksdb"), "{err}");
+    assert!(
+        err.contains("portll") && err.contains("VELD_STORAGE_BACKEND=rocksdb"),
+        "{err}"
+    );
 }
 
 #[test]
 fn the_same_data_starts_on_the_backend_that_holds_it() {
     let dir = outage_shape();
-    let m = manager(&dir, StorageBackend::RocksDb).expect("rocksdb holds the data, so it must start");
-    assert_eq!((m.backend_census.rocksdb, m.backend_census.redb), (1, Some(0)));
+    let m =
+        manager(&dir, StorageBackend::RocksDb).expect("rocksdb holds the data, so it must start");
+    assert_eq!(
+        (m.backend_census.rocksdb, m.backend_census.redb),
+        (1, Some(0))
+    );
 }

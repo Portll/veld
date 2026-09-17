@@ -300,9 +300,7 @@ impl LineageGraph {
     /// Create a new lineage graph backed by RocksDB
     pub fn new(db: Arc<DB>) -> Self {
         Self {
-            store: Arc::new(
-                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
-            ),
+            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),
             config: InferenceConfig::default(),
         }
     }
@@ -318,9 +316,7 @@ impl LineageGraph {
     /// Create with custom inference config
     pub fn with_config(db: Arc<DB>, config: InferenceConfig) -> Self {
         Self {
-            store: Arc::new(
-                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
-            ),
+            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),
             config,
         }
     }
@@ -338,11 +334,13 @@ impl LineageGraph {
 
         // Index by source (from)
         let from_key = format!("lineage:by_from:{}:{}:{}", user_id, edge.from.0, edge.id);
-        self.store.put_bytes(from_key.as_bytes(), edge.id.as_bytes())?;
+        self.store
+            .put_bytes(from_key.as_bytes(), edge.id.as_bytes())?;
 
         // Index by target (to)
         let to_key = format!("lineage:by_to:{}:{}:{}", user_id, edge.to.0, edge.id);
-        self.store.put_bytes(to_key.as_bytes(), edge.id.as_bytes())?;
+        self.store
+            .put_bytes(to_key.as_bytes(), edge.id.as_bytes())?;
 
         Ok(())
     }
@@ -398,7 +396,6 @@ impl LineageGraph {
 
         // scan_prefix enforces the bound; the hand-written break is gone.
         for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
-
             let edge_id = String::from_utf8_lossy(&value);
             if let Some(edge) = self.get_edge(user_id, &edge_id)? {
                 edges.push(edge);
@@ -415,7 +412,6 @@ impl LineageGraph {
 
         // scan_prefix enforces the bound; the hand-written break is gone.
         for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
-
             if let Ok(edge) = bincode::serde::decode_from_slice::<LineageEdge, _>(
                 &value,
                 bincode::config::standard(),
@@ -466,7 +462,6 @@ impl LineageGraph {
 
         // scan_prefix enforces the bound; the hand-written break is gone.
         for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
-
             if let Ok(branch) = bincode::serde::decode_from_slice::<LineageBranch, _>(
                 &value,
                 bincode::config::standard(),

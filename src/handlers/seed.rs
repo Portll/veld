@@ -11,8 +11,8 @@ use std::sync::Arc;
 use super::remember::parse_experience_type;
 use super::state::MultiUserMemoryManager;
 use crate::constants::{
-    SEED_DEFAULT_MAX_FILES, SEED_IMPORTANCE_CONFIG, SEED_IMPORTANCE_README,
-    SEED_IMPORTANCE_SOURCE, SEED_MAX_DEPTH, SEED_README_MAX_CHARS,
+    SEED_DEFAULT_MAX_FILES, SEED_IMPORTANCE_CONFIG, SEED_IMPORTANCE_README, SEED_IMPORTANCE_SOURCE,
+    SEED_MAX_DEPTH, SEED_README_MAX_CHARS,
 };
 use crate::errors::{AppError, ValidationErrorExt};
 #[cfg(feature = "pdf")]
@@ -45,8 +45,8 @@ const SKIP_DIRS: &[&str] = &[
 /// Source file extensions to include
 const SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "cs", "cpp", "cc", "c", "h", "hpp", "rb",
-    "ex", "exs", "erl", "hs", "ml", "mli", "scala", "kt", "kts", "swift", "dart", "lua", "r",
-    "jl", "zig", "nim", "v", "cr", "clj", "cljs", "fs", "fsx",
+    "ex", "exs", "erl", "hs", "ml", "mli", "scala", "kt", "kts", "swift", "dart", "lua", "r", "jl",
+    "zig", "nim", "v", "cr", "clj", "cljs", "fs", "fsx",
 ];
 
 /// Config file extensions to include
@@ -158,12 +158,7 @@ fn walk_project_files(root: &Path, max_files: usize) -> Vec<PathBuf> {
     files
 }
 
-fn walk_recursive(
-    dir: &Path,
-    depth: usize,
-    max_files: usize,
-    files: &mut Vec<PathBuf>,
-) {
+fn walk_recursive(dir: &Path, depth: usize, max_files: usize, files: &mut Vec<PathBuf>) {
     if depth > SEED_MAX_DEPTH || files.len() >= max_files {
         return;
     }
@@ -188,21 +183,19 @@ fn walk_recursive(
 
         if path.is_dir() {
             // Skip excluded directories
-            if SKIP_DIRS.iter().any(|s| file_name == *s || file_name.ends_with(".egg-info")) {
+            if SKIP_DIRS
+                .iter()
+                .any(|s| file_name == *s || file_name.ends_with(".egg-info"))
+            {
                 continue;
             }
             // Skip hidden directories (except .github, .vscode)
-            if file_name.starts_with('.')
-                && !matches!(file_name.as_str(), ".github" | ".vscode")
-            {
+            if file_name.starts_with('.') && !matches!(file_name.as_str(), ".github" | ".vscode") {
                 continue;
             }
             subdirs.push(path);
         } else if path.is_file() {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
             // Include source files, config files, PDFs, and well-known project files
             let is_known_file = matches!(
@@ -308,7 +301,8 @@ fn extract_toml_value(content: &str, key: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_package = trimmed == "[package]" || trimmed == "[project]" || trimmed == "[tool.poetry]";
+            in_package =
+                trimmed == "[package]" || trimmed == "[project]" || trimmed == "[tool.poetry]";
             continue;
         }
         if in_package {
@@ -336,10 +330,7 @@ fn extract_toml_value(content: &str, key: &str) -> Option<String> {
 
 /// Determine importance level for a file based on its role
 fn file_importance(path: &Path, root: &Path) -> f32 {
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     let rel_path = path.strip_prefix(root).unwrap_or(path);
     let rel_str = rel_path.to_string_lossy();
@@ -453,10 +444,7 @@ pub async fn seed_project(
                     if let Err(e) = guard.forget_by_tags(&seed_tags) {
                         tracing::warn!("Failed to clean old seed memories: {e}");
                     } else {
-                        tracing::info!(
-                            "Cleaned {} old seed memories for re-seeding",
-                            count
-                        );
+                        tracing::info!("Cleaned {} old seed memories for re-seeding", count);
                     }
                 }
                 _ => {}
@@ -471,15 +459,13 @@ pub async fn seed_project(
         // Extract README content if available
         let readme_path = project_path.join("README.md");
         let readme_content = if readme_path.is_file() {
-            std::fs::read_to_string(&readme_path)
-                .ok()
-                .map(|c| {
-                    if c.len() > SEED_README_MAX_CHARS {
-                        c[..SEED_README_MAX_CHARS].to_string()
-                    } else {
-                        c
-                    }
-                })
+            std::fs::read_to_string(&readme_path).ok().map(|c| {
+                if c.len() > SEED_README_MAX_CHARS {
+                    c[..SEED_README_MAX_CHARS].to_string()
+                } else {
+                    c
+                }
+            })
         } else {
             None
         };
@@ -559,9 +545,7 @@ pub async fn seed_project(
                 content
             };
 
-            let rel_path = file_path
-                .strip_prefix(&project_path)
-                .unwrap_or(file_path);
+            let rel_path = file_path.strip_prefix(&project_path).unwrap_or(file_path);
             let rel_str = rel_path.to_string_lossy().to_string();
 
             let importance = file_importance(file_path, &project_path);
@@ -574,10 +558,7 @@ pub async fn seed_project(
             let experience = Experience {
                 content: format!("File: {}\n\n{}", rel_str, content),
                 experience_type: parse_experience_type(Some(&exp_type.to_string())),
-                tags: vec![
-                    "_seed".to_string(),
-                    file_name.to_string(),
-                ],
+                tags: vec!["_seed".to_string(), file_name.to_string()],
                 entities: vec![file_name.to_string(), project_name.clone()],
                 ..Default::default()
             };

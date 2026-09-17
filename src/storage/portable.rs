@@ -92,7 +92,10 @@ pub fn read_all<R: Read>(mut src: R) -> Result<Vec<PortableRecord>> {
     src.read_to_end(&mut buf).context("reading portable dump")?;
 
     if buf.len() < 12 {
-        bail!("portable dump is {} bytes — too short to hold a header", buf.len());
+        bail!(
+            "portable dump is {} bytes — too short to hold a header",
+            buf.len()
+        );
     }
     if &buf[..8] != MAGIC {
         bail!("not a portable dump: magic is not VELDPORT");
@@ -112,7 +115,8 @@ pub fn read_all<R: Read>(mut src: R) -> Result<Vec<PortableRecord>> {
     if &buf[trailer_at..trailer_at + 8] != TRAILER {
         bail!("portable dump does not end with a trailer — truncated or corrupt");
     }
-    let declared_count = u64::from_le_bytes(buf[trailer_at + 8..trailer_at + 16].try_into().unwrap());
+    let declared_count =
+        u64::from_le_bytes(buf[trailer_at + 8..trailer_at + 16].try_into().unwrap());
     let declared_digest: [u8; 32] = buf[trailer_at + 16..].try_into().unwrap();
 
     let frames = &buf[12..trailer_at];
@@ -175,17 +179,22 @@ pub fn read_all<R: Read>(mut src: R) -> Result<Vec<PortableRecord>> {
 pub fn read_trailer(path: &std::path::Path) -> Result<(u64, [u8; 32])> {
     use std::io::{Seek, SeekFrom};
     const TRAILER_LEN: i64 = 8 + 8 + 32;
-    let mut f = std::fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let len = f.metadata()?.len();
     if len < 12 + TRAILER_LEN as u64 {
-        bail!("{} is {len} bytes — too short to hold a header and a trailer", path.display());
+        bail!(
+            "{} is {len} bytes — too short to hold a header and a trailer",
+            path.display()
+        );
     }
     f.seek(SeekFrom::End(-TRAILER_LEN))?;
     let mut buf = [0u8; TRAILER_LEN as usize];
     f.read_exact(&mut buf)?;
     if &buf[..8] != TRAILER {
-        bail!("{} does not end with a trailer — truncated or corrupt", path.display());
+        bail!(
+            "{} does not end with a trailer — truncated or corrupt",
+            path.display()
+        );
     }
     let count = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let digest: [u8; 32] = buf[16..].try_into().unwrap();
@@ -202,7 +211,11 @@ mod tests {
     use super::*;
 
     fn rec(cf: &str, k: &[u8], v: &[u8]) -> PortableRecord {
-        PortableRecord { cf: cf.to_string(), key: k.to_vec(), value: v.to_vec() }
+        PortableRecord {
+            cf: cf.to_string(),
+            key: k.to_vec(),
+            value: v.to_vec(),
+        }
     }
 
     fn dump(records: &[PortableRecord]) -> Vec<u8> {
@@ -296,7 +309,12 @@ mod trailer_tests {
         let mut buf = Vec::new();
         let mut w = PortableWriter::new(&mut buf).unwrap();
         for i in 0..7u8 {
-            w.write_record(&PortableRecord { cf: "kv".into(), key: vec![i], value: vec![i, i] }).unwrap();
+            w.write_record(&PortableRecord {
+                cf: "kv".into(),
+                key: vec![i],
+                value: vec![i, i],
+            })
+            .unwrap();
         }
         let (count, digest) = w.finish().unwrap();
         std::fs::write(&path, &buf).unwrap();
@@ -315,7 +333,12 @@ mod trailer_tests {
         let path = dir.path().join("cut.veldport");
         let mut buf = Vec::new();
         let mut w = PortableWriter::new(&mut buf).unwrap();
-        w.write_record(&PortableRecord { cf: "kv".into(), key: b"a".to_vec(), value: b"1".to_vec() }).unwrap();
+        w.write_record(&PortableRecord {
+            cf: "kv".into(),
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+        })
+        .unwrap();
         w.finish().unwrap();
         std::fs::write(&path, &buf[..buf.len() - 9]).unwrap();
 

@@ -46,7 +46,11 @@ fn scan(src: &Path, dir: &Path, counts: &mut BTreeMap<String, usize>) {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let rel = path.strip_prefix(src).unwrap().to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(src)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         if rel.starts_with("storage/") {
             continue;
         }
@@ -78,7 +82,11 @@ fn rocksdb_outside_storage_only_falls() {
         BASELINE.iter().map(|(m, n)| (m.to_string(), *n)).collect();
 
     let mut problems = Vec::new();
-    for module in baseline.keys().chain(measured.keys()).collect::<std::collections::BTreeSet<_>>() {
+    for module in baseline
+        .keys()
+        .chain(measured.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
         let was = baseline.get(module).copied().unwrap_or(0);
         let now = measured.get(module).copied().unwrap_or(0);
         if now > was {
@@ -86,7 +94,9 @@ fn rocksdb_outside_storage_only_falls() {
                 "{module}: {now} rocksdb:: uses, baseline {was} — route new storage access through the traits in src/storage/"
             ));
         } else if now < was {
-            problems.push(format!("{module}: fell {was} -> {now} — lower its BASELINE entry to {now}"));
+            problems.push(format!(
+                "{module}: fell {was} -> {now} — lower its BASELINE entry to {now}"
+            ));
         }
     }
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));

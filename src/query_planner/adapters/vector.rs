@@ -54,11 +54,7 @@ impl RealVectorQuerier {
 
 #[async_trait]
 impl VectorQuerier for RealVectorQuerier {
-    async fn scan(
-        &self,
-        user_id: &str,
-        p: &VectorPredicate,
-    ) -> Result<Vec<(String, f32)>> {
+    async fn scan(&self, user_id: &str, p: &VectorPredicate) -> Result<Vec<(String, f32)>> {
         let index = match self.provider.index(user_id, &p.kind) {
             Some(idx) => idx,
             None => return Ok(Vec::new()),
@@ -71,9 +67,7 @@ impl VectorQuerier for RealVectorQuerier {
         };
         let mut out = Vec::with_capacity(hits.len());
         for (vector_id, score) in hits {
-            if let Some(memory_id) =
-                self.provider.memory_id_for(user_id, &p.kind, vector_id)
-            {
+            if let Some(memory_id) = self.provider.memory_id_for(user_id, &p.kind, vector_id) {
                 out.push((memory_id, score));
             } else {
                 tracing::debug!(
@@ -131,12 +125,7 @@ mod tests {
                 None
             }
         }
-        fn memory_id_for(
-            &self,
-            user_id: &str,
-            kind: &str,
-            vector_id: u32,
-        ) -> Option<String> {
+        fn memory_id_for(&self, user_id: &str, kind: &str, vector_id: u32) -> Option<String> {
             if user_id == self.accepted_user && kind == self.accepted_kind {
                 self.reverse.get(&vector_id).cloned()
             } else {
@@ -233,9 +222,17 @@ mod tests {
             top_k: 1,
         };
         // mem-x is the top hit at top_k=1.
-        assert!(q.score("alice", "mem-x", &p).await.expect("score").is_some());
+        assert!(q
+            .score("alice", "mem-x", &p)
+            .await
+            .expect("score")
+            .is_some());
         // mem-y is the closest after mem-x but not in a top_k=1 slice.
-        assert!(q.score("alice", "mem-y", &p).await.expect("score").is_none());
+        assert!(q
+            .score("alice", "mem-y", &p)
+            .await
+            .expect("score")
+            .is_none());
     }
 
     #[tokio::test]

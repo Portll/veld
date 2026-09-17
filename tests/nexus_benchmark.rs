@@ -14,9 +14,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use dataset_loader::{BenchmarkDataset, DatasetMemory, DatasetQuery};
+use tempfile::TempDir;
 use veld::memory::types::{Experience, ExperienceType, Query};
 use veld::memory::{MemoryConfig, MemoryId, MemorySystem};
-use tempfile::TempDir;
 
 const OVERALL_COMPOSITE_THRESHOLD: f32 = 0.45;
 const OVERALL_MRR_THRESHOLD: f32 = 0.45;
@@ -77,7 +77,10 @@ fn remember_dataset_memory(system: &MemorySystem, memory: &DatasetMemory) -> Mem
     metadata.insert("importance_hint".to_string(), memory.importance.to_string());
     metadata.insert("session".to_string(), memory.session.to_string());
     if !memory.narrative_notes.is_empty() {
-        metadata.insert("narrative_notes".to_string(), memory.narrative_notes.clone());
+        metadata.insert(
+            "narrative_notes".to_string(),
+            memory.narrative_notes.clone(),
+        );
     }
 
     let mut entities = memory.tags.clone();
@@ -176,16 +179,38 @@ fn evaluate_query(
         acceptable_ids: query.acceptable_memory_ids.clone(),
         expected_ids: query.expected_memory_ids.clone(),
         absence_ids: query.absence_memory_ids.clone(),
-        precision_at_5: precision_at_k(&map_results_to_dataset_ids(&results, reverse_map), &relevant, 5),
-        recall_at_5: recall_at_k(&map_results_to_dataset_ids(&results, reverse_map), &relevant, 5),
-        recall_at_10: recall_at_k(&map_results_to_dataset_ids(&results, reverse_map), &relevant, 10),
-        reciprocal_rank: reciprocal_rank(&map_results_to_dataset_ids(&results, reverse_map), &relevant),
-        absence_compliance: absence_compliance(&map_results_to_dataset_ids(&results, reverse_map), &absence, 10),
+        precision_at_5: precision_at_k(
+            &map_results_to_dataset_ids(&results, reverse_map),
+            &relevant,
+            5,
+        ),
+        recall_at_5: recall_at_k(
+            &map_results_to_dataset_ids(&results, reverse_map),
+            &relevant,
+            5,
+        ),
+        recall_at_10: recall_at_k(
+            &map_results_to_dataset_ids(&results, reverse_map),
+            &relevant,
+            10,
+        ),
+        reciprocal_rank: reciprocal_rank(
+            &map_results_to_dataset_ids(&results, reverse_map),
+            &relevant,
+        ),
+        absence_compliance: absence_compliance(
+            &map_results_to_dataset_ids(&results, reverse_map),
+            &absence,
+            10,
+        ),
         latency_ms,
     }
 }
 
-fn aggregate_metrics(dataset: &BenchmarkDataset, evaluations: &[QueryEvaluation]) -> AggregateMetrics {
+fn aggregate_metrics(
+    dataset: &BenchmarkDataset,
+    evaluations: &[QueryEvaluation],
+) -> AggregateMetrics {
     let n = evaluations.len().max(1) as f32;
     let weights = &dataset.scoring.composite_weights;
 
@@ -193,7 +218,11 @@ fn aggregate_metrics(dataset: &BenchmarkDataset, evaluations: &[QueryEvaluation]
     let recall_at_5 = evaluations.iter().map(|e| e.recall_at_5).sum::<f32>() / n;
     let recall_at_10 = evaluations.iter().map(|e| e.recall_at_10).sum::<f32>() / n;
     let mrr = evaluations.iter().map(|e| e.reciprocal_rank).sum::<f32>() / n;
-    let absence_compliance = evaluations.iter().map(|e| e.absence_compliance).sum::<f32>() / n;
+    let absence_compliance = evaluations
+        .iter()
+        .map(|e| e.absence_compliance)
+        .sum::<f32>()
+        / n;
     let avg_latency_ms = (evaluations.iter().map(|e| e.latency_ms).sum::<u64>() as f32 / n) as u64;
 
     let composite = (mrr * weights.mrr)
@@ -213,7 +242,11 @@ fn aggregate_metrics(dataset: &BenchmarkDataset, evaluations: &[QueryEvaluation]
     }
 }
 
-fn print_summary(dataset: &BenchmarkDataset, overall: &AggregateMetrics, evaluations: &[QueryEvaluation]) {
+fn print_summary(
+    dataset: &BenchmarkDataset,
+    overall: &AggregateMetrics,
+    evaluations: &[QueryEvaluation],
+) {
     println!("\n=== NEXUS BENCHMARK V2 ===");
     println!("Dataset: {}", dataset.name);
     println!("Memories: {}", dataset.memories.len());
@@ -266,7 +299,10 @@ fn benchmark_nexus_dataset_v2() {
         .iter()
         .filter(|error| error.severity == "ERROR")
         .collect();
-    assert!(hard_errors.is_empty(), "Dataset validation failed: {hard_errors:?}");
+    assert!(
+        hard_errors.is_empty(),
+        "Dataset validation failed: {hard_errors:?}"
+    );
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = MemoryConfig {

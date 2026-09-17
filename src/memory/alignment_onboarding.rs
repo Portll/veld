@@ -63,10 +63,16 @@ fn resolve_or_fit_inner(
             return Ok(None);
         }
         let alignment: Arc<dyn Alignment> = match header.method.as_str() {
-            "orthogonal_procrustes" => Arc::new(ProcrustesAlignment::from_payload(header, &payload)?),
+            "orthogonal_procrustes" => {
+                Arc::new(ProcrustesAlignment::from_payload(header, &payload)?)
+            }
             "ridge" => Arc::new(RidgeAlignment::from_payload(header, &payload)?),
             other => {
-                tracing::warn!("unknown alignment method `{}` in {}; ignoring", other, path.display());
+                tracing::warn!(
+                    "unknown alignment method `{}` in {}; ignoring",
+                    other,
+                    path.display()
+                );
                 return Ok(None);
             }
         };
@@ -233,7 +239,9 @@ mod tests {
     }
 
     impl Embedder for StubEmbedder {
-        fn id(&self) -> &str { "stub-onboarding" }
+        fn id(&self) -> &str {
+            "stub-onboarding"
+        }
         fn encode(&self, text: &str) -> Result<Vec<f32>> {
             let seed = text.len() as f32 + 1.0;
             let mut v = vec![0.0f32; self.dim];
@@ -281,8 +289,12 @@ mod tests {
 
         // Canonical secondary id matches the live embedder's model_id() and is
         // intentionally NOT loadable by load_embedder_by_id.
-        let pair_id = AlignmentPairId::new("primary-stub-model", "text-embedding-nomic-embed-text-v1.5");
-        let primary: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 8, id: "primary-stub-model" });
+        let pair_id =
+            AlignmentPairId::new("primary-stub-model", "text-embedding-nomic-embed-text-v1.5");
+        let primary: Arc<dyn Embedder> = Arc::new(StubEmbedder {
+            dim: 8,
+            id: "primary-stub-model",
+        });
         let secondary: Arc<dyn Embedder> = Arc::new(StubEmbedder {
             dim: 16,
             id: "text-embedding-nomic-embed-text-v1.5",
@@ -305,13 +317,18 @@ mod tests {
         let result = fit_with_embedders(&pair_id, &texts, &primary, &secondary);
         let _ = std::fs::remove_file(&path);
 
-        let alignment = result.expect("live-secondary autofit must succeed (no 'unknown embedder id')");
+        let alignment =
+            result.expect("live-secondary autofit must succeed (no 'unknown embedder id')");
         assert_eq!(alignment.in_dim(), 16, "in_dim = secondary dim");
         assert_eq!(alignment.out_dim(), 8, "out_dim = primary dim");
         // Projection actually works end-to-end (768→primary-space shape).
         let probe = secondary.encode("a brand new probe sentence").unwrap();
         let projected = alignment.project(&probe).unwrap();
-        assert_eq!(projected.len(), 8, "projects secondary vec into primary space");
+        assert_eq!(
+            projected.len(),
+            8,
+            "projects secondary vec into primary space"
+        );
     }
 
     /// Guard the regression: feeding a non-loadable secondary id to the

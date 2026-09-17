@@ -131,7 +131,12 @@ fn list_item(m: &crate::memory::Memory) -> ListMemoryItem {
     let content_length = m.experience.content.chars().count();
     ListMemoryItem {
         id: m.id.0.to_string(),
-        content: m.experience.content.chars().take(LIST_CONTENT_PREVIEW_CHARS).collect(),
+        content: m
+            .experience
+            .content
+            .chars()
+            .take(LIST_CONTENT_PREVIEW_CHARS)
+            .collect(),
         content_truncated: content_length > LIST_CONTENT_PREVIEW_CHARS,
         content_length,
         memory_type: format!("{:?}", m.experience.experience_type),
@@ -301,7 +306,11 @@ pub async fn get_memory(
     } else if wants_full_content(&params) {
         match memory_guard.decompress_memory(&memory_obj) {
             Ok(restored) => (restored, true, None),
-            Err(e) => (memory_obj, false, Some(format!("decompression failed: {e}"))),
+            Err(e) => (
+                memory_obj,
+                false,
+                Some(format!("decompression failed: {e}")),
+            ),
         }
     } else {
         (
@@ -588,7 +597,9 @@ pub async fn delete_memory(
 
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state.get_user_memory(&user_id).map_err(AppError::Internal)?;
+    let memory = state
+        .get_user_memory(&user_id)
+        .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
     let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
@@ -1587,7 +1598,13 @@ mod tests {
         let guard = memory.read();
         for c in contents {
             guard
-                .remember(Experience { content: c.clone(), ..Default::default() }, None)
+                .remember(
+                    Experience {
+                        content: c.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                )
                 .unwrap();
         }
     }
@@ -1600,7 +1617,11 @@ mod tests {
         let user_id = "truncation-user";
         let long_content = "a".repeat(600);
         let short_content = "b".repeat(42);
-        remember_n(&harness, user_id, &[long_content.clone(), short_content.clone()]);
+        remember_n(
+            &harness,
+            user_id,
+            &[long_content.clone(), short_content.clone()],
+        );
 
         let req = test_helpers::get(&format!("/api/list/{user_id}?limit=10"));
         let (status, body) = test_helpers::send(harness.router(), req).await;
@@ -1633,7 +1654,9 @@ mod tests {
         let contents: Vec<String> = (0..5).map(|i| format!("record number {i}")).collect();
         remember_n(&harness, user_id, &contents);
 
-        let page = |offset: usize| test_helpers::get(&format!("/api/list/{user_id}?limit=2&offset={offset}"));
+        let page = |offset: usize| {
+            test_helpers::get(&format!("/api/list/{user_id}?limit=2&offset={offset}"))
+        };
 
         let (status, p0) = test_helpers::send(harness.router(), page(0)).await;
         assert_eq!(status, StatusCode::OK);
@@ -1674,7 +1697,13 @@ mod tests {
             let memory = harness.manager.get_user_memory(user_id).unwrap();
             let guard = memory.read();
             guard
-                .remember(Experience { content: content.clone(), ..Default::default() }, None)
+                .remember(
+                    Experience {
+                        content: content.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                )
                 .unwrap()
         };
 
@@ -1684,11 +1713,26 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{suffix}");
             assert_eq!(body["full_content"], true, "{suffix}");
             assert_eq!(body["lossless"], true, "{suffix}");
-            assert!(body.get("content_note").is_none(), "{suffix}: {:?}", body["content_note"]);
-            assert_eq!(body["experience"]["content"], content, "{suffix}: the whole body, not a preview");
+            assert!(
+                body.get("content_note").is_none(),
+                "{suffix}: {:?}",
+                body["content_note"]
+            );
+            assert_eq!(
+                body["experience"]["content"], content,
+                "{suffix}: the whole body, not a preview"
+            );
         }
 
-        assert!(super::wants_full_content(&[("decompress".to_string(), "true".to_string())].into_iter().collect()));
-        assert!(!super::wants_full_content(&[("decompress".to_string(), "0".to_string())].into_iter().collect()));
+        assert!(super::wants_full_content(
+            &[("decompress".to_string(), "true".to_string())]
+                .into_iter()
+                .collect()
+        ));
+        assert!(!super::wants_full_content(
+            &[("decompress".to_string(), "0".to_string())]
+                .into_iter()
+                .collect()
+        ));
     }
 }

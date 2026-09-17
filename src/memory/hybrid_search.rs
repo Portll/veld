@@ -524,13 +524,16 @@ impl BM25Index {
             let existing = Index::open(dir).context("Failed to open existing BM25 index")?;
             // Schema migration: if existing index lacks stemmed_content, rebuild
             if existing.schema().get_field("stemmed_content").is_err() {
-                tracing::warn!("BM25 schema missing stemmed_content — rebuilding index for stemming support");
+                tracing::warn!(
+                    "BM25 schema missing stemmed_content — rebuilding index for stemming support"
+                );
                 drop(existing);
                 if let Err(e) = std::fs::remove_dir_all(path) {
                     tracing::warn!("Failed to remove old BM25 index: {e}");
                 }
                 std::fs::create_dir_all(path)?;
-                Index::create_in_dir(path, schema).context("Failed to create BM25 index with stemmed_content")?
+                Index::create_in_dir(path, schema)
+                    .context("Failed to create BM25 index with stemmed_content")?
             } else {
                 existing
             }
@@ -936,9 +939,7 @@ impl CrossEncoderReranker {
         let mut bi_scores: Vec<f32> = Vec::with_capacity(candidates.len());
         for (_, content, _, stored) in &candidates {
             let bi = match stored {
-                Some(emb) if emb.len() == query_dim => {
-                    cosine_similarity(&query_embedding, emb)
-                }
+                Some(emb) if emb.len() == query_dim => cosine_similarity(&query_embedding, emb),
                 _ => {
                     let doc_embedding = self.embedder.encode(content)?;
                     cosine_similarity(&query_embedding, &doc_embedding)
@@ -1313,9 +1314,7 @@ impl HybridSearchEngine {
     ///
     /// Returns (bm25_weight, vector_weight, graph_weight) normalized to sum to 1.0
     pub fn effective_weights(&self) -> (f32, f32, f32) {
-        use crate::constants::{
-            ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD, ADAPTIVE_WEIGHT_MAX_BLEND,
-        };
+        use crate::constants::{ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD, ADAPTIVE_WEIGHT_MAX_BLEND};
 
         let learned = self.learned_weights.read();
 
@@ -1328,9 +1327,8 @@ impl HybridSearchEngine {
         }
 
         // Confidence ramp: linearly increase blend factor with update count
-        let confidence = (learned.update_count as f32
-            / ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD as f32)
-            .min(1.0);
+        let confidence =
+            (learned.update_count as f32 / ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD as f32).min(1.0);
         let blend = confidence * ADAPTIVE_WEIGHT_MAX_BLEND;
 
         let bm25 = (1.0 - blend) * self.config.bm25_weight + blend * learned.bm25;
@@ -1489,7 +1487,13 @@ impl HybridSearchEngine {
         // Filter low BM25 scores
         let bm25_results: Vec<_> = bm25_results
             .into_iter()
-            .filter(|(_, score)| *score >= dial.as_ref().and_then(|d| d.bm25_min_score).unwrap_or(self.config.min_bm25_score))
+            .filter(|(_, score)| {
+                *score
+                    >= dial
+                        .as_ref()
+                        .and_then(|d| d.bm25_min_score)
+                        .unwrap_or(self.config.min_bm25_score)
+            })
             .collect();
 
         // Calculate dynamic weights based on keyword discriminativeness
@@ -1538,7 +1542,12 @@ impl HybridSearchEngine {
         }
 
         // 2. RRF Fusion with dynamic weights
-        let rrf = RRFusion::new(dial.as_ref().and_then(|d| d.rrf_k_inner).unwrap_or(self.config.rrf_k), vec![bm25_weight, vector_weight]);
+        let rrf = RRFusion::new(
+            dial.as_ref()
+                .and_then(|d| d.rrf_k_inner)
+                .unwrap_or(self.config.rrf_k),
+            vec![bm25_weight, vector_weight],
+        );
 
         let fused = rrf.fuse(vec![bm25_results.clone(), vector_results.clone()]);
 
@@ -1580,70 +1589,92 @@ impl HybridSearchEngine {
         let use_cross_encoder = false; // CE runs once at recall Layer 5.3 (batched, dial-gated)
         let use_refiner = matches!(mode, RefinerMode::Llm | RefinerMode::Stacked);
 
-        let mut final_results: Vec<HybridSearchResult> = if let Some(reranker) =
-            self.reranker.as_ref().filter(|_| use_cross_encoder)
-        {
-            // Take top-k for reranking (FIX-11: dynamic per-query override)
-            let to_rerank: Vec<_> = fused
-                .iter()
-                .take(effective_rerank_count)
-                .filter_map(|(id, _score)| {
-                    get_content(id).map(|content| (id.clone(), content, *_score, None))
-                })
-                .collect();
-
-            if !to_rerank.is_empty() {
-                let reranked = reranker.rerank(query, to_rerank)?;
-
-                // Build rerank map with cosine similarities (range [-1, 1])
-                let rerank_map: HashMap<MemoryId, f32> = reranked.into_iter().collect();
-
-                // Normalize rerank scores to [0, 1] for scale-compatible blending
-                // Cosine similarity ∈ [-1, 1] → shift to [0, 1]
-                let rerank_normalized: HashMap<MemoryId, f32> = rerank_map
+        let mut final_results: Vec<HybridSearchResult> =
+            if let Some(reranker) = self.reranker.as_ref().filter(|_| use_cross_encoder) {
+                // Take top-k for reranking (FIX-11: dynamic per-query override)
+                let to_rerank: Vec<_> = fused
                     .iter()
-                    .map(|(id, s)| (id.clone(), (s + 1.0) / 2.0))
+                    .take(effective_rerank_count)
+                    .filter_map(|(id, _score)| {
+                        get_content(id).map(|content| (id.clone(), content, *_score, None))
+                    })
                     .collect();
 
-                // Combine reranked results with non-reranked
-                // Blend: 0.6 * RRF + 0.4 * normalized_rerank (preserves RRF scale)
-                let rerank_blend: f32 = dial.as_ref().and_then(|d| d.ce_blend).unwrap_or(0.4);
-                let mut results: Vec<HybridSearchResult> = Vec::new();
+                if !to_rerank.is_empty() {
+                    let reranked = reranker.rerank(query, to_rerank)?;
 
-                for (memory_id, rrf_score) in fused {
-                    let bm25_info = bm25_map.get(&memory_id);
-                    let vector_info = vector_map.get(&memory_id);
-                    let rerank_score = rerank_map.get(&memory_id).copied();
+                    // Build rerank map with cosine similarities (range [-1, 1])
+                    let rerank_map: HashMap<MemoryId, f32> = reranked.into_iter().collect();
 
-                    // Blend rerank with RRF to preserve score scale
-                    let final_score = if let Some(norm_rerank) =
-                        rerank_normalized.get(&memory_id).copied()
-                    {
-                        (1.0 - rerank_blend) * rrf_score + rerank_blend * norm_rerank * rrf_score
-                    } else {
-                        rrf_score
-                    };
+                    // Normalize rerank scores to [0, 1] for scale-compatible blending
+                    // Cosine similarity ∈ [-1, 1] → shift to [0, 1]
+                    let rerank_normalized: HashMap<MemoryId, f32> = rerank_map
+                        .iter()
+                        .map(|(id, s)| (id.clone(), (s + 1.0) / 2.0))
+                        .collect();
 
-                    results.push(HybridSearchResult {
-                        memory_id,
-                        score: final_score,
-                        bm25_score: bm25_info.map(|(s, _)| *s),
-                        vector_score: vector_info.map(|(s, _)| *s),
-                        graph_score: None,
-                        rrf_score,
-                        rerank_score,
-                        bm25_rank: bm25_info.map(|(_, r)| *r),
-                        vector_rank: vector_info.map(|(_, r)| *r),
-                        graph_rank: None,
-                    });
+                    // Combine reranked results with non-reranked
+                    // Blend: 0.6 * RRF + 0.4 * normalized_rerank (preserves RRF scale)
+                    let rerank_blend: f32 = dial.as_ref().and_then(|d| d.ce_blend).unwrap_or(0.4);
+                    let mut results: Vec<HybridSearchResult> = Vec::new();
+
+                    for (memory_id, rrf_score) in fused {
+                        let bm25_info = bm25_map.get(&memory_id);
+                        let vector_info = vector_map.get(&memory_id);
+                        let rerank_score = rerank_map.get(&memory_id).copied();
+
+                        // Blend rerank with RRF to preserve score scale
+                        let final_score =
+                            if let Some(norm_rerank) = rerank_normalized.get(&memory_id).copied() {
+                                (1.0 - rerank_blend) * rrf_score
+                                    + rerank_blend * norm_rerank * rrf_score
+                            } else {
+                                rrf_score
+                            };
+
+                        results.push(HybridSearchResult {
+                            memory_id,
+                            score: final_score,
+                            bm25_score: bm25_info.map(|(s, _)| *s),
+                            vector_score: vector_info.map(|(s, _)| *s),
+                            graph_score: None,
+                            rrf_score,
+                            rerank_score,
+                            bm25_rank: bm25_info.map(|(_, r)| *r),
+                            vector_rank: vector_info.map(|(_, r)| *r),
+                            graph_rank: None,
+                        });
+                    }
+
+                    // Re-sort by final score
+                    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+                    results
+                } else {
+                    // No content available for reranking, use RRF scores
+                    fused
+                        .into_iter()
+                        .map(|(memory_id, rrf_score)| {
+                            let bm25_info = bm25_map.get(&memory_id);
+                            let vector_info = vector_map.get(&memory_id);
+
+                            HybridSearchResult {
+                                memory_id,
+                                score: rrf_score,
+                                bm25_score: bm25_info.map(|(s, _)| *s),
+                                vector_score: vector_info.map(|(s, _)| *s),
+                                graph_score: None,
+                                rrf_score,
+                                rerank_score: None,
+                                bm25_rank: bm25_info.map(|(_, r)| *r),
+                                vector_rank: vector_info.map(|(_, r)| *r),
+                                graph_rank: None,
+                            }
+                        })
+                        .collect()
                 }
-
-                // Re-sort by final score
-                results.sort_by(|a, b| b.score.total_cmp(&a.score));
-
-                results
             } else {
-                // No content available for reranking, use RRF scores
+                // No reranking, use RRF scores directly
                 fused
                     .into_iter()
                     .map(|(memory_id, rrf_score)| {
@@ -1664,30 +1695,7 @@ impl HybridSearchEngine {
                         }
                     })
                     .collect()
-            }
-        } else {
-            // No reranking, use RRF scores directly
-            fused
-                .into_iter()
-                .map(|(memory_id, rrf_score)| {
-                    let bm25_info = bm25_map.get(&memory_id);
-                    let vector_info = vector_map.get(&memory_id);
-
-                    HybridSearchResult {
-                        memory_id,
-                        score: rrf_score,
-                        bm25_score: bm25_info.map(|(s, _)| *s),
-                        vector_score: vector_info.map(|(s, _)| *s),
-                        graph_score: None,
-                        rrf_score,
-                        rerank_score: None,
-                        bm25_rank: bm25_info.map(|(_, r)| *r),
-                        vector_rank: vector_info.map(|(_, r)| *r),
-                        graph_rank: None,
-                    }
-                })
-                .collect()
-        };
+            };
 
         // 4. Optional LLM refiner pass (applied after cross-encoder when
         // mode is Stacked; replaces cross-encoder when mode is Llm).
@@ -1697,14 +1705,12 @@ impl HybridSearchEngine {
                     .iter()
                     .take(effective_rerank_count)
                     .filter_map(|r| {
-                        get_content(&r.memory_id)
-                            .map(|c| (r.memory_id.clone(), c, r.score))
+                        get_content(&r.memory_id).map(|c| (r.memory_id.clone(), c, r.score))
                     })
                     .collect();
                 if !to_refine.is_empty() {
                     let refined = refiner.refine(query, to_refine)?;
-                    let refined_map: HashMap<MemoryId, f32> =
-                        refined.into_iter().collect();
+                    let refined_map: HashMap<MemoryId, f32> = refined.into_iter().collect();
 
                     // Blend mirrors the cross-encoder formula: refiner can
                     // demote weakly relevant candidates but the multiplicative
@@ -2005,7 +2011,10 @@ mod tests {
     fn test_signal_scores_zero_input() {
         let scores = SignalScores::from_components(0.0, 0.0, 0.0);
         let sum = scores.bm25_contribution + scores.vector_contribution + scores.graph_contribution;
-        assert!((sum - 1.0).abs() < 0.001, "Zero input should produce uniform weights");
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "Zero input should produce uniform weights"
+        );
         assert!((scores.bm25_contribution - 1.0 / 3.0).abs() < 0.001);
     }
 
@@ -2016,8 +2025,12 @@ mod tests {
         // High BM25 contribution should become low after inversion
         assert!(inverted.bm25_contribution < inverted.vector_contribution);
         assert!(inverted.bm25_contribution < inverted.graph_contribution);
-        let sum = inverted.bm25_contribution + inverted.vector_contribution + inverted.graph_contribution;
-        assert!((sum - 1.0).abs() < 0.001, "Inverted scores should sum to 1.0");
+        let sum =
+            inverted.bm25_contribution + inverted.vector_contribution + inverted.graph_contribution;
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "Inverted scores should sum to 1.0"
+        );
     }
 
     #[test]
@@ -2054,9 +2067,17 @@ mod tests {
         }
 
         // After 100 updates at lr=0.05, weights should be close to target
-        assert!(weights.vector > 0.6, "Vector should dominate after many updates: {}", weights.vector);
+        assert!(
+            weights.vector > 0.6,
+            "Vector should dominate after many updates: {}",
+            weights.vector
+        );
         assert!(weights.bm25 < 0.2, "BM25 should be low: {}", weights.bm25);
-        assert!(weights.graph < 0.2, "Graph should be low: {}", weights.graph);
+        assert!(
+            weights.graph < 0.2,
+            "Graph should be low: {}",
+            weights.graph
+        );
     }
 
     #[test]
@@ -2282,7 +2303,9 @@ mod tests {
 
         struct StubEmb;
         impl crate::embeddings::Embedder for StubEmb {
-            fn id(&self) -> &str { "stub-hybrid" }
+            fn id(&self) -> &str {
+                "stub-hybrid"
+            }
             fn encode(&self, _: &str) -> anyhow::Result<Vec<f32>> {
                 Ok(vec![0.0; 4])
             }
@@ -2292,12 +2315,11 @@ mod tests {
         }
 
         let embedder = Arc::new(CompetitiveEmbedder::primary_only(
-            Arc::new(StubEmb) as Arc<dyn crate::embeddings::Embedder>,
+            Arc::new(StubEmb) as Arc<dyn crate::embeddings::Embedder>
         ));
         let config = HybridSearchConfig::default();
         let tmp = tempfile::tempdir().unwrap();
-        let engine =
-            HybridSearchEngine::new(&tmp.path().join("bm25"), embedder, config).unwrap();
+        let engine = HybridSearchEngine::new(&tmp.path().join("bm25"), embedder, config).unwrap();
         (engine, tmp)
     }
 
@@ -2417,7 +2439,10 @@ mod tests {
         for _ in 0..R3B_MIN_UPDATES_BEFORE_READY {
             weights.apply_update(&pos, 0.05, false);
         }
-        assert!(!weights.negative_sample_floor_met(), "all-positive must not meet floor");
+        assert!(
+            !weights.negative_sample_floor_met(),
+            "all-positive must not meet floor"
+        );
 
         // Add enough negatives to satisfy the fraction.
         // Need: neg / (pos_count + neg) >= MIN_FRAC
@@ -2454,13 +2479,15 @@ mod tests {
         let vector_attr = 0.3_f32;
         let graph_attr = 0.0_f32;
 
-        let static_signal = static_bm25 * bm25_attr + static_vector * vector_attr + static_graph * graph_attr;
+        let static_signal =
+            static_bm25 * bm25_attr + static_vector * vector_attr + static_graph * graph_attr;
 
         // Learned = same as static in this case.
         let learned_bm25 = static_bm25;
         let learned_vector = static_vector;
         let learned_graph = static_graph;
-        let learned_signal = learned_bm25 * bm25_attr + learned_vector * vector_attr + learned_graph * graph_attr;
+        let learned_signal =
+            learned_bm25 * bm25_attr + learned_vector * vector_attr + learned_graph * graph_attr;
 
         let delta = learned_signal - static_signal;
         assert!(
@@ -2469,4 +2496,3 @@ mod tests {
         );
     }
 }
-

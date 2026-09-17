@@ -699,7 +699,9 @@ impl MiniLMEmbedder {
         let mut pooled = vec![0.0; self.dimension];
         let mut mask_sum = 0.0;
 
-        for (window, (start, end)) in window_spans(tokens.len(), max_length).into_iter().enumerate()
+        for (window, (start, end)) in window_spans(tokens.len(), max_length)
+            .into_iter()
+            .enumerate()
         {
             let mut input_ids = vec![0i64; max_length];
             let mut attention = vec![0i64; max_length];
@@ -926,7 +928,9 @@ impl MiniLMEmbedder {
 }
 
 impl Embedder for MiniLMEmbedder {
-    fn id(&self) -> &str { "minilm" }
+    fn id(&self) -> &str {
+        "minilm"
+    }
 
     fn model_id(&self) -> &str {
         "minilm-l6-v2"
@@ -1197,9 +1201,14 @@ mod window_spans_tests {
     #[test]
     fn windows_tile_the_sequence_exactly_leaving_nothing_out() {
         for max_length in [1usize, 2, 7, 128, 256, 512] {
-            for token_count in [0usize, 1, 2, 6, 7, 8, 127, 128, 129, 255, 256, 257, 999, 4096] {
+            for token_count in [
+                0usize, 1, 2, 6, 7, 8, 127, 128, 129, 255, 256, 257, 999, 4096,
+            ] {
                 let spans = window_spans(token_count, max_length);
-                assert!(!spans.is_empty(), "len={token_count} w={max_length}: no windows");
+                assert!(
+                    !spans.is_empty(),
+                    "len={token_count} w={max_length}: no windows"
+                );
 
                 let mut visited = vec![0u32; token_count];
                 for (start, end) in &spans {
@@ -1248,7 +1257,11 @@ mod window_spans_tests {
                 "{token_count} tokens should need one window, not more"
             );
         }
-        assert_eq!(window_spans(257, 256).len(), 2, "257 tokens needs a second window");
+        assert_eq!(
+            window_spans(257, 256).len(),
+            2,
+            "257 tokens needs a second window"
+        );
     }
 
     /// A degenerate window must not produce an infinite or empty plan.

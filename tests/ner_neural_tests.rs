@@ -3,12 +3,10 @@
 //! These tests download the TinyBERT-finetuned-NER model and run entity extraction.
 //! Requires network access on first run to download the model (~14.5MB quantized).
 
+use std::sync::Arc;
 use veld::embeddings::minilm::pre_init_ort_runtime;
 use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
-use veld::embeddings::{
-    are_ner_models_downloaded, download_ner_models, get_ner_models_dir,
-};
-use std::sync::Arc;
+use veld::embeddings::{are_ner_models_downloaded, download_ner_models, get_ner_models_dir};
 
 /// Download NER models if not already present
 fn ensure_models_downloaded() {

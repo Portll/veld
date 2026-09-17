@@ -187,7 +187,9 @@ pub struct RelationalSlowStoreAdapter {
 impl RelationalSlowStoreAdapter {
     /// Wrap a `RelationalStore` so the slow-store query surface can be
     /// exercised against it.
-    pub fn new(store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>) -> Self {
+    pub fn new(
+        store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
+    ) -> Self {
         Self { store }
     }
 
@@ -300,10 +302,9 @@ impl RelationalSlowStoreAdapter {
         ];
 
         for stmt in DDL {
-            self.store
-                .execute(stmt, &[])
-                .await
-                .with_context(|| format!("slow-store DDL failed: {}", &stmt[..stmt.len().min(60)]))?;
+            self.store.execute(stmt, &[]).await.with_context(|| {
+                format!("slow-store DDL failed: {}", &stmt[..stmt.len().min(60)])
+            })?;
         }
 
         // Bootstrap the schema_version row when missing. Matches the
@@ -766,8 +767,15 @@ mod tests {
         assert_eq!(memories_table_ddl(&RelationalBackend::Supabase), pg);
         // MSSQL: OBJECT_ID guard, VARBINARY(MAX), NONCLUSTERED PK.
         let ms = memories_table_ddl(&RelationalBackend::Mssql);
-        assert!(ms.contains("VARBINARY(MAX)") && ms.contains("OBJECT_ID") && ms.contains("NONCLUSTERED"));
-        assert!(!ms.contains("IF NOT EXISTS"), "T-SQL has no CREATE TABLE IF NOT EXISTS");
+        assert!(
+            ms.contains("VARBINARY(MAX)")
+                && ms.contains("OBJECT_ID")
+                && ms.contains("NONCLUSTERED")
+        );
+        assert!(
+            !ms.contains("IF NOT EXISTS"),
+            "T-SQL has no CREATE TABLE IF NOT EXISTS"
+        );
     }
 
     #[test]
@@ -787,17 +795,11 @@ mod tests {
         type Error = BoxError;
 
         async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64, BoxError> {
-            self.0
-                .execute(sql, params)
-                .await
-                .map_err(BoxError::new)
+            self.0.execute(sql, params).await.map_err(BoxError::new)
         }
 
         async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, BoxError> {
-            self.0
-                .query(sql, params)
-                .await
-                .map_err(BoxError::new)
+            self.0.query(sql, params).await.map_err(BoxError::new)
         }
 
         fn backend(&self) -> crate::storage::relational::RelationalBackend {
@@ -967,7 +969,11 @@ mod tests {
             .upsert_memory("alice", "m-1", 9, &[9u8, 9], 0.8)
             .await
             .expect("upsert higher lsn");
-        let row = adapter.get_memory_blob("alice", "m-1").await.unwrap().unwrap();
+        let row = adapter
+            .get_memory_blob("alice", "m-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.lsn, 9);
         assert_eq!(row.memory_bincode, vec![9u8, 9]);
 
@@ -976,7 +982,11 @@ mod tests {
             .upsert_memory("alice", "m-1", 2, &[0u8], 0.1)
             .await
             .expect("stale upsert is a no-op");
-        let row = adapter.get_memory_blob("alice", "m-1").await.unwrap().unwrap();
+        let row = adapter
+            .get_memory_blob("alice", "m-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.lsn, 9, "stale lsn must not overwrite the newer row");
         assert_eq!(row.memory_bincode, vec![9u8, 9]);
 
@@ -985,10 +995,18 @@ mod tests {
             .anchor_memory_importance("alice", "m-1", 12, 0.95)
             .await
             .expect("anchor");
-        let row = adapter.get_memory_blob("alice", "m-1").await.unwrap().unwrap();
+        let row = adapter
+            .get_memory_blob("alice", "m-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert!((row.importance - 0.95).abs() < 1e-5);
         assert_eq!(row.lsn, 12);
-        assert_eq!(row.memory_bincode, vec![9u8, 9], "anchor leaves the blob untouched");
+        assert_eq!(
+            row.memory_bincode,
+            vec![9u8, 9],
+            "anchor leaves the blob untouched"
+        );
 
         // Tenant isolation — bob shares the table but sees none of alice's rows.
         assert_eq!(adapter.count_memories("bob").await.expect("count"), 0);

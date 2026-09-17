@@ -71,7 +71,12 @@ fn is_json_content_type(req: &Request) -> bool {
         return true;
     };
     let Ok(s) = ct.to_str() else { return false };
-    let essence = s.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let essence = s
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     essence == "application/json" || essence.ends_with("+json")
 }
 
@@ -124,7 +129,13 @@ mod tests {
     async fn parses_valid_utf8_json() {
         let req = build_req(br#"{"content":"hello","n":1}"#.to_vec());
         let LenientJson(v) = LenientJson::<Probe>::from_request(req, &()).await.unwrap();
-        assert_eq!(v, Probe { content: "hello".into(), n: 1 });
+        assert_eq!(
+            v,
+            Probe {
+                content: "hello".into(),
+                n: 1
+            }
+        );
     }
 
     #[tokio::test]

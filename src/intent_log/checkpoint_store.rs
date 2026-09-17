@@ -180,11 +180,7 @@ impl CheckpointStore {
     /// buffered — callers that need durability before returning to user
     /// code must follow with `sync()`. Returns the resulting on-disk
     /// position so callers can optionally compact later.
-    pub fn set(
-        &mut self,
-        projection_name: &str,
-        lsn: Lsn,
-    ) -> Result<(), CheckpointStoreError> {
+    pub fn set(&mut self, projection_name: &str, lsn: Lsn) -> Result<(), CheckpointStoreError> {
         let name_bytes = projection_name.as_bytes();
         if name_bytes.len() > MAX_NAME_BYTES {
             return Err(CheckpointStoreError::NameTooLong {
@@ -305,11 +301,7 @@ impl CheckpointStore {
     /// `(projection_name, key)`. Returns `None` if no record has ever
     /// been written for that pair, or if the most recent record was
     /// rejected during scan due to a torn tail / CRC mismatch.
-    pub fn get_side_data(
-        &self,
-        projection_name: &str,
-        key: &str,
-    ) -> Option<&[u8]> {
+    pub fn get_side_data(&self, projection_name: &str, key: &str) -> Option<&[u8]> {
         self.side_data
             .get(&(projection_name.to_string(), key.to_string()))
             .map(|entry| entry.bytes.as_slice())
@@ -319,11 +311,7 @@ impl CheckpointStore {
     /// `(projection_name, key)`. Returns `None` when no such record
     /// exists. Projections compare this against their own checkpoint
     /// LSN to decide whether the side data is fresh enough to trust.
-    pub fn side_data_checkpoint(
-        &self,
-        projection_name: &str,
-        key: &str,
-    ) -> Option<Lsn> {
+    pub fn side_data_checkpoint(&self, projection_name: &str, key: &str) -> Option<Lsn> {
         self.side_data
             .get(&(projection_name.to_string(), key.to_string()))
             .map(|entry| entry.ckpt_lsn)
@@ -383,9 +371,7 @@ impl CheckpointStore {
     /// Truncate the side-data file to its last fully-valid record.
     /// Destructive — call only after a scan reports a torn tail (i.e.
     /// the on-disk file is longer than [`side_data_durable_end_offset`]).
-    pub fn truncate_corrupt_side_data_tail(
-        &mut self,
-    ) -> Result<u64, CheckpointStoreError> {
+    pub fn truncate_corrupt_side_data_tail(&mut self) -> Result<u64, CheckpointStoreError> {
         // Nothing to truncate if no side data has ever been written.
         if !self.side_data_path.exists() {
             return Ok(0);
@@ -464,9 +450,7 @@ impl CheckpointStore {
     /// Lazy-open the side-data writer. Idempotent — subsequent calls
     /// return the existing handle. Creates the file if it does not yet
     /// exist.
-    fn ensure_side_data_writer(
-        &mut self,
-    ) -> Result<&mut BufWriter<File>, CheckpointStoreError> {
+    fn ensure_side_data_writer(&mut self) -> Result<&mut BufWriter<File>, CheckpointStoreError> {
         if self.side_data_writer.is_none() {
             if let Some(parent) = self.side_data_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -795,7 +779,8 @@ mod tests {
         {
             let mut s = CheckpointStore::open(&path).unwrap();
             s.set("vamana-text-primary", Lsn(42)).unwrap();
-            s.set_side_data("vamana-text-primary", "id_map", b"hello").unwrap();
+            s.set_side_data("vamana-text-primary", "id_map", b"hello")
+                .unwrap();
             s.set_side_data("vamana-image", "id_map", b"world").unwrap();
             s.sync().unwrap();
         }
@@ -894,7 +879,11 @@ mod tests {
         // covers the payload, so flipping the payload invalidates it.
         let len = std::fs::metadata(&side_path).unwrap().len();
         {
-            let mut f = OpenOptions::new().read(true).write(true).open(&side_path).unwrap();
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&side_path)
+                .unwrap();
             // Position 5 bytes before EOF lands inside the last record's
             // payload (CRC is the last 4 bytes; payload sits above it).
             f.seek(SeekFrom::Start(len - 5)).unwrap();

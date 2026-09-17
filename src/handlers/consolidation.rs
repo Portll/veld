@@ -290,7 +290,8 @@ pub async fn consolidate_memories(
                     rng_state as usize
                 };
 
-                let pair_count = DREAM_REPLAY_PAIR_COUNT.min(all_ids.len() * (all_ids.len() - 1) / 2);
+                let pair_count =
+                    DREAM_REPLAY_PAIR_COUNT.min(all_ids.len() * (all_ids.len() - 1) / 2);
 
                 for _ in 0..pair_count {
                     let idx_a = next_rand() % all_ids.len();
@@ -308,10 +309,9 @@ pub async fn consolidate_memories(
                         Err(_) => continue,
                     };
 
-                    let (Some(emb_a), Some(emb_b)) = (
-                        &mem_a.experience.embeddings,
-                        &mem_b.experience.embeddings,
-                    ) else {
+                    let (Some(emb_a), Some(emb_b)) =
+                        (&mem_a.experience.embeddings, &mem_b.experience.embeddings)
+                    else {
                         continue;
                     };
 
@@ -319,7 +319,9 @@ pub async fn consolidate_memories(
                     metrics::DREAM_REPLAY_PAIRS_EVALUATED.inc();
 
                     // Discovery band: interesting but not already-connected similarity
-                    if !(DREAM_REPLAY_SIMILARITY_THRESHOLD..=DREAM_REPLAY_SIMILARITY_CEILING).contains(&sim) {
+                    if !(DREAM_REPLAY_SIMILARITY_THRESHOLD..=DREAM_REPLAY_SIMILARITY_CEILING)
+                        .contains(&sim)
+                    {
                         continue;
                     }
 
@@ -337,7 +339,12 @@ pub async fn consolidate_memories(
                     let mut already_connected = false;
                     'outer: for ea in &entities_a {
                         for eb in &entities_b {
-                            if graph.find_relationship_between(ea, eb).ok().flatten().is_some() {
+                            if graph
+                                .find_relationship_between(ea, eb)
+                                .ok()
+                                .flatten()
+                                .is_some()
+                            {
                                 already_connected = true;
                                 break 'outer;
                             }
@@ -381,9 +388,7 @@ pub async fn consolidate_memories(
                             metrics::DREAM_REPLAY_EDGES_CREATED.inc();
                         }
                         Err(e) => {
-                            tracing::debug!(
-                                "Dream replay edge creation failed: {e}"
-                            );
+                            tracing::debug!("Dream replay edge creation failed: {e}");
                         }
                     }
                 }
@@ -409,7 +414,10 @@ pub async fn consolidate_memories(
         if let Ok(graph) = state_clone.get_user_graph(&user_id) {
             if let Ok(store) = state_clone.get_user_slow_store(&user_id) {
                 let graph_guard = graph.read();
-                match (graph_guard.get_all_entities(), graph_guard.get_all_relationships()) {
+                match (
+                    graph_guard.get_all_entities(),
+                    graph_guard.get_all_relationships(),
+                ) {
                     (Ok(entities), Ok(edges)) => {
                         if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
                             let config = GapDetectionConfig::default();
@@ -561,8 +569,12 @@ pub async fn sleep_phase_consolidation(
                         "Sleep-phase: fact extraction complete"
                     );
                 }
-                Ok(Err(e)) => tracing::warn!(user_id = %user_id, "Sleep-phase fact extraction failed: {e}"),
-                Err(e) => tracing::warn!(user_id = %user_id, "Sleep-phase fact extraction panicked: {e}"),
+                Ok(Err(e)) => {
+                    tracing::warn!(user_id = %user_id, "Sleep-phase fact extraction failed: {e}")
+                }
+                Err(e) => {
+                    tracing::warn!(user_id = %user_id, "Sleep-phase fact extraction panicked: {e}")
+                }
             }
         }
 
@@ -745,7 +757,10 @@ pub async fn sleep_phase_consolidation(
         if let Ok(graph) = state_clone.get_user_graph(&user_id) {
             if let Ok(store) = state_clone.get_user_slow_store(&user_id) {
                 let graph_guard = graph.read();
-                if let (Ok(entities), Ok(edges)) = (graph_guard.get_all_entities(), graph_guard.get_all_relationships()) {
+                if let (Ok(entities), Ok(edges)) = (
+                    graph_guard.get_all_entities(),
+                    graph_guard.get_all_relationships(),
+                ) {
                     if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
                         let config = GapDetectionConfig::default();
                         if let Ok(result) = GapDetector::detect(store.as_ref(), &config) {

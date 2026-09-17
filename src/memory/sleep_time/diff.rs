@@ -112,9 +112,7 @@ fn retained_chars_estimate(a: &str, b: &str) -> usize {
     }
 
     let mut suffix = 0usize;
-    while suffix < n - prefix
-        && av[av.len() - 1 - suffix] == bv[bv.len() - 1 - suffix]
-    {
+    while suffix < n - prefix && av[av.len() - 1 - suffix] == bv[bv.len() - 1 - suffix] {
         suffix += 1;
     }
 

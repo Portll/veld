@@ -1083,7 +1083,12 @@ mod tests {
         let req: RecallRequest = serde_json::from_value(json).unwrap();
         assert_eq!(
             req.tags.as_deref(),
-            Some(&["scope:commitwork-sweep".to_string(), "memory-layer-project:commitwork".to_string()][..])
+            Some(
+                &[
+                    "scope:commitwork-sweep".to_string(),
+                    "memory-layer-project:commitwork".to_string()
+                ][..]
+            )
         );
 
         let bare: RecallRequest =

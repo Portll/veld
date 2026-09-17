@@ -210,10 +210,7 @@ impl InMemoryDatasetStore {
         }
     }
 
-    fn lookup(
-        &self,
-        dataset: &DatasetRef,
-    ) -> Result<Arc<RwLock<InMemoryState>>, DatasetError> {
+    fn lookup(&self, dataset: &DatasetRef) -> Result<Arc<RwLock<InMemoryState>>, DatasetError> {
         // Tenant isolation: keyed strictly by (user_id, name). The `table`
         // field on `DatasetRef` is informational and is not used for
         // routing — even if a caller forges a matching `table`, the

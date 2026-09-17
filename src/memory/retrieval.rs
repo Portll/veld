@@ -264,13 +264,9 @@ impl RetrievalEngine {
                 };
                 let sec_storage = storage_path.join("secondary_vector_index");
                 std::fs::create_dir_all(&sec_storage)?;
-                let sec_index =
-                    VamanaIndex::with_storage_path(sec_config, Some(sec_storage))
-                        .context("Failed to initialize secondary Vamana vector index")?;
-                info!(
-                    "Secondary Vamana index initialized ({}d, mmap)",
-                    sec_dim
-                );
+                let sec_index = VamanaIndex::with_storage_path(sec_config, Some(sec_storage))
+                    .context("Failed to initialize secondary Vamana vector index")?;
+                info!("Secondary Vamana index initialized ({}d, mmap)", sec_dim);
                 (
                     Some(Arc::new(RwLock::new(sec_index))),
                     Some(Arc::new(RwLock::new(IdMapping::new()))),
@@ -406,7 +402,11 @@ impl RetrievalEngine {
         );
 
         // Stale persisted indices must not be loaded against the new dimension.
-        let _ = std::fs::remove_file(self.storage_path.join("vector_index").join(VAMANA_INDEX_FILE));
+        let _ = std::fs::remove_file(
+            self.storage_path
+                .join("vector_index")
+                .join(VAMANA_INDEX_FILE),
+        );
         let _ = std::fs::remove_file(
             self.storage_path
                 .join("secondary_vector_index")
@@ -433,8 +433,8 @@ impl RetrievalEngine {
             // Already the correct length — nothing to do (keeps retries cheap).
             // Unless the EMBEDDER changed at the same dimension, in which case length
             // is exactly the property that stayed correct while the content did not.
-            let needs_migration = force_all
-                || matches!(&memory.experience.embeddings, Some(e) if e.len() != target);
+            let needs_migration =
+                force_all || matches!(&memory.experience.embeddings, Some(e) if e.len() != target);
             if !needs_migration {
                 unchanged += 1;
                 continue;
@@ -614,13 +614,11 @@ impl RetrievalEngine {
     /// Secondary has no RocksDB vector mappings — it rebuilds from
     /// `experience.embeddings_secondary` stored in each memory.
     fn rebuild_secondary_from_rocksdb(&self) -> Result<()> {
-        let (sec_index, sec_mapping) = match (
-            &self.secondary_vector_index,
-            &self.secondary_id_mapping,
-        ) {
-            (Some(idx), Some(map)) => (idx, map),
-            _ => return Ok(()), // No secondary configured
-        };
+        let (sec_index, sec_mapping) =
+            match (&self.secondary_vector_index, &self.secondary_id_mapping) {
+                (Some(idx), Some(map)) => (idx, map),
+                _ => return Ok(()), // No secondary configured
+            };
 
         let start_time = std::time::Instant::now();
 
@@ -732,10 +730,7 @@ impl RetrievalEngine {
                     indexed += 1;
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to index secondary for {}: {}",
-                        memory_id.0, e
-                    );
+                    warn!("Failed to index secondary for {}: {}", memory_id.0, e);
                     failed += 1;
                 }
             }
@@ -1070,10 +1065,7 @@ impl RetrievalEngine {
                             );
                             let _ = fs::remove_file(&tmp_path);
                         } else {
-                            info!(
-                                "Saved secondary Vamana index: {} vectors",
-                                sec_idx.len()
-                            );
+                            info!("Saved secondary Vamana index: {} vectors", sec_idx.len());
                         }
                     }
                     Err(e) => {
@@ -1221,10 +1213,7 @@ impl RetrievalEngine {
                     }
                     Err(e) => {
                         // Secondary failure is non-fatal — primary is authoritative
-                        warn!(
-                            "Failed to index secondary for {}: {}",
-                            memory.id.0, e
-                        );
+                        warn!("Failed to index secondary for {}: {}", memory.id.0, e);
                     }
                 }
             }
@@ -1585,18 +1574,19 @@ impl RetrievalEngine {
         query_embedding_secondary: &[f32],
         limit: usize,
     ) -> Result<Vec<(MemoryId, f32)>> {
-        let (sec_index, sec_mapping) = match (
-            &self.secondary_vector_index,
-            &self.secondary_id_mapping,
-        ) {
-            (Some(idx), Some(map)) => (idx, map),
-            _ => return Ok(Vec::new()),
-        };
+        let (sec_index, sec_mapping) =
+            match (&self.secondary_vector_index, &self.secondary_id_mapping) {
+                (Some(idx), Some(map)) => (idx, map),
+                _ => return Ok(Vec::new()),
+            };
 
         // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
         let index = sec_index.read();
         let results = index
-            .search(query_embedding_secondary, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
+            .search(
+                query_embedding_secondary,
+                limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
+            )
             .context("Secondary vector search failed")?;
 
         let id_mapping = sec_mapping.read();
@@ -1642,7 +1632,10 @@ impl RetrievalEngine {
     ) -> Result<Vec<(MemoryId, f32)>> {
         use crate::embeddings::competitive::AlignedSide;
 
-        let projected = match self.embedder.encode_aligned(query_text, AlignedSide::Query)? {
+        let projected = match self
+            .embedder
+            .encode_aligned(query_text, AlignedSide::Query)?
+        {
             Some(v) => v,
             None => return Ok(Vec::new()),
         };
@@ -1882,7 +1875,11 @@ impl RetrievalEngine {
             });
         } else {
             // Newest first; tie-break by MemoryId on identical timestamps (RH-10).
-            memories.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+            memories.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
         }
 
         memories.truncate(limit);
@@ -2063,7 +2060,11 @@ impl RetrievalEngine {
         memories.retain(|m| self.matches_filters(m, query));
 
         // Sort by timestamp (chronological order for mission replay), tie-break by id (RH-10).
-        memories.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        memories.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         memories.truncate(limit);
         Ok(memories)
@@ -2219,7 +2220,10 @@ impl RetrievalEngine {
             return Ok((0, 0));
         }
 
-        tracing::info!("Starting context-prefix re-embedding migration: {} memories", total);
+        tracing::info!(
+            "Starting context-prefix re-embedding migration: {} memories",
+            total
+        );
         let start_time = std::time::Instant::now();
         let mut reembedded = 0;
         let mut failed = 0;
@@ -2266,16 +2270,21 @@ impl RetrievalEngine {
                 };
                 tracing::info!(
                     "Re-embed progress: {}/{} ({:.1}%), {} done, {} failed, {:.0}/sec",
-                    i + 1, total,
+                    i + 1,
+                    total,
                     (i + 1) as f64 / total as f64 * 100.0,
-                    reembedded, failed, rate
+                    reembedded,
+                    failed,
+                    rate
                 );
             }
         }
 
         tracing::info!(
             "Re-embed migration complete: {} re-embedded, {} failed (total: {})",
-            reembedded, failed, total
+            reembedded,
+            failed,
+            total
         );
 
         Ok((reembedded, failed))
@@ -2413,8 +2422,7 @@ pub struct IndexHealth {
 ///
 /// When memories are retrieved and used to complete a task, this feedback
 /// tells the system whether they were helpful, enabling adaptive learning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RetrievalOutcome {
     /// Memory helped complete the task successfully
     /// Triggers: +importance boost, +association strength, +access count
@@ -2535,7 +2543,7 @@ impl RetrievalEngine {
                         // Increment access and apply importance boost
                         memory.record_access();
                         memory.boost_importance(0.05); // +5% importance
-                        // Bayesian confidence calibration
+                                                       // Bayesian confidence calibration
                         memory.update_confidence(true);
 
                         // PERSIST: Write updated memory back to durable storage
@@ -2551,7 +2559,7 @@ impl RetrievalEngine {
                     if let Ok(memory) = self.storage.get(id) {
                         memory.record_access();
                         memory.decay_importance(0.10); // -10% importance
-                        // Bayesian confidence calibration
+                                                       // Bayesian confidence calibration
                         memory.update_confidence(false);
 
                         // PERSIST: Write updated memory back to durable storage
@@ -2566,9 +2574,7 @@ impl RetrievalEngine {
             // future learned ranker, captured to the trace store elsewhere. For LIVE
             // reinforcement they are SHADOW-neutral — same access-only behaviour as
             // Neutral, so adding the labels changes no importance/confidence.
-            RetrievalOutcome::Neutral
-            | RetrievalOutcome::Abstained
-            | RetrievalOutcome::Ignored => {
+            RetrievalOutcome::Neutral | RetrievalOutcome::Abstained | RetrievalOutcome::Ignored => {
                 // Just record access, mild reinforcement - PERSIST to storage
                 for id in memory_ids {
                     if let Ok(memory) = self.storage.get(id) {
@@ -2637,7 +2643,6 @@ pub struct ReinforcementStats {
     /// How many persistence operations failed (non-zero indicates data loss risk)
     pub persist_failures: usize,
 }
-
 
 // NOTE: MemoryGraph has been consolidated into GraphMemory (src/graph_memory.rs)
 // which provides persistent storage in RocksDB and proper Hebbian learning.
@@ -3275,7 +3280,10 @@ mod corpus_action_tests {
 
     #[test]
     fn a_matching_pair_is_up_to_date_and_costs_nothing() {
-        assert_eq!(corpus_action(Some(384), Some("minilm"), 384, "minilm"), CorpusAction::UpToDate);
+        assert_eq!(
+            corpus_action(Some(384), Some("minilm"), 384, "minilm"),
+            CorpusAction::UpToDate
+        );
     }
 
     #[test]
@@ -3321,6 +3329,9 @@ mod corpus_action_tests {
         // finds zero memories and records both markers without work. Asserted so a
         // later reader does not "fix" this into UpToDate, which would record the
         // markers for a corpus nobody looked at.
-        assert_eq!(corpus_action(None, None, 384, "minilm"), CorpusAction::MigrateChangedLength);
+        assert_eq!(
+            corpus_action(None, None, 384, "minilm"),
+            CorpusAction::MigrateChangedLength
+        );
     }
 }

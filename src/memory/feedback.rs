@@ -1343,15 +1343,15 @@ impl RetrievalQualityTracker {
 
         // Update per-entity stats
         for entity in entity_names {
-            let stats = self
-                .entity_stats
-                .entry(entity.clone())
-                .or_insert_with(|| EntityRetrievalStats {
-                    retrieval_count: 0,
-                    success_count: 0,
-                    avg_signal: 0.0,
-                    last_retrieval: now,
-                });
+            let stats =
+                self.entity_stats
+                    .entry(entity.clone())
+                    .or_insert_with(|| EntityRetrievalStats {
+                        retrieval_count: 0,
+                        success_count: 0,
+                        avg_signal: 0.0,
+                        last_retrieval: now,
+                    });
             stats.retrieval_count += 1;
             if is_success {
                 stats.success_count += 1;
@@ -1471,7 +1471,6 @@ pub struct FeedbackStore {
     /// missing column family becomes an error at construction rather than a silent
 
     /// no-op at each write.
-
     store: Option<Arc<dyn crate::storage::KeyValueStore>>,
 
     /// Track dirty entries that need persistence
@@ -1489,7 +1488,6 @@ impl std::fmt::Debug for FeedbackStore {
             .finish()
     }
 }
-
 
 impl FeedbackStore {
     /// Create in-memory only store (no persistence)
@@ -2023,8 +2021,7 @@ impl RetrievalTrace {
     }
 
     fn is_expired(&self, now: DateTime<Utc>) -> bool {
-        self.outcome.is_none()
-            && (now - self.created_at).num_hours() >= TRACE_PENDING_TTL_HOURS
+        self.outcome.is_none() && (now - self.created_at).num_hours() >= TRACE_PENDING_TTL_HOURS
     }
 }
 
@@ -2093,7 +2090,9 @@ impl RetrievalTraceStore {
 
     /// Read all PENDING rows (un-labeled), newest-irrelevant ordering.
     pub fn load_pending(&self) -> Vec<RetrievalTrace> {
-        let Some(kv) = &self.kv else { return Vec::new() };
+        let Some(kv) = &self.kv else {
+            return Vec::new();
+        };
         match kv.scan_prefix(TRACE_PENDING_PREFIX.as_bytes(), None) {
             Ok(rows) => rows
                 .into_iter()
@@ -2108,7 +2107,9 @@ impl RetrievalTraceStore {
 
     /// Read all TRAINING rows (labeled + joined). Used by tests and a future R3.
     pub fn load_training(&self) -> Vec<RetrievalTrace> {
-        let Some(kv) = &self.kv else { return Vec::new() };
+        let Some(kv) = &self.kv else {
+            return Vec::new();
+        };
         match kv.scan_prefix(TRACE_TRAIN_PREFIX.as_bytes(), None) {
             Ok(rows) => rows
                 .into_iter()
@@ -2162,7 +2163,10 @@ impl RetrievalTraceStore {
             // the commit; a crash between writes only re-graduates idempotently).
             match serde_json::to_vec(&trace) {
                 Ok(bytes) => {
-                    if kv.put_bytes(&Self::train_key(&trace.trace_id), &bytes).is_ok() {
+                    if kv
+                        .put_bytes(&Self::train_key(&trace.trace_id), &bytes)
+                        .is_ok()
+                    {
                         let _ = kv.delete_bytes(&Self::pending_key(&trace.trace_id));
                         graduated += 1;
                         crate::metrics::LTR_TRACE_GRADUATED_TOTAL.inc();
@@ -2781,9 +2785,9 @@ mod tests {
     // separate integration test in recall.rs where the full scoring path runs.
     // =====================================================================
 
+    use crate::config::StorageBackend;
     use crate::memory::retrieval::RetrievalOutcome;
     use crate::storage::KeyValueStore;
-    use crate::config::StorageBackend;
     use parking_lot::Mutex as PlMutex;
     use std::collections::BTreeMap;
 
@@ -2926,7 +2930,11 @@ mod tests {
         newer.final_score = 0.90;
         store.record_pending(&newer);
 
-        assert_eq!(store.pending_count(), 2, "one row per recall for same memory");
+        assert_eq!(
+            store.pending_count(),
+            2,
+            "one row per recall for same memory"
+        );
 
         let graduated = store.join_feedback(&[mid.clone()], RetrievalOutcome::Helpful);
         assert_eq!(graduated, 1);
@@ -2954,8 +2962,7 @@ mod tests {
 
         let stale = MemoryId(Uuid::new_v4());
         let mut stale_row = pending_trace(stale.clone(), 1);
-        stale_row.created_at = Utc::now()
-            - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
+        stale_row.created_at = Utc::now() - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
         store.record_pending(&stale_row);
 
         // After the batch of inserts the expired row is still in KV — eviction
@@ -3032,13 +3039,19 @@ mod tests {
         );
 
         // Confirm the surviving rows are the originally-fresh ones.
-        let pend_ids: std::collections::HashSet<MemoryId> =
-            store.load_pending().into_iter().map(|t| t.memory_id).collect();
+        let pend_ids: std::collections::HashSet<MemoryId> = store
+            .load_pending()
+            .into_iter()
+            .map(|t| t.memory_id)
+            .collect();
         for mid in &fresh_ids {
             assert!(pend_ids.contains(mid), "fresh row {mid:?} must survive");
         }
         for mid in &expired_ids {
-            assert!(!pend_ids.contains(mid), "expired row {mid:?} must be evicted");
+            assert!(
+                !pend_ids.contains(mid),
+                "expired row {mid:?} must be evicted"
+            );
         }
     }
 
@@ -3049,8 +3062,7 @@ mod tests {
         let store = mem_store();
         let mid = MemoryId(Uuid::new_v4());
         let mut expired = pending_trace(mid.clone(), 0);
-        expired.created_at = Utc::now()
-            - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
+        expired.created_at = Utc::now() - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
         store.record_pending(&expired);
 
         let graduated = store.join_feedback(&[mid.clone()], RetrievalOutcome::Helpful);

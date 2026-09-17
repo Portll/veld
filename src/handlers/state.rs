@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 
-use crate::user_memory::{UserMemory, SharedUserMemory};
+use crate::user_memory::{SharedUserMemory, UserMemory};
 /// Static regex for extracting all-caps terms (API, TUI, NER, REST, etc.)
 fn allcaps_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -24,8 +24,6 @@ fn issue_regex() -> &'static regex::Regex {
 }
 
 use crate::ab_testing;
-#[cfg(feature = "multi-tenant")]
-use crate::extensions::maintenance;
 use crate::backup;
 use crate::backup::BackupMetadata;
 use crate::config::{ServerConfig, StorageBackend};
@@ -34,6 +32,8 @@ use crate::embeddings::{
     get_ner_models_dir, ner::NerEntityType, neural_ner_enabled, KeywordExtractor, NerConfig,
     NeuralNer,
 };
+#[cfg(feature = "multi-tenant")]
+use crate::extensions::maintenance;
 use crate::graph_memory::{
     EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
     LtpStatus, RelationType, RelationshipEdge,
@@ -107,11 +107,9 @@ impl MultiUserMemoryManagerRotationHelper {
             tracing::warn!("audit cutoff timestamp outside i64 nanos range, using 0");
             0
         });
-        let removed_count = self.audit_store.rotate_events(
-            user_id,
-            self.audit_max_entries,
-            cutoff_time,
-        )?;
+        let removed_count =
+            self.audit_store
+                .rotate_events(user_id, self.audit_max_entries, cutoff_time)?;
 
         // Sync in-memory cache
         if removed_count > 0 {
@@ -253,8 +251,7 @@ pub struct MultiUserMemoryManager {
     /// needs to query the same documents. Wrapped in `Arc` because the
     /// index's interior writer and reader are already lock-protected;
     /// the outer pointer just amortises the open cost.
-    pub bm25_indices:
-        DashMap<String, std::sync::Arc<crate::memory::BM25Index>>,
+    pub bm25_indices: DashMap<String, std::sync::Arc<crate::memory::BM25Index>>,
 
     /// Per-user [`JournaledWriter`]. Created lazily on first journaled
     /// CRUD for that user; holds the open intent log, the per-user
@@ -266,10 +263,8 @@ pub struct MultiUserMemoryManager {
     /// Wired up here (and not in the per-user UserMemory) because the
     /// projection list is a runtime construct that may grow over time
     /// (Vamana, BM25, Postgres) and we want one place to register them.
-    pub journaled_writers: DashMap<
-        String,
-        std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>,
-    >,
+    pub journaled_writers:
+        DashMap<String, std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>>,
 
     /// One init-lock per tenant for the lazy `JournaledWriter` creation.
     /// Without this, two concurrent first-touch requests for the same
@@ -313,8 +308,13 @@ pub struct MultiUserMemoryManager {
     /// uses this to run parametrised SELECTs directly against the same
     /// database, since the [`crate::datasets::DatasetStore`] trait does not
     /// expose raw SELECT.
-    pub dataset_executor:
-        Option<std::sync::Arc<dyn crate::storage::relational::RelationalStore<Error = crate::storage::relational::BoxError>>>,
+    pub dataset_executor: Option<
+        std::sync::Arc<
+            dyn crate::storage::relational::RelationalStore<
+                Error = crate::storage::relational::BoxError,
+            >,
+        >,
+    >,
 
     /// Sleep-time / observational memory orchestrator (V1). `Some` only
     /// when [`crate::config::SleepTimeConfig::enabled`] is true at startup
@@ -545,11 +545,8 @@ impl MultiUserMemoryManager {
             crate::constants::ROCKSDB_SHARED_CACHE_BYTES / (1024 * 1024)
         );
 
-        let shared_stores = Self::bootstrap_shared_stores(
-            &base_path,
-            &server_config,
-            &shared_rocksdb_cache,
-        )?;
+        let shared_stores =
+            Self::bootstrap_shared_stores(&base_path, &server_config, &shared_rocksdb_cache)?;
 
         if let Err(e) = shared_stores.todo_store.load_vector_indices() {
             tracing::warn!("Failed to load todo vector indices: {}, semantic todo search will rebuild on first use", e);
@@ -709,7 +706,9 @@ impl MultiUserMemoryManager {
         dataset_store: std::sync::Arc<dyn crate::datasets::DatasetStore>,
         link_store: std::sync::Arc<dyn crate::datasets::LinkStore>,
         dataset_executor: std::sync::Arc<
-            dyn crate::storage::relational::RelationalStore<Error = crate::storage::relational::BoxError>,
+            dyn crate::storage::relational::RelationalStore<
+                Error = crate::storage::relational::BoxError,
+            >,
         >,
     ) -> Self {
         self.dataset_store = Some(dataset_store);
@@ -729,12 +728,11 @@ impl MultiUserMemoryManager {
 
                 Self::migrate_audit_db(base_path, &shared_db)?;
 
-                let audit_store: Arc<dyn AuditStore> = Arc::new(
-                    crate::storage::legacy_rocksdb::RocksDbAuditStore::new(
+                let audit_store: Arc<dyn AuditStore> =
+                    Arc::new(crate::storage::legacy_rocksdb::RocksDbAuditStore::new(
                         shared_db.clone(),
                         CF_AUDIT,
-                    ),
-                );
+                    ));
 
                 let prospective_store =
                     Arc::new(ProspectiveStore::new(shared_db.clone(), base_path)?);
@@ -752,10 +750,7 @@ impl MultiUserMemoryManager {
                 let feedback_store = Arc::new(parking_lot::RwLock::new(
                     FeedbackStore::with_shared_db(shared_db.clone(), base_path).unwrap_or_else(
                         |e| {
-                            tracing::warn!(
-                                "Failed to load feedback store: {}, using in-memory",
-                                e
-                            );
+                            tracing::warn!("Failed to load feedback store: {}, using in-memory", e);
                             FeedbackStore::new()
                         },
                     ),
@@ -880,7 +875,10 @@ impl MultiUserMemoryManager {
             crate::memory::sleep_time::CF_SLEEP_TIME_GRADUATIONS,
             crate::memory::sleep_time::CF_SLEEP_TIME_SUPERSESSIONS,
         ] {
-            cfs.push(ColumnFamilyDescriptor::new(cf, Self::shared_store_cf_options()));
+            cfs.push(ColumnFamilyDescriptor::new(
+                cf,
+                Self::shared_store_cf_options(),
+            ));
         }
         cfs.push(ColumnFamilyDescriptor::new(
             crate::memory::feedback::CF_FEEDBACK,
@@ -1144,7 +1142,10 @@ impl MultiUserMemoryManager {
                     Some(&self.shared_rocksdb_cache),
                 )
                 .with_context(|| {
-                    format!("Failed to open primary memory store at {:?}", config.storage_path)
+                    format!(
+                        "Failed to open primary memory store at {:?}",
+                        config.storage_path
+                    )
                 })?;
 
                 // Share the tenant's `Arc<BM25Index>` with the
@@ -1198,13 +1199,14 @@ impl MultiUserMemoryManager {
 
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
-                let graph_store = RocksDbGraphStore::open(
-                    &graph_path,
-                    Some(&self.shared_rocksdb_cache),
-                )
-                .with_context(|| {
-                    format!("Failed to open graph store for user '{user_id}' at {:?}", graph_path)
-                })?;
+                let graph_store =
+                    RocksDbGraphStore::open(&graph_path, Some(&self.shared_rocksdb_cache))
+                        .with_context(|| {
+                            format!(
+                                "Failed to open graph store for user '{user_id}' at {:?}",
+                                graph_path
+                            )
+                        })?;
 
                 Ok(graph_store.into_inner())
             }
@@ -1212,11 +1214,13 @@ impl MultiUserMemoryManager {
             StorageBackend::Redb => {
                 std::fs::create_dir_all(&graph_path)?;
                 let database = crate::storage::redb::open_graph_database(&graph_path)?;
-                GraphMemory::with_store(Arc::new(
-                    crate::storage::redb::RedbColumnStore::new(database),
-                ))
+                GraphMemory::with_store(Arc::new(crate::storage::redb::RedbColumnStore::new(
+                    database,
+                )))
                 .with_context(|| {
-                    format!("Failed to open redb graph store for user '{user_id}' at {graph_path:?}")
+                    format!(
+                        "Failed to open redb graph store for user '{user_id}' at {graph_path:?}"
+                    )
                 })
             }
             #[cfg(not(feature = "storage-redb"))]
@@ -1303,7 +1307,10 @@ impl MultiUserMemoryManager {
             match created {
                 Some(user_mem) => user_mem,
                 None => {
-                    return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))).with_context(|| {
+                    return Err(
+                        last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))
+                    )
+                    .with_context(|| {
                         format!(
                             "Failed to initialize UserMemory for user '{}' after 4 attempts",
                             user_id
@@ -1329,7 +1336,11 @@ impl MultiUserMemoryManager {
         // the user memory is cached so the writer-open path resolves it via the
         // fast cache path without re-entering this per-user init lock.
         // Non-fatal — a reconcile failure must not block user memory creation.
-        if self.reconciled_users.insert(user_id.to_string(), ()).is_none() {
+        if self
+            .reconciled_users
+            .insert(user_id.to_string(), ())
+            .is_none()
+        {
             if let Err(e) = self.reconcile_store_with_intent_log(user_id, &memory_arc) {
                 tracing::warn!(
                     user_id = %user_id,
@@ -1836,7 +1847,10 @@ impl MultiUserMemoryManager {
             match created {
                 Some(gm) => gm,
                 None => {
-                    return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))).with_context(|| {
+                    return Err(
+                        last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))
+                    )
+                    .with_context(|| {
                         format!(
                             "Failed to initialize graph memory for user '{}' after 4 attempts",
                             user_id
@@ -1902,10 +1916,10 @@ impl MultiUserMemoryManager {
         let user_path = self.user_dir(user_id)?;
         let bm25_path = user_path.join(crate::memory::BM25_INDEX_DIR);
         std::fs::create_dir_all(&bm25_path)?;
-        let index =
-            std::sync::Arc::new(crate::memory::BM25Index::new(&bm25_path).with_context(
-                || format!("open BM25 projection index for user {user_id}"),
-            )?);
+        let index = std::sync::Arc::new(
+            crate::memory::BM25Index::new(&bm25_path)
+                .with_context(|| format!("open BM25 projection index for user {user_id}"))?,
+        );
         self.bm25_indices.insert(user_id.to_string(), index.clone());
         Ok(index)
     }
@@ -1937,9 +1951,7 @@ impl MultiUserMemoryManager {
     pub fn get_user_journaled_writer(
         &self,
         user_id: &str,
-    ) -> Result<
-        std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>,
-    > {
+    ) -> Result<std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>> {
         // Fast path — cached.
         if let Some(w) = self.journaled_writers.get(user_id) {
             return Ok(w.clone());
@@ -2002,11 +2014,8 @@ impl MultiUserMemoryManager {
         // Catch the SQLite projection up to the head of the log before
         // it goes live. The `Some(100)` flushes the checkpoint every 100
         // applied records so a crash during a long replay survives.
-        let applied_sqlite =
-            crate::intent_log::replay(&log, &mut sqlite_projection, Some(100))
-                .with_context(|| {
-                    format!("replay intent log for user {user_id} (sqlite projection)")
-                })?;
+        let applied_sqlite = crate::intent_log::replay(&log, &mut sqlite_projection, Some(100))
+            .with_context(|| format!("replay intent log for user {user_id} (sqlite projection)"))?;
         if applied_sqlite > 0 {
             tracing::info!(
                 user_id = %user_id,
@@ -2070,13 +2079,10 @@ impl MultiUserMemoryManager {
                     distance_metric: crate::vector_db::DistanceMetric::default(),
                 },
             };
-            let mut proj = crate::vector_db::VamanaProjection::lazy(
-                kind,
-                bootstrap,
-                checkpoint_store.clone(),
-            );
-            let applied = crate::intent_log::replay(&log, &mut proj, Some(100))
-                .with_context(|| {
+            let mut proj =
+                crate::vector_db::VamanaProjection::lazy(kind, bootstrap, checkpoint_store.clone());
+            let applied =
+                crate::intent_log::replay(&log, &mut proj, Some(100)).with_context(|| {
                     format!(
                         "replay intent log for user {user_id} ({} projection)",
                         kind.projection_name()
@@ -2096,18 +2102,14 @@ impl MultiUserMemoryManager {
         // Third projection: BM25 inverted index. Same independent-checkpoint
         // pattern — a stalled BM25 can't block the others' catch-up.
         let bm25_index = self.get_user_bm25_index(user_id)?;
-        let mut bm25_projection = crate::memory::Bm25Projection::new(
-            bm25_index.clone(),
-            checkpoint_store.clone(),
-        );
+        let mut bm25_projection =
+            crate::memory::Bm25Projection::new(bm25_index.clone(), checkpoint_store.clone());
         let bm25_applied = crate::intent_log::replay(
             &log,
             &mut bm25_projection,
             Some(crate::memory::bm25_projection::COMMIT_EVERY),
         )
-        .with_context(|| {
-            format!("replay intent log into BM25 projection for user {user_id}")
-        })?;
+        .with_context(|| format!("replay intent log into BM25 projection for user {user_id}"))?;
         if bm25_applied > 0 {
             tracing::info!(
                 user_id = %user_id,
@@ -2126,7 +2128,8 @@ impl MultiUserMemoryManager {
             let wiki_dir = crate::wiki::wiki_target_dir(&user_path, user_id);
             match crate::wiki::WikiProjection::new(wiki_dir, checkpoint_store.clone()) {
                 Ok(mut wp) => {
-                    match crate::intent_log::replay(&log, &mut wp, Some(crate::wiki::COMMIT_EVERY)) {
+                    match crate::intent_log::replay(&log, &mut wp, Some(crate::wiki::COMMIT_EVERY))
+                    {
                         Ok(applied) => {
                             if applied > 0 {
                                 tracing::info!(
@@ -2755,9 +2758,10 @@ impl MultiUserMemoryManager {
                 // R48: supersession-confidence decay across every user's
                 // edges (the store is global). Single pass, returns
                 // (decayed, removed) counts.
-                match orch.supersession_store().decay_all(
-                    crate::memory::sleep_time::DEFAULT_SUPERSESSION_DECAY,
-                ) {
+                match orch
+                    .supersession_store()
+                    .decay_all(crate::memory::sleep_time::DEFAULT_SUPERSESSION_DECAY)
+                {
                     Ok((decayed, removed)) => {
                         if decayed > 0 || removed > 0 {
                             tracing::info!(
@@ -2775,8 +2779,7 @@ impl MultiUserMemoryManager {
                 // R27: graduation pass per user. Scans each user's memories,
                 // promotes observation memories whose access_count meets the
                 // configured threshold.
-                let threshold =
-                    crate::memory::sleep_time::DEFAULT_GRADUATION_ACCESS_THRESHOLD;
+                let threshold = crate::memory::sleep_time::DEFAULT_GRADUATION_ACCESS_THRESHOLD;
                 for (user_id_arc, _) in self.user_memories.iter() {
                     let user_id = user_id_arc.as_ref();
                     if let Ok(user_mem) = self.get_user_memory(user_id) {
@@ -3022,9 +3025,9 @@ impl MultiUserMemoryManager {
         ];
 
         match &self.shared_db {
-            crate::storage::SharedEngineDb::RocksDb(db) => REQUIRED_CFS
-                .iter()
-                .all(|cf| db.cf_handle(cf).is_some()),
+            crate::storage::SharedEngineDb::RocksDb(db) => {
+                REQUIRED_CFS.iter().all(|cf| db.cf_handle(cf).is_some())
+            }
             #[cfg(feature = "storage-redb")]
             crate::storage::SharedEngineDb::Redb(_) => {
                 // Families are materialized at construction by each store's
@@ -3124,8 +3127,9 @@ impl MultiUserMemoryManager {
                 // Always attempt to include the intent log; the backup
                 // engine no-ops cleanly when the dir doesn't exist (W5
                 // not yet active for this install).
-                let intent_log_spec =
-                    crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id)?);
+                let intent_log_spec = crate::backup::IntentLogBackupSpec::per_user(
+                    self.intent_log_user_dir(user_id)?,
+                );
 
                 // Stage the journal under the tenant's writer mutex so the
                 // cut is clean (no mid-frame copy, exact cut LSN), and
@@ -3140,7 +3144,10 @@ impl MultiUserMemoryManager {
                 let staged = match self.get_user_journaled_writer(user_id) {
                     Ok(writer) => {
                         let _writer_guard = writer.lock();
-                        Some(self.require_backup_engine("backup intent-log staging")?.stage_intent_log(&intent_log_spec, user_id)?)
+                        Some(
+                            self.require_backup_engine("backup intent-log staging")?
+                                .stage_intent_log(&intent_log_spec, user_id)?,
+                        )
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -3148,7 +3155,10 @@ impl MultiUserMemoryManager {
                             error = %e,
                             "backup: journaled writer unavailable; staging intent log without quiesce",
                         );
-                        Some(self.require_backup_engine("backup intent-log staging")?.stage_intent_log(&intent_log_spec, user_id)?)
+                        Some(
+                            self.require_backup_engine("backup intent-log staging")?
+                                .stage_intent_log(&intent_log_spec, user_id)?,
+                        )
                     }
                 };
 
@@ -3220,13 +3230,14 @@ impl MultiUserMemoryManager {
                     )
                 })?);
 
-                self.require_backup_engine("comprehensive backup creation")?.create_comprehensive_backup_with_staged_intent_log(
-                    &db,
-                    user_id,
-                    &store_refs,
-                    graph_db_ref,
-                    staged,
-                )
+                self.require_backup_engine("comprehensive backup creation")?
+                    .create_comprehensive_backup_with_staged_intent_log(
+                        &db,
+                        user_id,
+                        &store_refs,
+                        graph_db_ref,
+                        staged,
+                    )
             }
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for backup creation yet",
@@ -3237,7 +3248,9 @@ impl MultiUserMemoryManager {
 
     pub fn list_backups_for_user(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
         match self.server_config.effective_storage_backend {
-            StorageBackend::RocksDb => self.require_backup_engine("backup listing")?.list_backups(user_id),
+            StorageBackend::RocksDb => self
+                .require_backup_engine("backup listing")?
+                .list_backups(user_id),
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for backup listing yet",
                 self.server_config.effective_storage_backend
@@ -3247,7 +3260,9 @@ impl MultiUserMemoryManager {
 
     pub fn verify_backup_for_user(&self, user_id: &str, backup_id: u32) -> Result<bool> {
         match self.server_config.effective_storage_backend {
-            StorageBackend::RocksDb => self.require_backup_engine("backup verification")?.verify_backup(user_id, backup_id),
+            StorageBackend::RocksDb => self
+                .require_backup_engine("backup verification")?
+                .verify_backup(user_id, backup_id),
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for backup verification yet",
                 self.server_config.effective_storage_backend
@@ -3257,7 +3272,9 @@ impl MultiUserMemoryManager {
 
     pub fn purge_backups_for_user(&self, user_id: &str, keep_count: usize) -> Result<usize> {
         match self.server_config.effective_storage_backend {
-            StorageBackend::RocksDb => self.require_backup_engine("backup purging")?.purge_old_backups(user_id, keep_count),
+            StorageBackend::RocksDb => self
+                .require_backup_engine("backup purging")?
+                .purge_old_backups(user_id, keep_count),
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for backup purging yet",
                 self.server_config.effective_storage_backend
@@ -3292,19 +3309,19 @@ impl MultiUserMemoryManager {
                 self.evict_user(user_id);
 
                 let secondary_restore_paths: Vec<(&str, &std::path::Path)> = vec![];
-                let intent_log_spec =
-                    crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id)?);
+                let intent_log_spec = crate::backup::IntentLogBackupSpec::per_user(
+                    self.intent_log_user_dir(user_id)?,
+                );
                 let restore_opts = crate::backup::RestoreOptions { max_lsn };
                 let backup_engine = self.require_backup_engine("backup restore")?;
-                let restored_stores = backup_engine
-                    .restore_comprehensive_backup_with_intent_log(
-                        user_id,
-                        backup_id,
-                        &memory_db_path,
-                        &secondary_restore_paths,
-                        Some(&intent_log_spec),
-                        &restore_opts,
-                    )?;
+                let restored_stores = backup_engine.restore_comprehensive_backup_with_intent_log(
+                    user_id,
+                    backup_id,
+                    &memory_db_path,
+                    &secondary_restore_paths,
+                    Some(&intent_log_spec),
+                    &restore_opts,
+                )?;
 
                 let resolved_backup_id = backup_id.unwrap_or_else(|| {
                     backup_engine
@@ -3430,8 +3447,7 @@ impl MultiUserMemoryManager {
                             );
                             backed_up += 1;
 
-                            if let Err(e) = self.purge_backups_for_user(name, max_backups)
-                            {
+                            if let Err(e) = self.purge_backups_for_user(name, max_backups) {
                                 tracing::warn!(
                                     user_id = name,
                                     error = %e,
@@ -3995,9 +4011,8 @@ mod shared_store_bootstrap_tests {
         config.effective_storage_backend = crate::config::StorageBackend::Redb;
         let cache = rocksdb::Cache::new_lru_cache(1024);
 
-        let bundle =
-            MultiUserMemoryManager::bootstrap_shared_stores(tmp.path(), &config, &cache)
-                .expect("redb shared-store bootstrap");
+        let bundle = MultiUserMemoryManager::bootstrap_shared_stores(tmp.path(), &config, &cache)
+            .expect("redb shared-store bootstrap");
 
         // The engine is the one asked for.
         assert!(bundle.shared_db.rocksdb().is_none());
@@ -4071,7 +4086,10 @@ mod shared_store_bootstrap_tests {
             pii_classification: crate::graph_memory::PiiClassification::PersonalIdentity,
         };
         let uuid = graph.add_entity(entity).expect("add_entity over redb");
-        let fetched = graph.get_entity(&uuid).expect("get_entity").expect("present");
+        let fetched = graph
+            .get_entity(&uuid)
+            .expect("get_entity")
+            .expect("present");
         assert_eq!(fetched.name, "Ada Lovelace");
 
         // The in-memory name index was populated from the same write path that

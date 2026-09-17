@@ -26,11 +26,7 @@ use std::sync::Arc;
 /// filter probe used when this predicate is not the leading scan.
 #[async_trait]
 pub trait RelationalQuerier: Send + Sync {
-    async fn scan(
-        &self,
-        user_id: &str,
-        p: &RelationalPredicate,
-    ) -> anyhow::Result<Vec<String>>;
+    async fn scan(&self, user_id: &str, p: &RelationalPredicate) -> anyhow::Result<Vec<String>>;
     async fn matches(
         &self,
         user_id: &str,
@@ -47,11 +43,7 @@ pub trait RelationalQuerier: Send + Sync {
 /// ANN result set — the executor treats `None` as "filter out".
 #[async_trait]
 pub trait VectorQuerier: Send + Sync {
-    async fn scan(
-        &self,
-        user_id: &str,
-        p: &VectorPredicate,
-    ) -> anyhow::Result<Vec<(String, f32)>>;
+    async fn scan(&self, user_id: &str, p: &VectorPredicate) -> anyhow::Result<Vec<(String, f32)>>;
     async fn score(
         &self,
         user_id: &str,
@@ -63,11 +55,7 @@ pub trait VectorQuerier: Send + Sync {
 /// Graph reachability candidate source.
 #[async_trait]
 pub trait GraphQuerier: Send + Sync {
-    async fn scan(
-        &self,
-        user_id: &str,
-        p: &GraphPredicate,
-    ) -> anyhow::Result<Vec<String>>;
+    async fn scan(&self, user_id: &str, p: &GraphPredicate) -> anyhow::Result<Vec<String>>;
     async fn matches(
         &self,
         user_id: &str,
@@ -112,12 +100,18 @@ impl Executor {
 
         for op in &plan.ordered_ops {
             match op {
-                PhysicalOp::ScanRelational { predicate, est_card } => {
+                PhysicalOp::ScanRelational {
+                    predicate,
+                    est_card,
+                } => {
                     let ids = self.relational.scan(&query.user_id, predicate).await?;
                     candidates = clamp_take(ids, *est_card);
                     have_scan = true;
                 }
-                PhysicalOp::ScanVector { predicate, est_card } => {
+                PhysicalOp::ScanVector {
+                    predicate,
+                    est_card,
+                } => {
                     let pairs = self.vector.scan(&query.user_id, predicate).await?;
                     candidates.clear();
                     for (id, score) in pairs.into_iter().take(*est_card) {
@@ -126,7 +120,10 @@ impl Executor {
                     }
                     have_scan = true;
                 }
-                PhysicalOp::ScanGraph { predicate, est_card } => {
+                PhysicalOp::ScanGraph {
+                    predicate,
+                    est_card,
+                } => {
                     let ids = self.graph.scan(&query.user_id, predicate).await?;
                     candidates = clamp_take(ids, *est_card);
                     have_scan = true;
@@ -290,11 +287,7 @@ mod tests {
 
     #[async_trait]
     impl GraphQuerier for MockGraph {
-        async fn scan(
-            &self,
-            _user_id: &str,
-            p: &GraphPredicate,
-        ) -> anyhow::Result<Vec<String>> {
+        async fn scan(&self, _user_id: &str, p: &GraphPredicate) -> anyhow::Result<Vec<String>> {
             let key = graph_key(p);
             Ok(self.scan_results.get(&key).cloned().unwrap_or_default())
         }
@@ -422,14 +415,14 @@ mod tests {
             ("c", vec![&small_key, &big_key]),
             ("d", vec![&small_key]),
         ] {
-            row_columns.insert(
-                id.into(),
-                keys.into_iter().map(|s| s.clone()).collect(),
-            );
+            row_columns.insert(id.into(), keys.into_iter().map(|s| s.clone()).collect());
         }
 
         let exec = Executor {
-            relational: Arc::new(MockRelational { scan_rows, row_columns }),
+            relational: Arc::new(MockRelational {
+                scan_rows,
+                row_columns,
+            }),
             vector: empty_vector(),
             graph: empty_graph(),
         };
@@ -460,8 +453,7 @@ mod tests {
         );
 
         let result = rt().block_on(exec.run(&query, &plan)).unwrap();
-        let ids: HashSet<String> =
-            result.into_iter().map(|s| s.memory_id).collect();
+        let ids: HashSet<String> = result.into_iter().map(|s| s.memory_id).collect();
         assert_eq!(ids, ["a".to_string()].into_iter().collect::<HashSet<_>>());
     }
 
@@ -489,14 +481,8 @@ mod tests {
         // Relational matches() says only m1 + m3 have the tag.
         let rel_key = relational_key(&rel_pred);
         let mut row_columns: HashMap<String, HashSet<String>> = HashMap::new();
-        row_columns.insert(
-            "m1".into(),
-            [rel_key.clone()].into_iter().collect(),
-        );
-        row_columns.insert(
-            "m3".into(),
-            [rel_key.clone()].into_iter().collect(),
-        );
+        row_columns.insert("m1".into(), [rel_key.clone()].into_iter().collect());
+        row_columns.insert("m3".into(), [rel_key.clone()].into_iter().collect());
 
         let exec = Executor {
             relational: Arc::new(MockRelational {
@@ -522,10 +508,7 @@ mod tests {
 
         let plan = planner::plan(&query);
         // Vector est=10, Equals est=100 → ScanVector first, FilterRelational second.
-        assert!(matches!(
-            plan.ordered_ops[0],
-            PhysicalOp::ScanVector { .. }
-        ));
+        assert!(matches!(plan.ordered_ops[0], PhysicalOp::ScanVector { .. }));
         assert!(matches!(
             plan.ordered_ops[1],
             PhysicalOp::FilterRelational { .. }
@@ -620,18 +603,12 @@ mod tests {
         // Graph scan returns {g1, g2, g3}.
         let g_key = graph_key(&gp);
         let mut scan_results = HashMap::new();
-        scan_results.insert(
-            g_key.clone(),
-            vec!["g1".into(), "g2".into(), "g3".into()],
-        );
+        scan_results.insert(g_key.clone(), vec!["g1".into(), "g2".into(), "g3".into()]);
 
         // Relational matches() says g2 only.
         let rel_key = relational_key(&rel);
         let mut row_columns: HashMap<String, HashSet<String>> = HashMap::new();
-        row_columns.insert(
-            "g2".into(),
-            [rel_key.clone()].into_iter().collect(),
-        );
+        row_columns.insert("g2".into(), [rel_key.clone()].into_iter().collect());
 
         let exec = Executor {
             relational: Arc::new(MockRelational {
@@ -657,10 +634,7 @@ mod tests {
 
         let plan = planner::plan(&query);
         // LinkedToEntity est=50, Equals est=100 → graph scans first.
-        assert!(matches!(
-            plan.ordered_ops[0],
-            PhysicalOp::ScanGraph { .. }
-        ));
+        assert!(matches!(plan.ordered_ops[0], PhysicalOp::ScanGraph { .. }));
         assert!(matches!(
             plan.ordered_ops[1],
             PhysicalOp::FilterRelational { .. }
