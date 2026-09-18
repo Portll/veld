@@ -1600,6 +1600,87 @@ impl RelationType {
     }
 }
 
+/// Causal cue lexemes in signal-strength order; first present wins.
+///
+/// Ported from upstream shodh-memory `predicate_from_cues`, causal family only.
+/// Fragments like "in motion" survive an entity splitting the verb phrase
+/// ("X set Y in motion"). The non-causal families upstream types in the same
+/// table (Manages, WorksAt, CreatedBy, ...) are not ported.
+fn causal_cue(sentence: &str) -> Option<&'static str> {
+    const CAUSAL_CUES: [&str; 10] = [
+        "in motion",
+        "brought about",
+        "gave rise",
+        "triggered",
+        "led directly to",
+        "led to",
+        "resulted in",
+        "caused",
+        "because of",
+        "due to",
+    ];
+    CAUSAL_CUES.iter().copied().find(|c| sentence.contains(c))
+}
+
+/// Span-scoped, direction-aware causal typing of a co-mentioned entity pair.
+///
+/// Ported from upstream shodh-memory `extract_directed_predicate`. Finds both
+/// mentions, scans only the sentence containing both for a causal cue, and
+/// returns `(Triggers, a_is_source)`: the earlier mention is the cause, flipped
+/// for effect-first constructions ("A because of B", "A was caused by B").
+/// `None` when the mentions do not share a sentence, no cue is present, or an
+/// endpoint lies inside the cue itself ("motion" from "in motion").
+pub fn extract_directed_predicate(
+    text: &str,
+    name_a: &str,
+    name_b: &str,
+) -> Option<(RelationType, bool)> {
+    let lc = text.to_ascii_lowercase();
+    let a = name_a.to_ascii_lowercase();
+    let b = name_b.to_ascii_lowercase();
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let pa = lc.find(&a)?;
+    let pb = lc.find(&b)?;
+    if pa == pb {
+        return None;
+    }
+    let (lo, hi) = if pa < pb {
+        (pa, pb + b.len())
+    } else {
+        (pb, pa + a.len())
+    };
+    let sent_start = lc[..lo]
+        .rfind(['.', '!', '?', ';', '\n'])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let sent_end = lc[hi..]
+        .find(['.', '!', '?', ';', '\n'])
+        .map(|i| hi + i)
+        .unwrap_or(lc.len());
+    let sentence = &lc[sent_start..sent_end];
+    let cue = causal_cue(sentence)?;
+
+    // A cue word minted as an entity would otherwise bridge every chain that uses the cue.
+    if let Some(cue_off) = sentence.find(cue) {
+        let cue_lo = sent_start + cue_off;
+        let cue_hi = cue_lo + cue.len();
+        let overlaps_cue = |lo: usize, len: usize| lo < cue_hi && cue_lo < lo + len;
+        if overlaps_cue(pa, a.len()) || overlaps_cue(pb, b.len()) {
+            return None;
+        }
+    }
+
+    const EFFECT_FIRST_CUES: [&str; 4] = ["because of", "due to", "caused by", "triggered by"];
+    let effect_first = EFFECT_FIRST_CUES.iter().any(|c| sentence.contains(c));
+    let a_first = pa < pb;
+    Some((
+        RelationType::Triggers,
+        if effect_first { !a_first } else { a_first },
+    ))
+}
+
 /// Episodic node representing a discrete experience/memory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodicNode {
@@ -9276,6 +9357,101 @@ mod tests {
         ];
         let causal: Vec<&str> = all.iter().filter(|r| r.is_causal()).map(|r| r.as_str()).collect();
         assert_eq!(causal, vec!["Causes", "ResultsIn", "Triggers"]);
+    }
+
+    #[test]
+    fn extract_directed_predicate_sets_cause_effect_arrow() {
+        assert_eq!(
+            extract_directed_predicate("Vornak set Meslin in motion.", "Vornak", "Meslin"),
+            Some((RelationType::Triggers, true))
+        );
+        assert_eq!(
+            extract_directed_predicate("Vornak set Meslin in motion.", "Meslin", "Vornak"),
+            Some((RelationType::Triggers, false))
+        );
+        assert_eq!(
+            extract_directed_predicate("Alpha and Beta met. Gamma caused Delta.", "Alpha", "Beta"),
+            None,
+            "a cue in a neighbouring sentence must not type the pair"
+        );
+        assert_eq!(
+            extract_directed_predicate("Gamma caused Delta.", "Gamma", "Delta"),
+            Some((RelationType::Triggers, true))
+        );
+        assert_eq!(
+            extract_directed_predicate("Gamma caused Delta.", "Gamma", "Epsilon"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_directed_predicate_flips_effect_first_constructions() {
+        assert_eq!(
+            extract_directed_predicate(
+                "The flood happened because of the dam failure.",
+                "dam failure",
+                "flood"
+            ),
+            Some((RelationType::Triggers, true))
+        );
+        assert_eq!(
+            extract_directed_predicate("The outage was caused by Redis.", "Redis", "outage"),
+            Some((RelationType::Triggers, true))
+        );
+        assert_eq!(
+            extract_directed_predicate("The delay was due to the storm.", "delay", "storm"),
+            Some((RelationType::Triggers, false))
+        );
+        assert_eq!(
+            extract_directed_predicate("Redis caused the outage.", "Redis", "outage"),
+            Some((RelationType::Triggers, true))
+        );
+    }
+
+    #[test]
+    fn extract_directed_predicate_rejects_cue_fragment_endpoints() {
+        let mid = "the Meslin incident then brought about the Caldor incident.";
+        assert_eq!(
+            extract_directed_predicate("Vornak set Meslin in motion.", "Vornak", "motion"),
+            None
+        );
+        assert_eq!(
+            extract_directed_predicate("Vornak set Meslin in motion.", "Meslin", "motion"),
+            None
+        );
+        assert_eq!(
+            extract_directed_predicate(mid, "the Meslin incident", "brought"),
+            None
+        );
+        assert_eq!(
+            extract_directed_predicate(mid, "brought", "the Caldor incident"),
+            None
+        );
+        assert_eq!(
+            extract_directed_predicate(mid, "the Meslin incident", "the Caldor incident"),
+            Some((RelationType::Triggers, true))
+        );
+    }
+
+    #[test]
+    fn extract_directed_predicate_leaves_non_causal_sentences_untyped() {
+        for (text, a, b) in [
+            ("Vornak and Meslin met.", "Vornak", "Meslin"),
+            ("Vornak is near Meslin.", "Vornak", "Meslin"),
+            ("Vornak works closely with Meslin.", "Vornak", "Meslin"),
+            ("Vornak met Meslin before the review.", "Vornak", "Meslin"),
+        ] {
+            assert_eq!(extract_directed_predicate(text, a, b), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn extract_directed_predicate_does_not_type_did_not_cause() {
+        // Upstream has no negation handling; this holds only because the cue is the past tense "caused".
+        assert_eq!(
+            extract_directed_predicate("Vornak did not cause Meslin.", "Vornak", "Meslin"),
+            None
+        );
     }
 
     #[test]
