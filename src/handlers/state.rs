@@ -3865,14 +3865,55 @@ impl MultiUserMemoryManager {
         // Create relationships between co-occurring entities
         // Pre-compute truncated context once (avoids re-allocating per edge)
         let truncated_context: String = experience.content.chars().take(150).collect();
+
+        // Upstream's SHODH_GRAPH_EXTRACTED_PREDICATES gate: on unless set to 0/false.
+        let extract_predicates: bool = std::env::var("SHODH_GRAPH_EXTRACTED_PREDICATES")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        // A name contained in a co-mentioned name ("Mor" in "the Morwen incident") is a
+        // recognizer fragment; a causal edge on it welds unrelated chains together.
+        let fragment_of_comention: Vec<bool> = (0..entity_uuids.len())
+            .map(|k| {
+                let name_k = entity_uuids[k].0.to_lowercase();
+                entity_uuids.iter().enumerate().any(|(m, other)| {
+                    m != k && {
+                        let name_m = other.0.to_lowercase();
+                        name_m.len() > name_k.len() && name_m.contains(name_k.as_str())
+                    }
+                })
+            })
+            .collect();
+
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
                 let state_edge_init = EdgeTier::L1Working.initial_weight();
+                let mut from_entity = entity_uuids[i].1;
+                let mut to_entity = entity_uuids[j].1;
+                let cue_hit =
+                    if extract_predicates && !fragment_of_comention[i] && !fragment_of_comention[j]
+                    {
+                        crate::graph_memory::extract_directed_predicate(
+                            &experience.content,
+                            &entity_uuids[i].0,
+                            &entity_uuids[j].0,
+                        )
+                    } else {
+                        None
+                    };
+                let relation_type = match cue_hit {
+                    Some((rt, a_is_source)) => {
+                        if !a_is_source {
+                            std::mem::swap(&mut from_entity, &mut to_entity);
+                        }
+                        rt
+                    }
+                    None => RelationType::RelatedTo,
+                };
                 let edge = RelationshipEdge {
                     uuid: uuid::Uuid::new_v4(),
-                    from_entity: entity_uuids[i].1,
-                    to_entity: entity_uuids[j].1,
-                    relation_type: RelationType::RelatedTo,
+                    from_entity,
+                    to_entity,
+                    relation_type,
                     strength: state_edge_init,
                     created_at: now,
                     valid_at: now,

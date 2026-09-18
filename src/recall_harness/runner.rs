@@ -2719,7 +2719,6 @@ mod tests {
     ///   3. at least one connecting edge is typed CAUSAL (the walk's food)
     /// Whichever assert fails localizes the lineage zero.
     #[test]
-    #[ignore = "parity gap: veld ingest types no lineage verb (set in motion, brought about) as causal, so chains are RelatedTo and the causal walk finds no origins"]
     fn lineage_chain_builds_causal_graph_structure() {
         let dir = unique_storage_dir("lineage-repro");
         let manager = build_manager(&dir).expect("manager");
@@ -2810,6 +2809,90 @@ mod tests {
              Retrieved: {texts:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ingest must type a causal sentence's pair as causal and leave non-causal
+    /// co-mentions untyped. The causal item is the positive control: without it a
+    /// typer that never fires would pass the negative half.
+    #[test]
+    fn ingest_types_only_causal_sentences_as_causal() {
+        let dir = unique_storage_dir("causal-typing-fp");
+        let manager = build_manager(&dir).expect("manager");
+        let base = chrono::Utc::now();
+        let items = [
+            (
+                "the Arvel incident",
+                "the Brisk incident",
+                "{a} set {b} in motion.",
+            ),
+            (
+                "the Corran incident",
+                "the Dellow incident",
+                "{a} and {b} met.",
+            ),
+            (
+                "the Eskin incident",
+                "the Farrow incident",
+                "{a} is near {b}.",
+            ),
+            (
+                "the Garth incident",
+                "the Hollin incident",
+                "{a} did not cause {b}.",
+            ),
+        ];
+        let corpus: Vec<CorpusItem> = items
+            .iter()
+            .enumerate()
+            .map(|(k, (a, b, tpl))| CorpusItem {
+                id: format!("fp-{k}"),
+                content: tpl.replace("{a}", a).replace("{b}", b),
+                memory_type: "fact".into(),
+                tags: vec![a.to_string(), b.to_string()],
+                created_at: base + chrono::Duration::minutes(k as i64),
+            })
+            .collect();
+        ingest_corpus(&manager, &corpus).expect("ingest");
+
+        let graph = manager.get_user_graph(EVAL_USER).expect("graph");
+        let g = graph.read();
+        let pair_edges = |a: &str, b: &str| {
+            let ua = g.find_entity_by_name(a).expect("lookup").expect(a).uuid;
+            let ub = g.find_entity_by_name(b).expect("lookup").expect(b).uuid;
+            let edges: Vec<(bool, bool)> = g
+                .get_entity_relationships_limited(&ua, Some(64))
+                .expect("edges")
+                .iter()
+                .filter(|e| {
+                    (e.from_entity == ua && e.to_entity == ub)
+                        || (e.from_entity == ub && e.to_entity == ua)
+                })
+                .map(|e| (e.relation_type.is_causal(), e.from_entity == ua))
+                .collect();
+            edges
+        };
+
+        let causal = pair_edges(items[0].0, items[0].1);
+        assert!(
+            causal.iter().any(|&(c, forward)| c && forward),
+            "positive control: '{}' must yield a cause-to-effect causal edge, got {causal:?}",
+            corpus[0].content
+        );
+        for (k, (a, b, _)) in items.iter().enumerate().skip(1) {
+            let edges = pair_edges(a, b);
+            assert!(
+                !edges.is_empty(),
+                "'{}' formed no edge at all",
+                corpus[k].content
+            );
+            assert!(
+                edges.iter().all(|&(c, _)| !c),
+                "'{}' produced a causal edge: {edges:?}",
+                corpus[k].content
+            );
+        }
+        drop(g);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3010,7 +3093,6 @@ mod tests {
     /// typing entirely, and every chain's backward cone must be exactly its own
     /// root, ranked first.
     #[test]
-    #[ignore = "parity gap: veld ingest types no lineage verb (set in motion, brought about) as causal, so chains are RelatedTo and the causal walk finds no origins"]
     fn lineage_fragment_bridges_never_form() {
         let dir = unique_storage_dir("lineage-flood-diag");
         let manager = build_manager(&dir).expect("manager");
@@ -3173,7 +3255,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "parity gap: veld ingest types no lineage verb (set in motion, brought about) as causal, so chains are RelatedTo and the causal walk finds no origins"]
+    #[ignore = "parity gap: the causal walk now reaches the root at 60 chains, but veld recall never consumes trace_causal_origins (upstream's SHODH_CAUSAL_ORIGIN stage in memory/mod.rs), so the root memory is absent from Full top-10"]
     fn lineage_walk_survives_harness_scale() {
         let dir = unique_storage_dir("lineage-scale");
         let manager = build_manager(&dir).expect("manager");
@@ -3275,6 +3357,50 @@ mod tests {
              from Full top-10 after prior-mode traffic. Retrieved: {texts:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lineage and multihop analyses side by side, for before/after comparisons
+    /// of an ingest change. Run explicitly in release:
+    ///   cargo test --release --lib lineage_and_multihop_recall_report -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement: lineage + multihop through every layer mode, run with --ignored in release"]
+    fn lineage_and_multihop_recall_report() {
+        let dir = unique_storage_dir("lineage-multihop-report");
+        let inputs = |sub: &str| RunInputs {
+            storage_path: dir.join(sub),
+            corpus_path: None,
+            cases_path: None,
+            suite: sub.into(),
+            git_sha: "local".into(),
+            repeats: 1,
+            layer_modes: vec![LayerMode::Full],
+            age_days: 0.0,
+        };
+        let lineage = crate::recall_harness::lineage_harness::analyze_lineage(
+            &inputs("lineage"),
+            crate::recall_harness::lineage_harness::DEFAULT_CHAINS,
+        )
+        .expect("lineage run");
+        let multihop = crate::recall_harness::multihop::analyze_multihop(
+            &inputs("multihop"),
+            crate::recall_harness::multihop::DEFAULT_CHAINS,
+        )
+        .expect("multihop run");
+        for (name, report) in [("lineage", &lineage), ("multihop", &multihop)] {
+            for r in &report.rows {
+                eprintln!(
+                    "REPORT {name} chains={} layer={} multihop_r@10={:.4} multihop_p@1={:.4} multihop_mrr={:.4} onehop_r@10={:.4} onehop_p@1={:.4}",
+                    report.chains,
+                    r.layer,
+                    r.multihop_recall_at_10,
+                    r.multihop_p_at_1,
+                    r.multihop_mrr,
+                    r.onehop_recall_at_10,
+                    r.onehop_p_at_1
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
