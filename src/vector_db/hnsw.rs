@@ -490,6 +490,20 @@ struct HnswSnapshotOwned {
 mod tests {
     use super::*;
 
+    // Persisted with bincode, which cannot decode a type needing deserialize_any (an
+    // internally tagged enum, say); tests/persisted_layout.rs cannot reach this private root.
+    #[test]
+    fn persisted_snapshot_is_bincode_decodable() {
+        use serde_reflection::{Samples, Tracer, TracerConfig};
+        let mut tracer = Tracer::new(TracerConfig::default().is_human_readable(false));
+        tracer
+            .trace_type::<HnswSnapshotOwned>(&Samples::new())
+            .unwrap_or_else(|e| panic!("tracing HnswSnapshotOwned: {e}"));
+        tracer
+            .registry()
+            .unwrap_or_else(|e| panic!("incomplete trace of HnswSnapshotOwned: {e}"));
+    }
+
     fn random_vectors(n: usize, d: usize) -> Vec<Vec<f32>> {
         use rand::Rng;
         let mut rng = rand::thread_rng();

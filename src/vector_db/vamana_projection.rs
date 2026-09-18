@@ -758,6 +758,20 @@ impl VamanaIndexConfigExt for VamanaIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Persisted with bincode, which cannot decode a type needing deserialize_any (an
+    // internally tagged enum, say); tests/persisted_layout.rs cannot reach this private root.
+    #[test]
+    fn persisted_snapshot_is_bincode_decodable() {
+        use serde_reflection::{Samples, Tracer, TracerConfig};
+        let mut tracer = Tracer::new(TracerConfig::default().is_human_readable(false));
+        tracer
+            .trace_type::<std::collections::HashMap<String, MemoryEntry>>(&Samples::new())
+            .unwrap_or_else(|e| panic!("tracing id-map snapshot: {e}"));
+        tracer
+            .registry()
+            .unwrap_or_else(|e| panic!("incomplete trace of id-map snapshot: {e}"));
+    }
     use crate::intent_log::{payload::CURRENT_PAYLOAD_SCHEMA_VERSION, replay, IntentLog};
     use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId};
     use crate::vector_db::vamana::{DistanceMetric, VamanaConfig};
