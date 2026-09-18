@@ -39,8 +39,8 @@
 //! - `worktree_path` — `std::env::current_dir()` normalized to forward
 //!   slashes (POSIX form). Same canonical shape on Windows and Unix, so
 //!   memories exported across platforms group correctly by worktree.
-//! - `branch` — `git -C <worktree_path> rev-parse --abbrev-ref HEAD` with a
-//!   1 s wall-clock timeout. `None` on failure / timeout.
+//! - `branch` — `git -C <worktree_path> symbolic-ref --short -q HEAD` with a
+//!   1 s wall-clock timeout. `None` on detached HEAD / failure / timeout.
 //! - `parent_repo` — `git -C <worktree_path> rev-parse --git-common-dir`,
 //!   resolved to its parent directory; `None` if it matches the worktree
 //!   (i.e. the worktree *is* the main clone) or if git failed.
@@ -288,12 +288,13 @@ fn strip_exe(name: &str) -> &str {
 // git probes — bounded shell-out to local git
 // =============================================================================
 
-/// `git -C <dir> rev-parse --abbrev-ref HEAD`, with a 1 s timeout.
+/// `git -C <dir> symbolic-ref --short -q HEAD`, with a 1 s timeout.
 fn git_branch(dir: &str) -> Option<String> {
-    let out = run_git_with_timeout(&["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"])?;
+    // symbolic-ref, not `rev-parse --abbrev-ref`, which exits 128 on an unborn branch (no commits yet).
+    let out = run_git_with_timeout(&["-C", dir, "symbolic-ref", "--short", "-q", "HEAD"])?;
     let trimmed = out.trim();
     if trimmed.is_empty() || trimmed == "HEAD" {
-        // Detached HEAD or empty output — branch is genuinely unknown.
+        // Detached HEAD (exit 1) or empty output — branch is genuinely unknown.
         return None;
     }
     Some(trimmed.to_owned())
