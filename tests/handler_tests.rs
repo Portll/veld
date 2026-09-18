@@ -1286,3 +1286,136 @@ async fn remember_then_list() {
         "stats should show at least 1 memory: {body}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Webhook signature enforcement (/webhook/linear, /webhook/github)
+// ═══════════════════════════════════════════════════════════════════════
+
+mod webhook_signature {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    // Env vars are process-global; a tokio lock because the guard is held across awaits.
+    static WEBHOOK_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const ENV_KEYS: [&str; 3] = [
+        "LINEAR_WEBHOOK_SECRET",
+        "GITHUB_WEBHOOK_SECRET",
+        "VELD_ALLOW_UNSIGNED_WEBHOOKS",
+    ];
+
+    /// Sets the webhook env for one test and restores the previous values on drop.
+    struct WebhookEnv {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl WebhookEnv {
+        fn set(secret: &str) -> Self {
+            let saved = ENV_KEYS
+                .iter()
+                .map(|k| (*k, std::env::var(k).ok()))
+                .collect();
+            std::env::set_var("LINEAR_WEBHOOK_SECRET", secret);
+            std::env::set_var("GITHUB_WEBHOOK_SECRET", secret);
+            std::env::remove_var("VELD_ALLOW_UNSIGNED_WEBHOOKS");
+            Self { saved }
+        }
+    }
+
+    impl Drop for WebhookEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    // Non-Issue / non-issues events return "ignored" right after the signature
+    // gate, so a 200 proves the gate passed without writing a memory.
+    const LINEAR_BODY: &str = r#"{"action":"create","type":"Comment","data":{"id":"c1"}}"#;
+    const GITHUB_BODY: &str = r#"{"zen":"ping"}"#;
+
+    fn linear_req(signature: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/webhook/linear")
+            .header("content-type", "application/json")
+            .header("x-api-key", TEST_KEY)
+            .header("linear-signature", signature)
+            .body(Body::from(LINEAR_BODY))
+            .unwrap()
+    }
+
+    fn github_req(signature: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/webhook/github")
+            .header("content-type", "application/json")
+            .header("x-api-key", TEST_KEY)
+            .header("x-github-event", "ping")
+            .header("x-hub-signature-256", signature)
+            .body(Body::from(GITHUB_BODY))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_secret_is_unconfigured_and_rejects_empty_key_forgery() {
+        let _lock = WEBHOOK_ENV_LOCK.lock().await;
+        let _env = WebhookEnv::set("");
+        let h = Harness::new();
+
+        let forged = sign("", LINEAR_BODY.as_bytes());
+        let status = status_of(h.app(), linear_req(&forged)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "linear");
+
+        let forged = format!("sha256={}", sign("", GITHUB_BODY.as_bytes()));
+        let status = status_of(h.app(), github_req(&forged)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "github");
+    }
+
+    #[tokio::test]
+    async fn malformed_signature_is_400_not_500() {
+        let _lock = WEBHOOK_ENV_LOCK.lock().await;
+        let _env = WebhookEnv::set("handler-webhook-secret");
+        let h = Harness::new();
+
+        let non_hex = "zz".repeat(32);
+        let short = "ab".repeat(31);
+        for sig in [non_hex.clone(), short.clone()] {
+            let status = status_of(h.app(), linear_req(&sig)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "linear sig {sig}");
+        }
+        for sig in [format!("sha256={non_hex}"), format!("sha256={short}")] {
+            let status = status_of(h.app(), github_req(&sig)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "github sig {sig}");
+        }
+    }
+
+    #[tokio::test]
+    async fn correctly_signed_body_is_accepted() {
+        let _lock = WEBHOOK_ENV_LOCK.lock().await;
+        let secret = "handler-webhook-secret";
+        let _env = WebhookEnv::set(secret);
+        let h = Harness::new();
+
+        let (status, body) =
+            json_of(h.app(), linear_req(&sign(secret, LINEAR_BODY.as_bytes()))).await;
+        assert_eq!(status, StatusCode::OK, "linear: {body}");
+        assert_eq!(body["status"], "ignored", "linear: {body}");
+
+        let sig = format!("sha256={}", sign(secret, GITHUB_BODY.as_bytes()));
+        let (status, body) = json_of(h.app(), github_req(&sig)).await;
+        assert_eq!(status, StatusCode::OK, "github: {body}");
+        assert_eq!(body["status"], "ignored", "github: {body}");
+    }
+}
