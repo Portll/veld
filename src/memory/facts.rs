@@ -132,16 +132,22 @@ impl LegacySemanticFactV2 {
 fn decode_semantic_fact_with_fallback(data: &[u8]) -> Result<(SemanticFact, bool)> {
     match bincode::serde::decode_from_slice::<SemanticFact, _>(data, bincode::config::standard()) {
         Ok((fact, _)) => Ok((fact, false)),
-        Err(_) => {
-            if let Ok((v2, _)) = bincode::serde::decode_from_slice::<LegacySemanticFactV2, _>(
+        Err(current_err) => {
+            // A legacy shape must consume the whole record: a newer record decoded as its prefix silently drops purged_at.
+            if let Ok((v2, read)) = bincode::serde::decode_from_slice::<LegacySemanticFactV2, _>(
                 data,
                 bincode::config::standard(),
             ) {
-                tracing::debug!("Migrated SemanticFact from pre-purge v2 shape");
-                return Ok((v2.upgrade(), true));
+                if read == data.len() {
+                    tracing::debug!("Migrated SemanticFact from pre-purge v2 shape");
+                    return Ok((v2.upgrade(), true));
+                }
             }
-            let (legacy, _): (LegacySemanticFactV1, _) =
+            let (legacy, read): (LegacySemanticFactV1, _) =
                 bincode::serde::decode_from_slice(data, bincode::config::standard())?;
+            if read != data.len() {
+                anyhow::bail!("SemanticFact matches no known shape: {current_err}");
+            }
             tracing::debug!("Migrated SemanticFact from pre-bi-temporal v1 shape");
             Ok((legacy.upgrade(), true))
         }

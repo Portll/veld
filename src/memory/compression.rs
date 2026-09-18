@@ -690,7 +690,7 @@ pub enum FactType {
 /// Reason a fact was administratively purged. Closed enum (no `Other` escape
 /// hatch) to keep `purge_reason` non-leaky: free-form operator notes belong
 /// in the audit log, not on the fact record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PurgeReason {
     /// Explicit user request to remove specific content.
@@ -703,6 +703,73 @@ pub enum PurgeReason {
     PatternMatch { pattern_hash: String },
     /// Calibrated confidence fell below the given threshold.
     ConfidenceFloor { threshold: f32 },
+}
+
+// Hand-written because an internally tagged derive needs `deserialize_any`, which bincode
+// refuses; binary formats read the layout the tagged Serialize writes: the tag, then the fields.
+impl<'de> Deserialize<'de> for PurgeReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged {
+            UserRequest,
+            AdminCleanup,
+            PatternMatch { pattern_hash: String },
+            ConfidenceFloor { threshold: f32 },
+        }
+
+        const VARIANTS: &[&str] = &[
+            "user_request",
+            "admin_cleanup",
+            "pattern_match",
+            "confidence_floor",
+        ];
+
+        struct Binary;
+
+        impl<'de> serde::de::Visitor<'de> for Binary {
+            type Value = PurgeReason;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a purge-reason kind followed by that kind's fields")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<PurgeReason, A::Error> {
+                use serde::de::Error;
+                let kind: String = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                Ok(match kind.as_str() {
+                    "user_request" => PurgeReason::UserRequest,
+                    "admin_cleanup" => PurgeReason::AdminCleanup,
+                    "pattern_match" => PurgeReason::PatternMatch {
+                        pattern_hash: seq
+                            .next_element()?
+                            .ok_or_else(|| A::Error::invalid_length(1, &self))?,
+                    },
+                    "confidence_floor" => PurgeReason::ConfidenceFloor {
+                        threshold: seq
+                            .next_element()?
+                            .ok_or_else(|| A::Error::invalid_length(1, &self))?,
+                    },
+                    other => return Err(A::Error::unknown_variant(other, VARIANTS)),
+                })
+            }
+        }
+
+        if !deserializer.is_human_readable() {
+            return deserializer.deserialize_tuple(2, Binary);
+        }
+        Ok(match Tagged::deserialize(deserializer)? {
+            Tagged::UserRequest => PurgeReason::UserRequest,
+            Tagged::AdminCleanup => PurgeReason::AdminCleanup,
+            Tagged::PatternMatch { pattern_hash } => PurgeReason::PatternMatch { pattern_hash },
+            Tagged::ConfidenceFloor { threshold } => PurgeReason::ConfidenceFloor { threshold },
+        })
+    }
 }
 
 /// Returns `true` if the fact is currently active: NOT bi-temporally expired
@@ -1574,6 +1641,33 @@ impl SemanticConsolidator {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn purge_reason_round_trips_through_bincode_and_json() {
+        let reasons = [
+            PurgeReason::UserRequest,
+            PurgeReason::AdminCleanup,
+            PurgeReason::PatternMatch {
+                pattern_hash: "abc123".to_string(),
+            },
+            PurgeReason::ConfidenceFloor { threshold: 0.25 },
+        ];
+        for reason in reasons {
+            let wrapped = (Some(reason.clone()), 7u32);
+            let bytes = bincode::serde::encode_to_vec(&wrapped, bincode::config::standard())
+                .expect("encode");
+            let (back, read): ((Option<PurgeReason>, u32), _) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                    .expect("bincode decode");
+            assert_eq!(back, wrapped, "bincode round-trip of {reason:?}");
+            assert_eq!(read, bytes.len(), "bincode must consume the whole record");
+
+            let json = serde_json::to_value(&reason).expect("json encode");
+            assert!(json.get("kind").is_some(), "JSON stays internally tagged");
+            let back: PurgeReason = serde_json::from_value(json).expect("json decode");
+            assert_eq!(back, reason);
+        }
+    }
 
     fn create_test_memory(content: &str, importance: f32) -> Memory {
         let experience = Experience {
