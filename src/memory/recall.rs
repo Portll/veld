@@ -104,7 +104,11 @@ impl super::MemorySystem {
         // Filter temporally invalidated memories before competition logic.
         memories.retain(|m| !m.is_expired());
 
-        let competition_mode = query.effective_competition_mode();
+        // A filter-only recall enumerates what matches; defaulting to competition would drop matches.
+        let competition_mode = match query.competition_mode {
+            Some(_) => query.effective_competition_mode(),
+            None => CompetitionMode::Coexist,
+        };
         let _ = Self::compete_memories(&mut memories, competition_mode);
 
         memories.truncate(query.max_results);
