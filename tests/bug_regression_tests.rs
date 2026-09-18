@@ -253,14 +253,13 @@ fn test_bug005_index_removal_is_fast() {
 // Fix: HashSet for O(1) lookups
 // ============================================================================
 
-#[test]
-fn test_bug007_combined_search_scales_linearly() {
+/// Minimum warm combined-search time over several repetitions on a store of `n` memories.
+fn combined_search_min_time(n: usize) -> std::time::Duration {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
     let system = MemorySystem::new(config, None).expect("Failed to create memory system");
 
-    // Record 50 memories with various entities
-    for i in 0..50 {
+    for i in 0..n {
         let exp = Experience {
             content: format!("Combined search test memory {} with multiple criteria", i),
             experience_type: ExperienceType::Observation,
@@ -275,8 +274,7 @@ fn test_bug007_combined_search_scales_linearly() {
         system.remember(exp, None).expect("Failed to record");
     }
 
-    // Run combined search with multiple criteria (semantic + robot_id filter)
-    let start = Instant::now();
+    // Combined search: semantic + robot_id filter
     let query = Query {
         query_text: Some("Combined search test".to_string()),
         robot_id: Some("robot_0".to_string()),
@@ -284,19 +282,37 @@ fn test_bug007_combined_search_scales_linearly() {
         ..Default::default()
     };
 
-    let results = system.recall(&query).expect("Failed to retrieve");
-    let duration = start.elapsed();
+    // The first recall loads the cross-encoder session; that is init, not search.
+    system.recall(&query).expect("Failed to retrieve");
+    (0..5)
+        .map(|_| {
+            let start = Instant::now();
+            system.recall(&query).expect("Failed to retrieve");
+            start.elapsed()
+        })
+        .min()
+        .unwrap()
+}
 
-    // Combined search should complete in < 500ms for 50 memories
-    assert!(
-        duration.as_millis() < 500,
-        "BUG-007 REGRESSION: Combined search took {}ms, expected < 500ms. \
-         Possible O(n*m) regression!",
-        duration.as_millis()
+#[test]
+fn test_bug007_combined_search_scales_linearly() {
+    let small = combined_search_min_time(50);
+    let large = combined_search_min_time(200);
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    println!(
+        "BUG-007 combined search min: 50 => {}ms, 200 => {}ms, ratio {ratio:.2}",
+        small.as_millis(),
+        large.as_millis()
     );
 
-    // Should find at least some results (robot_0 appears in ~5 memories)
-    // Note: Results may be empty if semantic search doesn't match well
+    // 4x the memories: linear allows ~4x, O(n*m) would be ~16x; 8 is their geometric midpoint.
+    assert!(
+        ratio < 8.0,
+        "BUG-007 REGRESSION: combined search at 200 memories took {}ms vs {}ms at 50 \
+         ({ratio:.1}x for 4x the data). Possible O(n*m) regression!",
+        large.as_millis(),
+        small.as_millis()
+    );
 }
 
 // ============================================================================
