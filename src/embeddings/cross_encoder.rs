@@ -668,8 +668,8 @@ impl CrossEncoderModel for OnnxCrossEncoder {
     ///
     /// # Batching strategy
     ///
-    /// All N pairs are tokenised into fixed-length `MAX_PAIR_LENGTH` sequences,
-    /// packed into `[N, MAX_PAIR_LENGTH]` tensors, and sent to the ONNX runtime
+    /// All N pairs are tokenised, padded to the batch's longest pair (capped at
+    /// `MAX_PAIR_LENGTH`), packed into `[N, seq_len]` tensors, and sent to the ONNX runtime
     /// as one call.  The output shape is `[N, head_size]` where `head_size` is 1
     /// (regression head — ms-marco, mxbai-rerank-*) or 2 (binary-classifier head
     /// — bge-reranker-v2-m3).  Scores are extracted by striding through the flat
@@ -697,7 +697,6 @@ impl CrossEncoderModel for OnnxCrossEncoder {
             })?;
 
         let n = documents.len();
-        let total_elements = n * MAX_PAIR_LENGTH;
 
         // Tokenise all (query, doc) pairs up-front.
         let encodings: Vec<_> = documents
@@ -710,7 +709,21 @@ impl CrossEncoderModel for OnnxCrossEncoder {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Pack into flat [N * MAX_PAIR_LENGTH] buffers.
+        // Fixed 512 padding cost ~400ms/pair on tokens the attention mask discards.
+        let seq_len = encodings
+            .iter()
+            .map(|e| {
+                e.get_attention_mask()
+                    .iter()
+                    .rposition(|&m| m != 0)
+                    .map_or(0, |p| p + 1)
+            })
+            .max()
+            .unwrap_or(0)
+            .clamp(1, MAX_PAIR_LENGTH);
+        let total_elements = n * seq_len;
+
+        // Pack into flat [N * seq_len] buffers.
         let mut input_ids_flat = vec![0i64; total_elements];
         let mut attention_flat = vec![0i64; total_elements];
         let mut token_types_flat = vec![0i64; total_elements];
@@ -719,26 +732,26 @@ impl CrossEncoderModel for OnnxCrossEncoder {
             let tokens = encoding.get_ids();
             let attention_mask = encoding.get_attention_mask();
             let type_ids = encoding.get_type_ids();
-            let offset = batch_idx * MAX_PAIR_LENGTH;
+            let offset = batch_idx * seq_len;
 
-            for (i, &token) in tokens.iter().take(MAX_PAIR_LENGTH).enumerate() {
+            for (i, &token) in tokens.iter().take(seq_len).enumerate() {
                 input_ids_flat[offset + i] = token as i64;
             }
-            for (i, &mask) in attention_mask.iter().take(MAX_PAIR_LENGTH).enumerate() {
+            for (i, &mask) in attention_mask.iter().take(seq_len).enumerate() {
                 attention_flat[offset + i] = mask as i64;
             }
-            for (i, &tid) in type_ids.iter().take(MAX_PAIR_LENGTH).enumerate() {
+            for (i, &tid) in type_ids.iter().take(seq_len).enumerate() {
                 token_types_flat[offset + i] = tid as i64;
             }
         }
 
-        // Build [N, MAX_PAIR_LENGTH] tensors.
-        let input_ids_val = Value::from_array((vec![n, MAX_PAIR_LENGTH], input_ids_flat))?;
-        let attention_val = Value::from_array((vec![n, MAX_PAIR_LENGTH], attention_flat))?;
+        // Build [N, seq_len] tensors.
+        let input_ids_val = Value::from_array((vec![n, seq_len], input_ids_flat))?;
+        let attention_val = Value::from_array((vec![n, seq_len], attention_flat))?;
 
         // Single batched forward pass — N pairs, one ONNX kernel launch.
         let outputs = if model.has_token_type_ids {
-            let token_type_val = Value::from_array((vec![n, MAX_PAIR_LENGTH], token_types_flat))?;
+            let token_type_val = Value::from_array((vec![n, seq_len], token_types_flat))?;
             session.run(ort::inputs![
                 "input_ids"      => &input_ids_val,
                 "attention_mask" => &attention_val,
