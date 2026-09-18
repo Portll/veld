@@ -14,7 +14,7 @@ const BASELINE: &[(&str, usize)] = &[
     ("handlers", 31),
     ("memory", 90),
     ("memory/sleep_time", 0),
-    ("user_auth", 8),
+    ("user_auth", 4),
     ("user_memory", 2),
 ];
 
