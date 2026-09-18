@@ -22,7 +22,9 @@ pub async fn linear_webhook(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use integrations::linear::LinearWebhook;
 
-    let signing_secret = std::env::var("LINEAR_WEBHOOK_SECRET").ok();
+    let signing_secret = std::env::var("LINEAR_WEBHOOK_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
     let has_secret = signing_secret.is_some();
     let webhook = LinearWebhook::new(signing_secret);
 
@@ -33,10 +35,14 @@ pub async fn linear_webhook(
 
     match (has_secret, signature) {
         (true, Some(sig)) => {
-            if !webhook
-                .verify_signature(&body, sig)
-                .map_err(AppError::Internal)?
-            {
+            let verified =
+                webhook
+                    .verify_signature(&body, sig)
+                    .map_err(|e| AppError::InvalidInput {
+                        field: "signature".to_string(),
+                        reason: e.to_string(),
+                    })?;
+            if !verified {
                 return Err(AppError::InvalidInput {
                     field: "signature".to_string(),
                     reason: "Invalid webhook signature".to_string(),
@@ -248,7 +254,9 @@ pub async fn github_webhook(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use integrations::github::GitHubWebhook;
 
-    let webhook_secret = std::env::var("GITHUB_WEBHOOK_SECRET").ok();
+    let webhook_secret = std::env::var("GITHUB_WEBHOOK_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
     let has_secret = webhook_secret.is_some();
     let webhook = GitHubWebhook::new(webhook_secret);
 
@@ -259,10 +267,14 @@ pub async fn github_webhook(
 
     match (has_secret, signature) {
         (true, Some(sig)) => {
-            if !webhook
-                .verify_signature(&body, sig)
-                .map_err(AppError::Internal)?
-            {
+            let verified =
+                webhook
+                    .verify_signature(&body, sig)
+                    .map_err(|e| AppError::InvalidInput {
+                        field: "signature".to_string(),
+                        reason: e.to_string(),
+                    })?;
+            if !verified {
                 return Err(AppError::InvalidInput {
                     field: "signature".to_string(),
                     reason: "Invalid webhook signature".to_string(),

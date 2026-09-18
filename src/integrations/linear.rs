@@ -197,29 +197,37 @@ impl LinearWebhook {
 
     /// Verify webhook signature using HMAC-SHA256
     ///
-    /// Linear sends the signature in the `Linear-Signature` header
+    /// Linear sends the signature in the `Linear-Signature` header as bare hex
+    /// (64 chars); a `sha256=` prefix is also accepted.
+    ///
+    /// `Ok(false)`: no usable secret, or a well-formed signature that does not
+    /// match. `Err`: the header is malformed. Never `Ok(true)` without a
+    /// matching HMAC under a non-empty secret.
     pub fn verify_signature(&self, body: &[u8], signature: &str) -> Result<bool> {
-        let secret = match &self.signing_secret {
-            Some(s) => s,
-            None => {
+        let secret = match self.signing_secret.as_deref() {
+            // An empty key is public knowledge, so anyone could mint a valid HMAC.
+            Some(s) if !s.is_empty() => s,
+            _ => {
                 tracing::warn!("No signing secret configured, rejecting webhook");
                 return Ok(false);
             }
         };
 
+        // Linear's documented header is bare hex, so the prefix must stay optional.
+        let hex_sig = signature.strip_prefix("sha256=").unwrap_or(signature);
+        let sig_bytes = hex::decode(hex_sig).context("Invalid signature format: not hex")?;
+        if sig_bytes.len() != 32 {
+            anyhow::bail!(
+                "Invalid signature format: expected 32 bytes, got {}",
+                sig_bytes.len()
+            );
+        }
+
         let mut mac =
             HmacSha256::new_from_slice(secret.as_bytes()).context("Invalid signing secret")?;
         mac.update(body);
-
-        // Linear signature format: "sha256=<hex>"
-        let expected_sig = signature.strip_prefix("sha256=").unwrap_or(signature);
-
-        let expected_bytes = match hex::decode(expected_sig) {
-            Ok(b) => b,
-            Err(_) => return Ok(false), // non-hex input → signature mismatch, not a server error
-        };
-
-        Ok(mac.verify_slice(&expected_bytes).is_ok())
+        // verify_slice compares in constant time (subtle::ConstantTimeEq).
+        Ok(mac.verify_slice(&sig_bytes).is_ok())
     }
 
     /// Parse webhook payload

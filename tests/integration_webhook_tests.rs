@@ -135,6 +135,62 @@ mod linear_tests {
         assert!(!result.unwrap()); // Should return false for invalid signature
     }
 
+    fn sign(secret: &str, body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[test]
+    fn test_linear_empty_secret_rejects_forgery() {
+        let body = b"forged";
+        let forged = format!("sha256={}", sign("", body));
+        let webhook = LinearWebhook::new(Some(String::new()));
+        assert!(!webhook.verify_signature(body, &forged).unwrap());
+        assert!(!webhook.verify_signature(body, &sign("", body)).unwrap());
+    }
+
+    // Linear documents a bare-hex header, so no prefix is valid; bad hex is still an error.
+    #[test]
+    fn test_linear_missing_prefix_is_bare_hex() {
+        let webhook = LinearWebhook::new(Some("secret".to_string()));
+        assert!(webhook
+            .verify_signature(b"body", &sign("secret", b"body"))
+            .unwrap());
+        assert!(!webhook
+            .verify_signature(b"other", &sign("secret", b"body"))
+            .unwrap());
+        assert!(webhook.verify_signature(b"body", "invalid").is_err());
+    }
+
+    #[test]
+    fn test_linear_wrong_length_hex_is_error() {
+        let webhook = LinearWebhook::new(Some("secret".to_string()));
+        let full = sign("secret", b"body");
+        assert!(webhook
+            .verify_signature(b"body", &format!("sha256={}", &full[..62]))
+            .is_err());
+        assert!(webhook
+            .verify_signature(b"body", &format!("sha256={}00", full))
+            .is_err());
+        assert!(webhook.verify_signature(b"body", "sha256=").is_err());
+    }
+
+    #[test]
+    fn test_linear_non_hex_is_error() {
+        let webhook = LinearWebhook::new(Some("secret".to_string()));
+        let not_hex = format!("sha256={}", "zz".repeat(32));
+        assert!(webhook.verify_signature(b"body", &not_hex).is_err());
+    }
+
+    #[test]
+    fn test_linear_signature_over_different_body_rejected() {
+        let webhook = LinearWebhook::new(Some("secret".to_string()));
+        let sig = format!("sha256={}", sign("secret", b"original body"));
+        assert!(webhook.verify_signature(b"original body", &sig).unwrap());
+        assert!(!webhook.verify_signature(b"tampered body", &sig).unwrap());
+    }
+
     #[test]
     fn test_linear_payload_parsing() {
         let payload_json = r#"{
@@ -452,6 +508,57 @@ mod github_tests {
 
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[test]
+    fn test_github_empty_secret_rejects_forgery() {
+        let body = b"forged";
+        let forged = format!("sha256={}", sign("", body));
+        let webhook = GitHubWebhook::new(Some(String::new()));
+        assert!(!webhook.verify_signature(body, &forged).unwrap());
+        assert!(!webhook.verify_signature(body, &sign("", body)).unwrap());
+    }
+
+    #[test]
+    fn test_github_missing_prefix_is_error() {
+        let webhook = GitHubWebhook::new(Some("secret".to_string()));
+        assert!(webhook
+            .verify_signature(b"body", &sign("secret", b"body"))
+            .is_err());
+    }
+
+    #[test]
+    fn test_github_wrong_length_hex_is_error() {
+        let webhook = GitHubWebhook::new(Some("secret".to_string()));
+        let full = sign("secret", b"body");
+        assert!(webhook
+            .verify_signature(b"body", &format!("sha256={}", &full[..62]))
+            .is_err());
+        assert!(webhook
+            .verify_signature(b"body", &format!("sha256={}00", full))
+            .is_err());
+        assert!(webhook.verify_signature(b"body", "sha256=").is_err());
+    }
+
+    #[test]
+    fn test_github_non_hex_is_error() {
+        let webhook = GitHubWebhook::new(Some("secret".to_string()));
+        let not_hex = format!("sha256={}", "zz".repeat(32));
+        assert!(webhook.verify_signature(b"body", &not_hex).is_err());
+    }
+
+    #[test]
+    fn test_github_signature_over_different_body_rejected() {
+        let webhook = GitHubWebhook::new(Some("secret".to_string()));
+        let sig = format!("sha256={}", sign("secret", b"original body"));
+        assert!(webhook.verify_signature(b"original body", &sig).unwrap());
+        assert!(!webhook.verify_signature(b"tampered body", &sig).unwrap());
     }
 
     #[test]
