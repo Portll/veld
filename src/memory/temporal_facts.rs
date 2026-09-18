@@ -2893,6 +2893,20 @@ fn parse_ago_unit(expr: &str) -> Option<(i64, AgoUnit)> {
 mod tests {
     use super::*;
 
+    /// Run a store test on every backend.
+    ///
+    /// These tests built a rocksdb DB directly, so the point-in-time recall this
+    /// module exists for had never executed against redb even though
+    /// `with_store` has accepted either engine for months. A body that takes the
+    /// store by value cannot leak state between the two runs.
+    fn on_both_backends(body: fn(TemporalFactStore)) {
+        let stores = crate::storage::test_support::key_value_stores("temporal_facts_test");
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (_backend, kv, _keyspace) in stores {
+            body(TemporalFactStore::with_store(kv));
+        }
+    }
+
     #[test]
     fn test_resolve_next_month() {
         let conv_date = DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
@@ -3077,14 +3091,10 @@ mod tests {
     /// must be visible via `as_of(T_between)` but absent via `as_of(now)`.
     #[test]
     fn test_temporal_fact_as_of_returns_historical_state() {
-        use rocksdb::DB;
-        use std::sync::Arc;
-        use tempfile::TempDir;
+        on_both_backends(test_temporal_fact_as_of_returns_historical_state_body);
+    }
 
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        let store = TemporalFactStore::new(db);
-
+    fn test_temporal_fact_as_of_returns_historical_state_body(store: TemporalFactStore) {
         let now = Utc::now();
         let t1 = now - chrono::Duration::days(10);
         let t2 = now - chrono::Duration::days(5);
@@ -3602,14 +3612,10 @@ mod tests {
     /// relative_time "after the wedding" resolves to After(wedding_date).
     #[test]
     fn test_r5_named_event_resolves_after_wedding() {
-        use rocksdb::DB;
-        use std::sync::Arc;
-        use tempfile::TempDir;
+        on_both_backends(test_r5_named_event_resolves_after_wedding_body);
+    }
 
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        let store = TemporalFactStore::new(db);
-
+    fn test_r5_named_event_resolves_after_wedding_body(store: TemporalFactStore) {
         let conv = conv();
         let wedding_date = NaiveDate::from_ymd_opt(2023, 3, 15).unwrap();
         let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
@@ -3664,14 +3670,10 @@ mod tests {
     /// wedding fact exists.  The result must stay Unknown (B2: no cascade).
     #[test]
     fn test_r5_forward_ref_stays_unknown() {
-        use rocksdb::DB;
-        use std::sync::Arc;
-        use tempfile::TempDir;
+        on_both_backends(test_r5_forward_ref_stays_unknown_body);
+    }
 
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        let store = TemporalFactStore::new(db);
-
+    fn test_r5_forward_ref_stays_unknown_body(store: TemporalFactStore) {
         let conv = conv();
         let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
 
@@ -3715,14 +3717,10 @@ mod tests {
     /// the stored wedding date.
     #[test]
     fn test_b2_resolve_event_to_date_wedding() {
-        use rocksdb::DB;
-        use std::sync::Arc;
-        use tempfile::TempDir;
+        on_both_backends(test_b2_resolve_event_to_date_wedding_body);
+    }
 
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        let store = TemporalFactStore::new(db);
-
+    fn test_b2_resolve_event_to_date_wedding_body(store: TemporalFactStore) {
         let conv = conv();
         // Wedding on May 25, 2023 (Thursday).
         let wedding_date = NaiveDate::from_ymd_opt(2023, 5, 25).unwrap();
@@ -3767,14 +3765,10 @@ mod tests {
     /// (b) Forward reference: no wedding fact stored → resolve_event_to_date → None.
     #[test]
     fn test_b2_forward_ref_returns_none() {
-        use rocksdb::DB;
-        use std::sync::Arc;
-        use tempfile::TempDir;
+        on_both_backends(test_b2_forward_ref_returns_none_body);
+    }
 
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        let store = TemporalFactStore::new(db);
-
+    fn test_b2_forward_ref_returns_none_body(store: TemporalFactStore) {
         let mut visited = std::collections::HashSet::new();
         let result = store.resolve_event_to_date("user-b2b", "the wedding", &mut visited, 0);
 
@@ -3788,14 +3782,10 @@ mod tests {
     /// yield None (depth cap + visited set).
     #[test]
     fn test_b2_cycle_terminates_in_resolve_event_to_date() {
-        use rocksdb::DB;
-        use std::sync::Arc;
-        use tempfile::TempDir;
+        on_both_backends(test_b2_cycle_terminates_in_resolve_event_to_date_body);
+    }
 
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        let store = TemporalFactStore::new(db);
-
+    fn test_b2_cycle_terminates_in_resolve_event_to_date_body(store: TemporalFactStore) {
         let conv = conv();
         let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
 
@@ -3857,14 +3847,10 @@ mod tests {
     /// still resolves to After(wedding_date) in resolve_named_event_hop.
     #[test]
     fn test_b2_r5_behavior_unchanged_after_helper_extraction() {
-        use rocksdb::DB;
-        use std::sync::Arc;
-        use tempfile::TempDir;
+        on_both_backends(test_b2_r5_behavior_unchanged_after_helper_extraction_body);
+    }
 
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        let store = TemporalFactStore::new(db);
-
+    fn test_b2_r5_behavior_unchanged_after_helper_extraction_body(store: TemporalFactStore) {
         let conv = conv();
         let wedding_date = NaiveDate::from_ymd_opt(2023, 3, 15).unwrap();
         let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
@@ -4111,14 +4097,10 @@ mod tests {
     /// Must terminate (no stack overflow / hang) and both end up Unknown.
     #[test]
     fn test_r5_cycle_terminates() {
-        use rocksdb::DB;
-        use std::sync::Arc;
-        use tempfile::TempDir;
+        on_both_backends(test_r5_cycle_terminates_body);
+    }
 
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        let store = TemporalFactStore::new(db);
-
+    fn test_r5_cycle_terminates_body(store: TemporalFactStore) {
         let conv = conv();
         let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
 

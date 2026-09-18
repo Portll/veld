@@ -48,6 +48,31 @@ pub(crate) fn column_stores(
     out
 }
 
+/// A [`KeyValueStore`] per backend, bound to one family.
+///
+/// For a store that prefixes its own keys the family name carries no meaning,
+/// which is why it is the caller's to choose: what the handle has to answer is
+/// the same set of calls on both engines. Production binds the DEFAULT keyspace
+/// for several of these stores; a named family is used here because a rocksdb
+/// `cf_handle("default")` is not guaranteed across crate versions, and the
+/// prefixes the store writes are identical either way.
+pub(crate) fn key_value_stores(
+    family: &str,
+) -> Vec<(
+    StorageBackend,
+    Arc<dyn crate::storage::KeyValueStore>,
+    TempDir,
+)> {
+    column_stores(&[family])
+        .into_iter()
+        .map(|(backend, store, tmp)| {
+            let kv: Arc<dyn crate::storage::KeyValueStore> =
+                Arc::new(crate::storage::FamilyKeyValueStore::new(store, family).unwrap());
+            (backend, kv, tmp)
+        })
+        .collect()
+}
+
 /// Refuses a build that silently dropped a backend: a loop over one store
 /// passes every assertion while proving nothing about the other.
 pub(crate) fn assert_both_backends<T>(stores: &[(StorageBackend, T, TempDir)]) {
