@@ -690,8 +690,7 @@ pub enum FactType {
 /// Reason a fact was administratively purged. Closed enum (no `Other` escape
 /// hatch) to keep `purge_reason` non-leaky: free-form operator notes belong
 /// in the audit log, not on the fact record.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PurgeReason {
     /// Explicit user request to remove specific content.
     UserRequest,
@@ -705,70 +704,44 @@ pub enum PurgeReason {
     ConfidenceFloor { threshold: f32 },
 }
 
-// Hand-written because an internally tagged derive needs `deserialize_any`, which bincode
-// refuses; binary formats read the layout the tagged Serialize writes: the tag, then the fields.
+// bincode cannot decode an internally tagged enum (it needs deserialize_any), so binary
+// formats get the externally tagged form. JSON keeps the `kind` tag. Records written
+// in the tagged layout are read by facts.rs's LegacySemanticFactV3 arm.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "PurgeReason", tag = "kind", rename_all = "snake_case")]
+enum PurgeReasonTagged {
+    UserRequest,
+    AdminCleanup,
+    PatternMatch { pattern_hash: String },
+    ConfidenceFloor { threshold: f32 },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "PurgeReason", rename_all = "snake_case")]
+enum PurgeReasonBinary {
+    UserRequest,
+    AdminCleanup,
+    PatternMatch { pattern_hash: String },
+    ConfidenceFloor { threshold: f32 },
+}
+
+impl Serialize for PurgeReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            PurgeReasonTagged::serialize(self, serializer)
+        } else {
+            PurgeReasonBinary::serialize(self, serializer)
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for PurgeReason {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(tag = "kind", rename_all = "snake_case")]
-        enum Tagged {
-            UserRequest,
-            AdminCleanup,
-            PatternMatch { pattern_hash: String },
-            ConfidenceFloor { threshold: f32 },
+        if deserializer.is_human_readable() {
+            PurgeReasonTagged::deserialize(deserializer)
+        } else {
+            PurgeReasonBinary::deserialize(deserializer)
         }
-
-        const VARIANTS: &[&str] = &[
-            "user_request",
-            "admin_cleanup",
-            "pattern_match",
-            "confidence_floor",
-        ];
-
-        struct Binary;
-
-        impl<'de> serde::de::Visitor<'de> for Binary {
-            type Value = PurgeReason;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a purge-reason kind followed by that kind's fields")
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<PurgeReason, A::Error> {
-                use serde::de::Error;
-                let kind: String = seq
-                    .next_element()?
-                    .ok_or_else(|| A::Error::invalid_length(0, &self))?;
-                Ok(match kind.as_str() {
-                    "user_request" => PurgeReason::UserRequest,
-                    "admin_cleanup" => PurgeReason::AdminCleanup,
-                    "pattern_match" => PurgeReason::PatternMatch {
-                        pattern_hash: seq
-                            .next_element()?
-                            .ok_or_else(|| A::Error::invalid_length(1, &self))?,
-                    },
-                    "confidence_floor" => PurgeReason::ConfidenceFloor {
-                        threshold: seq
-                            .next_element()?
-                            .ok_or_else(|| A::Error::invalid_length(1, &self))?,
-                    },
-                    other => return Err(A::Error::unknown_variant(other, VARIANTS)),
-                })
-            }
-        }
-
-        if !deserializer.is_human_readable() {
-            return deserializer.deserialize_tuple(2, Binary);
-        }
-        Ok(match Tagged::deserialize(deserializer)? {
-            Tagged::UserRequest => PurgeReason::UserRequest,
-            Tagged::AdminCleanup => PurgeReason::AdminCleanup,
-            Tagged::PatternMatch { pattern_hash } => PurgeReason::PatternMatch { pattern_hash },
-            Tagged::ConfidenceFloor { threshold } => PurgeReason::ConfidenceFloor { threshold },
-        })
     }
 }
 
@@ -1667,6 +1640,22 @@ mod tests {
             let back: PurgeReason = serde_json::from_value(json).expect("json decode");
             assert_eq!(back, reason);
         }
+    }
+
+    #[test]
+    fn purge_reason_json_keeps_its_kind_tag() {
+        let json = serde_json::to_value(PurgeReason::PatternMatch {
+            pattern_hash: "abc".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "pattern_match", "pattern_hash": "abc"})
+        );
+        assert_eq!(
+            serde_json::to_value(PurgeReason::UserRequest).unwrap(),
+            serde_json::json!({"kind": "user_request"})
+        );
     }
 
     fn create_test_memory(content: &str, importance: f32) -> Memory {

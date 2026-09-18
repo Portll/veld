@@ -14,7 +14,7 @@ use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::compression::{FactType, SemanticFact};
+use super::compression::{FactType, PurgeReason, SemanticFact};
 use super::types::MemoryId;
 
 /// Response for fact queries
@@ -124,8 +124,105 @@ impl LegacySemanticFactV2 {
     }
 }
 
-/// Decode a `SemanticFact` from RocksDB bytes with a two-step fallback chain:
-/// current shape → V2 (bi-temporal, no purge) → V1 (pre-bi-temporal). Returns
+/// `SemanticFact` as written while `PurgeReason` was internally tagged: bincode wrote
+/// the reason as a struct, its `kind` string first and then that kind's fields.
+#[derive(Deserialize)]
+struct LegacySemanticFactV3 {
+    id: String,
+    fact: String,
+    confidence: f32,
+    support_count: usize,
+    source_memories: Vec<MemoryId>,
+    related_entities: Vec<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    last_reinforced: chrono::DateTime<chrono::Utc>,
+    fact_type: FactType,
+    valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    superseded_by: Option<String>,
+    supersedes: Vec<String>,
+    purged_at: Option<chrono::DateTime<chrono::Utc>>,
+    purge_reason: Option<StructTaggedPurgeReason>,
+}
+
+impl LegacySemanticFactV3 {
+    fn upgrade(self) -> SemanticFact {
+        SemanticFact {
+            id: self.id,
+            fact: self.fact,
+            confidence: self.confidence,
+            support_count: self.support_count,
+            source_memories: self.source_memories,
+            related_entities: self.related_entities,
+            created_at: self.created_at,
+            last_reinforced: self.last_reinforced,
+            fact_type: self.fact_type,
+            valid_from: self.valid_from,
+            valid_until: self.valid_until,
+            superseded_by: self.superseded_by,
+            supersedes: self.supersedes,
+            purged_at: self.purged_at,
+            purge_reason: self.purge_reason.map(|r| r.0),
+        }
+    }
+}
+
+/// A `PurgeReason` in the internally tagged binary layout; decode-only.
+struct StructTaggedPurgeReason(PurgeReason);
+
+impl<'de> Deserialize<'de> for StructTaggedPurgeReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StructTaggedPurgeReason;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a purge-reason kind followed by that kind's fields")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                let kind: String = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                Ok(StructTaggedPurgeReason(match kind.as_str() {
+                    "user_request" => PurgeReason::UserRequest,
+                    "admin_cleanup" => PurgeReason::AdminCleanup,
+                    "pattern_match" => PurgeReason::PatternMatch {
+                        pattern_hash: seq
+                            .next_element()?
+                            .ok_or_else(|| A::Error::invalid_length(1, &self))?,
+                    },
+                    "confidence_floor" => PurgeReason::ConfidenceFloor {
+                        threshold: seq
+                            .next_element()?
+                            .ok_or_else(|| A::Error::invalid_length(1, &self))?,
+                    },
+                    other => {
+                        return Err(A::Error::unknown_variant(
+                            other,
+                            &[
+                                "user_request",
+                                "admin_cleanup",
+                                "pattern_match",
+                                "confidence_floor",
+                            ],
+                        ))
+                    }
+                }))
+            }
+        }
+
+        deserializer.deserialize_tuple(2, Visitor)
+    }
+}
+
+/// Decode a `SemanticFact` from RocksDB bytes with a fallback chain: current shape →
+/// V3 (struct-tagged purge reason) → V2 (bi-temporal, no purge) → V1 (pre-bi-temporal). Returns
 /// `(fact, is_legacy)` — when `is_legacy` is true, callers may opt to re-write
 /// the record in the current shape to amortize future reads. Matches the
 /// [crate::memory::storage::deserialize_with_fallback] pattern on `Memory`.
@@ -133,6 +230,17 @@ fn decode_semantic_fact_with_fallback(data: &[u8]) -> Result<(SemanticFact, bool
     match bincode::serde::decode_from_slice::<SemanticFact, _>(data, bincode::config::standard()) {
         Ok((fact, _)) => Ok((fact, false)),
         Err(current_err) => {
+            if let Ok((v3, read)) = bincode::serde::decode_from_slice::<LegacySemanticFactV3, _>(
+                data,
+                bincode::config::standard(),
+            ) {
+                if read == data.len() {
+                    tracing::debug!(
+                        "Migrated SemanticFact from struct-tagged purge_reason v3 shape"
+                    );
+                    return Ok((v3.upgrade(), true));
+                }
+            }
             // A legacy shape must consume the whole record: a newer record decoded as its prefix silently drops purged_at.
             if let Ok((v2, read)) = bincode::serde::decode_from_slice::<LegacySemanticFactV2, _>(
                 data,
@@ -1103,6 +1211,83 @@ mod tests {
         assert_eq!(got.valid_until, None);
         assert_eq!(got.superseded_by, None);
         assert!(got.supersedes.is_empty());
+    }
+
+    /// A fact purged while `PurgeReason` was internally tagged must still read back
+    /// purged, with its reason, for every kind.
+    #[test]
+    fn struct_tagged_purge_reason_records_decode_purged() {
+        #[derive(serde::Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum OldReason {
+            UserRequest,
+            AdminCleanup,
+            PatternMatch { pattern_hash: String },
+            ConfidenceFloor { threshold: f32 },
+        }
+
+        #[derive(serde::Serialize)]
+        struct V3 {
+            id: String,
+            fact: String,
+            confidence: f32,
+            support_count: usize,
+            source_memories: Vec<MemoryId>,
+            related_entities: Vec<String>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            last_reinforced: chrono::DateTime<chrono::Utc>,
+            fact_type: FactType,
+            valid_from: Option<chrono::DateTime<chrono::Utc>>,
+            valid_until: Option<chrono::DateTime<chrono::Utc>>,
+            superseded_by: Option<String>,
+            supersedes: Vec<String>,
+            purged_at: Option<chrono::DateTime<chrono::Utc>>,
+            purge_reason: Option<OldReason>,
+        }
+
+        let now = chrono::Utc::now();
+        let cases = [
+            (OldReason::UserRequest, PurgeReason::UserRequest),
+            (OldReason::AdminCleanup, PurgeReason::AdminCleanup),
+            (
+                OldReason::PatternMatch {
+                    pattern_hash: "h".to_string(),
+                },
+                PurgeReason::PatternMatch {
+                    pattern_hash: "h".to_string(),
+                },
+            ),
+            (
+                OldReason::ConfidenceFloor { threshold: 0.5 },
+                PurgeReason::ConfidenceFloor { threshold: 0.5 },
+            ),
+        ];
+        for (old, expected) in cases {
+            let record = V3 {
+                id: "f".to_string(),
+                fact: "purged".to_string(),
+                confidence: 0.9,
+                support_count: 1,
+                source_memories: vec![],
+                related_entities: vec!["e".to_string()],
+                created_at: now,
+                last_reinforced: now,
+                fact_type: FactType::Pattern,
+                valid_from: None,
+                valid_until: None,
+                superseded_by: None,
+                supersedes: vec![],
+                purged_at: Some(now),
+                purge_reason: Some(old),
+            };
+            let bytes = bincode::serde::encode_to_vec(&record, bincode::config::standard())
+                .expect("encode struct-tagged shape");
+            let (got, is_legacy) =
+                decode_semantic_fact_with_fallback(&bytes).expect("struct-tagged record decodes");
+            assert!(is_legacy);
+            assert_eq!(got.purged_at, Some(now), "{expected:?} lost purged_at");
+            assert_eq!(got.purge_reason, Some(expected));
+        }
     }
 
     /// Manual `valid_until` in the past must hide the fact from default
