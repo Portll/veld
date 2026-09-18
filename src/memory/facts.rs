@@ -920,12 +920,16 @@ fn detect_polarity(text_lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
-    fn create_test_store() -> (SemanticFactStore, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        (SemanticFactStore::new(db), temp_dir)
+    /// Run a store test on every backend. These tests built a rocksdb DB
+    /// directly, so this store had never executed against redb even though
+    /// its constructor has taken either engine.
+    fn on_both_backends(body: fn(SemanticFactStore)) {
+        let stores = crate::storage::test_support::key_value_stores("facts_test");
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (_backend, kv, _keyspace) in stores {
+            body(SemanticFactStore::with_store(kv));
+        }
     }
 
     fn create_test_fact(id: &str, content: &str) -> SemanticFact {
@@ -950,7 +954,10 @@ mod tests {
 
     #[test]
     fn test_store_and_get() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_store_and_get_body);
+    }
+
+    fn test_store_and_get_body(store: SemanticFactStore) {
         let fact = create_test_fact("fact-1", "Rust is a systems programming language");
 
         store.store("user-1", &fact).unwrap();
@@ -965,7 +972,10 @@ mod tests {
 
     #[test]
     fn test_find_by_entity() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_find_by_entity_body);
+    }
+
+    fn test_find_by_entity_body(store: SemanticFactStore) {
         let fact = create_test_fact("fact-1", "Rust has efficient memory management");
 
         store.store("user-1", &fact).unwrap();
@@ -977,7 +987,10 @@ mod tests {
 
     #[test]
     fn test_find_by_type() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_find_by_type_body);
+    }
+
+    fn test_find_by_type_body(store: SemanticFactStore) {
         let fact = create_test_fact("fact-1", "Pattern detected in codebase");
 
         store.store("user-1", &fact).unwrap();
@@ -988,7 +1001,10 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_delete_body);
+    }
+
+    fn test_delete_body(store: SemanticFactStore) {
         let fact = create_test_fact("fact-1", "Test fact");
 
         store.store("user-1", &fact).unwrap();
@@ -1004,8 +1020,10 @@ mod tests {
 
     #[test]
     fn test_stats() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_stats_body);
+    }
 
+    fn test_stats_body(store: SemanticFactStore) {
         store
             .store("user-1", &create_test_fact("fact-1", "Fact one"))
             .unwrap();
@@ -1027,6 +1045,10 @@ mod tests {
     /// backup/restore regression test for the schema-evolution shim.
     #[test]
     fn test_semantic_fact_legacy_v1_decode_upgrades() {
+        on_both_backends(test_semantic_fact_legacy_v1_decode_upgrades_body);
+    }
+
+    fn test_semantic_fact_legacy_v1_decode_upgrades_body(store: SemanticFactStore) {
         // Encode in the OLD shape (mirror of LegacySemanticFactV1 fields).
         #[derive(serde::Serialize)]
         struct V1 {
@@ -1059,7 +1081,6 @@ mod tests {
 
         // Put the v1 bytes directly into RocksDB under the canonical key,
         // then read via the store — must transparently upgrade.
-        let (store, _dir) = create_test_store();
         let key = format!("facts:{}:{}", "user-1", "legacy-fact");
         store.store.put_bytes(key.as_bytes(), &v1_bytes).unwrap();
 
@@ -1082,7 +1103,10 @@ mod tests {
     /// `list()` but keep it visible under `list_filtered(include_expired=true)`.
     #[test]
     fn test_semantic_fact_list_excludes_expired() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_semantic_fact_list_excludes_expired_body);
+    }
+
+    fn test_semantic_fact_list_excludes_expired_body(store: SemanticFactStore) {
         let now = chrono::Utc::now();
 
         let mut alive = create_test_fact("alive", "Currently true");
@@ -1107,7 +1131,10 @@ mod tests {
     /// that hadn't yet started or had already been invalidated.
     #[test]
     fn test_semantic_fact_as_of_returns_historical_state() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_semantic_fact_as_of_returns_historical_state_body);
+    }
+
+    fn test_semantic_fact_as_of_returns_historical_state_body(store: SemanticFactStore) {
         let now = chrono::Utc::now();
         let t1 = now - chrono::Duration::days(10);
         let t2 = now - chrono::Duration::days(5);
@@ -1144,7 +1171,10 @@ mod tests {
     /// invalidate the older fact and stamp `supersedes`/`superseded_by` links.
     #[test]
     fn test_semantic_fact_store_with_invalidation_supersedes_old() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_semantic_fact_store_with_invalidation_supersedes_old_body);
+    }
+
+    fn test_semantic_fact_store_with_invalidation_supersedes_old_body(store: SemanticFactStore) {
         let user = "user-1";
 
         // Embedding is the same vector for both, so cosine = 1.0 (above 0.80
@@ -1197,7 +1227,10 @@ mod tests {
     /// `find_contradictions` must skip silently when no embedding is provided.
     #[test]
     fn test_semantic_fact_no_embedding_skips_contradiction() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_semantic_fact_no_embedding_skips_contradiction_body);
+    }
+
+    fn test_semantic_fact_no_embedding_skips_contradiction_body(store: SemanticFactStore) {
         let user = "user-1";
 
         let mut old = create_test_fact("old", "Postgres v15 is supported");

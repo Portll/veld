@@ -1008,12 +1008,16 @@ mod tests {
     use super::*;
     use crate::memory::types::Experience;
     use chrono::Duration;
-    use tempfile::TempDir;
 
-    fn create_test_graph() -> (LineageGraph, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        (LineageGraph::new(db), temp_dir)
+    /// Run a store test on every backend. These tests built a rocksdb DB
+    /// directly, so this store had never executed against redb even though
+    /// its constructor has taken either engine.
+    fn on_both_backends(body: fn(LineageGraph)) {
+        let stores = crate::storage::test_support::key_value_stores("lineage_test");
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (_backend, kv, _keyspace) in stores {
+            body(LineageGraph::with_store(kv));
+        }
     }
 
     fn create_test_memory(exp_type: ExperienceType, entities: Vec<&str>) -> Memory {
@@ -1036,7 +1040,10 @@ mod tests {
 
     #[test]
     fn test_store_and_get_edge() {
-        let (graph, _dir) = create_test_graph();
+        on_both_backends(test_store_and_get_edge_body);
+    }
+
+    fn test_store_and_get_edge_body(graph: LineageGraph) {
         let from = MemoryId(Uuid::new_v4());
         let to = MemoryId(Uuid::new_v4());
 
@@ -1050,7 +1057,10 @@ mod tests {
 
     #[test]
     fn test_get_edges_from_and_to() {
-        let (graph, _dir) = create_test_graph();
+        on_both_backends(test_get_edges_from_and_to_body);
+    }
+
+    fn test_get_edges_from_and_to_body(graph: LineageGraph) {
         let from = MemoryId(Uuid::new_v4());
         let to1 = MemoryId(Uuid::new_v4());
         let to2 = MemoryId(Uuid::new_v4());
@@ -1070,8 +1080,10 @@ mod tests {
 
     #[test]
     fn test_infer_error_to_task() {
-        let (graph, _dir) = create_test_graph();
+        on_both_backends(test_infer_error_to_task_body);
+    }
 
+    fn test_infer_error_to_task_body(graph: LineageGraph) {
         // Use same entities for high overlap
         let error = create_test_memory(ExperienceType::Error, vec!["auth", "login"]);
         let mut task = create_test_memory(ExperienceType::Task, vec!["auth", "login"]);
@@ -1087,8 +1099,10 @@ mod tests {
 
     #[test]
     fn test_infer_learning_to_decision() {
-        let (graph, _dir) = create_test_graph();
+        on_both_backends(test_infer_learning_to_decision_body);
+    }
 
+    fn test_infer_learning_to_decision_body(graph: LineageGraph) {
         let learning = create_test_memory(ExperienceType::Learning, vec!["react", "hooks"]);
         let mut decision =
             create_test_memory(ExperienceType::Decision, vec!["react", "hooks", "state"]);
@@ -1102,8 +1116,10 @@ mod tests {
 
     #[test]
     fn test_no_inference_wrong_order() {
-        let (graph, _dir) = create_test_graph();
+        on_both_backends(test_no_inference_wrong_order_body);
+    }
 
+    fn test_no_inference_wrong_order_body(graph: LineageGraph) {
         let task = create_test_memory(ExperienceType::Task, vec!["auth"]);
         let mut error = create_test_memory(ExperienceType::Error, vec!["auth"]);
         error.created_at = task.created_at - Duration::days(1); // Error BEFORE task
@@ -1115,7 +1131,10 @@ mod tests {
 
     #[test]
     fn test_branch_creation() {
-        let (graph, _dir) = create_test_graph();
+        on_both_backends(test_branch_creation_body);
+    }
+
+    fn test_branch_creation_body(graph: LineageGraph) {
         let branch_point = MemoryId(Uuid::new_v4());
 
         graph.ensure_main_branch("user-1").unwrap();
@@ -1151,7 +1170,10 @@ mod tests {
 
     #[test]
     fn test_confirm_and_reject_edge() {
-        let (graph, _dir) = create_test_graph();
+        on_both_backends(test_confirm_and_reject_edge_body);
+    }
+
+    fn test_confirm_and_reject_edge_body(graph: LineageGraph) {
         let from = MemoryId(Uuid::new_v4());
         let to = MemoryId(Uuid::new_v4());
 
@@ -1173,8 +1195,10 @@ mod tests {
 
     #[test]
     fn test_lineage_stats() {
-        let (graph, _dir) = create_test_graph();
+        on_both_backends(test_lineage_stats_body);
+    }
 
+    fn test_lineage_stats_body(graph: LineageGraph) {
         let from = MemoryId(Uuid::new_v4());
         let to = MemoryId(Uuid::new_v4());
 

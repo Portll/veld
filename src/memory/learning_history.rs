@@ -770,18 +770,24 @@ impl LearningHistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
-    fn create_test_store() -> (LearningHistoryStore, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
-        (LearningHistoryStore::new(db), temp_dir)
+    /// Run a store test on every backend. These tests built a rocksdb DB
+    /// directly, so this store had never executed against redb even though
+    /// its constructor has taken either engine.
+    fn on_both_backends(body: fn(LearningHistoryStore)) {
+        let stores = crate::storage::test_support::key_value_stores("learning_history_test");
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (_backend, kv, _keyspace) in stores {
+            body(LearningHistoryStore::with_store(kv));
+        }
     }
 
     #[test]
     fn test_record_and_query() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_record_and_query_body);
+    }
 
+    fn test_record_and_query_body(store: LearningHistoryStore) {
         let event = ConsolidationEvent::EdgePotentiated {
             from_memory_id: "mem-1".to_string(),
             to_memory_id: "mem-2".to_string(),
@@ -801,8 +807,10 @@ mod tests {
 
     #[test]
     fn test_memory_velocity() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_memory_velocity_body);
+    }
 
+    fn test_memory_velocity_body(store: LearningHistoryStore) {
         // Record several events for a memory
         for i in 0..5 {
             let event = ConsolidationEvent::MemoryReplayed {
@@ -826,8 +834,10 @@ mod tests {
 
     #[test]
     fn test_recency_boost() {
-        let (store, _dir) = create_test_store();
+        on_both_backends(test_recency_boost_body);
+    }
 
+    fn test_recency_boost_body(store: LearningHistoryStore) {
         // No events = no boost
         let boost = store.recency_boost("user-1", "mem-1").unwrap();
         assert_eq!(boost, 1.0);
