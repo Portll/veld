@@ -173,20 +173,25 @@ impl MemoryAclStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocksdb::DB;
-    use tempfile::TempDir;
     use uuid::Uuid;
 
-    fn store() -> (MemoryAclStore, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let db = Arc::new(DB::open_default(dir.path()).unwrap());
-        let kv = Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db));
-        (MemoryAclStore::new(kv), dir)
+    /// Run a store test on every backend. These tests built a rocksdb DB
+    /// directly, so this store had never executed against redb even though
+    /// its constructor has taken either engine.
+    fn on_both_backends(body: fn(MemoryAclStore)) {
+        let stores = crate::storage::test_support::key_value_stores("acl_test");
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (_backend, kv, _keyspace) in stores {
+            body(MemoryAclStore::new(kv));
+        }
     }
 
     #[test]
     fn owner_can_always_read_and_write() {
-        let (s, _d) = store();
+        on_both_backends(owner_can_always_read_and_write_body);
+    }
+
+    fn owner_can_always_read_and_write_body(s: MemoryAclStore) {
         let mid = MemoryId(Uuid::new_v4());
         assert!(s.can_read("alice", &mid, "alice").unwrap());
         assert!(s.can_write("alice", &mid, "alice").unwrap());
@@ -194,7 +199,10 @@ mod tests {
 
     #[test]
     fn stranger_default_denied() {
-        let (s, _d) = store();
+        on_both_backends(stranger_default_denied_body);
+    }
+
+    fn stranger_default_denied_body(s: MemoryAclStore) {
         let mid = MemoryId(Uuid::new_v4());
         assert!(!s.can_read("alice", &mid, "bob").unwrap());
         assert!(!s.can_write("alice", &mid, "bob").unwrap());
@@ -202,7 +210,10 @@ mod tests {
 
     #[test]
     fn grant_read_then_check() {
-        let (s, _d) = store();
+        on_both_backends(grant_read_then_check_body);
+    }
+
+    fn grant_read_then_check_body(s: MemoryAclStore) {
         let mid = MemoryId(Uuid::new_v4());
         s.grant_read("alice", &mid, "bob").unwrap();
         assert!(s.can_read("alice", &mid, "bob").unwrap());
@@ -211,7 +222,10 @@ mod tests {
 
     #[test]
     fn grant_write_implies_read() {
-        let (s, _d) = store();
+        on_both_backends(grant_write_implies_read_body);
+    }
+
+    fn grant_write_implies_read_body(s: MemoryAclStore) {
         let mid = MemoryId(Uuid::new_v4());
         s.grant_write("alice", &mid, "bob").unwrap();
         assert!(s.can_write("alice", &mid, "bob").unwrap());
@@ -220,7 +234,10 @@ mod tests {
 
     #[test]
     fn revoke_removes_access() {
-        let (s, _d) = store();
+        on_both_backends(revoke_removes_access_body);
+    }
+
+    fn revoke_removes_access_body(s: MemoryAclStore) {
         let mid = MemoryId(Uuid::new_v4());
         s.grant_read("alice", &mid, "bob").unwrap();
         s.grant_write("alice", &mid, "carol").unwrap();
@@ -236,7 +253,10 @@ mod tests {
 
     #[test]
     fn list_shared_returns_all() {
-        let (s, _d) = store();
+        on_both_backends(list_shared_returns_all_body);
+    }
+
+    fn list_shared_returns_all_body(s: MemoryAclStore) {
         let m1 = MemoryId(Uuid::new_v4());
         let m2 = MemoryId(Uuid::new_v4());
         s.grant_read("alice", &m1, "bob").unwrap();
@@ -247,7 +267,10 @@ mod tests {
 
     #[test]
     fn clear_removes_record() {
-        let (s, _d) = store();
+        on_both_backends(clear_removes_record_body);
+    }
+
+    fn clear_removes_record_body(s: MemoryAclStore) {
         let mid = MemoryId(Uuid::new_v4());
         s.grant_read("alice", &mid, "bob").unwrap();
         s.clear("alice", &mid).unwrap();
