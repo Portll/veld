@@ -191,6 +191,8 @@ struct LazyNomicModel {
 impl LazyNomicModel {
     fn new(config: &NomicConfig) -> Result<Self> {
         let threads_env = std::env::var("VELD_ONNX_THREADS")
+            // The recall harness pins the upstream spelling.
+            .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
             .ok()
             .and_then(|s| s.parse().ok());
         let mut threads = default_threads_config();

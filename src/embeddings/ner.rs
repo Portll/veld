@@ -210,6 +210,8 @@ impl LazyNerModel {
         let default_threads = 2;
 
         let num_threads = std::env::var("VELD_ONNX_THREADS")
+            // The recall harness pins the upstream spelling.
+            .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(default_threads);

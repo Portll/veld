@@ -1107,9 +1107,13 @@ impl RelationshipEdge {
     /// would be after decay, without modifying the edge.
     /// Uses tier-aware decay (L1/L2/L3 have different decay rates).
     pub fn effective_strength(&self) -> f32 {
+        self.effective_strength_at(crate::memory::scoring_now())
+    }
+
+    /// As [`effective_strength`](Self::effective_strength), decayed to `now`.
+    pub fn effective_strength_at(&self, now: DateTime<Utc>) -> f32 {
         use crate::decay::tier_decay_factor_adaptive;
 
-        let now = Utc::now();
         let elapsed = now.signed_duration_since(self.last_activated);
         let hours_elapsed = elapsed.num_seconds() as f64 / 3600.0;
 
@@ -1122,7 +1126,7 @@ impl RelationshipEdge {
             EdgeTier::L2Episodic => 1,
             EdgeTier::L3Semantic => 2,
         };
-        let ltp_factor = self.ltp_status.decay_factor();
+        let ltp_factor = self.ltp_status.decay_factor_at(now);
         // Same rate as decay() — a read path on a different rate than the write
         // path reports a strength the store will never actually hold.
         let (decay_factor, _) = tier_decay_factor_adaptive(
@@ -1190,7 +1194,7 @@ impl RelationshipEdge {
         };
 
         // Apply the same time-based decay as effective_strength
-        let now = Utc::now();
+        let now = crate::memory::scoring_now();
         let elapsed = now.signed_duration_since(self.last_activated);
         let hours_elapsed = elapsed.num_seconds() as f64 / 3600.0;
 
@@ -1203,7 +1207,7 @@ impl RelationshipEdge {
             EdgeTier::L2Episodic => 1,
             EdgeTier::L3Semantic => 2,
         };
-        let ltp_factor = self.ltp_status.decay_factor();
+        let ltp_factor = self.ltp_status.decay_factor_at(now);
         let (decay_factor, _) = tier_decay_factor(hours_elapsed, tier_num, ltp_factor);
         (raw * decay_factor).max(LTP_MIN_STRENGTH)
     }
@@ -3840,7 +3844,10 @@ impl GraphMemory {
         // Uses batch update for efficiency instead of individual writes.
         // A usage write: skipped under read-only recall (memory::recall_readonly), so an eval
         // repeat does not strengthen the edges it walked (shodh-memory 4ec3b6e).
-        if !edges_to_strengthen.is_empty() && !crate::memory::recall_readonly() {
+        if !edges_to_strengthen.is_empty()
+            && !crate::memory::recall_readonly()
+            && crate::memory::ablation::is_enabled("graph_potentiation")
+        {
             match self.batch_strengthen_synapses(&edges_to_strengthen) {
                 Ok(count) => {
                     if count > 0 {
@@ -4026,7 +4033,10 @@ impl GraphMemory {
         all_entities.sort_by(|a, b| b.decay_factor.total_cmp(&a.decay_factor));
 
         // Hebbian strengthening — a usage write, skipped under read-only recall.
-        if !edges_to_strengthen.is_empty() && !crate::memory::recall_readonly() {
+        if !edges_to_strengthen.is_empty()
+            && !crate::memory::recall_readonly()
+            && crate::memory::ablation::is_enabled("graph_potentiation")
+        {
             if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
                 tracing::debug!("Failed to strengthen synapses: {}", e);
             }
@@ -4240,7 +4250,10 @@ impl GraphMemory {
         // Hebbian strengthening for traversed edges — a usage write, skipped under read-only
         // recall. This is the site recall's multi-hop leg reaches (memory/recall.rs), the one
         // the gate's doc comment named as the residual when the gate landed.
-        if !edges_to_strengthen.is_empty() && !crate::memory::recall_readonly() {
+        if !edges_to_strengthen.is_empty()
+            && !crate::memory::recall_readonly()
+            && crate::memory::ablation::is_enabled("graph_potentiation")
+        {
             if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
                 tracing::debug!("Failed to strengthen synapses: {}", e);
             }
@@ -9626,5 +9639,161 @@ mod tests {
             before,
             "the walk must not strengthen or rewrite edges"
         );
+    }
+}
+
+#[cfg(test)]
+mod ablation_gate_tests {
+    use super::*;
+    use crate::memory::ablation::{DISABLE_BOOSTS_VAR, ENV_LOCK};
+
+    fn node(uuid: Uuid, name: &str) -> EntityNode {
+        EntityNode {
+            uuid,
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        }
+    }
+
+    /// Strength of a fresh A-B edge before and after one walk of `kind` from A.
+    fn walk(kind: &str) -> (f32, f32) {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        graph.add_entity(node(a, "AblationA")).unwrap();
+        graph.add_entity(node(b, "AblationB")).unwrap();
+        let edge = graph
+            .add_relationship(RelationshipEdge {
+                uuid: Uuid::new_v4(),
+                from_entity: a,
+                to_entity: b,
+                relation_type: RelationType::RelatedTo,
+                strength: 0.5,
+                created_at: Utc::now(),
+                valid_at: Utc::now(),
+                invalidated_at: None,
+                source_episode_id: None,
+                context: String::new(),
+                last_activated: Utc::now(),
+                activation_count: 1,
+                ltp_status: LtpStatus::None,
+                activation_timestamps: None,
+                tier: EdgeTier::L2Episodic,
+                created_by: EdgeSource::CoOccurrence,
+                entity_confidence: None,
+                forward_strength: 0.5,
+                backward_strength: 0.5,
+            })
+            .unwrap();
+        let strength = || graph.get_relationship(&edge).unwrap().unwrap().strength;
+        let before = strength();
+        match kind {
+            "from_entity" => {
+                graph.traverse_from_entity(&a, 2).unwrap();
+            }
+            "weighted" => {
+                graph.traverse_weighted(&a, 2, None, 0.0).unwrap();
+            }
+            "bidirectional" => {
+                graph.traverse_bidirectional(&a, &b, 2, 0.0).unwrap();
+            }
+            other => panic!("unknown walk {other}"),
+        }
+        (before, strength())
+    }
+
+    /// Each traversal that feeds the recall graph leg strengthens the edges it walks;
+    /// ablating `graph_potentiation` must leave the edge exactly as it was.
+    #[test]
+    fn graph_potentiation_ablation_stops_the_traversal_write() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_readonly = std::env::var("VELD_RECALL_READONLY").ok();
+        // The harness pins SHODH_RECALL_READONLY=1 process-wide; VELD_ wins over it.
+        std::env::set_var("VELD_RECALL_READONLY", "0");
+        for kind in ["from_entity", "weighted", "bidirectional"] {
+            std::env::remove_var(DISABLE_BOOSTS_VAR);
+            let (before, live) = walk(kind);
+            assert!(
+                live > before,
+                "{kind}: a live walk must strengthen ({before} -> {live})"
+            );
+
+            std::env::set_var(DISABLE_BOOSTS_VAR, "graph_potentiation");
+            let (before, ablated) = walk(kind);
+            std::env::remove_var(DISABLE_BOOSTS_VAR);
+            assert_eq!(
+                ablated, before,
+                "{kind}: ablated walk still strengthened the edge"
+            );
+        }
+        match prev_readonly {
+            Some(v) => std::env::set_var("VELD_RECALL_READONLY", v),
+            None => std::env::remove_var("VELD_RECALL_READONLY"),
+        }
+    }
+
+    /// `SHODH_EVAL_NOW` freezes the read-path decay clock, and it is read per call.
+    #[test]
+    fn eval_now_freezes_effective_strength() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let anchor = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let edge = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: Uuid::new_v4(),
+            to_entity: Uuid::new_v4(),
+            relation_type: RelationType::RelatedTo,
+            strength: 0.8,
+            created_at: anchor - chrono::Duration::hours(200),
+            valid_at: anchor - chrono::Duration::hours(200),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: anchor - chrono::Duration::hours(100),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L1Working,
+            created_by: EdgeSource::CoOccurrence,
+            entity_confidence: None,
+            forward_strength: 0.8,
+            backward_strength: 0.8,
+        };
+        let at_anchor = edge.effective_strength_at(anchor);
+        let later = edge.effective_strength_at(anchor + chrono::Duration::hours(500));
+        assert_ne!(
+            at_anchor, later,
+            "the fixture must decay measurably over 500h"
+        );
+
+        let prev = std::env::var("VELD_EVAL_NOW").ok();
+        std::env::set_var("VELD_EVAL_NOW", "2030-01-01T00:00:00Z");
+        assert_eq!(edge.effective_strength(), at_anchor);
+        let directional_at_anchor = edge.directional_strength(&edge.from_entity);
+        std::env::set_var("VELD_EVAL_NOW", "2030-01-21T20:00:00Z");
+        assert_eq!(
+            edge.effective_strength(),
+            later,
+            "a later pin was not re-read"
+        );
+        assert_ne!(
+            edge.directional_strength(&edge.from_entity),
+            directional_at_anchor,
+            "directional decay ignored the pinned clock"
+        );
+        match prev {
+            Some(v) => std::env::set_var("VELD_EVAL_NOW", v),
+            None => std::env::remove_var("VELD_EVAL_NOW"),
+        }
     }
 }

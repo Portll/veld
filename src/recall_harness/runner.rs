@@ -1510,7 +1510,131 @@ pub fn run_longmemeval(
     })
 }
 
-/// every component's contribution — "don't fly blind".
+/// One ablation arm: display name and the env overrides it applies.
+pub(crate) type AblationArm = (&'static str, Vec<(&'static str, &'static str)>);
+
+/// Query-time ablation arms. Add a row whenever a query-time fix lands; that is
+/// how a fix becomes a measured, comparable line in the study. An arm that
+/// cannot differ from baseline reports a number attributable to nothing, so
+/// before adding one confirm the flag is read on the live path, or register it
+/// in [`UNAVAILABLE_IN_VELD`]. The guard test
+/// `every_ablation_arm_flag_is_read_in_src_or_declared_unavailable` enforces this.
+pub(crate) fn ablation_arms() -> Vec<AblationArm> {
+    vec![
+        (
+            "facts-off (lexical+graph)",
+            vec![("SHODH_DISABLE_FACT_LAYERS", "1")],
+        ),
+        ("baseline (facts on)", vec![]),
+        ("graph-off", vec![("SHODH_GRAPH_FUSION_WEIGHT", "0")]),
+        ("+graph-expand(K5)", vec![("SHODH_GRAPH_EXPAND_K", "5")]),
+        (
+            "+graph-expand+margin",
+            vec![
+                ("SHODH_GRAPH_EXPAND_K", "5"),
+                ("SHODH_GRAPH_EXPAND_MIN_STRENGTH", "0.3"),
+            ],
+        ),
+        (
+            "+graph-boost-mult",
+            vec![("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1")],
+        ),
+        ("+edge-dir", vec![("SHODH_GRAPH_EDGE_DIR", "1")]),
+        ("+graph-traverse", vec![("SHODH_GRAPH_TRAVERSE", "1")]),
+        // Upstream prefixes "hebbian," here to restate its own default; veld ships
+        // hebbian on, so the prefix would confound these arms with -hebbian.
+        (
+            "-lateral-inhibition",
+            vec![("SHODH_DISABLE_BOOSTS", "lateral_inhibition")],
+        ),
+        (
+            "-graph-potentiation",
+            vec![("SHODH_DISABLE_BOOSTS", "graph_potentiation")],
+        ),
+        ("-hebbian", vec![("SHODH_DISABLE_BOOSTS", "hebbian")]),
+        (
+            "+graph-boost-mult+expand",
+            vec![
+                ("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1"),
+                ("SHODH_GRAPH_EXPAND_K", "5"),
+            ],
+        ),
+    ]
+}
+
+/// Upstream flags an arm may set that nothing in veld reads, with the reason.
+/// A flag here must not be read anywhere in `src/`; porting it means deleting
+/// its entry, and the guard test fails until that happens.
+pub(crate) const UNAVAILABLE_IN_VELD: &[(&str, &str)] = &[
+    (
+        "SHODH_GRAPH_EXPAND_K",
+        "veld has no graph-driven BM25 cue expansion (upstream appends top-K 1-hop neighbour names to the BM25 query)",
+    ),
+    (
+        "SHODH_GRAPH_EXPAND_MIN_STRENGTH",
+        "margin gate of the graph cue expansion, which veld does not have",
+    ),
+    (
+        "SHODH_GRAPH_BOOST_MULTIPLICATIVE",
+        "veld's graph leg has no multiplicative boost form; its additive recency/arousal/credibility boosts exist only in the SpreadingActivation-mode path",
+    ),
+    (
+        "SHODH_GRAPH_EDGE_DIR",
+        "veld's spreading paths always resolve the true neighbour (GraphEdge::neighbor_of); there is no legacy to_entity-only path to toggle",
+    ),
+    (
+        "SHODH_GRAPH_TRAVERSE",
+        "veld has no intent-matching beam traversal (upstream traverse_beam)",
+    ),
+];
+
+/// The row for an arm that was not run: no metrics, and the reason in their place.
+fn unavailable_row(name: &str, env: &[(&str, &str)], reason: String) -> AblationRow {
+    AblationRow {
+        name: name.to_string(),
+        flags: env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        recall_at_10: None,
+        ndcg_at_10: None,
+        mrr: None,
+        p_at_1: None,
+        by_category_recall: Default::default(),
+        retrieval_fingerprint: 0,
+        vacuous_vs_baseline: false,
+        unavailable_in_veld: Some(reason),
+    }
+}
+
+/// Why `env` cannot be measured in veld, or `None` when every flag it sets
+/// reaches a live code path.
+pub(crate) fn arm_unavailable_in_veld(env: &[(&str, &str)]) -> Option<String> {
+    let mut reasons = Vec::new();
+    for (k, v) in env {
+        if let Some((_, why)) = UNAVAILABLE_IN_VELD.iter().find(|(f, _)| f == k) {
+            reasons.push(format!("{k}: {why}"));
+        }
+        if *k == crate::memory::ablation::DISABLE_BOOSTS_VAR {
+            for tok in v.split(',').map(|t| t.trim().to_ascii_lowercase()) {
+                if tok.is_empty() || tok == "all" {
+                    continue;
+                }
+                if let Some(why) = crate::memory::ablation::unavailable_reason(&tok) {
+                    reasons.push(format!("{k} family `{tok}`: {why}"));
+                } else if !crate::memory::ablation::FAMILIES.contains(&tok.as_str()) {
+                    reasons.push(format!("{k} family `{tok}` is not declared"));
+                } else if tok == "graph_potentiation" && crate::memory::recall_readonly() {
+                    reasons.push(format!(
+                        "{k} family `{tok}`: SHODH_RECALL_READONLY=1 already suppresses every potentiation write, so this arm cannot differ from baseline"
+                    ));
+                }
+            }
+        }
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+/// Unified ablation matrix: one ingest, one row per [`ablation_arms`] entry, so the
+/// study shows every component's contribution — "don't fly blind". An arm naming a
+/// flag veld has no code path for is reported unavailable, not measured.
 ///
 /// Only QUERY-TIME flags are ablatable here (they are read per-recall against the
 /// same ingested corpus). Ingest-time flags (concept entities, IDF edges, hub cap)
@@ -1538,73 +1662,15 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
     let id_map = ingest_corpus(&manager, &corpus)?;
     let system = manager.get_user_memory(EVAL_USER)?;
 
-    // Query-time ablation configs: (display name, [(env_key, env_val)]). Add a
-    // row here whenever a new query-time fix lands — that is how a fix becomes a
-    // measured, comparable line in the study.
-    let configs: Vec<(&str, Vec<(&str, &str)>)> = vec![
-        (
-            "facts-off (lexical+graph)",
-            vec![("SHODH_DISABLE_FACT_LAYERS", "1")],
-        ),
-        ("baseline (facts on)", vec![]),
-        ("graph-off", vec![("SHODH_GRAPH_FUSION_WEIGHT", "0")]),
-        ("+graph-expand(K5)", vec![("SHODH_GRAPH_EXPAND_K", "5")]),
-        (
-            "+graph-expand+margin",
-            vec![
-                ("SHODH_GRAPH_EXPAND_K", "5"),
-                ("SHODH_GRAPH_EXPAND_MIN_STRENGTH", "0.3"),
-            ],
-        ),
-        // Graph-leg boost form. The semantic leg modulates score multiplicatively with
-        // the canonical scales; this leg adds the pre-migration GRAPH_* scales. Measures
-        // whether unifying the form helps the graph leg survive fusion. See
-        // constants.rs GRAPH_RECENCY_BOOST_SCALE.
-        (
-            "+graph-boost-mult",
-            vec![("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1")],
-        ),
-        // Traversal direction. Without this flag `edge_neighbor` returns
-        // `edge.to_entity` unconditionally, so standing on a node and meeting an
-        // edge that ENDS there resolves to the node itself: every incoming edge
-        // is a self-loop and the walk can only follow outgoing edges. Reachable
-        // from the live path (`edge_neighbor` is called inside PPR), so this arm
-        // can differ from baseline.
-        ("+edge-dir", vec![("SHODH_GRAPH_EDGE_DIR", "1")]),
-        // Composition-by-traversal: beam-search the strongest intent-matching
-        // paths from the seeds and inject the reached endpoints. Shipped OFF
-        // since it landed and never carried an arm, so it has never appeared in
-        // the study at all.
-        ("+graph-traverse", vec![("SHODH_GRAPH_TRAVERSE", "1")]),
-        // The two graph-leg components that had no gate before `memory::ablation`
-        // existed, and so had never been ablated in either direction.
-        (
-            "-lateral-inhibition",
-            vec![("SHODH_DISABLE_BOOSTS", "hebbian,lateral_inhibition")],
-        ),
-        (
-            "-graph-potentiation",
-            vec![("SHODH_DISABLE_BOOSTS", "hebbian,graph_potentiation")],
-        ),
-        (
-            "+graph-boost-mult+expand",
-            vec![
-                ("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1"),
-                ("SHODH_GRAPH_EXPAND_K", "5"),
-            ],
-        ),
-        // NOTE: the former `+spread-fix` / `+expand+spread-fix` arms are gone. They set
-        // SHODH_SPREAD_FIX, which only reached the legacy BFS spread — but SHODH_PPR
-        // defaults ON and its branch precedes that path, so the flag could not execute
-        // and those two rows silently duplicated `baseline` and `+graph-expand(K5)`.
-        // The flag itself has been deleted as falsified (see graph_retrieval.rs).
-        // An arm that cannot differ from baseline is worse than no arm: it reports a
-        // number attributable to nothing. Before adding a row here, confirm the config
-        // it sets can actually reach the code path it names.
-    ];
+    let configs = ablation_arms();
 
     let mut rows: Vec<AblationRow> = Vec::with_capacity(configs.len());
     for (name, env) in &configs {
+        if let Some(reason) = arm_unavailable_in_veld(env) {
+            eprintln!("  -- ARM `{name}` unavailable in veld: {reason}");
+            rows.push(unavailable_row(name, env, reason));
+            continue;
+        }
         // SAFETY: the harness is single-threaded (pin_harness_threads) and the
         // production server never invokes it, so process-wide env mutation here
         // races no other reader. Set before the query pass, clear after.
@@ -1659,16 +1725,17 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
         rows.push(AblationRow {
             name: name.to_string(),
             flags: env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
-            recall_at_10: all.iter().map(|m| m.recall_at_k).sum::<f64>() / n,
-            ndcg_at_10: all.iter().map(|m| m.ndcg_at_k).sum::<f64>() / n,
-            mrr: all.iter().map(|m| m.mrr).sum::<f64>() / n,
-            p_at_1: all.iter().map(|m| m.p_at_1).sum::<f64>() / n,
+            recall_at_10: Some(all.iter().map(|m| m.recall_at_k).sum::<f64>() / n),
+            ndcg_at_10: Some(all.iter().map(|m| m.ndcg_at_k).sum::<f64>() / n),
+            mrr: Some(all.iter().map(|m| m.mrr).sum::<f64>() / n),
+            p_at_1: Some(all.iter().map(|m| m.p_at_1).sum::<f64>() / n),
             by_category_recall,
             retrieval_fingerprint: {
                 use std::hash::Hasher;
                 fp.finish()
             },
             vacuous_vs_baseline: false,
+            unavailable_in_veld: None,
         });
     }
 
@@ -1686,7 +1753,10 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
         .map(|r| r.retrieval_fingerprint);
     if let Some(base) = baseline_fp {
         for row in rows.iter_mut() {
-            if row.name.starts_with("baseline") || row.flags.is_empty() {
+            if row.name.starts_with("baseline")
+                || row.flags.is_empty()
+                || row.unavailable_in_veld.is_some()
+            {
                 continue;
             }
             if row.retrieval_fingerprint == base {
@@ -4116,5 +4186,311 @@ mod tests {
             "failure must name the diverging case: {}",
             failures[0].detail
         );
+    }
+
+    /// Every `.rs` under `src/` except the harness, which sets the flags rather than reading them.
+    fn src_outside_harness() -> Vec<(PathBuf, String)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let harness = root.join("recall_harness");
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("src dir entry").path();
+                if path.starts_with(&harness) {
+                    continue;
+                }
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read source");
+                    out.push((path, text));
+                }
+            }
+        }
+        out
+    }
+
+    /// A quoted `"KEY"` in non-test, non-comment code that is not a `set_var`/`remove_var`.
+    /// Test code is cut at a file's first `#[cfg(test)]`; cutting too much only makes a
+    /// flag look unread, which fails loudly, never the reverse.
+    fn reads_env(sources: &[(PathBuf, String)], key: &str) -> bool {
+        let quoted = format!("\"{key}\"");
+        sources.iter().any(|(_, text)| {
+            text.lines()
+                .take_while(|l| l.trim() != "#[cfg(test)]")
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| !l.contains("set_var") && !l.contains("remove_var"))
+                .any(|l| l.contains(&quoted))
+        })
+    }
+
+    fn gates_family(sources: &[(PathBuf, String)], family: &str) -> bool {
+        let enabled = format!("is_enabled(\"{family}\")");
+        let disabled = format!("is_disabled(\"{family}\")");
+        sources
+            .iter()
+            .filter(|(p, _)| !p.ends_with("memory/ablation.rs"))
+            .any(|(_, text)| {
+                text.lines()
+                    .take_while(|l| l.trim() != "#[cfg(test)]")
+                    .any(|l| l.contains(&enabled) || l.contains(&disabled))
+            })
+    }
+
+    /// Keeps the harness from drifting back into measuring baseline under another
+    /// name: every flag an arm sets is read somewhere in `src/` outside the
+    /// harness, or is declared unavailable (and then must not be read), and every
+    /// family an arm disables has a live gate.
+    #[test]
+    fn every_ablation_arm_flag_is_read_in_src_or_declared_unavailable() {
+        use crate::memory::ablation::{unavailable_reason, DISABLE_BOOSTS_VAR, FAMILIES};
+
+        let sources = src_outside_harness();
+        // A walk that read nothing would pass every "is not read" check below.
+        assert!(sources.len() > 100, "scanned only {} files", sources.len());
+        assert!(
+            reads_env(&sources, "SHODH_RECALL_READONLY"),
+            "scanner misses a known reader"
+        );
+        assert!(
+            !reads_env(&sources, "SHODH_PLANTED_NEVER_READ"),
+            "scanner invents a reader"
+        );
+
+        let arms = ablation_arms();
+        for (name, env) in &arms {
+            for (k, v) in env {
+                let read = reads_env(&sources, k);
+                let declared = UNAVAILABLE_IN_VELD.iter().any(|(f, _)| f == k);
+                assert!(
+                    read || declared,
+                    "arm `{name}` sets {k}, which nothing in src/ reads: it would measure baseline under another name"
+                );
+                assert!(
+                    !(read && declared),
+                    "{k} is now read in src/; delete its UNAVAILABLE_IN_VELD entry"
+                );
+                if *k == DISABLE_BOOSTS_VAR {
+                    for tok in v.split(',').map(str::trim) {
+                        if FAMILIES.contains(&tok) {
+                            assert!(gates_family(&sources, tok), "family `{tok}` has no gate");
+                        } else {
+                            assert!(
+                                unavailable_reason(tok).is_some(),
+                                "arm `{name}` disables `{tok}`, neither wired nor declared upstream-only"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for (flag, _) in UNAVAILABLE_IN_VELD {
+            assert!(
+                arms.iter()
+                    .any(|(_, env)| env.iter().any(|(k, _)| k == flag)),
+                "{flag} is declared unavailable but no arm sets it"
+            );
+        }
+        for family in FAMILIES {
+            assert!(
+                gates_family(&sources, family),
+                "family `{family}` has no gate"
+            );
+        }
+        for pin in [
+            "SHODH_EVAL_NOW",
+            "SHODH_RECALL_READONLY",
+            "SHODH_ONNX_THREADS",
+        ] {
+            assert!(
+                reads_env(&sources, pin),
+                "harness pin {pin} is read by nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_arms_are_reported_not_run_as_baseline() {
+        let _guard = crate::memory::ablation::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("VELD_RECALL_READONLY").ok();
+        std::env::set_var("VELD_RECALL_READONLY", "0");
+
+        for env in [
+            vec![("SHODH_DISABLE_FACT_LAYERS", "1")],
+            vec![("SHODH_GRAPH_FUSION_WEIGHT", "0")],
+            vec![("SHODH_DISABLE_BOOSTS", "hebbian")],
+            vec![("SHODH_DISABLE_BOOSTS", "graph_potentiation")],
+        ] {
+            assert_eq!(arm_unavailable_in_veld(&env), None, "{env:?} is wired");
+        }
+        for (env, needle) in [
+            (vec![("SHODH_GRAPH_TRAVERSE", "1")], "SHODH_GRAPH_TRAVERSE"),
+            (vec![("SHODH_GRAPH_EDGE_DIR", "1")], "neighbor_of"),
+            (
+                vec![
+                    ("SHODH_GRAPH_FUSION_WEIGHT", "0"),
+                    ("SHODH_GRAPH_EXPAND_K", "5"),
+                ],
+                "SHODH_GRAPH_EXPAND_K",
+            ),
+            (
+                vec![("SHODH_DISABLE_BOOSTS", "hebbian,lateral_inhibition")],
+                "lateral",
+            ),
+            (
+                vec![("SHODH_DISABLE_BOOSTS", "no_such_family")],
+                "not declared",
+            ),
+        ] {
+            let why = arm_unavailable_in_veld(&env).unwrap_or_default();
+            assert!(
+                why.contains(needle),
+                "{env:?}: expected `{needle}` in {why:?}"
+            );
+        }
+        std::env::set_var("VELD_RECALL_READONLY", "1");
+        let why = arm_unavailable_in_veld(&[("SHODH_DISABLE_BOOSTS", "graph_potentiation")]);
+        assert!(why.is_some_and(|w| w.contains("RECALL_READONLY")));
+        match prev {
+            Some(v) => std::env::set_var("VELD_RECALL_READONLY", v),
+            None => std::env::remove_var("VELD_RECALL_READONLY"),
+        }
+
+        let row = unavailable_row("+x", &[("SHODH_GRAPH_TRAVERSE", "1")], "why".into());
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(
+            json["recall@10"].is_null(),
+            "an unavailable arm must carry no metric"
+        );
+        assert_eq!(json["unavailable_in_veld"], "why");
+    }
+
+    /// Each wired query-time flag must change what recall returns on a fixture where
+    /// its layer has work to do. Byte-identical output means the flag did not reach
+    /// its code path.
+    #[test]
+    fn wired_query_time_ablations_change_what_recall_returns() {
+        use chrono::TimeZone;
+        let _guard = crate::memory::ablation::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for k in [
+            "SHODH_DISABLE_BOOSTS",
+            "SHODH_DISABLE_FACT_LAYERS",
+            "SHODH_GRAPH_FUSION_WEIGHT",
+        ] {
+            std::env::remove_var(k);
+        }
+        let dir = unique_storage_dir("ablation-wired");
+        let manager = build_manager(&dir).expect("manager");
+        let base = chrono::Utc.with_ymd_and_hms(2024, 3, 1, 12, 0, 0).unwrap();
+        let mk = |id: &str, content: &str, i: i64| CorpusItem {
+            id: id.to_string(),
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            tags: vec![],
+            created_at: base + chrono::Duration::minutes(i),
+        };
+        let gold_text = "Melanie ran a marathon yesterday.";
+        let corpus = vec![
+            mk("gold", gold_text, 0),
+            mk(
+                "m1",
+                "Melanie trains with Caroline at the Denver running club.",
+                1,
+            ),
+            mk(
+                "m2",
+                "Caroline and Melanie bought new running shoes in Denver.",
+                2,
+            ),
+            mk(
+                "m3",
+                "Melanie told Caroline about the Boston marathon route.",
+                3,
+            ),
+            mk(
+                "m4",
+                "Caroline painted a sunrise over the lake in Denver.",
+                4,
+            ),
+            mk(
+                "m5",
+                "The Denver running club meets every Saturday morning.",
+                5,
+            ),
+        ];
+        let id_map = ingest_corpus(&manager, &corpus).expect("ingest");
+        let gold = *id_map.get("gold").expect("gold ingested");
+        let system = manager.get_user_memory(EVAL_USER).expect("system");
+        // Harness ingest skips temporal facts (the HTTP handler stores them).
+        let stored = system
+            .read()
+            .store_temporal_facts_for_memory(
+                EVAL_USER,
+                &MemoryId(gold),
+                gold_text,
+                &["Melanie".to_string()],
+                base,
+            )
+            .expect("store facts");
+        assert!(stored > 0, "fixture produced no temporal fact to ablate");
+
+        let recall = |env: &[(&str, &str)]| -> Vec<(Uuid, f32)> {
+            for (k, v) in env {
+                std::env::set_var(k, v);
+            }
+            let out = system
+                .read()
+                .recall(&Query {
+                    query_text: Some("When did Melanie run a marathon?".to_string()),
+                    user_id: Some(EVAL_USER.to_string()),
+                    max_results: 10,
+                    layers: Some(LayerMode::Full),
+                    ..Default::default()
+                })
+                .expect("recall");
+            for (k, _) in env {
+                std::env::remove_var(k);
+            }
+            out.iter()
+                .map(|m| (m.id.0, m.score.unwrap_or(0.0)))
+                .collect()
+        };
+
+        // veld recall is not bit-repeatable even under the harness pins (read-only recall,
+        // frozen scoring clock): two identical passes drift in the fourth decimal. So the
+        // bar for "this ablation did something" is measured against that drift rather than
+        // assumed to be zero.
+        let (first, second) = (recall(&[]), recall(&[]));
+        assert!(!second.is_empty(), "baseline recall returned nothing");
+        let ids = |v: &Vec<(Uuid, f32)>| v.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        assert_eq!(ids(&first), ids(&second), "baseline result set is unstable");
+        let spread = |a: &Vec<(Uuid, f32)>, b: &Vec<(Uuid, f32)>| {
+            a.iter()
+                .zip(b.iter())
+                .map(|((_, x), (_, y))| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let noise = spread(&first, &second);
+        let tolerance = (noise * 10.0).max(1e-3);
+        eprintln!("baseline repeat noise = {noise:e}, tolerance = {tolerance:e}");
+
+        for (k, v) in [
+            ("SHODH_DISABLE_FACT_LAYERS", "1"),
+            ("SHODH_DISABLE_BOOSTS", "hebbian"),
+            ("SHODH_GRAPH_FUSION_WEIGHT", "0"),
+        ] {
+            let arm = recall(&[(k, v)]);
+            let moved = ids(&arm) != ids(&second) || spread(&arm, &second) > tolerance;
+            assert!(
+                moved,
+                "{k}={v} moved no score past the {tolerance:e} repeat noise: the flag does not reach its code path\n  baseline {second:?}\n  arm      {arm:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

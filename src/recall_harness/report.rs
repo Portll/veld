@@ -220,12 +220,13 @@ pub struct AblationRow {
     pub name: String,
     /// The env overrides applied for this row (key=value), for reproducibility.
     pub flags: Vec<String>,
+    /// `None` when the arm is [`unavailable_in_veld`](Self::unavailable_in_veld).
     #[serde(rename = "recall@10")]
-    pub recall_at_10: f64,
+    pub recall_at_10: Option<f64>,
     #[serde(rename = "ndcg@10")]
-    pub ndcg_at_10: f64,
-    pub mrr: f64,
-    pub p_at_1: f64,
+    pub ndcg_at_10: Option<f64>,
+    pub mrr: Option<f64>,
+    pub p_at_1: Option<f64>,
     /// Per-category recall@10 (category name → value), so a config that helps one
     /// capability but hurts another is visible, not hidden in the average.
     pub by_category_recall: std::collections::BTreeMap<String, f64>,
@@ -240,6 +241,11 @@ pub struct AblationRow {
     /// duplicated baseline while reading as evidence.
     #[serde(default)]
     pub vacuous_vs_baseline: bool,
+    /// Set when a flag this arm names has no code path in veld: the arm was not
+    /// run, and the reason says which flag and why. Distinct from a vacuous arm,
+    /// which ran and matched baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_in_veld: Option<String>,
 }
 
 /// Unified ablation report: one ingest, N query-time configs, one comparison

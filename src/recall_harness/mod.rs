@@ -11,12 +11,13 @@
 //! rather than reporting zero: `EDGE_DIR_FLIPS` and `DIRECTED_REVERSE_COLLAPSE`
 //! print `n/a`, because veld has no directed-edge traversal fix to instrument.
 //!
-//! The ablation arms in `runner::analyze_ablation` do not yet say so. They set
-//! upstream `SHODH_*` pipeline flags that nothing in veld reads (the graph
-//! expand/traverse/edge-dir/boost/fusion flags, `SHODH_DISABLE_BOOSTS`,
-//! `SHODH_DISABLE_FACT_LAYERS`), so every such arm measures the baseline under
-//! another name. Likewise `SHODH_EVAL_NOW` pins no clock here. Read an arm that
-//! matches baseline as "not wired in veld", never as "no effect".
+//! The ablation arms in `runner::analyze_ablation` do the same. Flags veld reads
+//! (`SHODH_DISABLE_BOOSTS` for the families in `memory::ablation::FAMILIES`,
+//! `SHODH_DISABLE_FACT_LAYERS`, `SHODH_GRAPH_FUSION_WEIGHT`) reach their code
+//! paths; `SHODH_EVAL_NOW` freezes `memory::scoring_now`. An arm naming a flag
+//! listed in `runner::UNAVAILABLE_IN_VELD`, or an upstream-only family, is not
+//! run and reports `unavailable_in_veld` with the reason. A guard test fails if
+//! an arm sets a flag that is neither read in `src/` nor declared unavailable.
 
 pub mod bridge_harness;
 pub mod decay_sim;
