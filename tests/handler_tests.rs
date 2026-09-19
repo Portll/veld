@@ -38,6 +38,9 @@ fn init_env() {
         // SAFETY: called once before any parallel tests start.
         unsafe {
             std::env::set_var("VELD_API_KEYS", TEST_KEY);
+            // The detached cross-encoder pre-warm races this binary's exit (its own
+            // cfg!(test) guard does not apply to an integration test's dependency).
+            std::env::set_var("VELD_LAZY_CROSS_ENCODER", "1");
         }
     });
 }
@@ -59,6 +62,24 @@ impl Harness {
         };
         let mgr = MultiUserMemoryManager::new(dir.path().to_path_buf(), cfg)
             .expect("create MultiUserMemoryManager");
+        Self {
+            mgr: Arc::new(mgr),
+            _dir: dir,
+        }
+    }
+
+    #[cfg(feature = "storage-redb")]
+    fn new_redb() -> Self {
+        init_env();
+        let dir = TempDir::new().expect("create temp dir");
+        let cfg = ServerConfig {
+            storage_path: dir.path().to_path_buf(),
+            backup_enabled: false,
+            effective_storage_backend: veld::config::StorageBackend::Redb,
+            ..ServerConfig::default()
+        };
+        let mgr = MultiUserMemoryManager::new(dir.path().to_path_buf(), cfg)
+            .expect("create redb MultiUserMemoryManager");
         Self {
             mgr: Arc::new(mgr),
             _dir: dir,
@@ -1102,6 +1123,159 @@ async fn list_backups_empty() {
     )
     .await;
     assert!(status.is_success());
+}
+
+#[cfg(feature = "storage-redb")]
+fn graph_entity(name: &str) -> veld::graph_memory::EntityNode {
+    veld::graph_memory::EntityNode {
+        uuid: veld::uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        labels: vec![veld::graph_memory::EntityLabel::Concept],
+        created_at: chrono::Utc::now(),
+        last_seen_at: chrono::Utc::now(),
+        mention_count: 1,
+        summary: String::new(),
+        attributes: std::collections::HashMap::new(),
+        name_embedding: None,
+        salience: 0.5,
+        is_proper_noun: false,
+        pii_classification: veld::graph_memory::PiiClassification::Clean,
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+#[tokio::test]
+async fn redb_backup_routes_create_list_verify_purge_and_restore() {
+    let h = Harness::new_redb();
+    let user = "test-user";
+    let kept = h
+        .mgr
+        .get_user_graph(user)
+        .unwrap()
+        .read()
+        .add_entity(graph_entity("in the backup"))
+        .unwrap();
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/backup/create", json!({"user_id": user})),
+    )
+    .await;
+    assert!(status.is_success());
+    assert_eq!(body["success"], true, "{body}");
+    assert_eq!(body["backup"]["backup_id"], 1, "{body}");
+
+    let later = h
+        .mgr
+        .get_user_graph(user)
+        .unwrap()
+        .read()
+        .add_entity(graph_entity("after the backup"))
+        .unwrap();
+    let (_, body) = json_of(
+        h.app(),
+        authed_post("/api/backup/create", json!({"user_id": user})),
+    )
+    .await;
+    assert_eq!(body["success"], true, "{body}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/backup/list", json!({"user_id": user})),
+    )
+    .await;
+    assert!(status.is_success());
+    assert_eq!(body["count"], 2, "{body}");
+    assert_eq!(body["backups"][0]["backup_id"], 2, "newest first: {body}");
+
+    let (_, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/backup/verify",
+            json!({"user_id": user, "backup_id": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        (&body["success"], &body["is_valid"]),
+        (&json!(true), &json!(true)),
+        "{body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/backup/restore",
+            json!({"user_id": user, "backup_id": 1}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(body["success"], true, "{body}");
+    let restored = body["restored_stores"].to_string();
+    assert!(restored.contains("NOT RESTORED: shared"), "{body}");
+
+    let graph = h.mgr.get_user_graph(user).unwrap();
+    let graph = graph.read();
+    assert!(
+        graph.get_entity(&kept).unwrap().is_some(),
+        "restored graph lost the backed-up entity"
+    );
+    assert!(
+        graph.get_entity(&later).unwrap().is_none(),
+        "restore did not roll the graph back"
+    );
+    drop(graph);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/backup/purge",
+            json!({"user_id": user, "keep_count": 1}),
+        ),
+    )
+    .await;
+    assert!(status.is_success());
+    assert_eq!(body["purged_count"], 1, "{body}");
+    let (_, body) = json_of(
+        h.app(),
+        authed_post("/api/backup/list", json!({"user_id": user})),
+    )
+    .await;
+    assert_eq!(body["count"], 1, "{body}");
+}
+
+#[cfg(feature = "storage-redb")]
+#[tokio::test]
+async fn redb_verify_route_reports_a_tampered_backup_as_invalid() {
+    let h = Harness::new_redb();
+    let (_, body) = json_of(
+        h.app(),
+        authed_post("/api/backup/create", json!({"user_id": "test-user"})),
+    )
+    .await;
+    assert_eq!(body["success"], true, "{body}");
+    let dump = h
+        ._dir
+        .path()
+        .join("backups/.redb/test-user/1/export/users/test-user.veldport");
+    let len = std::fs::metadata(&dump).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&dump)
+        .unwrap()
+        .set_len(len - 1)
+        .unwrap();
+    let (_, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/backup/verify",
+            json!({"user_id": "test-user", "backup_id": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(body["is_valid"], false, "{body}");
+    assert_eq!(body["success"], false, "{body}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

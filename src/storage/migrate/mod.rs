@@ -24,6 +24,8 @@
 //! order, so an extraction of the target after an import reproduces the dump's frames
 //! exactly — which is how an import proves itself against the trailer.
 
+#[cfg(feature = "storage-redb")]
+pub mod backup;
 mod readonly;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -382,6 +384,34 @@ fn extract_with<W: Write>(
     out: W,
     quarantine: Option<&mut QuarantineWriter>,
 ) -> Result<Extraction> {
+    run_sink(unit, out, quarantine, |sink| match (backend, unit) {
+        (StorageBackend::RocksDb, Unit::User(id)) => {
+            let dir = user_dir(base, id)?;
+            rocks_primary(sink, &dir.join("storage"))?;
+            rocks_families(sink, &dir.join("graph/graph"), |cf| format!("graph/{cf}"))
+        }
+        (StorageBackend::RocksDb, Unit::Shared) => {
+            rocks_families(sink, &base.join("shared"), |cf| {
+                if cf == "audit" {
+                    "audit/audit".to_string()
+                } else {
+                    format!("shared/{cf}")
+                }
+            })
+        }
+        #[cfg(feature = "storage-redb")]
+        (StorageBackend::Redb, _) => redb_unit(sink, base, unit, &LiveRedb::default()),
+        #[cfg(not(feature = "storage-redb"))]
+        (StorageBackend::Redb, _) => bail!("this build has no redb backend (feature storage-redb)"),
+    })
+}
+
+fn run_sink<W: Write>(
+    unit: &Unit,
+    out: W,
+    quarantine: Option<&mut QuarantineWriter>,
+    body: impl FnOnce(&mut Sink<'_, W>) -> Result<()>,
+) -> Result<Extraction> {
     let mut sink = Sink {
         writer: PortableWriter::new(out)?,
         stats: Extraction::default(),
@@ -390,48 +420,72 @@ fn extract_with<W: Write>(
     for (key, value) in meta_frames(unit) {
         sink.frame(META, key.as_bytes(), &value)?;
     }
-    match (backend, unit) {
-        (StorageBackend::RocksDb, Unit::User(id)) => {
-            let dir = user_dir(base, id)?;
-            rocks_primary(&mut sink, &dir.join("storage"))?;
-            rocks_families(&mut sink, &dir.join("graph/graph"), |cf| {
-                format!("graph/{cf}")
-            })?;
-        }
-        (StorageBackend::RocksDb, Unit::Shared) => {
-            rocks_families(&mut sink, &base.join("shared"), |cf| {
-                if cf == "audit" {
-                    "audit/audit".to_string()
-                } else {
-                    format!("shared/{cf}")
-                }
-            })?;
-        }
-        #[cfg(feature = "storage-redb")]
-        (StorageBackend::Redb, Unit::User(id)) => {
-            let dir = user_dir(base, id)?;
-            redb_primary(&mut sink, &dir.join("storage.redb"))?;
-            redb_tables_raw(&mut sink, &dir.join("graph/graph.redb"), |t| {
-                Some(format!("graph/{t}"))
-            })?;
-        }
-        #[cfg(feature = "storage-redb")]
-        (StorageBackend::Redb, Unit::Shared) => {
-            redb_tables_raw(&mut sink, &base.join("audit.redb"), |t| {
-                (t == "audit").then(|| "audit/audit".to_string())
-            })?;
-            redb_tables_raw(&mut sink, &base.join("shared.redb"), |t| {
-                (t != "audit").then(|| format!("shared/{t}"))
-            })?;
-        }
-        #[cfg(not(feature = "storage-redb"))]
-        (StorageBackend::Redb, _) => bail!("this build has no redb backend (feature storage-redb)"),
-    }
+    body(&mut sink)?;
     let mut stats = std::mem::take(&mut sink.stats);
     let (frames, digest) = sink.writer.finish()?;
     stats.frames = frames;
     stats.digest = portable::hex(&digest);
     Ok(stats)
+}
+
+/// Handles this process holds open (redb admits one opener per file); `None` reads the file read-only from disk.
+#[cfg(feature = "storage-redb")]
+#[derive(Clone, Copy, Default)]
+pub struct LiveRedb<'a> {
+    pub primary: Option<&'a redb::Database>,
+    pub graph: Option<&'a redb::Database>,
+    pub audit: Option<&'a redb::Database>,
+    pub shared: Option<&'a redb::Database>,
+}
+
+#[cfg(feature = "storage-redb")]
+fn redb_unit<W: Write>(
+    sink: &mut Sink<W>,
+    base: &Path,
+    unit: &Unit,
+    live: &LiveRedb,
+) -> Result<()> {
+    match unit {
+        Unit::User(id) => {
+            let dir = user_dir(base, id)?;
+            let primary = dir.join("storage.redb");
+            match live.primary {
+                Some(db) => redb_primary_db(sink, db, &primary)?,
+                None => redb_primary(sink, &primary)?,
+            }
+            let graph = |t: &str| Some(format!("graph/{t}"));
+            let graph_path = dir.join("graph/graph.redb");
+            match live.graph {
+                Some(db) => redb_tables_raw_db(sink, db, &graph_path, graph),
+                None => redb_tables_raw(sink, &graph_path, graph),
+            }
+        }
+        Unit::Shared => {
+            let audit = |t: &str| (t == "audit").then(|| "audit/audit".to_string());
+            let audit_path = base.join("audit.redb");
+            match live.audit {
+                Some(db) => redb_tables_raw_db(sink, db, &audit_path, audit)?,
+                None => redb_tables_raw(sink, &audit_path, audit)?,
+            }
+            let shared = |t: &str| (t != "audit").then(|| format!("shared/{t}"));
+            let shared_path = base.join("shared.redb");
+            match live.shared {
+                Some(db) => redb_tables_raw_db(sink, db, &shared_path, shared),
+                None => redb_tables_raw(sink, &shared_path, shared),
+            }
+        }
+    }
+}
+
+/// Same frames, order and digest as an offline `extract` of the same rows.
+#[cfg(feature = "storage-redb")]
+pub fn extract_live<W: Write>(
+    base: &Path,
+    unit: &Unit,
+    live: &LiveRedb,
+    out: W,
+) -> Result<Extraction> {
+    run_sink(unit, out, None, |sink| redb_unit(sink, base, unit, live))
 }
 
 fn refuse_if_encrypted(storage_dir: &Path) -> Result<()> {
@@ -579,11 +633,16 @@ fn redb_table_names(read: &redb::ReadTransaction, path: &Path) -> Result<Vec<Str
 
 #[cfg(feature = "storage-redb")]
 fn redb_primary<W: Write>(sink: &mut Sink<W>, path: &Path) -> Result<()> {
-    use redb::ReadableTable;
     let Some(store) = readonly::open_redb(path)? else {
         return Ok(());
     };
-    let read = store.db.begin_read()?;
+    redb_primary_db(sink, &store.db, path)
+}
+
+#[cfg(feature = "storage-redb")]
+fn redb_primary_db<W: Write>(sink: &mut Sink<W>, db: &redb::Database, path: &Path) -> Result<()> {
+    use redb::ReadableTable;
+    let read = db.begin_read()?;
     let names = redb_table_names(&read, path)?;
     if let Some(t) = names
         .iter()
@@ -637,11 +696,21 @@ fn redb_tables_raw<W: Write>(
     path: &Path,
     logical: impl Fn(&str) -> Option<String>,
 ) -> Result<()> {
-    use redb::{ReadableTable, ReadableTableMetadata};
     let Some(store) = readonly::open_redb(path)? else {
         return Ok(());
     };
-    let read = store.db.begin_read()?;
+    redb_tables_raw_db(sink, &store.db, path, logical)
+}
+
+#[cfg(feature = "storage-redb")]
+fn redb_tables_raw_db<W: Write>(
+    sink: &mut Sink<W>,
+    db: &redb::Database,
+    path: &Path,
+    logical: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
+    use redb::{ReadableTable, ReadableTableMetadata};
+    let read = db.begin_read()?;
     let mut tables = Vec::new();
     for name in redb_table_names(&read, path)? {
         match logical(&name) {
@@ -673,7 +742,7 @@ fn redb_label(key: &[u8]) -> String {
 
 // ─── export ─────────────────────────────────────────────────────────────────────
 
-fn dump_file_name(unit: &Unit) -> String {
+pub(crate) fn dump_file_name(unit: &Unit) -> String {
     match unit {
         Unit::User(id) => format!("users/{id}.veldport"),
         Unit::Shared => "shared.veldport".to_string(),
@@ -730,6 +799,20 @@ fn export_unit(
     path: &Path,
     quarantine_dir: Option<&Path>,
 ) -> Result<(Extraction, Option<QuarantineReport>)> {
+    write_dump(unit, path, quarantine_dir, |out, quarantine| {
+        extract_with(base, backend, unit, out, quarantine)
+    })
+}
+
+fn write_dump(
+    unit: &Unit,
+    path: &Path,
+    quarantine_dir: Option<&Path>,
+    extract_into: impl FnOnce(
+        &mut std::io::BufWriter<std::fs::File>,
+        Option<&mut QuarantineWriter>,
+    ) -> Result<Extraction>,
+) -> Result<(Extraction, Option<QuarantineReport>)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -759,7 +842,7 @@ fn export_unit(
             }
             None => None,
         };
-        let stats = extract_with(base, backend, unit, &mut out, quarantine.as_mut())?;
+        let stats = extract_into(&mut out, quarantine.as_mut())?;
         out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         if stats.decode_failures > 0 {
             bail!(
@@ -871,23 +954,7 @@ pub fn export(
         }
     }
     let manifest_result = if failures.is_empty() {
-        let manifest = Manifest {
-            format: FORMAT.to_string(),
-            source_backend: backend.to_string(),
-            dumps: reports
-                .iter()
-                .map(|r| ManifestEntry {
-                    file: dump_file_name(&r.unit),
-                    unit: r.unit.clone(),
-                    frames: r.frames,
-                    digest: r.digest.clone(),
-                })
-                .collect(),
-        };
-        write_atomic(
-            &out_dir.join(MANIFEST),
-            &serde_json::to_vec_pretty(&manifest)?,
-        )
+        write_export_manifest(out_dir, backend, &reports)
     } else {
         Ok(())
     };
@@ -910,6 +977,70 @@ pub fn export(
             "export failed; no dump was left behind:\n  {}",
             failures.join("\n  ")
         );
+    }
+    Ok(reports)
+}
+
+fn write_export_manifest(
+    out_dir: &Path,
+    backend: StorageBackend,
+    reports: &[DumpReport],
+) -> Result<()> {
+    let manifest = Manifest {
+        format: FORMAT.to_string(),
+        source_backend: backend.to_string(),
+        dumps: reports
+            .iter()
+            .map(|r| ManifestEntry {
+                file: dump_file_name(&r.unit),
+                unit: r.unit.clone(),
+                frames: r.frames,
+                digest: r.digest.clone(),
+            })
+            .collect(),
+    };
+    write_atomic(
+        &out_dir.join(MANIFEST),
+        &serde_json::to_vec_pretty(&manifest)?,
+    )
+}
+
+/// No quarantine here: an undecodable record refuses the export rather than shortening a backup.
+#[cfg(feature = "storage-redb")]
+pub fn export_live(
+    base: &Path,
+    units: &[Unit],
+    live: &LiveRedb,
+    out_dir: &Path,
+) -> Result<Vec<DumpReport>> {
+    prepare_private_dir(out_dir, "export directory")?;
+    let mut reports = Vec::new();
+    let result = (|| -> Result<()> {
+        for unit in units {
+            let path = out_dir.join(dump_file_name(unit));
+            let (stats, _) = write_dump(unit, &path, None, |out, _| {
+                extract_live(base, unit, live, out)
+            })?;
+            reports.push(DumpReport {
+                unit: unit.clone(),
+                path,
+                frames: stats.frames,
+                records: stats.records,
+                digest: stats.digest.clone(),
+                derived_rows_not_carried: stats.derived_rows_not_carried,
+                quarantined: 0,
+                source_records: stats.source_records(),
+                quarantine: None,
+            });
+        }
+        write_export_manifest(out_dir, StorageBackend::Redb, &reports)
+    })();
+    if let Err(e) = result {
+        for r in &reports {
+            let _ = std::fs::remove_file(&r.path);
+        }
+        let _ = std::fs::remove_dir(out_dir.join("users"));
+        return Err(e);
     }
     Ok(reports)
 }

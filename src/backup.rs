@@ -587,56 +587,66 @@ impl VeldBackupEngine {
         spec: &IntentLogBackupSpec,
         target_dir: &Path,
     ) -> Result<Vec<IntentLogFileMeta>> {
-        if !spec.source_dir.exists() {
-            // Nothing to back up. This is legal — W5 may not be active
-            // yet on a given installation. Record an empty list.
-            return Ok(Vec::new());
-        }
+        copy_intent_log_files(spec, target_dir)
+    }
+}
 
-        let mut metas = Vec::new();
-        let mut entries: Vec<_> = fs::read_dir(&spec.source_dir)
-            .with_context(|| format!("failed to read intent log directory {:?}", spec.source_dir))?
-            .filter_map(|e| e.ok())
-            .collect();
-        entries.sort_by_key(|e| e.file_name());
-
-        for entry in entries {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(only) = &spec.only_files {
-                if !only.iter().any(|n| n == &file_name) {
-                    continue;
-                }
-            }
-            let dst = target_dir.join(&file_name);
-
-            // Stream-copy + hash + size so a huge log doesn't load fully
-            // into memory.
-            let (sha256, size_bytes) = copy_and_hash(&path, &dst)?;
-
-            // For the main journal file, scan for the LSN range so PITR
-            // can decide whether the operator-requested LSN is in range.
-            let lsn_range = if file_name == spec.log_filename {
-                scan_lsn_range(&dst)
-                    .with_context(|| format!("failed to scan LSN range for intent log {:?}", dst))?
-            } else {
-                None
-            };
-
-            metas.push(IntentLogFileMeta {
-                name: file_name,
-                sha256,
-                size_bytes,
-                lsn_range,
-            });
-        }
-
-        Ok(metas)
+/// The intent-log capture both backends' backups share: copy, hash and LSN-scan.
+pub(crate) fn copy_intent_log_files(
+    spec: &IntentLogBackupSpec,
+    target_dir: &Path,
+) -> Result<Vec<IntentLogFileMeta>> {
+    if !spec.source_dir.exists() {
+        // Nothing to back up. This is legal — W5 may not be active
+        // yet on a given installation. Record an empty list.
+        return Ok(Vec::new());
     }
 
+    let mut metas = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(&spec.source_dir)
+        .with_context(|| format!("failed to read intent log directory {:?}", spec.source_dir))?
+        .filter_map(|e| e.ok())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(only) = &spec.only_files {
+            if !only.iter().any(|n| n == &file_name) {
+                continue;
+            }
+        }
+        let dst = target_dir.join(&file_name);
+
+        // Stream-copy + hash + size so a huge log doesn't load fully
+        // into memory.
+        let (sha256, size_bytes) = copy_and_hash(&path, &dst)?;
+
+        // For the main journal file, scan for the LSN range so PITR
+        // can decide whether the operator-requested LSN is in range.
+        let lsn_range = if file_name == spec.log_filename {
+            scan_lsn_range(&dst)
+                .with_context(|| format!("failed to scan LSN range for intent log {:?}", dst))?
+        } else {
+            None
+        };
+
+        metas.push(IntentLogFileMeta {
+            name: file_name,
+            sha256,
+            size_bytes,
+            lsn_range,
+        });
+    }
+
+    Ok(metas)
+}
+
+impl VeldBackupEngine {
     /// Restore from a specific backup
     ///
     /// # Arguments
@@ -1301,7 +1311,7 @@ fn enumerate_present_cfs(db: &DB) -> Vec<String> {
 /// Stream-copy `src` to `dst` while computing its SHA-256 and byte count.
 /// Used for intent-log archive captures (potentially many MiB) so we
 /// don't load the whole file into memory.
-fn copy_and_hash(src: &Path, dst: &Path) -> Result<(String, u64)> {
+pub(crate) fn copy_and_hash(src: &Path, dst: &Path) -> Result<(String, u64)> {
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Write};
 
@@ -1338,7 +1348,7 @@ fn copy_and_hash(src: &Path, dst: &Path) -> Result<(String, u64)> {
 /// error if any frame is corrupt — the journal isn't supposed to be
 /// captured mid-corruption, and silently widening the LSN window would
 /// mislead PITR callers.
-fn scan_lsn_range(path: &Path) -> Result<Option<(u64, u64)>> {
+pub(crate) fn scan_lsn_range(path: &Path) -> Result<Option<(u64, u64)>> {
     use std::fs::File;
     let file = File::open(path).with_context(|| format!("open intent log {path:?}"))?;
     if file.metadata()?.len() == 0 {
