@@ -283,6 +283,10 @@ pub struct MemorySystem {
     /// default build exactly as the get_db() call sites did.
     rocksdb_backup_db: Option<Arc<rocksdb::DB>>,
 
+    /// The live redb primary database; the redb backup must read through it, as redb admits one opener.
+    #[cfg(feature = "storage-redb")]
+    redb_backup_db: Option<Arc<::redb::Database>>,
+
     /// Compression pipeline
     compressor: CompressionPipeline,
 
@@ -1184,6 +1188,8 @@ impl MemorySystem {
             ))),
             long_term_memory: primary_store.clone(),
             rocksdb_backup_db,
+            #[cfg(feature = "storage-redb")]
+            redb_backup_db: None,
             compressor: CompressionPipeline::new(),
             retriever,
             embedder,
@@ -4509,6 +4515,16 @@ impl MemorySystem {
     /// becoming a trait object.
     pub fn rocksdb_for_comprehensive_backup(&self) -> Option<std::sync::Arc<rocksdb::DB>> {
         self.rocksdb_backup_db.clone()
+    }
+
+    #[cfg(feature = "storage-redb")]
+    pub fn attach_redb_backup_db(&mut self, database: Arc<::redb::Database>) {
+        self.redb_backup_db = Some(database);
+    }
+
+    #[cfg(feature = "storage-redb")]
+    pub fn redb_for_backup(&self) -> Option<Arc<::redb::Database>> {
+        self.redb_backup_db.clone()
     }
 
     /// Advanced search using storage criteria

@@ -1736,6 +1736,10 @@ pub struct GraphMemory {
     /// backend has no engine DB to hold.
     db: Option<Arc<DB>>,
 
+    /// The live redb graph database, for the redb backup (redb admits one opener).
+    #[cfg(feature = "storage-redb")]
+    redb_db: Option<Arc<::redb::Database>>,
+
     /// In-memory entity name index for fast lookups (loaded from name_index CF)
     entity_name_index: Arc<parking_lot::RwLock<HashMap<String, Uuid>>>,
 
@@ -1805,6 +1809,16 @@ impl GraphMemory {
     /// should reach through it.
     pub fn rocksdb_for_backup(&self) -> Option<&DB> {
         self.db.as_deref()
+    }
+
+    #[cfg(feature = "storage-redb")]
+    pub fn attach_redb_backup_db(&mut self, database: Arc<::redb::Database>) {
+        self.redb_db = Some(database);
+    }
+
+    #[cfg(feature = "storage-redb")]
+    pub fn redb_for_backup(&self) -> Option<Arc<::redb::Database>> {
+        self.redb_db.clone()
     }
 
     /// Create a new graph memory system.
@@ -1938,6 +1952,8 @@ impl GraphMemory {
         let graph = Self {
             store,
             db,
+            #[cfg(feature = "storage-redb")]
+            redb_db: None,
             entity_name_index: Arc::new(parking_lot::RwLock::new(entity_name_index)),
             entity_lowercase_index: Arc::new(parking_lot::RwLock::new(entity_lowercase_index)),
             entity_stemmed_index: Arc::new(parking_lot::RwLock::new(entity_stemmed_index)),

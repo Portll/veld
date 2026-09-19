@@ -63,7 +63,13 @@ struct SharedStoreBootstrap {
     context_block_store: Arc<crate::memory::ContextBlockStore>,
     file_store: Arc<FileMemoryStore>,
     feedback_store: Arc<parking_lot::RwLock<FeedbackStore>>,
+    #[cfg(feature = "storage-redb")]
+    audit_redb: Option<Arc<::redb::Database>>,
 }
+
+/// Under `<base>/backups/`; a leading dot is not a valid user id, so no rocksdb user's archive can share it.
+#[cfg(feature = "storage-redb")]
+const REDB_BACKUP_DIR: &str = ".redb";
 
 /// Helper struct for audit log rotation (allows spawn_blocking with minimal clone)
 struct MultiUserMemoryManagerRotationHelper {
@@ -205,6 +211,14 @@ pub struct MultiUserMemoryManager {
     /// so an absent engine refuses by operation name instead of existing in a
     /// state where any call would be wrong.
     pub backup_engine: Option<Arc<backup::VeldBackupEngine>>,
+
+    /// None on rocksdb.
+    #[cfg(feature = "storage-redb")]
+    pub redb_backup_engine: Option<Arc<crate::storage::migrate::backup::RedbBackupEngine>>,
+
+    /// The redb backup reads audit.redb through this: a second opener fails on its lock.
+    #[cfg(feature = "storage-redb")]
+    audit_redb: Option<Arc<::redb::Database>>,
 
     /// Context status from Claude Code sessions
     pub context_sessions: Arc<ContextSessions>,
@@ -557,6 +571,15 @@ impl MultiUserMemoryManager {
         info!("Todo store initialized");
 
         let backup_engine = Self::open_backup_engine(&base_path, &server_config)?;
+        #[cfg(feature = "storage-redb")]
+        let redb_backup_engine = match server_config.effective_storage_backend {
+            StorageBackend::Redb => Some(Arc::new(
+                crate::storage::migrate::backup::RedbBackupEngine::new(
+                    base_path.join("backups").join(REDB_BACKUP_DIR),
+                )?,
+            )),
+            StorageBackend::RocksDb => None,
+        };
         if server_config.backup_enabled {
             info!(
                 "Backup engine initialized (interval: {}h, keep: {})",
@@ -654,6 +677,10 @@ impl MultiUserMemoryManager {
             file_store: shared_stores.file_store,
             feedback_store: shared_stores.feedback_store,
             backup_engine,
+            #[cfg(feature = "storage-redb")]
+            redb_backup_engine,
+            #[cfg(feature = "storage-redb")]
+            audit_redb: shared_stores.audit_redb,
             context_sessions: Arc::new(DashMap::new()),
             context_broadcaster: {
                 let (tx, _) = tokio::sync::broadcast::channel(broadcast_capacity);
@@ -794,6 +821,8 @@ impl MultiUserMemoryManager {
                     context_block_store,
                     file_store,
                     feedback_store,
+                    #[cfg(feature = "storage-redb")]
+                    audit_redb: None,
                 })
             }
             #[cfg(feature = "storage-redb")]
@@ -802,8 +831,9 @@ impl MultiUserMemoryManager {
 
                 // Audit is its own audit.redb, mirroring the rocksdb layout where
                 // audit rows live apart from user data.
-                let audit_store: Arc<dyn AuditStore> =
-                    Arc::new(crate::storage::redb::RedbAuditStore::open(base_path)?);
+                let audit = crate::storage::redb::RedbAuditStore::open(base_path)?;
+                let audit_redb = Some(audit.database());
+                let audit_store: Arc<dyn AuditStore> = Arc::new(audit);
 
                 // ONE ColumnStore over ONE database handle — every multi-family
                 // store shares it (redb permits one opener per file), and each
@@ -855,6 +885,7 @@ impl MultiUserMemoryManager {
                     context_block_store,
                     file_store,
                     feedback_store,
+                    audit_redb,
                 })
             }
             #[cfg(not(feature = "storage-redb"))]
@@ -949,9 +980,7 @@ impl MultiUserMemoryManager {
             StorageBackend::RocksDb => {
                 Ok(Some(Arc::new(backup::VeldBackupEngine::new(backup_path)?)))
             }
-            // None, not an engine that errors on use: the rocksdb BackupEngine
-            // has no redb analogue, and the redb backup story is export/import.
-            // Every backup operation refuses by name until that lands.
+            // None: redb deployments route to redb_backup_engine instead.
             StorageBackend::Redb => Ok(None),
         }
     }
@@ -961,7 +990,21 @@ impl MultiUserMemoryManager {
         self.backup_engine.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{what} requires the rocksdb backup engine; this deployment's backend is '{}' \
-                 and its backup route is export/import",
+                 and its backups go through the redb backup engine",
+                self.server_config.effective_storage_backend
+            )
+        })
+    }
+
+    /// The redb backup engine, or a refusal that names the operation.
+    #[cfg(feature = "storage-redb")]
+    fn require_redb_backup_engine(
+        &self,
+        what: &str,
+    ) -> Result<&Arc<crate::storage::migrate::backup::RedbBackupEngine>> {
+        self.redb_backup_engine.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what} requires the redb backup engine; this deployment's backend is '{}'",
                 self.server_config.effective_storage_backend
             )
         })
@@ -1194,26 +1237,29 @@ impl MultiUserMemoryManager {
             }
             #[cfg(feature = "storage-redb")]
             StorageBackend::Redb => {
-                let primary_store: Arc<dyn crate::storage::PrimaryMemoryStore> = Arc::new(
+                let primary =
                     crate::storage::redb::RedbPrimaryMemoryStore::open(&config.storage_path)
                         .with_context(|| {
                             format!(
                                 "Failed to open redb primary memory store at {:?}",
                                 config.storage_path
                             )
-                        })?,
-                );
+                        })?;
+                let database = primary.database();
+                let primary_store: Arc<dyn crate::storage::PrimaryMemoryStore> = Arc::new(primary);
 
                 let bm25_index = self.get_user_bm25_index(user_id)?;
 
                 // None: there is no rocksdb engine behind this store, and the
                 // comprehensive-backup path refuses by name on it.
-                UserMemory::with_primary_store_and_bm25_index(
+                let mut memory = UserMemory::with_primary_store_and_bm25_index(
                     config,
                     primary_store,
                     None,
                     bm25_index,
-                )
+                )?;
+                memory.attach_redb_backup_db(database);
+                Ok(memory)
             }
             #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
@@ -1243,14 +1289,16 @@ impl MultiUserMemoryManager {
             StorageBackend::Redb => {
                 std::fs::create_dir_all(&graph_path)?;
                 let database = crate::storage::redb::open_graph_database(&graph_path)?;
-                GraphMemory::with_store(Arc::new(crate::storage::redb::RedbColumnStore::new(
-                    database,
-                )))
+                let mut graph = GraphMemory::with_store(Arc::new(
+                    crate::storage::redb::RedbColumnStore::new(Arc::clone(&database)),
+                ))
                 .with_context(|| {
                     format!(
                         "Failed to open redb graph store for user '{user_id}' at {graph_path:?}"
                     )
-                })
+                })?;
+                graph.attach_redb_backup_db(database);
+                Ok(graph)
             }
             #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
@@ -3268,11 +3316,75 @@ impl MultiUserMemoryManager {
                         staged,
                     )
             }
+            #[cfg(feature = "storage-redb")]
+            StorageBackend::Redb => self.create_redb_user_backup(user_id),
+            #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
-                "storage backend '{}' is not wired for backup creation yet",
-                self.server_config.effective_storage_backend
+                "storage backend 'redb' requires this build to enable the storage-redb feature"
             )),
         }
+    }
+
+    /// Journal staged under the writer lock before the stores are dumped: the rocksdb path's consistency cut.
+    #[cfg(feature = "storage-redb")]
+    fn create_redb_user_backup(&self, user_id: &str) -> Result<BackupMetadata> {
+        let engine = self.require_redb_backup_engine("backup creation")?;
+        let refuse = |store: &str| {
+            anyhow::anyhow!(
+                "refusing to write a backup for '{user_id}' without its {store}: this process \
+                 holds no redb handle for it, and the archive would be silently incomplete"
+            )
+        };
+        let memory = self.get_user_memory(user_id)?;
+        let primary = memory
+            .read()
+            .redb_for_backup()
+            .ok_or_else(|| refuse("primary store"))?;
+        let graph_lock = self.get_user_graph(user_id).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to write a backup for '{user_id}' without its graph store: {e}"
+            )
+        })?;
+        let graph = graph_lock
+            .read()
+            .redb_for_backup()
+            .ok_or_else(|| refuse("graph store"))?;
+        let shared = self
+            .shared_db
+            .redb()
+            .cloned()
+            .ok_or_else(|| refuse("shared stores"))?;
+        let audit = self
+            .audit_redb
+            .clone()
+            .ok_or_else(|| refuse("audit store"))?;
+
+        let mut pending = engine.begin(user_id)?;
+        let spec = crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id)?);
+        match self.get_user_journaled_writer(user_id) {
+            Ok(writer) => {
+                let _writer_guard = writer.lock();
+                pending.stage_intent_log(&spec)?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "backup: journaled writer unavailable; staging intent log without quiesce",
+                );
+                pending.stage_intent_log(&spec)?;
+            }
+        }
+        pending.export(
+            &self.base_path,
+            &crate::storage::migrate::LiveRedb {
+                primary: Some(&primary),
+                graph: Some(&graph),
+                audit: Some(&audit),
+                shared: Some(&shared),
+            },
+        )?;
+        pending.finish()
     }
 
     pub fn list_backups_for_user(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
@@ -3280,9 +3392,13 @@ impl MultiUserMemoryManager {
             StorageBackend::RocksDb => self
                 .require_backup_engine("backup listing")?
                 .list_backups(user_id),
+            #[cfg(feature = "storage-redb")]
+            StorageBackend::Redb => self
+                .require_redb_backup_engine("backup listing")?
+                .list(user_id),
+            #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
-                "storage backend '{}' is not wired for backup listing yet",
-                self.server_config.effective_storage_backend
+                "storage backend 'redb' requires this build to enable the storage-redb feature"
             )),
         }
     }
@@ -3292,9 +3408,15 @@ impl MultiUserMemoryManager {
             StorageBackend::RocksDb => self
                 .require_backup_engine("backup verification")?
                 .verify_backup(user_id, backup_id),
+            // Ok(true) only: every mismatch or missing file is an Err naming it.
+            #[cfg(feature = "storage-redb")]
+            StorageBackend::Redb => self
+                .require_redb_backup_engine("backup verification")?
+                .verify(user_id, backup_id)
+                .map(|_| true),
+            #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
-                "storage backend '{}' is not wired for backup verification yet",
-                self.server_config.effective_storage_backend
+                "storage backend 'redb' requires this build to enable the storage-redb feature"
             )),
         }
     }
@@ -3304,9 +3426,13 @@ impl MultiUserMemoryManager {
             StorageBackend::RocksDb => self
                 .require_backup_engine("backup purging")?
                 .purge_old_backups(user_id, keep_count),
+            #[cfg(feature = "storage-redb")]
+            StorageBackend::Redb => self
+                .require_redb_backup_engine("backup purging")?
+                .purge(user_id, keep_count),
+            #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
-                "storage backend '{}' is not wired for backup purging yet",
-                self.server_config.effective_storage_backend
+                "storage backend 'redb' requires this build to enable the storage-redb feature"
             )),
         }
     }
@@ -3425,11 +3551,87 @@ impl MultiUserMemoryManager {
 
                 Ok(all_restored)
             }
+            #[cfg(feature = "storage-redb")]
+            StorageBackend::Redb => self.restore_redb_user_backup(user_id, backup_id, max_lsn),
+            #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
-                "storage backend '{}' is not wired for backup restore yet",
-                self.server_config.effective_storage_backend
+                "storage backend 'redb' requires this build to enable the storage-redb feature"
             )),
         }
+    }
+
+    /// Staged import then rename-aside swap, with the tenant evicted and its journal quiesced.
+    #[cfg(feature = "storage-redb")]
+    fn restore_redb_user_backup(
+        &self,
+        user_id: &str,
+        backup_id: Option<u32>,
+        max_lsn: Option<u64>,
+    ) -> Result<Vec<String>> {
+        let engine = self.require_redb_backup_engine("backup restore")?;
+        let backup_id = match backup_id {
+            Some(id) => id,
+            None => engine
+                .list(user_id)?
+                .first()
+                .map(|m| m.backup_id)
+                .ok_or_else(|| anyhow::anyhow!("no backups for '{user_id}' to restore"))?,
+        };
+        let live_user = self.user_dir(user_id)?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // Inside the backup root: same filesystem as the data for the renames, and outside any user scan.
+        let staging = engine.root().join(format!(
+            ".restore-{}-{nanos}",
+            live_user
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("user")
+        ));
+        let result = (|| -> Result<Vec<String>> {
+            let report = engine.restore_into(
+                user_id,
+                backup_id,
+                &staging,
+                &crate::backup::RestoreOptions { max_lsn },
+                false,
+            )?;
+            let staged_user = staging.join(live_user.file_name().unwrap_or_default());
+            let pairs: Vec<(std::path::PathBuf, std::path::PathBuf)> = [
+                "storage.redb",
+                "graph/graph.redb",
+                "intent.log",
+                "projection_checkpoints.bin",
+            ]
+            .iter()
+            .map(|rel| (staged_user.join(rel), live_user.join(rel)))
+            .collect();
+
+            let writer = self.journaled_writers.get(user_id).map(|w| w.clone());
+            let writer_guard = writer.as_ref().map(|w| w.lock());
+            self.evict_user(user_id);
+            crate::storage::migrate::backup::swap_files_into_place(&pairs)?;
+            // The cached writer appends to the replaced journal; the next access reopens and replays the restored one.
+            self.journaled_writers.remove(user_id);
+            drop(writer_guard);
+
+            let mut restored = vec!["memories".to_string(), "graph".to_string()];
+            if !report.intent_log_files.is_empty() {
+                restored.push("intent_log".to_string());
+            }
+            restored.extend(
+                report
+                    .not_restored
+                    .iter()
+                    .map(|n| format!("NOT RESTORED: {n}")),
+            );
+            tracing::info!(user_id, backup_id, ?restored, "redb backup restored");
+            Ok(restored)
+        })();
+        let _ = std::fs::remove_dir_all(&staging);
+        result
     }
 
     /// Run backups for all active users
@@ -3455,7 +3657,10 @@ impl MultiUserMemoryManager {
                 // manual endpoint takes an explicit user_id and bypasses this scan,
                 // which is why it kept working and hid the fault. The same path is
                 // spelled correctly in restore_user_backup_with_options.
-                let db_path = path.join("storage");
+                let db_path = match self.server_config.effective_storage_backend {
+                    StorageBackend::RocksDb => path.join("storage"),
+                    StorageBackend::Redb => path.join("storage.redb"),
+                };
                 if !db_path.exists() {
                     tracing::debug!(
                         user_id = name,

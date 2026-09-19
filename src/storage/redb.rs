@@ -1537,6 +1537,11 @@ impl RedbAuditStore {
         init_table(&database, AUDIT_TABLE)?;
         Ok(Self { database })
     }
+
+    /// The live handle, for the redb backup: a second opener of audit.redb fails on its lock.
+    pub fn database(&self) -> Arc<redb::Database> {
+        Arc::clone(&self.database)
+    }
 }
 
 impl AuditStore for RedbAuditStore {
