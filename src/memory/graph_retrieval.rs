@@ -1107,7 +1107,7 @@ pub fn spreading_activation_retrieve_with_stats(
     let query_embedding = embedder.encode_for_query(query_text)?;
     stats.embedding_time_us = embedding_start.elapsed().as_micros() as u64;
 
-    let now = chrono::Utc::now();
+    let now = crate::memory::scoring_now();
 
     for (_episode_uuid, (graph_activation, episode)) in activated_memories {
         // Convert episode to memory

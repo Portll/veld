@@ -7,6 +7,7 @@
 //! - Multi-modal retrieval (similarity, temporal, causal)
 //! - Automatic memory consolidation
 
+pub mod ablation;
 pub mod acl;
 pub mod alignment_onboarding;
 pub mod bm25_projection;
@@ -98,6 +99,24 @@ fn marker_names_http(storage_path: &std::path::Path) -> Option<String> {
     let id = std::fs::read_to_string(storage_path.join(".veld_embedder")).ok()?;
     let id = id.trim();
     (id.starts_with("http://") || id.starts_with("https://")).then(|| id.to_string())
+}
+
+/// Query-time scoring clock. `VELD_EVAL_NOW` or the upstream spelling `SHODH_EVAL_NOW`
+/// (RFC3339; `VELD_` wins) freezes it for the recall harness: repeat passes minutes apart
+/// otherwise see different recency and edge-decay components, enough to flip near-tie ranks.
+/// Read on every call rather than cached, because tests and the harness set it after load.
+/// Unset or unparseable, it is the live clock, so production is unchanged.
+pub(crate) fn scoring_now() -> chrono::DateTime<chrono::Utc> {
+    let pinned = |name: &str| {
+        std::env::var(name).ok().and_then(|raw| {
+            chrono::DateTime::parse_from_rfc3339(raw.trim())
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        })
+    };
+    pinned("VELD_EVAL_NOW")
+        .or_else(|| pinned("SHODH_EVAL_NOW"))
+        .unwrap_or_else(chrono::Utc::now)
 }
 
 pub(crate) fn recall_readonly() -> bool {

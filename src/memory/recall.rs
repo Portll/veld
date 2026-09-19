@@ -88,7 +88,7 @@ impl super::MemorySystem {
         self.expand_with_hierarchy(&mut memories, &mut seen_ids);
 
         // Rank by importance * temporal relevance
-        let now = chrono::Utc::now();
+        let now = super::scoring_now();
         memories.sort_by(|a, b| {
             let age_days_a = (now - a.created_at).num_days();
             let temporal_a = Self::calculate_temporal_relevance(age_days_a);
@@ -493,7 +493,11 @@ impl super::MemorySystem {
         let temporal_gate = has_any_temporal_intent || has_temporal_keywords;
 
         let temporal_fact_boost_ids: HashSet<MemoryId> = if temporal_gate {
-            if let Some(user_id) = &query.user_id {
+            if let Some(user_id) = query
+                .user_id
+                .as_ref()
+                .filter(|_| !super::ablation::fact_layers_disabled())
+            {
                 // Get entity name (first focal entity)
                 let entity = query_analysis
                     .focal_entities
@@ -689,7 +693,8 @@ impl super::MemorySystem {
             // Layer 0.7 is a PlusFacts stage; below that rung it contributes nothing.
             let facts_allowed = query
                 .layer_mode()
-                .allows(crate::memory::types::LayerMode::PlusFacts);
+                .allows(crate::memory::types::LayerMode::PlusFacts)
+                && !super::ablation::fact_layers_disabled();
 
             if let Some(user_id) = &query.user_id.clone().filter(|_| facts_allowed) {
                 let entity_names: Vec<String> = query_analysis
@@ -1542,6 +1547,8 @@ impl super::MemorySystem {
                     density_weights,
                     &query_type,
                 );
+            // Applied after query-type modulation so `0` really is graph-off.
+            let graph_w = super::ablation::graph_fusion_weight_override().unwrap_or(graph_w);
 
             // Hybrid weight = semantic + linguistic (BM25 + vector combined)
             let hybrid_w = semantic_w + linguistic_w;
@@ -2512,7 +2519,7 @@ impl super::MemorySystem {
         // Recency decay: recent memories get boost, old memories decay
         // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
         const RECENCY_DECAY_RATE: f32 = 0.01;
-        let now = chrono::Utc::now();
+        let now = super::scoring_now();
 
         // PIPE-9: Get feedback store guard for momentum-based scoring
         // Acquire once outside the loop to avoid repeated locking
@@ -2541,6 +2548,7 @@ impl super::MemorySystem {
         // An empty set (the compile-time default) makes every `signal_enabled`
         // call return `true`, preserving byte-identical behaviour.
         let dials_snapshot = self.cognitive_dials.read().clone();
+        let hebbian_family_on = super::ablation::is_enabled("hebbian");
 
         // R2 (LTR) SHADOW CAPTURE side-map. The `with_unified_score` closure
         // (re-bound each loop iteration) borrows this by reference and inserts one
@@ -2557,7 +2565,7 @@ impl super::MemorySystem {
             // Hebbian boost from learned graph weights (10% contribution)
             // [signal: hebbian] Gated by disabled_signals dial; default = always on.
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
-            let base_score = if dials_snapshot.signal_enabled("hebbian") {
+            let base_score = if hebbian_family_on && dials_snapshot.signal_enabled("hebbian") {
                 score + hebbian_boost * 0.1
             } else {
                 score
@@ -3412,7 +3420,7 @@ impl super::MemorySystem {
             };
 
             if let Some(range) = temporal_range {
-                let now = chrono::Utc::now();
+                let now = super::scoring_now();
                 let mut demoted = 0;
 
                 match range {
@@ -3984,7 +3992,8 @@ impl super::MemorySystem {
         // shadows. During the labile window, the memory can be updated with new
         // context discovered during the retrieval interaction.
         // Reference: Nader et al. (2000) — reconsolidation theory.
-        {
+        // A usage write: set_activation feeds Layer 5's activation boost on the next recall.
+        if !readonly {
             let now = chrono::Utc::now();
             // Labile-window length + active-shadow cap are runtime dials (default to the
             // constant values). Read once here so the shadows write lock below never
