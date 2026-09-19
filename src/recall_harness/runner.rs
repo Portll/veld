@@ -1133,11 +1133,7 @@ pub fn ingest_corpus(
             // veld's signature takes three: it derives name embeddings inside
             // rather than accepting them, so the harness cannot hold them
             // constant across arms the way upstream does.
-            .process_experience_into_graph(
-                EVAL_USER,
-                &experience,
-                &memory_id,
-            )
+            .process_experience_into_graph(EVAL_USER, &experience, &memory_id)
             .with_context(|| format!("graph-processing corpus item {}", item.id))?;
 
         map.insert(item.id.clone(), memory_id.0);
@@ -3876,7 +3872,8 @@ mod tests {
     #[test]
     #[ignore = "writes a baseline file; run explicitly with VELD_WRITE_BASELINE set"]
     fn record_smoke_baseline() {
-        let out = std::env::var("VELD_WRITE_BASELINE").expect("VELD_WRITE_BASELINE unset — refusing to guess where a baseline goes");
+        let out = std::env::var("VELD_WRITE_BASELINE")
+            .expect("VELD_WRITE_BASELINE unset — refusing to guess where a baseline goes");
         let git_sha = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .output()
@@ -3897,7 +3894,11 @@ mod tests {
         };
         let report = run_smoke_suite(&inputs).expect("smoke suite must run");
         let _ = std::fs::remove_dir_all(&storage);
-        assert_ne!(report.embedder, crate::recall_harness::report::EMBEDDER_UNKNOWN, "a baseline of unknown provenance is not a baseline");
+        assert_ne!(
+            report.embedder,
+            crate::recall_harness::report::EMBEDDER_UNKNOWN,
+            "a baseline of unknown provenance is not a baseline"
+        );
         let json = serde_json::to_string_pretty(&report).unwrap();
         std::fs::write(&out, json).expect("write baseline");
         let full = report.layers.get("full").expect("full layer");
