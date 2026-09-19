@@ -18,14 +18,14 @@
 //! another name. Likewise `SHODH_EVAL_NOW` pins no clock here. Read an arm that
 //! matches baseline as "not wired in veld", never as "no effect".
 
-pub mod fixtures;
-pub mod metrics;
-pub mod report;
 pub mod bridge_harness;
 pub mod decay_sim;
+pub mod fixtures;
 pub mod forgetting_harness;
 pub mod lineage_harness;
+pub mod metrics;
 pub mod multihop;
 pub mod ontology_harness;
+pub mod report;
 pub mod runner;
 pub mod temporal_harness;

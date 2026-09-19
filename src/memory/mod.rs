@@ -8415,7 +8415,13 @@ mod simulate_edge_aging_tests {
     use chrono::{Duration, Utc};
     use tempfile::TempDir;
 
-    fn edge(from: uuid::Uuid, to: uuid::Uuid, tier: EdgeTier, strength: f32, ltp: LtpStatus) -> RelationshipEdge {
+    fn edge(
+        from: uuid::Uuid,
+        to: uuid::Uuid,
+        tier: EdgeTier,
+        strength: f32,
+        ltp: LtpStatus,
+    ) -> RelationshipEdge {
         let now = Utc::now();
         RelationshipEdge {
             uuid: uuid::Uuid::new_v4(),
@@ -8461,21 +8467,34 @@ mod simulate_edge_aging_tests {
     fn simulate_edge_aging_steps_real_graph_decay_at_the_cadence() {
         let tmp = TempDir::new().expect("temp dir");
         let mut sys = MemorySystem::new(
-            MemoryConfig { storage_path: tmp.path().to_path_buf(), ..Default::default() },
+            MemoryConfig {
+                storage_path: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
             None,
         )
         .expect("memory system");
-        assert_eq!(sys.simulate_edge_aging(30.0, 6).unwrap(), 0, "no graph configured");
+        assert_eq!(
+            sys.simulate_edge_aging(30.0, 6).unwrap(),
+            0,
+            "no graph configured"
+        );
 
         let graph_dir = TempDir::new().expect("graph dir");
-        let graph = Arc::new(parking_lot::RwLock::new(GraphMemory::new(graph_dir.path(), None).unwrap()));
+        let graph = Arc::new(parking_lot::RwLock::new(
+            GraphMemory::new(graph_dir.path(), None).unwrap(),
+        ));
         let (weak, strong, recovering) = {
             let g = graph.read();
-            let [a, b, c, d, e, f] = ["a", "b", "c", "d", "e", "f"].map(|n| g.add_entity(entity(n)).unwrap());
+            let [a, b, c, d, e, f] =
+                ["a", "b", "c", "d", "e", "f"].map(|n| g.add_entity(entity(n)).unwrap());
             (
-                g.add_relationship(edge(a, b, EdgeTier::L1Working, 0.3, LtpStatus::None)).unwrap(),
-                g.add_relationship(edge(c, d, EdgeTier::L1Working, 0.9, LtpStatus::None)).unwrap(),
-                g.add_relationship(edge(e, f, EdgeTier::L2Episodic, 0.08, LtpStatus::Full)).unwrap(),
+                g.add_relationship(edge(a, b, EdgeTier::L1Working, 0.3, LtpStatus::None))
+                    .unwrap(),
+                g.add_relationship(edge(c, d, EdgeTier::L1Working, 0.9, LtpStatus::None))
+                    .unwrap(),
+                g.add_relationship(edge(e, f, EdgeTier::L2Episodic, 0.08, LtpStatus::Full))
+                    .unwrap(),
             )
         };
         sys.set_graph_memory(graph.clone());
@@ -8502,11 +8521,24 @@ mod simulate_edge_aging_tests {
         let after = Utc::now();
         assert_eq!(pruned, 1);
         let g = graph.read();
-        assert!(g.get_relationship(&weak).unwrap().is_none(), "weak L1 edge pruned");
-        let strong = g.get_relationship(&strong).unwrap().expect("strong L1 edge survives");
-        assert!(strong.strength < 0.3, "strong edge decayed: {}", strong.strength);
+        assert!(
+            g.get_relationship(&weak).unwrap().is_none(),
+            "weak L1 edge pruned"
+        );
+        let strong = g
+            .get_relationship(&strong)
+            .unwrap()
+            .expect("strong L1 edge survives");
+        assert!(
+            strong.strength < 0.3,
+            "strong edge decayed: {}",
+            strong.strength
+        );
 
-        let aged = g.get_relationship(&recovering).unwrap().expect("potentiated edge is never pruned");
+        let aged = g
+            .get_relationship(&recovering)
+            .unwrap()
+            .expect("potentiated edge is never pruned");
         assert!(
             (aged.strength - reference.strength).abs() < 1e-3,
             "simulated {} vs {steps}-step reference {} (one jump gives {})",

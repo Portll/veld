@@ -9134,7 +9134,6 @@ mod tests {
         }
     }
 
-
     #[derive(Clone, Copy, Debug)]
     enum LtpSpec {
         None,
@@ -9161,8 +9160,12 @@ mod tests {
     ) -> RelationshipEdge {
         let ltp_status = match ltp {
             LtpSpec::None => LtpStatus::None,
-            LtpSpec::BurstFresh => LtpStatus::Burst { detected_at: anchor - Duration::hours(10) },
-            LtpSpec::BurstExpired => LtpStatus::Burst { detected_at: anchor - Duration::hours(60) },
+            LtpSpec::BurstFresh => LtpStatus::Burst {
+                detected_at: anchor - Duration::hours(10),
+            },
+            LtpSpec::BurstExpired => LtpStatus::Burst {
+                detected_at: anchor - Duration::hours(60),
+            },
             LtpSpec::Weekly => LtpStatus::Weekly,
             LtpSpec::Full => LtpStatus::Full,
         };
@@ -9196,7 +9199,11 @@ mod tests {
     fn decay_at_matches_the_pre_injection_decay_at_the_same_effective_time() {
         // Far from the wall clock, so a decay_at that reads Utc::now() anywhere diverges.
         let future: DateTime<Utc> = "2031-03-01T00:00:00Z".parse().unwrap();
-        let tiers = [EdgeTier::L1Working, EdgeTier::L2Episodic, EdgeTier::L3Semantic];
+        let tiers = [
+            EdgeTier::L1Working,
+            EdgeTier::L2Episodic,
+            EdgeTier::L3Semantic,
+        ];
         let ltps = [
             LtpSpec::None,
             LtpSpec::BurstFresh,
@@ -9204,7 +9211,11 @@ mod tests {
             LtpSpec::Weekly,
             LtpSpec::Full,
         ];
-        let histories = [HistorySpec::None, HistorySpec::WeeklyHabit, HistorySpec::Sparse];
+        let histories = [
+            HistorySpec::None,
+            HistorySpec::WeeklyHabit,
+            HistorySpec::Sparse,
+        ];
         let ages_hours = [1, 6, 30, 49, 240, 1100, 9000];
         let strengths = [0.9_f32, 0.12];
 
@@ -9216,13 +9227,16 @@ mod tests {
                     for age in ages_hours {
                         for strength in strengths {
                             let wall = Utc::now();
-                            let mut legacy = edge_anchored_at(wall, tier, strength, age, ltp, history);
+                            let mut legacy =
+                                edge_anchored_at(wall, tier, strength, age, ltp, history);
                             let legacy_prune = legacy_decay(&mut legacy);
 
-                            let mut injected = edge_anchored_at(future, tier, strength, age, ltp, history);
+                            let mut injected =
+                                edge_anchored_at(future, tier, strength, age, ltp, history);
                             let injected_prune = injected.decay_at(future);
 
-                            let case = format!("{tier:?} {ltp:?} {history:?} age={age}h s={strength}");
+                            let case =
+                                format!("{tier:?} {ltp:?} {history:?} age={age}h s={strength}");
                             assert_eq!(injected_prune, legacy_prune, "prune decision: {case}");
                             assert_eq!(
                                 injected.strength.to_bits(),
@@ -9233,11 +9247,20 @@ mod tests {
                             );
                             assert_eq!(injected.last_activated, future, "{case}");
                             let shape = |s: &LtpStatus| std::mem::discriminant(s);
-                            assert_eq!(shape(&injected.ltp_status), shape(&legacy.ltp_status), "ltp: {case}");
+                            assert_eq!(
+                                shape(&injected.ltp_status),
+                                shape(&legacy.ltp_status),
+                                "ltp: {case}"
+                            );
                             if legacy_prune {
                                 pruned += 1;
                             }
-                            if shape(&legacy.ltp_status) != shape(&edge_anchored_at(wall, tier, strength, age, ltp, history).ltp_status) {
+                            if shape(&legacy.ltp_status)
+                                != shape(
+                                    &edge_anchored_at(wall, tier, strength, age, ltp, history)
+                                        .ltp_status,
+                                )
+                            {
                                 changed_ltp += 1;
                             }
                             cases += 1;
@@ -9255,11 +9278,22 @@ mod tests {
     fn decay_is_decay_at_the_wall_clock() {
         for age in [1, 49, 1100] {
             let wall = Utc::now();
-            let mut a = edge_anchored_at(wall, EdgeTier::L2Episodic, 0.7, age, LtpSpec::BurstExpired, HistorySpec::Sparse);
+            let mut a = edge_anchored_at(
+                wall,
+                EdgeTier::L2Episodic,
+                0.7,
+                age,
+                LtpSpec::BurstExpired,
+                HistorySpec::Sparse,
+            );
             let mut b = a.clone();
             let pa = legacy_decay(&mut a);
             let pb = b.decay();
-            assert_eq!((pa, a.strength.to_bits()), (pb, b.strength.to_bits()), "age={age}h");
+            assert_eq!(
+                (pa, a.strength.to_bits()),
+                (pb, b.strength.to_bits()),
+                "age={age}h"
+            );
         }
     }
 
@@ -9280,7 +9314,12 @@ mod tests {
         }
     }
 
-    fn typed_edge(from: Uuid, to: Uuid, relation_type: RelationType, strength: f32) -> RelationshipEdge {
+    fn typed_edge(
+        from: Uuid,
+        to: Uuid,
+        relation_type: RelationType,
+        strength: f32,
+    ) -> RelationshipEdge {
         let mut edge = create_test_edge_with_tier(strength, 0, EdgeTier::L2Episodic);
         edge.from_entity = from;
         edge.to_entity = to;
@@ -9303,18 +9342,28 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let a = graph.add_entity(named_entity(&format!("decay-src-{i}"))).unwrap();
-            let b = graph.add_entity(named_entity(&format!("decay-dst-{i}"))).unwrap();
+            let a = graph
+                .add_entity(named_entity(&format!("decay-src-{i}")))
+                .unwrap();
+            let b = graph
+                .add_entity(named_entity(&format!("decay-dst-{i}")))
+                .unwrap();
             let mut edge = typed_edge(a, b, RelationType::RelatedTo, strength);
             edge.tier = tier;
             edge.ltp_status = ltp;
             ids.push(graph.add_relationship(edge).unwrap());
         }
 
-        assert_eq!(graph.apply_decay().unwrap().pruned_count, 0, "fresh edges survive the wall clock");
+        assert_eq!(
+            graph.apply_decay().unwrap().pruned_count,
+            0,
+            "fresh edges survive the wall clock"
+        );
 
-        let stored: Vec<RelationshipEdge> =
-            ids.iter().map(|id| graph.get_relationship(id).unwrap().unwrap()).collect();
+        let stored: Vec<RelationshipEdge> = ids
+            .iter()
+            .map(|id| graph.get_relationship(id).unwrap().unwrap())
+            .collect();
         let at = Utc::now() + Duration::days(60);
         let expected: Vec<(bool, RelationshipEdge)> = stored
             .iter()
@@ -9347,15 +9396,49 @@ mod tests {
     fn is_causal_is_exactly_causes_results_in_and_triggers() {
         use RelationType::*;
         let all = [
-            WorksWith, WorksAt, EmployedBy, PartOf, Contains, OwnedBy, LocatedIn, LocatedAt, Uses,
-            CreatedBy, DevelopedBy, Causes, ResultsIn, Learned, Knows, Teaches, RelatedTo,
-            AssociatedWith, CoRetrieved, CoOccurs, Manages, DependsOn, Requires, Configures,
-            Prefers, Recommends, Documents, Implements, DeploysTo, Monitors, Triggers,
-            SupersededBy, AlternativeTo, AssignedTo, Approves,
+            WorksWith,
+            WorksAt,
+            EmployedBy,
+            PartOf,
+            Contains,
+            OwnedBy,
+            LocatedIn,
+            LocatedAt,
+            Uses,
+            CreatedBy,
+            DevelopedBy,
+            Causes,
+            ResultsIn,
+            Learned,
+            Knows,
+            Teaches,
+            RelatedTo,
+            AssociatedWith,
+            CoRetrieved,
+            CoOccurs,
+            Manages,
+            DependsOn,
+            Requires,
+            Configures,
+            Prefers,
+            Recommends,
+            Documents,
+            Implements,
+            DeploysTo,
+            Monitors,
+            Triggers,
+            SupersededBy,
+            AlternativeTo,
+            AssignedTo,
+            Approves,
             Custom("Causes".to_string()),
             Custom("Precedes".to_string()),
         ];
-        let causal: Vec<&str> = all.iter().filter(|r| r.is_causal()).map(|r| r.as_str()).collect();
+        let causal: Vec<&str> = all
+            .iter()
+            .filter(|r| r.is_causal())
+            .map(|r| r.as_str())
+            .collect();
         assert_eq!(causal, vec!["Causes", "ResultsIn", "Triggers"]);
     }
 
@@ -9465,10 +9548,17 @@ mod tests {
         assert_eq!(strict("vornak reactors"), Some(reactor), "case-insensitive");
         assert_eq!(strict("Vornak Reactor"), Some(reactor), "stemmed");
         assert_eq!(strict("Vornak"), None, "substring must not resolve");
-        assert_eq!(strict("Reactors of Vornak"), None, "word-level must not resolve");
+        assert_eq!(
+            strict("Reactors of Vornak"),
+            None,
+            "word-level must not resolve"
+        );
 
         // The fuzzy resolver does bind the fragment, which is what strict exists to refuse.
-        assert_eq!(graph.find_entity_by_name("Vornak").unwrap().map(|e| e.uuid), Some(reactor));
+        assert_eq!(
+            graph.find_entity_by_name("Vornak").unwrap().map(|e| e.uuid),
+            Some(reactor)
+        );
     }
 
     #[test]
@@ -9479,17 +9569,33 @@ mod tests {
             ["root", "mid", "effect", "bystander", "downstream"]
                 .map(|n| graph.add_entity(named_entity(n)).unwrap());
 
-        graph.add_relationship(typed_edge(root, mid, RelationType::Causes, 0.8)).unwrap();
-        graph.add_relationship(typed_edge(mid, effect, RelationType::Triggers, 0.8)).unwrap();
-        graph.add_relationship(typed_edge(bystander, effect, RelationType::CoOccurs, 0.9)).unwrap();
-        graph.add_relationship(typed_edge(effect, downstream, RelationType::ResultsIn, 0.9)).unwrap();
+        graph
+            .add_relationship(typed_edge(root, mid, RelationType::Causes, 0.8))
+            .unwrap();
+        graph
+            .add_relationship(typed_edge(mid, effect, RelationType::Triggers, 0.8))
+            .unwrap();
+        graph
+            .add_relationship(typed_edge(bystander, effect, RelationType::CoOccurs, 0.9))
+            .unwrap();
+        graph
+            .add_relationship(typed_edge(effect, downstream, RelationType::ResultsIn, 0.9))
+            .unwrap();
 
         let snapshot = |g: &GraphMemory| {
             let mut edges: Vec<(Uuid, u32, u32, DateTime<Utc>, u32)> = g
                 .get_all_relationships()
                 .unwrap()
                 .into_iter()
-                .map(|e| (e.uuid, e.strength.to_bits(), e.activation_count, e.last_activated, e.forward_strength.to_bits()))
+                .map(|e| {
+                    (
+                        e.uuid,
+                        e.strength.to_bits(),
+                        e.activation_count,
+                        e.last_activated,
+                        e.forward_strength.to_bits(),
+                    )
+                })
                 .collect();
             edges.sort();
             edges
@@ -9498,11 +9604,27 @@ mod tests {
 
         let origins = graph.trace_causal_origins(&[effect], 8).unwrap();
         let ids: Vec<Uuid> = origins.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec![root], "root only: not the proximal cause, a non-causal parent, or an effect");
+        assert_eq!(
+            ids,
+            vec![root],
+            "root only: not the proximal cause, a non-causal parent, or an effect"
+        );
         let expected = 0.8_f32 * 0.7 * 0.8 * 0.7;
-        assert!((origins[0].1 - expected).abs() < 0.02, "two-hop score {} vs {expected}", origins[0].1);
+        assert!(
+            (origins[0].1 - expected).abs() < 0.02,
+            "two-hop score {} vs {expected}",
+            origins[0].1
+        );
 
-        assert_eq!(graph.trace_causal_origins(&[root], 8).unwrap(), vec![], "a seed with no cause is not its own origin");
-        assert_eq!(snapshot(&graph), before, "the walk must not strengthen or rewrite edges");
+        assert_eq!(
+            graph.trace_causal_origins(&[root], 8).unwrap(),
+            vec![],
+            "a seed with no cause is not its own origin"
+        );
+        assert_eq!(
+            snapshot(&graph),
+            before,
+            "the walk must not strengthen or rewrite edges"
+        );
     }
 }
