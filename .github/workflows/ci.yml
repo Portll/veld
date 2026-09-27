@@ -202,6 +202,13 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    # No debug info in test builds. On 2026-09-27 the runner ran out of disk linking
+    # hebbian_learning_tests (ld SIGBUS, "No space left on device"): every integration test is its
+    # own binary carrying full DWARF for the crate, RocksDB and ONNX Runtime. Panic messages keep
+    # their file:line without it; the cc-built C++ objects drop -g as well.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -213,15 +220,20 @@ jobs:
           sudo apt-get install -y llvm-dev libclang-dev clang
 
       - name: Run all tests
+        # pipefail: without it the step's status is tee's, and neither a failing test nor a compile
+        # error could fail this job.
         run: |
+          set -o pipefail
           cargo test --no-fail-fast 2>&1 | tee test-output.txt
 
       - name: Generate test summary
         if: always()
         run: |
-          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | tail -1 || echo "0")
-          FAILED=$(grep -oP '\d+(?= failed)' test-output.txt | tail -1 || echo "0")
-          IGNORED=$(grep -oP '\d+(?= ignored)' test-output.txt | tail -1 || echo "0")
+          # Summed over every test binary; `tail -1` reported only the last one.
+          count() { grep -oE "[0-9]+ $1;" test-output.txt | awk '{s+=$1} END {print s+0}'; }
+          PASSED=$(count passed)
+          FAILED=$(count failed)
+          IGNORED=$(count ignored)
 
           echo "## Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
