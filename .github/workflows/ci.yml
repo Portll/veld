@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-    # Release tags get the full cross-platform build (see the build job's matrix).
+    # Release tags get the release build on all three platforms (see the build job).
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -103,15 +103,18 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # The release build runs on release tags (v*) and manual dispatch only, on all three platforms.
+    # Measured 2026-09-18 over 35 days: the macOS runs billed ~1,870 minutes (x10 rate) and the
+    # Windows runs ~734 (x2), 2,604 of the ~4,100 that exhausted the account's Actions budget; those
+    # moved to tags and dispatch on 2026-09-17. Measured 2026-09-27 over 30 days: the Linux release
+    # build that stayed on every push averaged 14.6 min a run, 366 minutes, beside a 15.3 min debug
+    # compile in `test` that already proves the tree builds on Linux. Release-profile breakage is
+    # caught at release or on demand (Actions > CI > Run workflow).
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
-        # Linux only on pushes and PRs; macOS and Windows on release tags (v*) and manual dispatch.
-        # Measured 2026-09-18 over 35 days: this job's 10 macOS runs billed ~1,870 minutes (x10 rate) and
-        # its 10 Windows runs ~734 (x2), 2,604 of the ~4,100 minutes that exhausted the account's Actions
-        # budget and blocked CI across every private repository. Cross-platform breakage is now caught at
-        # release or on demand (Actions > CI > Run workflow), not on every push to main.
-        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -252,20 +255,25 @@ jobs:
           version_icon="${{ needs.version-check.result == 'success' && '✅' || '❌' }}"
           format_icon="${{ needs.format.result == 'success' && '✅' || '❌' }}"
           clippy_icon="${{ needs.clippy.result == 'success' && '✅' || '❌' }}"
-          build_icon="${{ needs.build.result == 'success' && '✅' || '❌' }}"
+          # A skipped build passes only where the policy skips it: a push or PR that is not a release
+          # tag. On a tag or a dispatch the build must run, and a skip there is a failure.
+          build_expected="${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}"
+          build_result="${{ needs.build.result }}"
+          if [[ "$build_result" == "success" || ( "$build_result" == "skipped" && "$build_expected" == "false" ) ]]; then build_ok=true; else build_ok=false; fi
+          if [[ "$build_result" == "skipped" && "$build_ok" == "true" ]]; then build_icon="⏭"; elif [[ "$build_ok" == "true" ]]; then build_icon="✅"; else build_icon="❌"; fi
           test_icon="${{ needs.test.result == 'success' && '✅' || '❌' }}"
 
           echo "| Version | $version_icon ${{ needs.version-check.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Format | $format_icon ${{ needs.format.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Clippy | $clippy_icon ${{ needs.clippy.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Build | $build_icon ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | $build_icon $build_result$([[ "$build_icon" == "⏭" ]] && echo ' (release tags and dispatch only)') |" >> $GITHUB_STEP_SUMMARY
           echo "| Tests | $test_icon ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [[ "${{ needs.version-check.result }}" == "success" && \
                 "${{ needs.format.result }}" == "success" && \
                 "${{ needs.clippy.result }}" == "success" && \
-                "${{ needs.build.result }}" == "success" && \
+                "$build_ok" == "true" && \
                 "${{ needs.test.result }}" == "success" ]]; then
             echo "### All critical checks passed" >> $GITHUB_STEP_SUMMARY
             exit 0
