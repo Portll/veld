@@ -202,6 +202,13 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    # Release tags and manual dispatch only; the suite is verified locally before a push instead
+    # (operator decision, 2026-09-27). It needs ~20 runner minutes a run, and the account's Actions
+    # budget ran out twice in September. Local method, which reproduced this job's results exactly:
+    # an empty HOME (so the model cache is empty, as on a runner), CARGO_PROFILE_*_DEBUG=0 and a
+    # private CARGO_TARGET_DIR; run A without the model matched this job's 216 failures one for one,
+    # run B after model-fetch passed 2,345 of 2,345.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     # No debug info in test builds. On 2026-09-27 the runner ran out of disk linking
     # hebbian_learning_tests (ld SIGBUS, "No space left on device"): every integration test is its
     # own binary carrying full DWARF for the crate, RocksDB and ONNX Runtime. Panic messages keep
@@ -218,6 +225,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang
+
+      # The ONNX runtime and MiniLM. Without them every test that builds a memory system fails
+      # (216 of them on 2026-09-27: ort is load-dynamic and the runner has neither). Fetched by
+      # veld's own downloader, pinned and SHA-256 verified, into the cache the tests search, and
+      # cached by the file that pins them.
+      - uses: actions/cache@v4
+        id: models
+        with:
+          path: ~/.cache/veld
+          key: veld-models-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs') }}
+      - name: Fetch the ONNX runtime and MiniLM
+        if: steps.models.outputs.cache-hit != 'true'
+        run: cargo run --quiet --bin model-fetch -- --onnxruntime --minilm
 
       - name: Run all tests
         # pipefail: without it the step's status is tee's, and neither a failing test nor a compile
@@ -273,20 +293,24 @@ jobs:
           build_result="${{ needs.build.result }}"
           if [[ "$build_result" == "success" || ( "$build_result" == "skipped" && "$build_expected" == "false" ) ]]; then build_ok=true; else build_ok=false; fi
           if [[ "$build_result" == "skipped" && "$build_ok" == "true" ]]; then build_icon="⏭"; elif [[ "$build_ok" == "true" ]]; then build_icon="✅"; else build_icon="❌"; fi
-          test_icon="${{ needs.test.result == 'success' && '✅' || '❌' }}"
+          # Tests follow the same policy as the build: skipped on pushes and PRs, required on tags and
+          # dispatch.
+          test_result="${{ needs.test.result }}"
+          if [[ "$test_result" == "success" || ( "$test_result" == "skipped" && "$build_expected" == "false" ) ]]; then test_ok=true; else test_ok=false; fi
+          if [[ "$test_result" == "skipped" && "$test_ok" == "true" ]]; then test_icon="⏭"; elif [[ "$test_ok" == "true" ]]; then test_icon="✅"; else test_icon="❌"; fi
 
           echo "| Version | $version_icon ${{ needs.version-check.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Format | $format_icon ${{ needs.format.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Clippy | $clippy_icon ${{ needs.clippy.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Build | $build_icon $build_result$([[ "$build_icon" == "⏭" ]] && echo ' (release tags and dispatch only)') |" >> $GITHUB_STEP_SUMMARY
-          echo "| Tests | $test_icon ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests | $test_icon $test_result$([[ "$test_icon" == "⏭" ]] && echo ' (release tags and dispatch only; verified locally before push)') |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [[ "${{ needs.version-check.result }}" == "success" && \
                 "${{ needs.format.result }}" == "success" && \
                 "${{ needs.clippy.result }}" == "success" && \
                 "$build_ok" == "true" && \
-                "${{ needs.test.result }}" == "success" ]]; then
+                "$test_ok" == "true" ]]; then
             echo "### All critical checks passed" >> $GITHUB_STEP_SUMMARY
             exit 0
           else
