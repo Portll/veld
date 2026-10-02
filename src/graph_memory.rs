@@ -2489,9 +2489,12 @@ impl GraphMemory {
         }
     }
 
-    /// Delete an entity and all its index entries.
+    /// Delete an entity, every relationship it is an endpoint of, and all its
+    /// index entries.
     ///
-    /// Removes the entity from:
+    /// Removes:
+    /// 0. each relationship the `entity_edges` index lists for it, through
+    ///    `delete_relationship`, so no edge is left pointing at nothing
     /// 1. `entities` CF (primary storage)
     /// 2. `entity_name_index` (exact name → UUID)
     /// 3. `entity_lowercase_index` (lowercase name → UUID)
@@ -2506,6 +2509,24 @@ impl GraphMemory {
             Some(e) => e,
             None => return Ok(false),
         };
+
+        // 0. Remove its relationships (keys are "{entity}:{edge}")
+        let edge_prefix = format!("{uuid}:");
+        let edge_uuids: Vec<Uuid> = self
+            .store
+            .scan_cf(CF_ENTITY_EDGES, Some(edge_prefix.as_bytes()), None)?
+            .into_iter()
+            .map_while(|(key, _)| {
+                std::str::from_utf8(&key)
+                    .ok()?
+                    .strip_prefix(&edge_prefix)
+                    .map(|rest| Uuid::parse_str(rest).ok())
+            })
+            .flatten()
+            .collect();
+        for edge_uuid in &edge_uuids {
+            self.delete_relationship(edge_uuid)?;
+        }
 
         // 1. Remove from entities CF
         self.store.delete_cf(CF_ENTITIES, uuid.as_bytes())?;
@@ -8515,6 +8536,65 @@ mod tests {
         assert!(strength.is_some());
         let s = strength.unwrap();
         assert!(s > 0.75 && s <= 0.8, "Strength should be ~0.8, got {}", s);
+    }
+
+    #[test]
+    fn deleting_an_entity_deletes_the_relationships_it_is_an_endpoint_of() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let entity = |name: &str| EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        };
+        let edge = |from: Uuid, to: Uuid| RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::RelatedTo,
+            strength: 0.8,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            created_by: EdgeSource::CoOccurrence,
+            entity_confidence: None,
+            forward_strength: 0.8,
+            backward_strength: 0.8,
+        };
+        let [a_id, b_id, c_id] =
+            ["Aster", "Birch", "Cedar"].map(|name| graph.add_entity(entity(name)).unwrap());
+        graph.add_relationship(edge(a_id, b_id)).unwrap();
+        graph.add_relationship(edge(c_id, a_id)).unwrap();
+        let kept = graph.add_relationship(edge(b_id, c_id)).unwrap();
+
+        assert!(graph.delete_entity(&a_id).unwrap());
+
+        let left: Vec<Uuid> = graph
+            .get_all_relationships()
+            .unwrap()
+            .iter()
+            .map(|e| e.uuid)
+            .collect();
+        assert_eq!(left, vec![kept]);
+        assert_eq!(graph.get_entity_relationships(&b_id).unwrap().len(), 1);
+        assert_eq!(graph.get_entity_relationships(&c_id).unwrap().len(), 1);
+        assert!(graph.get_entity_relationships(&a_id).unwrap().is_empty());
     }
 
     #[test]
