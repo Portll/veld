@@ -25,20 +25,28 @@ pub use storage::{StoredGap, StoredMemoryRow, StoredThought};
 
 use super::gap_topology::GapStore;
 
-use crate::graph_memory::{EdgeTier, EntityNode, LtpStatus, RelationshipEdge};
+use crate::graph_memory::{
+    EdgeSource, EdgeTier, EntityNode, LtpStatus, RelationType, RelationshipEdge,
+};
 use crate::keystore::SecretCryptor;
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 /// Statistics from a graph → SQLite sync operation
 #[derive(Debug, Default)]
 pub struct SyncStats {
     pub entities_upserted: usize,
     pub edges_upserted: usize,
+    /// Co-retrieval edges between memories, which the entity mirror leaves out.
+    pub edges_between_memories: usize,
+    /// Other edges left out because an endpoint is not among the synced entities.
+    pub edges_dangling: usize,
     pub duration_ms: u64,
 }
 
@@ -571,18 +579,33 @@ impl SlowStore {
             self.encryptor.as_ref(),
             &self.enc,
         )?;
-        Self::sync_edges(&tx, edges, &mut stats, self.encryptor.as_ref(), &self.enc)?;
+        let synced: HashSet<Uuid> = entities.iter().map(|e| e.uuid).collect();
+        Self::sync_edges(
+            &tx,
+            edges,
+            &synced,
+            &mut stats,
+            self.encryptor.as_ref(),
+            &self.enc,
+        )?;
 
         tx.commit()?;
         stats.duration_ms = start.elapsed().as_millis() as u64;
+        if stats.edges_dangling > 0 {
+            tracing::warn!(
+                dangling = stats.edges_dangling,
+                "SlowStore sync left out edges whose endpoint is not in the graph's entities"
+            );
+        }
 
         // Record sync timestamp for TTL-based skip
         *self.last_sync.lock() = Some(std::time::Instant::now());
 
         tracing::info!(
-            "SlowStore sync complete: {} entities, {} edges in {}ms",
+            "SlowStore sync complete: {} entities, {} edges ({} memory co-retrieval edges left out) in {}ms",
             stats.entities_upserted,
             stats.edges_upserted,
+            stats.edges_between_memories,
             stats.duration_ms
         );
         Ok(stats)
@@ -649,9 +672,16 @@ impl SlowStore {
         Ok(())
     }
 
+    /// Mirrors the edges between synced entities. GraphMemory keeps memory
+    /// co-retrieval edges (`CoRetrieved`, endpoints are memory ids; edges written
+    /// before `created_by` existed read back as `CoOccurrence`) beside entity
+    /// edges; those, and any edge to an entity the graph no longer returns, would
+    /// break the entities foreign key and roll back the whole sync, so they are
+    /// counted and left out.
     fn sync_edges(
         tx: &Transaction,
         edges: &[RelationshipEdge],
+        synced: &HashSet<Uuid>,
         stats: &mut SyncStats,
         enc: Option<&SecretCryptor>,
         toggles: &SlowStoreEncrypt,
@@ -678,6 +708,16 @@ impl SlowStore {
         )?;
 
         for edge in edges {
+            if !synced.contains(&edge.from_entity) || !synced.contains(&edge.to_entity) {
+                if edge.relation_type == RelationType::CoRetrieved
+                    || edge.created_by == EdgeSource::Coactivation
+                {
+                    stats.edges_between_memories += 1;
+                } else {
+                    stats.edges_dangling += 1;
+                }
+                continue;
+            }
             let tier_str = match edge.tier {
                 EdgeTier::L1Working => "L1Working",
                 EdgeTier::L2Episodic => "L2Episodic",
@@ -985,6 +1025,45 @@ mod tests {
         assert_eq!(stats.entities_upserted, 2);
         assert_eq!(stats.edges_upserted, 2);
         // Collapsed to one connectivity entry for the directed pair.
+        assert_eq!(store.edge_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn sync_mirrors_only_edges_between_entities() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+
+        let a = test_entity("Alice");
+        let b = test_entity("Bob");
+        let gone = test_entity("Dave");
+        let kept = test_edge(a.uuid, b.uuid, crate::graph_memory::RelationType::WorksWith);
+        let dangling = test_edge(
+            a.uuid,
+            gone.uuid,
+            crate::graph_memory::RelationType::WorksWith,
+        );
+        // record_memory_coactivation stores memory ids in from_entity/to_entity;
+        // an edge it wrote before created_by existed reads back as CoOccurrence.
+        let mut co_retrieved = test_edge(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            crate::graph_memory::RelationType::CoRetrieved,
+        );
+        co_retrieved.created_by = EdgeSource::Coactivation;
+        let older_co_retrieved = test_edge(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            crate::graph_memory::RelationType::CoRetrieved,
+        );
+
+        let stats = store
+            .sync_from_graph(&[a, b], &[kept, dangling, co_retrieved, older_co_retrieved])
+            .expect("an edge whose endpoint is not an entity must not roll back the sync");
+        assert_eq!(stats.entities_upserted, 2);
+        assert_eq!(stats.edges_upserted, 1);
+        assert_eq!(stats.edges_between_memories, 2);
+        assert_eq!(stats.edges_dangling, 1);
+        assert_eq!(store.entity_count().unwrap(), 2);
         assert_eq!(store.edge_count().unwrap(), 1);
     }
 
