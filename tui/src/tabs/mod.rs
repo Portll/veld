@@ -6,3 +6,4 @@
 
 pub mod dials;
 pub mod git;
+pub mod loops;
