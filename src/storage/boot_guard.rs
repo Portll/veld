@@ -27,14 +27,8 @@ pub fn user_store_content(user_dir: &Path, backend: StorageBackend) -> Result<St
                 Some(true) => StoreContent::NonEmpty,
             },
         ),
-        // A build without rocksdb cannot count its records, so a store that exists is taken to
-        // hold data: an empty redb beside it is then refused rather than served as healthy.
         #[cfg(not(feature = "legacy-rocksdb"))]
-        StorageBackend::RocksDb => Ok(if exists_file(&user_dir.join("storage").join("CURRENT"))? {
-            StoreContent::NonEmpty
-        } else {
-            StoreContent::Absent
-        }),
+        StorageBackend::RocksDb => rocksdb_files(&user_dir.join("storage")),
         #[cfg(feature = "storage-redb")]
         StorageBackend::Redb => Ok(match crate::storage::redb::user_memory_count(user_dir)? {
             None => StoreContent::Absent,
@@ -101,11 +95,19 @@ pub fn refuse_stranded_data(
     }
 
     if !stranded.is_empty() {
+        let uncounted = if cfg!(feature = "legacy-rocksdb") || other != StorageBackend::RocksDb {
+            ""
+        } else {
+            " This build has no RocksDB code, so a RocksDB store with any table file or non-empty \
+             write-ahead log counts as holding memories: a build with --features legacy-rocksdb \
+             counts them, and a store it finds holds none can be moved aside."
+        };
         bail!(
             "refusing to serve: the {selected} store is empty for {n} user(s) whose memories are \
              in {other}: {users}. Serving would report healthy over an empty store. Set \
              VELD_STORAGE_BACKEND={other} to serve the existing data, or copy it with \
-             `veld migrate --from {other} --to {selected} --dry-run` and then without --dry-run.",
+             `veld migrate --from {other} --to {selected} --dry-run` and then without \
+             --dry-run.{uncounted}",
             n = stranded.len(),
             users = stranded.join(", "),
         );
@@ -311,11 +313,96 @@ mod tests {
     }
 }
 
+/// A RocksDB directory as a build that cannot open it sees it: absent without CURRENT, empty when
+/// no table file and no write-ahead log holds anything, and otherwise taken to hold memories,
+/// since only RocksDB can tell its memories from the default family's other keys.
 #[cfg(not(feature = "legacy-rocksdb"))]
-fn exists_file(path: &Path) -> Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(anyhow::Error::from(e).context(format!("inspecting {}", path.display()))),
+fn rocksdb_files(dir: &Path) -> Result<StoreContent> {
+    let inspect =
+        |e: std::io::Error| anyhow::Error::from(e).context(format!("inspecting {}", dir.display()));
+    match std::fs::metadata(dir.join("CURRENT")) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StoreContent::Absent),
+        Err(e) => return Err(inspect(e)),
+    }
+    for entry in std::fs::read_dir(dir).map_err(inspect)? {
+        let entry = entry.map_err(inspect)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let table = name.ends_with(".sst") || name.ends_with(".blob");
+        let wal = name
+            .strip_suffix(".log")
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
+        if table || wal && entry.metadata().map_err(inspect)?.len() > 0 {
+            return Ok(StoreContent::NonEmpty);
+        }
+    }
+    Ok(StoreContent::Empty)
+}
+
+#[cfg(all(test, not(feature = "legacy-rocksdb")))]
+mod without_rocksdb {
+    use super::*;
+
+    /// A RocksDB directory as RocksDB leaves an empty store, plus `extra` files of the given sizes.
+    fn rocksdb_dir(user_dir: &Path, extra: &[(&str, usize)]) {
+        let dir = user_dir.join("storage");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, size) in [
+            ("CURRENT", 16),
+            ("IDENTITY", 36),
+            ("LOCK", 0),
+            ("LOG", 19331),
+            ("LOG.old.1785887307401456", 82050),
+            ("MANIFEST-000005", 232),
+            ("OPTIONS-000007", 17332),
+            ("000004.log", 0),
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        {
+            std::fs::write(dir.join(name), vec![b'x'; size]).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_store_with_no_table_file_and_empty_logs_is_empty_and_boots_on_redb() {
+        let base = tempfile::tempdir().unwrap();
+        rocksdb_dir(&base.path().join("test"), &[]);
+        assert_eq!(
+            user_store_content(&base.path().join("test"), StorageBackend::RocksDb).unwrap(),
+            StoreContent::Empty
+        );
+        let census =
+            refuse_stranded_data(base.path(), StorageBackend::Redb, &["test".to_string()]).unwrap();
+        assert_eq!((census.rocksdb, census.redb), (0, Some(0)));
+    }
+
+    #[test]
+    fn a_table_file_or_a_written_log_counts_as_memories_and_the_refusal_says_why() {
+        let base = tempfile::tempdir().unwrap();
+        rocksdb_dir(&base.path().join("tables"), &[("000009.sst", 1322)]);
+        rocksdb_dir(&base.path().join("logged"), &[("000016.log", 64)]);
+        rocksdb_dir(&base.path().join("blobs"), &[("000010.blob", 10)]);
+        let users: Vec<String> = ["tables", "logged", "blobs"].map(String::from).to_vec();
+        let msg = refuse_stranded_data(base.path(), StorageBackend::Redb, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("3 user(s)") && msg.contains("--features legacy-rocksdb counts them"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn no_current_file_is_no_store() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("ghost");
+        std::fs::create_dir_all(dir.join("storage")).unwrap();
+        std::fs::write(dir.join("storage").join("000004.sst"), b"x").unwrap();
+        assert_eq!(
+            user_store_content(&dir, StorageBackend::RocksDb).unwrap(),
+            StoreContent::Absent
+        );
     }
 }
