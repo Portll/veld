@@ -40,7 +40,9 @@ use crate::storage::portable::{self, PortableRecord, PortableWriter};
 pub const FORMAT: &str = "veld-logical-1";
 const MANIFEST: &str = "MANIFEST.json";
 const META: &str = "meta";
+#[cfg(feature = "legacy-rocksdb")]
 const VMAPPING: &[u8] = b"vmapping:";
+#[cfg(feature = "legacy-rocksdb")]
 /// `MemoryStorage::cleanup_corrupted`'s list: rows in the rocksdb default family that are
 /// not memories even when their key happens to be 16 bytes long.
 const NON_MEMORY_PREFIXES: &[&[u8]] = &[
@@ -60,6 +62,7 @@ const NON_MEMORY_PREFIXES: &[&[u8]] = &[
     b"learning:",
     b"geo:",
 ];
+#[cfg(feature = "legacy-rocksdb")]
 const ROCKS_BATCH_OPS: usize = 10_000;
 
 /// What one dump holds: one user's per-user stores, or the stores every user shares.
@@ -488,6 +491,7 @@ pub fn extract_live<W: Write>(
     run_sink(unit, out, None, |sink| redb_unit(sink, base, unit, live))
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 fn refuse_if_encrypted(storage_dir: &Path) -> Result<()> {
     let keystore = storage_dir.join("keystore.json");
     if exists(&keystore)? {
@@ -502,6 +506,39 @@ fn refuse_if_encrypted(storage_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "legacy-rocksdb"))]
+const NO_ROCKSDB: &str =
+    "this build has no RocksDB support; rebuild veld with `--features legacy-rocksdb` to read or write a RocksDB store";
+
+#[cfg(not(feature = "legacy-rocksdb"))]
+fn rocks_primary<W: Write>(_sink: &mut Sink<W>, _dir: &Path) -> Result<()> {
+    bail!(NO_ROCKSDB)
+}
+
+#[cfg(not(feature = "legacy-rocksdb"))]
+fn rocks_families<W: Write>(
+    _sink: &mut Sink<W>,
+    _dir: &Path,
+    _logical: impl Fn(&str) -> String,
+) -> Result<()> {
+    bail!(NO_ROCKSDB)
+}
+
+#[cfg(not(feature = "legacy-rocksdb"))]
+fn apply_rocks_raw(
+    _dir: &Path,
+    _records: Vec<PortableRecord>,
+    _family_for: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
+    bail!(NO_ROCKSDB)
+}
+
+#[cfg(not(feature = "legacy-rocksdb"))]
+fn apply_rocks_primary(_user_dir: &Path, _records: Vec<PortableRecord>) -> Result<()> {
+    bail!(NO_ROCKSDB)
+}
+
+#[cfg(feature = "legacy-rocksdb")]
 fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
     use rocksdb::{Direction, IteratorMode};
     refuse_if_encrypted(dir)?;
@@ -590,6 +627,7 @@ fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 fn rocks_families<W: Write>(
     sink: &mut Sink<W>,
     dir: &Path,
@@ -1384,6 +1422,7 @@ fn apply_redb<'a>(
     Ok(())
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 fn open_rocks_for_import(dir: &Path, families: &[String]) -> Result<rocksdb::DB> {
     std::fs::create_dir_all(dir)?;
     let mut opts = rocksdb::Options::default();
@@ -1416,6 +1455,7 @@ fn open_rocks_for_import(dir: &Path, families: &[String]) -> Result<rocksdb::DB>
     Ok(db)
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 fn write_rocks(
     db: &rocksdb::DB,
     rows: impl Iterator<Item = Result<(String, Vec<u8>, Vec<u8>)>>,
@@ -1438,6 +1478,7 @@ fn write_rocks(
     Ok(())
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 fn apply_rocks_raw(
     dir: &Path,
     records: Vec<PortableRecord>,
@@ -1466,6 +1507,7 @@ fn apply_rocks_raw(
     Ok(())
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 fn apply_rocks_primary(user_dir: &Path, records: Vec<PortableRecord>) -> Result<()> {
     let storage = user_dir.join("storage");
     refuse_if_encrypted(&storage)?;
@@ -1658,13 +1700,13 @@ impl Drop for WorkDir {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-rocksdb"))]
 pub(crate) const UNDECODABLE_VALUE: &[u8] = b"\xff\xfe\xfd this was never a memory";
 
 /// Writes a 16-byte-keyed value into a user's rocksdb primary store that no format decoder
 /// accepts. The runtime reader's raw-UTF-8 fallback still fabricates a memory from it,
 /// which is the case a migration must refuse.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-rocksdb"))]
 pub(crate) fn plant_undecodable_rocks_memory(user_dir: &Path) -> uuid::Uuid {
     let bad = uuid::Uuid::new_v4();
     let db = rocksdb::DB::open_cf(
@@ -1678,5 +1720,5 @@ pub(crate) fn plant_undecodable_rocks_memory(user_dir: &Path) -> uuid::Uuid {
     bad
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-rocksdb"))]
 mod tests;

@@ -1,3 +1,4 @@
+#![cfg(feature = "legacy-rocksdb")]
 //! End-to-end record-level encryption (encryption-v2, P2) against a real RocksDB.
 //!
 //! Runs in its own test binary so setting `VELD_MASTER_PASSPHRASE` cannot leak

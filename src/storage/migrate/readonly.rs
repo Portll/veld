@@ -9,12 +9,14 @@ use anyhow::{bail, Context, Result};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+#[cfg(feature = "legacy-rocksdb")]
 /// A rocksdb store opened read-only, with every column family it has.
 pub(crate) struct RocksReadOnly {
     pub db: rocksdb::DB,
     pub column_families: Vec<String>,
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 /// `Ok(None)` only when the store is absent (no `CURRENT` file). Any other failure to
 /// look is an error, never an empty store.
 pub(crate) fn open_rocks(dir: &Path) -> Result<Option<RocksReadOnly>> {

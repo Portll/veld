@@ -16,21 +16,26 @@ pub(crate) fn column_stores(
     families: &[&str],
 ) -> Vec<(StorageBackend, Arc<dyn ColumnStore>, TempDir)> {
     let mut out: Vec<(StorageBackend, Arc<dyn ColumnStore>, TempDir)> = Vec::new();
+    #[cfg(not(feature = "legacy-rocksdb"))]
+    let _ = families;
 
-    let tmp = TempDir::new().unwrap();
-    let mut opts = rocksdb::Options::default();
-    opts.create_if_missing(true);
-    opts.create_missing_column_families(true);
-    let mut names = vec!["default"];
-    names.extend(families.iter().copied());
-    let db = rocksdb::DB::open_cf(&opts, tmp.path(), names).unwrap();
-    out.push((
-        StorageBackend::RocksDb,
-        Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnStore::new(
-            Arc::new(db),
-        )),
-        tmp,
-    ));
+    #[cfg(feature = "legacy-rocksdb")]
+    {
+        let tmp = TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let mut names = vec!["default"];
+        names.extend(families.iter().copied());
+        let db = rocksdb::DB::open_cf(&opts, tmp.path(), names).unwrap();
+        out.push((
+            StorageBackend::RocksDb,
+            Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnStore::new(
+                Arc::new(db),
+            )),
+            tmp,
+        ));
+    }
 
     #[cfg(feature = "storage-redb")]
     {
@@ -73,10 +78,11 @@ pub(crate) fn key_value_stores(
         .collect()
 }
 
-/// Refuses a build that silently dropped a backend: a loop over one store
-/// passes every assertion while proving nothing about the other.
+/// Refuses a run that silently dropped a backend this build enables: a loop over
+/// one store passes every assertion while proving nothing about the other.
 pub(crate) fn assert_both_backends<T>(stores: &[(StorageBackend, T, TempDir)]) {
     let backends: Vec<StorageBackend> = stores.iter().map(|(b, _, _)| *b).collect();
+    #[cfg(feature = "legacy-rocksdb")]
     assert!(
         backends.contains(&StorageBackend::RocksDb),
         "no rocksdb store under test"

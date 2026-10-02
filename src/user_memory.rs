@@ -14,6 +14,7 @@ pub use crate::graph_memory::{
     EntityNode, EpisodicNode, GraphMemory, GraphStats, RelationshipEdge,
 };
 pub use crate::memory::hybrid_search::BM25Index;
+#[cfg(feature = "legacy-rocksdb")]
 pub use crate::memory::storage::MemoryStorage;
 pub use crate::memory::{Experience, Memory, MemoryConfig, MemoryId, MemoryStats};
 pub use crate::storage::{
@@ -37,13 +38,17 @@ pub struct UserMemory {
 
 impl UserMemory {
     /// Create a substrate using the current default storage bootstrap path.
-    pub fn new(config: MemoryConfig, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
+    pub fn new(
+        config: MemoryConfig,
+        shared_cache: Option<&crate::storage::SharedBlockCache>,
+    ) -> Result<Self> {
         Ok(Self {
             inner: MemorySystem::new(config, shared_cache)?,
         })
     }
 
     /// Create a substrate with an already-opened primary store.
+    #[cfg(feature = "legacy-rocksdb")]
     pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
         Ok(Self {
             inner: MemorySystem::with_storage(config, storage)?,
@@ -59,6 +64,7 @@ impl UserMemory {
     /// Without this seam the read side would open a second on-disk index
     /// at a parallel path and diverge from the writer until the next
     /// process restart triggered a replay catch-up.
+    #[cfg(feature = "legacy-rocksdb")]
     pub fn with_storage_and_bm25_index(
         config: MemoryConfig,
         storage: Arc<MemoryStorage>,
@@ -74,7 +80,7 @@ impl UserMemory {
     pub fn with_primary_store_and_bm25_index(
         config: MemoryConfig,
         primary_store: Arc<dyn crate::storage::PrimaryMemoryStore>,
-        rocksdb_backup_db: Option<Arc<rocksdb::DB>>,
+        rocksdb_backup_db: Option<crate::storage::RocksDbHandle>,
         bm25_index: Arc<BM25Index>,
     ) -> Result<Self> {
         Ok(Self {

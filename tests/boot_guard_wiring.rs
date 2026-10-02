@@ -1,3 +1,4 @@
+#![cfg(feature = "legacy-rocksdb")]
 //! The boot guard is wired: the real manager refuses to start over the outage shape.
 
 #![cfg(feature = "storage-redb")]

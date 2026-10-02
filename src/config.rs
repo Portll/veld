@@ -57,15 +57,21 @@ impl std::str::FromStr for StorageBackend {
 // fix: request rocksdb, because redb is unfinished and every request for it is served rocksdb
 // anyway. Requesting redb made /health report requested:redb / effective:rocksdb beside
 // status:healthy — a request the service did not honour, published as compliance.
+/// redb whenever this build has it, matching the CLI's `--storage-backend` default.
 pub const fn default_requested_storage_backend() -> StorageBackend {
-    StorageBackend::RocksDb
+    #[cfg(feature = "storage-redb")]
+    {
+        StorageBackend::Redb
+    }
+    #[cfg(not(feature = "storage-redb"))]
+    {
+        StorageBackend::RocksDb
+    }
 }
 
-// A request for redb is now honoured: every construction path is wired
-// (bundle, backup engine, MemorySystem, GraphMemory). The five backup
-// OPERATIONS still refuse by name — that is deliberate, not unfinished:
-// the comprehensive backup is a rocksdb BackupEngine facility whose redb
-// route is export/import.
+// Every construction path is wired for redb (bundle, backup engine, MemorySystem,
+// GraphMemory). A rocksdb request in a build without `legacy-rocksdb` stays rocksdb here so
+// bootstrap refuses it by name rather than serving another engine.
 pub const fn effective_storage_backend_for_current_build(
     requested: StorageBackend,
 ) -> StorageBackend {
@@ -1095,8 +1101,13 @@ mod tests {
         assert!(!config.is_production);
         // requested must EQUAL effective by default — a default that asks for a backend the build
         // cannot serve publishes an unhonoured request beside status:healthy.
-        assert_eq!(config.requested_storage_backend, StorageBackend::RocksDb);
-        assert_eq!(config.effective_storage_backend, StorageBackend::RocksDb);
+        let expected = if cfg!(feature = "storage-redb") {
+            StorageBackend::Redb
+        } else {
+            StorageBackend::RocksDb
+        };
+        assert_eq!(config.requested_storage_backend, expected);
+        assert_eq!(config.effective_storage_backend, expected);
     }
 
     #[test]

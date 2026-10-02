@@ -2303,6 +2303,7 @@ impl Memory {
         self.metadata.lock().importance = importance.clamp(0.0, 1.0);
     }
 
+    #[cfg_attr(not(feature = "legacy-rocksdb"), allow(dead_code))]
     /// Set the raw access count (thread-safe).
     ///
     /// Used by the S-R6 semantic merge pass to pool evidence from the loser

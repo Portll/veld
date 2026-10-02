@@ -51,18 +51,25 @@
 //! any that are older than [`SEMANTIC_MERGE_GC_MAX_AGE_SECS`] AND have no
 //! inbound refs.  Called from `run_maintenance` on heavy cycles.
 
+#[cfg(feature = "legacy-rocksdb")]
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+#[cfg(feature = "legacy-rocksdb")]
 use rocksdb::{IteratorMode, WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "legacy-rocksdb")]
 use crate::constants::{
     SEMANTIC_MERGE_ENABLED, SEMANTIC_MERGE_GC_MAX_AGE_SECS, SEMANTIC_MERGE_GC_QUIESCENCE_SECS,
     SEMANTIC_MERGE_SIMILARITY_THRESHOLD,
 };
-use crate::memory::types::{EntityRef, MemoryId};
+#[cfg(feature = "legacy-rocksdb")]
+use crate::memory::types::EntityRef;
+use crate::memory::types::MemoryId;
+#[cfg(feature = "legacy-rocksdb")]
 use crate::similarity::cosine_similarity;
 
+#[cfg(feature = "legacy-rocksdb")]
 use super::storage::MemoryStorage;
 
 // ============================================================================
@@ -71,10 +78,12 @@ use super::storage::MemoryStorage;
 
 /// Key prefix for merge-audit rows in the default CF.
 /// Full key: `merge_audit:{user_id}:{audit_id}`
+#[cfg(feature = "legacy-rocksdb")]
 pub(super) const AUDIT_PREFIX: &str = "merge_audit:";
 
 /// Key prefix for tombstone markers in the default CF.
 /// Full key: `merge_tombstone:{user_id}:{loser_id}`
+#[cfg(feature = "legacy-rocksdb")]
 pub(super) const TOMBSTONE_PREFIX: &str = "merge_tombstone:";
 
 /// Immutable audit record written as the atomic commit point of every merge.
@@ -129,6 +138,7 @@ pub struct MergeCandidate {
 // MemoryStorage methods — the public API surface for merge operations
 // ============================================================================
 
+#[cfg(feature = "legacy-rocksdb")]
 impl MemoryStorage {
     // -------------------------------------------------------------------------
     // Candidate detection
@@ -661,7 +671,7 @@ impl MemoryStorage {
 // Tests
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-rocksdb"))]
 pub(super) mod tests {
     use super::*;
     use crate::memory::storage::MemoryStorage;
