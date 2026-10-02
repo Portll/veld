@@ -1408,53 +1408,58 @@ impl RelevanceEngine {
             // Build set of already-found memory IDs to avoid duplicates
             let found_ids: HashSet<Uuid> = graph_results.iter().map(|(m, _, _)| m.id.0).collect();
 
+            // Each memory once, at the best score any traversal gives it; only the
+            // max_candidates best are fetched.
+            let mut graph_candidates: HashMap<Uuid, (f32, Vec<String>)> = HashMap::new();
+
             // Limit graph lookups to avoid latency spikes
             let max_graph_lookups = 5;
-            for (idx, entity) in entities.iter().enumerate() {
-                if idx >= max_graph_lookups {
-                    break;
-                }
-
+            for entity in entities.iter().take(max_graph_lookups) {
                 if let Ok(Some(entity_node)) = graph.find_entity_by_name(&entity.name) {
                     // GRAPH TRAVERSAL: Traverse to connected entities (5 hops for deep multi-hop reasoning)
                     // Decay factor (0.86^hop) naturally down-weights distant connections
                     if let Ok(traversal) = graph.traverse_from_entity(&entity_node.uuid, 5) {
                         for traversed in &traversal.entities {
-                            // Get episodes (memories) connected to this entity
-                            if let Ok(episodes) =
-                                graph.get_episodes_by_entity(&traversed.entity.uuid)
-                            {
-                                for episode in episodes.iter().take(10) {
-                                    // Episode UUID = Memory ID (we store it this way in remember())
-                                    let memory_id = crate::memory::MemoryId(episode.uuid);
-
-                                    // Skip if already found
-                                    if found_ids.contains(&episode.uuid) {
-                                        continue;
-                                    }
-
-                                    // Score = confidence * salience * decay_factor
-                                    // decay_factor accounts for hop distance (0.7^hop)
-                                    let score = entity.confidence
-                                        * traversed.entity.salience
-                                        * traversed.decay_factor;
-                                    if score >= config.entity_threshold {
-                                        // Direct memory lookup by ID (fast!)
-                                        if let Ok(memory) = memory_system.get_memory(&memory_id) {
-                                            graph_results.push((
-                                                memory,
-                                                score,
-                                                vec![
-                                                    entity.name.clone(),
-                                                    traversed.entity.name.clone(),
-                                                ],
-                                            ));
-                                        }
-                                    }
+                            // Score = confidence * salience * decay_factor; decay_factor accounts
+                            // for hop distance. It does not depend on the episodes, so an entity
+                            // below the threshold reads none.
+                            let score = entity.confidence
+                                * traversed.entity.salience
+                                * traversed.decay_factor;
+                            if score < config.entity_threshold {
+                                continue;
+                            }
+                            let Ok(episodes) =
+                                graph.get_episodes_by_entity_limited(&traversed.entity.uuid, 10)
+                            else {
+                                continue;
+                            };
+                            // Episode UUID = Memory ID (we store it this way in remember())
+                            for episode in episodes {
+                                if found_ids.contains(&episode.uuid) {
+                                    continue;
+                                }
+                                let best = graph_candidates
+                                    .entry(episode.uuid)
+                                    .or_insert((f32::MIN, Vec::new()));
+                                if score > best.0 {
+                                    *best = (
+                                        score,
+                                        vec![entity.name.clone(), traversed.entity.name.clone()],
+                                    );
                                 }
                             }
                         }
                     }
+                }
+            }
+
+            let mut ranked: Vec<_> = graph_candidates.into_iter().collect();
+            // Score desc; tie-break by id asc for deterministic candidate selection (RH-10).
+            ranked.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
+            for (id, (score, matched)) in ranked.into_iter().take(max_candidates) {
+                if let Ok(memory) = memory_system.get_memory(&crate::memory::MemoryId(id)) {
+                    graph_results.push((memory, score, matched));
                 }
             }
         }
