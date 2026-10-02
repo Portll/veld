@@ -3697,6 +3697,16 @@ impl GraphMemory {
     /// Collects episode UUIDs first, then batch-reads them using multi_get.
     /// Crucial for spreading activation algorithm.
     pub fn get_episodes_by_entity(&self, entity_uuid: &Uuid) -> Result<Vec<EpisodicNode>> {
+        self.get_episodes_by_entity_limited(entity_uuid, usize::MAX)
+    }
+
+    /// The first `limit` episodes `get_episodes_by_entity` would return, reading no more
+    /// episode records than it takes to decode them.
+    pub fn get_episodes_by_entity_limited(
+        &self,
+        entity_uuid: &Uuid,
+        limit: usize,
+    ) -> Result<Vec<EpisodicNode>> {
         let prefix = format!("{entity_uuid}:");
         tracing::debug!("get_episodes_by_entity: prefix {}", &prefix[..12]);
 
@@ -3724,17 +3734,15 @@ impl GraphMemory {
             return Ok(Vec::new());
         }
 
-        // Phase 2: Batch read all episodes using multi_get (single RocksDB call)
-        let keys: Vec<[u8; 16]> = episode_uuids.iter().map(|u| *u.as_bytes()).collect();
-        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-
-        let results: Vec<anyhow::Result<Option<Vec<u8>>>> = key_refs
-            .iter()
-            .map(|k| self.store.get_cf(CF_EPISODES, k))
-            .collect();
-
-        let mut episodes = Vec::with_capacity(episode_uuids.len());
-        for value in results.into_iter().flatten().flatten() {
+        // Phase 2: read episodes in index order until `limit` decode
+        let mut episodes = Vec::with_capacity(episode_uuids.len().min(limit));
+        for uuid in &episode_uuids {
+            if episodes.len() >= limit {
+                break;
+            }
+            let Ok(Some(value)) = self.store.get_cf(CF_EPISODES, uuid.as_bytes()) else {
+                continue;
+            };
             if let Ok((episode, _)) = bincode::serde::decode_from_slice::<EpisodicNode, _>(
                 &value,
                 bincode::config::standard(),
@@ -3811,6 +3819,10 @@ impl GraphMemory {
             let mut next_level = Vec::new();
 
             for (entity_uuid, _hop) in &current_level {
+                // The limit holds within a level too: one level of a hub can reach thousands.
+                if all_entities.len() >= MAX_ENTITIES {
+                    break;
+                }
                 // Use limited edge reading
                 let edges =
                     self.get_entity_relationships_limited(entity_uuid, Some(MAX_EDGES_PER_NODE))?;
