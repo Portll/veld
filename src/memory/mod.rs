@@ -74,6 +74,7 @@ use crate::constants::{
     TIER_PROMOTION_WORKING_IMPORTANCE,
 };
 
+#[cfg(feature = "legacy-rocksdb")]
 use crate::memory::storage::MemoryStorage;
 pub use crate::memory::types::*;
 
@@ -281,7 +282,7 @@ pub struct MemorySystem {
     /// refuse rather than degrade. Deliberately NOT on PrimaryMemoryStore:
     /// a trait carrying Option<Arc<rocksdb::DB>> would pin rocksdb into the
     /// default build exactly as the get_db() call sites did.
-    rocksdb_backup_db: Option<Arc<rocksdb::DB>>,
+    rocksdb_backup_db: Option<crate::storage::RocksDbHandle>,
 
     /// The live redb primary database; the redb backup must read through it, as redb admits one opener.
     #[cfg(feature = "storage-redb")]
@@ -614,7 +615,11 @@ impl MemorySystem {
     /// If `shared_cache` is provided, all per-user RocksDB instances share the
     /// same LRU block cache (multi-tenant server mode). Pass `None` for
     /// standalone / test use — each DB gets a small local cache.
-    pub fn new(config: MemoryConfig, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
+    #[cfg(feature = "legacy-rocksdb")]
+    pub fn new(
+        config: MemoryConfig,
+        shared_cache: Option<&crate::storage::SharedBlockCache>,
+    ) -> Result<Self> {
         let storage = Arc::new(
             MemoryStorage::new(&config.storage_path, shared_cache)
                 .with_context(|| format!("Failed to open storage at {:?}", config.storage_path))?,
@@ -631,6 +636,26 @@ impl MemorySystem {
     /// attached). Use [`MemorySystem::with_storage_and_bm25_index`] when
     /// the caller already holds the projection-owned handle and wants
     /// the retrieval engine to share it.
+    /// Create a memory system on a redb primary store at `config.storage_path`.
+    #[cfg(all(feature = "storage-redb", not(feature = "legacy-rocksdb")))]
+    pub fn new(
+        config: MemoryConfig,
+        _shared_cache: Option<&crate::storage::SharedBlockCache>,
+    ) -> Result<Self> {
+        let primary = crate::storage::redb::RedbPrimaryMemoryStore::open(&config.storage_path)
+            .with_context(|| format!("Failed to open storage at {:?}", config.storage_path))?;
+        let database = primary.database();
+        let bm25_index = Arc::new(
+            hybrid_search::BM25Index::new(&config.storage_path.join(BM25_INDEX_DIR))
+                .context("Failed to open BM25 index for hybrid search")?,
+        );
+        let mut system =
+            Self::with_primary_store_and_bm25_index(config, Arc::new(primary), None, bm25_index)?;
+        system.attach_redb_backup_db(database);
+        Ok(system)
+    }
+
+    #[cfg(feature = "legacy-rocksdb")]
     pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
         let bm25_path = config.storage_path.join(BM25_INDEX_DIR);
         let bm25_index = Arc::new(
@@ -652,6 +677,7 @@ impl MemorySystem {
     /// [`HybridSearchEngine`] as soon as the projection's `commit()` +
     /// `reload()` returns — no re-open, no second on-disk index, no
     /// "reads diverge until the next backfill" drift window.
+    #[cfg(feature = "legacy-rocksdb")]
     pub fn with_storage_and_bm25_index(
         config: MemoryConfig,
         storage: Arc<MemoryStorage>,
@@ -671,7 +697,7 @@ impl MemorySystem {
     pub fn with_primary_store_and_bm25_index(
         config: MemoryConfig,
         primary_store: Arc<dyn crate::storage::PrimaryMemoryStore>,
-        rocksdb_backup_db: Option<Arc<rocksdb::DB>>,
+        rocksdb_backup_db: Option<crate::storage::RocksDbHandle>,
         bm25_index: Arc<hybrid_search::BM25Index>,
     ) -> Result<Self> {
         #[cfg(feature = "multi-tenant")]
@@ -4521,7 +4547,7 @@ impl MemorySystem {
     /// other access goes through the storage traits. Reads the field captured
     /// at construction rather than the store, so it survives long_term_memory
     /// becoming a trait object.
-    pub fn rocksdb_for_comprehensive_backup(&self) -> Option<std::sync::Arc<rocksdb::DB>> {
+    pub fn rocksdb_for_comprehensive_backup(&self) -> Option<crate::storage::RocksDbHandle> {
         self.rocksdb_backup_db.clone()
     }
 

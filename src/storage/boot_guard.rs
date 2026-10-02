@@ -19,6 +19,7 @@ pub enum StoreContent {
 
 pub fn user_store_content(user_dir: &Path, backend: StorageBackend) -> Result<StoreContent> {
     match backend {
+        #[cfg(feature = "legacy-rocksdb")]
         StorageBackend::RocksDb => Ok(
             match crate::storage::legacy_rocksdb::user_has_memories(user_dir)? {
                 None => StoreContent::Absent,
@@ -26,6 +27,14 @@ pub fn user_store_content(user_dir: &Path, backend: StorageBackend) -> Result<St
                 Some(true) => StoreContent::NonEmpty,
             },
         ),
+        // A build without rocksdb cannot count its records, so a store that exists is taken to
+        // hold data: an empty redb beside it is then refused rather than served as healthy.
+        #[cfg(not(feature = "legacy-rocksdb"))]
+        StorageBackend::RocksDb => Ok(if exists_file(&user_dir.join("storage").join("CURRENT"))? {
+            StoreContent::NonEmpty
+        } else {
+            StoreContent::Absent
+        }),
         #[cfg(feature = "storage-redb")]
         StorageBackend::Redb => Ok(match crate::storage::redb::user_memory_count(user_dir)? {
             None => StoreContent::Absent,
@@ -109,7 +118,7 @@ pub fn refuse_stranded_data(
     })
 }
 
-#[cfg(all(test, feature = "storage-redb"))]
+#[cfg(all(test, feature = "storage-redb", feature = "legacy-rocksdb"))]
 mod tests {
     use super::*;
     use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId, MemoryTier};
@@ -299,5 +308,14 @@ mod tests {
             refuse_stranded_data(base.path(), StorageBackend::RocksDb, &users(&["corrupt"]))
                 .is_err()
         );
+    }
+}
+
+#[cfg(not(feature = "legacy-rocksdb"))]
+fn exists_file(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("inspecting {}", path.display()))),
     }
 }

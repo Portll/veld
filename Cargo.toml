@@ -442,35 +442,17 @@ debug-assertions = false
 incremental = false     # Full rebuild every time (no incremental artifacts)
 
 [features]
-# Default: runtime targets the redb migration path, while legacy RocksDB remains
-# the active compatibility engine until the storage abstraction is landed.
+# The default build runs on redb and contains no RocksDB code.
 default = ["storage-redb"]
 
-# Backend selection scaffolding for the storage migration.
+# The redb storage engine.
 storage-redb = ["dep:redb"]
 
-# GATES NOTHING TODAY, and that is the honest state rather than an oversight to
-# trip over. Measured 2026-09-01 before believing the TODO below:
-#
-#   * 198 direct `rocksdb::` type uses in src/, of which only 7 are inside
-#     src/storage/. 191 are OUTSIDE it — memory/storage.rs 36, handlers/state.rs 32,
-#     graph_memory.rs 24, backup.rs 16, memory/temporal_facts.rs 12,
-#     user_auth/store.rs 8, memory/facts.rs 8, sleep_time/supersession.rs 7, tail.
-#   * Adding `#[cfg(feature = "legacy-rocksdb")]` to the dependency today makes the
-#     default build fail on those 191, so this feature cannot be switched on in
-#     isolation. It is not one line away.
-#   * AND THE BLOCKER IS NOT THE COUNT. Those call sites use `rocksdb::WriteBatch`
-#     (atomic multi-key), `rocksdb::IteratorMode`/`Direction` (directional cursors)
-#     and `ColumnFamily`. The traits in src/storage/mod.rs expose get/put/delete/
-#     scan_prefix/flush and nothing else — no batch, no cursor, no column family.
-#     Moving a call site is therefore blocked on EXTENDING the trait surface first,
-#     and extending it means implementing the new methods on the redb side too.
-#     `StorageCapabilities::supports_transactional_batch` (src/storage/mod.rs:32) is
-#     already declared `true` for both backends with no API behind it.
-#
-# So the order is: extend the traits -> move the 191 call sites -> then this gate
-# becomes a one-line change. Not before.
-legacy-rocksdb = []
+# The RocksDB engine and what only it provides: reading, exporting or migrating an existing
+# RocksDB store (`veld migrate --from rocksdb`), record-level at-rest encryption and the RocksDB
+# backup engine. Off by default, so the default build needs no libclang or C++ toolchain;
+# without it those paths refuse and name this feature.
+legacy-rocksdb = ["dep:rocksdb"]
 
 # Heavy stress / brute-force test suites. Off by default so the standard
 # test build stays fast and does not compile the aggressive suites. Enable
@@ -522,26 +504,18 @@ telemetry = [
 ]
 
 
+# Optional: built only with `legacy-rocksdb`.
 # jemalloc replaces the system C allocator inside RocksDB's C++ code (not just Rust).
 # Without it, glibc/CRT malloc fragments heavily and never returns memory to the OS.
 # Confirmed fix by rust-rocksdb maintainer (zaidoon1) in facebook/rocksdb#12364.
 # PRs #989 (ran-openai) and #1026 (timothyg-stripe) fixed jemalloc linking in v0.24.0.
-# NOTE: rocksdb is compiled on EVERY platform — this block and the Windows one
-# below. Neither is gated, so `default = ["storage-redb"]` does not spare a default
-# build the bindgen/libclang toolchain or jemalloc.
-#
-# The previous note here read "138 source refs to cfg-gate". Measured 2026-09-01:
-# 198, of which 191 sit outside src/storage/. The count grew ~4x during development
-# while this comment did not, so it under-scoped the work by a factor of four to
-# anyone who trusted it. See the `legacy-rocksdb` feature above for why the count is
-# not even the hard part.
 [target.'cfg(not(windows))'.dependencies]
-rocksdb = { version = "0.24", default-features = false, features = ["lz4", "jemalloc"] }
+rocksdb = { version = "0.24", default-features = false, features = ["lz4", "jemalloc"], optional = true }
 
 # jemalloc doesn't compile with MSVC — Windows uses default CRT allocator.
 # Fundamental fix requires facebook/rocksdb#14403 (custom allocator C API for mimalloc).
 [target.'cfg(windows)'.dependencies]
-rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
+rocksdb = { version = "0.24", default-features = false, features = ["lz4"], optional = true }
 
 [workspace]
 # Standalone workspace - not part of parent kalki-v2

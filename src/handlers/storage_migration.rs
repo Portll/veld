@@ -205,5 +205,5 @@ pub async fn migrate(State(state): State<AppState>, headers: HeaderMap, body: By
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-rocksdb"))]
 mod tests;

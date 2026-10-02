@@ -12,6 +12,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+#[cfg(feature = "legacy-rocksdb")]
 use rocksdb::{ColumnFamilyDescriptor, Options};
 use std::sync::Arc;
 
@@ -95,6 +96,7 @@ impl ProspectiveStore {
     /// Return the column family descriptors needed by ProspectiveStore.
     ///
     /// Call this when opening the shared DB so the CFs are registered.
+    #[cfg(feature = "legacy-rocksdb")]
     pub fn column_family_descriptors() -> Vec<ColumnFamilyDescriptor> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -106,6 +108,7 @@ impl ProspectiveStore {
         ]
     }
 
+    #[cfg_attr(not(feature = "legacy-rocksdb"), allow(dead_code))]
     /// Pre-column-family standalone DBs under the data root, imported into these
     /// families by the rocksdb boot path before the store is bound.
     pub(crate) const LEGACY_SEPARATE_DBS: &'static [(&'static str, &'static str)] = &[
@@ -721,7 +724,7 @@ impl ProspectiveStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-rocksdb"))]
 mod tests {
     use super::*;
     use crate::storage::legacy_rocksdb::RocksDbColumnStore;

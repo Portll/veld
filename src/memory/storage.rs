@@ -3,21 +3,27 @@
 use anyhow::{anyhow, Context, Result};
 use bincode;
 use chrono::{DateTime, Utc};
+#[cfg(feature = "legacy-rocksdb")]
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB,
 };
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "legacy-rocksdb")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "legacy-rocksdb")]
 use std::sync::Arc;
 
 use super::types::*;
 
 /// Helper trait to safely iterate over RocksDB results with error logging.
 /// Unlike `.flatten()` which silently ignores errors, this logs them.
+#[cfg(feature = "legacy-rocksdb")]
 trait LogErrors<T> {
     fn log_errors(self) -> impl Iterator<Item = T>;
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 impl<I, T, E> LogErrors<T> for I
 where
     I: Iterator<Item = Result<T, E>>,
@@ -645,6 +651,7 @@ pub(crate) fn portable_memory_value(data: &[u8]) -> Result<std::borrow::Cow<'_, 
     Ok(std::borrow::Cow::Owned(encoded))
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 #[cfg(test)]
 pub(crate) fn deserialize_memory_for_test(data: &[u8]) -> Result<(Memory, bool)> {
     deserialize_memory(data)
@@ -1222,15 +1229,19 @@ fn crc32_simple(data: &[u8]) -> u32 {
 }
 
 /// Column family name for secondary indices (tags, types, timestamps, etc.)
+#[cfg(feature = "legacy-rocksdb")]
 const CF_INDEX: &str = "memory_index";
 /// Sentinel (in `CF_INDEX`) holding the last-seen keystore generation; rollback guard.
+#[cfg(feature = "legacy-rocksdb")]
 const KEYSTORE_GENERATION_KEY: &[u8] = b"meta:keystore_generation";
 /// General-purpose key-value column family for small per-user blobs (e.g. the
 /// `CognitiveDials` tuning surface) that don't fit the memory/index schemas.
 /// Created on open via `create_missing_column_families`, so it materializes on
 /// existing databases too.
+#[cfg(feature = "legacy-rocksdb")]
 const CF_KV: &str = "kv";
 
+#[cfg(feature = "legacy-rocksdb")]
 /// Storage engine for long-term memory persistence
 ///
 /// Uses a single RocksDB instance with 2 column families:
@@ -1255,6 +1266,7 @@ pub struct MemoryStorage {
     index_blinder: Option<crate::keystore::IndexBlinder>,
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 impl MemoryStorage {
     /// CF accessor for the memory_index column family
     fn index_cf(&self) -> &ColumnFamily {
@@ -3979,6 +3991,7 @@ impl VectorMappingEntry {
     }
 }
 
+#[cfg(feature = "legacy-rocksdb")]
 impl MemoryStorage {
     // =========================================================================
     // ATOMIC VECTOR MAPPING OPERATIONS
@@ -4724,6 +4737,7 @@ mod tests {
 
     use super::wire_fixtures::{encode, memory_with_session, strip_writer_structs};
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// A value that is not a memory but whose tail is UTF-8 used to "decode" through a raw-parse
     /// arm that took the id from the value's first 16 bytes, and `get` then rewrote that
     /// fabrication under the fabricated id. The arm is gone; this pins both halves.
@@ -4752,6 +4766,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     #[test]
     fn lazy_migration_refuses_a_key_the_decoded_id_does_not_match() {
         let (storage, _dir) = test_storage();
@@ -4856,6 +4871,7 @@ mod tests {
         assert!(recover_pre_writer_session(&encode(&no_context)).is_none());
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// Probe-only: AgentSession as written before 4a54053 appended `declared`/`verified`.
     /// bincode is positional, so `#[serde(default)]` on the appended fields does nothing for
     /// records already on disk with a populated context.
@@ -4868,6 +4884,7 @@ mod tests {
         started_at: Option<DateTime<Utc>>,
         parent_repo: Option<PathBuf>,
     }
+    #[cfg(feature = "legacy-rocksdb")]
     #[derive(Deserialize)]
     struct ProbeRichContextPreWriter {
         id: ContextId,
@@ -4893,6 +4910,7 @@ mod tests {
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
     }
+    #[cfg(feature = "legacy-rocksdb")]
     #[derive(Deserialize)]
     struct ProbeExperiencePreWriter {
         experience_type: ExperienceType,
@@ -4941,6 +4959,7 @@ mod tests {
         ner_entities: Vec<NerEntityRecord>,
         cooccurrence_pairs: Vec<(String, String)>,
     }
+    #[cfg(feature = "legacy-rocksdb")]
     /// LegacyMemoryFlatV3 (before edfb43f inserted `persistent` mid-struct on 2026-09-02) plus the
     /// W3.4 trailing facets, so full consumption can be required.
     #[derive(Deserialize)]
@@ -4979,6 +4998,7 @@ mod tests {
         when: WhenFacet,
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// Probe-only layout: veld's Experience WITHOUT the two fields upstream shodh-memory never
     /// had (embeddings_secondary, embedding_degraded), inside the V3 memory shape. A record that
     /// decodes here and nowhere else was written by an upstream-layout binary.
@@ -5005,12 +5025,14 @@ mod tests {
         #[serde(default)]
         _rest: (),
     }
+    #[cfg(feature = "legacy-rocksdb")]
     #[derive(Deserialize)]
     struct ProbeMemoryNoSecondary {
         id: MemoryId,
         experience: ProbeExperienceNoSecondary,
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// Offline diagnostic over a COPY of a store: for each id in VELD_PROBE_IDS (comma-separated),
     /// report which decoder candidate accepts the record, or the distinct error every candidate
     /// gives, and confirm the good records are untouched. Prints no content.
@@ -5589,6 +5611,7 @@ mod tests {
     // R7 — inbound-reference reverse index (F2)
     // ========================================================================
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// Spin up a real per-user MemoryStorage backed by a temp dir.
     fn test_storage() -> (MemoryStorage, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().expect("create tempdir");
@@ -5596,6 +5619,7 @@ mod tests {
         (storage, dir)
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// Build a memory whose experience.related_memories points at `targets`.
     fn memory_referencing(id: MemoryId, targets: &[MemoryId]) -> Memory {
         let now = Utc::now();
@@ -5629,6 +5653,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     #[test]
     fn r7_forward_ref_targets_harvests_all_memory_id_fields() {
         let a = MemoryId(uuid::Uuid::new_v4());
@@ -5685,6 +5710,7 @@ mod tests {
         assert_eq!(targets.len(), 4, "exactly the four distinct targets");
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     #[test]
     fn r7_forward_ref_targets_dedups_and_excludes_self() {
         let a = MemoryId(uuid::Uuid::new_v4());
@@ -5724,6 +5750,7 @@ mod tests {
         assert_eq!(targets, vec![a], "A once, self excluded");
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// (1) store M referencing A,B → inbound_refs(A) contains M; has_inbound_refs(A) true.
     #[test]
     fn r7_store_records_inbound_refs() {
@@ -5748,6 +5775,7 @@ mod tests {
         assert!(storage.inbound_refs(&unref).unwrap().is_empty());
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// (2) delete M → has_inbound_refs(A) false (teardown).
     #[test]
     fn r7_delete_tears_down_inbound_refs() {
@@ -5768,6 +5796,7 @@ mod tests {
         assert!(storage.inbound_refs(&a).unwrap().is_empty());
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// (3) update M to DROP ref to A → inbound_refs(A) no longer contains M.
     /// This is the update-diff hazard: update() does remove_from_indices(old)
     /// then store(new); Option-b teardown (remove all inbound_ref:*:{M}) must
@@ -5802,6 +5831,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// (4) per-user isolation: user-A's index never returns user-B's holders.
     /// Each user has its own MemoryStorage (separate DB), so a target id that
     /// exists in both stores resolves only to the local holder.
@@ -5854,6 +5884,7 @@ mod tests {
     //   (b) A memory cited ONLY by TemporalFact.source_memory_id → has_any_inbound_refs == true
     //   (c) A memory with no citations from any source → has_any_inbound_refs == false
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// (R7b-a) Memory cited only by a SemanticFact.source_memories entry reports
     /// has_any_inbound_refs == true even though the Memory-store reverse index is
     /// empty for it (no Memory-to-Memory edges point at it).
@@ -5906,6 +5937,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// (R7b-b) Memory cited only by a TemporalFact.source_memory_id entry reports
     /// has_any_inbound_refs == true.
     #[test]
@@ -5950,6 +5982,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-rocksdb")]
     /// (R7b-c) A memory with no refs from any source (no Memory-to-Memory edges,
     /// no SemanticFact citations, no TemporalFact citations) reports false.
     #[test]

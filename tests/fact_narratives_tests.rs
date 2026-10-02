@@ -1,3 +1,4 @@
+#![cfg(feature = "legacy-rocksdb")]
 //! Fact Narratives & Active-Fact Filter Enumeration Tests
 //!
 //! Phase A of the facts-port-purge-narratives PR.

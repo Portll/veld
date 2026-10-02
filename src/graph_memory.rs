@@ -5,11 +5,13 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+#[cfg(feature = "legacy-rocksdb")]
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+#[cfg(feature = "legacy-rocksdb")]
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1734,7 +1736,8 @@ pub struct GraphMemory {
     /// Present ONLY when rocksdb-backed: the backup/checkpoint accessor hands
     /// the engine DB to the rocksdb BackupEngine. A store built over another
     /// backend has no engine DB to hold.
-    db: Option<Arc<DB>>,
+    #[cfg_attr(not(feature = "legacy-rocksdb"), allow(dead_code))]
+    db: Option<crate::storage::RocksDbHandle>,
 
     /// The live redb graph database, for the redb backup (redb admits one opener).
     #[cfg(feature = "storage-redb")]
@@ -1807,6 +1810,7 @@ impl GraphMemory {
     /// and named for it: GraphMemory is a rocksdb-backed type, and this handle
     /// feeds the rocksdb BackupEngine's comprehensive archive. Nothing else
     /// should reach through it.
+    #[cfg(feature = "legacy-rocksdb")]
     pub fn rocksdb_for_backup(&self) -> Option<&DB> {
         self.db.as_deref()
     }
@@ -1826,6 +1830,7 @@ impl GraphMemory {
     /// If `shared_cache` is provided, block-cache reads are charged against the
     /// shared LRU cache (recommended for multi-tenant server mode). When `None`,
     /// a small per-instance cache is created (standalone / test use).
+    #[cfg(feature = "legacy-rocksdb")]
     pub fn new(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
         use crate::constants::ROCKSDB_GRAPH_WRITE_BUFFER_BYTES;
 
@@ -1901,6 +1906,21 @@ impl GraphMemory {
         Self::from_store(store, Some(db))
     }
 
+    /// Open the graph store at `path` on redb, as the server opens a tenant's graph.
+    #[cfg(all(feature = "storage-redb", not(feature = "legacy-rocksdb")))]
+    pub fn new(
+        path: &std::path::Path,
+        _shared_cache: Option<&crate::storage::SharedBlockCache>,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(path)?;
+        let database = crate::storage::redb::open_graph_database(path)?;
+        let mut graph = Self::with_store(Arc::new(crate::storage::redb::RedbColumnStore::new(
+            Arc::clone(&database),
+        )))?;
+        graph.attach_redb_backup_db(database);
+        Ok(graph)
+    }
+
     /// Bind a handle directly — the constructor a backend-agnostic caller uses.
     ///
     /// Skips migrate_from_separate_dbs: that is a rocksdb-to-rocksdb import from
@@ -1918,7 +1938,7 @@ impl GraphMemory {
     /// constructors do the same work over whichever engine they were given.
     fn from_store(
         store: Arc<dyn crate::storage::ColumnStore>,
-        db: Option<Arc<DB>>,
+        db: Option<crate::storage::RocksDbHandle>,
     ) -> Result<Self> {
         // Load entity name index from name_index CF (O(n) but faster than deserializing entities)
         // If empty, migrate from entities CF (one-time migration for existing data)
@@ -1989,6 +2009,7 @@ impl GraphMemory {
     ///
     /// Detects old `graph_*` subdirectories, opens them read-only, copies all KV
     /// pairs into the corresponding CF, then renames the old directory for rollback safety.
+    #[cfg(feature = "legacy-rocksdb")]
     fn migrate_from_separate_dbs(base_path: &Path, db: &DB) -> Result<usize> {
         let old_dirs: &[(&str, &str)] = &[
             ("graph_entities", CF_ENTITIES),

@@ -11,11 +11,11 @@ use std::path::Path;
 const BASELINE: &[(&str, usize)] = &[
     ("backup", 16),
     ("graph_memory", 7),
-    ("handlers", 31),
-    ("memory", 78),
+    ("handlers", 20),
+    ("memory", 74),
     ("memory/sleep_time", 0),
     ("user_auth", 4),
-    ("user_memory", 2),
+    ("user_memory", 0),
 ];
 
 fn module_of(rel: &str) -> String {
