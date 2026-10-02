@@ -212,13 +212,17 @@ pub fn chunk_text(text: &str, config: &ChunkConfig) -> ChunkResult {
         if end >= original_length {
             break;
         }
-        // Ensure new start is on a valid char boundary
-        start = ceil_char_boundary(text, end.saturating_sub(config.overlap));
-
-        // Ensure we make progress
-        if start <= chunks.len().saturating_sub(1) * (config.chunk_size - config.overlap) {
-            start = ceil_char_boundary(text, end);
-        }
+        // The overlap must never carry the next chunk back to this one's start: a break point
+        // exactly `overlap` bytes in, on a slice too short to emit, otherwise repeats forever while
+        // the last chunk grows without bound.
+        let next = ceil_char_boundary(text, end.saturating_sub(config.overlap));
+        start = if next <= start
+            || next <= chunks.len().saturating_sub(1) * (config.chunk_size - config.overlap)
+        {
+            ceil_char_boundary(text, end)
+        } else {
+            next
+        };
     }
 
     ChunkResult {
@@ -591,6 +595,22 @@ pub fn auto_chunk_text(text: &str) -> ChunkResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_text_advances_past_a_break_exactly_one_overlap_in() {
+        // From byte 1 the only whitespace at or past `min_chunk_size` is the newline 120 bytes in,
+        // the trimmed slice before it is too short to emit, and the overlap lands back on byte 1.
+        let text = format!("y{}   \n{}", "x".repeat(117), "z".repeat(361));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(chunk_text(&text, &ChunkConfig::default()));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("chunk_text did not terminate");
+        assert!(result.chunks.len() <= 3, "{} chunks", result.chunks.len());
+        assert_eq!(result.covered_length, result.original_length);
+    }
 
     #[test]
     fn test_short_text_no_chunking() {

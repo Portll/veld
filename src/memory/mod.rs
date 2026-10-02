@@ -1001,6 +1001,14 @@ impl MemorySystem {
                     match retriever.index_memory(&memory) {
                         Ok(_) => {
                             repaired += 1;
+                            // A repair killed before its final save would start over on the
+                            // next boot, so progress is persisted as it goes.
+                            const REPAIR_SAVE_EVERY: usize = 500;
+                            if repaired % REPAIR_SAVE_EVERY == 0 {
+                                if let Err(e) = retriever.save() {
+                                    tracing::error!("Failed to persist repair progress: {}", e);
+                                }
+                            }
                             if repaired <= 10 || repaired % 100 == 0 {
                                 tracing::info!(
                                     memory_id = %memory.id.0,
