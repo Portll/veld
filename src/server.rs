@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
 use tower::ServiceBuilder;
-use tower_http::timeout::TimeoutLayer;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -432,7 +431,10 @@ async fn async_main() -> Result<()> {
     // (Kubernetes must always be able to determine liveness/readiness)
 
     // Combine routes with global middleware
-    let request_timeout = std::time::Duration::from_secs(server_config.request_timeout_secs);
+    let timeouts = middleware::Timeouts {
+        general: std::time::Duration::from_secs(server_config.request_timeout_secs),
+        gap: std::time::Duration::from_secs(server_config.gap_request_timeout_secs),
+    };
     let app = axum::Router::new()
         .merge(probe_routes)
         .merge(public_routes)
@@ -442,9 +444,9 @@ async fn async_main() -> Result<()> {
                 .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
                 .layer(axum::middleware::from_fn(middleware::security_headers))
                 .layer(axum::middleware::from_fn(middleware::track_metrics))
-                .layer(TimeoutLayer::with_status_code(
-                    axum::http::StatusCode::REQUEST_TIMEOUT,
-                    request_timeout,
+                .layer(axum::middleware::from_fn_with_state(
+                    timeouts,
+                    middleware::request_timeout,
                 ))
                 .layer(tower::limit::ConcurrencyLimitLayer::new(
                     server_config.max_concurrent_requests,

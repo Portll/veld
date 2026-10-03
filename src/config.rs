@@ -469,6 +469,10 @@ pub struct ServerConfig {
     /// Requests exceeding this duration are terminated with 408 status
     pub request_timeout_secs: u64,
 
+    /// Request timeout for `/api/gap/*` in seconds (default: 300). Structural gap
+    /// detection on a large graph outlasts the general timeout.
+    pub gap_request_timeout_secs: u64,
+
     /// Whether running in production mode
     pub is_production: bool,
 
@@ -541,6 +545,7 @@ impl Default for ServerConfig {
             rate_limit_burst: 8000,
             max_concurrent_requests: 200,
             request_timeout_secs: 60,
+            gap_request_timeout_secs: 300,
             is_production: false,
             public_rate_limit: true,
             metrics_public: false,
@@ -715,6 +720,11 @@ impl ServerConfig {
                 }
             }
         }
+        if let Ok(val) = env::var("VELD_GAP_TIMEOUT") {
+            if let Ok(n) = val.parse::<u64>() {
+                config.gap_request_timeout_secs = n.max(1);
+            }
+        }
 
         // CORS configuration
         config.cors = CorsConfig::from_env();
@@ -855,7 +865,10 @@ impl ServerConfig {
             info!("   Rate limit: disabled");
         }
         info!("   Max concurrent: {}", self.max_concurrent_requests);
-        info!("   Request timeout: {}s", self.request_timeout_secs);
+        info!(
+            "   Request timeout: {}s (/api/gap/*: {}s)",
+            self.request_timeout_secs, self.gap_request_timeout_secs
+        );
         info!("   Audit retention: {} days", self.audit_retention_days);
         if self.cors.is_restricted() {
             if self.cors.deny_all {
@@ -905,6 +918,7 @@ pub fn print_env_help() {
     println!("  VELD_RATE_BURST       - Burst size (default: 8000)");
     println!("  VELD_MAX_CONCURRENT   - Max concurrent requests (default: 200)");
     println!("  VELD_REQUEST_TIMEOUT  - Request timeout in seconds (default: 60)");
+    println!("  VELD_GAP_TIMEOUT      - Request timeout for /api/gap/* in seconds (default: 300)");
     println!("  VELD_AUDIT_MAX_ENTRIES    - Max audit entries per user (default: 10000)");
     println!("  VELD_AUDIT_RETENTION_DAYS - Audit log retention days (default: 30)");
     println!();

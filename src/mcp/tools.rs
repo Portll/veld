@@ -654,12 +654,20 @@ impl VeldMcpServer {
             .await;
 
         match result {
+            Ok(resp) if resp.status.as_deref() == Some("running") => {
+                Ok(CallToolResult::success(vec![Content::text(
+                    "**Structural Gap Analysis** is still running for this graph; ask again shortly.\n",
+                )]))
+            }
             Ok(resp) => {
                 let mut output = format!(
                     "**Structural Gap Analysis** ({} gaps, {}ms)\n\n",
                     resp.gaps.len(),
                     resp.duration_ms
                 );
+                if let (Some("stale"), Some(at)) = (resp.status.as_deref(), &resp.computed_at) {
+                    output.push_str(&format!("Computed at {at}; a newer analysis is running.\n\n"));
+                }
 
                 for (gap_type, count) in &resp.type_counts {
                     output.push_str(&format!("- {}: {}\n", gap_type, count));

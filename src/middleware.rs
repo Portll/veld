@@ -6,13 +6,43 @@
 //! - Path normalization to prevent cardinality explosion
 
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::{header::HeaderValue, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// The request timeouts: `/api/gap/*` has its own, every other route the general one.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    pub general: Duration,
+    pub gap: Duration,
+}
+
+impl Timeouts {
+    pub fn for_path(&self, path: &str) -> Duration {
+        if path.starts_with("/api/gap/") {
+            self.gap
+        } else {
+            self.general
+        }
+    }
+}
+
+/// Ends a request that outlasts its route's timeout with 408.
+pub async fn request_timeout(
+    State(timeouts): State<Timeouts>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let limit = timeouts.for_path(req.uri().path());
+    match tokio::time::timeout(limit, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
+}
 
 /// Request ID extension for correlation across logs and errors
 #[derive(Debug, Clone)]
@@ -342,6 +372,47 @@ mod tests {
 
     /// Process-global lock for tests that manipulate environment variables.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn a_gap_route_gets_the_gap_timeout_and_every_other_route_the_general_one() {
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+
+        let timeouts = Timeouts {
+            general: Duration::from_millis(50),
+            gap: Duration::from_secs(5),
+        };
+        assert_eq!(timeouts.for_path("/api/gap/analyze"), timeouts.gap);
+        assert_eq!(timeouts.for_path("/api/recall"), timeouts.general);
+
+        let slow = || async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            "done"
+        };
+        let app = Router::new()
+            .route("/api/gap/analyze", get(slow))
+            .route("/api/recall", get(slow))
+            .layer(axum::middleware::from_fn_with_state(
+                timeouts,
+                request_timeout,
+            ));
+        let status = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        assert_eq!(status("/api/gap/analyze").await, StatusCode::OK);
+        assert_eq!(status("/api/recall").await, StatusCode::REQUEST_TIMEOUT);
+    }
 
     #[test]
     fn test_normalize_path() {

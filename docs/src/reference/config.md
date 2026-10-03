@@ -6,7 +6,7 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **107** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **113** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
@@ -48,6 +48,8 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_EMBED_TIMEOUT_MS` | — | `src/embeddings/minilm.rs` |
 | `VELD_ENFORCE_HTTPS` | — | `src/integrations/mod.rs` |
 | `VELD_ENV` | — | `src/config.rs` |
+| `VELD_EVAL_NOW` | — | `src/memory/ablation.rs` |
+| `VELD_GAP_TIMEOUT` | — | `src/config.rs` |
 | `VELD_HIDE_DEV_KEY` | — | `src/auth.rs` |
 | `VELD_HOST` | — | `src/config.rs` |
 | `VELD_INSTANCE_LABEL` | — | `src/instance_registry.rs` |
@@ -59,7 +61,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_LLM_API_KEY` | — | `src/memory/llm.rs` |
 | `VELD_LLM_ENDPOINT` | — | `src/memory/llm.rs` |
 | `VELD_LLM_HOST` | `_\| decl.default.clone(` | `src/query_parsing/llm_parser.rs` |
-| `VELD_LLM_MODEL` | — | `src/memory/llm.rs` |
+| `VELD_LLM_MODEL` | `_\|` | `src/memory/llm.rs` |
 | `VELD_LLM_REFINER_API_KEY` | — | `src/memory/llm_refiner.rs` |
 | `VELD_LLM_REFINER_ENDPOINT` | — | `src/memory/llm_refiner.rs` |
 | `VELD_LLM_REFINER_MODEL` | — | `src/memory/llm_refiner.rs` |
@@ -87,10 +89,13 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_PACKAGE_DIR` | — | `src/embeddings/minilm.rs` |
 | `VELD_PORT` | — | `src/config.rs` |
 | `VELD_POSTGRES_URL` | — | `src/config.rs` |
+| `VELD_PROBE_IDS` | — | `src/memory/storage.rs` |
+| `VELD_PROBE_STORE` | — | `src/memory/storage.rs` |
 | `VELD_PUBLIC_RATE_LIMIT` | — | `src/config.rs` |
 | `VELD_QUERY_NER` | — | `src/handlers/state.rs` |
 | `VELD_RATE_BURST` | — | `src/config.rs` |
 | `VELD_RATE_LIMIT` | — | `src/config.rs` |
+| `VELD_RECALL_READONLY` | — | `src/recall_harness/runner.rs` |
 | `VELD_RELATIONAL_BACKEND` | — | `src/config.rs` |
 | `VELD_RELATIONAL_SQLITE_PATH` | — | `src/config.rs` |
 | `VELD_REQUEST_TIMEOUT` | — | `src/config.rs` |
@@ -104,6 +109,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_WIKI_DIR` | — | `src/wiki/mod.rs` |
 | `VELD_WIKI_RENDER` | — | `src/wiki/mod.rs` |
 | `VELD_WIKI_WATCH` | — | `src/wiki/watcher.rs` |
+| `VELD_WRITE_BASELINE` | — | `src/recall_harness/runner.rs` |
 | `VELD_WRITE_MODE` | — | `src/memory/storage.rs` |
 | `VELD_ZENOH_API_KEY` | — | `src/embeddings/zenoh_embedder.rs` |
 | `VELD_ZENOH_AUTO_TOPICS` | — | `src/zenoh_transport/config.rs` |
@@ -111,7 +117,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_ZENOH_EMBED_DIMENSION` | — | `src/embeddings/zenoh_embedder.rs` |
 | `VELD_ZENOH_EMBED_ENABLED` | — | `src/memory/mod.rs` |
 | `VELD_ZENOH_EMBED_MODEL` | — | `src/embeddings/zenoh_embedder.rs` |
-| `VELD_ZENOH_EMBED_PREFIX` | — | `src/embeddings/zenoh_embedder.rs` |
+| `VELD_ZENOH_EMBED_PREFIX` | `_\|` | `src/embeddings/zenoh_embedder.rs` |
 | `VELD_ZENOH_EMBED_TIMEOUT_MS` | — | `src/embeddings/zenoh_embedder.rs` |
 | `VELD_ZENOH_ENABLED` | — | `src/zenoh_transport/config.rs` |
 | `VELD_ZENOH_LISTEN` | — | `src/zenoh_transport/config.rs` |
