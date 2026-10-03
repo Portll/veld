@@ -3,9 +3,13 @@ id: 0001
 title: Redb migration target
 status: accepted
 date: 2026-05-28
+amended-by: 0007
 ---
 
 # 0001 — Redb migration target
+
+Amended by [0007](0007-rocksdb-default-engine.md): RocksDB is the default engine and the port
+target; redb becomes the default only when 0007's gates hold.
 
 ## Context
 

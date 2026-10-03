@@ -68,6 +68,9 @@
 - [0002 — LLM wiki dual-pathway](decisions/0002-llm-wiki-dual-pathway.md)
 - [0003 — Epistemic hygiene location](decisions/0003-epistemic-hygiene-location.md)
 - [0004 — Docs sidecar stack](decisions/0004-docs-sidecar-stack.md)
+- [0005 — Facts purge and narratives](decisions/0005-facts-purge-and-narratives.md)
+- [0006 — Backend parity and on-demand migration](decisions/0006-backend-parity-and-on-demand-migration.md)
+- [0007 — RocksDB default engine](decisions/0007-rocksdb-default-engine.md)
 
 ---
 

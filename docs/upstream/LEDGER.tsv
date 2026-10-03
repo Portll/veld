@@ -1,0 +1,323 @@
+direction	upstream_commit	pr	date	theme	wave	status	veld_commit	reason
+in	286461b3		2026-03-27	infra	-	pending		
+in	0b40a0df	141	2026-03-28	graph	W3	pending		
+in	0ed19a54	137	2026-03-28	graph	W3	pending		
+in	f3cba6da	154	2026-03-29	http-api	W10	pending		
+in	390a2075	155	2026-03-29	security	W1	pending		
+in	d45dc56a	156	2026-03-29	retrieval	W2	pending		
+in	9bd59c27	157	2026-03-29	storage-integrity	W7	pending		
+in	1e528403	158	2026-03-29	retrieval	W2	pending		
+in	47d6d1d1	174	2026-03-29	retrieval	W2	pending		
+in	38d49a64	175	2026-03-29	embeddings-vectors	W8	pending		
+in	9f51da05	176	2026-03-29	mcp-hooks	W9	pending		
+in	8327171a	177	2026-03-29	mcp-hooks	W9	pending		
+in	ca1eef91	178	2026-03-29	retrieval	W2	pending		
+in	60e7e5da	179	2026-03-29	http-api	W10	pending		
+in	9a81dd7f	180	2026-03-29	lineage	W4	pending		
+in	7b70730a	181	2026-03-30	mcp-hooks	W9	pending		
+in	2092c858		2026-03-30	http-api	W10	pending		
+in	59dae70f	183	2026-03-31	security	W1	pending		
+in	7a0f0357	191	2026-03-31	http-api	W10	pending		
+in	6653000d	194	2026-04-01	storage-integrity	W7	pending		
+in	aa387b9e	195	2026-04-01	mcp-hooks	W9	pending		
+in	2f8ab23f	196	2026-04-01	mcp-hooks	W9	pending		
+in	8665e387	140	2026-04-01	retrieval	W2	pending		
+in	a27c06a8	198	2026-04-03	graph	W3	pending		
+in	416099e3	199	2026-04-03	storage-integrity	W7	pending		
+in	b18d8e65	200	2026-04-03	graph	W3	pending		
+in	1ffe73cf	201	2026-04-05	mcp-hooks	W9	pending		
+in	20f1b0a7	202	2026-04-05	mcp-hooks	W9	pending		
+in	9eecf0f9	203	2026-04-07	mcp-hooks	W9	pending		
+in	5aa1d5d3	204	2026-04-07	robotics-geo	W12	partial	29108a10	recall tags only; the robotics API surface belongs to W12a
+in	002493b1	211	2026-04-07	lineage	W4	pending		
+in	03e1a040	212	2026-04-08	lineage	W4	pending		
+in	ee9fc43b	213	2026-04-08	graph	W3	pending		
+in	72dfb6ce	214	2026-04-08	ner-entities	W6	pending		
+in	ca0a9fc1	215	2026-04-09	ner-entities	W6	pending		
+in	383f3a9d	217	2026-04-09	ner-entities	W6	pending		
+in	9759a836	218	2026-04-09	mcp-hooks	W9	pending		
+in	099cef94	219	2026-04-09	embeddings-vectors	W8	pending		
+in	1faafc88	220	2026-04-09	infra	-	pending		
+in	e3544189		2026-04-09	infra	-	pending		
+in	cd6b02c8	221	2026-04-09	infra	-	pending		
+in	260ce9b5	222	2026-04-09	infra	-	pending		
+in	61d117bd	225	2026-04-10	embeddings-vectors	W8	ported	ee166804	
+in	1e158e53	224	2026-04-10	robotics-geo	W12	pending		
+in	a4a896c4	226	2026-04-10	infra	-	pending		
+in	f7bd0b4c	227	2026-04-10	lineage	W4	pending		
+in	762d413e	228	2026-04-10	infra	-	pending		
+in	7abb20b1	229	2026-04-11	http-api	W10	pending		
+in	5359c7e7	230	2026-04-12	infra	-	pending		
+in	49cc4a82	233	2026-04-15	embeddings-vectors	W8	pending		
+in	ef0de730	232	2026-04-15	http-api	W10	pending		
+in	dacebb0c	234	2026-04-16	embeddings-vectors	W8	pending		
+in	05a0ef89	235	2026-04-17	facts-todos	W5	ported	2b92620c	build_fact_narratives; veld adds purged_at and is_active
+in	0738ba85	236	2026-04-17	facts-todos	W5	pending		
+in	a3f87a1e	237	2026-04-19	facts-todos	W5	ported	2b92620c	
+in	b08fa351	239	2026-04-19	robotics-geo	W12	pending		
+in	00695870	241	2026-04-19	http-api	W10	pending		
+in	7b882ace	240	2026-04-19	http-api	W10	pending		
+in	82cf1c90	242	2026-04-19	facts-todos	W5	pending		
+in	674abc7c	243	2026-04-19	infra	-	pending		
+in	38b818dd	244	2026-04-19	robotics-geo	W12	pending		
+in	25d54a51	245	2026-04-19	ner-entities	W6	pending		
+in	5e59f676		2026-04-19	facts-todos	W5	pending		
+in	9dbe3a73	246	2026-04-19	facts-todos	W5	pending		
+in	193bfff6	247	2026-04-19	retrieval	W2	pending		
+in	0184d6de	248	2026-04-20	robotics-geo	W12	pending		
+in	ca5a4638	249	2026-04-21	web-ui	W11	pending		
+in	000b68f4	252	2026-04-23	embeddings-vectors	W8	ported	ee166804	
+in	9e69ca9b	254	2026-04-23	eval	W0	pending		
+in	e66ad34d	255	2026-04-23	infra	-	pending		
+in	da23add0	256	2026-04-27	mcp-hooks	W9	pending		
+in	1a6708e9	257	2026-04-27	security	W1	pending		
+in	9a009cd7	258	2026-04-27	ner-entities	W6	pending		
+in	0fb9bbb4	259	2026-04-29	graph	W3	pending		
+in	0d9d8973	260	2026-04-29	ner-entities	W6	pending		
+in	e7cd526e	261	2026-04-29	eval	W0	pending		
+in	fe26edd3	262	2026-04-29	storage-integrity	W7	pending		
+in	9b237617	271	2026-05-02	infra	-	pending		
+in	d4806274	272	2026-05-02	eval	W0	ported	4d5d44d9	harness metrics, fixtures and corpora copied byte-identical
+in	036d9953	273	2026-05-02	eval	W0	ported	4d5d44d9	
+in	67566650	274	2026-05-03	eval	W0	ported	4d5d44d9	
+in	4330aca5	276	2026-05-04	eval	W0	pending		
+in	4bbc5176		2026-05-04	eval	W0	pending		
+in	1ebc54e1		2026-05-04	infra	-	pending		
+in	e69f4dee		2026-05-04	eval	W0	ported	c5c9ed0f	RH-10 (#290)
+in	ca350b14		2026-05-04	eval	W0	ported	c5c9ed0f	RH-10 id and recency tie-breaks (#290)
+in	deb42840		2026-05-04	eval	W0	pending		
+in	b7f0477f		2026-05-05	graph	W3	pending		
+in	ff565ddd		2026-05-05	eval	W0	pending		
+in	3961ad34		2026-05-05	infra	-	pending		
+in	860bfa39		2026-05-06	eval	W0	pending		
+in	e611a7a3		2026-05-07	eval	W0	pending		
+in	45e7b2b6	287	2026-05-24	storage-integrity	W7	ported	643dbd5a	
+in	2a8e78f6		2026-05-29	storage-integrity	W7	pending		
+in	b57b9e95		2026-05-29	embeddings-vectors	W8	pending		
+in	45990686		2026-05-29	retrieval	W2	ported	c5c9ed0f	RH-10 (#290)
+in	b3f68b50		2026-05-29	storage-integrity	W7	pending		
+in	dde789f0	270	2026-05-29	eval	W0	pending		
+in	8018e62d		2026-05-29	eval	W0	ported	7caedd3d	RH-8 LayerMode ladder (#281); report_key labels match upstream
+in	275f47bf		2026-05-29	eval	W0	pending		
+in	56771577		2026-05-29	eval	W0	pending		
+in	3af1dddb		2026-05-29	retrieval	W2	pending		
+in	1419a630	297	2026-05-29	retrieval	W2	pending		
+in	d8f6f89f	298	2026-05-29	lineage	W4	pending		
+in	5d65752e	299	2026-05-29	retrieval	W2	pending		
+in	46124e27	300	2026-05-29	ner-entities	W6	pending		
+in	d2431028	301	2026-05-29	lineage	W4	pending		
+in	3d37bf88	302	2026-05-29	retrieval	W2	pending		
+in	92872f42	303	2026-05-29	ner-entities	W6	pending		
+in	c4937162	304	2026-05-29	retrieval	W2	pending		
+in	ee062736	305	2026-05-30	lineage	W4	pending		
+in	0d7b57c2	306	2026-05-30	eval	W0	pending		
+in	6002c524	307	2026-05-30	retrieval	W2	pending		
+in	3791399c	308	2026-05-30	eval	W0	pending		
+in	474ef526	309	2026-05-30	infra	-	pending		
+in	9c86d086	310	2026-05-30	eval	W0	pending		
+in	ab0bce52	312	2026-05-30	eval	W0	ported	4d5d44d9	
+in	9908d304	313	2026-05-30	eval	W0	pending		
+in	c1098786	284	2026-06-05	security	W1	veld-origin		Portll PR
+in	86dc3af7	325	2026-06-12	eval	W0	partial	78a530d5,3c8a3028,433ad8a0	no silent hash embeddings, gold_funnel and fusion_features, causal cue extractor; OpenIE, CATENA, spaCy and the relation typer not ported
+in	34abc71c	326	2026-06-13	eval	W0	pending		
+in	4e04649a	327	2026-06-13	eval	W0	pending		
+in	2f413837	328	2026-06-13	eval	W0	pending		
+in	a91aa80c	330	2026-06-22	lineage	W4	pending		
+in	35dfd97f	334	2026-06-22	infra	-	ported	643dbd5a	
+in	bc32da12	332	2026-06-22	retrieval	W2	pending		
+in	e776e954	331	2026-06-22	eval	W0	pending		
+in	e0e6c513	337	2026-06-25	eval	W0	pending		
+in	a8ea9eeb	336	2026-06-25	eval	W0	pending		
+in	68438ef8	341	2026-07-01	ner-entities	W6	pending		
+in	51a9e406	329	2026-07-01	eval	W0	pending		
+in	558133f2	340	2026-07-01	storage-integrity	W7	pending		
+in	a4065957	339	2026-07-01	retrieval	W2	pending		
+in	9a1dc7a8	333	2026-07-01	graph	W3	pending		
+in	25655d89	342	2026-07-01	infra	-	pending		
+in	8b0f004b	343	2026-07-02	storage-integrity	W7	pending		
+in	3337088c	344	2026-07-02	lineage	W4	pending		
+in	a0667bdd	345	2026-07-02	graph	W3	pending		
+in	e93cf438	346	2026-07-02	lineage	W4	pending		
+in	0c118b10	6	2026-07-02	storage-integrity	W7	pending		
+in	83dcaa24	8	2026-07-02	lineage	W4	pending		
+in	c107ca13	5	2026-07-02	graph	W3	pending		
+in	fd255b8b	350	2026-07-02	ner-entities	W6	pending		
+in	d054e4a1	353	2026-07-02	anomaly	W12	pending		
+in	bd478863	354	2026-07-02	anomaly	W12	pending		
+in	ec740532	356	2026-07-02	anomaly	W12	pending		
+in	4dc8bdd5	351	2026-07-02	eval	W0	pending		
+in	530ad9c5	358	2026-07-03	retrieval	W2	pending		
+in	c8d32418	359	2026-07-03	retrieval	W2	pending		
+in	284bfd93	361	2026-07-03	infra	-	pending		
+in	06e120ed	357	2026-07-03	anomaly	W12	pending		
+in	851289e5	352	2026-07-03	infra	-	pending		
+in	f7cd364c	362	2026-07-03	http-api	W10	ported	643dbd5a	
+in	c2e44f09	363	2026-07-03	infra	-	pending		
+in	efe0c4e9	364	2026-07-03	eval	W0	pending		
+in	8c0e9f39	365	2026-07-03	http-api	W10	pending		
+in	f3e7f65a	366	2026-07-03	eval	W0	pending		
+in	4b81ff59	368	2026-07-03	eval	W0	pending		
+in	7c4462d1	369	2026-07-03	infra	-	pending		
+in	a4d65ee2	370	2026-07-03	retrieval	W2	pending		
+in	26ef411e	372	2026-07-04	infra	-	pending		
+in	cc5b6a45	373	2026-07-04	eval	W0	pending		
+in	02a4b07b	371	2026-07-04	infra	-	pending		
+in	0dd25ef6	374	2026-07-05	http-api	W10	pending		
+in	5e31dc95	375	2026-07-05	infra	-	pending		
+in	db46c51c	377	2026-07-05	infra	-	pending		
+in	14d85d29	378	2026-07-06	eval	W0	pending		
+in	f9e63ae3	383	2026-07-10	ner-entities	W6	pending		
+in	017ad134	382	2026-07-10	eval	W0	pending		
+in	b4c6d4c2	385	2026-07-10	ner-entities	W6	pending		
+in	e6f49ba2	386	2026-07-10	ner-entities	W6	pending		
+in	10b6f60e	387	2026-07-10	ner-entities	W6	pending		
+in	374f67eb	388	2026-07-10	ner-entities	W6	pending		
+in	f6e326b9	393	2026-07-14	facts-todos	W5	ported	b7fff76c	
+in	bad83cae	389	2026-07-14	http-api	W10	partial	433ad8a0	causal cue extractor only
+in	162a4289	379	2026-07-14	eval	W0	pending		
+in	631da3d8	380	2026-07-14	web-ui	W11	pending		
+in	fc718019	394	2026-07-14	ner-entities	W6	pending		
+in	2843d91f	399	2026-07-15	security	W1	pending		
+in	fed58c53	397	2026-07-15	eval	W0	pending		
+in	e0469ba7	398	2026-07-15	mcp-hooks	W9	pending		
+in	51130424	400	2026-07-15	graph	W3	ported	2c3f1a59,afc83727	read-only recall, hub-cap order
+in	1cd66bc5	404	2026-07-15	retrieval	W2	pending		
+in	ee51a60e	381	2026-07-15	ner-entities	W6	pending		
+in	11eeb6e2	408	2026-07-15	mcp-hooks	W9	pending		
+in	2a521429	410	2026-07-15	http-api	W10	pending		
+in	981ae4d8		2026-07-15	infra	-	pending		
+in	b5ca5cd6	411	2026-07-15	eval	W0	ported	a4287ed8,4abe8e7b	
+in	f113ad58	409	2026-07-15	http-api	W10	ported	a4287ed8	list paging and truncation markers
+in	09518ac8	422	2026-07-29	graph	W3	pending		
+in	e31bf3fd	421	2026-07-30	storage-integrity	W7	pending		
+in	a7b09381	418	2026-07-30	robotics-geo	W12	pending		
+in	fb0d3a91	419	2026-07-30	lineage	W4	pending		
+in	8c68a63b	420	2026-07-30	robotics-geo	W12	pending		
+in	f4164612	424	2026-07-30	web-ui	W11	pending		
+in	c1a89cdf	417	2026-07-31	robotics-geo	W12	veld-origin		Portll PR
+in	d553b466	426	2026-08-06	eval	W0	pending		
+in	ac3c0d4a	428	2026-08-07	mcp-hooks	W9	pending		
+in	80ecac53	429	2026-08-07	robotics-geo	W12	pending		
+in	ebaa10be	433	2026-08-07	mcp-hooks	W9	pending		
+in	956fc9ea	431	2026-08-07	robotics-geo	W12	pending		
+in	2762d395	430	2026-08-07	web-ui	W11	pending		
+in	b43a5c98	435	2026-08-07	ner-entities	W6	pending		
+in	5f7c993c	434	2026-08-08	retrieval	W2	pending		
+in	68ab0051	437	2026-08-08	web-ui	W11	pending		
+in	cf398448	441	2026-08-08	graph	W3	pending		
+in	6e5eabb4	443	2026-08-08	robotics-geo	W12	pending		
+in	c13e83e4	440	2026-08-08	graph	W3	pending		
+in	0c44040c	439	2026-08-08	ner-entities	W6	pending		
+in	64fb8c58	444	2026-08-08	web-ui	W11	pending		
+in	057aa69a	446	2026-08-08	infra	-	pending		
+in	b91c5e22	447	2026-08-08	retrieval	W2	pending		
+in	804985d2	448	2026-08-08	web-ui	W11	pending		
+in	0111c562	449	2026-08-08	web-ui	W11	pending		
+in	a857609d	450	2026-08-08	retrieval	W2	pending		
+in	6655b73a	442	2026-08-08	facts-todos	W5	partial	daddfcc4	tier trust applies only to the graph term; the Session and Archive tier choices are deferred
+in	7b79eb2d	445	2026-08-08	facts-todos	W5	pending		
+in	c25c5691	451	2026-08-08	robotics-geo	W12	pending		
+in	2bad9638	452	2026-08-08	anomaly	W12	pending		
+in	4c1b93ac	453	2026-08-08	web-ui	W11	pending		
+in	c22b2c02	454	2026-08-08	web-ui	W11	pending		
+in	6dd5ee9d	455	2026-08-08	web-ui	W11	pending		
+in	e180aab1	456	2026-08-08	mcp-hooks	W9	pending		
+in	d4551d59	457	2026-08-09	anomaly	W12	pending		
+in	85e35537	458	2026-08-09	anomaly	W12	pending		
+in	e1c8a06f	461	2026-08-09	graph	W3	pending		
+in	2cdc403f	459	2026-08-09	facts-todos	W5	pending		
+in	cac4c0b3	460	2026-08-09	ner-entities	W6	pending		
+in	fe95da84	463	2026-08-09	web-ui	W11	pending		
+in	6298ce66	464	2026-08-09	lineage	W4	pending		
+in	ab787db2	468	2026-08-09	lineage	W4	pending		
+in	4baef94c	465	2026-08-09	infra	-	pending		
+in	229f99e9	466	2026-08-09	web-ui	W11	pending		
+in	a7344bbd	467	2026-08-09	eval	W0	pending		
+in	e24b1ab3	469	2026-08-09	mcp-hooks	W9	pending		
+in	ca72b5c1	470	2026-08-09	mcp-hooks	W9	pending		
+in	90a5092b	462	2026-08-09	retrieval	W2	pending		
+in	28f9c836	471	2026-08-09	facts-todos	W5	pending		
+in	9a3e0ef8	472	2026-08-09	web-ui	W11	pending		
+in	4baf0d3f	474	2026-08-09	infra	-	pending		
+in	689a89a7	484	2026-08-09	web-ui	W11	pending		
+in	6d9b8042	425	2026-08-09	storage-integrity	W7	pending		
+in	1500ac24	486	2026-08-10	facts-todos	W5	pending		
+in	9b9ad634	416	2026-08-10	security	W1	veld-origin	f15e6840	Portll PR
+in	7c34a1cd	485	2026-08-10	mcp-hooks	W9	pending		
+in	2ffa24ef	480	2026-08-10	infra	-	pending		
+in	0ae0d8bc	488	2026-08-10	infra	-	pending		
+in	62d7f659	489	2026-08-10	graph	W3	pending		
+in	5a8ea858	491	2026-08-10	infra	-	pending		
+in	87ddbb0e	492	2026-08-11	security	W1	veld-origin	ede90e40	Portll PR
+in	dbfe8eba	494	2026-08-12	infra	-	pending		
+in	60eece98	479	2026-08-12	retrieval	W2	pending		
+in	f9b558fa	495	2026-08-13	web-ui	W11	pending		
+in	ce655e94	500	2026-08-14	infra	-	pending		
+in	2b94deeb	496	2026-08-14	embeddings-vectors	W8	pending		
+in	c6dd561a	502	2026-08-14	infra	-	pending		
+in	98c6e486	501	2026-08-14	web-ui	W11	pending		
+in	0d796f9e	514	2026-08-29	embeddings-vectors	W8	pending		
+in	d892dfef	520	2026-08-29	eval	W0	pending		
+in	844d4358	493	2026-08-29	embeddings-vectors	W8	pending		
+in	0966441b	516	2026-08-29	infra	-	pending		
+in	e82b7149	523	2026-08-29	web-ui	W11	pending		
+in	41c2bd08	506	2026-08-29	infra	-	pending		
+in	3eb23f1b	498	2026-08-29	embeddings-vectors	W8	pending		
+in	171ae467	503	2026-08-29	eval	W0	pending		
+in	699033ca	504	2026-08-29	ner-entities	W6	pending		
+in	c94570e0	505	2026-08-29	lineage	W4	pending		
+in	6a7028fa	508	2026-08-30	facts-todos	W5	pending		
+in	8aad89b6	525	2026-08-31	graph	W3	pending		
+in	49bd8088	524	2026-08-31	eval	W0	pending		
+in	16269ca3	528	2026-08-31	eval	W0	pending		
+in	69a17d96	529	2026-08-31	eval	W0	pending		
+in	b3e27c74	530	2026-09-01	eval	W0	pending		
+in	8eb277ec	531	2026-09-01	eval	W0	pending		
+in	63a61e42	537	2026-09-04	web-ui	W11	pending		
+in	b0ba1c5e	518	2026-09-04	security	W1	veld-origin	4d50116c,49a1519	Portll PR; upstream port of veld 49a1519, taken back as 4d50116c
+in	6272430f	538	2026-09-04	graph	W3	ported	29108a10,7aa8336c	
+in	501d522f	539	2026-09-06	robotics-geo	W12	partial	f781e82d	zenoh held at 1.8.0 for RUSTSEC-2026-0041; the other dependency moves are not taken
+in	14ab7944	536	2026-09-06	retrieval	W2	pending		
+in	a2dab9de	541	2026-09-06	embeddings-vectors	W8	pending		
+in	6aa48bd5	534	2026-09-06	graph	W3	pending		
+in	c6411e3e	535	2026-09-07	eval	W0	pending		
+in	5f65ce44	497	2026-09-07	retrieval	W2	pending		
+in	a292546f	509	2026-09-08	security	W1	pending		
+in	d475062e	545	2026-09-10	eval	W0	pending		
+in	3a3395f1	532	2026-09-10	storage-integrity	W7	pending		
+in	a724b862	548	2026-09-13	eval	W0	pending		
+in	fbcc0c98	554	2026-09-21	security	W1	veld-origin		Portll PR
+in	e44fdce6	546	2026-09-21	retrieval	W2	veld-origin		Portll PR
+in	8d371432	551	2026-09-21	eval	W0	veld-origin		Portll PR
+in	928c728c	549	2026-09-21	storage-integrity	W7	veld-origin	7aa8336c	Portll PR
+in	66b9e209	550	2026-09-22	facts-todos	W5	veld-origin	b7fff76c	Portll PR
+in	355e0b72	559	2026-09-22	storage-integrity	W7	pending		
+in	cef67213	560	2026-09-22	graph	W3	pending		
+in	486a9d95	561	2026-09-22	eval	W0	pending		
+in	cf886355	562	2026-09-22	retrieval	W2	pending		
+in	14f4239a	564	2026-09-22	http-api	W10	pending		
+in	681b2d8d	563	2026-09-23	eval	W0	pending		
+in	95be77fe	566	2026-09-24	retrieval	W2	pending		
+in	d629d659	568	2026-09-24	eval	W0	pending		
+in	18df072a	567	2026-09-25	eval	W0	pending		
+in	2c3eb049	569	2026-09-25	retrieval	W2	pending		
+in	8ccaf6ab	570	2026-09-26	eval	W0	pending		
+in	d6dd1ce7	571	2026-09-27	retrieval	W2	pending		
+in	93a29ba7	572	2026-09-27	eval	W0	pending		
+in	f22faa2e	574	2026-09-27	eval	W0	pending		
+in	902daf83	573	2026-09-27	ner-entities	W6	pending		
+out	c1098786	284	2026-06-05	security	-	merged		
+out	9b9ad634	416	2026-08-09	security	-	merged	f15e6840	
+out	c1a89cdf	417	2026-07-31	robotics-geo	-	merged		
+out	87ddbb0e	492	2026-08-11	security	-	merged	ede90e40	
+out	b0ba1c5e	518	2026-09-04	security	-	merged	49a1519	
+out	e44fdce6	546	2026-09-21	eval	-	merged		
+out	928c728c	549	2026-09-21	retrieval	-	merged	7aa8336c	
+out	66b9e209	550	2026-09-21	facts-todos	-	merged	b7fff76c	
+out	8d371432	551	2026-09-21	eval	-	merged		
+out	fbcc0c98	554	2026-09-21	security	-	merged		
+out		318	2026-06-05	security	-	open		encryption-v2 crypto core
+out		555	2026-09-15	security	-	open		encryption crypto core
+out		556	2026-09-15	embeddings-vectors	-	open	0e8df63e	SPANN insert after load_from_file
+out		285	2026-06-06	security	-	closed		superseded by the encryption-core PRs
+out		519	2026-09-06	infra	-	closed		superseded by #554 and #539
