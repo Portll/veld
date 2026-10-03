@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Turn an upstream shodh-memory commit into a veld-shaped patch, and report which hunks apply.
+
+  scripts/upstream/translate <upstream commit> [--onto <veld rev>] [--out <dir>] [--context N]
+
+The patch is the commit's diff against its first parent, with upstream's names rewritten to
+veld's (crate, binary, env vars, module and data-directory names) and upstream paths moved to
+where veld keeps them. It is applied with `git apply --reject` in a throwaway worktree at
+`--onto` (default HEAD); nothing in this checkout changes. `--context N` lets a hunk apply with
+only N lines of matching context (git apply -C), which finds more hunks in code veld has edited. The output directory receives the
+translated patch, the `.rej` hunks, and `report.json`.
+
+The result is a guide for a port written by hand through veld's storage traits, not a merge.
+"""
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+
+# Applied in order to paths and to every diff line, longest names first.
+RENAMES = [
+    (r"shodh_memory", "veld"),
+    (r"shodh-memory-server", "veld"),
+    (r"shodh-memory", "veld"),
+    (r"SHODH_", "VELD_"),
+    (r"Shodh", "Veld"),
+    (r"shodh", "veld"),
+]
+
+# Upstream path -> where veld keeps that code. A path that maps to None is absent in veld.
+MOVES = {
+    "src/main.rs": "src/server_runtime.rs",
+    "src/mcp.rs": "src/mcp/tools.rs",
+    "src/serialization.rs": None,
+    "src/migration.rs": None,
+}
+MOVE_NOTES = {
+    "src/main.rs": "veld has no main.rs; the server starts in src/server.rs and src/server_runtime.rs",
+    "src/mcp.rs": "veld splits mcp.rs into src/mcp/{mod,client,tools,types}.rs; hunks are tried against tools.rs",
+    "src/serialization.rs": "absent in veld: stored records are bincode with a pinned layout",
+    "src/migration.rs": "absent in veld: engine moves are src/storage/migrate/",
+}
+
+
+def git(*args, cwd=REPO, check=True):
+    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        sys.exit(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r
+
+
+def rename(text):
+    for pattern, replacement in RENAMES:
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
+def split_files(patch):
+    """[(upstream path, file section)] in patch order."""
+    sections = re.split(r"(?m)^(?=diff --git )", patch)
+    out = []
+    for section in sections:
+        m = re.match(r"diff --git a/(\S+) b/(\S+)", section)
+        if m:
+            out.append((m.group(2), section))
+    return out
+
+
+def translate_section(path, section):
+    moved = MOVES.get(path, path)
+    if moved is None:
+        return None, rename(section)
+    target = rename(moved)
+    body = rename(section)
+    renamed_path = rename(path)
+    if renamed_path != target:
+        body = body.replace(f"a/{renamed_path}", f"a/{target}").replace(
+            f"b/{renamed_path}", f"b/{target}"
+        )
+    return target, body
+
+
+def hunks(text):
+    return len(re.findall(r"(?m)^@@ ", text))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("commit")
+    p.add_argument("--onto", default="HEAD")
+    p.add_argument("--out", type=Path)
+    p.add_argument("--context", type=int, help="minimum matching context lines (git apply -C)")
+    args = p.parse_args()
+
+    commit = git("rev-parse", "--verify", f"{args.commit}^{{commit}}").stdout.strip()
+    parent = git("rev-parse", f"{commit}^1").stdout.strip()
+    onto = git("rev-parse", "--verify", f"{args.onto}^{{commit}}").stdout.strip()
+    subject = git("log", "-1", "--format=%s", commit).stdout.strip()
+    patch = git("diff", "--no-color", "--no-renames", "--binary", parent, commit).stdout
+
+    out = args.out or Path(tempfile.mkdtemp(prefix=f"translate-{commit[:8]}-"))
+    out.mkdir(parents=True, exist_ok=True)
+
+    files, translated = [], []
+    for path, section in split_files(patch):
+        target, body = translate_section(path, section)
+        entry = {"upstream": path, "veld": target, "hunks": hunks(section)}
+        if path in MOVE_NOTES:
+            entry["note"] = MOVE_NOTES[path]
+        if target is None:
+            entry.update(applied=0, rejected=entry["hunks"], absent=True)
+        else:
+            translated.append((entry, body))
+        files.append(entry)
+
+    (out / "translated.patch").write_text("".join(body for _, body in translated))
+
+    work = Path(tempfile.mkdtemp(prefix="translate-wt-"))
+    git("worktree", "add", "--detach", "--quiet", str(work), onto)
+    try:
+        for entry, body in translated:
+            target = entry["veld"]
+            exists = (work / target).exists()
+            new_file = "\nnew file mode" in body.split("\n@@", 1)[0]
+            if not exists and not new_file:
+                entry.update(applied=0, rejected=entry["hunks"], absent=True)
+                continue
+            single = work / ".translate-one.patch"
+            single.write_text(body)
+            r = subprocess.run(
+                ["git", "-C", str(work), "apply", "--reject", "--recount", "--whitespace=nowarn",
+                 *([f"-C{args.context}"] if args.context is not None else []), str(single)],
+                capture_output=True,
+                text=True,
+            )
+            rej = work / f"{target}.rej"
+            rejected = hunks(rej.read_text()) if rej.exists() else 0
+            if r.returncode != 0 and not rej.exists():
+                rejected = entry["hunks"]
+                entry["error"] = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "apply failed"
+            if rej.exists():
+                dest = out / "rejects" / f"{target}.rej"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(rej, dest)
+            entry.update(applied=entry["hunks"] - rejected, rejected=rejected)
+    finally:
+        git("worktree", "remove", "--force", str(work), check=False)
+
+    total = sum(f["hunks"] for f in files)
+    rejected = sum(f["rejected"] for f in files)
+    report = {
+        "upstream_commit": commit,
+        "subject": subject,
+        "onto": onto,
+        "context": args.context,
+        "hunks": total,
+        "rejected": rejected,
+        "absent_files": [f["upstream"] for f in files if f.get("absent")],
+        "files": files,
+    }
+    (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"{commit[:8]} {subject}")
+    print(f"  {total - rejected}/{total} hunks apply on {onto[:8]}; {rejected} rejected; "
+          f"{len(report['absent_files'])} file(s) absent in veld")
+    for f in files:
+        if f["rejected"]:
+            print(f"  {f['rejected']}/{f['hunks']} rejected  {f['upstream']}" + (" (absent)" if f.get("absent") else ""))
+    print(f"  output: {out}")
+
+
+if __name__ == "__main__":
+    main()
