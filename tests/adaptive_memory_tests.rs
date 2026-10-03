@@ -983,9 +983,6 @@ fn test_adaptive_memory_workflow() {
         .expect("Failed");
     assert!(stats.memories_processed > 0);
 
-    let graph_stats = system.graph_stats();
-    assert!(graph_stats.node_count > 0 || graph_stats.edge_count >= 0);
-
     let prefetch = AnticipatoryPrefetch::new();
     let ctx = PrefetchContext {
         recent_entities: vec!["rust".to_string()],
@@ -1010,10 +1007,11 @@ fn test_graph_maintenance() {
         .reinforce_recall(&[id1, id2], RetrievalOutcome::Helpful)
         .expect("Failed");
 
+    let before = system.graph_stats();
     system.graph_maintenance();
 
-    let stats = system.graph_stats();
-    assert!(stats.node_count >= 0);
+    let after = system.graph_stats();
+    assert!(after.node_count <= before.node_count);
 }
 
 #[test]

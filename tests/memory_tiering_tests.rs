@@ -448,11 +448,11 @@ fn test_forget_low_importance() {
         .forget(veld::memory::ForgetCriteria::LowImportance(0.5))
         .expect("Failed to forget");
 
-    // Some memories should be forgotten
-    // Note: actual count depends on importance calculation
+    // The count depends on the importance calculation; it can never exceed what was stored.
     assert!(
-        forgotten >= 0,
-        "Forget operation should complete successfully"
+        forgotten <= stats_before.total_memories,
+        "forgot {forgotten} of {} memories",
+        stats_before.total_memories
     );
 }
 
