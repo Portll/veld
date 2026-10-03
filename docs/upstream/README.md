@@ -22,6 +22,14 @@ scripts/upstream/ledger.py sync    # appends new upstream commits as pending
 scripts/upstream/ledger.py check   # every status valid, every reason present, every veld commit real
 ```
 
+`RELEASES.tsv` records each upstream release tag: `before-fork` for tags the fork already
+contains, `pending` until a veld release matches it. Upstream's `archive/*` tags preserve
+retired branches and are not releases.
+
+The `Upstream Watch` workflow runs daily: it fetches upstream, appends new commits and release
+tags as `pending`, and commits only when upstream has moved. `ledger.py heartbeat` reads its
+last successful run from GitHub Actions and fails past 48 hours.
+
 `scripts/upstream/translate <upstream commit>` rewrites an upstream commit's diff into veld's
 names and layout and applies it with `git apply --reject` in a throwaway worktree, reporting
 the hunks that apply and keeping the rejects. On 2026-10-03, against veld `b2a47508`, PR #559
