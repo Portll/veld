@@ -1,0 +1,60 @@
+name: Upstream Watch
+
+# Follows upstream shodh-memory daily: every new first-parent commit becomes a `pending` row in
+# docs/upstream/LEDGER.tsv and every new release tag a `pending` row in RELEASES.tsv. It commits
+# only when upstream has moved. CI's ledger job fails once this has not succeeded for 48 hours
+# (`ledger.py heartbeat`), so a watcher that stops is seen, not assumed.
+
+on:
+  schedule:
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: Fetch upstream and append ledger rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream main and its tags
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/varun29ankuS/shodh-memory.git
+          git fetch --no-tags upstream main:refs/remotes/upstream/main
+          git ls-remote --tags upstream > "$RUNNER_TEMP/upstream-tags.txt"
+          echo "upstream main: $(git log -1 --format='%h %ad %s' --date=short upstream/main)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Append new commits and release tags
+        run: |
+          set -euo pipefail
+          python3 scripts/upstream/ledger.py sync | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 scripts/upstream/ledger.py releases "$RUNNER_TEMP/upstream-tags.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 scripts/upstream/ledger.py check
+
+      - name: Commit the new rows
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- docs/upstream; then
+            echo "upstream has not moved" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name Portll
+          git config user.email john@portll.net
+          git add docs/upstream/LEDGER.tsv docs/upstream/RELEASES.tsv
+          git commit -m "docs(upstream): ledger rows for upstream through $(git rev-parse --short upstream/main)"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then exit 0; fi
+            sleep 15
+          done
+          exit 1

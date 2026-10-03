@@ -2,14 +2,18 @@
 """The upstream ledger: one row per upstream shodh-memory first-parent commit after the fork base,
 plus outbound rows for veld changes offered upstream.
 
-  ledger.py sync  [--upstream <repo>] [--head <rev>]   append new upstream commits as pending
-  ledger.py check [--veld <repo>]                      validate every row
+  ledger.py sync      [--upstream <repo>] [--head <rev>]   append new upstream commits as pending
+  ledger.py check     [--veld <repo>]                      validate every row
+  ledger.py releases  <git ls-remote --tags output>        append new upstream release tags as pending
+  ledger.py heartbeat [--max-age-hours N]                  fail unless the watcher succeeded recently
 
 Both default to this checkout; sync reads `upstream/main`, so the checkout needs the remote:
   git remote add upstream https://github.com/varun29ankuS/shodh-memory.git && git fetch upstream
 """
 import argparse
 import csv
+import datetime
+import json
 import re
 import subprocess
 import sys
@@ -17,6 +21,9 @@ from collections import Counter
 from pathlib import Path
 
 LEDGER = Path(__file__).resolve().parents[2] / "docs" / "upstream" / "LEDGER.tsv"
+RELEASES = LEDGER.with_name("RELEASES.tsv")
+RELEASE_COLUMNS = ["tag", "upstream_commit", "first_seen", "status", "veld_release"]
+WATCHER = "upstream-watch.yml"
 FORK_BASE = "2737b4f"
 COLUMNS = ["direction", "upstream_commit", "pr", "date", "theme", "wave", "status", "veld_commit", "reason"]
 INBOUND_STATUSES = {"pending", "ported", "adapted", "partial", "already-in-veld", "veld-origin",
@@ -179,6 +186,63 @@ def check(args):
     sys.exit(1 if errors else 0)
 
 
+def releases(args):
+    """Upstream release tags; `archive/*` tags preserve retired branches and are not releases."""
+    tags = {}
+    for line in Path(args.ls_remote).read_text().splitlines():
+        sha, _, ref = line.partition("\t")
+        if not ref.startswith("refs/tags/") or ref.startswith("refs/tags/archive/"):
+            continue
+        name = ref[len("refs/tags/"):]
+        if name.endswith("^{}"):
+            tags[name[:-3]] = sha
+        else:
+            tags.setdefault(name, sha)
+    rows = []
+    if RELEASES.exists():
+        with RELEASES.open(newline="") as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+    known = {r["tag"] for r in rows}
+    today = datetime.date.today().isoformat()
+    new = [t for t in sorted(tags) if t not in known]
+    repo = LEDGER.parents[2]
+    for tag in new:
+        before_fork = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", tags[tag], FORK_BASE],
+            capture_output=True,
+        ).returncode == 0
+        rows.append({"tag": tag, "upstream_commit": tags[tag][:8], "first_seen": today,
+                     "status": "before-fork" if before_fork else "pending", "veld_release": ""})
+    with RELEASES.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RELEASE_COLUMNS, delimiter="\t", lineterminator="\n")
+        w.writeheader()
+        w.writerows(rows)
+    for row in rows[len(rows) - len(new):]:
+        if row["status"] == "pending":
+            print(f"new upstream release {row['tag']}: match it with a veld release")
+    print(f"{len(new)} new release tag(s); {len(rows)} recorded")
+
+
+def heartbeat(args):
+    """The watcher's last successful run, read from GitHub Actions; needs `gh` with a token."""
+    r = subprocess.run(
+        ["gh", "run", "list", "--workflow", WATCHER, "--status", "success", "--limit", "1",
+         "--json", "updatedAt,headSha"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        sys.exit(f"cannot read the {WATCHER} runs: {r.stderr.strip()}")
+    runs = json.loads(r.stdout or "[]")
+    if not runs:
+        sys.exit(f"{WATCHER} has never succeeded: upstream is not being followed")
+    last = datetime.datetime.fromisoformat(runs[0]["updatedAt"].replace("Z", "+00:00"))
+    age = datetime.datetime.now(datetime.timezone.utc) - last
+    hours = age.total_seconds() / 3600
+    print(f"{WATCHER} last succeeded {hours:.1f} h ago")
+    if hours > args.max_age_hours:
+        sys.exit(f"the upstream watcher is {hours:.0f} h stale (limit {args.max_age_hours} h)")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -189,6 +253,12 @@ def main():
     c = sub.add_parser("check")
     c.add_argument("--veld", default=str(LEDGER.parents[2]))
     c.set_defaults(func=check)
+    r = sub.add_parser("releases")
+    r.add_argument("ls_remote")
+    r.set_defaults(func=releases)
+    h = sub.add_parser("heartbeat")
+    h.add_argument("--max-age-hours", type=float, default=48)
+    h.set_defaults(func=heartbeat)
     args = p.parse_args()
     args.func(args)
 
