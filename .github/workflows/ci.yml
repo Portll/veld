@@ -91,6 +91,7 @@ jobs:
           sudo apt-get install -y llvm-dev libclang-dev clang
       - name: Run Clippy
         run: |
+          set -o pipefail
           cargo clippy --all-targets -- -W clippy::all 2>&1 | tee clippy-output.txt
           cargo clippy --all-targets --features legacy-rocksdb -- -W clippy::all 2>&1 | tee -a clippy-output.txt
           WARNINGS=$(grep -c "warning:" clippy-output.txt || true)
