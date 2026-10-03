@@ -43,7 +43,7 @@ use crate::memory::{
     ProspectiveStore, SessionStore, TodoStore,
 };
 use crate::relevance::RelevanceEngine;
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use crate::storage::legacy_rocksdb::{
     import_separate_db_into_cf, RocksDbAuditStore, RocksDbColumnFamilyStore, RocksDbColumnStore,
     RocksDbGraphStore, RocksDbPrimaryMemoryStore,
@@ -80,7 +80,7 @@ struct MultiUserMemoryManagerRotationHelper {
     audit_max_entries: usize,
 }
 
-#[cfg_attr(not(feature = "legacy-rocksdb"), allow(dead_code))]
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 const CF_AUDIT: &str = "audit";
 
 impl From<&AuditEvent> for AuditLogEntry {
@@ -254,7 +254,7 @@ pub struct MultiUserMemoryManager {
     /// is not re-entrant — sharing a single lock map would deadlock.
     user_graph_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
 
-    #[cfg_attr(not(feature = "legacy-rocksdb"), allow(dead_code))]
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     /// Shared RocksDB block cache across all per-user DB instances.
     /// Single LRU cache provides a hard memory ceiling regardless of user count.
     /// Without this, each user's MemoryStorage + GraphMemory allocates ~96MB in
@@ -558,7 +558,7 @@ impl MultiUserMemoryManager {
         // regardless of how many users are active. Without this, each user allocates
         // ~96MB in independent caches — the shared cache collapses that to a single
         // 256MB pool with LRU eviction of the coldest blocks across all users.
-        #[cfg(feature = "legacy-rocksdb")]
+        #[cfg(feature = "rocksdb")]
         let shared_rocksdb_cache = {
             let cache = rocksdb::Cache::new_lru_cache(crate::constants::ROCKSDB_SHARED_CACHE_BYTES);
             info!(
@@ -567,7 +567,7 @@ impl MultiUserMemoryManager {
             );
             Some(cache)
         };
-        #[cfg(not(feature = "legacy-rocksdb"))]
+        #[cfg(not(feature = "rocksdb"))]
         let shared_rocksdb_cache: Option<crate::storage::SharedBlockCache> = None;
 
         let shared_stores = Self::bootstrap_shared_stores(
@@ -758,11 +758,12 @@ impl MultiUserMemoryManager {
     fn bootstrap_shared_stores(
         base_path: &std::path::Path,
         server_config: &ServerConfig,
-        #[cfg_attr(not(feature = "legacy-rocksdb"), allow(unused_variables))]
-        shared_rocksdb_cache: Option<&crate::storage::SharedBlockCache>,
+        #[cfg_attr(not(feature = "rocksdb"), allow(unused_variables))] shared_rocksdb_cache: Option<
+            &crate::storage::SharedBlockCache,
+        >,
     ) -> Result<SharedStoreBootstrap> {
         match server_config.effective_storage_backend {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => {
                 let shared_db = Self::open_legacy_shared_db(base_path, shared_rocksdb_cache)?;
 
@@ -835,7 +836,7 @@ impl MultiUserMemoryManager {
                     audit_redb: None,
                 })
             }
-            #[cfg(not(feature = "legacy-rocksdb"))]
+            #[cfg(not(feature = "rocksdb"))]
             StorageBackend::RocksDb => Err(no_rocksdb("the shared stores")),
             #[cfg(feature = "storage-redb")]
             StorageBackend::Redb => {
@@ -908,7 +909,7 @@ impl MultiUserMemoryManager {
         }
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     fn open_legacy_shared_db(
         base_path: &std::path::Path,
         shared_rocksdb_cache: Option<&rocksdb::Cache>,
@@ -978,7 +979,7 @@ impl MultiUserMemoryManager {
         ))
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     fn shared_store_cf_options() -> rocksdb::Options {
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
@@ -1026,7 +1027,7 @@ impl MultiUserMemoryManager {
         })
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Migrate old standalone audit_logs DB into the shared DB's audit CF.
     /// Old directory is renamed to `audit_logs.pre_cf_migration` for rollback safety.
     fn migrate_audit_db(base_path: &std::path::Path, shared_db: &rocksdb::DB) -> Result<()> {
@@ -1225,7 +1226,7 @@ impl MultiUserMemoryManager {
 
     fn open_user_memory(&self, user_id: &str, config: MemoryConfig) -> Result<UserMemory> {
         match self.server_config.effective_storage_backend {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => {
                 let primary_store = RocksDbPrimaryMemoryStore::open(
                     &config.storage_path,
@@ -1253,7 +1254,7 @@ impl MultiUserMemoryManager {
                     bm25_index,
                 )
             }
-            #[cfg(not(feature = "legacy-rocksdb"))]
+            #[cfg(not(feature = "rocksdb"))]
             StorageBackend::RocksDb => Err(no_rocksdb("opening a user memory store")),
             #[cfg(feature = "storage-redb")]
             StorageBackend::Redb => {
@@ -1293,7 +1294,7 @@ impl MultiUserMemoryManager {
         let graph_path = self.user_dir(user_id)?.join("graph");
 
         match self.server_config.effective_storage_backend {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => {
                 let graph_store =
                     RocksDbGraphStore::open(&graph_path, self.shared_rocksdb_cache.as_ref())
@@ -1306,7 +1307,7 @@ impl MultiUserMemoryManager {
 
                 Ok(graph_store.into_inner())
             }
-            #[cfg(not(feature = "legacy-rocksdb"))]
+            #[cfg(not(feature = "rocksdb"))]
             StorageBackend::RocksDb => Err(no_rocksdb("opening a user graph store")),
             #[cfg(feature = "storage-redb")]
             StorageBackend::Redb => {
@@ -1594,7 +1595,7 @@ impl MultiUserMemoryManager {
 
         // Single flush covers all shared stores (todos, prospective, files, feedback, audit)
         match &self.shared_db {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             crate::storage::SharedEngineDb::RocksDb(db) => {
                 db.flush()
                     .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))?;
@@ -2990,7 +2991,7 @@ impl MultiUserMemoryManager {
 
         // These column families are required for the shared stores initialized
         // at startup. Missing handles indicate the shared DB is not usable.
-        #[cfg(feature = "legacy-rocksdb")]
+        #[cfg(feature = "rocksdb")]
         const REQUIRED_CFS: &[&str] = &[
             "audit",
             "prospective",
@@ -3001,7 +3002,7 @@ impl MultiUserMemoryManager {
         ];
 
         match &self.shared_db {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             crate::storage::SharedEngineDb::RocksDb(db) => {
                 REQUIRED_CFS.iter().all(|cf| db.cf_handle(cf).is_some())
             }
@@ -3080,7 +3081,7 @@ impl MultiUserMemoryManager {
         triggered
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     fn collect_legacy_secondary_store_refs(&self) -> Vec<(String, std::sync::Arc<rocksdb::DB>)> {
         // Empty when not rocksdb-backed: these refs feed the rocksdb
         // BackupEngine, which require_backup_engine has already refused by then.
@@ -3101,7 +3102,7 @@ impl MultiUserMemoryManager {
 
     pub fn create_user_backup(&self, user_id: &str) -> Result<BackupMetadata> {
         match self.server_config.effective_storage_backend {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => {
                 // Always attempt to include the intent log; the backup
                 // engine no-ops cleanly when the dir doesn't exist (W5
@@ -3218,7 +3219,7 @@ impl MultiUserMemoryManager {
                         staged,
                     )
             }
-            #[cfg(not(feature = "legacy-rocksdb"))]
+            #[cfg(not(feature = "rocksdb"))]
             StorageBackend::RocksDb => Err(no_rocksdb("backup creation")),
             #[cfg(feature = "storage-redb")]
             StorageBackend::Redb => self.create_redb_user_backup(user_id),
@@ -3293,11 +3294,11 @@ impl MultiUserMemoryManager {
 
     pub fn list_backups_for_user(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
         match self.server_config.effective_storage_backend {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => self
                 .require_backup_engine("backup listing")?
                 .list_backups(user_id),
-            #[cfg(not(feature = "legacy-rocksdb"))]
+            #[cfg(not(feature = "rocksdb"))]
             StorageBackend::RocksDb => Err(no_rocksdb("backup listing")),
             #[cfg(feature = "storage-redb")]
             StorageBackend::Redb => self
@@ -3330,11 +3331,11 @@ impl MultiUserMemoryManager {
 
     pub fn purge_backups_for_user(&self, user_id: &str, keep_count: usize) -> Result<usize> {
         match self.server_config.effective_storage_backend {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => self
                 .require_backup_engine("backup purging")?
                 .purge_old_backups(user_id, keep_count),
-            #[cfg(not(feature = "legacy-rocksdb"))]
+            #[cfg(not(feature = "rocksdb"))]
             StorageBackend::RocksDb => Err(no_rocksdb("backup purging")),
             #[cfg(feature = "storage-redb")]
             StorageBackend::Redb => self
@@ -3367,7 +3368,7 @@ impl MultiUserMemoryManager {
         max_lsn: Option<u64>,
     ) -> Result<Vec<String>> {
         match self.server_config.effective_storage_backend {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => {
                 let memory_db_path = self.user_dir(user_id)?.join("storage");
                 let graph_path = self.user_dir(user_id)?.join("graph").join("graph");
@@ -3462,7 +3463,7 @@ impl MultiUserMemoryManager {
 
                 Ok(all_restored)
             }
-            #[cfg(not(feature = "legacy-rocksdb"))]
+            #[cfg(not(feature = "rocksdb"))]
             StorageBackend::RocksDb => Err(no_rocksdb("backup restore")),
             #[cfg(feature = "storage-redb")]
             StorageBackend::Redb => self.restore_redb_user_backup(user_id, backup_id, max_lsn),
@@ -4193,15 +4194,15 @@ mod shared_store_bootstrap_tests {
     ) -> Result<SharedStoreBootstrap> {
         let mut config = ServerConfig::default();
         config.effective_storage_backend = backend;
-        #[cfg(feature = "legacy-rocksdb")]
+        #[cfg(feature = "rocksdb")]
         let cache = Some(rocksdb::Cache::new_lru_cache(1024));
-        #[cfg(not(feature = "legacy-rocksdb"))]
+        #[cfg(not(feature = "rocksdb"))]
         let cache: Option<crate::storage::SharedBlockCache> = None;
         MultiUserMemoryManager::bootstrap_shared_stores(base, &config, cache.as_ref())
     }
 
     // ADR 0006: a rocksdb arm that binds a different family or key layout serves an empty store over live data.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     mod rocksdb_on_disk_compat {
         use super::*;
         use crate::memory::types::{
@@ -4662,7 +4663,7 @@ mod shared_store_bootstrap_tests {
             .expect("redb shared-store bootstrap");
 
         // The engine is the one asked for.
-        #[cfg(feature = "legacy-rocksdb")]
+        #[cfg(feature = "rocksdb")]
         assert!(bundle.shared_db.rocksdb().is_none());
 
         // A todo round-trips through the bundle's store (crosses all three
@@ -4716,7 +4717,7 @@ mod shared_store_bootstrap_tests {
 
         // No engine DB behind it — the backup accessor must say so rather than
         // hand a caller something that cannot exist.
-        #[cfg(feature = "legacy-rocksdb")]
+        #[cfg(feature = "rocksdb")]
         assert!(graph.rocksdb_for_backup().is_none());
 
         // A round trip across two families: the entity row and its name index.
@@ -4779,10 +4780,10 @@ pub fn annotate_query_ner_with(ner: &NeuralNer, query: &mut crate::memory::types
     }
 }
 
-#[cfg(not(feature = "legacy-rocksdb"))]
+#[cfg(not(feature = "rocksdb"))]
 fn no_rocksdb(what: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "{what} needs the rocksdb engine, and this build has none; rebuild veld with `--features legacy-rocksdb`"
+        "{what} needs the rocksdb engine, and this build has none; rebuild veld with `--features rocksdb`"
     )
 }
 

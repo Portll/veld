@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -129,7 +129,7 @@ pub struct LearningHistoryStore {
 
 impl LearningHistoryStore {
     /// Create a new learning history store
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn new(db: Arc<DB>) -> Self {
         Self {
             store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),

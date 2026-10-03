@@ -74,7 +74,7 @@ use crate::constants::{
     TIER_PROMOTION_WORKING_IMPORTANCE,
 };
 
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use crate::memory::storage::MemoryStorage;
 pub use crate::memory::types::*;
 
@@ -615,7 +615,7 @@ impl MemorySystem {
     /// If `shared_cache` is provided, all per-user RocksDB instances share the
     /// same LRU block cache (multi-tenant server mode). Pass `None` for
     /// standalone / test use — each DB gets a small local cache.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn new(
         config: MemoryConfig,
         shared_cache: Option<&crate::storage::SharedBlockCache>,
@@ -637,7 +637,7 @@ impl MemorySystem {
     /// the caller already holds the projection-owned handle and wants
     /// the retrieval engine to share it.
     /// Create a memory system on a redb primary store at `config.storage_path`.
-    #[cfg(all(feature = "storage-redb", not(feature = "legacy-rocksdb")))]
+    #[cfg(all(feature = "storage-redb", not(feature = "rocksdb")))]
     pub fn new(
         config: MemoryConfig,
         _shared_cache: Option<&crate::storage::SharedBlockCache>,
@@ -655,7 +655,7 @@ impl MemorySystem {
         Ok(system)
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
         let bm25_path = config.storage_path.join(BM25_INDEX_DIR);
         let bm25_index = Arc::new(
@@ -677,7 +677,7 @@ impl MemorySystem {
     /// [`HybridSearchEngine`] as soon as the projection's `commit()` +
     /// `reload()` returns — no re-open, no second on-disk index, no
     /// "reads diverge until the next backfill" drift window.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn with_storage_and_bm25_index(
         config: MemoryConfig,
         storage: Arc<MemoryStorage>,

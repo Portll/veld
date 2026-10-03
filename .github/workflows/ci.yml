@@ -104,7 +104,7 @@ jobs:
         run: |
           set -o pipefail
           cargo clippy --all-targets -- -W clippy::all 2>&1 | tee clippy-output.txt
-          cargo clippy --all-targets --features legacy-rocksdb -- -W clippy::all 2>&1 | tee -a clippy-output.txt
+          cargo clippy --all-targets --no-default-features --features storage-redb -- -W clippy::all 2>&1 | tee -a clippy-output.txt
           WARNINGS=$(grep -c "warning:" clippy-output.txt || true)
           echo "### Clippy Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -257,9 +257,9 @@ jobs:
         # error could fail this job.
         run: |
           set -o pipefail
+          # The default build carries both engines; the redb-only build keeps redb from leaning on RocksDB.
           cargo test --no-fail-fast 2>&1 | tee test-output.txt
-          # The RocksDB engine and its tests build only with legacy-rocksdb.
-          cargo test --no-fail-fast --features legacy-rocksdb 2>&1 | tee -a test-output.txt
+          cargo test --no-fail-fast --no-default-features --features storage-redb 2>&1 | tee -a test-output.txt
 
       - name: Generate test summary
         if: always()

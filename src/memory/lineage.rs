@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -299,7 +299,7 @@ pub struct LineageGraph {
 
 impl LineageGraph {
     /// Create a new lineage graph backed by RocksDB
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn new(db: Arc<DB>) -> Self {
         Self {
             store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),
@@ -316,7 +316,7 @@ impl LineageGraph {
     }
 
     /// Create with custom inference config
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn with_config(db: Arc<DB>, config: InferenceConfig) -> Self {
         Self {
             store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),

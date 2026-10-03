@@ -5,7 +5,7 @@
 //! types in recall, graph traversal, or server orchestration.
 
 pub mod boot_guard;
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 pub mod legacy_rocksdb;
 pub mod migrate;
 pub mod portable;
@@ -70,15 +70,15 @@ impl StorageCapabilities {
 
 /// The rocksdb handle the comprehensive backup reads. Uninhabited in a build without
 /// rocksdb, so an `Option<RocksDbHandle>` there can only be `None`.
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 pub type RocksDbHandle = Arc<rocksdb::DB>;
-#[cfg(not(feature = "legacy-rocksdb"))]
+#[cfg(not(feature = "rocksdb"))]
 pub type RocksDbHandle = std::convert::Infallible;
 
 /// The block cache per-user rocksdb stores share; uninhabited without rocksdb.
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 pub type SharedBlockCache = rocksdb::Cache;
-#[cfg(not(feature = "legacy-rocksdb"))]
+#[cfg(not(feature = "rocksdb"))]
 pub type SharedBlockCache = std::convert::Infallible;
 
 /// The one shared engine database behind the global stores, carried by ENGINE
@@ -88,26 +88,28 @@ pub type SharedBlockCache = std::convert::Infallible;
 /// the mismatch at their first raw call.
 #[derive(Clone)]
 pub enum SharedEngineDb {
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     RocksDb(Arc<rocksdb::DB>),
     #[cfg(feature = "storage-redb")]
     Redb(Arc<::redb::Database>),
 }
 
-#[cfg(not(any(feature = "storage-redb", feature = "legacy-rocksdb")))]
-compile_error!("veld needs a storage engine: enable `storage-redb` (default) or `legacy-rocksdb`");
+#[cfg(not(any(feature = "storage-redb", feature = "rocksdb")))]
+compile_error!(
+    "veld needs a storage engine: enable `rocksdb` or `storage-redb` (both are default)"
+);
 
 impl SharedEngineDb {
     pub fn backend(&self) -> StorageBackend {
         match self {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             SharedEngineDb::RocksDb(_) => StorageBackend::RocksDb,
             #[cfg(feature = "storage-redb")]
             SharedEngineDb::Redb(_) => StorageBackend::Redb,
         }
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn rocksdb(&self) -> Option<&Arc<rocksdb::DB>> {
         match self {
             SharedEngineDb::RocksDb(db) => Some(db),
@@ -118,7 +120,7 @@ impl SharedEngineDb {
 
     /// `what` names the CAPABILITY, so the refusal reads as a statement about
     /// the caller's requirement, not about the database.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn require_rocksdb(&self, what: &str) -> Result<&Arc<rocksdb::DB>> {
         self.rocksdb().ok_or_else(|| {
             anyhow::anyhow!(
@@ -132,7 +134,7 @@ impl SharedEngineDb {
     pub fn redb(&self) -> Option<&Arc<::redb::Database>> {
         match self {
             SharedEngineDb::Redb(db) => Some(db),
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             SharedEngineDb::RocksDb(_) => None,
         }
     }
@@ -140,7 +142,7 @@ impl SharedEngineDb {
     /// A multi-family handle over THIS open database, never a second opener.
     pub fn column_store(&self) -> Arc<dyn ColumnStore> {
         match self {
-            #[cfg(feature = "legacy-rocksdb")]
+            #[cfg(feature = "rocksdb")]
             SharedEngineDb::RocksDb(db) => {
                 Arc::new(legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(db)))
             }
@@ -636,7 +638,7 @@ pub trait StorageFactory: Send + Sync {
     fn open_migration_store(&self, path: &Path) -> Result<Arc<dyn MigrationStore>>;
 }
 
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 pub use legacy_rocksdb::{
     visit_records_read_only, RocksDbBackupStore, RocksDbBatchWriter, RocksDbGraphStore,
     RocksDbPrimaryMemoryStore, RocksDbStorageFactory,
@@ -718,7 +720,7 @@ mod tests {
         assert_eq!(b.column_families(), vec!["b", "a"]);
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     #[test]
     fn rocksdb_factory_reports_backend_and_capabilities() {
         let factory = RocksDbStorageFactory::default();
@@ -735,7 +737,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "legacy-rocksdb", feature = "storage-redb"))]
+#[cfg(all(test, feature = "rocksdb", feature = "storage-redb"))]
 mod backend_coverage_matrix {
     //! Executable coverage: every PrimaryMemoryStore method CALLED on both backends.
     //!
@@ -976,7 +978,7 @@ mod backend_coverage_matrix {
     }
 }
 
-#[cfg(all(test, feature = "legacy-rocksdb", feature = "storage-redb"))]
+#[cfg(all(test, feature = "rocksdb", feature = "storage-redb"))]
 mod column_store_conformance {
     //! The same script against both backends, compared.
     //!

@@ -1,4 +1,4 @@
-#![cfg(feature = "legacy-rocksdb")]
+#![cfg(feature = "rocksdb")]
 //! Tests for FileMemoryStore - Codebase Integration (MEM-36)
 //!
 //! Tests cover:

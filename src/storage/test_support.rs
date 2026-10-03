@@ -16,10 +16,10 @@ pub(crate) fn column_stores(
     families: &[&str],
 ) -> Vec<(StorageBackend, Arc<dyn ColumnStore>, TempDir)> {
     let mut out: Vec<(StorageBackend, Arc<dyn ColumnStore>, TempDir)> = Vec::new();
-    #[cfg(not(feature = "legacy-rocksdb"))]
+    #[cfg(not(feature = "rocksdb"))]
     let _ = families;
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     {
         let tmp = TempDir::new().unwrap();
         let mut opts = rocksdb::Options::default();
@@ -82,7 +82,7 @@ pub(crate) fn key_value_stores(
 /// one store passes every assertion while proving nothing about the other.
 pub(crate) fn assert_both_backends<T>(stores: &[(StorageBackend, T, TempDir)]) {
     let backends: Vec<StorageBackend> = stores.iter().map(|(b, _, _)| *b).collect();
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     assert!(
         backends.contains(&StorageBackend::RocksDb),
         "no rocksdb store under test"

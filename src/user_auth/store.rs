@@ -30,7 +30,7 @@ use crate::user_auth::session::{SessionRecord, SessionToken};
 use crate::user_auth::{session, AuthError, UserRecord, UserRole};
 
 use chrono::{DateTime, Utc};
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::{ColumnFamilyDescriptor, Options};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ pub const CF_USER_AUTH: &str = "user_auth";
 
 /// Build the `ColumnFamilyDescriptor` for `user_auth`. Used by the shared
 /// RocksDB bootstrap until that bootstrap declares the family itself.
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 pub fn cf_descriptor() -> ColumnFamilyDescriptor {
     let mut opts = Options::default();
     opts.create_if_missing(true);
@@ -149,7 +149,7 @@ impl UserAuthStore {
     }
 
     /// Bind a raw rocksdb handle; equivalent to `with_store` over its column store.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn new(db: Arc<rocksdb::DB>) -> Result<Self, AuthError> {
         Self::with_store(Arc::new(
             crate::storage::legacy_rocksdb::RocksDbColumnStore::new(db),

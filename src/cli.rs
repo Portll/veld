@@ -78,8 +78,8 @@ enum Commands {
         )]
         storage_path: PathBuf,
 
-        /// Requested storage backend (`redb` target, `rocksdb` legacy compatibility)
-        #[arg(long, env = "VELD_STORAGE_BACKEND", default_value = "redb")]
+        /// Storage engine: `rocksdb` (the default when built in) or `redb`
+        #[arg(long, env = "VELD_STORAGE_BACKEND", default_value_t = veld::config::default_requested_storage_backend())]
         storage_backend: StorageBackend,
 
         /// Production mode: deny-all CORS fallback, backup auto-enable, and startup safety warnings

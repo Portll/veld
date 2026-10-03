@@ -770,7 +770,7 @@ fn revoke_my_other_sessions_with_runtime(
 // Tests — handler-level end-to-end flow.
 // ─────────────────────────────────────────────────────────────────────────
 
-#[cfg(all(test, feature = "legacy-rocksdb"))]
+#[cfg(all(test, feature = "rocksdb"))]
 mod tests {
     use super::*;
     use crate::user_auth::runtime::{LoginLimiter, UserAuthRuntime};

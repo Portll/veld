@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use glob::Pattern;
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::{ColumnFamilyDescriptor, Options};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ impl FileMemoryStore {
 
     /// CF accessor for the file_index column family
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Return CF descriptors needed by this store. The caller must include
     /// these when opening the shared RocksDB instance.
     pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
@@ -53,7 +53,7 @@ impl FileMemoryStore {
         ]
     }
 
-    #[cfg_attr(not(feature = "legacy-rocksdb"), allow(dead_code))]
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     /// Pre-column-family standalone DBs under the data root, imported into these
     /// families by the rocksdb boot path before the store is bound.
     pub(crate) const LEGACY_SEPARATE_DBS: &'static [(&'static str, &'static str)] =
@@ -1165,7 +1165,7 @@ pub struct IndexingResult {
     pub errors: Vec<String>,
 }
 
-#[cfg(all(test, feature = "legacy-rocksdb"))]
+#[cfg(all(test, feature = "rocksdb"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

@@ -199,7 +199,7 @@ Working Memory ──overflow──▶ Session Memory ──importance──▶ 
   (100 items)                  (100 MB)                      (backend-selected store)
 ```
 
-The storage migration is underway: `redb` is the default backend target, while RocksDB remains the legacy compatibility engine until the backend abstraction lands.
+Long-term memory is stored in RocksDB by default. redb is built in as a second engine (`VELD_STORAGE_BACKEND=redb`); `veld migrate` moves a store between the two, verified record by record. See [ADR 0007](docs/src/decisions/0007-rocksdb-default-engine.md).
 
 This is based on [Cowan's working memory model](https://doi.org/10.1177/0963721409359277) and [Wixted's memory decay research](https://doi.org/10.1111/j.1467-9280.2004.00687.x). The neuroscience isn't a gimmick — it's why the system gets better with use instead of just accumulating data.
 
