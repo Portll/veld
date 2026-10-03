@@ -293,52 +293,18 @@ pub fn detect_orbit_gaps(
         return Ok(Vec::new());
     }
 
-    // Build cluster membership lookup
-    let mut entity_cluster: HashMap<&str, usize> = HashMap::new();
-    for (cluster_id, members) in &meaningful_clusters {
-        for member in members {
-            entity_cluster.insert(member.as_str(), *cluster_id);
-        }
-    }
-
     // Find cluster pairs that share attractors but have no direct cross-links
+    let links = cluster_links(&adj, &meaningful_clusters);
     let mut gaps = Vec::new();
     for i in 0..meaningful_clusters.len() {
         for j in (i + 1)..meaningful_clusters.len() {
             let (id_a, members_a) = &meaningful_clusters[i];
             let (id_b, members_b) = &meaningful_clusters[j];
-
-            // Find shared attractors: entities outside both clusters
-            // that have neighbors in both
-            let set_a: HashSet<&str> = members_a.iter().map(|s| s.as_str()).collect();
-            let set_b: HashSet<&str> = members_b.iter().map(|s| s.as_str()).collect();
-
-            let mut shared_attractors: HashSet<&str> = HashSet::new();
-            for (entity, neighbors) in &adj {
-                if set_a.contains(entity.as_str()) || set_b.contains(entity.as_str()) {
-                    continue;
-                }
-                let has_a_neighbor = neighbors.iter().any(|n| set_a.contains(n.as_str()));
-                let has_b_neighbor = neighbors.iter().any(|n| set_b.contains(n.as_str()));
-                if has_a_neighbor && has_b_neighbor {
-                    shared_attractors.insert(entity.as_str());
-                }
-            }
-
-            if shared_attractors.is_empty() {
+            let Some(&(shared_attractors, cross_links)) = links.get(&(i, j)) else {
                 continue;
-            }
-
-            // Check for direct cross-links
-            let mut cross_links = 0usize;
-            for member_a in members_a {
-                if let Some(neighbors) = adj.get(member_a.as_str()) {
-                    for neighbor in neighbors {
-                        if set_b.contains(neighbor.as_str()) {
-                            cross_links += 1;
-                        }
-                    }
-                }
+            };
+            if shared_attractors == 0 {
+                continue;
             }
 
             // If few or no cross-links relative to shared attractors, it's an orbit gap
@@ -346,7 +312,7 @@ pub fn detect_orbit_gaps(
                 cross_links as f32 / (members_a.len() * members_b.len()).max(1) as f32;
             if cross_ratio < 0.1 {
                 let confidence =
-                    (shared_attractors.len() as f32 / 5.0).clamp(0.0, 1.0) * (1.0 - cross_ratio);
+                    (shared_attractors as f32 / 5.0).clamp(0.0, 1.0) * (1.0 - cross_ratio);
 
                 let gap_id = format!("orbit:{}:{}", id_a, id_b);
 
@@ -392,8 +358,7 @@ pub fn detect_orbit_gaps(
                             to_name: b_name,
                             evidence: format!(
                                 "Clusters share {} attractor(s) but have only {} cross-link(s)",
-                                shared_attractors.len(),
-                                cross_links
+                                shared_attractors, cross_links
                             ),
                         });
                     }
@@ -405,7 +370,7 @@ pub fn detect_orbit_gaps(
                     shape: ShapeSignature::orbit(
                         members_a.len(),
                         members_b.len(),
-                        shared_attractors.len(),
+                        shared_attractors,
                     ),
                     entities,
                     missing_links,
@@ -418,6 +383,46 @@ pub fn detect_orbit_gaps(
     }
 
     Ok(gaps)
+}
+
+/// For each pair of clusters `(i, j)`, `i < j` by position: how many entities
+/// outside both have a neighbor in each (shared attractors), and how many
+/// adjacency entries run from cluster `i` into cluster `j` (cross-links). One
+/// pass over the adjacency; testing every pair against every entity took a pass
+/// per pair.
+fn cluster_links(
+    adj: &HashMap<String, Vec<String>>,
+    clusters: &[(usize, Vec<String>)],
+) -> HashMap<(usize, usize), (usize, usize)> {
+    let cluster_of: HashMap<&str, usize> = clusters
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (_, members))| members.iter().map(move |m| (m.as_str(), i)))
+        .collect();
+    let mut links: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
+    for (entity, neighbors) in adj {
+        let own = cluster_of.get(entity.as_str()).copied();
+        let mut near: Vec<usize> = neighbors
+            .iter()
+            .filter_map(|n| cluster_of.get(n.as_str()).copied())
+            .collect();
+        if let Some(p) = own {
+            for &q in &near {
+                if p < q {
+                    links.entry((p, q)).or_default().1 += 1;
+                }
+            }
+        }
+        near.sort_unstable();
+        near.dedup();
+        near.retain(|&c| Some(c) != own);
+        for (k, &p) in near.iter().enumerate() {
+            for &q in &near[k + 1..] {
+                links.entry((p, q)).or_default().0 += 1;
+            }
+        }
+    }
+    links
 }
 
 /// Simple label propagation for community detection.
@@ -471,4 +476,62 @@ pub fn label_propagation(
     }
 
     clusters.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_links_counts_what_the_per_pair_scan_counted() {
+        for seed in 1..=20u64 {
+            let mut state = seed | 1;
+            let mut next = move |n: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % n as u64) as usize
+            };
+            let names: Vec<String> = (0..60).map(|i| format!("n{i}")).collect();
+            let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+            for _ in 0..180 {
+                let (a, b) = (&names[next(60)], &names[next(60)]);
+                adj.entry(a.clone()).or_default().push(b.clone());
+                adj.entry(b.clone()).or_default().push(a.clone());
+            }
+            let mut clusters: Vec<(usize, Vec<String>)> =
+                (0..5).map(|c| (c * 7, Vec::new())).collect();
+            for name in adj.keys() {
+                // Some entities stay outside every cluster, as small clusters are dropped.
+                if let Some(c) = Some(next(7)).filter(|&c| c < 5) {
+                    clusters[c].1.push(name.clone());
+                }
+            }
+
+            let links = cluster_links(&adj, &clusters);
+            for i in 0..clusters.len() {
+                for j in (i + 1)..clusters.len() {
+                    let set_a: HashSet<&str> = clusters[i].1.iter().map(String::as_str).collect();
+                    let set_b: HashSet<&str> = clusters[j].1.iter().map(String::as_str).collect();
+                    let shared = adj
+                        .iter()
+                        .filter(|(e, n)| {
+                            !set_a.contains(e.as_str())
+                                && !set_b.contains(e.as_str())
+                                && n.iter().any(|x| set_a.contains(x.as_str()))
+                                && n.iter().any(|x| set_b.contains(x.as_str()))
+                        })
+                        .count();
+                    let cross: usize = clusters[i]
+                        .1
+                        .iter()
+                        .filter_map(|m| adj.get(m))
+                        .map(|n| n.iter().filter(|x| set_b.contains(x.as_str())).count())
+                        .sum();
+                    let got = links.get(&(i, j)).copied().unwrap_or((0, 0));
+                    assert_eq!(got, (shared, cross), "seed {seed} pair {i},{j}");
+                }
+            }
+        }
+    }
 }

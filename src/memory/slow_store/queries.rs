@@ -6,9 +6,102 @@
 use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use super::SlowStore;
+
+/// The entities and edges the structural searches walk in memory: names and
+/// salience by index, every directed pair at any strength, and for each node its
+/// edges at or above the minimum strength, strongest first.
+struct EdgeGraph {
+    uuids: Vec<String>,
+    names: Vec<String>,
+    salience: Vec<f32>,
+    relations: Vec<String>,
+    /// (to, strength, relation) at or above the minimum, strongest first.
+    out: Vec<Vec<(u32, f32, u32)>>,
+    /// The strength of each pair at or above the minimum.
+    strong: HashMap<(u32, u32), f32>,
+    /// Every directed pair, at any strength.
+    pairs: HashSet<(u32, u32)>,
+}
+
+impl EdgeGraph {
+    fn linked(&self, a: u32, b: u32) -> bool {
+        self.pairs.contains(&(a, b)) || self.pairs.contains(&(b, a))
+    }
+
+    /// Each node's strongest outgoing strength, and the strongest of all.
+    fn best_out(&self) -> (Vec<f64>, f64) {
+        let best: Vec<f64> = self
+            .out
+            .iter()
+            .map(|l| l.first().map_or(f64::NEG_INFINITY, |e| f64::from(e.1)))
+            .collect();
+        let global = best.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (best, global)
+    }
+}
+
+struct Scored<T>(f64, T);
+
+impl<T> PartialEq for Scored<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0) == Ordering::Equal
+    }
+}
+impl<T> Eq for Scored<T> {}
+impl<T> PartialOrd for Scored<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for Scored<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// The `k` highest-scoring items. A score that only ties the lowest kept one is
+/// not taken, as `ORDER BY … LIMIT` leaves the choice among ties open.
+struct TopK<T> {
+    k: usize,
+    heap: BinaryHeap<Reverse<Scored<T>>>,
+}
+
+impl<T> TopK<T> {
+    fn new(k: usize) -> Self {
+        Self {
+            k,
+            heap: BinaryHeap::new(),
+        }
+    }
+
+    /// Whether an item scoring `score` would be kept.
+    fn admits(&self, score: f64) -> bool {
+        self.k > 0
+            && (self.heap.len() < self.k
+                || self.heap.peek().is_some_and(|Reverse(low)| score > low.0))
+    }
+
+    fn push(&mut self, score: f64, item: T) {
+        if !self.admits(score) {
+            return;
+        }
+        if self.heap.len() == self.k {
+            self.heap.pop();
+        }
+        self.heap.push(Reverse(Scored(score, item)));
+    }
+
+    /// The kept items, highest score first.
+    fn into_sorted(self) -> Vec<T> {
+        let mut kept: Vec<Scored<T>> = self.heap.into_iter().map(|Reverse(s)| s).collect();
+        kept.sort_by(|a, b| b.cmp(a));
+        kept.into_iter().map(|s| s.1).collect()
+    }
+}
 
 /// An open triad (U-shape) found in the graph.
 ///
@@ -82,6 +175,76 @@ pub struct EntityCluster {
 }
 
 impl SlowStore {
+    /// The entities and edges of the mirror, for the in-memory structural searches.
+    fn edge_graph(&self, min_strength: f32) -> Result<EdgeGraph> {
+        let conn = self.read()?;
+        let mut index: HashMap<String, u32> = HashMap::new();
+        let (mut uuids, mut names, mut salience) = (Vec::new(), Vec::new(), Vec::new());
+        let mut stmt = conn.prepare_cached("SELECT uuid, name, salience FROM entities")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f32>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (uuid, name, s) = row?;
+            index.insert(uuid.clone(), uuids.len() as u32);
+            uuids.push(uuid);
+            names.push(name);
+            salience.push(s);
+        }
+
+        let mut relation_index: HashMap<String, u32> = HashMap::new();
+        let mut relations = Vec::new();
+        let mut out = vec![Vec::new(); uuids.len()];
+        let mut strong = HashMap::new();
+        let mut pairs = HashSet::new();
+        let mut stmt = conn
+            .prepare_cached("SELECT from_entity, to_entity, strength, relation_type FROM edges")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f32>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (from, to, strength, relation) = row?;
+            let (Some(&f), Some(&t)) = (index.get(&from), index.get(&to)) else {
+                continue;
+            };
+            pairs.insert((f, t));
+            if strength >= min_strength {
+                let r = match relation_index.get(&relation) {
+                    Some(&r) => r,
+                    None => {
+                        let r = relations.len() as u32;
+                        relation_index.insert(relation.clone(), r);
+                        relations.push(relation);
+                        r
+                    }
+                };
+                out[f as usize].push((t, strength, r));
+                strong.insert((f, t), strength);
+            }
+        }
+        for list in &mut out {
+            list.sort_by(|a, b| b.1.total_cmp(&a.1));
+        }
+        Ok(EdgeGraph {
+            uuids,
+            names,
+            salience,
+            relations,
+            out,
+            strong,
+            pairs,
+        })
+    }
+
     /// Find all open triads (U-shapes) in the graph.
     ///
     /// An open triad is A→B→C where no edge exists between A and C (in either direction).
@@ -89,7 +252,70 @@ impl SlowStore {
     /// but their mutual relationship hasn't been established.
     ///
     /// Returns raw triads sorted by combined edge strength (strongest gaps first).
+    /// Edges are taken strongest first and a path stops being extended once its
+    /// best possible sum cannot displace the weakest triad kept.
     pub fn find_open_triads(&self, min_strength: f32, limit: usize) -> Result<Vec<RawOpenTriad>> {
+        let g = self.edge_graph(min_strength)?;
+        let (best_out, global_best) = g.best_out();
+        let mut first: Vec<(u32, u32, f32, u32)> = g
+            .out
+            .iter()
+            .enumerate()
+            .flat_map(|(a, l)| l.iter().map(move |&(b, s, r)| (a as u32, b, s, r)))
+            .collect();
+        first.sort_by(|x, y| y.2.total_cmp(&x.2));
+
+        let mut top = TopK::new(limit);
+        for &(a, b, s1, r1) in &first {
+            let s1f = f64::from(s1);
+            if !top.admits(s1f + global_best) {
+                break;
+            }
+            if !top.admits(s1f + best_out[b as usize]) {
+                continue;
+            }
+            for &(c, s2, r2) in &g.out[b as usize] {
+                let sum = s1f + f64::from(s2);
+                if !top.admits(sum) {
+                    break;
+                }
+                if c == a || g.linked(a, c) {
+                    continue;
+                }
+                top.push(sum, (a, b, c, s1, s2, r1, r2));
+            }
+        }
+
+        Ok(top
+            .into_sorted()
+            .into_iter()
+            .map(|(a, b, c, s1, s2, r1, r2)| {
+                let (a, b, c) = (a as usize, b as usize, c as usize);
+                RawOpenTriad {
+                    node_a: g.uuids[a].clone(),
+                    node_a_name: g.names[a].clone(),
+                    a_salience: g.salience[a],
+                    node_b: g.uuids[b].clone(),
+                    node_b_name: g.names[b].clone(),
+                    node_c: g.uuids[c].clone(),
+                    node_c_name: g.names[c].clone(),
+                    c_salience: g.salience[c],
+                    ab_strength: s1,
+                    bc_strength: s2,
+                    ab_relation: g.relations[r1 as usize].clone(),
+                    bc_relation: g.relations[r2 as usize].clone(),
+                }
+            })
+            .collect())
+    }
+
+    /// The SQL form of [`find_open_triads`](Self::find_open_triads), kept to check it against.
+    #[cfg(test)]
+    pub(crate) fn find_open_triads_sql(
+        &self,
+        min_strength: f32,
+        limit: usize,
+    ) -> Result<Vec<RawOpenTriad>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare_cached(
             "SELECT
@@ -254,7 +480,82 @@ impl SlowStore {
     /// Two parallel paths from A to D through different intermediaries,
     /// where the intermediaries aren't connected. This often indicates
     /// two approaches to the same problem that haven't been reconciled.
+    ///
+    /// Returns diamonds sorted by the sum of their four edge strengths. Each pair
+    /// of A's edges, and each B→D after it, is skipped once its best possible sum
+    /// cannot displace the weakest diamond kept.
     pub fn find_diamond_gaps(&self, min_strength: f32, limit: usize) -> Result<Vec<RawDiamondGap>> {
+        let g = self.edge_graph(min_strength)?;
+        let (best_out, global_best) = g.best_out();
+        let mut top = TopK::new(limit);
+        for (a, list) in g.out.iter().enumerate() {
+            let a = a as u32;
+            for (i, &(x, sx, _)) in list.iter().enumerate() {
+                let sx = f64::from(sx);
+                if !top.admits(sx + sx + global_best + global_best) {
+                    break;
+                }
+                for &(y, sy, _) in &list[i + 1..] {
+                    let sy = f64::from(sy);
+                    if !top.admits(sx + sy + best_out[x as usize] + global_best) {
+                        break;
+                    }
+                    if !top.admits(sx + sy + best_out[x as usize] + best_out[y as usize]) {
+                        continue;
+                    }
+                    // B is the intermediary whose uuid sorts first, as `e1.to_entity < e2.to_entity`.
+                    let ((b, sab), (c, sac)) = if g.uuids[x as usize] < g.uuids[y as usize] {
+                        ((x, sx), (y, sy))
+                    } else {
+                        ((y, sy), (x, sx))
+                    };
+                    if g.linked(b, c) {
+                        continue;
+                    }
+                    for &(d, sbd, _) in &g.out[b as usize] {
+                        let sbd = f64::from(sbd);
+                        if !top.admits(sab + sac + sbd + best_out[c as usize]) {
+                            break;
+                        }
+                        if d == a {
+                            continue;
+                        }
+                        let Some(&scd) = g.strong.get(&(c, d)) else {
+                            continue;
+                        };
+                        top.push(sab + sac + sbd + f64::from(scd), (a, b, c, d));
+                    }
+                }
+            }
+        }
+
+        Ok(top
+            .into_sorted()
+            .into_iter()
+            .map(|(a, b, c, d)| {
+                let (a, b, c, d) = (a as usize, b as usize, c as usize, d as usize);
+                RawDiamondGap {
+                    top: g.uuids[a].clone(),
+                    top_name: g.names[a].clone(),
+                    left: g.uuids[b].clone(),
+                    left_name: g.names[b].clone(),
+                    right: g.uuids[c].clone(),
+                    right_name: g.names[c].clone(),
+                    bottom: g.uuids[d].clone(),
+                    bottom_name: g.names[d].clone(),
+                    missing_left_right: true,
+                }
+            })
+            .collect())
+    }
+
+    /// The SQL form of [`find_diamond_gaps`](Self::find_diamond_gaps), kept to check it against.
+    #[cfg(test)]
+    pub(crate) fn find_diamond_gaps_sql(
+        &self,
+        min_strength: f32,
+        limit: usize,
+    ) -> Result<Vec<RawDiamondGap>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare_cached(
             "SELECT

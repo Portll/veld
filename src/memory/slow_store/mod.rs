@@ -807,6 +807,7 @@ impl GapStore for SlowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -1026,6 +1027,183 @@ mod tests {
         assert_eq!(stats.edges_upserted, 2);
         // Collapsed to one connectivity entry for the directed pair.
         assert_eq!(store.edge_count().unwrap(), 1);
+    }
+
+    /// A store holding a pseudo-random graph whose strengths repeat, so ties
+    /// are common, and the strength of each of its directed pairs.
+    fn random_graph(
+        seed: u64,
+        nodes: usize,
+        edges_per_node: usize,
+    ) -> (NamedTempFile, SlowStore, HashMap<(String, String), f32>) {
+        const STRENGTHS: [f32; 6] = [0.1, 0.2, 0.3, 0.5, 0.8, 1.0];
+        let mut state = seed | 1;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let entities: Vec<EntityNode> = (0..nodes)
+            .map(|i| {
+                let mut e = test_entity(&format!("E{i}"));
+                e.salience = STRENGTHS[next(STRENGTHS.len())];
+                e
+            })
+            .collect();
+        let mut strengths = HashMap::new();
+        let mut edges = Vec::new();
+        for _ in 0..nodes * edges_per_node {
+            let (from, to) = (&entities[next(nodes)], &entities[next(nodes)]);
+            let key = (from.uuid.to_string(), to.uuid.to_string());
+            if strengths.contains_key(&key) {
+                continue;
+            }
+            let mut edge = test_edge(
+                from.uuid,
+                to.uuid,
+                crate::graph_memory::RelationType::RelatedTo,
+            );
+            edge.strength = STRENGTHS[next(STRENGTHS.len())];
+            strengths.insert(key, edge.strength);
+            edges.push(edge);
+        }
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+        store.sync_from_graph(&entities, &edges).unwrap();
+        (tmp, store, strengths)
+    }
+
+    #[test]
+    fn open_triads_found_in_memory_match_the_sql_search() {
+        for seed in 1..=12 {
+            let (_tmp, store, strength) = random_graph(seed, 40, 4);
+            let s = |a: &str, b: &str| strength.get(&(a.to_string(), b.to_string())).copied();
+            for limit in [0, 1, 5, 20, 100_000] {
+                let fast = store.find_open_triads(0.2, limit).unwrap();
+                let sql = store.find_open_triads_sql(0.2, limit).unwrap();
+                let sums = |t: &[RawOpenTriad]| -> Vec<f64> {
+                    t.iter()
+                        .map(|t| f64::from(t.ab_strength) + f64::from(t.bc_strength))
+                        .collect()
+                };
+                assert_eq!(sums(&fast), sums(&sql), "seed {seed} limit {limit}");
+                for t in &fast {
+                    assert_eq!(s(&t.node_a, &t.node_b), Some(t.ab_strength));
+                    assert_eq!(s(&t.node_b, &t.node_c), Some(t.bc_strength));
+                    assert!(t.ab_strength >= 0.2 && t.bc_strength >= 0.2);
+                    assert_ne!(t.node_a, t.node_c);
+                    assert!(s(&t.node_a, &t.node_c).is_none() && s(&t.node_c, &t.node_a).is_none());
+                }
+                if limit == 100_000 {
+                    let paths = |t: &[RawOpenTriad]| -> HashSet<(String, String, String)> {
+                        t.iter()
+                            .map(|t| (t.node_a.clone(), t.node_b.clone(), t.node_c.clone()))
+                            .collect()
+                    };
+                    assert_eq!(paths(&fast), paths(&sql), "seed {seed}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diamond_gaps_found_in_memory_match_the_sql_search() {
+        for seed in 1..=12 {
+            let (_tmp, store, strength) = random_graph(seed, 30, 5);
+            let s = |a: &str, b: &str| strength.get(&(a.to_string(), b.to_string())).copied();
+            let sum = |d: &RawDiamondGap| -> f64 {
+                [
+                    (&d.top, &d.left),
+                    (&d.top, &d.right),
+                    (&d.left, &d.bottom),
+                    (&d.right, &d.bottom),
+                ]
+                .iter()
+                .map(|(a, b)| f64::from(s(a, b).expect("a diamond edge exists")))
+                .sum()
+            };
+            for limit in [0, 1, 5, 20, 100_000] {
+                let fast = store.find_diamond_gaps(0.2, limit).unwrap();
+                let sql = store.find_diamond_gaps_sql(0.2, limit).unwrap();
+                assert_eq!(
+                    fast.iter().map(sum).collect::<Vec<_>>(),
+                    sql.iter().map(sum).collect::<Vec<_>>(),
+                    "seed {seed} limit {limit}"
+                );
+                for d in &fast {
+                    assert!(d.left < d.right);
+                    assert_ne!(d.top, d.bottom);
+                    assert!(s(&d.left, &d.right).is_none() && s(&d.right, &d.left).is_none());
+                    for (a, b) in [
+                        (&d.top, &d.left),
+                        (&d.top, &d.right),
+                        (&d.left, &d.bottom),
+                        (&d.right, &d.bottom),
+                    ] {
+                        assert!(s(a, b).is_some_and(|v| v >= 0.2));
+                    }
+                }
+                if limit == 100_000 {
+                    let shapes =
+                        |g: &[RawDiamondGap]| -> HashSet<(String, String, String, String)> {
+                            g.iter()
+                                .map(|d| {
+                                    (
+                                        d.top.clone(),
+                                        d.left.clone(),
+                                        d.right.clone(),
+                                        d.bottom.clone(),
+                                    )
+                                })
+                                .collect()
+                        };
+                    assert_eq!(shapes(&fast), shapes(&sql), "seed {seed}");
+                }
+            }
+        }
+    }
+
+    /// Times both searches, and a whole detection, on a copy of a live mirror:
+    /// `SLOW_STORE_BENCH_DB=/path/to/slow_store.db cargo test --release -- --ignored gap_searches_on_a_mirror`.
+    #[test]
+    #[ignore]
+    fn gap_searches_on_a_mirror() {
+        let path = std::env::var("SLOW_STORE_BENCH_DB")
+            .expect("SLOW_STORE_BENCH_DB names a slow_store.db");
+        let store = SlowStore::open(Path::new(&path)).unwrap();
+        let timed = |f: &dyn Fn() -> Vec<f64>| {
+            let start = std::time::Instant::now();
+            let sums = f();
+            (start.elapsed(), sums)
+        };
+        let triad_sums = |t: Vec<RawOpenTriad>| -> Vec<f64> {
+            t.iter()
+                .map(|t| f64::from(t.ab_strength) + f64::from(t.bc_strength))
+                .collect()
+        };
+        let (fast, fast_sums) = timed(&|| triad_sums(store.find_open_triads(0.2, 50).unwrap()));
+        let (sql, sql_sums) = timed(&|| triad_sums(store.find_open_triads_sql(0.2, 50).unwrap()));
+        assert_eq!(fast_sums, sql_sums);
+        println!("open triads: in memory {fast:?}, SQL {sql:?}");
+        let (fast, fast_count) =
+            timed(&|| vec![store.find_diamond_gaps(0.2, 50).unwrap().len() as f64]);
+        let (sql, sql_count) =
+            timed(&|| vec![store.find_diamond_gaps_sql(0.2, 50).unwrap().len() as f64]);
+        assert_eq!(fast_count, sql_count);
+        println!("diamonds: in memory {fast:?}, SQL {sql:?}");
+        let start = std::time::Instant::now();
+        let result = crate::memory::gap_topology::GapDetector::detect(
+            &store,
+            &crate::memory::gap_topology::GapDetectionConfig::default(),
+        )
+        .unwrap();
+        println!(
+            "whole detection: {:?}, {} gaps {:?}",
+            start.elapsed(),
+            result.gaps.len(),
+            result.type_counts
+        );
     }
 
     #[test]
