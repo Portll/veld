@@ -15,12 +15,17 @@
 //! - VELD_EMBEDDING_API_TASK_PREFIXES: 1/0 to force nomic's `search_document: ` /
 //!   `search_query: ` task prefixes on or off (default: on when the model name
 //!   contains "nomic", which needs them and silently degrades without them)
+//! - VELD_EMBEDDING_API_MAX_TOKENS: the model's input window in tokens (default: 2048 for
+//!   nomic, 8192 for bge-m3, none for other models). A text longer than the window is embedded
+//!   in pieces and given the mean of their vectors, because the server would otherwise keep
+//!   only its opening; LM Studio does so silently.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use super::chunking::{chunk_text, ChunkConfig};
 use super::Embedder;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:1234";
@@ -36,6 +41,79 @@ pub fn default_task_prefixes(model: &str) -> bool {
     model.to_ascii_lowercase().contains("nomic")
 }
 
+/// The input window a model was trained on, judged from its name: nomic-embed-text v1.5 was
+/// trained at 2048 tokens and degrades past it even where a server accepts more; bge-m3 at 8192.
+pub fn default_max_tokens(model: &str) -> Option<usize> {
+    let model = model.to_ascii_lowercase();
+    if model.contains("nomic") {
+        Some(2048)
+    } else if model.contains("bge-m3") {
+        Some(8192)
+    } else {
+        None
+    }
+}
+
+/// Room left in the window for the special tokens a server adds and for a task prefix.
+const WINDOW_MARGIN: usize = 8;
+/// Bytes per token assumed where the server cannot count: this store's densest text (paths,
+/// SHAs, JSON) runs under 2 characters per token (`chunking.rs`), so 2 never overruns.
+const BYTES_PER_TOKEN_FLOOR: usize = 2;
+/// How many times a piece that still does not fit is split again before it is sent as it is.
+const MAX_SPLIT_DEPTH: usize = 4;
+
+/// The mean of unit-length vectors, scaled to unit length.
+fn mean_normalised(vectors: &[Vec<f32>]) -> Vec<f32> {
+    let width = vectors.first().map_or(0, Vec::len);
+    let mut sum = vec![0f32; width];
+    for v in vectors {
+        let norm = v
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt()
+            .max(f32::EPSILON);
+        for (s, x) in sum.iter_mut().zip(v) {
+            *s += x / norm;
+        }
+    }
+    let norm = sum
+        .iter()
+        .map(|x| x * x)
+        .sum::<f32>()
+        .sqrt()
+        .max(f32::EPSILON);
+    sum.iter().map(|x| x / norm).collect()
+}
+
+/// `text` cut on `chunk_text`'s boundaries into pieces that each pass `fits`, a piece that does
+/// not being cut again at half the size, up to `MAX_SPLIT_DEPTH` times.
+fn pieces(text: &str, piece_bytes: usize, fits: &dyn Fn(&str) -> bool) -> Vec<String> {
+    fn split(
+        text: &str,
+        size: usize,
+        depth: usize,
+        fits: &dyn Fn(&str) -> bool,
+        out: &mut Vec<String>,
+    ) {
+        let config = ChunkConfig {
+            chunk_size: size,
+            overlap: size / 8,
+            min_chunk_size: size / 4,
+        };
+        for chunk in chunk_text(text, &config).chunks {
+            if depth < MAX_SPLIT_DEPTH && size > 64 && !fits(&chunk) {
+                split(&chunk, size / 2, depth + 1, fits, out);
+            } else {
+                out.push(chunk);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    split(text, piece_bytes.max(64), 0, fits, &mut out);
+    out
+}
+
 /// Configuration for HTTP embedding API
 #[derive(Debug, Clone)]
 pub struct HttpEmbedderConfig {
@@ -49,6 +127,8 @@ pub struct HttpEmbedderConfig {
     pub timeout_ms: u64,
     /// Prepend nomic's `search_document: ` / `search_query: ` task prefixes.
     pub task_prefixes: bool,
+    /// The model's input window in tokens; a longer text is embedded in pieces. None: no limit.
+    pub max_input_tokens: Option<usize>,
 }
 
 impl Default for HttpEmbedderConfig {
@@ -86,6 +166,7 @@ impl HttpEmbedderConfig {
             .ok()
             .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
             .unwrap_or_else(|| default_task_prefixes(&model));
+        let max_input_tokens = Self::max_tokens_env().unwrap_or_else(|| default_max_tokens(&model));
         Self {
             base_url,
             model,
@@ -95,7 +176,18 @@ impl HttpEmbedderConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_TIMEOUT_MS),
             task_prefixes,
+            max_input_tokens,
         }
+    }
+
+    /// `VELD_EMBEDDING_API_MAX_TOKENS` when set: a count, or 0 for no limit.
+    fn max_tokens_env() -> Option<Option<usize>> {
+        let n: usize = std::env::var("VELD_EMBEDDING_API_MAX_TOKENS")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some((n > 0).then_some(n))
     }
 
     /// Configuration from a canonical id, `<base_url>` or `<base_url>#<model>` — the form
@@ -113,6 +205,9 @@ impl HttpEmbedderConfig {
             cfg.model = m.to_string();
             if std::env::var("VELD_EMBEDDING_API_TASK_PREFIXES").is_err() {
                 cfg.task_prefixes = default_task_prefixes(&cfg.model);
+            }
+            if Self::max_tokens_env().is_none() {
+                cfg.max_input_tokens = default_max_tokens(&cfg.model);
             }
         }
         cfg
@@ -158,6 +253,20 @@ pub struct HttpEmbedder {
     /// Cached dimension from first successful call
     cached_dimension: std::sync::OnceLock<usize>,
     availability_cache: Mutex<Option<(Instant, bool)>>,
+    /// Whether the server answers `POST /tokenize` (llama-server does, LM Studio does not),
+    /// learned on the first text long enough to need counting.
+    tokenizes: std::sync::OnceLock<bool>,
+}
+
+/// llama-server's `/tokenize` request and response.
+#[derive(Serialize)]
+struct TokenizeRequest<'a> {
+    content: &'a str,
+}
+
+#[derive(Deserialize)]
+struct TokenizeResponse {
+    tokens: Vec<serde_json::Value>,
 }
 
 /// What `GET /v1/models` lists (OpenAI shape).
@@ -186,7 +295,82 @@ impl HttpEmbedder {
             canonical_id,
             cached_dimension: std::sync::OnceLock::new(),
             availability_cache: Mutex::new(None),
+            tokenizes: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The server's token count for `text`, or None where it cannot count.
+    fn count_tokens(&self, text: &str) -> Option<usize> {
+        if self.tokenizes.get() == Some(&false) {
+            return None;
+        }
+        let mut builder = self
+            .client
+            .post(&format!("{}/tokenize", self.config.base_url));
+        if let Some(ref key) = self.config.api_key {
+            builder = builder.header("Authorization", &format!("Bearer {key}"));
+        }
+        match builder.send_json(&TokenizeRequest { content: text }) {
+            Ok(resp) => {
+                let counted = resp
+                    .into_body()
+                    .read_json::<TokenizeResponse>()
+                    .ok()
+                    .map(|r| r.tokens.len());
+                let _ = self.tokenizes.set(counted.is_some());
+                counted
+            }
+            // A server without the endpoint says so; anything else may pass, and is not remembered.
+            Err(ureq::Error::StatusCode(404 | 405 | 501)) => {
+                let _ = self.tokenizes.set(false);
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Whether `sent`, the text as it goes to the server, fits the model's window. A text with
+    /// fewer bytes than the window always fits, since every token covers at least one byte.
+    fn fits(&self, sent: &str) -> bool {
+        let Some(window) = self.config.max_input_tokens else {
+            return true;
+        };
+        let room = window.saturating_sub(WINDOW_MARGIN);
+        if sent.len() <= room {
+            return true;
+        }
+        match self.count_tokens(sent) {
+            Some(n) => n <= room,
+            None => sent.len() / BYTES_PER_TOKEN_FLOOR <= room,
+        }
+    }
+
+    /// `text` embedded with `prefixed` applied: whole when it fits the window, otherwise as the
+    /// mean of pieces that each fit.
+    fn encode_windowed(&self, text: &str, prefixed: impl Fn(&str) -> String) -> Result<Vec<f32>> {
+        let sent = prefixed(text);
+        if self.fits(&sent) {
+            return self.encode_http(&sent);
+        }
+        let room = self
+            .config
+            .max_input_tokens
+            .unwrap_or(usize::MAX)
+            .saturating_sub(WINDOW_MARGIN);
+        let split = pieces(text, room.saturating_mul(BYTES_PER_TOKEN_FLOOR), &|p| {
+            self.fits(&prefixed(p))
+        });
+        tracing::debug!(
+            "embedding {} bytes in {} pieces: longer than the {}-token window",
+            text.len(),
+            split.len(),
+            room + WINDOW_MARGIN
+        );
+        let vectors = split
+            .iter()
+            .map(|p| self.encode_http(&prefixed(p)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(mean_normalised(&vectors))
     }
 
     pub fn base_url(&self) -> &str {
@@ -318,7 +502,7 @@ impl Embedder for HttpEmbedder {
 
     /// Document side: nomic's `search_document: ` prefix when the model wants it.
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
-        let embedding = self.encode_http(&self.document_text(text))?;
+        let embedding = self.encode_windowed(text, |t| self.document_text(t).into_owned())?;
         // Cache the dimension on first successful call
         let _ = self.cached_dimension.set(embedding.len());
         Ok(embedding)
@@ -326,7 +510,7 @@ impl Embedder for HttpEmbedder {
 
     /// Query side: nomic's `search_query: ` prefix when the model wants it.
     fn encode_for_query(&self, text: &str) -> Result<Vec<f32>> {
-        let embedding = self.encode_http(&self.query_text(text))?;
+        let embedding = self.encode_windowed(text, |t| self.query_text(t).into_owned())?;
         let _ = self.cached_dimension.set(embedding.len());
         Ok(embedding)
     }
@@ -337,6 +521,10 @@ impl Embedder for HttpEmbedder {
     }
 
     fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        // A text longer than the window is embedded in pieces, so the batch goes one by one.
+        if texts.iter().any(|t| !self.fits(&self.document_text(t))) {
+            return texts.iter().map(|t| self.encode(t)).collect();
+        }
         // Use batch endpoint if available
         let url = format!("{}/v1/embeddings", self.config.base_url);
         let prefixed: Vec<std::borrow::Cow<'_, str>> =
@@ -385,7 +573,52 @@ mod tests {
             api_key: None,
             timeout_ms: 100,
             task_prefixes: default_task_prefixes(model),
+            max_input_tokens: default_max_tokens(model),
         }
+    }
+
+    #[test]
+    fn the_window_follows_the_model() {
+        assert_eq!(
+            default_max_tokens("text-embedding-nomic-embed-text-v1.5"),
+            Some(2048)
+        );
+        assert_eq!(default_max_tokens("bge-m3"), Some(8192));
+        assert_eq!(default_max_tokens("some-other-model"), None);
+    }
+
+    #[test]
+    fn the_mean_of_pieces_is_unit_length_and_between_them() {
+        let m = mean_normalised(&[vec![2.0, 0.0], vec![0.0, 3.0]]);
+        assert!((m.iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((m[0] - m[1]).abs() < 1e-6, "{m:?}");
+    }
+
+    /// Each piece fits, and together they reach from the text's start to its end.
+    #[test]
+    fn pieces_each_fit_and_cover_the_text() {
+        let text: String = (0..3000).map(|i| format!("w{i} ")).collect();
+        let fits = |p: &str| p.split_whitespace().count() <= 300;
+        let split = pieces(&text, 4000, &fits);
+        assert!(split.len() > 1);
+        assert!(split.iter().all(|p| fits(p)), "a piece over the window");
+        assert!(split.first().unwrap().starts_with("w0 "));
+        assert!(split.last().unwrap().trim_end().ends_with("w2999"));
+    }
+
+    /// A text with fewer bytes than the window fits without asking the server; past that, a
+    /// server that cannot count leaves the 2-bytes-per-token floor to decide.
+    #[test]
+    fn fits_counts_only_what_could_overrun() {
+        let e = HttpEmbedder::new(cfg("text-embedding-nomic-embed-text-v1.5"));
+        assert!(e.fits(&"a".repeat(2000)));
+        assert!(
+            e.fits(&"a ".repeat(1500)),
+            "3000 bytes is at most 1500 tokens"
+        );
+        assert!(!e.fits(&"a ".repeat(3000)), "6000 bytes may be 3000 tokens");
+        let unlimited = HttpEmbedder::new(cfg("some-other-model"));
+        assert!(unlimited.fits(&"a ".repeat(100_000)));
     }
 
     #[test]
