@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::{ColumnFamilyDescriptor, Options};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -83,7 +83,7 @@ pub struct ContextBlockStore {
 impl ContextBlockStore {
     /// Column family descriptors required by the ContextBlockStore.
     /// The caller must include these when opening the shared DB.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
         let mut cf_opts = Options::default();
         cf_opts.create_if_missing(true);
@@ -303,7 +303,7 @@ impl ContextBlockStore {
     }
 }
 
-#[cfg(all(test, feature = "legacy-rocksdb"))]
+#[cfg(all(test, feature = "rocksdb"))]
 mod tests {
     use super::*;
     use crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore;

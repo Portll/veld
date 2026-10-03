@@ -10,7 +10,7 @@
 //! - `facts_embedding:{user_id}:{fact_id}` - Pre-computed embedding vector (384-dim)
 
 use anyhow::Result;
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -263,7 +263,7 @@ fn decode_semantic_fact_with_fallback(data: &[u8]) -> Result<(SemanticFact, bool
     }
 }
 
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 /// Minimal deserializer for the GC-path scanner in `storage.rs`.
 ///
 /// Decodes a raw RocksDB value (primary-record format, including legacy
@@ -309,7 +309,7 @@ pub struct SemanticFactStore {
 
 impl SemanticFactStore {
     /// Create a new fact store backed by RocksDB
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn new(db: Arc<DB>) -> Self {
         Self {
             store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),

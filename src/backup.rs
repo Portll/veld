@@ -28,7 +28,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::{
     backup::{BackupEngine, BackupEngineOptions},
     checkpoint::Checkpoint,
@@ -39,11 +39,11 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use std::sync::Arc;
 
 use crate::intent_log::IntentLogIter;
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use crate::intent_log::{IntentLog, Lsn};
 
 /// Column family that holds Phase C user authentication records. It is
@@ -53,7 +53,7 @@ use crate::intent_log::{IntentLog, Lsn};
 /// MANIFEST as one unit.
 pub const CF_USER_AUTH: &str = "cf_user_auth";
 
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 /// Other column families known to live on the *main memories* database.
 /// Used only for enumeration into the manifest; the backup engine itself
 /// captures whatever the source DB actually has, regardless of this list.
@@ -191,7 +191,7 @@ pub struct RestoreOptions {
     pub max_lsn: Option<u64>,
 }
 
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 /// Named reference to a RocksDB database for backup
 pub struct SecondaryStoreRef<'a> {
     pub name: &'a str,
@@ -251,7 +251,7 @@ impl VeldBackupEngine {
         )?))
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Create a full backup of a RocksDB database
     ///
     /// # Arguments
@@ -332,7 +332,7 @@ impl VeldBackupEngine {
         Ok(metadata)
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Create a comprehensive backup of the main database, secondary stores, and graph.
     ///
     /// Uses RocksDB BackupEngine for the main memories DB and Checkpoint API
@@ -347,7 +347,7 @@ impl VeldBackupEngine {
         self.create_comprehensive_backup_with_graph(db, user_id, secondary_stores, None)
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Create a comprehensive backup including the knowledge graph DB.
     pub fn create_comprehensive_backup_with_graph(
         &self,
@@ -450,7 +450,7 @@ impl VeldBackupEngine {
         Ok(metadata)
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Create a comprehensive backup that ALSO captures the W5 intent log
     /// directory. Behaviour is identical to
     /// [`create_comprehensive_backup_with_graph`] for the main DB, secondary
@@ -523,7 +523,7 @@ impl VeldBackupEngine {
         })
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Comprehensive backup around an intent log that was already staged
     /// via [`stage_intent_log`]. The staged tree is renamed into place as
     /// `<backup_dir>/intent_log_<backup_id>/` once the backup id is known.
@@ -658,7 +658,7 @@ pub(crate) fn copy_intent_log_files(
 }
 
 impl VeldBackupEngine {
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Restore from a specific backup
     ///
     /// # Arguments
@@ -711,7 +711,7 @@ impl VeldBackupEngine {
         Ok(())
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// List all available backups for a user
     pub fn list_backups(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
         let backup_dir = self.user_backup_dir(user_id)?;
@@ -736,7 +736,7 @@ impl VeldBackupEngine {
         Ok(metadata_list)
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Restore from a comprehensive backup, including secondary stores.
     ///
     /// The `secondary_restore_paths` map store names to their target restore directories.
@@ -834,7 +834,7 @@ impl VeldBackupEngine {
         Ok(restored_stores)
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Restore from a comprehensive backup AND materialise the intent log
     /// into `intent_log_target.source_dir`.
     ///
@@ -1004,7 +1004,7 @@ impl VeldBackupEngine {
         Ok(restored)
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Delete old backups, keeping only the most recent N backups.
     /// `keep_count` must be >= 1 to prevent accidental deletion of all backups.
     pub fn purge_old_backups(&self, user_id: &str, keep_count: usize) -> Result<usize> {
@@ -1098,7 +1098,7 @@ impl VeldBackupEngine {
     // Private helper methods
     // ========================================================================
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     fn save_metadata(&self, metadata: &BackupMetadata) -> Result<()> {
         let metadata_path = self
             .backup_path
@@ -1167,7 +1167,7 @@ impl VeldBackupEngine {
         Ok(())
     }
 
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     /// Upper bound on the memory records in `db`.
     ///
     /// This used to count EVERY key in the column family — counters, `stats:`
@@ -1213,7 +1213,7 @@ pub fn copy_dir_recursive_pub(src: &Path, dst: &Path) -> Result<()> {
     copy_dir_recursive(src, dst)
 }
 
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 /// Calculate total size of a directory recursively
 fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
@@ -1231,7 +1231,7 @@ fn dir_size(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 /// Recursively copy a directory
 /// Replace `target` with `staging`. The original is renamed aside rather than deleted and is
 /// only removed once the new copy is in place; if placing fails, any partial copy is removed
@@ -1299,7 +1299,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 /// Enumerate the column families that the current DB instance actually
 /// contains. We probe a known set including Phase C's `cf_user_auth`. CFs
 /// that are not present are simply omitted from the result.
@@ -1401,7 +1401,7 @@ pub(crate) fn scan_lsn_range(path: &Path) -> Result<Option<(u64, u64)>> {
     })
 }
 
-#[cfg(all(test, feature = "legacy-rocksdb"))]
+#[cfg(all(test, feature = "rocksdb"))]
 mod tests {
     use super::*;
     use rocksdb::Options;

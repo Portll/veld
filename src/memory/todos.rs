@@ -14,7 +14,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use parking_lot::RwLock;
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::{ColumnFamilyDescriptor, Options};
 use std::collections::HashMap;
 use std::path::Path;
@@ -93,7 +93,7 @@ pub struct TodoStore {
 impl TodoStore {
     /// Column family descriptors required by the TodoStore.
     /// The caller must include these (plus `"default"`) when opening the shared DB.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
         let mut cf_opts = Options::default();
         cf_opts.create_if_missing(true);
@@ -105,7 +105,7 @@ impl TodoStore {
         ]
     }
 
-    #[cfg_attr(not(feature = "legacy-rocksdb"), allow(dead_code))]
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     /// Pre-column-family standalone DBs under the data root, imported into these
     /// families by the rocksdb boot path before the store is bound.
     pub(crate) const LEGACY_SEPARATE_DBS: &'static [(&'static str, &'static str)] = &[
@@ -1486,7 +1486,7 @@ pub struct UserTodoStats {
     pub projects: usize,
 }
 
-#[cfg(all(test, feature = "legacy-rocksdb"))]
+#[cfg(all(test, feature = "rocksdb"))]
 mod tests {
     use super::*;
     use crate::memory::types::Recurrence;

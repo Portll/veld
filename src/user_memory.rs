@@ -14,7 +14,7 @@ pub use crate::graph_memory::{
     EntityNode, EpisodicNode, GraphMemory, GraphStats, RelationshipEdge,
 };
 pub use crate::memory::hybrid_search::BM25Index;
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 pub use crate::memory::storage::MemoryStorage;
 pub use crate::memory::{Experience, Memory, MemoryConfig, MemoryId, MemoryStats};
 pub use crate::storage::{
@@ -48,7 +48,7 @@ impl UserMemory {
     }
 
     /// Create a substrate with an already-opened primary store.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
         Ok(Self {
             inner: MemorySystem::with_storage(config, storage)?,
@@ -64,7 +64,7 @@ impl UserMemory {
     /// Without this seam the read side would open a second on-disk index
     /// at a parallel path and diverge from the writer until the next
     /// process restart triggered a replay catch-up.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn with_storage_and_bm25_index(
         config: MemoryConfig,
         storage: Arc<MemoryStorage>,

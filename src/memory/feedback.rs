@@ -6,7 +6,7 @@
 //! type-dependent inertia to prevent noise from destabilizing useful memories.
 
 use chrono::{DateTime, Duration, Timelike, Utc};
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -20,7 +20,7 @@ use crate::memory::types::{ExperienceType, MemoryId};
 // =============================================================================
 
 /// Column family name for feedback data in the shared RocksDB instance
-#[cfg_attr(not(feature = "legacy-rocksdb"), allow(dead_code))]
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 pub(crate) const CF_FEEDBACK: &str = "feedback";
 
 /// Maximum number of recent signals to keep for trend detection
@@ -1507,7 +1507,7 @@ impl FeedbackStore {
         Self::load_from(store)
     }
 
-    #[cfg_attr(not(feature = "legacy-rocksdb"), allow(dead_code))]
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     /// Pre-column-family standalone DB under the data root, imported into
     /// CF_FEEDBACK by the rocksdb boot path before the store is bound.
     pub(crate) const LEGACY_SEPARATE_DBS: &'static [(&'static str, &'static str)] =
@@ -1569,7 +1569,7 @@ impl FeedbackStore {
     ///
     /// Primarily useful for tests and standalone operation. In production the
     /// rocksdb boot path binds [`with_store`](Self::with_store) to the shared DB.
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn with_persistence<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);

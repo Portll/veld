@@ -7,7 +7,7 @@ redb and RocksDB implementations, and the tools that move data between engines.
 | :--- | :--- |
 | `mod.rs` | The traits: `ColumnStore`, `KeyValueStore`, `PrimaryMemoryStore`, `GraphStore`, `AuditStore`, `BackupStore`, `MigrationStore`, `BatchWriter`, `StorageFactory`; `SharedEngineDb`. |
 | `redb.rs` | The redb implementation of every trait. |
-| `legacy_rocksdb.rs` | The RocksDB implementation. Compiled only with `legacy-rocksdb`. |
+| `legacy_rocksdb.rs` | The RocksDB implementation. Compiled with the `rocksdb` feature. |
 | `portable.rs` | The VELDPORT interchange codec used by export, import and migrate. |
 | `migrate/` | `veld export`, `veld import` and `veld migrate`; each unit is verified by frame count and SHA-256 digest. |
 | `boot_guard.rs` | Refuses to serve an empty store while the other engine holds data. |
@@ -16,9 +16,10 @@ redb and RocksDB implementations, and the tools that move data between engines.
 
 ## Engines
 
-- **redb** is the default (`storage-redb`).
-- **RocksDB** is built only with `legacy-rocksdb`. Without it the binary contains no RocksDB code,
-  and a request for the rocksdb backend refuses at boot, naming the feature.
+- **RocksDB** is the default engine (`rocksdb`, [ADR 0007](../../docs/src/decisions/0007-rocksdb-default-engine.md)).
+- **redb** (`storage-redb`) is built by default too and selected with `VELD_STORAGE_BACKEND=redb`.
+- `--no-default-features --features storage-redb` builds redb alone: the binary contains no RocksDB
+  code, and a request for the rocksdb backend refuses at boot, naming the feature.
 
 ## Moving data between engines
 

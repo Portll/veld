@@ -19,7 +19,7 @@ pub enum StoreContent {
 
 pub fn user_store_content(user_dir: &Path, backend: StorageBackend) -> Result<StoreContent> {
     match backend {
-        #[cfg(feature = "legacy-rocksdb")]
+        #[cfg(feature = "rocksdb")]
         StorageBackend::RocksDb => Ok(
             match crate::storage::legacy_rocksdb::user_has_memories(user_dir)? {
                 None => StoreContent::Absent,
@@ -27,7 +27,7 @@ pub fn user_store_content(user_dir: &Path, backend: StorageBackend) -> Result<St
                 Some(true) => StoreContent::NonEmpty,
             },
         ),
-        #[cfg(not(feature = "legacy-rocksdb"))]
+        #[cfg(not(feature = "rocksdb"))]
         StorageBackend::RocksDb => rocksdb_files(&user_dir.join("storage")),
         #[cfg(feature = "storage-redb")]
         StorageBackend::Redb => Ok(match crate::storage::redb::user_memory_count(user_dir)? {
@@ -95,11 +95,11 @@ pub fn refuse_stranded_data(
     }
 
     if !stranded.is_empty() {
-        let uncounted = if cfg!(feature = "legacy-rocksdb") || other != StorageBackend::RocksDb {
+        let uncounted = if cfg!(feature = "rocksdb") || other != StorageBackend::RocksDb {
             ""
         } else {
             " This build has no RocksDB code, so a RocksDB store with any table file or non-empty \
-             write-ahead log counts as holding memories: a build with --features legacy-rocksdb \
+             write-ahead log counts as holding memories: a build with --features rocksdb \
              counts them, and a store it finds holds none can be moved aside."
         };
         bail!(
@@ -120,7 +120,7 @@ pub fn refuse_stranded_data(
     })
 }
 
-#[cfg(all(test, feature = "storage-redb", feature = "legacy-rocksdb"))]
+#[cfg(all(test, feature = "storage-redb", feature = "rocksdb"))]
 mod tests {
     use super::*;
     use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId, MemoryTier};
@@ -316,7 +316,7 @@ mod tests {
 /// A RocksDB directory as a build that cannot open it sees it: absent without CURRENT, empty when
 /// no table file and no write-ahead log holds anything, and otherwise taken to hold memories,
 /// since only RocksDB can tell its memories from the default family's other keys.
-#[cfg(not(feature = "legacy-rocksdb"))]
+#[cfg(not(feature = "rocksdb"))]
 fn rocksdb_files(dir: &Path) -> Result<StoreContent> {
     let inspect =
         |e: std::io::Error| anyhow::Error::from(e).context(format!("inspecting {}", dir.display()));
@@ -340,7 +340,7 @@ fn rocksdb_files(dir: &Path) -> Result<StoreContent> {
     Ok(StoreContent::Empty)
 }
 
-#[cfg(all(test, not(feature = "legacy-rocksdb")))]
+#[cfg(all(test, not(feature = "rocksdb")))]
 mod without_rocksdb {
     use super::*;
 
@@ -389,7 +389,7 @@ mod without_rocksdb {
             .unwrap_err()
             .to_string();
         assert!(
-            msg.contains("3 user(s)") && msg.contains("--features legacy-rocksdb counts them"),
+            msg.contains("3 user(s)") && msg.contains("--features rocksdb counts them"),
             "{msg}"
         );
     }

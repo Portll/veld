@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 use rocksdb::DB;
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
@@ -409,7 +409,7 @@ pub fn detect_semantic_opposition(text_a: &str, text_b: &str) -> bool {
     false
 }
 
-#[cfg(feature = "legacy-rocksdb")]
+#[cfg(feature = "rocksdb")]
 /// Minimal deserializer for the GC-path scanner in `storage.rs`.
 ///
 /// Decodes a raw RocksDB value into a [`TemporalFact`] so that
@@ -431,7 +431,7 @@ pub struct TemporalFactStore {
 }
 
 impl TemporalFactStore {
-    #[cfg(feature = "legacy-rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn new(db: Arc<DB>) -> Self {
         Self {
             store: Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db)),

@@ -442,17 +442,20 @@ debug-assertions = false
 incremental = false     # Full rebuild every time (no incremental artifacts)
 
 [features]
-# The default build runs on redb and contains no RocksDB code.
-default = ["storage-redb"]
+# The default build carries both engines; RocksDB is the default engine (ADR 0007).
+default = ["rocksdb", "storage-redb"]
+
+# The RocksDB engine and what only it provides today: record-level at-rest encryption, the
+# RocksDB backup engine and the semantic merge pass. Needs libclang and a C++ toolchain. A build
+# without it refuses those paths and names this feature:
+# `--no-default-features --features storage-redb` is the redb-only build.
+rocksdb = ["dep:rocksdb"]
+
+# The earlier name of `rocksdb`, kept so existing build commands keep working.
+legacy-rocksdb = ["rocksdb"]
 
 # The redb storage engine.
 storage-redb = ["dep:redb"]
-
-# The RocksDB engine and what only it provides: reading, exporting or migrating an existing
-# RocksDB store (`veld migrate --from rocksdb`), record-level at-rest encryption and the RocksDB
-# backup engine. Off by default, so the default build needs no libclang or C++ toolchain;
-# without it those paths refuse and name this feature.
-legacy-rocksdb = ["dep:rocksdb"]
 
 # Heavy stress / brute-force test suites. Off by default so the standard
 # test build stays fast and does not compile the aggressive suites. Enable
@@ -504,7 +507,7 @@ telemetry = [
 ]
 
 
-# Optional: built only with `legacy-rocksdb`.
+# Optional: built only with `rocksdb`.
 # jemalloc replaces the system C allocator inside RocksDB's C++ code (not just Rust).
 # Without it, glibc/CRT malloc fragments heavily and never returns memory to the OS.
 # Confirmed fix by rust-rocksdb maintainer (zaidoon1) in facebook/rocksdb#12364.
