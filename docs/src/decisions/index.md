@@ -23,3 +23,4 @@ pointing back at it with `supersedes:` in the frontmatter and add
 | [0004](0004-docs-sidecar-stack.md) | Docs sidecar built on mdBook + Rust generators | accepted | 2026-05-28 |
 | [0005](0005-facts-purge-and-narratives.md) | Facts purge, narratives, and the `purged_at` field | accepted | 2026-05-29 |
 | [0006](0006-backend-parity-and-on-demand-migration.md) | Backend parity and on-demand migration | proposed | 2026-09-11 |
+| [0007](0007-rocksdb-default-engine.md) | RocksDB is the default engine and the port target | accepted | 2026-10-03 |
