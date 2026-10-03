@@ -394,6 +394,7 @@ VELD_HOST=127.0.0.1              # Bind address (default: localhost)
 VELD_PORT=3030                   # Port (default: 3030)
 VELD_MEMORY_PATH=/var/lib/veld  # Data directory
 VELD_REQUEST_TIMEOUT=60          # Request timeout in seconds
+VELD_GAP_TIMEOUT=300             # Request timeout for /api/gap/* in seconds
 VELD_MAX_CONCURRENT=200          # Max concurrent requests
 VELD_RATE_LIMIT=4000             # Enabled by default in production unless explicitly set to 0
 VELD_CORS_ORIGINS=https://app.example.com

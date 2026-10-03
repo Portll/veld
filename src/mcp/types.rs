@@ -368,6 +368,11 @@ pub(crate) struct GapAnalyzeResponse {
     pub gaps: Vec<GapSummaryMcp>,
     pub type_counts: std::collections::HashMap<String, usize>,
     pub duration_ms: u64,
+    /// `fresh`, `stale` or `running`; servers before the asynchronous analysis send none.
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub computed_at: Option<String>,
 }
 
 #[derive(Deserialize)]
