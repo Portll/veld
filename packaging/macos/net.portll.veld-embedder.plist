@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  veld's embedder on its own llama-server (macOS launchd agent).
+
+  Installation (per-user):
+    1. Write ~/.config/veld/embedder.env (see scripts/embedder-server.sh for the keys), e.g.
+         EMBEDDER_MODEL_PATH=/path/to/nomic-embed-text-v1.5.Q4_K_M.gguf
+         EMBEDDER_ALIAS=text-embedding-nomic-embed-text-v1.5
+    2. Copy this file, substituting __SCRIPT_PATH__ and __USER__ (launchd does not expand ~):
+         sed -e "s|__SCRIPT_PATH__|$(pwd)/scripts/embedder-server.sh|" -e "s|__USER__|$USER|" \
+           packaging/macos/net.portll.veld-embedder.plist \
+           > ~/Library/LaunchAgents/net.portll.veld-embedder.plist
+    3. Load and start:
+         launchctl load -w ~/Library/LaunchAgents/net.portll.veld-embedder.plist
+    4. Verify, then point veld at it (VELD_EMBEDDING_API_URL=http://127.0.0.1:8095):
+         curl http://127.0.0.1:8095/health
+         curl http://127.0.0.1:8095/v1/models
+
+  Uninstall:
+         launchctl unload -w ~/Library/LaunchAgents/net.portll.veld-embedder.plist
+         rm ~/Library/LaunchAgents/net.portll.veld-embedder.plist
+
+  Logs:  ~/Library/Logs/veld-embedder.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>net.portll.veld-embedder</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>__SCRIPT_PATH__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/__USER__/Library/Logs/veld-embedder.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/__USER__/Library/Logs/veld-embedder.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

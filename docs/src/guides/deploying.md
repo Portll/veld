@@ -80,7 +80,7 @@ BASE URL, without `/v1`; the client appends the path:
 | Backend | Start it | `VELD_EMBEDDING_API_URL` |
 |---|---|---|
 | LM Studio | load `text-embedding-nomic-embed-text-v1.5` (bundled) | `http://127.0.0.1:1234` (default) |
-| llama.cpp | `llama-server -m nomic-embed-text-v1.5.Q4_K_M.gguf --embedding --pooling mean --alias text-embedding-nomic-embed-text-v1.5 --port 8080` | `http://127.0.0.1:8080` |
+| llama.cpp | `scripts/embedder-server.sh`, as a LaunchAgent from `packaging/macos/net.portll.veld-embedder.plist` (below) | `http://127.0.0.1:8095` |
 | vLLM / LocalAI / llamafile | serve the model under the same name | its base URL |
 
 `VELD_EMBEDDING_API_MODEL` (default `text-embedding-nomic-embed-text-v1.5`) must match an
@@ -91,6 +91,35 @@ model name contains `nomic`, and `VELD_EMBEDDING_API_TASK_PREFIXES=0|1` forces e
 `VELD_EMBEDDING_API_TIMEOUT_MS` (default 30000) covers a cold model load, which is the
 slow case, not the embed. Ollama is not supported: its native API is not OpenAI-shaped and
 was removed on 2026-08-27.
+
+**A text longer than the model's window is embedded in pieces.** `VELD_EMBEDDING_API_MAX_TOKENS`
+is the window (default 2048 for nomic, 8192 for bge-m3, no limit for other models; 0 turns it
+off). A longer text is cut on `chunk_text`'s boundaries, each piece is embedded, and the text gets
+the normalised mean of the pieces. A server keeps only the opening of an over-long input, and LM
+Studio does so without an error. Serving nomic past its trained 2048 tokens does not help: on 22
+long documents, plain 8192 context halved recall@1 (0.34 to 0.14), and YaRN ×4 reached 0.39,
+against 0.52 for the mean of pieces. Where the server answers `POST /tokenize` (llama-server),
+veld counts exactly; elsewhere it assumes 2 bytes per token, the densest this store's text runs.
+Only a text with more bytes than the window is counted at all.
+
+### The embedder on its own llama-server
+
+LM Studio serves embeddings from the same queue as any chat model it holds, so a busy LLM delays
+every remember and recall. `scripts/embedder-server.sh` runs the embedding model on its own
+llama-server, configured by `~/.config/veld/embedder.env`:
+
+```sh
+EMBEDDER_MODEL_PATH=/path/to/nomic-embed-text-v1.5.Q4_K_M.gguf
+EMBEDDER_ALIAS=text-embedding-nomic-embed-text-v1.5   # = VELD_EMBEDDING_API_MODEL
+EMBEDDER_WINDOW=2048     # the model's trained window; 8192 for bge-m3
+EMBEDDER_POOLING=mean    # cls for bge-m3
+```
+
+The script sizes llama-server for embedding: `-c` is the window times the slots, because
+llama-server divides `-c` among its slots, and `-b`/`-ub` are the window, because an embedding
+input must fit in one micro-batch. With llama-server's defaults any input over 512 tokens is
+refused. `packaging/macos/net.portll.veld-embedder.plist` runs it under launchd; then set
+`VELD_EMBEDDING_API_URL=http://127.0.0.1:8095`.
 
 **Switching embedders re-embeds the store.** The embedder id and dimension are recorded in
 `.veld_embedder` / `.veld_embedding_dim` beside each tenant's storage; when they differ from
