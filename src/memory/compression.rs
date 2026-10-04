@@ -1504,7 +1504,25 @@ impl SemanticConsolidator {
             "moved to backlog",
             "moved to in_progress",
         ];
-        if [SESSION_NOISE, TOOL_NOISE, TODO_NOISE]
+        // Protocol output that reaches memories verbatim: task notifications, agent output
+        // tags, crash-recovery lines.
+        const SYSTEM_OUTPUT_NOISE: &[&str] = &[
+            "<task-notification>",
+            "</output-file>",
+            "<status>killed</status>",
+            "<status>completed</status>",
+            "[assistant: codeedit]",
+            "[assistant: observation]",
+            "[assistant: search]",
+            "[assistant: decision]",
+            "[assistant: pattern]",
+            "reconnected after",
+            "oom crash",
+            "surfaced 5 memories",
+            "surfaced 3 memories",
+            "agent \"",
+        ];
+        if [SESSION_NOISE, TOOL_NOISE, TODO_NOISE, SYSTEM_OUTPUT_NOISE]
             .iter()
             .any(|list| list.iter().any(|s| lower.contains(s)))
         {
@@ -2351,6 +2369,18 @@ mod tests {
         assert!(!SemanticConsolidator::is_knowledge_worthy(
             "Task completed after fixing the database connection pooling issue"
         ));
+    }
+
+    #[test]
+    fn test_quality_gate_rejects_system_output() {
+        for text in [
+            "<task-notification> background build finished with status ok",
+            "[Assistant: CodeEdit] rewrote the retry loop in the uploader module",
+            "Reconnected after the server restarted at midnight on the build host",
+            "Agent \"reviewer\" completed its pass over the storage module changes",
+        ] {
+            assert!(!SemanticConsolidator::is_knowledge_worthy(text), "{text}");
+        }
     }
 
     #[test]
