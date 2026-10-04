@@ -165,7 +165,9 @@ pub async fn consolidate_memories(
             }
         };
 
-        // Step 2: Maintenance (replay + tier consolidation + decay)
+        // Step 2: Maintenance (replay + tier consolidation + decay). Its heavy cycle may run
+        // the extraction step 1 just ran; ingest_candidate makes the repeat a no-op, and the
+        // maintenance pass applies its own thresholds.
         let decay_factor = state_clone.server_config().activation_decay_factor;
         let maintenance_result = {
             let memory = memory.clone();
