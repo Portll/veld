@@ -3,30 +3,25 @@
 This directory holds the fixtures, ground truth, and frozen baselines for the recall harness
 (`src/recall_harness/`).
 
-## What is wired, and what is not
-
-Read this before trusting any number in this directory.
-
-The harness **library** is real, tested, and exercised by the unit suite. There is **no CLI
-front-end**. Earlier revisions of this file documented a `recall-eval` binary and pointed at
-`src/bin/recall_eval.rs`; no such file has ever existed on any branch, and `Cargo.toml` declares no
-such `[[bin]]`. Those commands were never runnable. The same applies to two other artifacts this
-file used to reference: `.github/workflows/recall.yml` and `scripts/recall_diff.py` are both absent.
+## What is wired
 
 | Asset | State |
 | --- | --- |
 | `src/recall_harness/` library (`run_smoke_suite`, `run_longmemeval`) | wired, unit-tested |
+| `recall-eval` binary (`src/bin/recall_eval.rs`, `--suite`, `--layer`, `--baseline`) | ported from upstream `20de49c3`, the revision veld's harness tracks |
+| `.github/workflows/recall.yml` | the recall gate: weekly and on dispatch, once per storage engine |
+| `scripts/recall_diff.py`, `scripts/recall_engines_equal.py` | the diff table, and the check that both engines score the same |
 | Smoke corpus + `smoke_cases.jsonl` + `baseline.json` | present, consumed by the library |
-| LOCOMO gate fixtures + `locomo-gate-baseline.json` | **inert — nothing reads them** |
-| `recall-eval` binary / `--suite` / `--layer` CLI flags | do not exist |
-| CI recall workflow, `recall_diff.py` | do not exist |
+| LOCOMO gate fixtures + `locomo-gate-baseline.json` | read by the gate |
 
-The LOCOMO gate is the sharp edge. `LOCOMO_GATE_CORPUS_PATH` and `LOCOMO_GATE_CASES_PATH`
-(`src/recall_harness/fixtures.rs`) are declared and referenced by **nothing**, and
-`locomo-gate-baseline.json` is read by nothing. Its pinned numbers (p@1 0.31, ndcg@10 0.411,
-recall@10 0.527, stamped 2026-08-08 at `ec7abd2`) cannot be reproduced by anything in this
-repository — the producer is not here. Treat them as an unreproduced historical record, not a gate.
-Nothing regresses when they move, because nothing measures them.
+`locomo-gate-baseline.json` gates every run. A baseline is recorded by dispatching the workflow
+with `record=true`, which runs ungated and uploads each engine's report; the RocksDB report is
+committed as the baseline. Until a veld recording replaces it, the file holds upstream's numbers
+from 2026-08-08 (`ec7abd2`), which veld has never reproduced.
+
+The gate compares veld with veld: upstream's published numbers are hypotheses to test, never a
+reason to accept or decline a port (`docs/upstream/PLAN.md`, 1.5). Agent sessions may not build
+binaries locally (`CLAUDE.md`), so the gate runs in CI.
 
 ## Files
 
@@ -122,8 +117,8 @@ per mode.
 3. **Cumulative-only by design.** You cannot ask for "BM25 without spreading" or "rerank without
    facts" — only the six cumulative modes exist. A non-cumulative ablation is a different feature.
 
-4. **Nothing is CI-gated.** There is no recall workflow in this repository. Every baseline here is
-   advisory; a regression fails no build. Do not describe these as gates.
+4. **Only the LoCoMo gate is gated.** `recall.yml` gates the `locomo-gate` suite at `--layer
+   full`; the smoke baseline and the per-layer numbers are advisory.
 
 5. **30 cases is a small sample.** A single document rank flip moves per-category recall by ~0.20
    and per-mode ndcg by ~0.05. A `+0.01` per-layer delta is noise; trust direction, not magnitude.
