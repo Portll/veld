@@ -66,22 +66,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang
 
-      # The harness refuses the fallback NER and the hash embedder, so the ONNX runtime, MiniLM and
-      # the NER model are fetched, pinned and SHA-256 verified, by veld's own downloader.
+      # The harness refuses the hash embedder, so the ONNX runtime and MiniLM are fetched, pinned
+      # and SHA-256 verified by veld's own downloader, into the cache ci.yml's tests share.
       - uses: actions/cache@v4
         id: models
         with:
           path: ~/.cache/veld
-          key: veld-models-ner-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs') }}
-      - name: Fetch the ONNX runtime, MiniLM and the NER model
+          key: veld-models-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs') }}
+      - name: Fetch the ONNX runtime and MiniLM
         if: steps.models.outputs.cache-hit != 'true'
-        run: cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime --minilm --ner
+        run: cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime --minilm
 
       - name: Build recall-eval
         run: cargo build --release --bin recall-eval ${{ matrix.features }}
 
       - name: Run the LoCoMo gate
         id: run
+        env:
+          # veld ships with neural NER off (VELD_NEURAL_NER defaults to false), so the rule-based
+          # NER is the shipped system here; the harness's refusal of it is upstream's, which ships
+          # GLiNER.
+          SHODH_ALLOW_FALLBACK_NER: '1'
         run: |
           set +e
           set -o pipefail
