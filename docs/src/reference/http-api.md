@@ -6,7 +6,7 @@
 
 # HTTP API
 
-Veld exposes **227** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
+Veld exposes **230** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
 
 > Warning: 2 route(s) used a non-literal path string and were skipped by the generator. Inspect [src/handlers/router.rs](https://github.com/Portll/veld/blob/main/src/handlers/router.rs) directly for those.
 
@@ -164,6 +164,9 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 |---|---|---|
 | `POST` | `/api/facts/by-entity` | `facts::facts_by_entity` |
 | `POST` | `/api/facts/list` | `facts::list_facts` |
+| `POST` | `/api/facts/narratives` | `facts::fact_narratives` |
+| `POST` | `/api/facts/preview-purge` | `facts::facts_preview_purge` |
+| `POST` | `/api/facts/purge` | `facts::facts_purge` |
 | `POST` | `/api/facts/search` | `facts::search_facts` |
 | `POST` | `/api/facts/stats` | `facts::get_facts_stats` |
 | `POST` | `/api/facts/temporal` | `facts::list_temporal_facts` |
