@@ -6534,8 +6534,12 @@ impl MemorySystem {
         // `gc_merge_tombstones` is always run on heavy cycles so quiescence-expired
         // tombstones from any prior enabled run are eventually reclaimed (J2).
         if is_heavy {
-            let _merges = self.long_term_memory.run_merge_pass(user_id, 32);
-            let _gc = self.long_term_memory.gc_merge_tombstones(user_id);
+            if let Err(e) = self.long_term_memory.run_merge_pass(user_id, 32) {
+                tracing::warn!(user_id, error = %e, "S-R6: merge pass failed");
+            }
+            if let Err(e) = self.long_term_memory.gc_merge_tombstones(user_id) {
+                tracing::warn!(user_id, error = %e, "S-R6: tombstone GC failed");
+            }
         }
 
         let duration_ms = start_time.elapsed().as_millis() as u64;

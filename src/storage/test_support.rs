@@ -78,6 +78,37 @@ pub(crate) fn key_value_stores(
         .collect()
 }
 
+/// A fresh [`PrimaryMemoryStore`] per backend, each opened the way production opens it.
+pub(crate) fn primary_stores() -> Vec<(
+    StorageBackend,
+    Arc<dyn crate::storage::PrimaryMemoryStore>,
+    TempDir,
+)> {
+    let mut out: Vec<(
+        StorageBackend,
+        Arc<dyn crate::storage::PrimaryMemoryStore>,
+        TempDir,
+    )> = Vec::new();
+
+    #[cfg(feature = "rocksdb")]
+    {
+        let tmp = TempDir::new().unwrap();
+        let store =
+            crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::open(tmp.path(), None)
+                .unwrap();
+        out.push((StorageBackend::RocksDb, Arc::new(store), tmp));
+    }
+
+    #[cfg(feature = "storage-redb")]
+    {
+        let tmp = TempDir::new().unwrap();
+        let store = crate::storage::redb::RedbPrimaryMemoryStore::open(tmp.path()).unwrap();
+        out.push((StorageBackend::Redb, Arc::new(store), tmp));
+    }
+
+    out
+}
+
 /// Refuses a run that silently dropped a backend this build enables: a loop over
 /// one store passes every assertion while proving nothing about the other.
 pub(crate) fn assert_both_backends<T>(stores: &[(StorageBackend, T, TempDir)]) {

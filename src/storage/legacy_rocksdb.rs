@@ -329,10 +329,13 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
         self.inner.migrate_legacy()
     }
     fn run_merge_pass(&self, user_id: &str, limit: usize) -> Result<usize> {
-        Ok(self.inner.run_merge_pass(user_id, limit))
+        crate::memory::merge::run_merge_pass(self, user_id, limit)
     }
     fn gc_merge_tombstones(&self, user_id: &str) -> Result<usize> {
-        Ok(self.inner.gc_merge_tombstones(user_id))
+        crate::memory::merge::gc_merge_tombstones(self, user_id)
+    }
+    fn has_any_inbound_refs(&self, target: &MemoryId, user_id: &str) -> Result<bool> {
+        self.inner.has_any_inbound_refs(target, user_id)
     }
 
     fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {

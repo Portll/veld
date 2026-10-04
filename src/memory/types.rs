@@ -1870,6 +1870,59 @@ impl Clone for Memory {
 }
 
 impl Memory {
+    /// Collect every distinct target `MemoryId` this memory points AT — the
+    /// forward references that the inbound-reference reverse index inverts (R7).
+    ///
+    /// Harvested fields (each whose VALUE is a MemoryId reference):
+    /// - `experience.related_memories` (types.rs)
+    /// - `experience.causal_chain` (types.rs)
+    /// - `parent_id` (types.rs)
+    /// - `experience.context.why.causes[*].other` — WhyFacet CausalLink (facets.rs)
+    ///
+    /// NOT harvested:
+    /// - `related_todo_ids` — these are `TodoId`, not `MemoryId` (types.rs:1740).
+    /// - `derived_from` — the spec located this on `WhatFacet`, but it actually
+    ///   lives on `LearningFacet` (facets.rs:349), which is NOT a field on
+    ///   `Memory`/`Experience`/`RichContext` (unattached scaffold facet — never
+    ///   populated on a stored memory). There is nothing to harvest until a
+    ///   future change attaches it; revisit then.
+    /// - `SemanticFact.source_memories` — SemanticFacts live in a SEPARATE store
+    ///   (`SemanticFactStore`, facts.rs) with its own write path and its own id
+    ///   space (FactId holders, not MemoryId holders). Indexing them here would
+    ///   require a second write path into a different store and would mix two id
+    ///   spaces into one index. DEFERRED to keep R7 inside the Memory-store
+    ///   maintenance path. NOTE for R6 GC completeness: a memory cited only by a
+    ///   SemanticFact's `source_memories` will report zero inbound refs here even
+    ///   though a fact still depends on it. R6's GC must also consult fact-source
+    ///   refs (or a future extension must index them) before reclaiming.
+    pub fn forward_ref_targets(&self) -> Vec<MemoryId> {
+        // Order-preserving de-dup so repeated references collapse to one entry.
+        let mut targets: Vec<MemoryId> = Vec::new();
+        let push = |id: &MemoryId, targets: &mut Vec<MemoryId>| {
+            // A memory referencing itself is not a meaningful inbound edge for GC.
+            if *id != self.id && !targets.contains(id) {
+                targets.push(id.clone());
+            }
+        };
+
+        for id in &self.experience.related_memories {
+            push(id, &mut targets);
+        }
+        for id in &self.experience.causal_chain {
+            push(id, &mut targets);
+        }
+        if let Some(ref parent_id) = self.parent_id {
+            push(parent_id, &mut targets);
+        }
+        if let Some(ctx) = &self.experience.context {
+            for link in &ctx.why.causes {
+                push(&link.other, &mut targets);
+            }
+        }
+
+        targets
+    }
+
     /// Create new memory with given parameters
     /// If `created_at` is None, uses current time (Utc::now())
     pub fn new(

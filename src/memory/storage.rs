@@ -1908,7 +1908,7 @@ impl MemoryStorage {
         //   inbound_ref:{blinded(target_id)}:{holder_id} -> {holder_id bytes}
         // De-duplicated so a memory that references the same target twice (e.g.
         // both related_memories and a CausalLink) yields a single entry.
-        for target in Self::forward_ref_targets(memory) {
+        for target in memory.forward_ref_targets() {
             let inbound_key = format!(
                 "inbound_ref:{}:{}",
                 self.blind_term(&target.0.to_string()),
@@ -1922,59 +1922,6 @@ impl MemoryStorage {
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
         self.db.write_opt(batch, &write_opts)?;
         Ok(())
-    }
-
-    /// Collect every distinct target `MemoryId` this memory points AT — the
-    /// forward references that the inbound-reference reverse index inverts (R7).
-    ///
-    /// Harvested fields (each whose VALUE is a MemoryId reference):
-    /// - `experience.related_memories` (types.rs)
-    /// - `experience.causal_chain` (types.rs)
-    /// - `parent_id` (types.rs)
-    /// - `experience.context.why.causes[*].other` — WhyFacet CausalLink (facets.rs)
-    ///
-    /// NOT harvested:
-    /// - `related_todo_ids` — these are `TodoId`, not `MemoryId` (types.rs:1740).
-    /// - `derived_from` — the spec located this on `WhatFacet`, but it actually
-    ///   lives on `LearningFacet` (facets.rs:349), which is NOT a field on
-    ///   `Memory`/`Experience`/`RichContext` (unattached scaffold facet — never
-    ///   populated on a stored memory). There is nothing to harvest until a
-    ///   future change attaches it; revisit then.
-    /// - `SemanticFact.source_memories` — SemanticFacts live in a SEPARATE store
-    ///   (`SemanticFactStore`, facts.rs) with its own write path and its own id
-    ///   space (FactId holders, not MemoryId holders). Indexing them here would
-    ///   require a second write path into a different store and would mix two id
-    ///   spaces into one index. DEFERRED to keep R7 inside the Memory-store
-    ///   maintenance path. NOTE for R6 GC completeness: a memory cited only by a
-    ///   SemanticFact's `source_memories` will report zero inbound refs here even
-    ///   though a fact still depends on it. R6's GC must also consult fact-source
-    ///   refs (or a future extension must index them) before reclaiming.
-    fn forward_ref_targets(memory: &Memory) -> Vec<MemoryId> {
-        // Order-preserving de-dup so repeated references collapse to one entry.
-        let mut targets: Vec<MemoryId> = Vec::new();
-        let push = |id: &MemoryId, targets: &mut Vec<MemoryId>| {
-            // A memory referencing itself is not a meaningful inbound edge for GC.
-            if *id != memory.id && !targets.contains(id) {
-                targets.push(id.clone());
-            }
-        };
-
-        for id in &memory.experience.related_memories {
-            push(id, &mut targets);
-        }
-        for id in &memory.experience.causal_chain {
-            push(id, &mut targets);
-        }
-        if let Some(ref parent_id) = memory.parent_id {
-            push(parent_id, &mut targets);
-        }
-        if let Some(ctx) = &memory.experience.context {
-            for link in &ctx.why.causes {
-                push(&link.other, &mut targets);
-            }
-        }
-
-        targets
     }
 
     /// Public query API (R7) — enumerate the holders that still point AT `target`.
@@ -4369,25 +4316,6 @@ impl MemoryStorage {
 
         Ok(count)
     }
-
-    // =========================================================================
-    // S-R6 accessors — used by merge.rs (same crate, super-module visibility)
-    // =========================================================================
-
-    /// Returns `true` when the storage is in sync (fsync-on-write) mode.
-    /// Used by `merge.rs` to set `WriteOptions::set_sync` without accessing
-    /// the private `write_mode` field directly from a sibling module.
-    pub(super) fn write_mode_is_sync(&self) -> bool {
-        self.write_mode == WriteMode::Sync
-    }
-
-    /// Return the tombstone key for `(user_id, loser_id)`.
-    /// Exposed `pub(super)` so `merge.rs` tests can back-date tombstones
-    /// without duplicating the key format.
-    pub(super) fn tombstone_key(user_id: &str, loser_id: &MemoryId) -> String {
-        use crate::memory::merge::TOMBSTONE_PREFIX;
-        format!("{}{user_id}:{}", TOMBSTONE_PREFIX, loser_id.0)
-    }
 }
 
 /// Wire fixtures shared by the decoder tests and the projection tests: a current record with a
@@ -5632,7 +5560,7 @@ mod tests {
         );
         memory.parent_id = Some(c.clone());
 
-        let targets = MemoryStorage::forward_ref_targets(&memory);
+        let targets = memory.forward_ref_targets();
         assert!(targets.contains(&a), "related_memories harvested");
         assert!(targets.contains(&b), "causal_chain harvested");
         assert!(targets.contains(&c), "parent_id harvested");
@@ -5676,7 +5604,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let targets = MemoryStorage::forward_ref_targets(&memory);
+        let targets = memory.forward_ref_targets();
         assert_eq!(targets, vec![a], "A once, self excluded");
     }
 
