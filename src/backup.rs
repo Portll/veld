@@ -989,8 +989,21 @@ impl VeldBackupEngine {
         if let Some(parent) = target.source_dir.parent() {
             fs::create_dir_all(parent)?;
         }
-        swap_dir_into_place(&staging, &target.source_dir)
-            .context("failed to swap the restored intent log into place")?;
+        // A per-user spec names its files inside the tenant's directory, which also holds
+        // the memory store just restored; only those files are replaced.
+        match &target.only_files {
+            Some(files) => {
+                let pairs: Vec<(PathBuf, PathBuf)> = files
+                    .iter()
+                    .map(|f| (staging.join(f), target.source_dir.join(f)))
+                    .collect();
+                swap_files_into_place(&pairs)
+                    .context("failed to swap the restored intent log into place")?;
+                let _ = fs::remove_dir_all(&staging);
+            }
+            None => swap_dir_into_place(&staging, &target.source_dir)
+                .context("failed to swap the restored intent log into place")?,
+        }
 
         restored.push("intent_log".to_string());
         tracing::info!(
@@ -1229,6 +1242,98 @@ fn dir_size(path: &Path) -> Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// All or none, by rename-aside; an existing `.pre_restore` refuses, as it may be the only copy left by an interrupted restore.
+pub fn swap_files_into_place(pairs: &[(PathBuf, PathBuf)]) -> Result<()> {
+    let aside_of = |target: &Path| {
+        let mut os = target.as_os_str().to_os_string();
+        os.push(".pre_restore");
+        PathBuf::from(os)
+    };
+    for (_, target) in pairs {
+        let aside = aside_of(target);
+        if aside
+            .try_exists()
+            .with_context(|| format!("inspecting {}", aside.display()))?
+        {
+            anyhow::bail!(
+                "{} already exists, likely left by an interrupted restore and possibly the only \
+                 copy of that data; move it away before restoring again",
+                aside.display()
+            );
+        }
+    }
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let put_back = |moved: &[(PathBuf, PathBuf)]| -> Vec<String> {
+        let mut stranded = Vec::new();
+        for (target, aside) in moved {
+            if let Err(e) = std::fs::rename(aside, target) {
+                stranded.push(format!(
+                    "{} (intact at {}: {e})",
+                    target.display(),
+                    aside.display()
+                ));
+            }
+        }
+        stranded
+    };
+    for (_, target) in pairs {
+        if !target
+            .try_exists()
+            .with_context(|| format!("inspecting {}", target.display()))?
+        {
+            continue;
+        }
+        let aside = aside_of(target);
+        if let Err(e) = std::fs::rename(target, &aside) {
+            let stranded = put_back(&moved);
+            anyhow::bail!(
+                "moving {} aside failed: {e}; nothing was replaced{}",
+                target.display(),
+                if stranded.is_empty() {
+                    String::new()
+                } else {
+                    format!(", but not moved back: {stranded:?}")
+                }
+            );
+        }
+        moved.push((target.clone(), aside));
+    }
+    let mut placed: Vec<&Path> = Vec::new();
+    for (staged, target) in pairs {
+        if !staged
+            .try_exists()
+            .with_context(|| format!("inspecting {}", staged.display()))?
+        {
+            continue;
+        }
+        let result = target
+            .parent()
+            .map(std::fs::create_dir_all)
+            .transpose()
+            .and_then(|_| std::fs::rename(staged, target));
+        if let Err(e) = result {
+            for p in &placed {
+                let _ = std::fs::remove_file(p);
+            }
+            let stranded = put_back(&moved);
+            anyhow::bail!(
+                "placing {} failed: {e}; the originals were put back{}",
+                target.display(),
+                if stranded.is_empty() {
+                    String::new()
+                } else {
+                    format!(", except {stranded:?}")
+                }
+            );
+        }
+        placed.push(target);
+    }
+    for (_, aside) in &moved {
+        let _ = std::fs::remove_file(aside);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "rocksdb")]
@@ -1937,6 +2042,74 @@ mod tests {
         let recs: Vec<_> = log.iter().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(recs.len(), 3);
         assert_eq!(recs.last().unwrap().lsn, Lsn(2));
+    }
+
+    #[test]
+    fn a_per_user_restore_replaces_the_journal_files_and_keeps_the_rest_of_the_tenant() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let user_dir = temp_dir.path().join("tenant");
+        let db_path = user_dir.join("storage");
+        let user_id = "tenant";
+
+        let db = open_db_with_user_auth(&db_path);
+        fs::create_dir_all(&user_dir).unwrap();
+        let mut log = IntentLog::open(user_dir.join("intent.log")).unwrap();
+        for frame in [b"frame-A".as_slice(), b"frame-B", b"frame-C"] {
+            log.append(frame).unwrap();
+        }
+        log.sync().unwrap();
+        drop(log);
+        fs::write(
+            user_dir.join("projection_checkpoints.bin"),
+            b"checkpoints-at-backup",
+        )
+        .unwrap();
+        fs::write(user_dir.join("slow_store.db"), b"slow-store-bytes").unwrap();
+        fs::create_dir_all(user_dir.join("bm25_projection_index")).unwrap();
+        fs::write(user_dir.join("bm25_projection_index/meta"), b"bm25").unwrap();
+
+        let spec = IntentLogBackupSpec::per_user(user_dir.clone());
+        let engine = VeldBackupEngine::new(backup_root).unwrap();
+        let metadata = engine
+            .create_comprehensive_backup_with_intent_log(&db, user_id, &[], None, Some(&spec))
+            .unwrap();
+        drop(db);
+        fs::write(
+            user_dir.join("projection_checkpoints.bin"),
+            b"checkpoints-after",
+        )
+        .unwrap();
+
+        engine
+            .restore_comprehensive_backup_with_intent_log(
+                user_id,
+                Some(metadata.backup_id),
+                &db_path,
+                &[],
+                Some(&spec),
+                &RestoreOptions { max_lsn: Some(1) },
+            )
+            .unwrap();
+
+        assert!(
+            db_path.join("CURRENT").exists(),
+            "the restored memory store was removed"
+        );
+        assert_eq!(
+            fs::read(user_dir.join("slow_store.db")).unwrap(),
+            b"slow-store-bytes"
+        );
+        assert!(user_dir.join("bm25_projection_index/meta").exists());
+        assert_eq!(
+            fs::read(user_dir.join("projection_checkpoints.bin")).unwrap(),
+            b"checkpoints-at-backup"
+        );
+        let log = IntentLog::open(user_dir.join("intent.log")).unwrap();
+        let lsns: Vec<u64> = log.iter().unwrap().map(|r| r.unwrap().lsn.0).collect();
+        assert_eq!(lsns, vec![0, 1], "the journal is truncated to max_lsn");
+        assert!(!temp_dir.path().join("tenant.restore_tmp").exists());
+        assert!(!user_dir.join("intent.log.pre_restore").exists());
     }
 
     #[test]

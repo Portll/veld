@@ -1456,6 +1456,35 @@ impl MultiUserMemoryManager {
 
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
     /// Does NOT delete data — used before restore to release file locks.
+    /// Evict the tenant and wait until nothing else holds its memory system, so its store is
+    /// closed before files are restored under it. Work spawned by a recent write can hold it
+    /// for seconds; past `within` the restore is refused rather than run under an open store.
+    fn evict_user_and_wait_for_release(
+        &self,
+        user_id: &str,
+        within: std::time::Duration,
+    ) -> Result<()> {
+        let held = self
+            .user_memories
+            .get(user_id)
+            .map(|memory| Arc::downgrade(&memory));
+        self.evict_user(user_id);
+        let Some(held) = held else {
+            return Ok(());
+        };
+        let deadline = std::time::Instant::now() + within;
+        while held.strong_count() > 0 {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "refusing to restore '{user_id}': its memory store is still in use after \
+                     {within:?}, by work a recent write started; retry once it finishes"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
     pub fn evict_user(&self, user_id: &str) {
         self.user_memories.invalidate(user_id);
         self.graph_memories.invalidate(user_id);
@@ -3373,7 +3402,9 @@ impl MultiUserMemoryManager {
                 let memory_db_path = self.user_dir(user_id)?.join("storage");
                 let graph_path = self.user_dir(user_id)?.join("graph").join("graph");
 
-                self.evict_user(user_id);
+                // The backup engine restores into the live directory, so the store must be
+                // closed first; a lingering handle would also fail the reopen.
+                self.evict_user_and_wait_for_release(user_id, std::time::Duration::from_secs(30))?;
 
                 let secondary_restore_paths: Vec<(&str, &std::path::Path)> = vec![];
                 let intent_log_spec = crate::backup::IntentLogBackupSpec::per_user(
