@@ -569,9 +569,16 @@ impl OnnxCrossEncoder {
             // Metal/ANE-aware ORT execution providers that manage their own threading.
             // Other platforms: 4 intra-op threads to parallelise batch matrix ops.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let num_threads = 1;
+            let default_threads = 1;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let num_threads = 4;
+            let default_threads = 4;
+            // The same pin the embedders read: the recall harness sets it to 1 so ONNX
+            // reductions run in one order and repeat passes score identically.
+            let num_threads = std::env::var("VELD_ONNX_THREADS")
+                .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default_threads);
 
             // ort's `load-dynamic` PANICS (not Errs) when libonnxruntime cannot be
             // dlopen'd, and this server is built with `panic = "abort"` — so an
