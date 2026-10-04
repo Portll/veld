@@ -3,8 +3,9 @@
 //! 4a54053 appended two fields to AgentSession and 24 live records stopped decoding.
 //!
 //! This snapshots the traced serde layout of every type reachable from `Memory`,
-//! including types that are `None` in practice. A layout change fails here, at the
-//! commit that makes it; the fix is a legacy decode arm for the old shape, then
+//! including types that are `None` in practice (`memory.json`), and of every other root
+//! the stores bincode-encode (`roots.json`). A layout change fails here, at the commit
+//! that makes it; the fix is a legacy decode arm for the old shape, then
 //! `VELD_WRITE_LAYOUT=1 cargo test --test persisted_layout` to accept the new one.
 
 use std::path::PathBuf;
@@ -75,8 +76,7 @@ fn trace() -> Registry {
 // (internally tagged, untagged, flatten: anything needing deserialize_any) encodes
 // without error and never reads back; PurgeReason under SemanticFact did exactly that.
 // HnswSnapshotOwned and vamana's MemoryEntry are private and guarded in their modules.
-#[test]
-fn every_bincode_persisted_root_is_decodable() {
+fn trace_all_roots() -> Registry {
     use veld::embeddings::alignment::AlignmentHeader;
     use veld::graph_memory::{
         EdgeSource, EdgeTier, EntityLabel, EpisodeSource, LtpStatus, PiiClassification,
@@ -152,7 +152,12 @@ fn every_bincode_persisted_root_is_decodable() {
     );
     tracer.registry().unwrap_or_else(|e| {
         panic!("incomplete trace: {e}. Trace the named enum in the list above.")
-    });
+    })
+}
+
+#[test]
+fn every_bincode_persisted_root_is_decodable() {
+    trace_all_roots();
 }
 
 // serde-reflection cannot trace TemporalFact: NaiveDate and DateTime both read the one
@@ -273,8 +278,10 @@ fn temporal_fact_round_trips_through_bincode_in_every_variant() {
     }
 }
 
-fn snapshot_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/persisted_layout/memory.json")
+fn snapshot_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/persisted_layout")
+        .join(format!("{name}.json"))
 }
 
 #[test]
@@ -289,10 +296,10 @@ fn the_trace_reaches_nested_types_that_are_none_in_practice() {
     }
 }
 
-#[test]
-fn persisted_memory_layout_is_unchanged() {
-    let current = serde_json::to_string_pretty(&trace()).unwrap() + "\n";
-    let path = snapshot_path();
+/// Compare `registry` with the committed snapshot `name`, or write it under VELD_WRITE_LAYOUT.
+fn assert_layout_unchanged(name: &str, registry: &Registry) {
+    let current = serde_json::to_string_pretty(registry).unwrap() + "\n";
+    let path = snapshot_path(name);
 
     if std::env::var("VELD_WRITE_LAYOUT").is_ok() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -322,4 +329,16 @@ fn persisted_memory_layout_is_unchanged() {
          before this change will not decode. Add a legacy decode arm for the old shape, \
          test it on a record of that shape, then regenerate with VELD_WRITE_LAYOUT=1."
     );
+}
+
+#[test]
+fn persisted_memory_layout_is_unchanged() {
+    assert_layout_unchanged("memory", &trace());
+}
+
+/// Graph nodes and edges, facts, vector mappings, audit and journal entries, auth records:
+/// every root the stores bincode-encode, beside Memory.
+#[test]
+fn every_persisted_root_layout_is_unchanged() {
+    assert_layout_unchanged("roots", &trace_all_roots());
 }
