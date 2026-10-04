@@ -761,25 +761,58 @@ impl BM25Index {
             }
         };
 
-        let top_docs = searcher
-            .search(&parsed_query, &TopDocs::with_limit(limit))
-            .context("BM25 search failed")?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
 
-        let mut results = Vec::with_capacity(top_docs.len());
+        // Equal BM25 scores are common (quantized field norms, short documents), and TopDocs
+        // breaks them by doc address, which moves whenever background segment merges finish.
+        // Widen the window until the score group at the cutoff is complete (bounded, so a
+        // degenerate query cannot read the whole index), then order ties by content so the
+        // cut does not depend on segment layout.
+        let max_window = limit.saturating_mul(32).max(1024);
+        let mut window = limit + 1;
+        let top_docs = loop {
+            let docs = searcher
+                .search(&parsed_query, &TopDocs::with_limit(window))
+                .context("BM25 search failed")?;
+            if docs.len() < window
+                || docs[window - 1].0 != docs[limit - 1].0
+                || window >= max_window
+            {
+                break docs;
+            }
+            window = window.saturating_mul(2).min(max_window);
+        };
 
+        let mut scored: Vec<(MemoryId, f32, String)> = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             if let Ok(doc) = searcher.doc::<TantivyDocument>(doc_address) {
-                if let Some(id_value) = doc.get_first(self.id_field) {
-                    if let Some(id_str) = id_value.as_str() {
-                        if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
-                            results.push((MemoryId(uuid), score));
-                        }
-                    }
+                let id = doc
+                    .get_first(self.id_field)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                if let Some(uuid) = id {
+                    let content = doc
+                        .get_first(self.content_field)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    scored.push((MemoryId(uuid), score, content));
                 }
             }
         }
+        scored.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        scored.truncate(limit);
 
-        Ok(results)
+        Ok(scored
+            .into_iter()
+            .map(|(id, score, _)| (id, score))
+            .collect())
     }
 
     /// Get document count
@@ -838,6 +871,9 @@ impl RRFusion {
     pub fn fuse(&self, ranked_lists: Vec<Vec<(MemoryId, f32)>>) -> Vec<(MemoryId, f32)> {
         let mut scores: HashMap<MemoryId, f32> = HashMap::new();
         let mut original_scores: HashMap<MemoryId, Vec<Option<f32>>> = HashMap::new();
+        // First-appearance order across the input lists: equal fused scores keep it, so the
+        // output does not depend on the map's per-instance hash order.
+        let mut first_seen: Vec<MemoryId> = Vec::new();
 
         for (list_idx, ranked_list) in ranked_lists.iter().enumerate() {
             let weight = self.weights.get(list_idx).copied().unwrap_or(1.0);
@@ -847,7 +883,11 @@ impl RRFusion {
                 // rank is 0-indexed, so rank+1 for 1-indexed
                 let rrf_contribution = weight / (self.k + (rank + 1) as f32);
 
-                *scores.entry(memory_id.clone()).or_insert(0.0) += rrf_contribution;
+                let fused = scores.entry(memory_id.clone()).or_insert_with(|| {
+                    first_seen.push(memory_id.clone());
+                    0.0
+                });
+                *fused += rrf_contribution;
 
                 // Track original scores for debugging
                 let orig = original_scores
@@ -859,8 +899,14 @@ impl RRFusion {
             }
         }
 
-        // Sort by RRF score descending
-        let mut results: Vec<_> = scores.into_iter().collect();
+        // Sort by RRF score descending; the sort is stable over first appearance.
+        let mut results: Vec<(MemoryId, f32)> = first_seen
+            .into_iter()
+            .map(|id| {
+                let score = scores[&id];
+                (id, score)
+            })
+            .collect();
         results.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         results
@@ -1801,6 +1847,67 @@ mod tests {
         assert_eq!(fused.len(), 2);
         // Both should have same RRF score (rank 1 in their respective list)
         assert!((fused[0].1 - fused[1].1).abs() < 0.001);
+    }
+
+    #[test]
+    fn rrf_equal_scores_keep_first_appearance_order() {
+        let rrf = RRFusion::new(60.0, vec![0.5, 0.5]);
+        let left: Vec<MemoryId> = (0..24).map(|_| MemoryId(uuid::Uuid::new_v4())).collect();
+        let right: Vec<MemoryId> = (0..24).map(|_| MemoryId(uuid::Uuid::new_v4())).collect();
+        let as_list = |ids: &[MemoryId]| ids.iter().map(|id| (id.clone(), 1.0)).collect();
+
+        let fused = rrf.fuse(vec![as_list(&left), as_list(&right)]);
+
+        // Rank r in one list ties rank r in the other; the left list was read first.
+        let expected: Vec<MemoryId> = left
+            .iter()
+            .zip(&right)
+            .flat_map(|(l, r)| [l.clone(), r.clone()])
+            .collect();
+        let got: Vec<MemoryId> = fused.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn bm25_ties_at_the_cutoff_are_ordered_by_content() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let index = BM25Index::new(temp_dir.path()).unwrap();
+        // Same length, same term frequency: every document scores the same for "lantern".
+        // Written in reverse content order, one commit each, so doc order is not content order.
+        for i in (0..12).rev() {
+            let id = MemoryId(uuid::Uuid::new_v4());
+            index
+                .upsert(&id, &format!("lantern marker{i:02}"), &[], &[])
+                .unwrap();
+            index.commit().unwrap();
+        }
+        index.reload().unwrap();
+
+        let results = index.search("lantern", 3).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|(_, s)| *s == results[0].1),
+            "fixture must tie"
+        );
+
+        let searcher = index.reader.searcher();
+        let content_of = |id: &MemoryId| -> String {
+            let query = tantivy::query::TermQuery::new(
+                tantivy::Term::from_field_text(index.id_field, &id.0.to_string()),
+                tantivy::schema::IndexRecordOption::Basic,
+            );
+            let hits = searcher.search(&query, &TopDocs::with_limit(1)).unwrap();
+            let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
+            doc.get_first(index.content_field)
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string()
+        };
+        let contents: Vec<String> = results.iter().map(|(id, _)| content_of(id)).collect();
+        assert_eq!(
+            contents,
+            ["lantern marker00", "lantern marker01", "lantern marker02"]
+        );
     }
 
     #[test]
