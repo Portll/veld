@@ -3,7 +3,7 @@ in	286461b3		2026-03-27	infra	-	declined		rustfmt line-wrapping only, in handler
 in	0b40a0df	141	2026-03-28	graph	W3	pending		
 in	0ed19a54	137	2026-03-28	graph	W3	pending		
 in	f3cba6da	154	2026-03-29	http-api	W10	pending		
-in	390a2075	155	2026-03-29	security	W1	pending		
+in	390a2075	155	2026-03-29	security	W1	partial	3e4d7ca7	the recall auth bypass fix is in veld since the import (3e4d7ca7: a payload-less recall query is refused when an API key is set). The forget user_id fallback, req.created_at for temporal facts and the recall_memories use-after-move are not ported: veld's zenoh feature does not compile at 5dd17e67 (10 type errors, which stop rustc before borrow checking would report that move too), so they wait for W12a
 in	d45dc56a	156	2026-03-29	retrieval	W2	pending		
 in	9bd59c27	157	2026-03-29	storage-integrity	W7	pending		
 in	1e528403	158	2026-03-29	retrieval	W2	pending		
@@ -16,8 +16,8 @@ in	60e7e5da	179	2026-03-29	http-api	W10	pending
 in	9a81dd7f	180	2026-03-29	lineage	W4	pending		
 in	7b70730a	181	2026-03-30	mcp-hooks	W9	pending		
 in	2092c858		2026-03-30	http-api	W10	pending		
-in	59dae70f	183	2026-03-31	security	W1	partial		recall_by_tags MCP tool ported (#130). The proactive_context tag boost changes ranking and waits for the W2 recall gate. The session-start tag fetch reads session-summary memories that only upstream #189's stop hook writes (in #191, not ported), so it waits for W9. The zenoh constant-time compare (#136) waits for W12a: veld's zenoh feature does not compile (10 errors at 5dd17e67). The files.rs change is rustfmt of pr-133's codebase-path blocklist, which veld lacks (row 2092c858)
-in	7a0f0357	191	2026-03-31	http-api	W10	partial		#188 ported (15931cf8): a TaskTracker on the manager, drained at shutdown before the flush; veld tracks remember, batch remember, deferred embedding, ingest and todo-memory writes. #184-#187, #189, #190 and the BatchRememberOptions and branch-signal fixes not yet triaged
+in	59dae70f	183	2026-03-31	security	W1	partial	137858d9	recall_by_tags MCP tool ported (#130). The proactive_context tag boost changes ranking and waits for the W2 recall gate. The session-start tag fetch reads session-summary memories that only upstream #189's stop hook writes (in #191, not ported), so it waits for W9. The zenoh constant-time compare (#136) waits for W12a: veld's zenoh feature does not compile (10 errors at 5dd17e67). The files.rs change is rustfmt of pr-133's codebase-path blocklist, which veld lacks (row 2092c858)
+in	7a0f0357	191	2026-03-31	http-api	W10	partial	08c84a77	#188 ported (15931cf8): a TaskTracker on the manager, drained at shutdown before the flush; veld tracks remember, batch remember, deferred embedding, ingest and todo-memory writes. #184-#187, #189, #190 and the BatchRememberOptions and branch-signal fixes not yet triaged
 in	6653000d	194	2026-04-01	storage-integrity	W7	pending		
 in	aa387b9e	195	2026-04-01	mcp-hooks	W9	pending		
 in	2f8ab23f	196	2026-04-01	mcp-hooks	W9	pending		
@@ -58,7 +58,7 @@ in	b08fa351	239	2026-04-19	robotics-geo	W12	pending
 in	00695870	241	2026-04-19	http-api	W10	pending		
 in	7b882ace	240	2026-04-19	http-api	W10	pending		
 in	82cf1c90	242	2026-04-19	facts-todos	W5	pending		
-in	674abc7c	243	2026-04-19	storage-integrity	W1	adapted		only the iterator-error propagation in the legacy-DB migrations applies, now in veld at all three sites (the two in memory/storage.rs and import_separate_db_into_cf); the lint fixes are to upstream's own code
+in	674abc7c	243	2026-04-19	storage-integrity	W1	adapted	aef47086	only the iterator-error propagation in the legacy-DB migrations applies, now in veld at all three sites (the two in memory/storage.rs and import_separate_db_into_cf); the lint fixes are to upstream's own code
 in	38b818dd	244	2026-04-19	robotics-geo	W12	pending		
 in	25d54a51	245	2026-04-19	ner-entities	W6	pending		
 in	5e59f676		2026-04-19	facts-todos	W5	pending		
@@ -70,7 +70,7 @@ in	000b68f4	252	2026-04-23	embeddings-vectors	W8	ported	ee166804
 in	9e69ca9b	254	2026-04-23	eval	W0	pending		
 in	e66ad34d	255	2026-04-23	infra	-	declined		an opt-in heartbeat whose default endpoint is upstream's (https://shodh-memory.com/api/telemetry), counting upstream's installs; veld reports nothing to upstream
 in	da23add0	256	2026-04-27	mcp-hooks	W9	pending		
-in	1a6708e9	257	2026-04-27	security	W1	partial		Ported: graph handlers on the blocking pool (plus veld-only delete_entity and invalidate_relationship), fact updates rebuild their indices, ResilientEmbedder batch delegation, Vamana start graph in O(n*d). In veld already: backup rename-aside and SPANN insert after load (0e8df63e, which keeps the loaded postings upstream's empty partitions hid), the /api/stats user_id check (3e4d7ca7). Not applicable: the five MCP callBrain calls, which veld's MCP server never had. Superseded: persisting access updates on recall, replaced upstream by #297 (W2). Declined: for_each_memory, which has no caller and adds a raw RocksDB iterator outside the storage traits. Waiting for W3: remember_with_agent's duplicate graph pass (veld's copy also makes causal edges only there), strengthen_episode_entity_edges (revives a no-op, moves graph weights), CoRetrieved edges in entity_edges (veld's coactivation is directional; upstream later stopped making them), the batch_weaken_synapses LTP guard (that function arrives with upstream d392c022)
+in	1a6708e9	257	2026-04-27	security	W1	partial	af09e173,0e8df63e,3e4d7ca7	Ported: graph handlers on the blocking pool (plus veld-only delete_entity and invalidate_relationship), fact updates rebuild their indices, ResilientEmbedder batch delegation, the start-graph test. In veld already: the O(n*d) Vamana start graph (9a6b2609), backup rename-aside and SPANN insert after load (0e8df63e, which keeps the loaded postings upstream's empty partitions hid), the /api/stats user_id check (3e4d7ca7). Not applicable: the five MCP callBrain calls, which veld's MCP server never had. Superseded: persisting access updates on recall, replaced upstream by #297 (W2). Declined: for_each_memory, which has no caller and adds a raw RocksDB iterator outside the storage traits. Waiting for W3: remember_with_agent's duplicate graph pass (veld's copy also makes causal edges only there), strengthen_episode_entity_edges (revives a no-op, moves graph weights), CoRetrieved edges in entity_edges (veld's coactivation is directional; upstream later stopped making them), the batch_weaken_synapses LTP guard (that function arrives with upstream d392c022)
 in	9a009cd7	258	2026-04-27	ner-entities	W6	pending		
 in	0fb9bbb4	259	2026-04-29	graph	W3	pending		
 in	0d9d8973	260	2026-04-29	ner-entities	W6	pending		
@@ -209,7 +209,7 @@ in	6e5eabb4	443	2026-08-08	robotics-geo	W12	pending
 in	c13e83e4	440	2026-08-08	graph	W3	pending		
 in	0c44040c	439	2026-08-08	ner-entities	W6	pending		
 in	64fb8c58	444	2026-08-08	web-ui	W11	pending		
-in	057aa69a	446	2026-08-08	graph	W1	ported		
+in	057aa69a	446	2026-08-08	graph	W1	ported	15e1d82f	
 in	b91c5e22	447	2026-08-08	retrieval	W2	pending		
 in	804985d2	448	2026-08-08	web-ui	W11	pending		
 in	0111c562	449	2026-08-08	web-ui	W11	pending		
@@ -230,7 +230,7 @@ in	cac4c0b3	460	2026-08-09	ner-entities	W6	pending
 in	fe95da84	463	2026-08-09	web-ui	W11	pending		
 in	6298ce66	464	2026-08-09	lineage	W4	pending		
 in	ab787db2	468	2026-08-09	lineage	W4	pending		
-in	4baef94c	465	2026-08-09	infra	W1	partial		panic = "abort" is gone from [profile.release] (the cargo#6313 collision with the cdylib); the fortress profile keeps it, since it builds bins only. Not taken: the python.rs toponyms initialisers wait on W6; the CI gates do not map yet: veld CI has no per-feature check loop to add python to, an --all-features check cannot pass while the zenoh feature does not compile, and veld has no recall_eval_cli test to serve as the release-graph sentinel
+in	4baef94c	465	2026-08-09	infra	W1	partial	ad49321a	"panic = ""abort"" is gone from [profile.release] (the cargo#6313 collision with the cdylib); the fortress profile keeps it, since it builds bins only. Not taken: the python.rs toponyms initialisers wait on W6; the CI gates do not map yet: veld CI has no per-feature check loop to add python to, an --all-features check cannot pass while the zenoh feature does not compile, and veld has no recall_eval_cli test to serve as the release-graph sentinel"
 in	229f99e9	466	2026-08-09	web-ui	W11	pending		
 in	a7344bbd	467	2026-08-09	eval	W0	pending		
 in	e24b1ab3	469	2026-08-09	mcp-hooks	W9	pending		
@@ -247,7 +247,7 @@ in	7c34a1cd	485	2026-08-10	mcp-hooks	W9	pending
 in	2ffa24ef	480	2026-08-10	infra	-	declined		bumps actions in upstream's 22 workflow files, 19 of which veld does not have; veld's ci.yml, recall.yml and release.yml are its own and pin checkout@v4, cache@v4 and upload-artifact@v4, so moving them is a veld CI change
 in	0ae0d8bc	488	2026-08-10	infra	-	declined		excludes ort from the Dependabot group of #474, declined; veld has no Dependabot config
 in	62d7f659	489	2026-08-10	graph	W3	pending		
-in	5a8ea858	491	2026-08-10	infra	W1	ported		
+in	5a8ea858	491	2026-08-10	infra	W1	ported	431c3575	
 in	87ddbb0e	492	2026-08-11	security	W1	veld-origin	ede90e40	Portll PR
 in	dbfe8eba	494	2026-08-12	eval	W0	pending		fixes weekly-trend.yml from #368 (W0, pending); veld has no weekly-trend.yml
 in	60eece98	479	2026-08-12	retrieval	W2	pending		
@@ -256,12 +256,12 @@ in	ce655e94	500	2026-08-14	infra	-	declined		upstream maintainer's agent rule fo
 in	2b94deeb	496	2026-08-14	embeddings-vectors	W8	pending		
 in	c6dd561a	502	2026-08-14	infra	-	declined		veld already at or past all 58 versions in the group (tokio 1.53.1, uuid 1.26.0, serde_json 1.0.151 and the rest), and holds zenoh at 1.8.0 with lz4_flex 0.11.6 (f781e82d)
 in	98c6e486	501	2026-08-14	web-ui	W11	pending		
-in	0d796f9e	514	2026-08-29	embeddings-vectors	W8	partial		carries #513 through its merge dae86722: the ENFORCE_HTTPS default (9e3a954e) is ported, with the Linear and GitHub clients wired to the guard veld never called and the embedder kept on its own switch; #514's Vamana insert pruning and the rest of #513 (ablation module, vacuity guard, sharded LongMemEval) are pending, W8 and W0
+in	0d796f9e	514	2026-08-29	embeddings-vectors	W8	partial	a3e4178b	carries #513 through its merge dae86722: the ENFORCE_HTTPS default (9e3a954e) is ported, with the Linear and GitHub clients wired to the guard veld never called and the embedder kept on its own switch; #514's Vamana insert pruning and the rest of #513 (ablation module, vacuity guard, sharded LongMemEval) are pending, W8 and W0
 in	d892dfef	520	2026-08-29	eval	W0	pending		
 in	844d4358	493	2026-08-29	embeddings-vectors	W8	pending		
 in	0966441b	516	2026-08-29	web-ui	W11	pending		bumps front/ui, the React app W11 brings in; veld has no front/, so this closes with W11's import of front/ at upstream's current state
 in	e82b7149	523	2026-08-29	web-ui	W11	pending		
-in	41c2bd08	506	2026-08-29	infra	W1	ported		
+in	41c2bd08	506	2026-08-29	infra	W1	ported	13d84ce9	
 in	3eb23f1b	498	2026-08-29	embeddings-vectors	W8	pending		
 in	171ae467	503	2026-08-29	eval	W0	pending		
 in	699033ca	504	2026-08-29	ner-entities	W6	pending		
@@ -291,7 +291,7 @@ in	e44fdce6	546	2026-09-21	retrieval	W2	veld-origin		Portll PR
 in	8d371432	551	2026-09-21	eval	W0	veld-origin		Portll PR
 in	928c728c	549	2026-09-21	storage-integrity	W7	veld-origin	7aa8336c	Portll PR
 in	66b9e209	550	2026-09-22	facts-todos	W5	veld-origin	b7fff76c	Portll PR
-in	355e0b72	559	2026-09-22	storage-integrity	W7	adapted		both log_event spawn sites run on the task tracker as upstream; the test lives in handlers/state.rs and checks the audit store on both engines (and the shared RocksDB); the sources.rs lease-test drain has no counterpart, since veld has no source store (W7)
+in	355e0b72	559	2026-09-22	storage-integrity	W7	adapted	7a2e987a	both log_event spawn sites run on the task tracker as upstream; the test lives in handlers/state.rs and checks the audit store on both engines (and the shared RocksDB); the sources.rs lease-test drain has no counterpart, since veld has no source store (W7)
 in	cef67213	560	2026-09-22	graph	W3	pending		
 in	486a9d95	561	2026-09-22	eval	W0	pending		
 in	cf886355	562	2026-09-22	retrieval	W2	pending		
