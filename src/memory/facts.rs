@@ -694,7 +694,7 @@ impl SemanticFactStore {
     /// 3. Cosine gate: embedding similarity >= FACT_DEDUP_COSINE_THRESHOLD
     /// 4. Jaccard floor: word overlap >= FACT_DEDUP_JACCARD_FLOOR
     ///
-    /// Falls back to pure Jaccard (0.70) if no embedding is provided.
+    /// Falls back to pure Jaccard (`FACT_DEDUP_JACCARD_FALLBACK`) if no embedding is provided.
     pub fn find_similar(
         &self,
         user_id: &str,
