@@ -209,7 +209,7 @@ in	6e5eabb4	443	2026-08-08	robotics-geo	W12	pending
 in	c13e83e4	440	2026-08-08	graph	W3	pending		
 in	0c44040c	439	2026-08-08	ner-entities	W6	pending		
 in	64fb8c58	444	2026-08-08	web-ui	W11	pending		
-in	057aa69a	446	2026-08-08	graph	W1	pending		veld has both tautologies (tests/brutal_stress_tests.rs:672 and :1304); clippy never sees them because the target needs --features stress
+in	057aa69a	446	2026-08-08	graph	W1	ported		
 in	b91c5e22	447	2026-08-08	retrieval	W2	pending		
 in	804985d2	448	2026-08-08	web-ui	W11	pending		
 in	0111c562	449	2026-08-08	web-ui	W11	pending		
