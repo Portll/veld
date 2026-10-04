@@ -32,6 +32,9 @@ INBOUND_STATUSES = {"pending", "ported", "adapted", "partial", "already-in-veld"
 OUTBOUND_STATUSES = {"open", "merged", "closed"}
 NEEDS_REASON = {"adapted", "partial", "declined", "superseded", "veld-layer", "closed"}
 NEEDS_VELD_COMMIT = {"ported", "adapted", "partial", "already-in-veld"}
+# Port commits from the ledger's start on must name their upstream PR or commit in the body;
+# the ports made before it are recorded here instead.
+ATTRIBUTION_FROM = "2026-10-04"
 
 # First match wins, so the narrower subsystems come before the broad ones.
 THEMES = [
@@ -152,6 +155,16 @@ def check(args):
     seen = set()
     commit_ok = {}
 
+    def attributed(ref, row):
+        r = subprocess.run(["git", "-C", args.veld, "log", "-1", "--format=%cs%n%B", ref],
+                           capture_output=True, text=True)
+        date, _, body = r.stdout.partition("\n")
+        if date < ATTRIBUTION_FROM:
+            return True
+        names = [f"#{row['pr']}"] if row["pr"] else []
+        names.append(row["upstream_commit"][:7])
+        return any(n and n in body for n in names)
+
     def veld_commit_exists(ref):
         if ref not in commit_ok:
             r = subprocess.run(["git", "-C", args.veld, "cat-file", "-e", f"{ref}^{{commit}}"],
@@ -180,6 +193,9 @@ def check(args):
         for ref in filter(None, r["veld_commit"].split(",")):
             if not veld_commit_exists(ref.strip()):
                 errors.append(f"{where}: veld commit {ref.strip()} does not exist")
+            elif r["direction"] == "in" and r["status"] in NEEDS_VELD_COMMIT and not attributed(ref.strip(), r):
+                errors.append(f"{where}: veld commit {ref.strip()} does not name upstream "
+                              f"#{r['pr']} or {r['upstream_commit'][:7]} in its message")
     for e in errors:
         print(e, file=sys.stderr)
     counts = Counter((r["direction"], r["status"]) for r in rows)
