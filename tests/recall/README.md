@@ -48,6 +48,14 @@ cargo test --release --lib -- --ignored runner_repeats_2_produces_same_quality_a
 cargo test --release --lib -- --ignored runner_layer_all_emits_six_modes_with_per_mode_determinism
 ```
 
+The gate's repeat check runs locally as an integration test, with the settings `recall-eval`
+pins. It ingests the LoCoMo gate corpus into two fresh stores and fails on any case whose top-10
+differs; `RECALL_DET_LAYERS=all` names the first pipeline stage that diverges:
+
+```bash
+cargo test --release --test recall_determinism -- --ignored --nocapture
+```
+
 Note that `veld/CLAUDE.md` bars agent sessions from `cargo build`/`cargo run`, so binary-producing
 paths are unavailable to them regardless; `cargo test --no-run` and `cargo check` are permitted.
 
