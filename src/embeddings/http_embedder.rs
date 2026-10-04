@@ -142,11 +142,12 @@ impl HttpEmbedderConfig {
     pub fn from_env() -> Self {
         // An insecure plain-http override to a non-localhost host is rejected
         // (fall back to the localhost default) because the embedder POSTs user
-        // text to that URL. Opt back in with VELD_ALLOW_INSECURE_REMOTE_EMBEDDER=true.
-        let mut base_url = crate::integrations::resolve_api_url_override(
-            "VELD_EMBEDDING_API_URL",
-            DEFAULT_BASE_URL,
-        );
+        // text to that URL. Opt back in with VELD_ALLOW_INSECURE_REMOTE_EMBEDDER=true;
+        // VELD_ENFORCE_HTTPS governs the integration tokens, not this switch.
+        let mut base_url = std::env::var("VELD_EMBEDDING_API_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         if crate::integrations::is_insecure_remote_url(&base_url)
             && !std::env::var("VELD_ALLOW_INSECURE_REMOTE_EMBEDDER")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -566,6 +567,27 @@ impl Embedder for HttpEmbedder {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_remote_embedder_opt_in_does_not_depend_on_enforce_https() {
+        const REMOTE: &str = "http://gpu-box.invalid:1234";
+        let opted_in = crate::integrations::with_override_env(
+            None,
+            &[
+                ("VELD_EMBEDDING_API_URL", REMOTE),
+                ("VELD_ALLOW_INSECURE_REMOTE_EMBEDDER", "true"),
+            ],
+            HttpEmbedderConfig::from_env,
+        );
+        assert_eq!(opted_in.base_url, REMOTE);
+
+        let refused = crate::integrations::with_override_env(
+            Some("false"),
+            &[("VELD_EMBEDDING_API_URL", REMOTE)],
+            HttpEmbedderConfig::from_env,
+        );
+        assert_eq!(refused.base_url, DEFAULT_BASE_URL);
+    }
+
     fn cfg(model: &str) -> HttpEmbedderConfig {
         HttpEmbedderConfig {
             base_url: "http://localhost:9".into(), // unreachable
@@ -623,7 +645,8 @@ mod tests {
 
     #[test]
     fn test_config_defaults() {
-        let config = HttpEmbedderConfig::from_env();
+        let config =
+            crate::integrations::with_override_env(None, &[], HttpEmbedderConfig::from_env);
         assert!(config.base_url.contains("127.0.0.1"));
         assert!(config.model.contains("nomic"));
         assert!(

@@ -932,8 +932,8 @@ pub fn print_env_help() {
     println!("                                 True = /metrics is public (for unauthenticated Prometheus scrapers).");
     println!("  VELD_ADMIN_API_KEY           - API key for /api/admin/* endpoints (separate from VELD_API_KEYS).");
     println!("                                 Required to use admin operations such as rate-limit reset.");
-    println!("  VELD_ENFORCE_HTTPS           - Reject insecure HTTP overrides for integration API URLs (default: false).");
-    println!("                                 True = non-localhost http:// overrides fall back to the secure default.");
+    println!("  VELD_ENFORCE_HTTPS           - Reject insecure HTTP overrides for integration API URLs (default: true).");
+    println!("                                 False = honour a non-localhost http:// override (token in cleartext).");
     println!();
     println!("Integration APIs:");
     println!("  LINEAR_API_URL         - Linear GraphQL API URL (default: https://api.linear.app/graphql)");
