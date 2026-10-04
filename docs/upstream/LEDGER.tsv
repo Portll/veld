@@ -127,7 +127,7 @@ in	35dfd97f	334	2026-06-22	infra	-	ported	643dbd5a
 in	bc32da12	332	2026-06-22	retrieval	W2	pending		
 in	e776e954	331	2026-06-22	eval	W0	pending		
 in	e0e6c513	337	2026-06-25	eval	W0	pending		
-in	a8ea9eeb	336	2026-06-25	eval	W0	pending		
+in	a8ea9eeb	336	2026-06-25	graph	W3	pending		
 in	68438ef8	341	2026-07-01	ner-entities	W6	pending		
 in	51a9e406	329	2026-07-01	eval	W0	pending		
 in	558133f2	340	2026-07-01	storage-integrity	W7	pending		
