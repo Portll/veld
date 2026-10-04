@@ -14,6 +14,7 @@ import argparse
 import csv
 import datetime
 import json
+import os
 import re
 import subprocess
 import sys
@@ -223,11 +224,23 @@ def releases(args):
     print(f"{len(new)} new release tag(s); {len(rows)} recorded")
 
 
+def origin_repo():
+    """`owner/name` of this checkout's origin; a checkout with an `upstream` remote must not ask
+    gh to guess, because it would answer about upstream."""
+    url = subprocess.run(["git", "-C", str(LEDGER.parents[2]), "remote", "get-url", "origin"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+    if not m:
+        sys.exit(f"origin {url} is not a GitHub repository")
+    return m.group(1)
+
+
 def heartbeat(args):
     """The watcher's last successful run, read from GitHub Actions; needs `gh` with a token."""
+    repo = os.environ.get("GITHUB_REPOSITORY") or origin_repo()
     r = subprocess.run(
-        ["gh", "run", "list", "--workflow", WATCHER, "--status", "success", "--limit", "1",
-         "--json", "updatedAt,headSha"],
+        ["gh", "run", "list", "-R", repo, "--workflow", WATCHER, "--status", "success",
+         "--limit", "1", "--json", "updatedAt,headSha"],
         capture_output=True, text=True,
     )
     if r.returncode != 0:

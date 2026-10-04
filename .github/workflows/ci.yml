@@ -68,6 +68,9 @@ jobs:
   upstream-ledger:
     name: Upstream Ledger
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -75,6 +78,10 @@ jobs:
           fetch-depth: 0
       - name: Check docs/upstream/LEDGER.tsv
         run: python3 scripts/upstream/ledger.py check
+      - name: The upstream watcher succeeded within 48 hours
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/upstream/ledger.py heartbeat
 
   format:
     name: Format Check
