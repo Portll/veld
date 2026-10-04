@@ -321,7 +321,13 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     }
 
     let op_start = std::time::Instant::now();
-    let experience_type = parse_experience_type(req.memory_type.as_ref());
+    let experience_type = match parse_experience_type(req.memory_type.as_ref()) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(user_id = %req.user_id, "Validation failed: {}", e);
+            return;
+        }
+    };
 
     // Parallel NER + YAKE extraction (same as HTTP handler)
     let ner = manager.get_neural_ner();
