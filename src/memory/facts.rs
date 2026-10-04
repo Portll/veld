@@ -698,6 +698,11 @@ impl SemanticFactStore {
 
     /// Check if a similar fact already exists (hybrid dedup)
     ///
+    /// Inactive facts (superseded, expired or purged) match too. A retired claim is usually
+    /// still in its source memories and is re-extracted every cycle; matching it back onto its
+    /// own row keeps it retired, where a fresh row would meet its correction again and, on
+    /// equal support, win.
+    ///
     /// Multi-gate pipeline when embedding is provided:
     /// 1. Entity gate: at least 1 shared entity, OR both have zero entities
     /// 2. Polarity gate: same negation polarity (prevents merging contradictions)
@@ -717,7 +722,7 @@ impl SemanticFactStore {
         };
         use crate::similarity::cosine_similarity;
 
-        let facts = self.list(user_id, 1000)?;
+        let facts = self.list_filtered(user_id, 1000, true)?;
         let query_lower = fact_content.to_lowercase();
         let query_words: std::collections::HashSet<&str> = query_lower.split_whitespace().collect();
         let new_polarity = detect_polarity(&query_lower);
@@ -790,6 +795,75 @@ impl SemanticFactStore {
                 if jaccard >= FACT_DEDUP_JACCARD_FALLBACK {
                     return Ok(Some(fact));
                 }
+            }
+        }
+
+        Ok(best_match.map(|(_, fact)| fact))
+    }
+
+    /// The active fact that negates `fact_content`: the gates of [`Self::find_similar`] (a
+    /// shared entity, cosine and Jaccard over their thresholds) with polarity inverted.
+    ///
+    /// Needs an embedding. Negation is often one word, so word overlap alone cannot tell a
+    /// contradiction from a paraphrase, and a false positive retires a true fact; without an
+    /// embedding the answer is None. Inactive facts are not evidence and are skipped.
+    pub fn find_contradiction(
+        &self,
+        user_id: &str,
+        fact_content: &str,
+        fact_entities: &[String],
+        new_embedding: Option<&[f32]>,
+    ) -> Result<Option<SemanticFact>> {
+        use crate::constants::{FACT_DEDUP_COSINE_THRESHOLD, FACT_DEDUP_JACCARD_FLOOR};
+        use crate::similarity::cosine_similarity;
+
+        let Some(new_emb) = new_embedding else {
+            return Ok(None);
+        };
+
+        let query_lower = fact_content.to_lowercase();
+        let query_words: std::collections::HashSet<&str> = query_lower.split_whitespace().collect();
+        let new_polarity = detect_polarity(&query_lower);
+        let new_entity_set: std::collections::HashSet<&str> =
+            fact_entities.iter().map(|s| s.as_str()).collect();
+
+        let mut best_match: Option<(f32, SemanticFact)> = None;
+        for fact in self.list(user_id, 1000)? {
+            let fact_lower = fact.fact.to_lowercase();
+            if detect_polarity(&fact_lower) == new_polarity {
+                continue;
+            }
+
+            let existing_entity_set: std::collections::HashSet<&str> =
+                fact.related_entities.iter().map(|s| s.as_str()).collect();
+            let both_empty = new_entity_set.is_empty() && existing_entity_set.is_empty();
+            if !both_empty && new_entity_set.is_disjoint(&existing_entity_set) {
+                continue;
+            }
+
+            let fact_words: std::collections::HashSet<&str> =
+                fact_lower.split_whitespace().collect();
+            let intersection = query_words.intersection(&fact_words).count();
+            let union = query_words.union(&fact_words).count();
+            let jaccard = if union > 0 {
+                intersection as f32 / union as f32
+            } else {
+                0.0
+            };
+            if jaccard < FACT_DEDUP_JACCARD_FLOOR {
+                continue;
+            }
+
+            let Ok(Some(existing_emb)) = self.get_embedding(user_id, &fact.id) else {
+                continue;
+            };
+            let cosine = cosine_similarity(new_emb, &existing_emb);
+            if cosine < FACT_DEDUP_COSINE_THRESHOLD {
+                continue;
+            }
+
+            if best_match.as_ref().is_none_or(|(s, _)| cosine > *s) {
+                best_match = Some((cosine, fact));
             }
         }
 
@@ -1071,6 +1145,115 @@ mod tests {
             purged_at: None,
             purge_reason: None,
         }
+    }
+
+    #[test]
+    fn supersede_keeps_the_first_window_and_winner() {
+        let mut fact = create_test_fact("f", "no crew were injured");
+        let first = chrono::Utc::now();
+        fact.supersede(Some("winner-a"), first);
+        fact.supersede(Some("winner-b"), first + chrono::Duration::days(3));
+        assert_eq!(fact.valid_until, Some(first.max(fact.created_at)));
+        assert_eq!(fact.superseded_by.as_deref(), Some("winner-a"));
+        assert!(!super::super::compression::is_active(
+            &fact,
+            first + chrono::Duration::seconds(1)
+        ));
+
+        let mut winner = create_test_fact("w", "four crew were injured");
+        winner.record_superseded("f");
+        winner.record_superseded("f");
+        assert_eq!(winner.supersedes, vec!["f".to_string()]);
+    }
+
+    #[test]
+    fn find_contradiction_requires_an_embedding() {
+        on_both_backends(find_contradiction_requires_an_embedding_body);
+    }
+
+    fn find_contradiction_requires_an_embedding_body(store: SemanticFactStore) {
+        let claim = create_test_fact("c1", "four crew were injured in the incident");
+        store.store("u", &claim).unwrap();
+        store.store_embedding("u", "c1", &[0.5; 8]).unwrap();
+        let found = store
+            .find_contradiction(
+                "u",
+                "four crew were not injured in the incident",
+                &["rust".into()],
+                None,
+            )
+            .unwrap();
+        assert!(found.is_none(), "no embedding, no arbitration");
+    }
+
+    #[test]
+    fn find_contradiction_matches_opposite_polarity_only() {
+        on_both_backends(find_contradiction_matches_opposite_polarity_only_body);
+    }
+
+    fn find_contradiction_matches_opposite_polarity_only_body(store: SemanticFactStore) {
+        // Identical embeddings satisfy every gate but polarity.
+        let emb = [0.5_f32; 8];
+        let claim = create_test_fact("c1", "four crew were injured in the incident");
+        store.store("u", &claim).unwrap();
+        store.store_embedding("u", "c1", &emb).unwrap();
+
+        let hit = store
+            .find_contradiction(
+                "u",
+                "four crew were not injured in the incident",
+                &["rust".into()],
+                Some(&emb),
+            )
+            .unwrap();
+        assert_eq!(hit.map(|f| f.id), Some("c1".to_string()));
+
+        let miss = store
+            .find_contradiction(
+                "u",
+                "four crew were injured in the incident today",
+                &["rust".into()],
+                Some(&emb),
+            )
+            .unwrap();
+        assert!(miss.is_none(), "same polarity is dedup's case");
+    }
+
+    #[test]
+    fn a_superseded_fact_is_out_of_arbitration_but_still_absorbs_its_restatement() {
+        on_both_backends(
+            a_superseded_fact_is_out_of_arbitration_but_still_absorbs_its_restatement_body,
+        );
+    }
+
+    fn a_superseded_fact_is_out_of_arbitration_but_still_absorbs_its_restatement_body(
+        store: SemanticFactStore,
+    ) {
+        let emb = [0.5_f32; 8];
+        let mut dead = create_test_fact("dead", "four crew were injured in the incident");
+        dead.supersede(Some("winner"), chrono::Utc::now());
+        store.store("u", &dead).unwrap();
+        store.store_embedding("u", "dead", &emb).unwrap();
+
+        let contradiction = store
+            .find_contradiction(
+                "u",
+                "four crew were not injured in the incident",
+                &["rust".into()],
+                Some(&emb),
+            )
+            .unwrap();
+        assert!(contradiction.is_none(), "a retired fact cannot win or lose");
+
+        let restated = store
+            .find_similar(
+                "u",
+                "four crew were injured in the incident",
+                &["rust".into()],
+                Some(&emb),
+            )
+            .unwrap();
+        assert_eq!(restated.map(|f| f.id), Some("dead".to_string()));
     }
 
     #[test]
