@@ -669,8 +669,9 @@ fn test_brutal_graph_maintenance_cycles() {
     // Verify graph still works
     let stats = system.graph_stats();
     assert!(
-        stats.node_count > 0 || stats.edge_count >= 0,
-        "Graph should be intact"
+        stats.edge_count == 0 || stats.node_count > 0,
+        "graph has {} edges but no nodes",
+        stats.edge_count
     );
 }
 
@@ -1299,9 +1300,13 @@ fn test_brutal_graph_consistency() {
         handle.join().expect("Thread panicked");
     }
 
-    // Verify graph is still valid
+    // Edges require nodes to connect.
     let stats = system.graph_stats();
-    assert!(stats.node_count >= 0, "Graph should have valid node count");
+    assert!(
+        stats.edge_count == 0 || stats.node_count > 0,
+        "graph has {} edges but no nodes",
+        stats.edge_count
+    );
 }
 
 /// Test rapid creation and deletion simulation (via importance decay)
