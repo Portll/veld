@@ -177,7 +177,7 @@ in	bad83cae	389	2026-07-14	http-api	W10	partial	433ad8a0	causal cue extractor on
 in	162a4289	379	2026-07-14	eval	W0	pending		
 in	631da3d8	380	2026-07-14	web-ui	W11	pending		
 in	fc718019	394	2026-07-14	ner-entities	W6	pending		
-in	2843d91f	399	2026-07-15	security	W1	pending		
+in	2843d91f	399	2026-07-15	security	W1	pending		awaiting ADR 0008
 in	fed58c53	397	2026-07-15	eval	W0	pending		
 in	e0469ba7	398	2026-07-15	mcp-hooks	W9	pending		
 in	51130424	400	2026-07-15	graph	W3	ported	2c3f1a59,afc83727	read-only recall, hub-cap order
@@ -282,7 +282,7 @@ in	a2dab9de	541	2026-09-06	embeddings-vectors	W8	pending
 in	6aa48bd5	534	2026-09-06	graph	W3	pending		
 in	c6411e3e	535	2026-09-07	eval	W0	pending		
 in	5f65ce44	497	2026-09-07	retrieval	W2	pending		
-in	a292546f	509	2026-09-08	security	W1	pending		
+in	a292546f	509	2026-09-08	graph	W3	pending		
 in	d475062e	545	2026-09-10	eval	W0	pending		
 in	3a3395f1	532	2026-09-10	storage-integrity	W7	pending		
 in	a724b862	548	2026-09-13	eval	W0	pending		
