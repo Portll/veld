@@ -518,6 +518,18 @@ pub const CONSOLIDATION_MIN_SUPPORT_SMALL: usize = 2; // <= 100 eligible memorie
 pub const CONSOLIDATION_MIN_SUPPORT_MEDIUM: usize = 3; // <= 1000 eligible memories
 pub const CONSOLIDATION_MIN_SUPPORT_LARGE: usize = 4; // > 1000 eligible memories
 
+/// Minimum non-stop-words a sentence needs to be a declarative fact candidate
+/// (`SemanticConsolidator::extract_salient_statement`).
+///
+/// Justification:
+/// - Four is the smallest floor that needs a clause rather than a caption: at three, a
+///   20-character heading ("Bridge collapse update") still qualifies.
+/// - Not higher: declarative sentences in news and technical prose routinely carry 5-8
+///   content words, and a floor of 5 starts discarding them.
+/// - Corroboration (`CONSOLIDATION_MIN_SUPPORT`, two or more distinct memories) decides what
+///   becomes a fact; this floor is the cheap structural half.
+pub const CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS: usize = 4;
+
 /// Maximum members in one consolidation cluster. A full cluster takes no more members, so a
 /// greedy pass cannot grow one cluster that absorbs everything.
 pub const CONSOLIDATION_CLUSTER_SIZE_CAP: usize = 20;
@@ -2675,6 +2687,7 @@ pub const RECONSOLIDATION_WORKING_MEMORY_THRESHOLD: u32 = 5;
 // | CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY | memory/compression.rs | extract_fact_candidates() |
 // | CONSOLIDATION_MIN_SUPPORT_SMALL/MEDIUM/LARGE | memory/compression.rs | consolidate()     |
 // | CONSOLIDATION_CLUSTER_SIZE_CAP | memory/compression.rs | group_candidates_by_similarity()  |
+// | CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS | memory/compression.rs | extract_salient_statement() |
 // | FACT_DECAY_GRACE_DAYS              | memory/mod.rs, compression.rs | fact decay grace period     |
 // | FACT_DECAY_HALF_LIFE_BASE_DAYS     | memory/mod.rs, compression.rs | fact decay half-life base  |
 // | FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS | memory/mod.rs, compression.rs | fact decay per support  |
