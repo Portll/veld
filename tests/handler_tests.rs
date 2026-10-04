@@ -550,6 +550,82 @@ async fn multimodal_search_refuses_modes_it_cannot_parameterise() {
     }
 }
 
+/// Names of the entities a memory's graph episode references.
+fn episode_entity_names(h: &Harness, user: &str, id: &veld::uuid::Uuid) -> Vec<String> {
+    let graph = h.mgr.get_user_graph(user).expect("graph");
+    let graph = graph.read();
+    match graph.get_episode(id).expect("read episode") {
+        Some(episode) => episode
+            .entity_refs
+            .iter()
+            .filter_map(|e| graph.get_entity(e).ok().flatten())
+            .map(|e| e.name.to_lowercase())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Waits for the background graph pass to give a memory's episode an entity.
+async fn wait_for_episode_entity(h: &Harness, user: &str, id: veld::uuid::Uuid, name: &str) {
+    for _ in 0..300 {
+        if episode_entity_names(h, user, &id).iter().any(|n| n == name) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!(
+        "the graph episode never gained '{name}': {:?}",
+        episode_entity_names(h, user, &id)
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_with_new_tags_reaches_the_stored_memory_and_its_graph_episode() {
+    use veld::memory::MemoryId;
+
+    let h = Harness::new();
+    let user = "merge-user";
+    // Short enough that the episode stays under max_entities_per_memory (10) after the merge.
+    let content = "The tender drifted overnight.";
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user, "content": content, "tags": ["mooring"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["id"].as_str().expect("id")).unwrap();
+    wait_for_episode_entity(&h, user, id, "mooring").await;
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user, "content": content, "tags": ["kestrel"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"].as_str(), Some(id.to_string().as_str()));
+
+    let stored = {
+        let memory = h.mgr.get_user_memory(user).expect("memory");
+        let guard = memory.read();
+        guard.get_memory(&MemoryId(id)).expect("stored")
+    };
+    for name in ["mooring", "kestrel"] {
+        assert!(
+            stored.experience.entities.iter().any(|e| e == name),
+            "{name} missing from {:?}",
+            stored.experience.entities
+        );
+    }
+    wait_for_episode_entity(&h, user, id, "kestrel").await;
+}
+
 #[tokio::test]
 async fn batch_remember() {
     let h = Harness::new();
