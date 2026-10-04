@@ -3570,18 +3570,25 @@ impl MemorySystem {
         }
 
         let count = to_promote.len();
+
+        // Recall's tier trust reads the tier from storage, so the promotion is persisted, and
+        // persisted before the tier maps are locked. If the map move then fails, storage
+        // already says Session and the next cycle re-promotes.
+        let mut promoted: Vec<Memory> = Vec::with_capacity(count);
+        for memory in &to_promote {
+            let mut promoted_memory = (**memory).clone();
+            promoted_memory.promote(); // Working -> Session
+            self.long_term_memory.store(&promoted_memory)?;
+            promoted.push(promoted_memory);
+        }
+
         let mut working = self.working_memory.write();
         let mut session = self.session_memory.write();
 
-        for memory in &to_promote {
-            // Log promotion
+        for (memory, promoted_memory) in to_promote.iter().zip(promoted) {
             self.logger
                 .write()
                 .log_promoted(&memory.id, "working", "session", count);
-
-            // Clone out of Arc and update tier before session storage
-            let mut promoted_memory = (**memory).clone();
-            promoted_memory.promote(); // Working -> Session
             session.add(promoted_memory)?;
             working.remove(&memory.id)?;
         }
@@ -6241,13 +6248,21 @@ impl MemorySystem {
                     let mut truly_new: Vec<(SemanticFact, Option<Vec<f32>>)> = Vec::new();
 
                     for (fact, embedding) in gated.into_iter() {
-                        // Hybrid dedup: embedding cosine + entity gate + polarity + Jaccard floor
-                        match self.fact_store.find_similar(
+                        // Hybrid dedup: embedding cosine + entity gate + polarity + Jaccard floor.
+                        // A match on a retired fact absorbs the restatement and writes nothing:
+                        // no support, no confidence, no fresh half-life.
+                        let similar = self.fact_store.find_similar(
                             user_id,
                             &fact.fact,
                             &fact.related_entities,
                             embedding.as_deref(),
-                        ) {
+                        );
+                        let existing_is_active = match &similar {
+                            Ok(Some(existing)) => compression::is_active(existing, now),
+                            _ => true,
+                        };
+                        match similar {
+                            Ok(Some(_)) if !existing_is_active => {}
                             Ok(Some(mut existing)) => {
                                 // Support counts distinct evidence: re-deriving the fact
                                 // from memories it already cites adds none.
@@ -6298,7 +6313,60 @@ impl MemorySystem {
                                 }
                             }
                             _ => {
-                                truly_new.push((fact.clone(), embedding));
+                                // A fact that negates an active one is arbitrated: the newer
+                                // fact wins unless the existing one has strictly greater
+                                // support. Recency is the default because a later
+                                // contradiction is usually a correction; support overrides it
+                                // so one stray extraction cannot overturn a well-attested
+                                // claim. Confidence is not the tie-breaker: it rises with
+                                // every re-derivation, so it would make an old claim ever
+                                // harder to correct. The loser is retired, not deleted, and
+                                // keeps its source memories.
+                                let contradiction = self
+                                    .fact_store
+                                    .find_contradiction(
+                                        user_id,
+                                        &fact.fact,
+                                        &fact.related_entities,
+                                        embedding.as_deref(),
+                                    )
+                                    .unwrap_or(None);
+
+                                if let Some(mut existing) = contradiction {
+                                    if fact.support_count >= existing.support_count {
+                                        let mut winner = fact.clone();
+                                        winner.record_superseded(&existing.id);
+                                        existing.supersede(Some(&winner.id), now);
+                                        if let Err(e) = self.fact_store.update(user_id, &existing) {
+                                            tracing::debug!(
+                                                "Failed to supersede contradicted fact: {e}"
+                                            );
+                                        }
+                                        tracing::info!(
+                                            superseded = %existing.id,
+                                            winner = %winner.id,
+                                            "Fact contradiction: newer claim supersedes"
+                                        );
+                                        truly_new.push((winner, embedding));
+                                    } else {
+                                        let mut loser = fact.clone();
+                                        loser.supersede(Some(&existing.id), now);
+                                        existing.record_superseded(&loser.id);
+                                        if let Err(e) = self.fact_store.update(user_id, &existing) {
+                                            tracing::debug!(
+                                                "Failed to record contradiction on winner: {e}"
+                                            );
+                                        }
+                                        tracing::info!(
+                                            rejected = %loser.id,
+                                            winner = %existing.id,
+                                            "Fact contradiction: better-supported claim holds"
+                                        );
+                                        truly_new.push((loser, embedding));
+                                    }
+                                } else {
+                                    truly_new.push((fact.clone(), embedding));
+                                }
                             }
                         }
                     }
@@ -6307,6 +6375,13 @@ impl MemorySystem {
                     if !truly_new.is_empty() {
                         let facts_only: Vec<SemanticFact> =
                             truly_new.iter().map(|(f, _)| f.clone()).collect();
+                        // A newcomer that lost arbitration is stored for the record but must
+                        // stay unreachable by graph traversal.
+                        let active_facts: Vec<SemanticFact> = facts_only
+                            .iter()
+                            .filter(|f| compression::is_active(f, now))
+                            .cloned()
+                            .collect();
                         match self.fact_store.store_batch(user_id, &facts_only) {
                             Ok(stored) => {
                                 facts_extracted_count = stored;
@@ -6335,7 +6410,7 @@ impl MemorySystem {
                         }
 
                         // Connect newly extracted facts to the knowledge graph
-                        self.connect_facts_to_graph(&facts_only);
+                        self.connect_facts_to_graph(&active_facts);
                     }
 
                     if facts_extracted_count > 0 || facts_reinforced_count > 0 {
@@ -7551,9 +7626,13 @@ impl MemorySystem {
         let user_ids = self.fact_store.list_users(100)?;
 
         for user_id in &user_ids {
-            let facts = self.fact_store.list(user_id, 10000)?;
+            // Retired facts decay too; purged ones are the reaper's.
+            let facts = self.fact_store.list_filtered(user_id, 10000, true)?;
 
             for mut fact in facts {
+                if fact.purged_at.is_some() {
+                    continue;
+                }
                 let days_since_reinforcement = (now - fact.last_reinforced).num_days();
 
                 // Grace period: no decay at all
@@ -7566,9 +7645,15 @@ impl MemorySystem {
                 // Exponential half-life decay: confidence × 0.5^(elapsed / half_life)
                 // Half-life grows linearly with support_count — each corroborating source
                 // is genuine evidence that the fact is stable knowledge.
+                // A retired fact loses the support extension: otherwise the more often a
+                // wrong claim was re-derived, the longer it would outlive its correction.
                 let elapsed = (days_since_reinforcement - FACT_DECAY_GRACE_DAYS) as f64;
-                let half_life = FACT_DECAY_HALF_LIFE_BASE_DAYS
-                    + (fact.support_count as f64 * FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS);
+                let support_extension = if compression::is_active(&fact, now) {
+                    fact.support_count as f64 * FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS
+                } else {
+                    0.0
+                };
+                let half_life = FACT_DECAY_HALF_LIFE_BASE_DAYS + support_extension;
                 let decay_factor = (0.5_f64).powf(elapsed / half_life) as f32;
                 fact.confidence = (confidence_before * decay_factor).max(0.0);
 
@@ -8886,6 +8971,104 @@ mod fact_lifecycle_tests {
             assert_eq!(edges.len(), 1, "{backend}");
             assert_eq!(edges[0].relation, CausalRelation::RelatedTo, "{backend}");
             assert_eq!(edges[0].confidence, 0.05, "{backend}");
+        }
+    }
+
+    fn aged_fact(id: &str, days_unreinforced: i64) -> SemanticFact {
+        let now = chrono::Utc::now();
+        SemanticFact {
+            id: id.to_string(),
+            fact: format!("fact {id} about the release train"),
+            confidence: 0.8,
+            support_count: 10,
+            source_memories: vec![MemoryId(Uuid::new_v4())],
+            related_entities: vec!["release".to_string()],
+            created_at: now - chrono::Duration::days(days_unreinforced + 100),
+            last_reinforced: now - chrono::Duration::days(days_unreinforced),
+            fact_type: FactType::Pattern,
+            valid_from: None,
+            valid_until: None,
+            superseded_by: None,
+            supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_retired_fact_decays_on_the_base_half_life() {
+        for (backend, system, _tmp) in systems() {
+            let user = "decay-user";
+            let active = aged_fact("active", 300);
+            let mut retired = aged_fact("retired", 300);
+            retired.supersede(
+                Some("active"),
+                chrono::Utc::now() - chrono::Duration::days(1),
+            );
+            system.fact_store.store(user, &active).unwrap();
+            system.fact_store.store(user, &retired).unwrap();
+
+            system.decay_facts_for_all_users().unwrap();
+
+            let active = system.fact_store.get(user, "active").unwrap().unwrap();
+            let retired = system.fact_store.get(user, "retired").unwrap().unwrap();
+            assert!(active.confidence < 0.8, "{backend}: the active fact decays");
+            assert!(
+                retired.confidence < active.confidence,
+                "{backend}: support no longer extends a retired fact's half-life ({} vs {})",
+                retired.confidence,
+                active.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn working_to_session_promotion_is_persisted() {
+        for (backend, system, _tmp) in systems() {
+            let in_working = |content: &str, age: chrono::Duration| {
+                let memory = Memory::new(
+                    MemoryId(Uuid::new_v4()),
+                    Experience {
+                        content: content.to_string(),
+                        ..Default::default()
+                    },
+                    0.9,
+                    None,
+                    None,
+                    None,
+                    Some(chrono::Utc::now() - age),
+                );
+                system.long_term_memory.store(&memory).unwrap();
+                system
+                    .working_memory
+                    .write()
+                    .add_shared(Arc::new(memory.clone()))
+                    .unwrap();
+                memory.id
+            };
+            let eligible = in_working(
+                "The release train leaves every second Tuesday at noon.",
+                chrono::Duration::hours(2),
+            );
+            let young = in_working(
+                "The canary build is still running on the staging pool.",
+                chrono::Duration::seconds(5),
+            );
+
+            system.promote_working_to_session().unwrap();
+
+            let stored = system.long_term_memory.get(&eligible).unwrap();
+            assert_eq!(
+                stored.tier,
+                MemoryTier::Session,
+                "{backend}: storage follows"
+            );
+            let control = system.long_term_memory.get(&young).unwrap();
+            assert_eq!(
+                control.tier,
+                MemoryTier::Working,
+                "{backend}: a memory under the age threshold is not promoted"
+            );
         }
     }
 }
