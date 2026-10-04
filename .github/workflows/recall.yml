@@ -1,0 +1,145 @@
+name: Recall Gate
+
+# Measures retrieval quality on the 100-case LoCoMo gate with `recall-eval`, once per storage engine.
+# Each engine's run is gated against tests/recall/locomo-gate-baseline.json, and the two engines'
+# scores must be equal. Weekly and on demand, not per push: the Actions budget (2026-09-27 ruling
+# in ci.yml) cannot carry two release builds on every commit. A retrieval, graph or NER port runs
+# it by dispatch before it lands (docs/upstream/PLAN.md, 1.5).
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      tolerance:
+        description: 'Allowed regression in percent of baseline'
+        required: false
+        default: '2.0'
+      repeats:
+        description: 'Ingest+query repeats'
+        required: false
+        default: '5'
+      record:
+        description: 'Record a new baseline: run ungated and upload the reports'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recall-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_DEBUG: 0
+  TOLERANCE: ${{ github.event.inputs.tolerance || '2.0' }}
+  REPEATS: ${{ github.event.inputs.repeats || '5' }}
+  RECORD: ${{ github.event.inputs.record || 'false' }}
+
+jobs:
+  gate:
+    name: Recall gate (${{ matrix.engine }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: rocksdb
+            features: ''
+          - engine: redb
+            features: '--no-default-features --features storage-redb'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: recall-eval-${{ matrix.engine }}
+
+      - name: Install LLVM
+        if: matrix.engine == 'rocksdb'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
+      # The harness refuses the fallback NER and the hash embedder, so the ONNX runtime, MiniLM and
+      # the NER model are fetched, pinned and SHA-256 verified, by veld's own downloader.
+      - uses: actions/cache@v4
+        id: models
+        with:
+          path: ~/.cache/veld
+          key: veld-models-ner-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs') }}
+      - name: Fetch the ONNX runtime, MiniLM and the NER model
+        if: steps.models.outputs.cache-hit != 'true'
+        run: cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime --minilm --ner
+
+      - name: Build recall-eval
+        run: cargo build --release --bin recall-eval ${{ matrix.features }}
+
+      - name: Run the LoCoMo gate
+        id: run
+        run: |
+          set +e
+          set -o pipefail
+          gate_args=()
+          if [ "$RECORD" != "true" ]; then
+            gate_args=(--baseline tests/recall/locomo-gate-baseline.json --tolerance "$TOLERANCE")
+          fi
+          ./target/release/recall-eval \
+            --suite locomo-gate \
+            --layer full \
+            --repeats "$REPEATS" \
+            --output "current-${{ matrix.engine }}.json" \
+            --per-case-output "per-case-${{ matrix.engine }}.json" \
+            "${gate_args[@]}" \
+            --storage ./recall-storage 2>&1 | tee "recall-eval-${{ matrix.engine }}.log"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Render the diff table
+        if: always() && hashFiles(format('current-{0}.json', matrix.engine)) != ''
+        run: |
+          python3 scripts/recall_diff.py tests/recall/locomo-gate-baseline.json \
+            "current-${{ matrix.engine }}.json" --tolerance "$TOLERANCE" > "recall-diff-${{ matrix.engine }}.md"
+          cat "recall-diff-${{ matrix.engine }}.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recall-${{ matrix.engine }}
+          path: |
+            current-${{ matrix.engine }}.json
+            per-case-${{ matrix.engine }}.json
+            recall-eval-${{ matrix.engine }}.log
+            recall-diff-${{ matrix.engine }}.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce the gate
+        if: always()
+        env:
+          EXIT: ${{ steps.run.outputs.exit_code }}
+        run: |
+          case "$EXIT" in
+            0) echo "::notice::recall gate passed (${{ matrix.engine }}, record=$RECORD)" ;;
+            1) echo "::error::recall regression beyond ${TOLERANCE}% on ${{ matrix.engine }}"; exit 1 ;;
+            2) echo "::error::recall harness infrastructure failure on ${{ matrix.engine }}"; exit 1 ;;
+            *) echo "::error::recall-eval exited with '$EXIT' on ${{ matrix.engine }}"; exit 1 ;;
+          esac
+
+  engines-equal:
+    name: Engines score equal
+    needs: gate
+    if: always() && needs.gate.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: recall-*
+          merge-multiple: true
+      - name: Compare the RocksDB and redb reports
+        run: python3 scripts/recall_engines_equal.py current-rocksdb.json current-redb.json
