@@ -36,5 +36,6 @@ veld migrate --from rocksdb --to redb --user all --dry-run
 - The RocksDB `MemoryStorage` in `src/memory/storage.rs`.
 - Record-level at-rest encryption (encryption-v2); redb refuses encrypted records.
 
-On redb, `PrimaryMemoryStore::run_merge_pass` and `gc_merge_tombstones` return an error
-(semantic merge is off by default).
+The semantic merge pass and its tombstone GC (`memory::merge`) are one implementation over
+`PrimaryMemoryStore` and run on both engines; RocksDB answers the GC's citation check from its
+`inbound_ref:` index, redb by reading the memories and facts.

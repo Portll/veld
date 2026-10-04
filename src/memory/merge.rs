@@ -1,5 +1,10 @@
 //! S-R6: Semantic merge of near-duplicate memories via tombstone + audit log.
 //!
+//! One implementation for every engine: each function takes a
+//! [`PrimaryMemoryStore`] and keeps its rows in the store's default keyspace,
+//! so RocksDB and redb run the same merge and GC, and `veld migrate` carries
+//! the rows as `primary/default`.
+//!
 //! # Design
 //!
 //! A merge is triggered when two memories exceed
@@ -10,88 +15,59 @@
 //!
 //! ## Commit point
 //!
-//! The atomic commit point is the append of a [`MergeAudit`] row.  Crash-safe:
-//! on startup [`MemoryStorage::replay_merge_audits`] re-applies every un-GC'd
-//! audit idempotently.
+//! The atomic commit point is the append of a [`MergeAudit`] row;
+//! [`replay_merge_audits`] re-writes the tombstone of every un-GC'd audit
+//! idempotently.
 //!
 //! ## Evidence pooling (winner update)
 //!
 //! 1. `access_count` — summed.
-//! 2. `entity_refs`  — union (deduplicated by entity id).
+//! 2. `entity_refs`  — union (deduplicated by entity name).
 //! 3. `embeddings`   — element-wise average of loser into winner.
 //!
 //! ## Tombstone
 //!
 //! The loser row stays in storage with a `merge_tombstone:{user_id}:{loser_id}`
-//! marker written in the default CF.  It is **not** deleted.
+//! marker in the default keyspace.  It is **not** deleted.
 //!
-//! ## Lazy remap on read (B2)
+//! ## Lazy remap (B2) and path compression (B7)
 //!
-//! [`MemoryStorage::resolve_loser`] is called on a storage MISS.  It checks
-//! for a tombstone → scans the audit log → returns the winner id.  Always-on
-//! (no flag); strict no-op when no audits exist.
+//! [`resolve_loser`] follows the audit log from a loser to its current winner
+//! and re-writes the first audit to point at the end of the chain.
 //!
-//! ## Path compression (B7)
+//! ## GC (J2)
 //!
-//! On each `resolve_loser` call the chain A→B→C is compressed to A→C by
-//! re-writing the audit entry for A to point directly at C.
-//!
-//! ## GC
-//!
-//! A tombstone is physically reclaimed ONLY when:
-//! - [`MemoryStorage::has_any_inbound_refs`] returns `false`, AND
-//! - The quiescence window ([`SEMANTIC_MERGE_GC_QUIESCENCE_SECS`]) has elapsed.
-//!
-//! Physical reclaim calls the existing `delete()` path.  The audit row is
-//! deleted at the same time.
-//!
-//! ## J2 force-GC (maintenance tick)
-//!
-//! [`MemoryStorage::gc_merge_tombstones`] scans all tombstones and force-GCs
-//! any that are older than [`SEMANTIC_MERGE_GC_MAX_AGE_SECS`] AND have no
-//! inbound refs.  Called from `run_maintenance` on heavy cycles.
+//! A tombstone is physically reclaimed ONLY when
+//! [`PrimaryMemoryStore::has_any_inbound_refs`] is `false` and the quiescence
+//! window ([`SEMANTIC_MERGE_GC_QUIESCENCE_SECS`]) or the force window
+//! ([`SEMANTIC_MERGE_GC_MAX_AGE_SECS`]) has elapsed.  Reclaim deletes the loser
+//! through the store, then its tombstone and audit rows.
 
-#[cfg(feature = "rocksdb")]
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-#[cfg(feature = "rocksdb")]
-use rocksdb::{IteratorMode, WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "rocksdb")]
 use crate::constants::{
     SEMANTIC_MERGE_ENABLED, SEMANTIC_MERGE_GC_MAX_AGE_SECS, SEMANTIC_MERGE_GC_QUIESCENCE_SECS,
     SEMANTIC_MERGE_SIMILARITY_THRESHOLD,
 };
-#[cfg(feature = "rocksdb")]
-use crate::memory::types::EntityRef;
-use crate::memory::types::MemoryId;
-#[cfg(feature = "rocksdb")]
+use crate::memory::types::{EntityRef, MemoryId};
 use crate::similarity::cosine_similarity;
+use crate::storage::{KeyValueStore, PrimaryMemoryStore};
 
-#[cfg(feature = "rocksdb")]
-use super::storage::MemoryStorage;
+/// Key prefix for merge-audit rows: `merge_audit:{user_id}:{audit_id}`.
+pub(crate) const AUDIT_PREFIX: &str = "merge_audit:";
 
-// ============================================================================
-// Audit record
-// ============================================================================
-
-/// Key prefix for merge-audit rows in the default CF.
-/// Full key: `merge_audit:{user_id}:{audit_id}`
-#[cfg(feature = "rocksdb")]
-pub(super) const AUDIT_PREFIX: &str = "merge_audit:";
-
-/// Key prefix for tombstone markers in the default CF.
-/// Full key: `merge_tombstone:{user_id}:{loser_id}`
-#[cfg(feature = "rocksdb")]
-pub(super) const TOMBSTONE_PREFIX: &str = "merge_tombstone:";
+/// Key prefix for tombstone markers: `merge_tombstone:{user_id}:{loser_id}`.
+pub(crate) const TOMBSTONE_PREFIX: &str = "merge_tombstone:";
 
 /// Immutable audit record written as the atomic commit point of every merge.
 ///
-/// Stored in the default CF under `merge_audit:{user_id}:{audit_id}` (JSON).
-/// Append-only; never mutated after write.  The only in-place modification
-/// permitted is path-compression: replacing `winner_id` with the end of the
-/// chain (B7).
+/// Stored in the default keyspace under `merge_audit:{user_id}:{audit_id}` (JSON).
+/// Append-only; the only in-place modification permitted is path compression:
+/// replacing `winner_id` with the end of the chain (B7).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MergeAudit {
     /// Surrogate key for this audit row (UUID v4).
@@ -106,10 +82,6 @@ pub struct MergeAudit {
     pub user_id: String,
 }
 
-// ============================================================================
-// Tombstone record
-// ============================================================================
-
 /// Minimal tombstone written at `merge_tombstone:{user_id}:{loser_id}`.
 /// Value is a JSON-encoded [`TombstoneRecord`] so GC can check quiescence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,10 +91,6 @@ pub struct TombstoneRecord {
     pub tombstoned_at: DateTime<Utc>,
     pub user_id: String,
 }
-
-// ============================================================================
-// Merge candidate detection
-// ============================================================================
 
 /// A pair of memories that exceed the similarity threshold.
 #[derive(Debug, Clone)]
@@ -134,481 +102,292 @@ pub struct MergeCandidate {
     pub similarity: f32,
 }
 
-// ============================================================================
-// MemoryStorage methods — the public API surface for merge operations
-// ============================================================================
+pub(crate) fn audit_key(user_id: &str, audit_id: &str) -> String {
+    format!("{AUDIT_PREFIX}{user_id}:{audit_id}")
+}
 
-#[cfg(feature = "rocksdb")]
-impl MemoryStorage {
-    // -------------------------------------------------------------------------
-    // Candidate detection
-    // -------------------------------------------------------------------------
+pub(crate) fn tombstone_key(user_id: &str, loser_id: &MemoryId) -> String {
+    format!("{TOMBSTONE_PREFIX}{user_id}:{}", loser_id.0)
+}
 
-    /// Scan all memories for near-duplicate pairs.
-    ///
-    /// Only called when [`SEMANTIC_MERGE_ENABLED`] is true.  Returns an ordered
-    /// list of merge candidates (highest similarity first).
-    ///
-    /// Algorithm: O(n²) pair scan over memories that have embeddings.  For
-    /// large corpora (>10 k memories) the caller should pass a per-tick limit.
-    ///
-    /// The loser is the memory with the lower `access_count` + `importance`
-    /// combined score.  Ties broken by lexicographic id ordering so the choice
-    /// is deterministic and stable.
-    pub fn find_merge_candidates(&self, limit: usize) -> Result<Vec<MergeCandidate>> {
-        let memories = self.get_all()?;
-        // Only consider memories with embeddings — no embedding means no
-        // reliable cosine comparison.
-        let with_emb: Vec<_> = memories
-            .into_iter()
-            .filter(|m| m.experience.embeddings.is_some())
-            // Skip tombstoned losers — they have no live role.
-            .filter(|m| !self.is_tombstoned_losers_ignore_user(m.id.clone()))
-            .collect();
+fn write_json<T: Serialize>(kv: &dyn KeyValueStore, key: &str, value: &T) -> Result<()> {
+    let bytes = serde_json::to_vec(value).context("serialize merge row")?;
+    kv.put_bytes(key.as_bytes(), &bytes)
+}
 
-        let n = with_emb.len();
-        let mut candidates: Vec<MergeCandidate> = Vec::new();
+/// Every audit row for `user_id`, with its key. A row that will not decode is
+/// skipped: an audit is only ever written whole, by [`execute_merge`].
+fn load_audits(kv: &dyn KeyValueStore, user_id: &str) -> Result<Vec<(Vec<u8>, MergeAudit)>> {
+    let prefix = format!("{AUDIT_PREFIX}{user_id}:");
+    Ok(kv
+        .scan_prefix(prefix.as_bytes(), None)?
+        .into_iter()
+        .filter_map(|(k, v)| {
+            serde_json::from_slice::<MergeAudit>(&v)
+                .ok()
+                .map(|a| (k, a))
+        })
+        .collect())
+}
 
-        for i in 0..n {
-            let a = &with_emb[i];
-            let emb_a = a.experience.embeddings.as_deref().unwrap();
-            for j in (i + 1)..n {
-                let b = &with_emb[j];
-                let emb_b = b.experience.embeddings.as_deref().unwrap();
-                if emb_a.len() != emb_b.len() {
-                    continue;
-                }
-                let sim = cosine_similarity(emb_a, emb_b);
-                if sim >= SEMANTIC_MERGE_SIMILARITY_THRESHOLD {
-                    // Loser = lower score memory; winner = higher.
-                    let score_a = a.access_count() as f64 + a.importance() as f64;
-                    let score_b = b.access_count() as f64 + b.importance() as f64;
-                    let (loser, winner) = if score_a <= score_b {
-                        (&a.id, &b.id)
-                    } else {
-                        (&b.id, &a.id)
-                    };
-                    candidates.push(MergeCandidate {
-                        loser_id: loser.clone(),
-                        winner_id: winner.clone(),
-                        similarity: sim,
-                    });
-                }
+/// Losers of every tombstone in the store, for any user.
+fn tombstoned_losers(kv: &dyn KeyValueStore) -> Result<HashSet<MemoryId>> {
+    Ok(kv
+        .scan_prefix(TOMBSTONE_PREFIX.as_bytes(), None)?
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_slice::<TombstoneRecord>(&v).ok())
+        .map(|ts| ts.loser_id)
+        .collect())
+}
+
+/// Scan all memories for near-duplicate pairs, highest similarity first.
+///
+/// O(n²) over memories that have embeddings; the caller passes a per-tick
+/// `limit`.  The loser is the memory with the lower `access_count` +
+/// `importance`; a tie makes the earlier memory in store order the loser.
+pub fn find_merge_candidates(
+    store: &dyn PrimaryMemoryStore,
+    limit: usize,
+) -> Result<Vec<MergeCandidate>> {
+    let tombstoned = tombstoned_losers(store.default_key_value_store().as_ref())?;
+    let with_emb: Vec<_> = store
+        .get_all()?
+        .into_iter()
+        .filter(|m| m.experience.embeddings.is_some())
+        .filter(|m| !tombstoned.contains(&m.id))
+        .collect();
+
+    let mut candidates: Vec<MergeCandidate> = Vec::new();
+    for (i, a) in with_emb.iter().enumerate() {
+        let emb_a = a.experience.embeddings.as_deref().unwrap_or_default();
+        for b in &with_emb[i + 1..] {
+            let emb_b = b.experience.embeddings.as_deref().unwrap_or_default();
+            if emb_a.len() != emb_b.len() {
+                continue;
+            }
+            let sim = cosine_similarity(emb_a, emb_b);
+            if sim >= SEMANTIC_MERGE_SIMILARITY_THRESHOLD {
+                let score_a = a.access_count() as f64 + a.importance() as f64;
+                let score_b = b.access_count() as f64 + b.importance() as f64;
+                let (loser, winner) = if score_a <= score_b {
+                    (&a.id, &b.id)
+                } else {
+                    (&b.id, &a.id)
+                };
+                candidates.push(MergeCandidate {
+                    loser_id: loser.clone(),
+                    winner_id: winner.clone(),
+                    similarity: sim,
+                });
             }
         }
-
-        candidates.sort_by(|a, b| {
-            b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        candidates.truncate(limit);
-        Ok(candidates)
     }
 
-    /// Returns true if `id` is the loser side of any tombstone (any user).
-    /// Used internally during candidate scan to skip already-tombstoned rows.
-    fn is_tombstoned_losers_ignore_user(&self, id: MemoryId) -> bool {
-        // Scan `merge_tombstone:*:{id}` — cheap: each key includes the id.
-        let id_str = id.0.to_string();
-        let db = self.db();
-        let iter = db.iterator(IteratorMode::From(
-            TOMBSTONE_PREFIX.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-        for item in iter {
-            let Ok((key, _)) = item else { continue };
-            let key_str = String::from_utf8_lossy(&key);
-            if !key_str.starts_with(TOMBSTONE_PREFIX) {
-                break;
-            }
-            if key_str.ends_with(&id_str) {
-                return true;
+    candidates.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(limit);
+    Ok(candidates)
+}
+
+/// Execute one merge: pool evidence into winner, append audit, tombstone loser.
+///
+/// **This is the only write path for merges.**  Production reaches it only
+/// through [`run_merge_pass`], which refuses while [`SEMANTIC_MERGE_ENABLED`]
+/// is false.  Returns the audit id.
+pub fn execute_merge(
+    store: &dyn PrimaryMemoryStore,
+    loser_id: &MemoryId,
+    winner_id: &MemoryId,
+    user_id: &str,
+) -> Result<String> {
+    let mut winner = store
+        .get(winner_id)
+        .context("execute_merge: winner not found")?;
+    let loser = store
+        .get(loser_id)
+        .context("execute_merge: loser not found")?;
+
+    winner.set_access_count(winner.access_count().saturating_add(loser.access_count()));
+
+    for er in &loser.entity_refs {
+        if !winner
+            .entity_refs
+            .iter()
+            .any(|e: &EntityRef| e.name == er.name)
+        {
+            winner.entity_refs.push(er.clone());
+        }
+    }
+
+    if let (Some(winner_emb), Some(loser_emb)) = (
+        winner.experience.embeddings.as_mut(),
+        loser.experience.embeddings.as_deref(),
+    ) {
+        if winner_emb.len() == loser_emb.len() {
+            for (w, l) in winner_emb.iter_mut().zip(loser_emb.iter()) {
+                *w = (*w + l) * 0.5;
             }
         }
-        false
     }
 
-    // -------------------------------------------------------------------------
-    // Execute a single merge
-    // -------------------------------------------------------------------------
+    store
+        .update(&winner)
+        .context("execute_merge: failed to persist winner update")?;
 
-    /// Execute one merge: pool evidence into winner, append audit, tombstone loser.
-    ///
-    /// **This is the only write path for merges.**  It MUST NOT be called with
-    /// [`SEMANTIC_MERGE_ENABLED`] == false except in `#[cfg(test)]` tests that
-    /// force the flag on explicitly.
-    ///
-    /// Returns the audit id on success.
-    pub fn execute_merge(
-        &self,
-        loser_id: &MemoryId,
-        winner_id: &MemoryId,
-        user_id: &str,
-    ) -> Result<String> {
-        // --- 1. Load both memories -------------------------------------------
-        let mut winner = self
-            .get(winner_id)
-            .context("execute_merge: winner not found")?;
-        let loser = self
-            .get(loser_id)
-            .context("execute_merge: loser not found")?;
+    let kv = store.default_key_value_store();
+    let audit_id = uuid::Uuid::new_v4().to_string();
+    let audit = MergeAudit {
+        audit_id: audit_id.clone(),
+        loser_id: loser_id.clone(),
+        winner_id: winner_id.clone(),
+        merged_at: Utc::now(),
+        user_id: user_id.to_string(),
+    };
+    write_json(kv.as_ref(), &audit_key(user_id, &audit_id), &audit)
+        .context("execute_merge: failed to write audit")?;
 
-        // --- 2. Pool evidence: access_count ------------------------------------
-        let winner_access = winner.access_count();
-        let loser_access = loser.access_count();
-        let new_access = winner_access.saturating_add(loser_access);
-        winner.set_access_count(new_access);
+    let tombstone = TombstoneRecord {
+        loser_id: loser_id.clone(),
+        winner_id: winner_id.clone(),
+        tombstoned_at: Utc::now(),
+        user_id: user_id.to_string(),
+    };
+    write_json(kv.as_ref(), &tombstone_key(user_id, loser_id), &tombstone)
+        .context("execute_merge: failed to write tombstone")?;
 
-        // --- 3. Pool evidence: entity_refs (union, dedup by entity name) -------
-        for er in &loser.entity_refs {
-            if !winner
-                .entity_refs
-                .iter()
-                .any(|e: &EntityRef| e.name == er.name)
-            {
-                winner.entity_refs.push(er.clone());
-            }
-        }
+    tracing::info!(
+        loser_id = %loser_id.0,
+        winner_id = %winner_id.0,
+        audit_id = %audit_id,
+        user_id = %user_id,
+        "S-R6: merge committed"
+    );
+    Ok(audit_id)
+}
 
-        // --- 4. Pool evidence: embeddings (element-wise average) ---------------
-        if let (Some(winner_emb), Some(loser_emb)) = (
-            winner.experience.embeddings.as_mut(),
-            loser.experience.embeddings.as_deref(),
-        ) {
-            if winner_emb.len() == loser_emb.len() {
-                for (w, l) in winner_emb.iter_mut().zip(loser_emb.iter()) {
-                    *w = (*w + l) * 0.5;
-                }
-            }
-        }
-
-        // --- 5. Persist updated winner -----------------------------------------
-        self.update(&winner)
-            .context("execute_merge: failed to persist winner update")?;
-
-        // --- 6. Append MergeAudit (ATOMIC COMMIT POINT) ------------------------
-        let audit_id = uuid::Uuid::new_v4().to_string();
-        let audit = MergeAudit {
-            audit_id: audit_id.clone(),
-            loser_id: loser_id.clone(),
-            winner_id: winner_id.clone(),
-            merged_at: Utc::now(),
-            user_id: user_id.to_string(),
-        };
-        self.write_audit(&audit)
-            .context("execute_merge: failed to write audit")?;
-
-        // --- 7. Tombstone the loser -------------------------------------------
-        let tombstone = TombstoneRecord {
-            loser_id: loser_id.clone(),
-            winner_id: winner_id.clone(),
-            tombstoned_at: Utc::now(),
-            user_id: user_id.to_string(),
-        };
-        self.write_tombstone(&tombstone)
-            .context("execute_merge: failed to write tombstone")?;
-
-        tracing::info!(
-            loser_id = %loser_id.0,
-            winner_id = %winner_id.0,
-            audit_id = %audit_id,
-            user_id = %user_id,
-            "S-R6: merge committed"
-        );
-
-        Ok(audit_id)
-    }
-
-    // -------------------------------------------------------------------------
-    // Audit + tombstone persistence helpers
-    // -------------------------------------------------------------------------
-
-    fn audit_key(user_id: &str, audit_id: &str) -> String {
-        format!("{}{user_id}:{audit_id}", AUDIT_PREFIX)
-    }
-
-    fn write_audit(&self, audit: &MergeAudit) -> Result<()> {
-        let key = Self::audit_key(&audit.user_id, &audit.audit_id);
-        let value = serde_json::to_vec(audit).context("serialize MergeAudit")?;
-        let mut wo = WriteOptions::default();
-        wo.set_sync(self.write_mode_is_sync());
-        self.db()
-            .put_opt(key.as_bytes(), &value, &wo)
-            .context("write MergeAudit to RocksDB")
-    }
-
-    fn write_tombstone(&self, ts: &TombstoneRecord) -> Result<()> {
-        let key = Self::tombstone_key(&ts.user_id, &ts.loser_id);
-        let value = serde_json::to_vec(ts).context("serialize TombstoneRecord")?;
-        let mut wo = WriteOptions::default();
-        wo.set_sync(self.write_mode_is_sync());
-        self.db()
-            .put_opt(key.as_bytes(), &value, &wo)
-            .context("write TombstoneRecord to RocksDB")
-    }
-
-    // -------------------------------------------------------------------------
-    // Audit scan helpers
-    // -------------------------------------------------------------------------
-
-    /// Load all MergeAudit rows for `user_id`.
-    fn load_audits_for_user(&self, user_id: &str) -> Vec<MergeAudit> {
-        let prefix = format!("{}{user_id}:", AUDIT_PREFIX);
-        let db = self.db();
-        let iter = db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-        let mut audits = Vec::new();
-        for item in iter {
-            let Ok((key, value)) = item else { continue };
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            if let Ok(a) = serde_json::from_slice::<MergeAudit>(&value) {
-                audits.push(a);
-            }
-        }
+/// Resolve a loser id to its current winner id via the audit log, compressing
+/// a chain A→B→C to A→C (B7).  `None` when `id` is no audit's loser.
+pub fn resolve_loser(
+    store: &dyn PrimaryMemoryStore,
+    id: &MemoryId,
+    user_id: &str,
+) -> Result<Option<MemoryId>> {
+    let kv = store.default_key_value_store();
+    let audits = load_audits(kv.as_ref(), user_id)?;
+    let next_winner = |loser: &MemoryId| {
         audits
+            .iter()
+            .find(|(_, a)| a.loser_id == *loser)
+            .map(|(_, a)| a.winner_id.clone())
+    };
+
+    let Some((audit_key, first)) = audits.iter().find(|(_, a)| a.loser_id == *id) else {
+        return Ok(None);
+    };
+    let mut winner = first.winner_id.clone();
+    let mut visited = vec![id.clone()];
+    while !visited.contains(&winner) {
+        visited.push(winner.clone());
+        match next_winner(&winner) {
+            Some(next) => winner = next,
+            None => break,
+        }
     }
 
-    // -------------------------------------------------------------------------
-    // Lazy remap on read (B2 / J1)
-    // -------------------------------------------------------------------------
-
-    /// Resolve a loser id to its current winner id via the audit log.
-    ///
-    /// Called ONLY on a storage MISS (J1 — zero per-read tax on the hot path).
-    /// Always-on regardless of [`SEMANTIC_MERGE_ENABLED`]; no-op when no audits
-    /// exist for this storage instance.
-    ///
-    /// Performs path compression (B7): if A→B→C exists, rewrites A's audit to
-    /// point directly at C.
-    ///
-    /// Returns `None` if `id` is not the loser side of any audit.
-    pub fn resolve_loser(&self, id: &MemoryId, user_id: &str) -> Option<MemoryId> {
-        let loser_str = id.0.to_string();
-
-        // Find the audit for this loser.
-        let prefix = format!("{}{user_id}:", AUDIT_PREFIX);
-        let db = self.db();
-        let iter = db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-        let mut found_audit: Option<(String, MergeAudit)> = None;
-        for item in iter {
-            let Ok((key, value)) = item else { continue };
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            if let Ok(a) = serde_json::from_slice::<MergeAudit>(&value) {
-                if a.loser_id.0.to_string() == loser_str {
-                    found_audit = Some((String::from_utf8_lossy(&key).to_string(), a));
-                    break;
-                }
-            }
-        }
-
-        let (audit_key, mut audit) = found_audit?;
-        let mut winner = audit.winner_id.clone();
-
-        // Path compression (B7): follow the chain until the end.
-        let mut visited: Vec<String> = vec![loser_str.clone()];
-        loop {
-            let winner_str = winner.0.to_string();
-            if visited.contains(&winner_str) {
-                // Cycle guard (should never happen in practice).
-                break;
-            }
-            visited.push(winner_str.clone());
-
-            // Check if the winner itself is also a loser.
-            let next = self.resolve_loser_raw(user_id, &winner);
-            match next {
-                Some(next_winner) => {
-                    winner = next_winner;
-                }
-                None => break,
-            }
-        }
-
-        // If the chain was longer than 1 hop, rewrite the original audit
-        // to point directly at the end (path compression).
-        if winner != audit.winner_id {
-            tracing::debug!(
-                loser = %loser_str,
-                old_winner = %audit.winner_id.0,
-                compressed_winner = %winner.0,
-                "S-R6: path-compressing merge chain"
-            );
-            audit.winner_id = winner.clone();
-            if let Ok(value) = serde_json::to_vec(&audit) {
-                let db = self.db();
-                let mut wo = WriteOptions::default();
-                wo.set_sync(self.write_mode_is_sync());
-                let _ = db.put_opt(audit_key.as_bytes(), &value, &wo);
-            }
-        }
-
-        Some(winner)
-    }
-
-    /// Inner lookup: find the immediate winner for `loser` from the audit log.
-    /// Returns `None` if `loser` is not the loser side of any audit.
-    fn resolve_loser_raw(&self, user_id: &str, loser: &MemoryId) -> Option<MemoryId> {
-        let loser_str = loser.0.to_string();
-        let prefix = format!("{}{user_id}:", AUDIT_PREFIX);
-        let db = self.db();
-        let iter = db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-        for item in iter {
-            let Ok((key, value)) = item else { continue };
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            if let Ok(a) = serde_json::from_slice::<MergeAudit>(&value) {
-                if a.loser_id.0.to_string() == loser_str {
-                    return Some(a.winner_id);
-                }
-            }
-        }
-        None
-    }
-
-    // -------------------------------------------------------------------------
-    // Crash-safe startup replay (idempotent)
-    // -------------------------------------------------------------------------
-
-    /// Replay all un-GC'd audit entries on startup to ensure tombstones are
-    /// consistent with audits.  Idempotent: if the tombstone already exists
-    /// and the winner is already up to date, the write is a no-op.
-    ///
-    /// Called once during `MemoryStorage::new` AFTER the DB is opened.
-    pub fn replay_merge_audits(&self, user_id: &str) {
-        let audits = self.load_audits_for_user(user_id);
-        if audits.is_empty() {
-            return;
-        }
-        tracing::info!(
-            count = audits.len(),
-            user_id = %user_id,
-            "S-R6: replaying merge audits on startup"
+    if winner != first.winner_id {
+        tracing::debug!(
+            loser = %id.0,
+            old_winner = %first.winner_id.0,
+            compressed_winner = %winner.0,
+            "S-R6: path-compressing merge chain"
         );
-        for audit in &audits {
-            // Ensure tombstone exists (idempotent).
-            let ts = TombstoneRecord {
-                loser_id: audit.loser_id.clone(),
-                winner_id: audit.winner_id.clone(),
-                tombstoned_at: audit.merged_at,
-                user_id: audit.user_id.clone(),
-            };
-            if let Err(e) = self.write_tombstone(&ts) {
-                tracing::warn!(
-                    audit_id = %audit.audit_id,
-                    error = %e,
-                    "S-R6: replay failed to re-write tombstone (non-fatal)"
-                );
-            }
+        let compressed = MergeAudit {
+            winner_id: winner.clone(),
+            ..first.clone()
+        };
+        let bytes = serde_json::to_vec(&compressed).context("serialize MergeAudit")?;
+        kv.put_bytes(audit_key, &bytes)?;
+    }
+    Ok(Some(winner))
+}
+
+/// Re-write the tombstone of every audit for `user_id`, so a crash between the
+/// audit (the commit point) and the tombstone leaves no loser live.
+/// Idempotent.  Returns the number of audits replayed.
+pub fn replay_merge_audits(store: &dyn PrimaryMemoryStore, user_id: &str) -> Result<usize> {
+    let kv = store.default_key_value_store();
+    let audits = load_audits(kv.as_ref(), user_id)?;
+    for (_, audit) in &audits {
+        let ts = TombstoneRecord {
+            loser_id: audit.loser_id.clone(),
+            winner_id: audit.winner_id.clone(),
+            tombstoned_at: audit.merged_at,
+            user_id: audit.user_id.clone(),
+        };
+        write_json(kv.as_ref(), &tombstone_key(user_id, &ts.loser_id), &ts)
+            .with_context(|| format!("replaying merge audit {}", audit.audit_id))?;
+    }
+    Ok(audits.len())
+}
+
+/// Reclaim every tombstone for `user_id` that has no inbound refs and is past
+/// the quiescence or force window.  Returns the number reclaimed; a tombstone
+/// whose reclaim fails stays for the next cycle.
+pub fn gc_merge_tombstones(store: &dyn PrimaryMemoryStore, user_id: &str) -> Result<usize> {
+    let now = Utc::now();
+    let kv = store.default_key_value_store();
+    let prefix = format!("{TOMBSTONE_PREFIX}{user_id}:");
+
+    let mut to_gc: Vec<TombstoneRecord> = Vec::new();
+    for (_, value) in kv.scan_prefix(prefix.as_bytes(), None)? {
+        let Ok(ts) = serde_json::from_slice::<TombstoneRecord>(&value) else {
+            continue;
+        };
+        let age_secs = (now - ts.tombstoned_at).num_seconds();
+        // Past either window is enough; the shorter one decides.
+        if age_secs < SEMANTIC_MERGE_GC_QUIESCENCE_SECS.min(SEMANTIC_MERGE_GC_MAX_AGE_SECS) {
+            continue;
+        }
+        match store.has_any_inbound_refs(&ts.loser_id, user_id) {
+            Ok(false) => to_gc.push(ts),
+            Ok(true) => tracing::debug!(
+                loser_id = %ts.loser_id.0,
+                "S-R6 GC: loser still has inbound refs, skipping"
+            ),
+            Err(e) => tracing::warn!(
+                loser_id = %ts.loser_id.0,
+                error = %e,
+                "S-R6 GC: has_any_inbound_refs failed, skipping"
+            ),
         }
     }
+    if to_gc.is_empty() {
+        return Ok(0);
+    }
 
-    // -------------------------------------------------------------------------
-    // GC (J2)
-    // -------------------------------------------------------------------------
-
-    /// Scan tombstones and reclaim any that:
-    /// 1. have no inbound refs (`has_any_inbound_refs` == false), AND
-    /// 2. exceed the quiescence window OR the force-GC max-age window.
-    ///
-    /// Returns the number of tombstones reclaimed.
-    ///
-    /// Called from `run_maintenance` on heavy cycles (J2).
-    pub fn gc_merge_tombstones(&self, user_id: &str) -> usize {
-        let now = Utc::now();
-        let prefix = format!("{}{user_id}:", TOMBSTONE_PREFIX);
-        let db = self.db();
-        let iter = db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        let mut to_gc: Vec<TombstoneRecord> = Vec::new();
-        for item in iter {
-            let Ok((key, value)) = item else { continue };
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            let Ok(ts) = serde_json::from_slice::<TombstoneRecord>(&value) else {
-                continue;
-            };
-            let age_secs = (now - ts.tombstoned_at).num_seconds();
-            let quiescent = age_secs >= SEMANTIC_MERGE_GC_QUIESCENCE_SECS;
-            let force_age = age_secs >= SEMANTIC_MERGE_GC_MAX_AGE_SECS;
-
-            if !quiescent && !force_age {
-                continue;
-            }
-
-            // GC gate: refuse if anything still references the loser.
-            match self.has_any_inbound_refs(&ts.loser_id, user_id) {
-                Ok(true) => {
-                    tracing::debug!(
-                        loser_id = %ts.loser_id.0,
-                        "S-R6 GC: loser still has inbound refs, skipping"
-                    );
-                }
-                Ok(false) => {
-                    to_gc.push(ts);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        loser_id = %ts.loser_id.0,
-                        error = %e,
-                        "S-R6 GC: has_any_inbound_refs failed, skipping"
-                    );
-                }
-            }
+    let audits = load_audits(kv.as_ref(), user_id)?;
+    let mut reclaimed = 0;
+    for ts in to_gc {
+        if let Err(e) = store.delete(&ts.loser_id) {
+            tracing::warn!(
+                loser_id = %ts.loser_id.0,
+                error = %e,
+                "S-R6 GC: failed to delete loser memory (will retry next cycle)"
+            );
+            continue;
         }
-
-        let mut reclaimed = 0;
-        for ts in to_gc {
-            // Physically delete the loser memory row.
-            if let Err(e) = self.delete(&ts.loser_id) {
-                tracing::warn!(
-                    loser_id = %ts.loser_id.0,
-                    error = %e,
-                    "S-R6 GC: failed to delete loser memory (will retry next cycle)"
-                );
-                continue;
-            }
-
-            // Remove tombstone and audit rows atomically.
-            let mut batch = WriteBatch::default();
-            let tombstone_key = Self::tombstone_key(user_id, &ts.loser_id);
-            batch.delete(tombstone_key.as_bytes());
-
-            // Remove all audit rows for this loser.
-            let audits = self.load_audits_for_user(user_id);
-            for audit in audits {
-                if audit.loser_id == ts.loser_id {
-                    let key = Self::audit_key(user_id, &audit.audit_id);
-                    batch.delete(key.as_bytes());
-                }
-            }
-
-            let mut wo = WriteOptions::default();
-            wo.set_sync(self.write_mode_is_sync());
-            if let Err(e) = self.db().write_opt(batch, &wo) {
-                tracing::warn!(
-                    loser_id = %ts.loser_id.0,
-                    error = %e,
-                    "S-R6 GC: failed to remove tombstone/audit rows"
-                );
-            } else {
+        let mut keys = vec![tombstone_key(user_id, &ts.loser_id).into_bytes()];
+        keys.extend(
+            audits
+                .iter()
+                .filter(|(_, a)| a.loser_id == ts.loser_id)
+                .map(|(k, _)| k.clone()),
+        );
+        match kv.delete_many(&keys) {
+            Ok(()) => {
                 tracing::info!(
                     loser_id = %ts.loser_id.0,
                     winner_id = %ts.winner_id.0,
@@ -616,91 +395,109 @@ impl MemoryStorage {
                 );
                 reclaimed += 1;
             }
+            Err(e) => tracing::warn!(
+                loser_id = %ts.loser_id.0,
+                error = %e,
+                "S-R6 GC: failed to remove tombstone/audit rows"
+            ),
         }
-
-        reclaimed
     }
-
-    // -------------------------------------------------------------------------
-    // Merge trigger (called from run_maintenance when flag is on)
-    // -------------------------------------------------------------------------
-
-    /// Find and execute up to `limit` merges.  No-op when
-    /// [`SEMANTIC_MERGE_ENABLED`] is false.
-    ///
-    /// Returns the number of merges executed.
-    pub fn run_merge_pass(&self, user_id: &str, limit: usize) -> usize {
-        if !SEMANTIC_MERGE_ENABLED {
-            return 0;
-        }
-        let candidates = match self.find_merge_candidates(limit) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "S-R6: find_merge_candidates failed");
-                return 0;
-            }
-        };
-        let mut merged = 0;
-        for cand in candidates {
-            match self.execute_merge(&cand.loser_id, &cand.winner_id, user_id) {
-                Ok(audit_id) => {
-                    tracing::debug!(
-                        loser = %cand.loser_id.0,
-                        winner = %cand.winner_id.0,
-                        audit_id = %audit_id,
-                        sim = cand.similarity,
-                        "S-R6: merged duplicate"
-                    );
-                    merged += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        loser = %cand.loser_id.0,
-                        winner = %cand.winner_id.0,
-                        error = %e,
-                        "S-R6: merge failed"
-                    );
-                }
-            }
-        }
-        merged
-    }
+    Ok(reclaimed)
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(all(test, feature = "rocksdb"))]
-pub(super) mod tests {
-    use super::*;
-    use crate::memory::storage::MemoryStorage;
-    use crate::memory::types::*;
-    use chrono::Utc;
-    use tempfile::TempDir;
-
-    /// Build a test storage and a temp dir (keep dir alive for the lifetime of the test).
-    fn test_storage() -> (MemoryStorage, TempDir) {
-        let dir = TempDir::new().expect("create tempdir");
-        let storage = MemoryStorage::new(dir.path(), None).expect("open storage");
-        (storage, dir)
+/// Find and execute up to `limit` merges.  `Ok(0)` while
+/// [`SEMANTIC_MERGE_ENABLED`] is false.  A merge that fails is logged and
+/// skipped; the count is of merges committed.
+pub fn run_merge_pass(
+    store: &dyn PrimaryMemoryStore,
+    user_id: &str,
+    limit: usize,
+) -> Result<usize> {
+    if !SEMANTIC_MERGE_ENABLED {
+        return Ok(0);
     }
+    let mut merged = 0;
+    for cand in find_merge_candidates(store, limit)? {
+        match execute_merge(store, &cand.loser_id, &cand.winner_id, user_id) {
+            Ok(audit_id) => {
+                tracing::debug!(
+                    loser = %cand.loser_id.0,
+                    winner = %cand.winner_id.0,
+                    audit_id = %audit_id,
+                    sim = cand.similarity,
+                    "S-R6: merged duplicate"
+                );
+                merged += 1;
+            }
+            Err(e) => tracing::warn!(
+                loser = %cand.loser_id.0,
+                winner = %cand.winner_id.0,
+                error = %e,
+                "S-R6: merge failed"
+            ),
+        }
+    }
+    Ok(merged)
+}
 
-    /// Build a minimal memory with `content` and optional embeddings.
+/// Whether anything still cites `target`, found by reading the store rather
+/// than an index: a memory's forward references, a `SemanticFact`'s
+/// `source_memories`, a `TemporalFact`'s `source_memory_id`.  For an engine
+/// that keeps no inbound-reference index; RocksDB answers the same question
+/// from its `inbound_ref:` index.
+pub fn scan_inbound_refs(
+    store: &dyn PrimaryMemoryStore,
+    target: &MemoryId,
+    user_id: &str,
+) -> Result<bool> {
+    if store
+        .get_all()?
+        .iter()
+        .any(|m| m.forward_ref_targets().contains(target))
+    {
+        return Ok(true);
+    }
+    let kv = store.default_key_value_store();
+    // Primary keys are `{prefix}{user_id}:{fact_id}`; secondary index rows carry more colons.
+    let primary_rows = |prefix: &str| -> Result<Vec<Vec<u8>>> {
+        let full = format!("{prefix}{user_id}:");
+        Ok(kv
+            .scan_prefix(full.as_bytes(), None)?
+            .into_iter()
+            .filter(|(k, _)| String::from_utf8_lossy(k).matches(':').count() == 2)
+            .map(|(_, v)| v)
+            .collect())
+    };
+    if primary_rows("facts:")?.iter().any(|v| {
+        super::facts::decode_for_gc(v).is_ok_and(|fact| fact.source_memories.contains(target))
+    }) {
+        return Ok(true);
+    }
+    Ok(primary_rows("temporal_facts:")?.iter().any(|v| {
+        super::temporal_facts::decode_for_gc(v).is_ok_and(|fact| fact.source_memory_id == *target)
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::memory::types::*;
+    use crate::storage::test_support::{assert_both_backends, primary_stores};
+
+    const USER: &str = "test-user";
+
     fn make_memory(content: &str, embeddings: Option<Vec<f32>>) -> Memory {
         let now = Utc::now();
-        let id = MemoryId(uuid::Uuid::new_v4());
-        let mut experience = Experience {
-            experience_type: ExperienceType::Observation,
-            content: content.to_string(),
-            embeddings: embeddings.clone(),
-            ..Default::default()
-        };
-        // Also set secondary slot so tests exercising average detect the update.
-        experience.embeddings = embeddings;
         Memory::from_legacy(
-            id,
-            experience,
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                experience_type: ExperienceType::Observation,
+                content: content.to_string(),
+                embeddings,
+                ..Default::default()
+            },
             0.5,
             0,
             now,
@@ -722,271 +519,312 @@ pub(super) mod tests {
         )
     }
 
-    /// Helper: normalise a 3-vector so cosine_similarity returns 1.0 against itself.
     fn unit(v: [f32; 3]) -> Vec<f32> {
         let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
         vec![v[0] / norm, v[1] / norm, v[2] / norm]
     }
 
-    // ------------------------------------------------------------------
-    // (a) Post-merge: no dangling refs; loser is NOT reachable via get()
-    //     but IS reachable via resolve_loser (audit replay).
-    // ------------------------------------------------------------------
-    #[test]
-    fn sr6_a_post_merge_loser_resolves_to_winner() {
-        let (storage, _dir) = test_storage();
-        const USER: &str = "test-user";
-
-        let loser_mem = make_memory("duplicate memory A", Some(unit([1.0, 0.0, 0.0])));
-        let winner_mem = make_memory("duplicate memory B", Some(unit([1.0, 0.01, 0.0])));
-        let loser_id = loser_mem.id.clone();
-        let winner_id = winner_mem.id.clone();
-
-        storage.store(&loser_mem).unwrap();
-        storage.store(&winner_mem).unwrap();
-
-        // Execute merge directly (flag bypassed in test via direct call).
-        let _audit_id = storage
-            .execute_merge(&loser_id, &winner_id, USER)
-            .expect("merge should succeed");
-
-        // Resolve loser → winner via audit.
-        let resolved = storage.resolve_loser(&loser_id, USER);
-        assert_eq!(
-            resolved.as_ref(),
-            Some(&winner_id),
-            "(a) loser resolves to winner"
-        );
-
-        // Winner is still readable.
-        let winner_got = storage.get(&winner_id).expect("winner must be readable");
-        assert_eq!(winner_got.id, winner_id);
-
-        // Dangling-ref scan: has_any_inbound_refs for loser should be false
-        // (the loser has no remaining citations from other memories / facts).
-        assert!(
-            !storage.has_any_inbound_refs(&loser_id, USER).unwrap(),
-            "(a) no dangling inbound refs to loser"
-        );
+    fn stored_pair(store: &dyn PrimaryMemoryStore, tag: &str) -> (MemoryId, MemoryId) {
+        let loser = make_memory(&format!("{tag} loser"), Some(unit([1.0, 0.0, 0.0])));
+        let winner = make_memory(&format!("{tag} winner"), Some(unit([1.0, 0.01, 0.0])));
+        // Unequal scores decide the loser; equal ones fall to store order, which is key order.
+        winner.set_access_count(1);
+        store.store(&loser).unwrap();
+        store.store(&winner).unwrap();
+        (loser.id, winner.id)
     }
 
-    // ------------------------------------------------------------------
-    // (b) Crash-after-audit: audit present, tombstone written → replay
-    //     is idempotent and remap still works.
-    // ------------------------------------------------------------------
-    #[test]
-    fn sr6_b_crash_after_audit_replay_idempotent() {
-        let (storage, _dir) = test_storage();
-        const USER: &str = "test-user";
-
-        let loser_mem = make_memory("crash test loser", Some(unit([1.0, 0.0, 0.0])));
-        let winner_mem = make_memory("crash test winner", Some(unit([1.0, 0.01, 0.0])));
-        let loser_id = loser_mem.id.clone();
-        let winner_id = winner_mem.id.clone();
-
-        storage.store(&loser_mem).unwrap();
-        storage.store(&winner_mem).unwrap();
-
-        // Simulate crash: write audit + tombstone manually, skip GC / physical delete.
-        let audit_id = uuid::Uuid::new_v4().to_string();
-        let audit = MergeAudit {
-            audit_id: audit_id.clone(),
-            loser_id: loser_id.clone(),
-            winner_id: winner_id.clone(),
-            merged_at: Utc::now(),
-            user_id: USER.to_string(),
-        };
-        storage.write_audit(&audit).unwrap();
-        let ts = TombstoneRecord {
-            loser_id: loser_id.clone(),
-            winner_id: winner_id.clone(),
-            tombstoned_at: Utc::now(),
-            user_id: USER.to_string(),
-        };
-        storage.write_tombstone(&ts).unwrap();
-
-        // Replay — must be idempotent (no panic, no duplicate key error).
-        storage.replay_merge_audits(USER);
-        storage.replay_merge_audits(USER); // second replay must also succeed
-
-        // Remap must still work post-replay.
-        let resolved = storage.resolve_loser(&loser_id, USER);
-        assert_eq!(
-            resolved.as_ref(),
-            Some(&winner_id),
-            "(b) remap survives replay"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // (c) Chain A→B→C path-compresses to A→C on resolve.
-    // ------------------------------------------------------------------
-    #[test]
-    fn sr6_c_chain_path_compresses_to_end() {
-        let (storage, _dir) = test_storage();
-        const USER: &str = "test-user";
-
-        let mem_a = make_memory("chain A", Some(unit([1.0, 0.0, 0.0])));
-        let mem_b = make_memory("chain B", Some(unit([1.0, 0.01, 0.0])));
-        let mem_c = make_memory("chain C", Some(unit([1.0, 0.02, 0.0])));
-        let id_a = mem_a.id.clone();
-        let id_b = mem_b.id.clone();
-        let id_c = mem_c.id.clone();
-
-        storage.store(&mem_a).unwrap();
-        storage.store(&mem_b).unwrap();
-        storage.store(&mem_c).unwrap();
-
-        // Build chain: A→B (A is loser of B), B→C (B is loser of C).
-        let audit_ab = MergeAudit {
-            audit_id: uuid::Uuid::new_v4().to_string(),
-            loser_id: id_a.clone(),
-            winner_id: id_b.clone(),
-            merged_at: Utc::now(),
-            user_id: USER.to_string(),
-        };
-        storage.write_audit(&audit_ab).unwrap();
-        let audit_bc = MergeAudit {
-            audit_id: uuid::Uuid::new_v4().to_string(),
-            loser_id: id_b.clone(),
-            winner_id: id_c.clone(),
-            merged_at: Utc::now(),
-            user_id: USER.to_string(),
-        };
-        storage.write_audit(&audit_bc).unwrap();
-
-        // Resolve A — must compress to C.
-        let resolved = storage.resolve_loser(&id_a, USER);
-        assert_eq!(
-            resolved.as_ref(),
-            Some(&id_c),
-            "(c) A resolves to C after path compression"
-        );
-
-        // Resolve B — must still resolve to C.
-        let resolved_b = storage.resolve_loser(&id_b, USER);
-        assert_eq!(
-            resolved_b.as_ref(),
-            Some(&id_c),
-            "(c) B still resolves to C"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // (d) GC removes tombstone only when has_any_inbound_refs is false.
-    //     With a live ref, GC skips; after the ref is gone, GC reclaims.
-    // ------------------------------------------------------------------
-    #[test]
-    fn sr6_d_gc_gated_on_has_any_inbound_refs() {
-        use crate::memory::compression::{FactType, SemanticFact};
-        use crate::memory::facts::SemanticFactStore;
-
-        let (storage, _dir) = test_storage();
-        const USER: &str = "test-user";
-
-        let loser_mem = make_memory("gc loser", Some(unit([1.0, 0.0, 0.0])));
-        let winner_mem = make_memory("gc winner", Some(unit([1.0, 0.01, 0.0])));
-        let loser_id = loser_mem.id.clone();
-        let winner_id = winner_mem.id.clone();
-
-        storage.store(&loser_mem).unwrap();
-        storage.store(&winner_mem).unwrap();
-
-        // Execute merge — tombstone is written.
-        storage
-            .execute_merge(&loser_id, &winner_id, USER)
-            .expect("merge ok");
-
-        // Add a SemanticFact that cites the loser → has_any_inbound_refs == true.
-        let fact_store = SemanticFactStore::new(storage.db());
-        let fact = SemanticFact {
-            id: "sf-gc-d".to_string(),
-            fact: "gc test fact".to_string(),
-            confidence: 0.9,
-            support_count: 1,
-            source_memories: vec![loser_id.clone()],
-            related_entities: vec![],
-            created_at: Utc::now(),
-            last_reinforced: Utc::now(),
-            fact_type: FactType::Pattern,
-            valid_from: None,
-            valid_until: None,
-            superseded_by: None,
-            supersedes: vec![],
-            purged_at: None,
-            purge_reason: None,
-        };
-        fact_store.store(USER, &fact).unwrap();
-
-        // GC should skip (has inbound refs).
-        // Adjust quiescence by back-dating the tombstone.
-        let ts_key = MemoryStorage::tombstone_key(USER, &loser_id);
-        let aged_ts = TombstoneRecord {
-            loser_id: loser_id.clone(),
-            winner_id: winner_id.clone(),
+    fn back_date_tombstone(store: &dyn PrimaryMemoryStore, loser: &MemoryId, winner: &MemoryId) {
+        let aged = TombstoneRecord {
+            loser_id: loser.clone(),
+            winner_id: winner.clone(),
             tombstoned_at: Utc::now()
                 - chrono::Duration::seconds(SEMANTIC_MERGE_GC_MAX_AGE_SECS + 10),
             user_id: USER.to_string(),
         };
-        let aged_bytes = serde_json::to_vec(&aged_ts).unwrap();
-        storage.db().put(ts_key.as_bytes(), &aged_bytes).unwrap();
+        write_json(
+            store.default_key_value_store().as_ref(),
+            &tombstone_key(USER, loser),
+            &aged,
+        )
+        .unwrap();
+    }
 
-        let reclaimed_with_ref = storage.gc_merge_tombstones(USER);
-        assert_eq!(
-            reclaimed_with_ref, 0,
-            "(d) GC must not reclaim while inbound ref exists"
-        );
+    #[test]
+    fn a_merge_pools_evidence_the_same_way_on_both_engines() {
+        let stores = primary_stores();
+        assert_both_backends(&stores);
+        let mut pooled = Vec::new();
+        for (backend, store, _tmp) in &stores {
+            let mut loser = make_memory("pool loser", Some(vec![1.0, 0.0, 0.0]));
+            let winner = make_memory("pool winner", Some(vec![0.0, 1.0, 0.0]));
+            loser.set_access_count(3);
+            winner.set_access_count(4);
+            loser.entity_refs.push(EntityRef {
+                entity_id: uuid::Uuid::new_v4(),
+                name: "alpha".into(),
+                relation: "mentions".into(),
+            });
+            store.store(&loser).unwrap();
+            store.store(&winner).unwrap();
 
-        // Remove the citing fact by storing a version without the loser in source_memories.
-        // (SemanticFactStore has no delete API in this codebase, so we use a raw DB delete.)
-        let fact_key = format!("facts:{}:sf-gc-d", USER);
-        storage.db().delete(fact_key.as_bytes()).unwrap();
+            execute_merge(store.as_ref(), &loser.id, &winner.id, USER).unwrap();
 
-        // Now has_any_inbound_refs should be false → GC reclaims.
-        let reclaimed_no_ref = storage.gc_merge_tombstones(USER);
-        assert_eq!(
-            reclaimed_no_ref, 1,
-            "(d) GC must reclaim when inbound refs are gone"
+            let merged = store.get(&winner.id).unwrap();
+            assert_eq!(
+                merged.access_count(),
+                7,
+                "{backend:?}: access counts summed"
+            );
+            assert!(
+                merged.entity_refs.iter().any(|e| e.name == "alpha"),
+                "{backend:?}: entity refs unioned"
+            );
+            assert_eq!(
+                merged.experience.embeddings.as_deref(),
+                Some(&[0.5, 0.5, 0.0][..]),
+                "{backend:?}: embeddings averaged"
+            );
+            let kv = store.default_key_value_store();
+            assert!(kv
+                .get_bytes(tombstone_key(USER, &loser.id).as_bytes())
+                .unwrap()
+                .is_some());
+            assert_eq!(load_audits(kv.as_ref(), USER).unwrap().len(), 1);
+            pooled.push((merged.access_count(), merged.experience.embeddings.clone()));
+        }
+        assert!(
+            pooled.windows(2).all(|w| w[0] == w[1]),
+            "engines disagree: {pooled:?}"
         );
     }
 
-    // ------------------------------------------------------------------
-    // (e) With SEMANTIC_MERGE_ENABLED == false (default), run_merge_pass
-    //     returns 0 and leaves a known near-duplicate pair untouched.
-    // ------------------------------------------------------------------
     #[test]
-    fn sr6_e_flag_off_leaves_candidates_untouched() {
-        let (storage, _dir) = test_storage();
-        const USER: &str = "test-user";
+    fn a_loser_resolves_to_its_winner_and_replay_is_idempotent() {
+        let stores = primary_stores();
+        assert_both_backends(&stores);
+        for (backend, store, _tmp) in &stores {
+            let (loser, winner) = stored_pair(store.as_ref(), "resolve");
+            execute_merge(store.as_ref(), &loser, &winner, USER).unwrap();
 
-        // Two near-identical embeddings (cosine ≈ 1.0).
-        let mem_a = make_memory("flag-off A", Some(unit([1.0, 0.0, 0.0])));
-        let mem_b = make_memory("flag-off B", Some(unit([1.0, 0.001, 0.0])));
-        let id_a = mem_a.id.clone();
-        let id_b = mem_b.id.clone();
+            assert_eq!(replay_merge_audits(store.as_ref(), USER).unwrap(), 1);
+            assert_eq!(replay_merge_audits(store.as_ref(), USER).unwrap(), 1);
+            assert_eq!(
+                resolve_loser(store.as_ref(), &loser, USER).unwrap(),
+                Some(winner.clone()),
+                "{backend:?}"
+            );
+            assert_eq!(
+                resolve_loser(store.as_ref(), &winner, USER).unwrap(),
+                None,
+                "{backend:?}"
+            );
+            assert!(
+                !store.has_any_inbound_refs(&loser, USER).unwrap(),
+                "{backend:?}: nothing cites the loser"
+            );
+        }
+    }
 
-        storage.store(&mem_a).unwrap();
-        storage.store(&mem_b).unwrap();
+    #[test]
+    fn a_chain_path_compresses_to_its_end() {
+        let stores = primary_stores();
+        assert_both_backends(&stores);
+        for (backend, store, _tmp) in &stores {
+            let ids: Vec<MemoryId> = (0..3)
+                .map(|i| {
+                    let m = make_memory(
+                        &format!("chain {i}"),
+                        Some(unit([1.0, 0.01 * i as f32, 0.0])),
+                    );
+                    store.store(&m).unwrap();
+                    m.id
+                })
+                .collect();
+            let kv = store.default_key_value_store();
+            for (loser, winner) in [(&ids[0], &ids[1]), (&ids[1], &ids[2])] {
+                let audit = MergeAudit {
+                    audit_id: uuid::Uuid::new_v4().to_string(),
+                    loser_id: loser.clone(),
+                    winner_id: winner.clone(),
+                    merged_at: Utc::now(),
+                    user_id: USER.to_string(),
+                };
+                write_json(kv.as_ref(), &audit_key(USER, &audit.audit_id), &audit).unwrap();
+            }
 
-        // The flag is OFF by default — run_merge_pass must be a no-op.
-        let merged = storage.run_merge_pass(USER, 10);
-        assert_eq!(
-            merged, 0,
-            "(e) no merges when SEMANTIC_MERGE_ENABLED is false"
-        );
+            assert_eq!(
+                resolve_loser(store.as_ref(), &ids[0], USER).unwrap(),
+                Some(ids[2].clone()),
+                "{backend:?}"
+            );
+            let compressed = load_audits(kv.as_ref(), USER)
+                .unwrap()
+                .into_iter()
+                .find(|(_, a)| a.loser_id == ids[0])
+                .unwrap()
+                .1;
+            assert_eq!(
+                compressed.winner_id, ids[2],
+                "{backend:?}: A's audit rewritten to C"
+            );
+            assert_eq!(
+                resolve_loser(store.as_ref(), &ids[1], USER).unwrap(),
+                Some(ids[2].clone()),
+                "{backend:?}"
+            );
+        }
+    }
 
-        // Both memories must still be independently readable.
-        assert!(storage.get(&id_a).is_ok(), "(e) memory A must be intact");
-        assert!(storage.get(&id_b).is_ok(), "(e) memory B must be intact");
+    #[test]
+    fn gc_waits_for_every_citation_to_go_on_both_engines() {
+        use crate::memory::compression::{FactType, SemanticFact};
+        use crate::memory::facts::SemanticFactStore;
 
-        // resolve_loser must return None (no audits written).
-        assert!(
-            storage.resolve_loser(&id_a, USER).is_none(),
-            "(e) no audit for A"
-        );
-        assert!(
-            storage.resolve_loser(&id_b, USER).is_none(),
-            "(e) no audit for B"
-        );
+        let stores = primary_stores();
+        assert_both_backends(&stores);
+        for (backend, store, _tmp) in &stores {
+            let (loser, winner) = stored_pair(store.as_ref(), "gc");
+            let holder = {
+                let mut m = make_memory("gc holder", None);
+                m.experience.related_memories.push(loser.clone());
+                store.store(&m).unwrap();
+                m.id
+            };
+            execute_merge(store.as_ref(), &loser, &winner, USER).unwrap();
+            back_date_tombstone(store.as_ref(), &loser, &winner);
+
+            let facts = SemanticFactStore::with_store(store.default_key_value_store());
+            facts
+                .store(
+                    USER,
+                    &SemanticFact {
+                        id: "sf-gc".to_string(),
+                        fact: "gc test fact".to_string(),
+                        confidence: 0.9,
+                        support_count: 1,
+                        source_memories: vec![loser.clone()],
+                        related_entities: vec![],
+                        created_at: Utc::now(),
+                        last_reinforced: Utc::now(),
+                        fact_type: FactType::Pattern,
+                        valid_from: None,
+                        valid_until: None,
+                        superseded_by: None,
+                        supersedes: vec![],
+                        purged_at: None,
+                        purge_reason: None,
+                    },
+                )
+                .unwrap();
+
+            assert!(
+                store.has_any_inbound_refs(&loser, USER).unwrap(),
+                "{backend:?}"
+            );
+            assert_eq!(
+                gc_merge_tombstones(store.as_ref(), USER).unwrap(),
+                0,
+                "{backend:?}: memory and fact cite it"
+            );
+
+            store.delete(&holder).unwrap();
+            assert_eq!(
+                gc_merge_tombstones(store.as_ref(), USER).unwrap(),
+                0,
+                "{backend:?}: the fact still cites it"
+            );
+
+            let kv = store.default_key_value_store();
+            kv.delete_bytes(format!("facts:{USER}:sf-gc").as_bytes())
+                .unwrap();
+            assert!(
+                !store.has_any_inbound_refs(&loser, USER).unwrap(),
+                "{backend:?}"
+            );
+            assert_eq!(
+                gc_merge_tombstones(store.as_ref(), USER).unwrap(),
+                1,
+                "{backend:?}"
+            );
+
+            assert!(
+                store.get_memory(&loser).unwrap().is_none(),
+                "{backend:?}: loser deleted"
+            );
+            assert!(kv
+                .get_bytes(tombstone_key(USER, &loser).as_bytes())
+                .unwrap()
+                .is_none());
+            assert!(
+                load_audits(kv.as_ref(), USER).unwrap().is_empty(),
+                "{backend:?}: audit removed"
+            );
+            assert!(
+                store.get_memory(&winner).unwrap().is_some(),
+                "{backend:?}: winner kept"
+            );
+        }
+    }
+
+    #[test]
+    fn a_young_tombstone_is_not_collected() {
+        let stores = primary_stores();
+        assert_both_backends(&stores);
+        for (backend, store, _tmp) in &stores {
+            let (loser, winner) = stored_pair(store.as_ref(), "young");
+            execute_merge(store.as_ref(), &loser, &winner, USER).unwrap();
+            assert_eq!(
+                gc_merge_tombstones(store.as_ref(), USER).unwrap(),
+                0,
+                "{backend:?}"
+            );
+            assert!(store.get_memory(&loser).unwrap().is_some(), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn candidates_skip_tombstoned_losers() {
+        let stores = primary_stores();
+        assert_both_backends(&stores);
+        for (backend, store, _tmp) in &stores {
+            let (loser, winner) = stored_pair(store.as_ref(), "candidates");
+            let found = find_merge_candidates(store.as_ref(), 10).unwrap();
+            assert_eq!(found.len(), 1, "{backend:?}");
+            assert_eq!(
+                (&found[0].loser_id, &found[0].winner_id),
+                (&loser, &winner),
+                "{backend:?}"
+            );
+
+            execute_merge(store.as_ref(), &loser, &winner, USER).unwrap();
+            assert!(
+                find_merge_candidates(store.as_ref(), 10)
+                    .unwrap()
+                    .is_empty(),
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_the_flag_off_the_trait_pass_merges_nothing_on_both_engines() {
+        let stores = primary_stores();
+        assert_both_backends(&stores);
+        for (backend, store, _tmp) in &stores {
+            let a = make_memory("flag-off A", Some(unit([1.0, 0.0, 0.0])));
+            let b = make_memory("flag-off B", Some(unit([1.0, 0.001, 0.0])));
+            store.store(&a).unwrap();
+            store.store(&b).unwrap();
+
+            let store: Arc<dyn PrimaryMemoryStore> = Arc::clone(store);
+            assert_eq!(store.run_merge_pass(USER, 10).unwrap(), 0, "{backend:?}");
+            assert_eq!(store.gc_merge_tombstones(USER).unwrap(), 0, "{backend:?}");
+            assert!(store.get_memory(&a.id).unwrap().is_some());
+            assert!(store.get_memory(&b.id).unwrap().is_some());
+            assert!(resolve_loser(store.as_ref(), &a.id, USER)
+                .unwrap()
+                .is_none());
+        }
     }
 }

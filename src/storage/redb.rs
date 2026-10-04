@@ -233,13 +233,6 @@ impl ColumnStore for RedbColumnStore {
     }
 }
 
-/// An operation the redb backend declares but has not built. Distinct from
-/// `not_implemented`, which names a path; these are store-level and the store
-/// holds only a database handle.
-fn unbuilt(operation: &str) -> anyhow::Error {
-    anyhow!("redb {operation} is declared on PrimaryMemoryStore but not implemented — refusing rather than returning an empty result")
-}
-
 fn not_implemented(operation: &str, path: &Path) -> anyhow::Error {
     anyhow!(
         "redb {} is not implemented yet for {}",
@@ -952,14 +945,14 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         Ok((0, already_current, failed))
     }
 
-    // These carried `-> usize` and had to PANIC to stay honest, because 0 would have
-    // made "merged nothing" and "cannot merge" the same answer. The trait now returns
-    // Result, so they refuse like everything else and a caller can handle it.
-    fn run_merge_pass(&self, _user_id: &str, _limit: usize) -> Result<usize> {
-        Err(unbuilt("run_merge_pass"))
+    fn run_merge_pass(&self, user_id: &str, limit: usize) -> Result<usize> {
+        crate::memory::merge::run_merge_pass(self, user_id, limit)
     }
-    fn gc_merge_tombstones(&self, _user_id: &str) -> Result<usize> {
-        Err(unbuilt("gc_merge_tombstones"))
+    fn gc_merge_tombstones(&self, user_id: &str) -> Result<usize> {
+        crate::memory::merge::gc_merge_tombstones(self, user_id)
+    }
+    fn has_any_inbound_refs(&self, target: &MemoryId, user_id: &str) -> Result<bool> {
+        crate::memory::merge::scan_inbound_refs(self, target, user_id)
     }
 
     fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -1049,10 +1042,8 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         Ok(())
     }
 
-    // ── The eight the long_term_memory flip surfaced. All eight answer for
-    //    real: get_by_content_hash and set_fact_watermark have no error channel
-    //    in their signatures, so an unbuilt() stub could not even fail loudly —
-    //    it would BE the absence-as-success this file refuses everywhere else.
+    // ── get_by_content_hash and set_fact_watermark have no error channel in their
+    //    signatures, so each must answer for real: a refusal could not be heard.
 
     fn get_all_vector_mappings(&self) -> Result<Vec<(MemoryId, VectorMappingEntry)>> {
         let txn = self.database.begin_read()?;

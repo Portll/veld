@@ -514,13 +514,11 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn clear_all_interference_records(&self) -> Result<usize>;
     fn cleanup_corrupted(&self) -> Result<usize>;
     fn migrate_legacy(&self) -> Result<(usize, usize, usize)>;
-    // `-> Result<usize>`, not `-> usize`. The bare count could not express failure,
-    // so an unbuilt backend could only return 0 — making "merged nothing" and
-    // "cannot merge" the same answer, which is the absence-as-success this codebase
-    // refuses everywhere else. The redb side panicked to keep them distinguishable;
-    // with an error channel it can simply say so.
+    /// Semantic merge (S-R6), one implementation for every engine in `memory::merge`.
     fn run_merge_pass(&self, user_id: &str, limit: usize) -> Result<usize>;
     fn gc_merge_tombstones(&self, user_id: &str) -> Result<usize>;
+    /// Whether any memory or fact still cites `target`: the merge GC's guard.
+    fn has_any_inbound_refs(&self, target: &MemoryId, user_id: &str) -> Result<bool>;
 
     /// Every key under `prefix`, values not loaded.
     ///
@@ -795,7 +793,7 @@ mod backend_coverage_matrix {
         )
     }
 
-    /// Calls all 44 trait methods and returns (name, outcome), sorted.
+    /// Calls all 45 trait methods and returns (name, outcome), sorted.
     fn matrix(s: &dyn PrimaryMemoryStore) -> Vec<(&'static str, Outcome)> {
         let m = a_memory();
         let id = m.id.clone();
@@ -876,6 +874,10 @@ mod backend_coverage_matrix {
             ),
             ("run_merge_pass", probe(|| s.run_merge_pass("u", 1))),
             ("gc_merge_tombstones", probe(|| s.gc_merge_tombstones("u"))),
+            (
+                "has_any_inbound_refs",
+                probe(|| s.has_any_inbound_refs(&id, "u")),
+            ),
             // The eight surfaced by the long_term_memory flip. The KV probes
             // exercise the handle they get back, not just its construction —
             // a handle over the wrong keyspace constructs fine.
@@ -944,7 +946,7 @@ mod backend_coverage_matrix {
 
         let r = matrix(&rocks);
         let b = matrix(&redb);
-        assert_eq!(r.len(), 44, "the matrix must cover every trait method");
+        assert_eq!(r.len(), 45, "the matrix must cover every trait method");
         assert_eq!(r.len(), b.len());
 
         let rocks_ok = r.iter().filter(|(_, o)| *o == Outcome::Works).count();
@@ -957,7 +959,7 @@ mod backend_coverage_matrix {
             .collect();
 
         eprintln!(
-            "COVERAGE  rocksdb {rocks_ok}/44   redb {redb_ok}/44   gap {}",
+            "COVERAGE  rocksdb {rocks_ok}/45   redb {redb_ok}/45   gap {}",
             gap.len()
         );
         for name in &gap {
@@ -972,7 +974,7 @@ mod backend_coverage_matrix {
         );
         assert_eq!(
             gap.len(),
-            44 - redb_ok,
+            45 - redb_ok,
             "a redb method failed that rocksdb also fails — the gap list is not the whole story"
         );
     }
