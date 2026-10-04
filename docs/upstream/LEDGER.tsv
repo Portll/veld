@@ -291,7 +291,7 @@ in	e44fdce6	546	2026-09-21	retrieval	W2	veld-origin		Portll PR
 in	8d371432	551	2026-09-21	eval	W0	veld-origin		Portll PR
 in	928c728c	549	2026-09-21	storage-integrity	W7	veld-origin	7aa8336c	Portll PR
 in	66b9e209	550	2026-09-22	facts-todos	W5	veld-origin	b7fff76c	Portll PR
-in	355e0b72	559	2026-09-22	storage-integrity	W7	pending		
+in	355e0b72	559	2026-09-22	storage-integrity	W7	adapted		both log_event spawn sites run on the task tracker as upstream; the test lives in handlers/state.rs and checks the audit store on both engines (and the shared RocksDB); the sources.rs lease-test drain has no counterpart, since veld has no source store (W7)
 in	cef67213	560	2026-09-22	graph	W3	pending		
 in	486a9d95	561	2026-09-22	eval	W0	pending		
 in	cf886355	562	2026-09-22	retrieval	W2	pending		
