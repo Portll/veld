@@ -13,6 +13,8 @@ pub mod portable;
 pub mod redb;
 pub mod relational;
 #[cfg(test)]
+mod stored_enums;
+#[cfg(test)]
 pub(crate) mod test_support;
 
 use anyhow::Result;
