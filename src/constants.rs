@@ -677,6 +677,17 @@ pub const FACT_DEDUP_JACCARD_FLOOR: f32 = 0.30;
 ///   embedding path keeps apart is not merged on the fallback path
 pub const FACT_DEDUP_JACCARD_FALLBACK: f32 = 0.75;
 
+/// Confidence boost when a stored fact is re-attested by new source evidence, as a fraction of
+/// the remaining headroom (`c += k * (1 - c)`).
+///
+/// Justification:
+/// - Diminishing returns: a confident fact gains little, a weak one a lot, and it never
+///   passes 1.0.
+/// - Applied only when the candidate brings source memories the fact does not cite;
+///   boosting on already-counted evidence would make confidence a cycle counter
+///   (`SemanticFactStore::ingest_candidate`).
+pub const FACT_REINFORCEMENT_BOOST: f32 = 0.1;
+
 /// Negation markers for polarity detection in fact deduplication
 ///
 /// Justification:
@@ -2700,6 +2711,7 @@ pub const RECONSOLIDATION_WORKING_MEMORY_THRESHOLD: u32 = 5;
 // | FACT_DEDUP_COSINE_THRESHOLD   | memory/facts.rs       | find_similar() hybrid dedup       |
 // | FACT_DEDUP_JACCARD_FLOOR      | memory/facts.rs       | find_similar() hybrid dedup       |
 // | FACT_DEDUP_JACCARD_FALLBACK   | memory/facts.rs       | find_similar() fallback mode      |
+// | FACT_REINFORCEMENT_BOOST      | memory/facts.rs       | ingest_candidate() reinforcement  |
 // | FACT_NEGATION_MARKERS         | memory/facts.rs       | detect_polarity()                 |
 //
 // ## Default Configuration Constants

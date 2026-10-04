@@ -729,7 +729,7 @@ pub async fn remember(
         .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
-    let memory_id = {
+    let outcome = {
         let memory = memory.clone();
         let exp_clone = experience.clone();
         let created_at = req.created_at;
@@ -741,7 +741,7 @@ pub async fn remember(
             let memory_guard = memory.read();
             // Fast path: persist + BM25 only (~10ms), embedding deferred to background
             if agent_id.is_some() || run_id.is_some() {
-                memory_guard.remember_with_agent_deferred(
+                memory_guard.remember_with_agent_deferred_detailed(
                     exp_clone,
                     created_at,
                     agent_id,
@@ -749,13 +749,18 @@ pub async fn remember(
                     external_id,
                 )
             } else {
-                memory_guard.remember_deferred(exp_clone, created_at, external_id)
+                memory_guard.remember_deferred_detailed(exp_clone, created_at, external_id)
             }
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
         .map_err(AppError::Internal)?
     };
+    let memory_id = outcome.id.clone();
+    // A merge that added entities left the episode built from the old set, and every
+    // downstream pass runs on the merged experience, not the request's.
+    let rebuild_graph = outcome.needs_graph_rebuild();
+    let experience = outcome.merged_experience.unwrap_or(experience);
 
     // Background: complete embedding + vector indexing.
     // The memory is already searchable via BM25; vector search follows in ~150ms.
@@ -905,7 +910,11 @@ pub async fn remember(
                 let experience = experience.clone();
                 let mid = memory_id.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
-                    state.process_experience_into_graph(&user_id, &experience, &mid)
+                    if rebuild_graph {
+                        state.rebuild_experience_graph(&user_id, &experience, &mid)
+                    } else {
+                        state.process_experience_into_graph(&user_id, &experience, &mid)
+                    }
                 })
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")))
@@ -1431,14 +1440,18 @@ pub async fn batch_remember(
         let experiences = experiences_with_index;
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            let mut results: Vec<(usize, String, Experience)> =
+            // The experience carried on is the merged one when a duplicate enriched a stored
+            // memory, with whether its graph episode has to be rebuilt.
+            let mut results: Vec<(usize, String, Experience, bool)> =
                 Vec::with_capacity(experiences.len());
             let mut errors: Vec<BatchErrorItem> = Vec::new();
 
             for (index, experience, created_at) in experiences {
-                match memory_guard.remember(experience.clone(), created_at) {
-                    Ok(id) => {
-                        results.push((index, id.0.to_string(), experience));
+                match memory_guard.remember_detailed(experience.clone(), created_at) {
+                    Ok(outcome) => {
+                        let rebuild = outcome.needs_graph_rebuild();
+                        let effective = outcome.merged_experience.unwrap_or(experience);
+                        results.push((index, outcome.id.0.to_string(), effective, rebuild));
                     }
                     Err(e) => {
                         errors.push(BatchErrorItem {
@@ -1454,7 +1467,10 @@ pub async fn batch_remember(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
-    let memory_ids: Vec<String> = memory_results.iter().map(|(_, id, _)| id.clone()).collect();
+    let memory_ids: Vec<String> = memory_results
+        .iter()
+        .map(|(_, id, _, _)| id.clone())
+        .collect();
     let created = memory_ids.len();
 
     let mut all_errors = validation_errors;
@@ -1475,15 +1491,20 @@ pub async fn batch_remember(
         tracker.spawn(async move {
             // Task 1: Build episodic graph for each stored memory
             let mut batch_memory_ids: Vec<crate::memory::MemoryId> = Vec::new();
-            for (_, id_str, experience) in &memory_results_bg {
+            for (_, id_str, experience, rebuild) in &memory_results_bg {
                 if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
                     let memory_id = crate::memory::MemoryId(uuid);
                     let state = state.clone();
                     let uid = user_id.clone();
                     let exp = experience.clone();
                     let mid = memory_id.clone();
+                    let rebuild = *rebuild;
                     if let Err(e) = tokio::task::spawn_blocking(move || {
-                        state.process_experience_into_graph(&uid, &exp, &mid)
+                        if rebuild {
+                            state.rebuild_experience_graph(&uid, &exp, &mid)
+                        } else {
+                            state.process_experience_into_graph(&uid, &exp, &mid)
+                        }
                     })
                     .await
                     .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")))
@@ -1499,7 +1520,7 @@ pub async fn batch_remember(
             }
 
             // Task 2: Set parent_id for hierarchical organization
-            for (index, id_str, _) in &memory_results_bg {
+            for (index, id_str, _, _) in &memory_results_bg {
                 if let Some(parent_id_str) = parent_ids.get(index) {
                     if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
                         let mid = crate::memory::MemoryId(uuid);
@@ -1545,7 +1566,7 @@ pub async fn batch_remember(
             }
 
             // Task 3: Extract and store temporal facts for each memory
-            for (_, id_str, experience) in &memory_results_bg {
+            for (_, id_str, experience, _) in &memory_results_bg {
                 if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
                     let mem = memory.clone();
                     let uid = user_id.clone();
@@ -1569,7 +1590,7 @@ pub async fn batch_remember(
             }
 
             // Task 4: Infer causal lineage for each memory
-            for (_, id_str, _) in &memory_results_bg {
+            for (_, id_str, _, _) in &memory_results_bg {
                 if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
                     let graph_arc = state.get_user_graph(&user_id).ok();
                     let memory_arc = memory.clone();
@@ -1648,7 +1669,7 @@ pub async fn batch_remember(
             }
 
             // Task 5: Conflict detection for each memory
-            for (_, id_str, _) in &memory_results_bg {
+            for (_, id_str, _, _) in &memory_results_bg {
                 if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
                     let state = state.clone();
                     let memory_arc = memory.clone();
@@ -1974,31 +1995,14 @@ pub async fn upsert_memory(
         }
     }
 
-    // Build episodic graph for multi-hop retrieval
-    // On updates, clean up the old episode's edges/entities first to prevent
-    // stale graph data from accumulating (entity_episodes index, orphan edges).
-    if was_update {
-        if let Ok(graph) = state.get_user_graph(&req.user_id) {
-            let graph_guard = graph.read();
-            match graph_guard.delete_episode(&memory_id.0) {
-                Ok(true) => {
-                    tracing::debug!(
-                        "Cleaned up old episode {} before graph rebuild",
-                        &memory_id.0.to_string()[..8]
-                    );
-                }
-                Ok(false) => {} // No prior episode existed
-                Err(e) => {
-                    tracing::debug!(
-                        "Old episode cleanup failed for {} (non-fatal): {}",
-                        &memory_id.0.to_string()[..8],
-                        e
-                    );
-                }
-            }
-        }
-    }
-    if let Err(e) = state.process_experience_into_graph(&req.user_id, &experience, &memory_id) {
+    // Build episodic graph for multi-hop retrieval. An update rebuilds the episode, so the
+    // graph does not keep the old entity set.
+    let graph_result = if was_update {
+        state.rebuild_experience_graph(&req.user_id, &experience, &memory_id)
+    } else {
+        state.process_experience_into_graph(&req.user_id, &experience, &memory_id)
+    };
+    if let Err(e) = graph_result {
         tracing::debug!("Graph processing failed (non-fatal): {}", e);
     }
 

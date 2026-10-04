@@ -3681,6 +3681,34 @@ impl MultiUserMemoryManager {
         backed_up
     }
 
+    /// Rebuilds a memory's graph episode after its entity set changed: an upsert rewrote it,
+    /// or a content-identical duplicate merged in entities or tags. The episode is deleted,
+    /// with the edges it sourced, and built again from `experience` by the same pass that
+    /// built it, so there is one implementation of edge construction. It scans the
+    /// relationships, so callers run it only on a real delta.
+    pub fn rebuild_experience_graph(
+        &self,
+        user_id: &str,
+        experience: &Experience,
+        memory_id: &MemoryId,
+    ) -> Result<()> {
+        if let Ok(graph) = self.get_user_graph(user_id) {
+            match graph.read().delete_episode(&memory_id.0) {
+                Ok(true) => tracing::debug!(
+                    "Cleaned up old episode {} before graph rebuild",
+                    &memory_id.0.to_string()[..8]
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::debug!(
+                    "Old episode cleanup failed for {} (non-fatal): {}",
+                    &memory_id.0.to_string()[..8],
+                    e
+                ),
+            }
+        }
+        self.process_experience_into_graph(user_id, experience, memory_id)
+    }
+
     /// Process an experience and extract entities/relationships into the graph
     ///
     /// SHO-102: Improved graph building with:

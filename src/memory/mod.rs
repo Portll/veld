@@ -609,6 +609,52 @@ fn build_ner_lookup(
         .collect()
 }
 
+/// What a remember call did: created a memory, or found identical content and merged the
+/// duplicate's enrichment into it. The graph episode is built by the handler, so only the
+/// handler can rebuild it, and it needs this report to know when.
+#[derive(Debug, Clone)]
+pub struct RememberOutcome {
+    /// The memory's id; on a merge, the existing memory's.
+    pub id: MemoryId,
+    /// True when the content already existed.
+    pub deduped: bool,
+    /// What the merge added. Empty for a new memory and for a duplicate that added nothing.
+    pub delta: EnrichmentDelta,
+    /// The merged experience, present only when the merge changed something. A graph rebuild
+    /// must use it: the incoming experience holds only its own entities.
+    pub merged_experience: Option<Experience>,
+}
+
+impl RememberOutcome {
+    fn created(id: MemoryId) -> Self {
+        Self {
+            id,
+            deduped: false,
+            delta: EnrichmentDelta::default(),
+            merged_experience: None,
+        }
+    }
+
+    fn deduped(
+        id: MemoryId,
+        delta: EnrichmentDelta,
+        merged_experience: Option<Experience>,
+    ) -> Self {
+        Self {
+            id,
+            deduped: true,
+            delta,
+            merged_experience,
+        }
+    }
+
+    /// True when the merge added entities or tags, which the graph builds nodes from, so
+    /// the memory's episode no longer matches it.
+    pub fn needs_graph_rebuild(&self) -> bool {
+        self.deduped && !(self.delta.entities_added.is_empty() && self.delta.tags_added.is_empty())
+    }
+}
+
 impl MemorySystem {
     /// Create a new memory system.
     ///
@@ -1527,6 +1573,17 @@ impl MemorySystem {
         experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<MemoryId> {
+        self.remember_detailed(experience, created_at)
+            .map(|outcome| outcome.id)
+    }
+
+    /// [`Self::remember`], reporting whether the content already existed and what a merge
+    /// added to it.
+    pub fn remember_detailed(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RememberOutcome> {
         self.remember_impl(experience, created_at, None, false)
     }
 
@@ -1542,6 +1599,17 @@ impl MemorySystem {
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         external_id: Option<String>,
     ) -> Result<MemoryId> {
+        self.remember_deferred_detailed(experience, created_at, external_id)
+            .map(|outcome| outcome.id)
+    }
+
+    /// [`Self::remember_deferred`], reporting whether a merge happened.
+    pub fn remember_deferred_detailed(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        external_id: Option<String>,
+    ) -> Result<RememberOutcome> {
         self.remember_impl(experience, created_at, external_id, true)
     }
 
@@ -1557,7 +1625,7 @@ impl MemorySystem {
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         external_id: Option<String>,
         defer_embedding: bool,
-    ) -> Result<MemoryId> {
+    ) -> Result<RememberOutcome> {
         // C1: serialize the per-user write path. Every writer (HTTP ingest,
         // WebSocket streaming, hooks) funnels through remember_impl, so holding
         // this lock for the create critical section (store + working_memory +
@@ -1570,19 +1638,14 @@ impl MemorySystem {
         // No-op when no flat fields are populated.
         experience.migrate_robotics_to_facets();
 
-        // IDEMPOTENCY (issue #109): Check content hash index before creating a new memory.
-        // If identical content already exists, return the existing MemoryId instead of
-        // creating a duplicate. Catches all duplication paths: timeout retries, auto_ingest,
-        // and manual re-remembers. O(1) RocksDB index lookup.
+        // IDEMPOTENCY (issue #109): identical content already stored is not stored again;
+        // the duplicate's enrichment is merged into it and its id returned. Catches every
+        // duplication path: timeout retries, auto_ingest and manual re-remembers.
         if let Some(existing_id) = self
             .long_term_memory
             .get_by_content_hash(&experience.content)
         {
-            tracing::debug!(
-                existing_id = %existing_id.0,
-                "Content dedup: returning existing memory (identical content already stored)"
-            );
-            return Ok(existing_id);
+            return self.merge_into_existing(existing_id, &experience);
         }
 
         let memory_id = MemoryId(Uuid::new_v4());
@@ -1933,7 +1996,101 @@ impl MemorySystem {
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        Ok(memory_id)
+        Ok(RememberOutcome::created(memory_id))
+    }
+
+    /// Folds a content-identical duplicate's enrichment into the stored memory.
+    ///
+    /// A duplicate that adds nothing, the common timeout retry, writes nothing. Otherwise the
+    /// stored record and its secondary indices are rewritten (the merge only adds, so an index
+    /// key can only be gained), BM25 is refreshed when tags or entities grew, and cached
+    /// working and session copies are replaced. The vector index is left alone: identical
+    /// content has an identical embedding. Importance can rise with the merged signals, never
+    /// fall. `id`, `created_at`, `tier` and the other identity fields are outside the
+    /// experience and cannot change.
+    fn merge_into_existing(
+        &self,
+        existing_id: MemoryId,
+        incoming: &Experience,
+    ) -> Result<RememberOutcome> {
+        let mut existing = match self.long_term_memory.get(&existing_id) {
+            Ok(memory) => memory,
+            Err(e) => {
+                tracing::debug!(
+                    existing_id = %existing_id.0,
+                    "Content dedup: the existing memory vanished before the merge ({e})"
+                );
+                return Ok(RememberOutcome::deduped(
+                    existing_id,
+                    EnrichmentDelta::default(),
+                    None,
+                ));
+            }
+        };
+
+        let delta = existing.experience.merge_enrichment_from(incoming);
+        if delta.is_empty() {
+            tracing::debug!(
+                existing_id = %existing_id.0,
+                "Content dedup: identical duplicate, nothing to merge"
+            );
+            return Ok(RememberOutcome::deduped(existing_id, delta, None));
+        }
+
+        let enriched = self.calculate_importance(&existing.experience);
+        if enriched > existing.importance() {
+            existing.set_importance(enriched);
+        }
+        self.long_term_memory.update(&existing)?;
+
+        if !delta.entities_added.is_empty() || !delta.tags_added.is_empty() {
+            if let Err(e) = self.hybrid_search.index_memory(
+                &existing_id,
+                &existing.experience.content,
+                &existing.experience.tags,
+                &existing.experience.entities,
+            ) {
+                tracing::warn!(
+                    "Failed to reindex merged memory {} in BM25: {e}",
+                    existing_id.0
+                );
+            }
+            if let Err(e) = self.hybrid_search.commit_and_reload() {
+                tracing::warn!("Failed to commit/reload BM25 index after merge: {e}");
+            }
+        }
+
+        let shared = Arc::new(existing.clone());
+        {
+            let mut working = self.working_memory.write();
+            if working.contains(&existing_id) {
+                working.remove(&existing_id)?;
+                working.add_shared(Arc::clone(&shared))?;
+            }
+        }
+        {
+            let mut session = self.session_memory.write();
+            if session.contains(&existing_id) {
+                session.remove(&existing_id)?;
+                session.add_shared(Arc::clone(&shared))?;
+            }
+        }
+
+        // New entities mean new fact candidates.
+        self.fact_extraction_needed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        tracing::info!(
+            existing_id = %existing_id.0,
+            entities_added = delta.entities_added.len(),
+            fields_filled = ?delta.fields_filled,
+            "Content dedup: merged enrichment into existing memory"
+        );
+        Ok(RememberOutcome::deduped(
+            existing_id,
+            delta,
+            Some(existing.experience),
+        ))
     }
 
     /// Update the per-user TCM drift state (E6) from a memory's embedding and
@@ -2296,6 +2453,18 @@ impl MemorySystem {
         agent_id: Option<String>,
         run_id: Option<String>,
     ) -> Result<MemoryId> {
+        self.remember_with_agent_detailed(experience, created_at, agent_id, run_id)
+            .map(|outcome| outcome.id)
+    }
+
+    /// [`Self::remember_with_agent`], reporting whether a merge happened.
+    pub fn remember_with_agent_detailed(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<String>,
+        run_id: Option<String>,
+    ) -> Result<RememberOutcome> {
         self.remember_with_agent_impl(experience, created_at, agent_id, run_id, None, false)
     }
 
@@ -2309,6 +2478,25 @@ impl MemorySystem {
         run_id: Option<String>,
         external_id: Option<String>,
     ) -> Result<MemoryId> {
+        self.remember_with_agent_deferred_detailed(
+            experience,
+            created_at,
+            agent_id,
+            run_id,
+            external_id,
+        )
+        .map(|outcome| outcome.id)
+    }
+
+    /// [`Self::remember_with_agent_deferred`], reporting whether a merge happened.
+    pub fn remember_with_agent_deferred_detailed(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<String>,
+        run_id: Option<String>,
+        external_id: Option<String>,
+    ) -> Result<RememberOutcome> {
         self.remember_with_agent_impl(experience, created_at, agent_id, run_id, external_id, true)
     }
 
@@ -2320,20 +2508,17 @@ impl MemorySystem {
         run_id: Option<String>,
         external_id: Option<String>,
         defer_embedding: bool,
-    ) -> Result<MemoryId> {
+    ) -> Result<RememberOutcome> {
         // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
         experience.migrate_robotics_to_facets();
 
-        // IDEMPOTENCY (issue #109): Content hash dedup (same as remember())
+        // IDEMPOTENCY (issue #109): content hash dedup with the enrichment merge, as in
+        // remember().
         if let Some(existing_id) = self
             .long_term_memory
             .get_by_content_hash(&experience.content)
         {
-            tracing::debug!(
-                existing_id = %existing_id.0,
-                "Content dedup: returning existing memory (identical content already stored)"
-            );
-            return Ok(existing_id);
+            return self.merge_into_existing(existing_id, &experience);
         }
 
         let memory_id = MemoryId(Uuid::new_v4());
@@ -2629,7 +2814,7 @@ impl MemorySystem {
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        Ok(memory_id)
+        Ok(RememberOutcome::created(memory_id))
     }
 
     // ==========================================================================
@@ -6245,172 +6430,58 @@ impl MemorySystem {
                         })
                         .collect();
 
-                    let mut truly_new: Vec<(SemanticFact, Option<Vec<f32>>)> = Vec::new();
-
-                    for (fact, embedding) in gated.into_iter() {
-                        // Hybrid dedup: embedding cosine + entity gate + polarity + Jaccard floor.
-                        // A match on a retired fact absorbs the restatement and writes nothing:
-                        // no support, no confidence, no fresh half-life.
-                        let similar = self.fact_store.find_similar(
+                    // One arbitration policy, shared with distill_facts: see
+                    // SemanticFactStore::ingest_candidate.
+                    let mut newly_active: Vec<SemanticFact> = Vec::new();
+                    for (fact, embedding) in gated {
+                        let outcome = match self.fact_store.ingest_candidate(
                             user_id,
-                            &fact.fact,
-                            &fact.related_entities,
+                            &fact,
                             embedding.as_deref(),
-                        );
-                        let existing_is_active = match &similar {
-                            Ok(Some(existing)) => compression::is_active(existing, now),
-                            _ => true,
+                            now,
+                        ) {
+                            Ok(outcome) => outcome,
+                            Err(e) => {
+                                tracing::warn!(
+                                    fact_id = %fact.id,
+                                    "Fact ingest failed during maintenance: {e}"
+                                );
+                                continue;
+                            }
                         };
-                        match similar {
-                            Ok(Some(_)) if !existing_is_active => {}
-                            Ok(Some(mut existing)) => {
-                                // Support counts distinct evidence: re-deriving the fact
-                                // from memories it already cites adds none.
-                                let mut new_sources_added = false;
-                                for src in &fact.source_memories {
-                                    if !existing.source_memories.contains(src) {
-                                        existing.source_memories.push(src.clone());
-                                        new_sources_added = true;
-                                    }
-                                }
-                                if new_sources_added {
-                                    existing.support_count += 1;
-                                }
-                                existing.last_reinforced = now;
-                                let confidence_before = existing.confidence;
-                                let boost = 0.1 * (1.0 - existing.confidence);
-                                existing.confidence = (existing.confidence + boost).min(1.0);
-
-                                for entity in &fact.related_entities {
-                                    if !existing.related_entities.contains(entity) {
-                                        existing.related_entities.push(entity.clone());
-                                    }
-                                }
-
-                                if let Err(e) = self.fact_store.update(user_id, &existing) {
-                                    tracing::debug!("Failed to reinforce fact: {e}");
-                                } else {
-                                    // Update existing fact's embedding with latest encoding
-                                    if let Some(ref emb) = embedding {
-                                        let _ = self.fact_store.store_embedding(
-                                            user_id,
-                                            &existing.id,
-                                            emb,
-                                        );
-                                    }
-                                    facts_reinforced_count += 1;
-                                    self.record_consolidation_event_for_user(
-                                        user_id,
-                                        ConsolidationEvent::FactReinforced {
-                                            fact_id: existing.id.clone(),
-                                            fact_content: existing.fact.clone(),
-                                            confidence_before,
-                                            confidence_after: existing.confidence,
-                                            new_support_count: existing.support_count,
-                                            timestamp: now,
-                                        },
-                                    );
-                                }
-                            }
-                            _ => {
-                                // A fact that negates an active one is arbitrated: the newer
-                                // fact wins unless the existing one has strictly greater
-                                // support. Recency is the default because a later
-                                // contradiction is usually a correction; support overrides it
-                                // so one stray extraction cannot overturn a well-attested
-                                // claim. Confidence is not the tie-breaker: it rises with
-                                // every re-derivation, so it would make an old claim ever
-                                // harder to correct. The loser is retired, not deleted, and
-                                // keeps its source memories.
-                                let contradiction = self
-                                    .fact_store
-                                    .find_contradiction(
-                                        user_id,
-                                        &fact.fact,
-                                        &fact.related_entities,
-                                        embedding.as_deref(),
-                                    )
-                                    .unwrap_or(None);
-
-                                if let Some(mut existing) = contradiction {
-                                    if fact.support_count >= existing.support_count {
-                                        let mut winner = fact.clone();
-                                        winner.record_superseded(&existing.id);
-                                        existing.supersede(Some(&winner.id), now);
-                                        if let Err(e) = self.fact_store.update(user_id, &existing) {
-                                            tracing::debug!(
-                                                "Failed to supersede contradicted fact: {e}"
-                                            );
-                                        }
-                                        tracing::info!(
-                                            superseded = %existing.id,
-                                            winner = %winner.id,
-                                            "Fact contradiction: newer claim supersedes"
-                                        );
-                                        truly_new.push((winner, embedding));
-                                    } else {
-                                        let mut loser = fact.clone();
-                                        loser.supersede(Some(&existing.id), now);
-                                        existing.record_superseded(&loser.id);
-                                        if let Err(e) = self.fact_store.update(user_id, &existing) {
-                                            tracing::debug!(
-                                                "Failed to record contradiction on winner: {e}"
-                                            );
-                                        }
-                                        tracing::info!(
-                                            rejected = %loser.id,
-                                            winner = %existing.id,
-                                            "Fact contradiction: better-supported claim holds"
-                                        );
-                                        truly_new.push((loser, embedding));
-                                    }
-                                } else {
-                                    truly_new.push((fact.clone(), embedding));
-                                }
-                            }
+                        if let Some((reinforced, confidence_before)) = outcome.reinforced_fact() {
+                            facts_reinforced_count += 1;
+                            self.record_consolidation_event_for_user(
+                                user_id,
+                                ConsolidationEvent::FactReinforced {
+                                    fact_id: reinforced.id.clone(),
+                                    fact_content: reinforced.fact.clone(),
+                                    confidence_before,
+                                    confidence_after: reinforced.confidence,
+                                    new_support_count: reinforced.support_count,
+                                    timestamp: now,
+                                },
+                            );
+                        }
+                        if let Some(stored) = outcome.newly_active_fact() {
+                            facts_extracted_count += 1;
+                            self.record_consolidation_event_for_user(
+                                user_id,
+                                ConsolidationEvent::FactExtracted {
+                                    fact_id: stored.id.clone(),
+                                    fact_content: stored.fact.clone(),
+                                    confidence: stored.confidence,
+                                    fact_type: format!("{:?}", stored.fact_type),
+                                    source_memory_count: stored.source_memories.len(),
+                                    timestamp: now,
+                                },
+                            );
+                            newly_active.push(stored.clone());
                         }
                     }
 
-                    // Store new facts
-                    if !truly_new.is_empty() {
-                        let facts_only: Vec<SemanticFact> =
-                            truly_new.iter().map(|(f, _)| f.clone()).collect();
-                        // A newcomer that lost arbitration is stored for the record but must
-                        // stay unreachable by graph traversal.
-                        let active_facts: Vec<SemanticFact> = facts_only
-                            .iter()
-                            .filter(|f| compression::is_active(f, now))
-                            .cloned()
-                            .collect();
-                        match self.fact_store.store_batch(user_id, &facts_only) {
-                            Ok(stored) => {
-                                facts_extracted_count = stored;
-                                // Store embeddings for newly persisted facts
-                                for (fact, embedding) in &truly_new {
-                                    if let Some(emb) = embedding {
-                                        let _ =
-                                            self.fact_store.store_embedding(user_id, &fact.id, emb);
-                                    }
-                                    self.record_consolidation_event_for_user(
-                                        user_id,
-                                        ConsolidationEvent::FactExtracted {
-                                            fact_id: fact.id.clone(),
-                                            fact_content: fact.fact.clone(),
-                                            confidence: fact.confidence,
-                                            fact_type: format!("{:?}", fact.fact_type),
-                                            source_memory_count: fact.source_memories.len(),
-                                            timestamp: now,
-                                        },
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to store extracted facts: {e}");
-                            }
-                        }
-
-                        // Connect newly extracted facts to the knowledge graph
-                        self.connect_facts_to_graph(&active_facts);
+                    if !newly_active.is_empty() {
+                        self.connect_facts_to_graph(&newly_active);
                     }
 
                     if facts_extracted_count > 0 || facts_reinforced_count > 0 {
@@ -7182,41 +7253,57 @@ impl MemorySystem {
                     .collect();
             let facts_gated = result.facts_extracted.saturating_sub(gated_facts.len());
 
-            let gated_fact_refs: Vec<SemanticFact> =
-                gated_facts.iter().map(|(f, _)| f.clone()).collect();
-            let stored = self.fact_store.store_batch(user_id, &gated_fact_refs)?;
+            // The same ingest as maintenance: dedup, reinforcement and contradiction
+            // arbitration all happen in SemanticFactStore::ingest_candidate, which writes as
+            // it goes, so facts minted in one batch also dedup against each other.
+            let now = chrono::Utc::now();
+            let mut newly_active: Vec<SemanticFact> = Vec::new();
+            let mut reinforced = 0usize;
+            for (fact, emb) in &gated_facts {
+                let outcome =
+                    match self
+                        .fact_store
+                        .ingest_candidate(user_id, fact, emb.as_deref(), now)
+                    {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            tracing::warn!(
+                                fact_id = %fact.id,
+                                "Fact ingest failed during distillation: {e}"
+                            );
+                            continue;
+                        }
+                    };
+                if outcome.reinforced_fact().is_some() {
+                    reinforced += 1;
+                }
+                if let Some(stored) = outcome.newly_active_fact() {
+                    self.record_consolidation_event_for_user(
+                        user_id,
+                        ConsolidationEvent::FactExtracted {
+                            fact_id: stored.id.clone(),
+                            fact_content: stored.fact.clone(),
+                            confidence: stored.confidence,
+                            fact_type: format!("{:?}", stored.fact_type),
+                            source_memory_count: stored.source_memories.len(),
+                            timestamp: now,
+                        },
+                    );
+                    newly_active.push(stored.clone());
+                }
+            }
             tracing::info!(
                 user_id = %user_id,
                 facts_extracted = result.facts_extracted,
                 facts_gated,
-                facts_stored = stored,
+                facts_stored = newly_active.len(),
+                facts_reinforced = reinforced,
                 "Semantic distillation complete"
             );
 
-            // Store embeddings for distilled facts
-            for (fact, emb) in &gated_facts {
-                if let Some(emb) = emb {
-                    let _ = self.fact_store.store_embedding(user_id, &fact.id, emb);
-                }
-            }
-
-            // Record consolidation event for each fact (persists significant events)
-            for (fact, _) in &gated_facts {
-                self.record_consolidation_event_for_user(
-                    user_id,
-                    ConsolidationEvent::FactExtracted {
-                        fact_id: fact.id.clone(),
-                        fact_content: fact.fact.clone(),
-                        confidence: fact.confidence,
-                        fact_type: format!("{:?}", fact.fact_type),
-                        source_memory_count: fact.source_memories.len(),
-                        timestamp: chrono::Utc::now(),
-                    },
-                );
-            }
-
-            // Update result with gated facts for return value
-            result.new_facts = gated_fact_refs;
+            result.facts_reinforced = reinforced;
+            result.new_fact_ids = newly_active.iter().map(|f| f.id.clone()).collect();
+            result.new_facts = newly_active;
         }
 
         // Advance watermark after successful extraction
@@ -8864,7 +8951,7 @@ mod vector_index_reopen_tests {
 }
 
 #[cfg(test)]
-mod fact_lifecycle_tests {
+mod lifecycle_tests {
     use super::*;
     use crate::config::StorageBackend;
     use tempfile::TempDir;
@@ -8971,6 +9058,51 @@ mod fact_lifecycle_tests {
             assert_eq!(edges.len(), 1, "{backend}");
             assert_eq!(edges[0].relation, CausalRelation::RelatedTo, "{backend}");
             assert_eq!(edges[0].confidence, 0.05, "{backend}");
+        }
+    }
+
+    #[test]
+    fn a_content_duplicate_merges_its_enrichment_and_keeps_the_identity() {
+        for (backend, system, _tmp) in systems() {
+            let content =
+                "The mooring line parted during the night watch and the tender drifted free.";
+            let first = system
+                .remember_detailed(
+                    Experience {
+                        content: content.to_string(),
+                        entities: vec!["mooring".to_string()],
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            assert!(!first.deduped, "{backend}");
+            let before = system.long_term_memory.get(&first.id).unwrap();
+
+            let enriched = Experience {
+                content: content.to_string(),
+                entities: vec!["mooring".to_string(), "kestrel".to_string()],
+                geo_location: Some([39.29, -76.61, 0.0]),
+                ..Default::default()
+            };
+            let second = system.remember_detailed(enriched.clone(), None).unwrap();
+            assert!(second.deduped, "{backend}");
+            assert_eq!(second.id, first.id, "{backend}: a merge never mints an id");
+            assert_eq!(second.delta.entities_added, vec!["kestrel".to_string()]);
+            assert!(second.needs_graph_rebuild(), "{backend}");
+
+            let after = system.long_term_memory.get(&first.id).unwrap();
+            assert_eq!(after.created_at, before.created_at, "{backend}");
+            assert!(
+                after.experience.entities.contains(&"kestrel".to_string()),
+                "{backend}: the merge reaches storage"
+            );
+            assert_eq!(after.experience.geo_location, Some([39.29, -76.61, 0.0]));
+
+            let retry = system.remember_detailed(enriched, None).unwrap();
+            assert!(retry.deduped && retry.delta.is_empty(), "{backend}");
+            assert!(retry.merged_experience.is_none(), "{backend}");
+            assert!(!retry.needs_graph_rebuild(), "{backend}");
         }
     }
 
