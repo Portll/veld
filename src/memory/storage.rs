@@ -631,8 +631,8 @@ fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
 /// re-derivation from the target reproduces it byte for byte; anything else is decoded
 /// through the legacy chain and re-encoded once. `Memory` holds `HashMap`s, so
 /// re-encoding is not byte-stable and must not be applied to already-current records.
-/// Encrypted records are refused: the redb backend has no at-rest encryption, and a
-/// dump is plaintext.
+/// Encrypted records are refused: a cross-engine dump cannot carry a record the target
+/// has no key for. A redb backup carries its own sealed records verbatim instead.
 pub(crate) fn portable_memory_value(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     if crate::keystore::is_encrypted_record(data) {
         return Err(anyhow!(
@@ -1402,57 +1402,12 @@ impl MemoryStorage {
             crate::keystore::IndexBlinder,
         )>,
     > {
-        use crate::keystore::{IndexBlinder, KdfParams, Keystore, LocalAeadKms, RecordCryptors};
-
-        let keystore_path = storage_path.join("keystore.json");
-        let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
-            .ok()
-            .filter(|s| !s.is_empty());
-
-        let (ks, kek) = match (keystore_path.exists(), passphrase) {
-            (true, Some(pass)) => {
-                let json = std::fs::read_to_string(&keystore_path)
-                    .context("Failed to read keystore.json")?;
-                let ks = Keystore::from_json(&json)?;
-                let kek = ks.unseal_with_passphrase(&pass)?;
-                tracing::info!("Record-level encryption: keystore unsealed (passphrase)");
-                (ks, kek)
-            }
-            (true, None) => {
-                // No passphrase: try unattended KMS unseal via VELD_KMS_WRAP_KEY.
-                let json = std::fs::read_to_string(&keystore_path)
-                    .context("Failed to read keystore.json")?;
-                let ks = Keystore::from_json(&json)?;
-                let kms = LocalAeadKms::from_env()?.ok_or_else(|| {
-                    anyhow!(
-                        "keystore.json is present but neither VELD_MASTER_PASSPHRASE nor \
-                         VELD_KMS_WRAP_KEY is set; refusing to start (encrypted records would be \
-                         served as ciphertext)"
-                    )
-                })?;
-                let kek = ks.unseal_with_kms(&kms)?;
-                tracing::info!("Record-level encryption: keystore unsealed (KMS)");
-                (ks, kek)
-            }
-            (false, Some(pass)) => {
-                let ks = Keystore::create(&pass, KdfParams::production())?;
-                ks.save_to_path(&keystore_path)
-                    .context("Failed to write keystore.json")?;
-                let kek = ks.unseal_with_passphrase(&pass)?;
-                tracing::info!("Created new encryption keystore at {keystore_path:?}");
-                (ks, kek)
-            }
-            (false, None) => return Ok(None),
+        let Some(keys) = crate::keystore::open_record_keys(&storage_path.join("keystore.json"))?
+        else {
+            return Ok(None);
         };
-
-        // Integrity (in-place tamper) + rollback (file-swap) guards.
-        ks.verify_integrity(&kek)
-            .context("keystore integrity verification failed")?;
-        Self::check_keystore_generation(db, ks.generation)?;
-
-        let cryptors = RecordCryptors::from_keystore(&ks, &kek)?;
-        let blinder = IndexBlinder::derive_from_kek(&kek);
-        Ok(Some((cryptors, blinder)))
+        Self::check_keystore_generation(db, keys.generation)?;
+        Ok(Some((keys.cryptors, keys.blinder)))
     }
 
     /// Rollback guard: refuse a keystore whose generation is older than the last
@@ -1467,33 +1422,8 @@ impl MemoryStorage {
             .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
             .map(u64::from_le_bytes)
             .unwrap_or(0);
-        if generation < stored {
-            let allow_rollback = std::env::var("VELD_ALLOW_KEYSTORE_ROLLBACK")
-                .map(|v| {
-                    let v = v.trim().to_ascii_lowercase();
-                    v == "true" || v == "1"
-                })
-                .unwrap_or(false);
-            if !allow_rollback {
-                return Err(anyhow!(
-                    "keystore rollback detected: file generation {generation} < last-seen {stored}. \
-                     If you intentionally restored an older keystore (e.g. keystore.json.bak), set \
-                     VELD_ALLOW_KEYSTORE_ROLLBACK=true once to accept it and reset the sentinel."
-                ));
-            }
-            tracing::warn!(
-                file_generation = generation,
-                last_seen = stored,
-                "VELD_ALLOW_KEYSTORE_ROLLBACK set: accepting an older keystore generation (restored \
-                 keystore?) and resetting the rollback sentinel to it. Rollback protection is \
-                 bypassed for this start — unset the variable afterward."
-            );
-            db.put_cf(cf, KEYSTORE_GENERATION_KEY, generation.to_le_bytes())
-                .context("reset keystore generation sentinel")?;
-            return Ok(());
-        }
-        if generation > stored {
-            db.put_cf(cf, KEYSTORE_GENERATION_KEY, generation.to_le_bytes())
+        if let Some(next) = crate::keystore::keystore_generation_sentinel(stored, generation)? {
+            db.put_cf(cf, KEYSTORE_GENERATION_KEY, next.to_le_bytes())
                 .context("write keystore generation sentinel")?;
         }
         Ok(())

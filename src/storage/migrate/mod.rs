@@ -697,6 +697,12 @@ fn redb_primary_db<W: Write>(sink: &mut Sink<W>, db: &redb::Database, path: &Pat
             let (k, v) = row?;
             let (key, value) = (k.value(), v.value());
             match table {
+                // A sealed record travels sealed: the backup it lands in restores into the
+                // same store, under the same keystore. `migrate` refuses an encrypted
+                // source before it gets here.
+                "memories" if key.len() == 16 && crate::keystore::is_encrypted_record(value) => {
+                    sink.put("primary/memories", key, value)?
+                }
                 "memories" => match crate::memory::storage::portable_memory_value(value) {
                     Ok(bytes) if key.len() == 16 => sink.put("primary/memories", key, &bytes)?,
                     _ => sink.fail(
@@ -1584,6 +1590,17 @@ pub fn migrate(
             target: None,
             blocked: Vec::new(),
         };
+        #[cfg(feature = "storage-redb")]
+        if let (StorageBackend::Redb, Unit::User(id)) = (from, &unit) {
+            let keystore = user_dir(base, id)?.join(crate::storage::redb::KEYSTORE_FILE);
+            if exists(&keystore)? {
+                plan.blocked.push(format!(
+                    "the redb store uses record-level encryption ({} is present); the {to} \
+                     target would hold records it has no key for",
+                    keystore.display()
+                ));
+            }
+        }
         match extract(base, from, &unit, std::io::sink()) {
             Ok(source) => {
                 if source.decode_failures > 0 && quarantine_dir.is_none() {

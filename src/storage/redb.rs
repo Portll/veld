@@ -516,8 +516,36 @@ pub fn user_memory_count(user_dir: &Path) -> Result<Option<u64>> {
     }
 }
 
+/// Rollback guard: refuse a keystore older than the last generation this store
+/// saw; advance the sentinel otherwise.
+fn check_keystore_generation(database: &redb::Database, generation: u64) -> Result<()> {
+    let stored = table_get(database, DEFAULT_TABLE, KEYSTORE_GENERATION_KEY)?
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0);
+    if let Some(next) = crate::keystore::keystore_generation_sentinel(stored, generation)? {
+        table_put(
+            database,
+            DEFAULT_TABLE,
+            KEYSTORE_GENERATION_KEY,
+            &next.to_le_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+/// The keystore beside a tenant's `storage.redb`. RocksDB keeps its own inside the
+/// RocksDB directory, `storage/keystore.json`.
+pub const KEYSTORE_FILE: &str = "keystore.json";
+
+/// Rollback sentinel for the keystore generation, in the default table.
+const KEYSTORE_GENERATION_KEY: &[u8] = b"meta:keystore_generation";
+
 pub struct RedbPrimaryMemoryStore {
     database: Arc<redb::Database>,
+    /// Record-level encryption (encryption-v2): with a keystore, every memory record
+    /// is sealed in the same envelope RocksDB writes, bound to its memory id.
+    cryptors: Option<crate::keystore::RecordCryptors>,
 }
 
 impl RedbPrimaryMemoryStore {
@@ -527,7 +555,49 @@ impl RedbPrimaryMemoryStore {
         init_table(&database, MEMORIES_TABLE)?;
         init_table(&database, VMAPPINGS_TABLE)?;
         init_table(&database, DEFAULT_TABLE)?;
-        Ok(Self { database })
+        let cryptors = match crate::keystore::open_record_keys(&path.join(KEYSTORE_FILE))? {
+            Some(keys) => {
+                check_keystore_generation(&database, keys.generation)?;
+                Some(keys.cryptors)
+            }
+            None => None,
+        };
+        Ok(Self { database, cryptors })
+    }
+
+    /// Serialize a memory record, sealed when the store has a keystore.
+    fn seal(&self, memory: &Memory) -> Result<Vec<u8>> {
+        let plaintext = encode(memory)?;
+        match &self.cryptors {
+            Some(cryptors) => cryptors
+                .active()
+                .encrypt_record(&plaintext, memory.id.0.as_bytes())
+                .context("Failed to encrypt memory record"),
+            None => Ok(plaintext),
+        }
+    }
+
+    /// Decode a memory record read at `key`. A sealed record is opened with its
+    /// epoch's key; one that cannot be opened is an error, never a plaintext read.
+    fn open_record(&self, key: &[u8], bytes: &[u8]) -> Result<Memory> {
+        if !crate::keystore::is_encrypted_record(bytes) {
+            return decode::<Memory>(bytes);
+        }
+        let cryptors = self.cryptors.as_ref().ok_or_else(|| {
+            anyhow!("encountered an encrypted record but no keystore/key is configured")
+        })?;
+        let epoch = crate::keystore::record_epoch(bytes).unwrap_or(0);
+        let cryptor = cryptors.for_epoch(epoch).ok_or_else(|| {
+            anyhow!(
+                "record epoch {epoch} has no DEK in the keystore (active epoch {}); \
+                 the keystore may have been replaced or the epoch's key pruned",
+                cryptors.active_epoch()
+            )
+        })?;
+        let plaintext = cryptor
+            .decrypt_record(bytes, key)
+            .context("Failed to decrypt memory record")?;
+        decode::<Memory>(&plaintext)
     }
 
     /// The live database handle, for stores that must share it rather than open the
@@ -543,8 +613,8 @@ impl RedbPrimaryMemoryStore {
         let table = txn.open_table(MEMORIES_TABLE)?;
         let mut memories = Vec::new();
         for entry in table.iter()? {
-            let (_key, value) = entry?;
-            memories.push(decode::<Memory>(value.value())?);
+            let (key, value) = entry?;
+            memories.push(self.open_record(key.value(), value.value())?);
         }
         Ok(memories)
     }
@@ -630,7 +700,7 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
             if k.value().len() != 16 {
                 continue;
             }
-            match decode::<Memory>(v.value()) {
+            match self.open_record(k.value(), v.value()) {
                 Ok(memory) => {
                     if memory.is_forgotten() {
                         continue;
@@ -736,7 +806,7 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
                 .map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
                 .collect();
             for (key, value) in candidates {
-                let mut memory = match decode::<Memory>(&value) {
+                let mut memory = match self.open_record(&key, &value) {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::warn!(error = %e,
@@ -756,7 +826,7 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
                     .experience
                     .metadata
                     .insert("forgotten_at".into(), now.clone());
-                table.insert(key.as_slice(), encode(&memory)?.as_slice())?;
+                table.insert(key.as_slice(), self.seal(&memory)?.as_slice())?;
             }
         }
         // One transaction: rocksdb writes its whole batch or none of it, so a
@@ -833,6 +903,11 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
                         foreign += 1;
                         return None;
                     }
+                    // A sealed record that will not open points at the key, not the
+                    // record; deleting it would destroy data a restored keystore opens.
+                    if crate::keystore::is_encrypted_record(v.value()) {
+                        return None;
+                    }
                     decode::<Memory>(v.value()).err().map(|_| key)
                 })
                 .collect();
@@ -869,7 +944,7 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
             if k.value().len() != 16 {
                 continue;
             }
-            match decode::<Memory>(v.value()) {
+            match self.open_record(k.value(), v.value()) {
                 Ok(_) => already_current += 1,
                 Err(_) => failed += 1,
             }
@@ -915,13 +990,13 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
 
     fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>> {
         match table_get(&self.database, MEMORIES_TABLE, id.0.as_bytes())? {
-            Some(bytes) => Ok(Some(decode::<Memory>(&bytes)?)),
+            Some(bytes) => Ok(Some(self.open_record(id.0.as_bytes(), &bytes)?)),
             None => Ok(None),
         }
     }
 
     fn put_memory(&self, memory: &Memory) -> Result<()> {
-        let bytes = encode(memory)?;
+        let bytes = self.seal(memory)?;
         table_put(
             &self.database,
             MEMORIES_TABLE,
