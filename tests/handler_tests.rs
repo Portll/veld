@@ -1593,3 +1593,114 @@ mod webhook_signature {
         assert_eq!(body["status"], "ignored", "github: {body}");
     }
 }
+
+/// The `.route("path", method(` calls inside `fn_sig`'s body, in source order.
+fn routes_in(source: &str, fn_sig: &str) -> Vec<(String, String)> {
+    let start = source
+        .find(fn_sig)
+        .unwrap_or_else(|| panic!("{fn_sig} not found"));
+    let after = &source[start..];
+    let open = after.find('{').expect("function body");
+    let mut depth = 0i32;
+    let mut end = open;
+    for (i, ch) in after[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = open + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[open..end];
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find(".route(\"") {
+        rest = &rest[i + ".route(\"".len()..];
+        let Some(close) = rest.find('"') else { break };
+        let path = rest[..close].to_string();
+        let tail = rest[close + 1..].trim_start_matches([',', ' ', '\n', '\t', '\r']);
+        let method: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
+            .collect();
+        out.push((path, method));
+        rest = &rest[close..];
+    }
+    out
+}
+
+/// Every route the protected router mounts refuses a request that carries no API key. The MCP
+/// server reaches veld only through these routes, with the key, so this covers its tools too.
+/// `/webhook/*` and `/api/user_auth/*` skip the key check by design and answer through their
+/// own signature and session checks, or 503 while the feature or its secret is not configured.
+#[tokio::test]
+async fn every_protected_route_refuses_a_request_without_an_api_key() {
+    // The server assembles its app inline rather than through this harness, so both of its
+    // protected-route branches (with and without rate limiting) must carry the auth layer.
+    let server = include_str!("../src/server.rs");
+    let layered = server
+        .split(".protected_routes(metrics_public)")
+        .skip(1)
+        .filter(|after| {
+            after
+                .lines()
+                .take(2)
+                .any(|l| l.contains(".layer(axum::middleware::from_fn(auth::auth_middleware))"))
+        })
+        .count();
+    assert_eq!(
+        layered, 2,
+        "server.rs mounts protected routes without auth_middleware"
+    );
+
+    let h = Harness::new();
+    let source = include_str!("../src/handlers/router.rs");
+    let routes = routes_in(source, "pub fn build_protected_routes(");
+    assert!(
+        routes.len() > 150,
+        "the route parser found only {} routes",
+        routes.len()
+    );
+
+    let mut answered = Vec::new();
+    for (path, method) in &routes {
+        let uri: String = path
+            .split('/')
+            .map(|seg| if seg.starts_with('{') { "probe" } else { seg })
+            .collect::<Vec<_>>()
+            .join("/");
+        let method = match method.as_str() {
+            "get" => Method::GET,
+            "post" => Method::POST,
+            "put" => Method::PUT,
+            "delete" => Method::DELETE,
+            "patch" => Method::PATCH,
+            other => panic!("{path}: unrecognised method builder `{other}`"),
+        };
+        let req = Request::builder()
+            .method(method.clone())
+            .uri(&uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let status = h.app().oneshot(req).await.unwrap().status();
+        // 503: user auth disabled, or a webhook rejecting an unsigned call with no secret set.
+        let own_check = path.starts_with("/api/user_auth/") || path.starts_with("/webhook/");
+        let refused = matches!(status.as_u16(), 401 | 403)
+            || (own_check && status == StatusCode::SERVICE_UNAVAILABLE);
+        if !refused {
+            answered.push(format!("{method} {uri} -> {status}"));
+        }
+    }
+    assert!(
+        answered.is_empty(),
+        "{} of {} protected routes answered without an API key: {answered:#?}",
+        answered.len(),
+        routes.len()
+    );
+}
