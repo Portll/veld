@@ -247,7 +247,7 @@ in	7c34a1cd	485	2026-08-10	mcp-hooks	W9	pending
 in	2ffa24ef	480	2026-08-10	infra	-	declined		bumps actions in upstream's 22 workflow files, 19 of which veld does not have; veld's ci.yml, recall.yml and release.yml are its own and pin checkout@v4, cache@v4 and upload-artifact@v4, so moving them is a veld CI change
 in	0ae0d8bc	488	2026-08-10	infra	-	declined		excludes ort from the Dependabot group of #474, declined; veld has no Dependabot config
 in	62d7f659	489	2026-08-10	graph	W3	pending		
-in	5a8ea858	491	2026-08-10	infra	W1	pending		veld's clippy step still runs -W clippy::all with no -D clippy::correctness (ci.yml, Run Clippy), which downgrades the deny-by-default correctness lints to warnings
+in	5a8ea858	491	2026-08-10	infra	W1	ported		
 in	87ddbb0e	492	2026-08-11	security	W1	veld-origin	ede90e40	Portll PR
 in	dbfe8eba	494	2026-08-12	eval	W0	pending		fixes weekly-trend.yml from #368 (W0, pending); veld has no weekly-trend.yml
 in	60eece98	479	2026-08-12	retrieval	W2	pending		
