@@ -30,6 +30,9 @@ use crate::vector_db::vamana::{VamanaConfig, VamanaIndex};
 
 /// Filename for persisted Vamana index (instant startup)
 const VAMANA_INDEX_FILE: &str = "vamana.idx";
+/// Present beside a saved index when every stored vector mapping refers to it. Each path that
+/// assigns vector ids writes its mappings, and rebuilds remove the marker until the next save.
+pub(crate) const MAPPINGS_MARKER_FILE: &str = "mappings.authoritative";
 /// Filename for persisted secondary Vamana index
 const SECONDARY_VAMANA_INDEX_FILE: &str = "secondary_vamana.idx";
 
@@ -538,67 +541,7 @@ impl RetrievalEngine {
         }
 
         if !primary_loaded_from_file {
-            // Fall back to rebuilding from RocksDB
-            info!("No valid .vamana file, rebuilding from RocksDB...");
-
-            // Get all vector mappings from RocksDB
-            let mappings = self.storage.get_all_vector_mappings()?;
-
-            if !mappings.is_empty() {
-                // Fast path: Mappings exist in RocksDB
-                info!(
-                    "Loading {} vector mappings from RocksDB (atomic storage)",
-                    mappings.len()
-                );
-
-                // LOCK ORDERING: Always acquire vector_index (1) before id_mapping (2)
-                let mut vector_index = self.vector_index.write();
-                let mut id_mapping = self.id_mapping.write();
-                id_mapping.clear();
-                let mut indexed = 0;
-                let mut failed = 0;
-
-                for (memory_id, entry) in &mappings {
-                    // Check if this entry has text vectors (current modality)
-                    if entry.text_vectors().is_none() {
-                        continue;
-                    }
-
-                    // Get memory with embeddings from storage
-                    if let Ok(memory) = self.storage.get(memory_id) {
-                        if let Some(ref embedding) = memory.experience.embeddings {
-                            // Insert into Vamana and get new vector_id
-                            match vector_index.add_vector(embedding.clone()) {
-                                Ok(new_vector_id) => {
-                                    id_mapping.insert(memory_id.clone(), new_vector_id);
-                                    indexed += 1;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to index memory {} during rebuild: {}",
-                                        memory_id.0,
-                                        e
-                                    );
-                                    failed += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let elapsed = start_time.elapsed();
-                info!(
-                    "Rebuilt Vamana from RocksDB: {} indexed, {} failed in {:.2}s",
-                    indexed,
-                    failed,
-                    elapsed.as_secs_f64()
-                );
-            } else {
-                // Slow path: No mappings in RocksDB - need full migration
-                // This happens on first run after upgrade to atomic storage
-                info!("No vector mappings in RocksDB - checking for migration...");
-                self.migrate_to_atomic_storage()?;
-            }
+            self.rebuild_primary_index()?;
         }
 
         // Rebuild secondary index if configured
@@ -746,88 +689,15 @@ impl RetrievalEngine {
         Ok(())
     }
 
-    /// Migrate existing memories to atomic storage
-    ///
-    /// Called when RocksDB has no vector mappings (first run after upgrade).
-    /// Iterates all memories with embeddings and creates atomic mappings.
-    fn migrate_to_atomic_storage(&self) -> Result<()> {
-        let start_time = std::time::Instant::now();
-
-        // Get all memories from storage
-        let memories = self.storage.get_all()?;
-        let total = memories.len();
-
-        if total == 0 {
-            info!("No memories to migrate");
-            return Ok(());
-        }
-
-        info!("Migrating {} memories to atomic storage...", total);
-
-        // LOCK ORDERING: Always acquire vector_index (1) before id_mapping (2)
-        let mut vector_index = self.vector_index.write();
-        let mut id_mapping = self.id_mapping.write();
-        let mut migrated = 0;
-        let mut skipped = 0;
-        let mut failed = 0;
-
-        for (i, memory) in memories.iter().enumerate() {
-            // Only migrate memories with embeddings
-            if let Some(ref embedding) = memory.experience.embeddings {
-                // Insert into Vamana
-                match vector_index.add_vector(embedding.clone()) {
-                    Ok(vector_id) => {
-                        // Update in-memory mapping
-                        id_mapping.insert(memory.id.clone(), vector_id);
-
-                        // Store mapping in RocksDB for future startups
-                        if let Err(e) = self
-                            .storage
-                            .update_vector_mapping(&memory.id, vec![vector_id])
-                        {
-                            tracing::warn!("Failed to persist mapping for {}: {}", memory.id.0, e);
-                            failed += 1;
-                        } else {
-                            migrated += 1;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to index memory {}: {}", memory.id.0, e);
-                        failed += 1;
-                    }
-                }
-            } else {
-                skipped += 1;
-            }
-
-            // Progress logging
-            if (i + 1) % 500 == 0 || i + 1 == total {
-                info!(
-                    "Migration progress: {}/{} ({:.1}%)",
-                    i + 1,
-                    total,
-                    (i + 1) as f64 / total as f64 * 100.0
-                );
-            }
-        }
-
-        let elapsed = start_time.elapsed();
-        info!(
-            "Migration complete: {} migrated, {} skipped (no embeddings), {} failed in {:.2}s",
-            migrated,
-            skipped,
-            failed,
-            elapsed.as_secs_f64()
-        );
-
-        Ok(())
-    }
-
     /// Try loading Vamana from persisted file for instant startup
     ///
     /// Returns Ok(true) if successfully loaded, Ok(false) if should fall back to rebuild.
     /// Verifies checksum and cross-checks with RocksDB mappings.
     fn try_load_persisted_vamana(&self, vamana_path: &Path) -> Result<bool> {
+        if !vamana_path.with_file_name(MAPPINGS_MARKER_FILE).exists() {
+            info!("saved vector index predates authoritative mappings; rebuilding it");
+            return Ok(false);
+        }
         // Verify file integrity first
         if !VamanaIndex::verify_index_file(vamana_path)? {
             warn!("Vamana file checksum mismatch, will rebuild");
@@ -857,135 +727,246 @@ impl RetrievalEngine {
         }
 
         let loaded_count = loaded_index.len();
+        let deleted = loaded_index.deleted_ids.read().clone();
+        let live = |vid: u32| (vid as usize) < loaded_count && !deleted.contains(&vid);
 
-        // Get mappings from RocksDB to rebuild IdMapping
-        let mappings = self.storage.get_all_vector_mappings()?;
-        let rocksdb_count = mappings
-            .iter()
-            .filter(|(_, e)| e.text_vectors().is_some())
-            .count();
+        // A mapping whose ids are missing or deleted in this file was written after the last save;
+        // its memory goes back to the startup repair, which re-indexes and re-records it.
+        let mut usable: Vec<(MemoryId, Vec<u32>)> = Vec::new();
+        let mut stale: Vec<MemoryId> = Vec::new();
+        for (memory_id, entry) in self.storage.get_all_vector_mappings()? {
+            match entry.text_vectors() {
+                Some(ids) if !ids.is_empty() && ids.iter().all(|&vid| live(vid)) => {
+                    usable.push((memory_id, ids.clone()))
+                }
+                Some(ids) if !ids.is_empty() => stale.push(memory_id),
+                _ => {}
+            }
+        }
 
-        // Check for significant drift (>10% difference suggests corruption or data loss)
-        let drift_ratio = if loaded_count > 0 {
-            (loaded_count as f64 - rocksdb_count as f64).abs() / loaded_count as f64
-        } else {
-            0.0
-        };
-
-        if drift_ratio > 0.1 && loaded_count > 100 {
+        let (sampled, mismatched) = self.own_vector_mismatches(&loaded_index, &usable);
+        if mismatched * 10 > sampled {
             warn!(
-                "Vamana/RocksDB drift too high ({:.1}%): {} vs {}, will rebuild",
-                drift_ratio * 100.0,
-                loaded_count,
-                rocksdb_count
+                sampled,
+                mismatched, "saved vector index disagrees with memories' own vectors; rebuilding"
             );
             return Ok(false);
         }
 
-        // Identify mappings that point to vectors missing from persisted Vamana.
-        // We can recover these without a full rebuild when drift is small.
-        let missing_vector_mappings: Vec<MemoryId> = mappings
+        let referenced: HashSet<u32> = usable
             .iter()
-            .filter_map(|(memory_id, entry)| {
-                let vector_ids = entry.text_vectors()?;
-                if vector_ids.is_empty() {
-                    return None;
-                }
-                let has_in_range_vector =
-                    vector_ids.iter().any(|&vid| (vid as usize) < loaded_count);
-                if has_in_range_vector {
-                    None
-                } else {
-                    Some(memory_id.clone())
-                }
-            })
+            .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
-
-        // Replace the vector index with the loaded one.
-        // Restore search_list_size to our configured value since persistence
-        // uses a hardcoded default (75) that is lower than our runtime config (100).
-        {
-            let mut index = self.vector_index.write();
-            loaded_index.config.search_list_size = 100;
-            *index = loaded_index;
+        let unreferenced: Vec<u32> = (0..loaded_count as u32)
+            .filter(|vid| !referenced.contains(vid) && !deleted.contains(vid))
+            .collect();
+        for &vid in &unreferenced {
+            loaded_index.mark_deleted(vid);
         }
-
-        // Rebuild IdMapping from RocksDB (fast - just HashMap operations)
-        let mut id_mapping = self.id_mapping.write();
-        id_mapping.clear();
-
-        for (memory_id, entry) in mappings.iter() {
-            if let Some(vector_ids) = entry.text_vectors() {
-                if !vector_ids.is_empty() {
-                    // Use the first vector_id for simple case
-                    // For chunked, we'd need to store all of them
-                    if vector_ids.len() == 1 {
-                        id_mapping.insert(memory_id.clone(), vector_ids[0]);
-                    } else {
-                        id_mapping.insert_chunks(memory_id.clone(), vector_ids.clone());
-                    }
-                }
-            }
-        }
-        drop(id_mapping);
-
-        // Recover memories whose mapped vectors are missing from loaded Vamana.
-        // This prevents permanently losing searchable vectors when persisted index
-        // has minor drift but not enough to trigger full rebuild.
-        if !missing_vector_mappings.is_empty() {
-            // LOCK ORDERING: vector_index (1) before id_mapping (2)
-            let mut index = self.vector_index.write();
-            let mut id_mapping = self.id_mapping.write();
-            let mut recovered = 0usize;
-            let mut recovery_failed = 0usize;
-
-            for memory_id in &missing_vector_mappings {
-                match self.storage.get(memory_id) {
-                    Ok(memory) => {
-                        if let Some(ref embedding) = memory.experience.embeddings {
-                            match index.add_vector(embedding.clone()) {
-                                Ok(new_vector_id) => {
-                                    id_mapping.remove_all(memory_id);
-                                    id_mapping.insert(memory_id.clone(), new_vector_id);
-                                    recovered += 1;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to recover missing vector for memory {}: {}",
-                                        memory_id.0, e
-                                    );
-                                    recovery_failed += 1;
-                                }
-                            }
-                        } else {
-                            recovery_failed += 1;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to load memory {} for vector recovery: {}",
-                            memory_id.0, e
-                        );
-                        recovery_failed += 1;
-                    }
-                }
-            }
-
-            if recovered > 0 || recovery_failed > 0 {
-                info!(
-                    "Recovered {} missing vectors from RocksDB mappings ({} failed)",
-                    recovered, recovery_failed
+        for memory_id in &stale {
+            if let Err(e) = self.storage.delete_vector_mapping(memory_id) {
+                warn!(
+                    "Failed to clear stale vector mapping for {}: {}",
+                    memory_id.0, e
                 );
             }
         }
 
-        info!(
-            "Loaded {} vectors from .vamana, {} mappings from RocksDB",
-            self.vector_index.read().len(),
-            self.id_mapping.read().len()
-        );
+        // Persistence stores a construction default; recall searches with the runtime list size.
+        loaded_index.config.search_list_size = 100;
+        let needs_compaction = loaded_index.needs_compaction();
+        {
+            let mut index = self.vector_index.write();
+            let mut id_mapping = self.id_mapping.write();
+            *index = loaded_index;
+            id_mapping.clear();
+            for (memory_id, ids) in usable {
+                id_mapping.insert_chunks(memory_id, ids);
+            }
+        }
 
+        info!(
+            vectors = loaded_count,
+            memories = self.id_mapping.read().len(),
+            retired_vectors = unreferenced.len(),
+            stale_mappings = stale.len(),
+            "Loaded saved vector index"
+        );
+        if needs_compaction {
+            self.compact()?;
+        }
         Ok(true)
+    }
+
+    /// Over a sample of single-vector memories that keep their own vector: how many were checked,
+    /// and how many map to an index vector that is not that vector.
+    fn own_vector_mismatches(
+        &self,
+        index: &VamanaIndex,
+        usable: &[(MemoryId, Vec<u32>)],
+    ) -> (usize, usize) {
+        const SAMPLE: usize = 256;
+        let singles: Vec<&(MemoryId, Vec<u32>)> =
+            usable.iter().filter(|(_, ids)| ids.len() == 1).collect();
+        let step = (singles.len() / SAMPLE).max(1);
+        let (mut sampled, mut mismatched) = (0, 0);
+        for (memory_id, ids) in singles.into_iter().step_by(step).take(SAMPLE) {
+            let Ok(memory) = self.storage.get(memory_id) else {
+                continue;
+            };
+            let Some(own) = memory
+                .experience
+                .embeddings
+                .as_ref()
+                .filter(|e| e.len() == index.config.dimension)
+            else {
+                continue;
+            };
+            sampled += 1;
+            let agrees = index.vector(ids[0]).is_ok_and(|indexed| {
+                crate::memory::hybrid_search::cosine_similarity_pub(own, &indexed) >= 0.999
+            });
+            if !agrees {
+                mismatched += 1;
+            }
+        }
+        (sampled, mismatched)
+    }
+
+    /// The saved index stops being authoritative the moment stored mappings start to change.
+    fn invalidate_saved_index(&self) {
+        let marker = self
+            .storage_path
+            .join("vector_index")
+            .join(MAPPINGS_MARKER_FILE);
+        if let Err(e) = fs::remove_file(&marker) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to remove {}: {}", marker.display(), e);
+            }
+        }
+    }
+
+    /// A fresh index for this engine, in memory: rebuilds replace the mapped vector file wholesale.
+    fn fresh_index(&self) -> Result<VamanaIndex> {
+        let current = self.vector_index.read();
+        let config = VamanaConfig {
+            use_mmap: false,
+            ..current.config.clone()
+        };
+        VamanaIndex::with_storage_path(config, current.storage_path.clone())
+    }
+
+    /// Build the primary index from storage. A memory that embeds as one vector, its own, is built
+    /// in with Vamana's batch construction and its mapping rewritten; a chunked memory, or one with
+    /// no own vector, loses its mapping and is left to the startup repair, which re-chunks it.
+    fn rebuild_primary_index(&self) -> Result<()> {
+        use crate::embeddings::chunking::{chunk_text, ChunkConfig};
+
+        let start = std::time::Instant::now();
+        self.invalidate_saved_index();
+        let dimension = self.embedder.primary_dimension();
+        let chunk_config = ChunkConfig::default();
+        let mapped: HashSet<MemoryId> = self
+            .storage
+            .get_all_vector_mappings()?
+            .into_iter()
+            .map(|(memory_id, _)| memory_id)
+            .collect();
+
+        let mut members = Vec::new();
+        let mut vectors = Vec::new();
+        let mut left_to_repair = 0usize;
+        for memory_id in self.storage.get_all_ids()? {
+            let Ok(memory) = self.storage.get(&memory_id) else {
+                continue;
+            };
+            let own = memory
+                .experience
+                .embeddings
+                .as_ref()
+                .filter(|e| e.len() == dimension);
+            let single = own.is_some()
+                && !chunk_text(&Self::extract_searchable_text(&memory), &chunk_config).was_chunked;
+            match own {
+                Some(own) if single => {
+                    vectors.push(own.clone());
+                    members.push(memory_id);
+                }
+                _ => {
+                    left_to_repair += 1;
+                    if mapped.contains(&memory_id) {
+                        if let Err(e) = self.storage.delete_vector_mapping(&memory_id) {
+                            warn!("Failed to clear vector mapping for {}: {}", memory_id.0, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut index = self.fresh_index()?;
+        index.build(vectors)?;
+        let mut id_mapping = IdMapping::new();
+        for (vid, memory_id) in members.into_iter().enumerate() {
+            self.storage
+                .update_vector_mapping(&memory_id, vec![vid as u32])?;
+            id_mapping.insert(memory_id, vid as u32);
+        }
+
+        let built = id_mapping.len();
+        *self.vector_index.write() = index;
+        *self.id_mapping.write() = id_mapping;
+        info!(
+            built,
+            left_to_repair,
+            secs = format!("{:.2}", start.elapsed().as_secs_f64()),
+            "Rebuilt primary vector index from storage"
+        );
+        Ok(())
+    }
+
+    /// Rebuild the index from its own live vectors, dropping soft-deleted ones. Chunk vectors
+    /// survive, so nothing is re-embedded; every memory's mapping is rewritten to the new ids.
+    pub fn compact(&self) -> Result<()> {
+        let start = std::time::Instant::now();
+        self.invalidate_saved_index();
+        let mut fresh = self.fresh_index()?;
+
+        // LOCK ORDERING: vector_index (1) before id_mapping (2)
+        let mut index = self.vector_index.write();
+        let mut id_mapping = self.id_mapping.write();
+        let mut members: Vec<(MemoryId, Vec<u32>)> = id_mapping
+            .memory_to_vectors
+            .iter()
+            .map(|(memory_id, ids)| (memory_id.clone(), ids.clone()))
+            .collect();
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let before = index.len();
+        let mut vectors = Vec::new();
+        let mut remapped = IdMapping::new();
+        for (memory_id, old_ids) in members {
+            let mut new_ids = Vec::with_capacity(old_ids.len());
+            for old in old_ids {
+                vectors.push(index.vector(old)?);
+                new_ids.push((vectors.len() - 1) as u32);
+            }
+            remapped.insert_chunks(memory_id, new_ids);
+        }
+        fresh.build(vectors)?;
+        for (memory_id, ids) in &remapped.memory_to_vectors {
+            self.storage.update_vector_mapping(memory_id, ids.clone())?;
+        }
+
+        *index = fresh;
+        *id_mapping = remapped;
+        info!(
+            before,
+            after = index.len(),
+            memories = id_mapping.len(),
+            secs = format!("{:.2}", start.elapsed().as_secs_f64()),
+            "Compacted primary vector index"
+        );
+        Ok(())
     }
 
     /// Set the consolidation event buffer (for late binding after construction)
@@ -1024,8 +1005,11 @@ impl RetrievalEngine {
                         );
                         let _ = fs::remove_file(&tmp_path);
                     } else {
+                        if let Err(e) = fs::write(index_path.join(MAPPINGS_MARKER_FILE), b"") {
+                            warn!("Failed to write the vector mappings marker: {}", e);
+                        }
                         info!(
-                            "Saved Vamana index: {} vectors to {} (instant startup enabled)",
+                            "Saved Vamana index: {} memories to {} (instant startup enabled)",
                             vector_count,
                             vamana_path.display()
                         );
@@ -2332,20 +2316,9 @@ impl RetrievalEngine {
         }
     }
 
-    /// Check if vector index needs rebuild and rebuild if necessary
-    ///
-    /// Returns true if rebuild was performed.
-    ///
-    /// IMPORTANT: We perform a full rebuild from RocksDB rather than using
-    /// Vamana's internal `auto_rebuild_if_needed()`. The internal rebuild
-    /// extracts live vectors and assigns new sequential IDs (0, 1, 2, ...),
-    /// but does NOT update the RetrievalEngine's id_mapping. This would
-    /// silently corrupt all search results after compaction — searches
-    /// would return wrong memories because old vector_id→memory_id mappings
-    /// no longer match the new vector IDs.
-    ///
-    /// By rebuilding from RocksDB (the single source of truth), both the
-    /// vector index and the id_mapping are rebuilt atomically.
+    /// Compact the vector index when deletions or incremental inserts call for it; returns
+    /// whether it did. Compaction rewrites the id mapping with the index, never one without the
+    /// other, so it does not use Vamana's own `auto_rebuild_if_needed()`.
     pub fn auto_rebuild_index_if_needed(&self) -> Result<bool> {
         // Check if rebuild is needed (read lock only)
         {
@@ -2355,9 +2328,7 @@ impl RetrievalEngine {
             }
         }
 
-        // Full rebuild from RocksDB — rebuilds both vector index and id_mapping
-        info!("Index rebuild/compaction needed, performing full rebuild from RocksDB");
-        self.rebuild_from_rocksdb()?;
+        self.compact()?;
         Ok(true)
     }
 
