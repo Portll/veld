@@ -13,7 +13,8 @@ use crate::constants::{
     COMPRESSION_IMPORTANCE_LOW, CONSOLIDATION_CLUSTER_SIZE_CAP, CONSOLIDATION_JACCARD_THRESHOLD,
     CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY, CONSOLIDATION_MIN_AGE_DAYS, CONSOLIDATION_MIN_SUPPORT,
     CONSOLIDATION_MIN_SUPPORT_LARGE, CONSOLIDATION_MIN_SUPPORT_MEDIUM,
-    CONSOLIDATION_MIN_SUPPORT_SMALL, MAX_COMPRESSION_RATIO, MAX_DECOMPRESSED_SIZE,
+    CONSOLIDATION_MIN_SUPPORT_SMALL, CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS,
+    MAX_COMPRESSION_RATIO, MAX_DECOMPRESSED_SIZE,
 };
 
 /// Compression strategy for memories
@@ -1209,11 +1210,15 @@ impl SemanticConsolidator {
 
     // ── Multi-Extractor Pipeline ────────────────────────────────────────────
 
-    /// Extract fact candidates from a single memory with type-gated extractors.
+    /// Extract fact candidates from a single memory.
     ///
     /// Operational traces (Context, Command, CodeEdit, FileAccess, Search) produce no
-    /// candidates. Each extractor runs only on the experience types that carry its shape, and
-    /// every candidate must pass `is_fact_shaped`.
+    /// candidates. The four specialist extractors each look for one rhetorical shape and run
+    /// only on the experience types that carry it. The declarative extractor runs on every
+    /// other type: a plain factual sentence has no marker to gate on and belongs to no single
+    /// type. Importance scales a candidate's confidence, not whether it exists; corroboration
+    /// across distinct memories decides what becomes a fact. Every candidate must pass
+    /// `is_fact_shaped`.
     fn extract_fact_candidates(&self, memory: &Memory) -> Vec<(String, f32)> {
         let mut candidates = Vec::new();
         let content = &memory.experience.content;
@@ -1299,12 +1304,9 @@ impl SemanticConsolidator {
             }
         }
 
-        if *exp_type == ExperienceType::Observation && importance >= 0.5 {
-            if let Some(fact) = self.extract_salient_statement(content, &memory.experience.entities)
-            {
-                if Self::is_fact_shaped(&fact) {
-                    candidates.push((fact, importance * 0.6));
-                }
+        if let Some(fact) = self.extract_salient_statement(content, &memory.experience.entities) {
+            if Self::is_fact_shaped(&fact) {
+                candidates.push((fact, importance * 0.6));
             }
         }
 
@@ -1528,7 +1530,11 @@ impl SemanticConsolidator {
         None
     }
 
-    /// Extract the most information-dense sentence that mentions at least one entity.
+    /// Extract the most information-dense declarative sentence.
+    ///
+    /// Entity mentions rank sentences; they do not gate them. `entities` comes from NER, which
+    /// is empty for whole classes of records, and a gate on it would extract nothing whenever
+    /// NER is silent.
     fn extract_salient_statement(&self, content: &str, entities: &[String]) -> Option<String> {
         let sentences = Self::split_sentences(content);
         let entity_lower: Vec<String> = entities.iter().map(|e| e.to_lowercase()).collect();
@@ -1554,8 +1560,7 @@ impl SemanticConsolidator {
                 .filter(|w| !w.is_empty() && !self.keyword_extractor.is_stop_word(w))
                 .count();
 
-            // Require at least 3 content words for a meaningful statement
-            if content_words < 3 {
+            if content_words < CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS {
                 continue;
             }
 
@@ -1563,10 +1568,6 @@ impl SemanticConsolidator {
                 .iter()
                 .filter(|e| lower.contains(e.as_str()))
                 .count();
-            if entity_match_count == 0 {
-                continue;
-            }
-
             let entity_bonus = entity_match_count as f32 * 2.0;
             let score = content_words as f32 + entity_bonus;
 
@@ -2639,6 +2640,145 @@ mod tests {
         assert!(
             !candidates.is_empty(),
             "Should extract at least one candidate"
+        );
+    }
+
+    const BRIDGE_REPORT: &str =
+        "Initial reports said four crew members were injured in the bridge collapse.";
+
+    #[test]
+    fn declarative_sentence_yields_a_candidate_with_no_ner_entities() {
+        let consolidator = SemanticConsolidator::new();
+        let memory = create_typed_memory(BRIDGE_REPORT, 0.3, ExperienceType::Observation, vec![]);
+
+        let candidates = consolidator.extract_fact_candidates(&memory);
+        assert!(
+            candidates
+                .iter()
+                .any(|(t, _)| t.contains("four crew members were injured")),
+            "a plain declarative sentence must mint a candidate without NER entities, got \
+             {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn declarative_extractor_runs_on_every_non_operational_type() {
+        let consolidator = SemanticConsolidator::new();
+        for exp_type in [
+            ExperienceType::Observation,
+            ExperienceType::Conversation,
+            ExperienceType::Task,
+            ExperienceType::Intention,
+            ExperienceType::Decision,
+            ExperienceType::Learning,
+            ExperienceType::Discovery,
+            ExperienceType::Pattern,
+            ExperienceType::Error,
+        ] {
+            let memory = create_typed_memory(BRIDGE_REPORT, 0.3, exp_type.clone(), vec![]);
+            assert!(
+                !consolidator.extract_fact_candidates(&memory).is_empty(),
+                "{exp_type:?} must produce a declarative candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn importance_weights_a_declarative_candidate_instead_of_gating_it() {
+        let consolidator = SemanticConsolidator::new();
+        let low = create_typed_memory(BRIDGE_REPORT, 0.23, ExperienceType::Observation, vec![]);
+        let low = consolidator.extract_fact_candidates(&low);
+        assert!(
+            !low.is_empty(),
+            "importance below 0.5 must not erase the candidate"
+        );
+
+        let high = create_typed_memory(BRIDGE_REPORT, 0.9, ExperienceType::Observation, vec![]);
+        let high = consolidator.extract_fact_candidates(&high);
+        assert!(
+            high[0].1 > low[0].1,
+            "importance must still rank candidates"
+        );
+    }
+
+    #[test]
+    fn entity_mentions_rank_sentences_rather_than_gating_them() {
+        let consolidator = SemanticConsolidator::new();
+        // Identical tails: the second sentence has exactly one more content word, so density
+        // alone picks it, and one entity hit (+2.0) flips the choice to the first.
+        let content = "The Dali blocked the shipping channel for weeks. \
+                       The salvage barge blocked the shipping channel for weeks.";
+
+        let with_entity = create_typed_memory(
+            content,
+            0.6,
+            ExperienceType::Observation,
+            vec!["Dali".to_string()],
+        );
+        let picked = consolidator.extract_fact_candidates(&with_entity);
+        assert!(
+            picked.iter().any(|(t, _)| t.contains("Dali")),
+            "an entity mention must outrank raw density, got {picked:?}"
+        );
+
+        let without_entity = create_typed_memory(content, 0.6, ExperienceType::Observation, vec![]);
+        let fallback = consolidator.extract_fact_candidates(&without_entity);
+        assert!(
+            fallback.iter().any(|(t, _)| t.contains("salvage barge")),
+            "without an entity signal, density decides; got {fallback:?}"
+        );
+    }
+
+    #[test]
+    fn content_word_floor_separates_a_caption_from_a_clause() {
+        assert_eq!(CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS, 4);
+        let consolidator = SemanticConsolidator::new();
+        for w in ["the", "and", "in"] {
+            assert!(
+                consolidator.keyword_extractor.is_stop_word(w),
+                "fixture assumes '{w}' is a stop word"
+            );
+        }
+        for w in ["barge", "tugboat", "harbor", "sank"] {
+            assert!(
+                !consolidator.keyword_extractor.is_stop_word(w),
+                "fixture assumes '{w}' is a content word"
+            );
+        }
+
+        let caption = "The barge and the tugboat in the harbor";
+        assert!(consolidator
+            .extract_salient_statement(caption, &[])
+            .is_none());
+        let clause = "The barge and the tugboat in the harbor sank";
+        assert_eq!(
+            consolidator.extract_salient_statement(clause, &[]),
+            Some(clause.to_string())
+        );
+    }
+
+    #[test]
+    fn repeated_declarative_mentions_reach_the_support_threshold() {
+        let consolidator = SemanticConsolidator::with_thresholds(2, 0);
+        let m1 = create_typed_memory(BRIDGE_REPORT, 0.3, ExperienceType::Observation, vec![]);
+        let m2 = create_typed_memory(
+            "Early reports said four crew members were injured in the bridge collapse.",
+            0.3,
+            ExperienceType::Observation,
+            vec![],
+        );
+
+        let single = consolidator.consolidate(std::slice::from_ref(&m1));
+        assert_eq!(single.facts_extracted, 0, "one mention is an anecdote");
+
+        let paired = consolidator.consolidate(&[m1, m2]);
+        assert!(
+            paired
+                .new_facts
+                .iter()
+                .any(|f| f.fact.contains("crew members were injured")),
+            "two corroborating memories must mint the sentence, got {:?}",
+            paired.new_facts
         );
     }
 
