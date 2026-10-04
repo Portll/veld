@@ -506,6 +506,7 @@ impl VamanaIndex {
             ),
             rebuilding: std::sync::atomic::AtomicBool::new(false),
             deleted_ids: std::sync::Arc::new(parking_lot::RwLock::new(deleted_ids)),
+            exact_search_max: super::vamana::EXACT_SEARCH_MAX_VECTORS,
         };
 
         info!(

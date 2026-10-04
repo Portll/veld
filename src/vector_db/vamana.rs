@@ -114,6 +114,10 @@ pub const DELETION_RATIO_THRESHOLD: f32 = 0.30;
 /// Below this threshold, rebuild is strongly recommended
 pub const MIN_ACCEPTABLE_RECALL: f32 = 0.85;
 
+/// Indexes with at most this many live vectors are searched exhaustively. At 768 dimensions that is
+/// under 40M multiply-adds a query, a few milliseconds, and it is exact where the graph approximates.
+pub const EXACT_SEARCH_MAX_VECTORS: usize = 50_000;
+
 /// Main Vamana index
 pub struct VamanaIndex {
     pub(crate) config: VamanaConfig,
@@ -144,6 +148,9 @@ pub struct VamanaIndex {
     /// These vectors remain in the graph but are excluded from results.
     /// Physically removed on next rebuild.
     pub(crate) deleted_ids: Arc<RwLock<HashSet<u32>>>,
+
+    /// Live-vector count up to which `search` scans every vector instead of walking the graph.
+    pub(crate) exact_search_max: usize,
 }
 
 /// Vector storage abstraction
@@ -183,7 +190,13 @@ impl VamanaIndex {
             incremental_inserts: std::sync::atomic::AtomicUsize::new(0),
             rebuilding: std::sync::atomic::AtomicBool::new(false),
             deleted_ids: Arc::new(RwLock::new(HashSet::new())),
+            exact_search_max: EXACT_SEARCH_MAX_VECTORS,
         })
+    }
+
+    /// Search exhaustively up to `n` live vectors; 0 makes every search walk the graph.
+    pub fn set_exact_search_max(&mut self, n: usize) {
+        self.exact_search_max = n;
     }
 
     /// Get number of vectors in the index
@@ -244,9 +257,15 @@ impl VamanaIndex {
                 // Get vector for this node
                 let query = self.get_vector(node_id as u32)?;
 
-                // Search for L nearest neighbors
-                let candidates =
+                // Search for L nearest neighbors; the node's current edges compete with them
+                let mut candidates =
                     self.greedy_search(&query, self.config.search_list_size, *self.medoid.read())?;
+                candidates.extend(
+                    self.graph.read()[node_id]
+                        .neighbors
+                        .iter()
+                        .map(|&id| SearchCandidate { id, distance: 0.0 }),
+                );
 
                 // Prune using α-RNG strategy
                 let pruned = self.robust_prune(node_id as u32, &candidates)?;
@@ -302,18 +321,19 @@ impl VamanaIndex {
     /// Uses a content-derived seed so identical vector sets always produce
     /// identical initial graphs, making index construction fully reproducible.
     fn initialize_graph(&mut self, n: usize, seed: u64) -> Result<()> {
-        use rand::seq::SliceRandom;
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
         let mut graph = Vec::with_capacity(n);
+        let draw = (self.config.max_degree + 1).min(n);
 
         for i in 0..n {
-            // Create random edges
-            let mut neighbors: Vec<u32> = (0..n as u32).filter(|&j| j != i as u32).collect();
-
-            neighbors.shuffle(&mut rng);
-            neighbors.truncate(self.config.max_degree);
+            let neighbors: Vec<u32> = rand::seq::index::sample(&mut rng, n, draw)
+                .into_iter()
+                .filter(|&j| j != i)
+                .take(self.config.max_degree)
+                .map(|j| j as u32)
+                .collect();
 
             graph.push(VamanaNode {
                 id: i as u32,
@@ -453,6 +473,11 @@ impl VamanaIndex {
         Ok(())
     }
 
+    /// The stored vector for `id`.
+    pub(crate) fn vector(&self, id: u32) -> Result<Vec<f32>> {
+        self.get_vector(id)
+    }
+
     /// Get vector by ID
     fn get_vector(&self, id: u32) -> Result<Vec<f32>> {
         let storage = self.vectors.read();
@@ -506,38 +531,6 @@ impl VamanaIndex {
                 let float_slice =
                     unsafe { std::slice::from_raw_parts(ptr as *const f32, total_floats) };
 
-                Ok(float_slice[start..end].to_vec())
-            }
-        }
-    }
-
-    /// Get vector by ID from a storage reference (static helper for use when locks are already held)
-    fn get_vector_from_storage(storage: &VectorStorage, id: u32) -> Result<Vec<f32>> {
-        match storage {
-            VectorStorage::Memory(vecs) => Ok(vecs
-                .get(id as usize)
-                .ok_or_else(|| anyhow!("Vector {id} not found"))?
-                .clone()),
-            VectorStorage::Mmap {
-                mmap,
-                dimension,
-                num_vectors,
-            } => {
-                if id as usize >= *num_vectors {
-                    return Err(anyhow!(
-                        "Vector {id} out of bounds (num_vectors={})",
-                        num_vectors
-                    ));
-                }
-                let start = id as usize * dimension;
-                let end = start + dimension;
-                let ptr = mmap.as_ptr();
-                let total_floats = mmap.len() / std::mem::size_of::<f32>();
-                if end > total_floats {
-                    return Err(anyhow!("Vector slice bounds exceed mmap capacity"));
-                }
-                let float_slice =
-                    unsafe { std::slice::from_raw_parts(ptr as *const f32, total_floats) };
                 Ok(float_slice[start..end].to_vec())
             }
         }
@@ -669,78 +662,51 @@ impl VamanaIndex {
         Ok(results)
     }
 
-    /// Robust prune using α-RNG strategy
-    ///
-    /// Optimized with:
-    /// - Zero-copy slice access for vector data
-    /// - Cached dist_ne (node to existing) to avoid O(n²) distance recomputation
-    /// - Pre-loaded candidate vectors to minimize storage lookups
+    /// Robust prune (DiskANN's α-RNG rule): keep candidates nearest first, dropping any that a kept
+    /// neighbour already covers, so the node keeps long edges as well as short ones. Distances to
+    /// the node are recomputed, so callers may pass candidates in any order or at any distance.
     fn robust_prune(&self, node_id: u32, candidates: &[SearchCandidate]) -> Result<Vec<u32>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
+        let storage = self.vectors.read();
+        let node = Self::get_slice_from_storage(&storage, node_id)?;
 
-        let storage = self.vectors.read(); // Hold lock for entire prune operation
-        let node_slice = Self::get_slice_from_storage(&storage, node_id)?;
-
-        // Sort candidates by distance (NaN values sort to end), tie-break by id for determinism (RH-10)
-        let mut sorted_candidates = candidates.to_vec();
-        sorted_candidates.sort_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-
-        // Pre-load all candidate vectors to avoid repeated storage lookups
-        // This trades memory for CPU - worth it for the O(n²) inner loop
-        let candidate_vectors: Vec<_> = sorted_candidates
-            .iter()
-            .filter_map(|c| {
-                if c.id == node_id {
-                    None
-                } else {
-                    Self::get_slice_from_storage(&storage, c.id)
-                        .ok()
-                        .map(|slice| (c.id, slice.to_vec(), c.distance))
-                }
-            })
-            .collect();
-
-        let mut pruned_ids = Vec::with_capacity(self.config.max_degree);
-        // Cache dist_ne (distance from node to each pruned neighbor)
-        // When we add candidate C to pruned, dist_nc becomes the dist_ne for C
-        let mut pruned_dist_ne: Vec<f32> = Vec::with_capacity(self.config.max_degree);
-        // Cache existing vectors for O(1) access in inner loop
-        let mut pruned_vectors: Vec<&[f32]> = Vec::with_capacity(self.config.max_degree);
-
-        for (candidate_id, candidate_vec, _candidate_dist) in &candidate_vectors {
-            let dist_nc = self.distance(node_slice, candidate_vec);
-
-            let mut should_add = true;
-            for i in 0..pruned_ids.len() {
-                let dist_ne = pruned_dist_ne[i]; // Cached - no recomputation!
-                let dist_ce = self.distance(candidate_vec, pruned_vectors[i]);
-
-                // α-RNG pruning condition
-                if self.config.alpha * dist_ce <= dist_nc && dist_ce <= dist_ne {
-                    should_add = false;
-                    break;
-                }
+        let mut seen = HashSet::with_capacity(candidates.len());
+        let mut ranked: Vec<(u32, f32, &[f32])> = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if candidate.id == node_id || !seen.insert(candidate.id) {
+                continue;
             }
+            if let Ok(vector) = Self::get_slice_from_storage(&storage, candidate.id) {
+                ranked.push((candidate.id, self.prune_distance(node, vector), vector));
+            }
+        }
+        ranked.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
-            if should_add {
-                pruned_ids.push(*candidate_id);
-                // dist_nc is the distance from node to this candidate
-                // It becomes dist_ne when this candidate is used as "existing" in future iterations
-                pruned_dist_ne.push(dist_nc);
-                pruned_vectors.push(candidate_vec);
-                if pruned_ids.len() >= self.config.max_degree {
+        let mut kept: Vec<(u32, &[f32])> = Vec::with_capacity(self.config.max_degree);
+        for (id, to_node, vector) in ranked {
+            let covered = kept
+                .iter()
+                .any(|(_, k)| self.config.alpha * self.prune_distance(k, vector) <= to_node);
+            if !covered {
+                kept.push((id, vector));
+                if kept.len() >= self.config.max_degree {
                     break;
                 }
             }
         }
+        Ok(kept.into_iter().map(|(id, _)| id).collect())
+    }
 
-        Ok(pruned_ids)
+    /// Distance on a scale that starts at zero, as the α rule needs: for unit vectors `-dot` runs
+    /// from -1 to 1, and multiplying a negative distance by α would tighten the rule, not relax it.
+    #[inline(always)]
+    fn prune_distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        match self.config.distance_metric {
+            DistanceMetric::NormalizedDotProduct => self.distance(a, b) + 1.0,
+            DistanceMetric::Euclidean | DistanceMetric::Cosine => self.distance(a, b),
+        }
     }
 
     /// Compute distance between two vectors using configured metric
@@ -760,9 +726,15 @@ impl VamanaIndex {
 
     /// Search for k nearest neighbors (excludes soft-deleted vectors)
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
-        // Check if index is empty
-        if self.num_vectors.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        let n = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
+        if n == 0 || k == 0 {
             return Ok(Vec::new());
+        }
+        {
+            let deleted = self.deleted_ids.read();
+            if n.saturating_sub(deleted.len()) <= self.exact_search_max {
+                return self.exact_search(query, k, n, &deleted);
+            }
         }
 
         // Check if graph is built
@@ -783,7 +755,8 @@ impl VamanaIndex {
             k
         };
 
-        let candidates = self.greedy_search(query, search_k, entry)?;
+        let beam = search_k.max(self.config.search_list_size);
+        let candidates = self.greedy_search(query, beam, entry)?;
 
         // Filter out deleted vectors and take k results
         let results: Vec<(u32, f32)> = candidates
@@ -794,6 +767,33 @@ impl VamanaIndex {
             .collect();
 
         Ok(results)
+    }
+
+    /// The k nearest live vectors by scanning all `n`, ties broken by id.
+    fn exact_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        n: usize,
+        deleted: &HashSet<u32>,
+    ) -> Result<Vec<(u32, f32)>> {
+        let storage = self.vectors.read();
+        let mut scored = Vec::with_capacity(n.saturating_sub(deleted.len()));
+        for id in 0..n as u32 {
+            if deleted.contains(&id) {
+                continue;
+            }
+            let vector = Self::get_slice_from_storage(&storage, id)?;
+            scored.push((id, self.distance(query, vector)));
+        }
+        let nearest_first =
+            |a: &(u32, f32), b: &(u32, f32)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
+        if scored.len() > k {
+            scored.select_nth_unstable_by(k, nearest_first);
+            scored.truncate(k);
+        }
+        scored.sort_by(nearest_first);
+        Ok(scored)
     }
 
     /// Mark a vector as deleted (soft delete)
@@ -898,73 +898,37 @@ impl VamanaIndex {
             return Ok(id);
         }
 
-        // OPTIMIZATION: Use simpler neighbor selection for incremental adds
         let neighbors = if self.graph.read().is_empty() {
             Vec::new()
         } else {
-            // Just find k-nearest neighbors without expensive pruning
             let candidates =
-                self.greedy_search(&vector, self.config.max_degree, *self.medoid.read())?;
-            // Take top-k neighbors directly without robust_prune for speed
-            candidates
-                .into_iter()
-                .take(self.config.max_degree)
-                .map(|c| c.id)
-                .collect()
+                self.greedy_search(&vector, self.config.search_list_size, *self.medoid.read())?;
+            self.robust_prune(id, &candidates)?
         };
 
-        // Add node to graph
         let mut graph = self.graph.write();
         graph.push(VamanaNode {
             id,
             neighbors: neighbors.clone(),
         });
-
-        // BUG-004 FIX: Distance-aware neighbor pruning for incremental inserts
-        // Instead of truncate() which removes newest (possibly best) neighbors,
-        // we sort by distance and keep the closest ones.
-        let vectors = self.vectors.read();
         for &neighbor_id in &neighbors {
-            if neighbor_id as usize >= graph.len() {
+            let Some(neighbor) = graph.get_mut(neighbor_id as usize) else {
                 continue;
-            }
-
-            graph[neighbor_id as usize].neighbors.push(id);
-
-            // Prune by distance when over max_degree
-            if graph[neighbor_id as usize].neighbors.len() > self.config.max_degree {
-                // Get neighbor's vector for distance calculations
-                if let Ok(neighbor_vec) = Self::get_vector_from_storage(&vectors, neighbor_id) {
-                    // Calculate distances to all neighbors using configured metric
-                    let mut neighbor_distances: Vec<(u32, f32)> = graph[neighbor_id as usize]
-                        .neighbors
-                        .iter()
-                        .filter_map(|&n_id| {
-                            Self::get_vector_from_storage(&vectors, n_id)
-                                .ok()
-                                .map(|v| (n_id, self.distance(&neighbor_vec, &v)))
-                        })
-                        .collect();
-
-                    // Sort by distance (lower = closer for all metrics), tie-break by id (RH-10)
-                    neighbor_distances
-                        .sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-
-                    // Keep only max_degree closest neighbors
-                    graph[neighbor_id as usize].neighbors = neighbor_distances
-                        .into_iter()
-                        .take(self.config.max_degree)
-                        .map(|(id, _)| id)
-                        .collect();
-                } else {
-                    // Fallback: truncate if vector access fails
-                    graph[neighbor_id as usize]
-                        .neighbors
-                        .truncate(self.config.max_degree);
-                }
+            };
+            neighbor.neighbors.push(id);
+            if neighbor.neighbors.len() > self.config.max_degree {
+                let candidates: Vec<SearchCandidate> = neighbor
+                    .neighbors
+                    .iter()
+                    .map(|&n| SearchCandidate {
+                        id: n,
+                        distance: 0.0,
+                    })
+                    .collect();
+                neighbor.neighbors = self.robust_prune(neighbor_id, &candidates)?;
             }
         }
-        drop(vectors);
+        drop(graph);
 
         self.num_vectors
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -1771,5 +1735,113 @@ mod tests {
         // Should take no action on fresh index
         let result = index.auto_maintain().unwrap();
         assert_eq!(result, "no_action");
+    }
+
+    /// Unit vectors in tight clusters with near-duplicates, the shape of a memory store: many
+    /// session notes and audit rollups that differ by a timestamp.
+    fn clustered_unit_vectors(n: usize, dim: usize, clusters: usize, seed: u64) -> Vec<Vec<f32>> {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let normalise = |v: Vec<f32>| {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.into_iter().map(|x| x / norm).collect::<Vec<f32>>()
+        };
+        let centres: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| normalise((0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect()))
+            .collect();
+        (0..n)
+            .map(|i| {
+                let centre = &centres[i % clusters];
+                normalise(
+                    centre
+                        .iter()
+                        .map(|c| c + rng.gen_range(-0.08..0.08))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn graph_config(dimension: usize) -> VamanaConfig {
+        VamanaConfig {
+            dimension,
+            max_degree: 32,
+            search_list_size: 100,
+            alpha: 1.2,
+            use_mmap: false,
+            ..Default::default()
+        }
+    }
+
+    /// Share of vectors that the index returns in the top 10 when queried with themselves.
+    fn self_recall(index: &VamanaIndex, vectors: &[Vec<f32>]) -> f32 {
+        let found = vectors
+            .iter()
+            .enumerate()
+            .filter(|(id, v)| {
+                index
+                    .search(v, 10)
+                    .unwrap()
+                    .iter()
+                    .any(|(hit, _)| *hit == *id as u32)
+            })
+            .count();
+        found as f32 / vectors.len() as f32
+    }
+
+    #[test]
+    fn vectors_inserted_one_at_a_time_stay_reachable() {
+        let vectors = clustered_unit_vectors(3000, 48, 40, 7);
+        let mut index = VamanaIndex::new(graph_config(48)).unwrap();
+        index.set_exact_search_max(0);
+        for v in &vectors {
+            index.add_vector(v.clone()).unwrap();
+        }
+        let recall = self_recall(&index, &vectors);
+        assert!(
+            recall >= 0.95,
+            "graph self-recall after incremental inserts: {recall}"
+        );
+    }
+
+    #[test]
+    fn a_built_graph_reaches_every_vector() {
+        let vectors = clustered_unit_vectors(3000, 48, 40, 11);
+        let mut index = VamanaIndex::new(graph_config(48)).unwrap();
+        index.set_exact_search_max(0);
+        index.build(vectors.clone()).unwrap();
+        let recall = self_recall(&index, &vectors);
+        assert!(recall >= 0.95, "graph self-recall after build: {recall}");
+    }
+
+    #[test]
+    fn small_indexes_are_searched_exactly_and_skip_deleted_vectors() {
+        let vectors = clustered_unit_vectors(500, 16, 5, 3);
+        let mut index = VamanaIndex::new(graph_config(16)).unwrap();
+        for v in &vectors {
+            index.add_vector(v.clone()).unwrap();
+        }
+        index.mark_deleted(9);
+        let query = &vectors[9];
+        let mut expected: Vec<(u32, f32)> = vectors
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| *id != 9)
+            .map(|(id, v)| {
+                (
+                    id as u32,
+                    -v.iter().zip(query).map(|(a, b)| a * b).sum::<f32>(),
+                )
+            })
+            .collect();
+        expected.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let got: Vec<u32> = index
+            .search(query, 10)
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let want: Vec<u32> = expected.iter().take(10).map(|(id, _)| *id).collect();
+        assert_eq!(got, want);
     }
 }

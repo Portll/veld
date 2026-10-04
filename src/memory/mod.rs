@@ -8629,3 +8629,133 @@ mod simulate_edge_aging_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod vector_index_reopen_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const NEEDLES: [&str; 6] = [
+        "quartz lighthouse ledger",
+        "saffron glacier compass",
+        "obsidian orchard lantern",
+        "velvet harbour almanac",
+        "copper tundra sextant",
+        "indigo canyon metronome",
+    ];
+
+    fn open(path: &std::path::Path) -> MemorySystem {
+        MemorySystem::new(
+            MemoryConfig {
+                storage_path: path.to_path_buf(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("memory system")
+    }
+
+    /// A memory long enough to be chunked, whose distinguishing phrase sits in its last chunk.
+    fn long_memory(needle: &str, n: usize) -> String {
+        let filler: String = (0..40)
+            .map(|j| format!("Routine note {j} on report {n}: backups ran inside the window. "))
+            .collect();
+        format!("{filler}The finding that matters is the {needle}.")
+    }
+
+    fn finds(sys: &MemorySystem, query: &str, target: &MemoryId) -> bool {
+        let query = Query {
+            query_text: Some(query.to_string()),
+            ..Default::default()
+        };
+        sys.retriever
+            .search_ids(&query, 5)
+            .expect("search")
+            .iter()
+            .any(|(id, _)| id == target)
+    }
+
+    fn remember_corpus(sys: &MemorySystem) -> Vec<(MemoryId, &'static str)> {
+        for i in 0..150 {
+            let content = format!("Short note {i}: the build passed on runner {i}.");
+            sys.remember(
+                Experience {
+                    content,
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("remember short");
+        }
+        NEEDLES
+            .iter()
+            .enumerate()
+            .map(|(n, needle)| {
+                let id = sys
+                    .remember(
+                        Experience {
+                            content: long_memory(needle, n),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .expect("remember long");
+                (id, *needle)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_memory_stays_findable_by_its_last_chunk_across_reopens_and_a_rebuild() {
+        let tmp = TempDir::new().expect("temp dir");
+        let long = {
+            let sys = open(tmp.path());
+            let long = remember_corpus(&sys);
+            for (id, needle) in &long {
+                assert!(finds(&sys, needle, id), "fresh: {needle}");
+            }
+            sys.flush_storage().expect("flush");
+            long
+        };
+
+        let marker = tmp
+            .path()
+            .join("vector_index")
+            .join(super::retrieval::MAPPINGS_MARKER_FILE);
+        assert!(
+            marker.exists(),
+            "a save marks the stored mappings authoritative"
+        );
+
+        {
+            let sys = open(tmp.path());
+            for (id, needle) in &long {
+                assert!(
+                    finds(&sys, needle, id),
+                    "reopened from the saved index: {needle}"
+                );
+            }
+            sys.flush_storage().expect("flush");
+        }
+
+        std::fs::remove_file(&marker).expect("remove marker");
+        {
+            let sys = open(tmp.path());
+            for (id, needle) in &long {
+                assert!(
+                    finds(&sys, needle, id),
+                    "after a rebuild from storage: {needle}"
+                );
+            }
+            sys.flush_storage().expect("flush");
+        }
+
+        let sys = open(tmp.path());
+        for (id, needle) in &long {
+            assert!(
+                finds(&sys, needle, id),
+                "reopened after the rebuild: {needle}"
+            );
+        }
+    }
+}
