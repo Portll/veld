@@ -77,6 +77,14 @@ jobs:
         if: steps.models.outputs.cache-hit != 'true'
         run: cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime --minilm
 
+      # The cross-encoder downloads itself on first use; the models cache above is saved only on
+      # a miss, so without this it would download every run, and a failed download in one repeat
+      # makes the repeats diverge.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/veld/cross-encoder
+          key: veld-cross-encoder-${{ runner.os }}-${{ hashFiles('src/embeddings/cross_encoder.rs') }}
+
       - name: Build recall-eval
         run: cargo build --release --bin recall-eval ${{ matrix.features }}
 
