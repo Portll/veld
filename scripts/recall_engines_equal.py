@@ -3,8 +3,9 @@
 
   recall_engines_equal.py <rocksdb report.json> <redb report.json>
 
-The storage engine holds the memories and the graph; it must not move a ranking. Every metric in
-`layers` and `by_category` is compared, and any difference is printed and fails the run.
+The storage engine holds the memories and the graph; it must not move a ranking. Every score in
+`layers` and `by_category` is compared, and any difference is printed and fails the run. Latencies
+are wall-clock times from two different runners, so they are left out.
 """
 import json
 import sys
@@ -17,11 +18,11 @@ def metrics(report):
     out = {}
     for layer, values in (report.get("layers") or {}).items():
         for name, value in (values or {}).items():
-            if isinstance(value, (int, float)):
+            if isinstance(value, (int, float)) and not name.startswith("latency_"):
                 out[f"layers.{layer}.{name}"] = value
     for category, values in (report.get("by_category") or {}).items():
         for name, value in (values or {}).items():
-            if isinstance(value, (int, float)):
+            if isinstance(value, (int, float)) and not name.startswith("latency_"):
                 out[f"by_category.{category}.{name}"] = value
     return out
 
