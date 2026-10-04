@@ -83,6 +83,13 @@ of both trees on 2026-10-03; `LEDGER.tsv` carries the per-commit result.
 0.4 **CI shows clippy's verdict.** The clippy step pipes through `tee` without `pipefail`, which hides
     two deny-level errors in `tests/adaptive_memory_tests.rs` and `tests/memory_tiering_tests.rs`;
     fix both and set `pipefail`.
+0.1a **Gate status (2026-10-04).** Merge pass and tombstone GC on redb: done (one
+    implementation over the traits; the coverage matrix has no gap). Encryption-v2 on redb: done.
+    Backup and point-in-time restore parity: done; the parity test found a RocksDB restore that
+    deleted the tenant's data, fixed. Equal recall-gate scores: the gate runs, but veld's pipeline
+    gives different rankings between repeats on fresh stores, which blocks an equality check
+    until it is deterministic. 14-day live soak: needs the operator, since live runs RocksDB; a
+    daily soak rehearsal on a clone can run meanwhile.
 0.5 **Live back on RocksDB, with writes frozen.** Done 2026-10-03: rehearsed on an APFS clone
     (78 s migration, census and probes checked), then run on the stopped live store. Steps:
     1. Set aside the 6 pre-cutover RocksDB stores, since migrate refuses a target that holds records.
@@ -147,9 +154,13 @@ of both trees on 2026-10-03; `LEDGER.tsv` carries the per-commit result.
     - Hotspot files take SPINE file claims for the length of a wave: `graph_memory.rs`,
       `memory/mod.rs`, `handlers/state.rs`, `memory/storage.rs`, `handlers/recall.rs` and the
       rest of the top 25.
-1.8 **Performance budget.** Set latency budgets for `/api/recall`, `/api/relevant` and remember
-    before W2 and W6, measured on a live clone. `/api/relevant` takes 16-37 s today, with the
-    default settings.
+1.8 **Performance budget.** Budgets for `/api/recall`, `/api/relevant` and remember are in
+    `latency-budgets.json`, measured on 2026-10-04 on a clone of the live store:
+    `scripts/upstream/latency_probe.py --budgets docs/upstream/latency-budgets.json` checks them.
+    p95 budgets: recall 30 s, relevant 60 s (the request timeout), remember 1 s. The machine's
+    load moved between 22 and 70 during the measurement and the cross-encoder rerank dominates
+    every recall, so these catch a gross regression, not upstream's +190 ms per recall; a port
+    that changes ranking cost is measured on a quiet machine before and after.
 
 ## Phase 2: catch-up waves
 
@@ -169,7 +180,7 @@ Waves run in this order because each needs the one before it, or carries more ri
 | Wave | Upstream work | Notes for veld |
 |---|---|---|
 | W0 Measurement | recall harness and eval gates: RH #271–#281, #312, #328, #548, #561, #570 | the harness is mostly ported; the gate binary and workflow are not |
-| W1 Fixes and security | storage and integrity fixes, #559 audit writes, the security commits (#399, #492, #513, #518 partly in) | #399 enforces HTTPS by default. veld serves loopback with its own auth, so W1 opens with an ADR deciding that default for loopback clients (desktop, MCP, hooks) before #399 is ported |
+| W1 Fixes and security | storage and integrity fixes, #559 audit writes, the security commits (#399, #492, #513, #518 partly in) | #513 turns `ENFORCE_HTTPS` on by default, but it governs only outbound integration-API URL overrides (Linear, GitHub), so it ports without touching loopback clients. #399 adds an authenticated local IPC transport (owner-scoped Unix socket or named pipe, mutual auth, on by default); W1 opens with an ADR deciding whether veld's loopback clients (desktop, MCP, hooks) take it beside HTTP with the API key |
 | W2 Retrieval and ranking | #181 temporal credit, #320, #324, #536 cross-encoder by default, #538 (in), #560, #562, FLAT fusion, PPR | veld has its own cross-encoder registry and LLM refiner; reconcile, then measure: upstream reports p@1 0.33→0.49 and +190 ms per recall |
 | W3 Knowledge graph | #213 curvature, #321, #323, #336/#364, #340, #442 (in), #461, #509; `relation_stats` column family; four edge tail fields | veld decays edges exponentially, upstream by power law: measure both and record the choice; veld still makes the CoRetrieved edges upstream stopped making |
 | W4 Causal lineage | #330, #389 (partly in), #419; `RelationType::Precedes`; `/api/lineage/root-cause` | veld's lineage test is skipped today; upstream reports root-cause P@1 0→0.867 |
@@ -280,7 +291,7 @@ answer them:
 
 - the write-frozen cutover and its rollback window (F1, F2);
 - old-shape fixtures and pinned discriminants (F3, F4);
-- the route and tool auth inventory (F5), and the #399 ADR (F6);
+- the route and tool auth inventory (F5), and the #399 ADR (F6; re-read on 2026-10-04: #513's HTTPS default covers only outbound integration URLs, and #399 is a local IPC transport, so F6's loopback-HTTPS concern does not arise);
 - the attribution check (F7), the watcher heartbeat (F8) and the trait parity test (F9);
 - veld-against-veld gating (F10) and SPINE claims on hotspot files (F11).
 
