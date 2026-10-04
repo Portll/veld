@@ -733,6 +733,101 @@ pub fn record_epoch(data: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes([data[5], data[6], data[7], data[8]]))
 }
 
+/// A keystore unsealed for record-level encryption: one cryptor per epoch, the
+/// index blinder, and the generation a store's rollback sentinel is checked against.
+pub struct UnsealedRecordKeys {
+    pub cryptors: RecordCryptors,
+    pub blinder: IndexBlinder,
+    pub generation: u64,
+}
+
+/// Open the keystore at `keystore_path` for a store's records, on either engine.
+///
+/// Unsealed with `VELD_MASTER_PASSPHRASE`, or `VELD_KMS_WRAP_KEY` when no
+/// passphrase is set. With a passphrase and no keystore, one is created. `None`
+/// when there is neither a keystore nor a passphrase: a plaintext store. A
+/// keystore present but not unsealable is an error, so ciphertext is never served
+/// as plaintext. Integrity is verified before the keys are returned.
+pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<UnsealedRecordKeys>> {
+    let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    let (ks, kek) = match (keystore_path.exists(), passphrase) {
+        (true, Some(pass)) => {
+            let json =
+                std::fs::read_to_string(keystore_path).context("Failed to read keystore.json")?;
+            let ks = Keystore::from_json(&json)?;
+            let kek = ks.unseal_with_passphrase(&pass)?;
+            tracing::info!("Record-level encryption: keystore unsealed (passphrase)");
+            (ks, kek)
+        }
+        (true, None) => {
+            let json =
+                std::fs::read_to_string(keystore_path).context("Failed to read keystore.json")?;
+            let ks = Keystore::from_json(&json)?;
+            let kms = LocalAeadKms::from_env()?.ok_or_else(|| {
+                anyhow!(
+                    "keystore.json is present but neither VELD_MASTER_PASSPHRASE nor \
+                     VELD_KMS_WRAP_KEY is set; refusing to start (encrypted records would be \
+                     served as ciphertext)"
+                )
+            })?;
+            let kek = ks.unseal_with_kms(&kms)?;
+            tracing::info!("Record-level encryption: keystore unsealed (KMS)");
+            (ks, kek)
+        }
+        (false, Some(pass)) => {
+            let ks = Keystore::create(&pass, KdfParams::production())?;
+            ks.save_to_path(keystore_path)
+                .context("Failed to write keystore.json")?;
+            let kek = ks.unseal_with_passphrase(&pass)?;
+            tracing::info!("Created new encryption keystore at {keystore_path:?}");
+            (ks, kek)
+        }
+        (false, None) => return Ok(None),
+    };
+
+    ks.verify_integrity(&kek)
+        .context("keystore integrity verification failed")?;
+    Ok(Some(UnsealedRecordKeys {
+        cryptors: RecordCryptors::from_keystore(&ks, &kek)?,
+        blinder: IndexBlinder::derive_from_kek(&kek),
+        generation: ks.generation,
+    }))
+}
+
+/// The rollback guard's decision for a store whose sentinel holds `stored` and
+/// whose keystore file is at `generation`. `Ok(Some(g))`: write `g` to the
+/// sentinel. `Ok(None)`: leave it. An older keystore is refused unless
+/// `VELD_ALLOW_KEYSTORE_ROLLBACK` accepts it for this start.
+pub fn keystore_generation_sentinel(stored: u64, generation: u64) -> Result<Option<u64>> {
+    if generation < stored {
+        let allow_rollback = std::env::var("VELD_ALLOW_KEYSTORE_ROLLBACK")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "true" || v == "1"
+            })
+            .unwrap_or(false);
+        if !allow_rollback {
+            return Err(anyhow!(
+                "keystore rollback detected: file generation {generation} < last-seen {stored}. \
+                 If you intentionally restored an older keystore (e.g. keystore.json.bak), set \
+                 VELD_ALLOW_KEYSTORE_ROLLBACK=true once to accept it and reset the sentinel."
+            ));
+        }
+        tracing::warn!(
+            file_generation = generation,
+            last_seen = stored,
+            "VELD_ALLOW_KEYSTORE_ROLLBACK set: accepting an older keystore generation (restored \
+             keystore?) and resetting the rollback sentinel to it. Rollback protection is \
+             bypassed for this start — unset the variable afterward."
+        );
+        return Ok(Some(generation));
+    }
+    Ok((generation > stored).then_some(generation))
+}
+
 /// Decrypt an encrypted record blob with the DEK for its epoch. The caller is
 /// responsible for selecting `dek` matching [`record_epoch`].
 pub fn decrypt_record(dek: &SecretKey, data: &[u8], aad_ctx: &[u8]) -> Result<Vec<u8>> {
