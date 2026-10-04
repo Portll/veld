@@ -19,7 +19,7 @@ what order, and which of veld's own layers stay on top.
 git remote add upstream https://github.com/varun29ankuS/shodh-memory.git
 git fetch upstream
 scripts/upstream/ledger.py sync    # appends new upstream commits as pending
-scripts/upstream/ledger.py check   # every status valid, every reason present, every veld commit real
+scripts/upstream/ledger.py check   # every status valid, every reason present, every veld commit real and attributed
 ```
 
 `RELEASES.tsv` records each upstream release tag: `before-fork` for tags the fork already
@@ -37,3 +37,6 @@ rejected 4 of 4 hunks (one file absent in veld), #330 3 of 3 and #425 19 of 34; 
 `--context 1`, 3 of 4, 3 of 3 and 14 of 34. A port is written by hand from that guide, through
 the storage traits.
 
+A port commit made from 2026-10-04 on names its upstream PR (`#559`) or commit (`355e0b7`) in
+its message, and `check` fails on one that does not. The ports made before then are recorded in
+the ledger instead; their commit messages mostly do not name the PR.
