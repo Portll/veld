@@ -366,13 +366,23 @@ impl SemanticFactStore {
         }
     }
 
-    /// Update an existing fact (for reinforcement)
+    /// Update an existing fact (for reinforcement). The entity and type indices are rebuilt,
+    /// since the update may change the fact's entities or type.
     pub fn update(&self, user_id: &str, fact: &SemanticFact) -> Result<()> {
-        // Simply overwrite - indices stay valid since ID doesn't change
-        let key = format!("facts:{}:{}", user_id, fact.id);
-        let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
-        self.store.put_bytes(key.as_bytes(), &value)?;
-        Ok(())
+        if let Some(old) = self.get(user_id, &fact.id)? {
+            for entity in &old.related_entities {
+                let entity_key = format!(
+                    "facts_by_entity:{}:{}:{}",
+                    user_id,
+                    entity.to_lowercase(),
+                    fact.id
+                );
+                self.store.delete_bytes(entity_key.as_bytes())?;
+            }
+            let type_key = format!("facts_by_type:{}:{:?}:{}", user_id, old.fact_type, fact.id);
+            self.store.delete_bytes(type_key.as_bytes())?;
+        }
+        self.store(user_id, fact)
     }
 
     /// Delete a fact
@@ -1094,6 +1104,37 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "fact-1");
+    }
+
+    #[test]
+    fn test_update_rebuilds_entity_and_type_indices() {
+        on_both_backends(test_update_rebuilds_entity_and_type_indices_body);
+    }
+
+    fn test_update_rebuilds_entity_and_type_indices_body(store: SemanticFactStore) {
+        let mut fact = create_test_fact("fact-1", "Rust has efficient memory management");
+        store.store("user-1", &fact).unwrap();
+
+        fact.related_entities = vec!["tokio".to_string()];
+        fact.fact_type = FactType::Preference;
+        store.update("user-1", &fact).unwrap();
+
+        assert!(store
+            .find_by_entity("user-1", "rust", 10)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .find_by_type("user-1", FactType::Pattern, 10)
+            .unwrap()
+            .is_empty());
+        let by_entity = store.find_by_entity("user-1", "tokio", 10).unwrap();
+        assert_eq!(by_entity.len(), 1);
+        assert_eq!(by_entity[0].related_entities, vec!["tokio".to_string()]);
+        let by_type = store
+            .find_by_type("user-1", FactType::Preference, 10)
+            .unwrap();
+        assert_eq!(by_type.len(), 1);
+        assert_eq!(by_type[0].id, "fact-1");
     }
 
     #[test]
