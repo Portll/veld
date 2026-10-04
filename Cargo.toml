@@ -167,6 +167,7 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }  # Pa
 # Async runtime & web server
 tokio = { version = "1.48", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }  # SSE event streaming (sync for BroadcastStream)
+tokio-util = { version = "0.7", features = ["rt"] }  # TaskTracker: shutdown waits for background writes
 futures = "0.3"  # Stream utilities for SSE
 axum = { version = "0.8", features = ["json", "ws"] }
 tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
@@ -202,7 +203,6 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 # driver); it ships its own TDS protocol stack. tokio-util/compat adapts a
 # tokio TcpStream into the futures AsyncRead/Write tiberius expects.
 tiberius = { version = "0.12", optional = true }
-tokio-util = { version = "0.7", optional = true, features = ["compat"] }
 
 # Concurrency
 parking_lot = "0.12"
@@ -475,7 +475,7 @@ postgres = ["sqlx/postgres"]
 # Microsoft SQL Server backend (W4-D). Opt-in: tiberius pulls a heavy TDS
 # protocol stack (its own wire codec, TLS, auth). Off by default so the
 # standard build stays SQLite-only.
-mssql = ["dep:tiberius", "dep:tokio-util"]
+mssql = ["dep:tiberius", "tokio-util/compat"]
 
 # Python bindings for PyO3
 python = ["pyo3", "numpy"]

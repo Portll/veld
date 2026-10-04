@@ -24,7 +24,8 @@ use crate::{
 use crate::tracing_setup;
 
 use crate::constants::{
-    DATABASE_FLUSH_TIMEOUT_SECS, GRACEFUL_SHUTDOWN_TIMEOUT_SECS, VECTOR_INDEX_SAVE_TIMEOUT_SECS,
+    BACKGROUND_TASK_DRAIN_TIMEOUT_SECS, DATABASE_FLUSH_TIMEOUT_SECS,
+    GRACEFUL_SHUTDOWN_TIMEOUT_SECS, VECTOR_INDEX_SAVE_TIMEOUT_SECS,
 };
 
 // Timeout for draining in-flight requests (server-specific, not in constants.rs)
@@ -793,6 +794,24 @@ async fn run_shutdown_cleanup(manager: AppState) {
     info!("Proceeding with database flush...");
 
     let cleanup_future = async {
+        info!(
+            "Waiting up to {}s for background tasks...",
+            BACKGROUND_TASK_DRAIN_TIMEOUT_SECS
+        );
+        if manager
+            .drain_background_tasks(std::time::Duration::from_secs(
+                BACKGROUND_TASK_DRAIN_TIMEOUT_SECS,
+            ))
+            .await
+        {
+            info!("Background tasks completed");
+        } else {
+            warn!(
+                "Background task drain timed out after {}s; flushing anyway",
+                BACKGROUND_TASK_DRAIN_TIMEOUT_SECS
+            );
+        }
+
         // Flush databases (blocking operation, must use spawn_blocking)
         let manager_for_flush = Arc::clone(&manager);
         let flush_handle =

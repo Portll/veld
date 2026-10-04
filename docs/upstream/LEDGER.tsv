@@ -17,7 +17,7 @@ in	9a81dd7f	180	2026-03-29	lineage	W4	pending
 in	7b70730a	181	2026-03-30	mcp-hooks	W9	pending		
 in	2092c858		2026-03-30	http-api	W10	pending		
 in	59dae70f	183	2026-03-31	security	W1	pending		
-in	7a0f0357	191	2026-03-31	http-api	W10	pending		
+in	7a0f0357	191	2026-03-31	http-api	W10	partial		#188 ported (15931cf8): a TaskTracker on the manager, drained at shutdown before the flush; veld tracks remember, batch remember, deferred embedding, ingest and todo-memory writes. #184-#187, #189, #190 and the BatchRememberOptions and branch-signal fixes not yet triaged
 in	6653000d	194	2026-04-01	storage-integrity	W7	pending		
 in	aa387b9e	195	2026-04-01	mcp-hooks	W9	pending		
 in	2f8ab23f	196	2026-04-01	mcp-hooks	W9	pending		
