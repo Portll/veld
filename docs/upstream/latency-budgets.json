@@ -1,0 +1,15 @@
+{
+  "measured": "2026-10-04, APFS clone of the live store on RocksDB (veld 0.7.39+6, nomic embedder on llama-server), 10 runs after a warm-up, machine load average 22 rising to 70",
+  "observed_ms": {
+    "recall": { "p50": 5335, "p95": 25271 },
+    "relevant": { "p50": 9176, "p95": 60080 },
+    "relevant_entities": { "p50": 12862, "p95": 57254 },
+    "remember": { "p50": 218, "p95": 716 }
+  },
+  "p95_ms": {
+    "recall": 30000,
+    "relevant": 60000,
+    "relevant_entities": 60000,
+    "remember": 1000
+  }
+}
