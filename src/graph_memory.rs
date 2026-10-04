@@ -2766,22 +2766,23 @@ impl GraphMemory {
                 }
             }
 
-            // Pick best candidate: highest salience, then shortest name for ties
+            // Pick best candidate: highest salience, then shortest name, then the name itself.
+            // Candidates come from map iteration, so the last key keeps equal (salience,
+            // length) pairs from resolving to whichever entity the hash order visits first.
             if !candidates.is_empty() {
-                let mut best: Option<(Uuid, f32, usize)> = None; // (uuid, salience, name_len)
+                let mut best: Option<(Uuid, f32, &String)> = None;
                 for (uuid, name) in &candidates {
                     let salience = self.get_entity(uuid)?.map(|e| e.salience).unwrap_or(0.0);
-                    match &best {
-                        Some((_, best_sal, best_len))
-                            if salience > *best_sal
-                                || (salience == *best_sal && name.len() < *best_len) =>
-                        {
-                            best = Some((*uuid, salience, name.len()));
-                        }
-                        None => {
-                            best = Some((*uuid, salience, name.len()));
-                        }
-                        _ => {}
+                    let better = match &best {
+                        None => true,
+                        Some((_, best_sal, best_name)) => salience
+                            .total_cmp(best_sal)
+                            .then_with(|| best_name.len().cmp(&name.len()))
+                            .then_with(|| best_name.as_str().cmp(name.as_str()))
+                            .is_gt(),
+                    };
+                    if better {
+                        best = Some((*uuid, salience, name));
                     }
                 }
                 if let Some((uuid, _, _)) = best {
@@ -3245,6 +3246,62 @@ impl GraphMemory {
             let sb = strength_cache.get(&b.uuid).copied().unwrap_or(0.0);
             sb.total_cmp(&sa)
         });
+
+        // Phase 3.1: equal-strength runs arrive in edge-UUID order, which is random per ingest,
+        // and the limit below cuts through them on hub entities. Order each run by (peer entity
+        // name, relation type, uuid), as the degree-cap prune does, so two stores built from the
+        // same content keep the same edges. Names are looked up only inside runs of two or more.
+        {
+            let peer_of = |e: &RelationshipEdge| -> Uuid {
+                if e.from_entity == *entity_uuid {
+                    e.to_entity
+                } else {
+                    e.from_entity
+                }
+            };
+            let strength_bits = |e: &RelationshipEdge| -> u32 {
+                strength_cache
+                    .get(&e.uuid)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .to_bits()
+            };
+            let mut peer_names: HashMap<Uuid, String> = HashMap::new();
+            let mut start = 0;
+            while start < edges.len() {
+                let bits = strength_bits(&edges[start]);
+                let mut end = start + 1;
+                while end < edges.len() && strength_bits(&edges[end]) == bits {
+                    end += 1;
+                }
+                if end - start > 1 {
+                    for e in &edges[start..end] {
+                        let peer = peer_of(e);
+                        peer_names.entry(peer).or_insert_with(|| {
+                            self.get_entity(&peer)
+                                .ok()
+                                .flatten()
+                                .map(|ent| ent.name)
+                                .unwrap_or_default()
+                        });
+                    }
+                    edges[start..end].sort_by(|a, b| {
+                        peer_names[&peer_of(a)]
+                            .cmp(&peer_names[&peer_of(b)])
+                            .then_with(|| {
+                                format!("{:?}", a.relation_type)
+                                    .cmp(&format!("{:?}", b.relation_type))
+                            })
+                            .then_with(|| {
+                                (b.from_entity == *entity_uuid)
+                                    .cmp(&(a.from_entity == *entity_uuid))
+                            })
+                            .then_with(|| a.uuid.cmp(&b.uuid))
+                    });
+                }
+                start = end;
+            }
+        }
 
         // Phase 3.5: Opportunistic pruning — queue edges that have decayed below
         // their tier's threshold for batch deletion on next maintenance cycle.
@@ -9924,5 +9981,98 @@ mod ablation_gate_tests {
             Some(v) => std::env::set_var("VELD_EVAL_NOW", v),
             None => std::env::remove_var("VELD_EVAL_NOW"),
         }
+    }
+}
+
+#[cfg(test)]
+mod repeat_stable_order_tests {
+    use super::*;
+
+    fn entity(name: &str, salience: f32) -> EntityNode {
+        EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        }
+    }
+
+    fn edge(from: Uuid, to: Uuid, strength: f32) -> RelationshipEdge {
+        // Activated in the future, so no clock (live or pinned) decays it.
+        let future = DateTime::parse_from_rfc3339("2100-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::RelatedTo,
+            strength,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: future,
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            tier: EdgeTier::L1Working,
+            activation_timestamps: None,
+            entity_confidence: None,
+            created_by: EdgeSource::CoOccurrence,
+            forward_strength: strength,
+            backward_strength: strength,
+        }
+    }
+
+    #[test]
+    fn equal_strength_edges_under_a_limit_follow_peer_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let hub = graph.add_entity(entity("hub", 0.5)).unwrap();
+        let mut names: Vec<String> = (0..16).map(|i| format!("peer-{i:02}")).collect();
+        names.reverse();
+        for name in &names {
+            let peer = graph.add_entity(entity(name, 0.5)).unwrap();
+            graph.add_relationship(edge(hub, peer, 0.3)).unwrap();
+        }
+        let strongest = graph.add_entity(entity("zz-strong", 0.5)).unwrap();
+        graph.add_relationship(edge(hub, strongest, 0.9)).unwrap();
+
+        let edges = graph
+            .get_entity_relationships_limited(&hub, Some(5))
+            .unwrap();
+        let peers: Vec<String> = edges
+            .iter()
+            .map(|e| graph.get_entity(&e.to_entity).unwrap().unwrap().name)
+            .collect();
+        assert_eq!(
+            peers,
+            ["zz-strong", "peer-00", "peer-01", "peer-02", "peer-03"],
+            "strength first, then peer name; edge uuids must not choose the survivors"
+        );
+    }
+
+    #[test]
+    fn fuzzy_lookup_breaks_salience_and_length_ties_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        // Proper nouns skip the stemmed dedup tier, so all ten stay distinct entities.
+        for suffix in ["j", "c", "h", "a", "f", "b", "i", "d", "g", "e"] {
+            let mut node = entity(&format!("Broke{suffix}"), 0.4);
+            node.is_proper_noun = true;
+            graph.add_entity(node).unwrap();
+        }
+        assert_eq!(graph.get_all_entities().unwrap().len(), 10);
+        let found = graph.find_entity_by_name("rok").unwrap().unwrap();
+        assert_eq!(found.name, "Brokea");
     }
 }
