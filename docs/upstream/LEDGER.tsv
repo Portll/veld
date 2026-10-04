@@ -261,7 +261,7 @@ in	d892dfef	520	2026-08-29	eval	W0	pending
 in	844d4358	493	2026-08-29	embeddings-vectors	W8	pending		
 in	0966441b	516	2026-08-29	web-ui	W11	pending		bumps front/ui, the React app W11 brings in; veld has no front/, so this closes with W11's import of front/ at upstream's current state
 in	e82b7149	523	2026-08-29	web-ui	W11	pending		
-in	41c2bd08	506	2026-08-29	infra	W1	pending		veld's Cargo.toml has no [profile.dev] or [profile.test]; only CI turns debug info off (CARGO_PROFILE_DEV_DEBUG and CARGO_PROFILE_TEST_DEBUG=0, 87a56fc9)
+in	41c2bd08	506	2026-08-29	infra	W1	ported		
 in	3eb23f1b	498	2026-08-29	embeddings-vectors	W8	pending		
 in	171ae467	503	2026-08-29	eval	W0	pending		
 in	699033ca	504	2026-08-29	ner-entities	W6	pending		
