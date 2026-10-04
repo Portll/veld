@@ -451,6 +451,106 @@ async fn remember_with_tags_and_type() {
 }
 
 #[tokio::test]
+async fn unknown_memory_type_is_rejected_not_stored_as_observation() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({
+                "user_id": "test-user",
+                "content": "A memory whose type is a typo.",
+                "memory_type": "Decsion"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("Decsion"), "{body}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember/batch",
+            json!({
+                "user_id": "test-user",
+                "memories": [
+                    {"content": "First batch item with a valid type.", "memory_type": "Learning"},
+                    {"content": "Second batch item with a typo type.", "memory_type": "Lerning"}
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], 1, "{body}");
+    assert_eq!(body["failed"], 1, "{body}");
+    assert_eq!(body["errors"][0]["index"], 1, "{body}");
+}
+
+#[tokio::test]
+async fn todo_filters_and_fields_reject_unknown_values() {
+    let h = Harness::new();
+    for (uri, body) in [
+        (
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Bad status", "status": "finished"}),
+        ),
+        (
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Bad priority", "priority": "critical"}),
+        ),
+        (
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Bad recurrence", "recurrence": "yearly"}),
+        ),
+        (
+            "/api/todos",
+            json!({"user_id": "test-user", "status": ["todo", "finished"]}),
+        ),
+        (
+            "/api/todos",
+            json!({"user_id": "test-user", "due": "tomorrow"}),
+        ),
+        (
+            "/api/todos",
+            json!({"user_id": "test-user", "priority": "critical"}),
+        ),
+        (
+            "/api/reminders",
+            json!({"user_id": "test-user", "status": "snoozed"}),
+        ),
+    ] {
+        let (status, resp) = json_of(h.app(), authed_post(uri, body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}: {resp}");
+    }
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/todos", json!({"user_id": "test-user", "due": "all"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "due=all lists everything: {body}");
+}
+
+#[tokio::test]
+async fn multimodal_search_refuses_modes_it_cannot_parameterise() {
+    let h = Harness::new();
+    for mode in ["spatial", "mission"] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/search/multimodal",
+                json!({"user_id": "test-user", "query_text": "dock", "mode": mode}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{mode}: {body}");
+        assert!(body.to_string().contains("/api/search/robotics"), "{body}");
+    }
+}
+
+#[tokio::test]
 async fn batch_remember() {
     let h = Harness::new();
     let (status, _) = json_of(

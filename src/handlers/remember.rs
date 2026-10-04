@@ -199,26 +199,36 @@ pub struct UpsertResponse {
 // HELPER FUNCTIONS
 // =============================================================================
 
-/// Parse memory type from string
-pub fn parse_experience_type(s: Option<&String>) -> ExperienceType {
-    s.and_then(|s| match s.to_lowercase().as_str() {
-        "observation" => Some(ExperienceType::Observation),
-        "decision" => Some(ExperienceType::Decision),
-        "learning" => Some(ExperienceType::Learning),
-        "error" => Some(ExperienceType::Error),
-        "discovery" => Some(ExperienceType::Discovery),
-        "pattern" => Some(ExperienceType::Pattern),
-        "context" => Some(ExperienceType::Context),
-        "task" => Some(ExperienceType::Task),
-        "codeedit" | "code_edit" => Some(ExperienceType::CodeEdit),
-        "fileaccess" | "file_access" => Some(ExperienceType::FileAccess),
-        "search" => Some(ExperienceType::Search),
-        "command" => Some(ExperienceType::Command),
-        "conversation" => Some(ExperienceType::Conversation),
-        "intention" => Some(ExperienceType::Intention),
-        _ => None,
-    })
-    .unwrap_or(ExperienceType::Observation)
+/// Parse a memory type. No type means `Observation`; an unknown type is a 400, not a silent
+/// `Observation`.
+pub fn parse_experience_type(s: Option<&String>) -> Result<ExperienceType, AppError> {
+    let Some(s) = s else {
+        return Ok(ExperienceType::Observation);
+    };
+    match s.to_lowercase().as_str() {
+        "observation" => Ok(ExperienceType::Observation),
+        "decision" => Ok(ExperienceType::Decision),
+        "learning" => Ok(ExperienceType::Learning),
+        "error" => Ok(ExperienceType::Error),
+        "discovery" => Ok(ExperienceType::Discovery),
+        "pattern" => Ok(ExperienceType::Pattern),
+        "context" => Ok(ExperienceType::Context),
+        "task" => Ok(ExperienceType::Task),
+        "codeedit" | "code_edit" => Ok(ExperienceType::CodeEdit),
+        "fileaccess" | "file_access" => Ok(ExperienceType::FileAccess),
+        "search" => Ok(ExperienceType::Search),
+        "command" => Ok(ExperienceType::Command),
+        "conversation" => Ok(ExperienceType::Conversation),
+        "intention" => Ok(ExperienceType::Intention),
+        _ => Err(AppError::InvalidInput {
+            field: "type".to_string(),
+            reason: format!(
+                "Unknown memory type '{s}'. Valid types: Observation, Decision, Learning, \
+                 Error, Discovery, Pattern, Context, Task, CodeEdit, FileAccess, Search, Command, \
+                 Conversation, Intention"
+            ),
+        }),
+    }
 }
 
 /// Parse source type from string
@@ -539,7 +549,7 @@ pub async fn remember(
         (req.content.clone(), vec![])
     };
 
-    let experience_type = parse_experience_type(req.memory_type.as_ref());
+    let experience_type = parse_experience_type(req.memory_type.as_ref())?;
 
     // PERF: Run NER and YAKE extraction in parallel using spawn_blocking
     // Both are CPU-bound and independent - parallelization reduces latency by ~40%
@@ -1256,7 +1266,7 @@ pub async fn batch_remember(
 
     // Pre-validate all items
     let mut validation_errors: Vec<BatchErrorItem> = Vec::new();
-    let mut valid_items: Vec<(usize, BatchMemoryItem)> = Vec::new();
+    let mut valid_items: Vec<(usize, BatchMemoryItem, ExperienceType)> = Vec::new();
 
     let mut seen_content: HashSet<u64> = HashSet::new();
     for (index, item) in req.memories.into_iter().enumerate() {
@@ -1285,7 +1295,17 @@ pub async fn batch_remember(
             });
             continue;
         }
-        valid_items.push((index, item));
+        let experience_type = match parse_experience_type(item.memory_type.as_ref()) {
+            Ok(t) => t,
+            Err(e) => {
+                validation_errors.push(BatchErrorItem {
+                    index,
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        };
+        valid_items.push((index, item, experience_type));
     }
 
     let memory = state
@@ -1306,11 +1326,10 @@ pub async fn batch_remember(
     )> = Vec::with_capacity(valid_items.len());
     let mut parent_ids: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
 
-    for (index, item) in valid_items {
+    for (index, item, experience_type) in valid_items {
         if let Some(ref pid) = item.parent_id {
             parent_ids.insert(index, pid.clone());
         }
-        let experience_type = parse_experience_type(item.memory_type.as_ref());
 
         let (merged_entities, ner_records) = if extract_entities {
             // NER for named entities (Person, Org, Location, Misc)
@@ -1763,7 +1782,7 @@ pub async fn upsert_memory(
         });
     }
 
-    let experience_type = parse_experience_type(req.memory_type.as_ref());
+    let experience_type = parse_experience_type(req.memory_type.as_ref())?;
 
     let change_type = match req.change_type.to_lowercase().as_str() {
         "created" => ChangeType::Created,

@@ -718,7 +718,10 @@ pub async fn recall(
                 facts
             })
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!("Fact fetch task panicked: {e} — facts excluded from recall");
+                Vec::new()
+            })
         };
 
         // Deduplicate by fact ID and take top 5 by confidence
@@ -789,7 +792,12 @@ pub async fn recall(
                 edges
             })
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Lineage edge fetch task panicked: {e} — lineage excluded from recall"
+                );
+                Vec::new()
+            })
         } else {
             Vec::new()
         }
