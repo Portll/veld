@@ -70,16 +70,20 @@ impl Harness {
 
     #[cfg(feature = "storage-redb")]
     fn new_redb() -> Self {
+        Self::with_backend(veld::config::StorageBackend::Redb)
+    }
+
+    fn with_backend(backend: veld::config::StorageBackend) -> Self {
         init_env();
         let dir = TempDir::new().expect("create temp dir");
         let cfg = ServerConfig {
             storage_path: dir.path().to_path_buf(),
             backup_enabled: false,
-            effective_storage_backend: veld::config::StorageBackend::Redb,
+            effective_storage_backend: backend,
             ..ServerConfig::default()
         };
         let mgr = MultiUserMemoryManager::new(dir.path().to_path_buf(), cfg)
-            .expect("create redb MultiUserMemoryManager");
+            .unwrap_or_else(|e| panic!("create {backend} MultiUserMemoryManager: {e:#}"));
         Self {
             mgr: Arc::new(mgr),
             _dir: dir,
@@ -1243,6 +1247,142 @@ async fn redb_backup_routes_create_list_verify_purge_and_restore() {
     )
     .await;
     assert_eq!(body["count"], 1, "{body}");
+}
+
+/// What one engine's backup and point-in-time restore left behind.
+#[cfg(all(feature = "rocksdb", feature = "storage-redb"))]
+#[derive(Debug, PartialEq)]
+struct RestoredState {
+    contents: Vec<String>,
+    kept_entity: bool,
+    later_entity: bool,
+    journal_ends_at_max_lsn: bool,
+}
+
+/// Three memories and an entity, a backup, a fourth memory and a second entity,
+/// then a restore of the backup truncated to the middle of the journal.
+#[cfg(all(feature = "rocksdb", feature = "storage-redb"))]
+async fn backup_then_point_in_time_restore(h: &Harness) -> RestoredState {
+    let user = "parity-user";
+    for content in [
+        "alpha: the river floods every spring",
+        "beta: the pass closes after the first snow",
+        "gamma: the dunes move east each year",
+    ] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember",
+                json!({"user_id": user, "content": content}),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+    }
+    let kept = h
+        .mgr
+        .get_user_graph(user)
+        .unwrap()
+        .read()
+        .add_entity(graph_entity("in the backup"))
+        .unwrap();
+
+    let journal = h._dir.path().join(user).join("intent.log");
+    let lsns: Vec<u64> = veld::intent_log::IntentLogIter::open_for_scan(&journal)
+        .expect("scan the journal")
+        .map(|r| r.expect("journal frame").lsn.0)
+        .collect();
+    assert!(lsns.len() >= 3, "each remember journals a frame: {lsns:?}");
+    let max_lsn = lsns[lsns.len() / 2];
+
+    let (_, body) = json_of(
+        h.app(),
+        authed_post("/api/backup/create", json!({"user_id": user})),
+    )
+    .await;
+    assert_eq!(body["success"], true, "{body}");
+    let backup_id = body["backup"]["backup_id"].as_u64().expect("backup id");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user, "content": "delta: written after the backup"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let later = h
+        .mgr
+        .get_user_graph(user)
+        .unwrap()
+        .read()
+        .add_entity(graph_entity("after the backup"))
+        .unwrap();
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/backup/restore",
+            json!({"user_id": user, "backup_id": backup_id, "max_lsn": max_lsn}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(body["success"], true, "{body}");
+
+    let last_lsn = veld::intent_log::IntentLogIter::open_for_scan(&journal)
+        .expect("scan the restored journal")
+        .map(|r| r.expect("restored frame").lsn.0)
+        .last();
+    let mut contents: Vec<String> = h
+        .mgr
+        .get_user_memory(user)
+        .unwrap()
+        .read()
+        .get_all_memories()
+        .unwrap()
+        .iter()
+        .map(|m| m.experience.content.clone())
+        .collect();
+    contents.sort();
+    let graph = h.mgr.get_user_graph(user).unwrap();
+    let graph = graph.read();
+    RestoredState {
+        contents,
+        kept_entity: graph.get_entity(&kept).unwrap().is_some(),
+        later_entity: graph.get_entity(&later).unwrap().is_some(),
+        journal_ends_at_max_lsn: last_lsn == Some(max_lsn),
+    }
+}
+
+#[cfg(all(feature = "rocksdb", feature = "storage-redb"))]
+#[tokio::test]
+async fn backup_and_point_in_time_restore_leave_the_same_store_on_both_engines() {
+    use veld::config::StorageBackend;
+    let rocksdb =
+        backup_then_point_in_time_restore(&Harness::with_backend(StorageBackend::RocksDb)).await;
+    let redb =
+        backup_then_point_in_time_restore(&Harness::with_backend(StorageBackend::Redb)).await;
+
+    assert_eq!(
+        rocksdb,
+        RestoredState {
+            contents: vec![
+                "alpha: the river floods every spring".to_string(),
+                "beta: the pass closes after the first snow".to_string(),
+                "gamma: the dunes move east each year".to_string(),
+            ],
+            kept_entity: true,
+            later_entity: false,
+            journal_ends_at_max_lsn: true,
+        },
+        "the RocksDB restore is the reference"
+    );
+    assert_eq!(
+        redb, rocksdb,
+        "redb restored a different store than RocksDB"
+    );
 }
 
 #[cfg(feature = "storage-redb")]
