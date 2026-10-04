@@ -670,6 +670,27 @@ pub struct SemanticFact {
     pub purge_reason: Option<PurgeReason>,
 }
 
+impl SemanticFact {
+    /// Ends belief in this fact at `at` in favour of `winner_id`. The first supersession
+    /// stands: a fact already closed keeps its window and its winner, so the record says when
+    /// belief stopped. The window never closes before the fact's own `valid_from`.
+    pub fn supersede(&mut self, winner_id: Option<&str>, at: chrono::DateTime<chrono::Utc>) {
+        if self.valid_until.is_none_or(|until| until > at) {
+            self.valid_until = Some(at.max(self.valid_from.unwrap_or(self.created_at)));
+        }
+        if self.superseded_by.is_none() {
+            self.superseded_by = winner_id.map(str::to_string);
+        }
+    }
+
+    /// Records, on the fact that stays believed, a fact it displaced.
+    pub fn record_superseded(&mut self, loser_id: &str) {
+        if !self.supersedes.iter().any(|id| id == loser_id) {
+            self.supersedes.push(loser_id.to_string());
+        }
+    }
+}
+
 /// Types of semantic facts
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FactType {
