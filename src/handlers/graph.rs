@@ -22,6 +22,19 @@ use std::sync::Arc;
 
 type AppState = Arc<MultiUserMemoryManager>;
 
+/// Runs a graph operation on the blocking pool: the graph's `parking_lot` lock and its store
+/// reads must not stall a runtime worker.
+async fn blocking<T, F>(op: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("graph task failed: {e}")))?
+        .map_err(AppError::Internal)
+}
+
 /// GET /api/graph/{user_id}/stats - Get graph statistics for a user
 pub async fn get_graph_stats(
     State(state): State<AppState>,
@@ -59,10 +72,8 @@ pub async fn find_entity(
         .get_user_graph(&req.user_id)
         .map_err(AppError::Internal)?;
 
-    let graph_guard = graph.read();
-    let entity = graph_guard
-        .find_entity_by_name(&req.entity_name)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let entity_name = req.entity_name;
+    let entity = blocking(move || graph.read().find_entity_by_name(&entity_name)).await?;
 
     Ok(Json(entity))
 }
@@ -86,19 +97,19 @@ pub async fn traverse_graph(
         .get_user_graph(&req.user_id)
         .map_err(AppError::Internal)?;
 
-    let graph_guard = graph.read();
-
-    let entity = graph_guard
-        .find_entity_by_name(&req.entity_name)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
-        .ok_or_else(|| {
-            AppError::MemoryNotFound(format!("Entity not found: {}", req.entity_name))
-        })?;
-
+    let entity_name = req.entity_name.clone();
     let max_depth = req.max_depth.unwrap_or(2);
-    let traversal = graph_guard
-        .traverse_from_entity(&entity.uuid, max_depth)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let traversal = blocking(move || {
+        let graph_guard = graph.read();
+        match graph_guard.find_entity_by_name(&entity_name)? {
+            Some(entity) => graph_guard
+                .traverse_from_entity(&entity.uuid, max_depth)
+                .map(Some),
+            None => Ok(None),
+        }
+    })
+    .await?
+    .ok_or_else(|| AppError::MemoryNotFound(format!("Entity not found: {}", req.entity_name)))?;
 
     Ok(Json(traversal))
 }
@@ -117,21 +128,17 @@ pub async fn get_episode(
 ) -> Result<Json<Option<EpisodicNode>>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let graph = state
-        .get_user_graph(&req.user_id)
-        .map_err(AppError::Internal)?;
-
-    let graph_guard = graph.read();
-
     let episode_uuid =
         uuid::Uuid::parse_str(&req.episode_uuid).map_err(|_| AppError::InvalidInput {
             field: "episode_uuid".to_string(),
             reason: "Invalid UUID format".to_string(),
         })?;
 
-    let episode = graph_guard
-        .get_episode(&episode_uuid)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let graph = state
+        .get_user_graph(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let episode = blocking(move || graph.read().get_episode(&episode_uuid)).await?;
 
     Ok(Json(episode))
 }
@@ -153,11 +160,8 @@ pub async fn get_all_entities(
     let graph = state
         .get_user_graph(&req.user_id)
         .map_err(AppError::Internal)?;
-    let graph_guard = graph.read();
 
-    let entities = graph_guard
-        .get_all_entities()
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let entities = blocking(move || graph.read().get_all_entities()).await?;
 
     let limit = req.limit.unwrap_or(100);
     let entities: Vec<_> = entities.into_iter().take(limit).collect();
@@ -183,10 +187,7 @@ pub async fn get_memory_universe(
 
     let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
 
-    let graph_guard = graph.read();
-    let universe = graph_guard
-        .get_universe()
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let universe = blocking(move || graph.read().get_universe()).await?;
 
     Ok(Json(universe))
 }
@@ -237,11 +238,7 @@ pub async fn delete_entity(
     })?;
 
     let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
-    let graph_guard = graph.write();
-
-    let deleted = graph_guard
-        .delete_entity(&uuid)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let deleted = blocking(move || graph.write().delete_entity(&uuid)).await?;
 
     // Audited whether or not it removed anything. A deletion attempt is a security-relevant act
     // even when it is a no-op, and an attempt that found nothing is the shape a probe makes.
@@ -292,11 +289,7 @@ pub async fn clear_user_graph(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
-    let graph_guard = graph.write();
-
-    let (entities, relationships, episodes) = graph_guard
-        .clear_all()
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let (entities, relationships, episodes) = blocking(move || graph.write().clear_all()).await?;
 
     info!(
         "Cleared graph for user {}: {} entities, {} relationships, {} episodes",
@@ -342,9 +335,8 @@ pub async fn rebuild_user_graph(
 
     // First, clear existing graph data
     let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
-    {
-        let graph_guard = graph.write();
-        let _ = graph_guard.clear_all();
+    if let Err(e) = blocking(move || graph.write().clear_all()).await {
+        tracing::debug!("Graph clear before rebuild failed for {}: {:?}", user_id, e);
     }
 
     // Get all memories for this user
@@ -424,21 +416,17 @@ pub async fn invalidate_relationship(
 ) -> Result<Json<serde_json::Value>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let graph = state
-        .get_user_graph(&req.user_id)
-        .map_err(AppError::Internal)?;
-
-    let graph_guard = graph.write();
-
     let rel_uuid =
         uuid::Uuid::parse_str(&req.relationship_uuid).map_err(|_| AppError::InvalidInput {
             field: "relationship_uuid".to_string(),
             reason: "Invalid UUID format".to_string(),
         })?;
 
-    graph_guard
-        .invalidate_relationship(&rel_uuid)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let graph = state
+        .get_user_graph(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    blocking(move || graph.write().invalidate_relationship(&rel_uuid)).await?;
 
     state.emit_event(MemoryEvent {
         event_type: "EDGE_INVALIDATE".to_string(),

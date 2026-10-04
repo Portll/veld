@@ -70,7 +70,7 @@ in	000b68f4	252	2026-04-23	embeddings-vectors	W8	ported	ee166804
 in	9e69ca9b	254	2026-04-23	eval	W0	pending		
 in	e66ad34d	255	2026-04-23	infra	-	declined		an opt-in heartbeat whose default endpoint is upstream's (https://shodh-memory.com/api/telemetry), counting upstream's installs; veld reports nothing to upstream
 in	da23add0	256	2026-04-27	mcp-hooks	W9	pending		
-in	1a6708e9	257	2026-04-27	security	W1	pending		
+in	1a6708e9	257	2026-04-27	security	W1	partial		Ported: graph handlers on the blocking pool (plus veld-only delete_entity and invalidate_relationship), fact updates rebuild their indices, ResilientEmbedder batch delegation, Vamana start graph in O(n*d). In veld already: backup rename-aside and SPANN insert after load (0e8df63e, which keeps the loaded postings upstream's empty partitions hid), the /api/stats user_id check (3e4d7ca7). Not applicable: the five MCP callBrain calls, which veld's MCP server never had. Superseded: persisting access updates on recall, replaced upstream by #297 (W2). Declined: for_each_memory, which has no caller and adds a raw RocksDB iterator outside the storage traits. Waiting for W3: remember_with_agent's duplicate graph pass (veld's copy also makes causal edges only there), strengthen_episode_entity_edges (revives a no-op, moves graph weights), CoRetrieved edges in entity_edges (veld's coactivation is directional; upstream later stopped making them), the batch_weaken_synapses LTP guard (that function arrives with upstream d392c022)
 in	9a009cd7	258	2026-04-27	ner-entities	W6	pending		
 in	0fb9bbb4	259	2026-04-29	graph	W3	pending		
 in	0d9d8973	260	2026-04-29	ner-entities	W6	pending		
