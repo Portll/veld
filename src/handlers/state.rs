@@ -1456,31 +1456,29 @@ impl MultiUserMemoryManager {
 
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
     /// Does NOT delete data — used before restore to release file locks.
-    /// Evict the tenant and wait until nothing else holds its memory system, so its store is
-    /// closed before files are restored under it. Work spawned by a recent write can hold it
-    /// for seconds; past `within` the restore is refused rather than run under an open store.
+    /// Evict the tenant and close its memory and graph stores before files are restored under
+    /// them. Work spawned by a recent write can hold them for seconds; past `within` the
+    /// restore is refused rather than run under an open store.
     fn evict_user_and_wait_for_release(
         &self,
         user_id: &str,
         within: std::time::Duration,
     ) -> Result<()> {
-        let held = self
-            .user_memories
-            .get(user_id)
-            .map(|memory| Arc::downgrade(&memory));
+        let memory = self.user_memories.get(user_id);
+        let graph = self.graph_memories.get(user_id);
         self.evict_user(user_id);
-        let Some(held) = held else {
-            return Ok(());
-        };
         let deadline = std::time::Instant::now() + within;
-        while held.strong_count() > 0 {
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "refusing to restore '{user_id}': its memory store is still in use after \
-                     {within:?}, by work a recent write started; retry once it finishes"
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        // A store closes in whichever thread drops the last reference, after the count has
+        // already reached zero, and a closing RocksDB deletes the files it does not know. So
+        // the restore waits to hold the last reference and drops it here, closing the store
+        // before any file is replaced.
+        if let Some(memory) = memory {
+            wait_until_sole_owner(&memory, deadline, user_id, within)?;
+            drop(memory);
+        }
+        if let Some(graph) = graph {
+            wait_until_sole_owner(&graph, deadline, user_id, within)?;
+            drop(graph);
         }
         Ok(())
     }
@@ -3396,15 +3394,32 @@ impl MultiUserMemoryManager {
         backup_id: Option<u32>,
         max_lsn: Option<u64>,
     ) -> Result<Vec<String>> {
+        const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+        // Work a recent write started can still hold the tenant and may need its graph to
+        // finish, so it is let go before the tenant's open locks are taken.
+        self.evict_user_and_wait_for_release(user_id, RELEASE_WAIT)?;
+        // get_user_memory and get_user_graph open a tenant under these locks, in this order.
+        // Holding them keeps anything from reopening its stores while their files are replaced:
+        // a store opened mid-restore reads the old or half-written files and stays cached.
+        let memory_lock = self
+            .user_memory_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone();
+        let graph_lock = self
+            .user_graph_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone();
+        let _memory_guard = memory_lock.lock();
+        let _graph_guard = graph_lock.lock();
+        self.evict_user_and_wait_for_release(user_id, RELEASE_WAIT)?;
+
         match self.server_config.effective_storage_backend {
             #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => {
                 let memory_db_path = self.user_dir(user_id)?.join("storage");
                 let graph_path = self.user_dir(user_id)?.join("graph").join("graph");
-
-                // The backup engine restores into the live directory, so the store must be
-                // closed first; a lingering handle would also fail the reopen.
-                self.evict_user_and_wait_for_release(user_id, std::time::Duration::from_secs(30))?;
 
                 let secondary_restore_paths: Vec<(&str, &std::path::Path)> = vec![];
                 let intent_log_spec = crate::backup::IntentLogBackupSpec::per_user(
@@ -4809,6 +4824,24 @@ pub fn annotate_query_ner_with(ner: &NeuralNer, query: &mut crate::memory::types
         }
         Err(e) => tracing::debug!("query NER annotation failed: {e}"),
     }
+}
+
+fn wait_until_sole_owner<T: ?Sized>(
+    held: &Arc<T>,
+    deadline: std::time::Instant,
+    user_id: &str,
+    within: std::time::Duration,
+) -> Result<()> {
+    while Arc::strong_count(held) > 1 {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "refusing to restore '{user_id}': its stores are still in use after {within:?}, \
+                 by work a recent write started; retry once it finishes"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "rocksdb"))]
