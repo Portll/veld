@@ -235,7 +235,7 @@ in	229f99e9	466	2026-08-09	web-ui	W11	pending
 in	a7344bbd	467	2026-08-09	eval	W0	pending		
 in	e24b1ab3	469	2026-08-09	mcp-hooks	W9	pending		
 in	ca72b5c1	470	2026-08-09	mcp-hooks	W9	pending		
-in	90a5092b	462	2026-08-09	retrieval	W2	pending		
+in	90a5092b	462	2026-08-09	retrieval	W2	partial	103e60c9	repeat-stable graph-leg edge ordering (523a32ac) ported with veld's own determinism fixes; the open-domain recall changes in the rest of #462 are W2's
 in	28f9c836	471	2026-08-09	facts-todos	W5	pending		
 in	9a3e0ef8	472	2026-08-09	web-ui	W11	pending		
 in	4baf0d3f	474	2026-08-09	infra	-	declined		configures Dependabot for upstream's repository, including /seat and /front/ui; veld has no .github/dependabot.yml, and adopting Dependabot would be a veld CI decision, not a port
