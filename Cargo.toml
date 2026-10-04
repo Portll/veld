@@ -108,6 +108,8 @@ name = "veld"
 path = "src/lib.rs"
 # rlib: for Rust library usage (tests, benchmarks, binary)
 # cdylib: for Python bindings (PyO3/maturin needs shared library)
+# The cdylib gives this lib an unhashed filename, which is why [profile.release] must not set
+# `panic`: see the note there.
 crate-type = ["rlib", "cdylib"]
 
 [[bin]]
@@ -419,12 +421,15 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true  # Reduce binary size
-panic = "abort"
+# No `panic = "abort"` while [lib] builds a cdylib. A cdylib lib is emitted under one unhashed
+# filename, and abort makes cargo build the lib twice whenever a test harness is in the graph
+# (harnesses need unwind): both variants write the same rlib, one clobbers the other, and the
+# consumer links against the wrong one (rust-lang/cargo#6313), so `cargo test --release` cannot
+# build. Unwinding also keeps a panicking request on its own task: tokio turns it into a
+# JoinError instead of the panic ending the server.
 
 [profile.bench]
-# Note: bench profile inherits from release by default
-# panic cannot be overridden when inheriting (Cargo limitation)
-# Criterion benchmarks work with panic = "abort" in release mode
+# Inherits release.
 opt-level = 3
 lto = "thin"  # Faster build than full LTO for benchmarks
 
