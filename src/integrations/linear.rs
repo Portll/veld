@@ -418,8 +418,7 @@ impl LinearClient {
     const DEFAULT_API_URL: &'static str = "https://api.linear.app/graphql";
 
     pub fn new(api_key: String) -> Self {
-        let api_url =
-            std::env::var("LINEAR_API_URL").unwrap_or_else(|_| Self::DEFAULT_API_URL.to_string());
+        let api_url = super::resolve_api_url_override("LINEAR_API_URL", Self::DEFAULT_API_URL);
         Self {
             api_key,
             api_url,
@@ -577,6 +576,16 @@ impl LinearClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_insecure_remote_api_url_override_is_refused_by_default() {
+        let client = crate::integrations::with_override_env(
+            None,
+            &[("LINEAR_API_URL", "http://evil.example.com/graphql")],
+            || LinearClient::new("lin_api_key".to_string()),
+        );
+        assert_eq!(client.api_url, LinearClient::DEFAULT_API_URL);
+    }
 
     #[test]
     fn test_issue_to_content() {
