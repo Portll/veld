@@ -1571,7 +1571,10 @@ impl MemoryStorage {
                 Ok(old_db) => {
                     let mut batch = WriteBatch::default();
                     let mut count = 0usize;
-                    for (key, value) in old_db.iterator(IteratorMode::Start).flatten() {
+                    for item in old_db.iterator(IteratorMode::Start) {
+                        let (key, value) = item.map_err(|e| {
+                            anyhow::anyhow!("RocksDB iterator error during memory migration: {e}")
+                        })?;
                         batch.put(&key, &value);
                         count += 1;
                         if count.is_multiple_of(10_000) {
@@ -1611,7 +1614,10 @@ impl MemoryStorage {
                 Ok(old_db) => {
                     let mut batch = WriteBatch::default();
                     let mut count = 0usize;
-                    for (key, value) in old_db.iterator(IteratorMode::Start).flatten() {
+                    for item in old_db.iterator(IteratorMode::Start) {
+                        let (key, value) = item.map_err(|e| {
+                            anyhow::anyhow!("RocksDB iterator error during index migration: {e}")
+                        })?;
                         batch.put_cf(&index_cf, &key, &value);
                         count += 1;
                         if count.is_multiple_of(10_000) {
