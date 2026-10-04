@@ -343,6 +343,11 @@ pub struct MultiUserMemoryManager {
     /// Service Unavailable with a clear reason.
     pub sleep_time_orchestrator:
         parking_lot::RwLock<Option<Arc<crate::memory::sleep_time::SleepTimeOrchestrator>>>,
+
+    /// Fire-and-forget writes spawned on behalf of requests (graph processing, deferred
+    /// embedding, audit persistence). Shutdown closes it and waits, so the stores are not
+    /// flushed or released under a write still in flight.
+    pub task_tracker: tokio_util::task::TaskTracker,
 }
 
 /// User directories under the data root. An unreadable entry is an error, not a
@@ -720,6 +725,7 @@ impl MultiUserMemoryManager {
             // rest of state is settled and a tokio runtime is available.
             // See `set_sleep_time_orchestrator()`.
             sleep_time_orchestrator: parking_lot::RwLock::new(None),
+            task_tracker: tokio_util::task::TaskTracker::new(),
         };
 
         info!("Running initial audit log rotation...");
@@ -1102,6 +1108,15 @@ impl MultiUserMemoryManager {
         );
 
         Ok(())
+    }
+
+    /// Closes the task tracker and waits up to `timeout` for every tracked task. Returns false
+    /// when the wait timed out. Tasks spawned after the close are still tracked and waited for.
+    pub async fn drain_background_tasks(&self, timeout: std::time::Duration) -> bool {
+        self.task_tracker.close();
+        tokio::time::timeout(timeout, self.task_tracker.wait())
+            .await
+            .is_ok()
     }
 
     /// Log audit event (non-blocking with background persistence)
@@ -5079,5 +5094,48 @@ mod shared_purge_tests {
                 "{backend:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod background_task_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn manager(
+        base: &std::path::Path,
+        audit_rotation_check_interval: usize,
+    ) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: base.to_path_buf(),
+            backup_enabled: false,
+            audit_rotation_check_interval,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(base.to_path_buf(), config).expect("manager")
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_tracked_tasks_and_reports_a_timeout() {
+        let home = tempfile::tempdir().expect("temp home");
+        let state = manager(home.path(), 100);
+
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        state.task_tracker.spawn(async move {
+            let _ = released.await;
+        });
+
+        assert!(
+            !state
+                .drain_background_tasks(Duration::from_millis(50))
+                .await,
+            "a drain must report the timeout while a tracked task is still running"
+        );
+        release.send(()).expect("task still waiting");
+        assert!(
+            state.drain_background_tasks(Duration::from_secs(30)).await,
+            "the drain returns once the tracked task finishes"
+        );
+        assert!(state.task_tracker.is_empty());
     }
 }

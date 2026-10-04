@@ -1059,7 +1059,7 @@ pub async fn create_todo(
         let state_clone = state.clone();
         let user_id = req.user_id.clone();
 
-        tokio::spawn(async move {
+        state.task_tracker.spawn(async move {
             let memory_result = tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_clone.read();
                 memory_guard.remember(exp_clone, None)
@@ -1604,7 +1604,7 @@ pub async fn update_todo(
             let state_clone = state.clone();
             let user_id = req.user_id.clone();
 
-            tokio::spawn(async move {
+            state.task_tracker.spawn(async move {
                 let memory_result = tokio::task::spawn_blocking(move || {
                     let memory_guard = memory_clone.read();
                     memory_guard.remember(exp_clone, None)
@@ -1728,7 +1728,7 @@ pub async fn complete_todo(
             let state_clone = state.clone();
             let user_id = req.user_id.clone();
 
-            tokio::spawn(async move {
+            state.task_tracker.spawn(async move {
                 let memory_result = tokio::task::spawn_blocking(move || {
                     let memory_guard = memory_clone.read();
                     memory_guard.remember(exp_clone, None)

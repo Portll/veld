@@ -1805,9 +1805,15 @@ pub const IC_VERB: f32 = 1.0;
 /// Maximum time to wait for the full graceful shutdown sequence.
 ///
 /// Justification:
-/// - 120 seconds accommodates drain (5s) + flush (30s) + vector save (60s)
+/// - 120 seconds accommodates drain (5s) + background tasks (10s) + flush (30s) + vector save (60s)
 /// - Overall budget prevents indefinite hangs even if individual phases stall
 pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
+
+/// Background task drain timeout in seconds
+///
+/// Maximum time shutdown waits for tracked fire-and-forget writes (graph processing, deferred
+/// embedding, audit persistence) before it flushes the databases anyway.
+pub const BACKGROUND_TASK_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 /// Database flush timeout in seconds
 ///
@@ -2706,6 +2712,7 @@ pub const RECONSOLIDATION_WORKING_MEMORY_THRESHOLD: u32 = 5;
 // | Constant                      | File      | Function/Context                        |
 // |-------------------------------|-----------|-----------------------------------------|
 // | GRACEFUL_SHUTDOWN_TIMEOUT_SECS| main.rs   | graceful_shutdown() - request drain     |
+// | BACKGROUND_TASK_DRAIN_TIMEOUT_SECS | server.rs | run_shutdown_cleanup() - tracked tasks |
 // | DATABASE_FLUSH_TIMEOUT_SECS   | main.rs   | graceful_shutdown() - RocksDB flush     |
 // | VECTOR_INDEX_SAVE_TIMEOUT_SECS| main.rs   | graceful_shutdown() - HNSW persist      |
 //

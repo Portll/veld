@@ -752,7 +752,7 @@ pub async fn remember(
     {
         let memory_for_bg = memory.clone();
         let mid = memory_id.clone();
-        tokio::task::spawn_blocking(move || {
+        state.task_tracker.spawn_blocking(move || {
             let guard = memory_for_bg.read();
             if let Err(e) = guard.embed_and_index(&mid) {
                 tracing::warn!(memory_id = %mid.0, "Background embed_and_index failed: {e}");
@@ -878,6 +878,7 @@ pub async fn remember(
     // Now fire-and-forget: response returns in <200ms, post-tasks run in background.
     let response_id = memory_id.0.to_string();
     {
+        let tracker = state.task_tracker.clone();
         let state = state.clone();
         let memory = memory.clone();
         let user_id = req.user_id.clone();
@@ -886,7 +887,7 @@ pub async fn remember(
         let parent_id = req.parent_id.clone();
         let created_at = req.created_at;
 
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             // Task 1: Build episodic graph (entities + episode + relationships)
             {
                 let state = state.clone();
@@ -1446,12 +1447,13 @@ pub async fn batch_remember(
     // Mirrors the single remember handler's 5-task pipeline to ensure batch items
     // get the same treatment: graph, parent_id, temporal facts, lineage, conflicts.
     {
+        let tracker = state.task_tracker.clone();
         let state = state.clone();
         let user_id = req.user_id.clone();
         let memory = memory.clone();
         let memory_results_bg = memory_results;
 
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             // Task 1: Build episodic graph for each stored memory
             let mut batch_memory_ids: Vec<crate::memory::MemoryId> = Vec::new();
             for (_, id_str, experience) in &memory_results_bg {
