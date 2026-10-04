@@ -139,7 +139,7 @@ pub async fn ingest(
     };
 
     // ── NER + YAKE extraction in parallel ───────────────────────────────
-    let experience_type = parse_experience_type(req.memory_type.as_ref());
+    let experience_type = parse_experience_type(req.memory_type.as_ref())?;
 
     let ner = state.get_neural_ner();
     let yake = state.get_keyword_extractor();
