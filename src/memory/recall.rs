@@ -896,6 +896,10 @@ impl super::MemorySystem {
                 };
 
                 let mut ids = Vec::new();
+                // Episode content per candidate: the repeat-stable tie-break for the
+                // activation sort below (memory ids are random per ingest).
+                let mut episode_content: std::collections::HashMap<MemoryId, String> =
+                    std::collections::HashMap::new();
 
                 // Density-adaptive traversal: dense graphs get shallower depth
                 // and stricter strength filters to avoid exploring noisy L1 edges.
@@ -942,7 +946,11 @@ impl super::MemorySystem {
                                     if let Ok(mut eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
                                         // Keep most recent episodes — recency correlates
                                         // with relevance for graph-surfaced candidates.
-                                        eps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                        eps.sort_by(|a, b| {
+                                            b.created_at
+                                                .cmp(&a.created_at)
+                                                .then_with(|| a.content.cmp(&b.content))
+                                        });
                                         eps.truncate(20);
                                         for ep in eps {
                                             let mid = MemoryId(ep.uuid);
@@ -956,6 +964,9 @@ impl super::MemorySystem {
                                                     * path_boost;
                                                 // Relevance floor: skip low-activation candidates
                                                 if activation >= 0.1 {
+                                                    episode_content
+                                                        .entry(mid.clone())
+                                                        .or_insert(ep.content);
                                                     ids.push((mid, activation, tr.decay_factor));
                                                 }
                                             }
@@ -990,7 +1001,11 @@ impl super::MemorySystem {
                     ) {
                         for tr in &t.entities {
                             if let Ok(mut eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
-                                eps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                eps.sort_by(|a, b| {
+                                    b.created_at
+                                        .cmp(&a.created_at)
+                                        .then_with(|| a.content.cmp(&b.content))
+                                });
                                 eps.truncate(20);
                                 for ep in eps {
                                     let mid = MemoryId(ep.uuid);
@@ -999,6 +1014,9 @@ impl super::MemorySystem {
                                         let activation = tr.entity.salience * tr.decay_factor;
                                         // Relevance floor: skip low-activation candidates
                                         if activation >= 0.1 {
+                                            episode_content
+                                                .entry(mid.clone())
+                                                .or_insert(ep.content);
                                             ids.push((mid, activation, tr.decay_factor));
                                         }
                                     }
@@ -1019,8 +1037,13 @@ impl super::MemorySystem {
                         .or_insert((act, heb));
                 }
                 let mut r: Vec<_> = seen.into_iter().map(|(id, (a, h))| (id, a, h)).collect();
-                // CRITICAL: Sort by activation score so RRF rank is meaningful
-                r.sort_by(|a, b| b.1.total_cmp(&a.1));
+                // CRITICAL: Sort by activation score so RRF rank is meaningful. Activations
+                // take few distinct values, so the cap below cuts through ties: those are
+                // ordered by content, which is unique per store (content-hash dedup).
+                r.sort_by(|a, b| {
+                    b.1.total_cmp(&a.1)
+                        .then_with(|| episode_content[&a.0].cmp(&episode_content[&b.0]))
+                });
                 let pre_cap = r.len();
                 // Cap total graph candidates to prevent flooding RRF fusion
                 r.truncate(200);
@@ -1120,6 +1143,9 @@ impl super::MemorySystem {
 
             let mut merged: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
+            // First-appearance order over the sub-query lists, kept by the stable sort below
+            // for equal fused scores.
+            let mut first_seen: Vec<MemoryId> = Vec::new();
 
             for (idx, sub_q) in sub_queries.iter().enumerate() {
                 let is_original = idx == 0;
@@ -1215,7 +1241,10 @@ impl super::MemorySystem {
                 // Weighted RRF: score = weight / (K + rank)
                 for (rank, (id, _sim)) in filtered.iter().enumerate() {
                     let rrf_score = weight / (decomp_rrf_k + (rank + 1) as f32);
-                    let entry = merged.entry(id.clone()).or_insert(0.0);
+                    let entry = merged.entry(id.clone()).or_insert_with(|| {
+                        first_seen.push(id.clone());
+                        0.0
+                    });
                     *entry = entry.max(rrf_score).max(*entry);
                     // Use max-merge: keep the highest RRF contribution per memory
                     // to prevent score inflation from appearing in multiple sub-queries
@@ -1224,7 +1253,13 @@ impl super::MemorySystem {
             }
 
             // Sort by fused score and convert back to (MemoryId, f32)
-            let mut fused_vec: Vec<(MemoryId, f32)> = merged.into_iter().collect();
+            let mut fused_vec: Vec<(MemoryId, f32)> = first_seen
+                .into_iter()
+                .map(|id| {
+                    let score = merged[&id];
+                    (id, score)
+                })
+                .collect();
             fused_vec.sort_by(|a, b| b.1.total_cmp(&a.1));
 
             tracing::info!(
@@ -1931,8 +1966,9 @@ impl super::MemorySystem {
                     }
                 }
                 if lengths.len() >= 5 {
-                    let mean_len: f32 =
-                        lengths.iter().map(|(_, l)| *l as f32).sum::<f32>() / lengths.len() as f32;
+                    // Summed as integers: an f32 sum would depend on the map's iteration order.
+                    let total_len: usize = lengths.iter().map(|(_, l)| *l).sum();
+                    let mean_len: f32 = total_len as f32 / lengths.len() as f32;
                     for (id, len) in &lengths {
                         let ratio = *len as f32 / mean_len.max(1.0);
                         // Memories 50%+ longer than mean get penalized (0.85-0.70x)
@@ -2041,7 +2077,15 @@ impl super::MemorySystem {
             // query has recency intent, demote the older memory. Belt & braces
             // against light pollution from old-but-topical memories.
             if has_any_temporal_intent || has_temporal_keywords {
-                let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+                // Pairs are visited in content order: when two same-topic memories share a
+                // timestamp the second one visited is demoted, so the visiting order must not
+                // come from the map's hash order.
+                let mut ids: Vec<(MemoryId, Option<String>)> = fused
+                    .keys()
+                    .map(|id| (id.clone(), get_content(id)))
+                    .collect();
+                ids.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                let ids: Vec<MemoryId> = ids.into_iter().map(|(id, _)| id).collect();
                 let get_created_at = |id: &MemoryId| -> Option<chrono::DateTime<chrono::Utc>> {
                     self.working_memory
                         .read()
@@ -2264,6 +2308,7 @@ impl super::MemorySystem {
             // not all fused results (avoids 100s of RocksDB reads).
             let mut res: Vec<_> = fused.into_iter().collect();
             res.sort_by(|a, b| b.1.total_cmp(&a.1));
+            order_score_ties_by_content(&mut res, &get_content);
             let rerank_budget = query.max_results * 2;
 
             if use_ontology_rerank && !onto_intent.expected_labels.is_empty() {
@@ -5256,6 +5301,37 @@ impl super::MemorySystem {
     }
 }
 
+/// Orders each run of exactly equal scores in a score-sorted list by content, then id.
+///
+/// Fused scores tie often, and the map they come from iterates in a per-instance hash order.
+/// Content is unique per store (remember() dedups on a content hash), so this is a total
+/// order that two stores built from the same corpus agree on; ids are random per ingest.
+/// Content is fetched only for members of a tied run.
+fn order_score_ties_by_content<F>(items: &mut [(MemoryId, f32)], content: &F)
+where
+    F: Fn(&MemoryId) -> Option<String>,
+{
+    let mut start = 0;
+    while start < items.len() {
+        let bits = items[start].1.to_bits();
+        let mut end = start + 1;
+        while end < items.len() && items[end].1.to_bits() == bits {
+            end += 1;
+        }
+        if end - start > 1 {
+            let mut keyed: Vec<(Option<String>, (MemoryId, f32))> = items[start..end]
+                .iter()
+                .map(|item| (content(&item.0), item.clone()))
+                .collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| (a.1).0.cmp(&(b.1).0)));
+            for (slot, (_, item)) in items[start..end].iter_mut().zip(keyed) {
+                *slot = item;
+            }
+        }
+        start = end;
+    }
+}
+
 // =============================================================================
 // R2 unit tests — temporal boost bound-overlap logic
 // =============================================================================
@@ -5576,5 +5652,34 @@ mod signal_disable_gate_tests {
             (base_enabled - base_disabled).abs() > 1e-6,
             "disabling hebbian must change base_score"
         );
+    }
+}
+
+#[cfg(test)]
+mod score_tie_order_tests {
+    use super::order_score_ties_by_content;
+    use crate::memory::types::MemoryId;
+    use std::collections::HashMap;
+
+    #[test]
+    fn equal_scores_are_ordered_by_content_and_the_rest_is_untouched() {
+        let ids: Vec<MemoryId> = (0..5).map(|_| MemoryId(uuid::Uuid::new_v4())).collect();
+        let content: HashMap<MemoryId, String> = ids
+            .iter()
+            .zip(["top", "delta", "alpha", "charlie", "bottom"])
+            .map(|(id, c)| (id.clone(), c.to_string()))
+            .collect();
+        let mut items = vec![
+            (ids[0].clone(), 0.9),
+            (ids[1].clone(), 0.5),
+            (ids[2].clone(), 0.5),
+            (ids[3].clone(), 0.5),
+            (ids[4].clone(), 0.1),
+        ];
+
+        order_score_ties_by_content(&mut items, &|id: &MemoryId| content.get(id).cloned());
+
+        let order: Vec<&str> = items.iter().map(|(id, _)| content[id].as_str()).collect();
+        assert_eq!(order, ["top", "alpha", "charlie", "delta", "bottom"]);
     }
 }
