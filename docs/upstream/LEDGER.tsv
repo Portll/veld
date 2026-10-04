@@ -58,7 +58,7 @@ in	b08fa351	239	2026-04-19	robotics-geo	W12	pending
 in	00695870	241	2026-04-19	http-api	W10	pending		
 in	7b882ace	240	2026-04-19	http-api	W10	pending		
 in	82cf1c90	242	2026-04-19	facts-todos	W5	pending		
-in	674abc7c	243	2026-04-19	storage-integrity	W1	pending		the lint fixes are upstream's own; what applies is propagating RocksDB iterator errors in the legacy-DB migrations, which veld still skips with .flatten() before renaming the old DB away (src/memory/storage.rs:1574 and :1614, src/storage/legacy_rocksdb.rs:701)
+in	674abc7c	243	2026-04-19	storage-integrity	W1	adapted		only the iterator-error propagation in the legacy-DB migrations applies, now in veld at all three sites (the two in memory/storage.rs and import_separate_db_into_cf); the lint fixes are to upstream's own code
 in	38b818dd	244	2026-04-19	robotics-geo	W12	pending		
 in	25d54a51	245	2026-04-19	ner-entities	W6	pending		
 in	5e59f676		2026-04-19	facts-todos	W5	pending		
