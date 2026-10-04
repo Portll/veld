@@ -764,6 +764,41 @@ async fn facts_stats() {
     assert!(status.is_success());
 }
 
+#[tokio::test]
+async fn facts_narratives_preview_purge_and_purge_are_routed() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/facts/narratives", json!({"user_id": "test-user"})),
+    )
+    .await;
+    assert!(status.is_success(), "narratives: {status} {body}");
+    assert_eq!(body["total_clusters"], 0);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/facts/preview-purge",
+            json!({"user_id": "test-user", "pattern": "relates to"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "preview-purge: {status} {body}");
+    assert_eq!(body["match_bucket"], "none");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/facts/purge",
+            json!({"user_id": "test-user", "pattern": "relates to"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "purge: {status} {body}");
+    assert_eq!(body["dry_run"], true, "purge defaults to a dry run");
+    assert_eq!(body["purged"], 0);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // compression.rs
 // ═══════════════════════════════════════════════════════════════════════
