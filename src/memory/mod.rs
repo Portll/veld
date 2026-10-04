@@ -6249,19 +6249,23 @@ impl MemorySystem {
                             embedding.as_deref(),
                         ) {
                             Ok(Some(mut existing)) => {
-                                // Reinforce the existing fact
-                                existing.support_count += 1;
+                                // Support counts distinct evidence: re-deriving the fact
+                                // from memories it already cites adds none.
+                                let mut new_sources_added = false;
+                                for src in &fact.source_memories {
+                                    if !existing.source_memories.contains(src) {
+                                        existing.source_memories.push(src.clone());
+                                        new_sources_added = true;
+                                    }
+                                }
+                                if new_sources_added {
+                                    existing.support_count += 1;
+                                }
                                 existing.last_reinforced = now;
                                 let confidence_before = existing.confidence;
                                 let boost = 0.1 * (1.0 - existing.confidence);
                                 existing.confidence = (existing.confidence + boost).min(1.0);
 
-                                // Extend source memories and related entities
-                                for src in &fact.source_memories {
-                                    if !existing.source_memories.contains(src) {
-                                        existing.source_memories.push(src.clone());
-                                    }
-                                }
                                 for entity in &fact.related_entities {
                                     if !existing.related_entities.contains(entity) {
                                         existing.related_entities.push(entity.clone());
@@ -7464,19 +7468,33 @@ impl MemorySystem {
             if let Some((relation, confidence)) =
                 self.lineage_graph.infer_relation(candidate, new_memory)
             {
-                // Check if edge already exists
-                if !self
+                let existing = self
                     .lineage_graph
-                    .edge_exists(user_id, &candidate.id, &new_memory.id)?
-                {
-                    let edge = LineageEdge::inferred(
-                        candidate.id.clone(),
-                        new_memory.id.clone(),
-                        relation,
-                        confidence,
-                    );
-                    self.lineage_graph.store_edge(user_id, &edge)?;
-                    inferred_edges.push(edge);
+                    .get_edges_from(user_id, &candidate.id)?
+                    .into_iter()
+                    .find(|e| e.to == new_memory.id);
+                match existing {
+                    // A stronger re-inference updates an inferred edge; a confirmed or
+                    // explicit edge is a person's statement and stays as it is.
+                    Some(mut old)
+                        if old.source == lineage::LineageSource::Inferred
+                            && confidence > old.confidence =>
+                    {
+                        old.confidence = confidence;
+                        old.relation = relation;
+                        self.lineage_graph.store_edge(user_id, &old)?;
+                    }
+                    Some(_) => {}
+                    None => {
+                        let edge = LineageEdge::inferred(
+                            candidate.id.clone(),
+                            new_memory.id.clone(),
+                            relation,
+                            confidence,
+                        );
+                        self.lineage_graph.store_edge(user_id, &edge)?;
+                        inferred_edges.push(edge);
+                    }
                 }
             }
         }
@@ -8756,6 +8774,118 @@ mod vector_index_reopen_tests {
                 finds(&sys, needle, id),
                 "reopened after the rebuild: {needle}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fact_lifecycle_tests {
+    use super::*;
+    use crate::config::StorageBackend;
+    use tempfile::TempDir;
+
+    /// One memory system per storage engine this build carries.
+    fn systems() -> Vec<(StorageBackend, MemorySystem, TempDir)> {
+        let config_for = |tmp: &TempDir| MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        #[cfg(feature = "rocksdb")]
+        {
+            let tmp = TempDir::new().expect("temp dir");
+            let system = MemorySystem::new(config_for(&tmp), None).expect("rocksdb system");
+            out.push((StorageBackend::RocksDb, system, tmp));
+        }
+        #[cfg(feature = "storage-redb")]
+        {
+            let tmp = TempDir::new().expect("temp dir");
+            let primary = crate::storage::redb::RedbPrimaryMemoryStore::open(tmp.path())
+                .expect("redb primary store");
+            let bm25 = Arc::new(
+                hybrid_search::BM25Index::new(&tmp.path().join(BM25_INDEX_DIR)).expect("bm25"),
+            );
+            let system = MemorySystem::with_primary_store_and_bm25_index(
+                config_for(&tmp),
+                Arc::new(primary),
+                None,
+                bm25,
+            )
+            .expect("redb system");
+            out.push((StorageBackend::Redb, system, tmp));
+        }
+        assert!(!out.is_empty(), "no storage engine in this build");
+        out
+    }
+
+    fn memory(exp_type: ExperienceType, content: &str) -> Memory {
+        Memory::new(
+            MemoryId(Uuid::new_v4()),
+            Experience {
+                experience_type: exp_type,
+                content: content.to_string(),
+                entities: vec!["auth".to_string(), "login".to_string()],
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_stronger_reinference_updates_an_inferred_lineage_edge_but_not_a_confirmed_one() {
+        for (backend, system, _tmp) in systems() {
+            let user = "lineage-user";
+            let error = memory(ExperienceType::Error, "login fails with a token error");
+            let mut task = memory(ExperienceType::Task, "fix the login token refresh");
+            task.created_at = error.created_at + chrono::Duration::hours(1);
+
+            let weak = LineageEdge::inferred(
+                error.id.clone(),
+                task.id.clone(),
+                CausalRelation::RelatedTo,
+                0.05,
+            );
+            system.lineage_graph().store_edge(user, &weak).unwrap();
+            let created = system
+                .infer_lineage_for_memory(user, &task, std::slice::from_ref(&error))
+                .unwrap();
+            assert!(
+                created.is_empty(),
+                "{backend}: the edge exists, so none is created"
+            );
+            let edges = system
+                .lineage_graph()
+                .get_edges_from(user, &error.id)
+                .unwrap();
+            assert_eq!(edges.len(), 1, "{backend}");
+            assert_eq!(edges[0].relation, CausalRelation::Caused, "{backend}");
+            assert!(edges[0].confidence > 0.05, "{backend}");
+
+            let other_error = memory(ExperienceType::Error, "login fails again after deploy");
+            let mut other_task = memory(ExperienceType::Task, "roll back the login deploy");
+            other_task.created_at = other_error.created_at + chrono::Duration::hours(1);
+            let mut confirmed = LineageEdge::inferred(
+                other_error.id.clone(),
+                other_task.id.clone(),
+                CausalRelation::RelatedTo,
+                0.05,
+            );
+            confirmed.source = LineageSource::Confirmed;
+            system.lineage_graph().store_edge(user, &confirmed).unwrap();
+            system
+                .infer_lineage_for_memory(user, &other_task, std::slice::from_ref(&other_error))
+                .unwrap();
+            let edges = system
+                .lineage_graph()
+                .get_edges_from(user, &other_error.id)
+                .unwrap();
+            assert_eq!(edges.len(), 1, "{backend}");
+            assert_eq!(edges[0].relation, CausalRelation::RelatedTo, "{backend}");
+            assert_eq!(edges[0].confidence, 0.05, "{backend}");
         }
     }
 }

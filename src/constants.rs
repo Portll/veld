@@ -511,6 +511,17 @@ pub const IMPORTANCE_RECENCY_DAYS: f64 = 7.0;
 /// - Higher values (3-5) for more confidence but slower learning
 pub const CONSOLIDATION_MIN_SUPPORT: usize = 2;
 
+/// Corpus-size tiers for min_support: the bar for minting a fact rises with the number of
+/// eligible memories, so a large store needs more corroboration before noise becomes a fact.
+/// A caller's explicit min_support is a floor under the tier, never a way below it.
+pub const CONSOLIDATION_MIN_SUPPORT_SMALL: usize = 2; // <= 100 eligible memories
+pub const CONSOLIDATION_MIN_SUPPORT_MEDIUM: usize = 3; // <= 1000 eligible memories
+pub const CONSOLIDATION_MIN_SUPPORT_LARGE: usize = 4; // > 1000 eligible memories
+
+/// Maximum members in one consolidation cluster. A full cluster takes no more members, so a
+/// greedy pass cannot grow one cluster that absorbs everything.
+pub const CONSOLIDATION_CLUSTER_SIZE_CAP: usize = 20;
+
 /// Minimum age in days before consolidation (legacy gate, still used as fallback)
 ///
 /// Justification:
@@ -645,13 +656,14 @@ pub const FACT_DEDUP_COSINE_THRESHOLD: f32 = 0.80;
 /// - Prevents pure embedding hallucination from causing false merges
 pub const FACT_DEDUP_JACCARD_FLOOR: f32 = 0.30;
 
-/// Legacy Jaccard-only threshold (fallback when embedder is unavailable)
+/// Jaccard-only threshold (fallback when embedder is unavailable)
 ///
 /// Justification:
-/// - Original threshold for pure Jaccard dedup (preserved for graceful degradation)
 /// - Used when embedder fails (circuit breaker open, model load failure)
 /// - Also used per-candidate when an existing fact has no stored embedding
-pub const FACT_DEDUP_JACCARD_FALLBACK: f32 = 0.70;
+/// - 0.75 sits close to the cosine path (cosine 0.80 plus Jaccard 0.30), so a pair the
+///   embedding path keeps apart is not merged on the fallback path
+pub const FACT_DEDUP_JACCARD_FALLBACK: f32 = 0.75;
 
 /// Negation markers for polarity detection in fact deduplication
 ///
@@ -2661,6 +2673,8 @@ pub const RECONSOLIDATION_WORKING_MEMORY_THRESHOLD: u32 = 5;
 // | CONSOLIDATION_MIN_AGE_DAYS    | memory/compression.rs | consolidate_semantic_facts()      |
 // | CONSOLIDATION_JACCARD_THRESHOLD | memory/compression.rs | group_candidates_by_similarity()  |
 // | CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY | memory/compression.rs | extract_fact_candidates() |
+// | CONSOLIDATION_MIN_SUPPORT_SMALL/MEDIUM/LARGE | memory/compression.rs | consolidate()     |
+// | CONSOLIDATION_CLUSTER_SIZE_CAP | memory/compression.rs | group_candidates_by_similarity()  |
 // | FACT_DECAY_GRACE_DAYS              | memory/mod.rs, compression.rs | fact decay grace period     |
 // | FACT_DECAY_HALF_LIFE_BASE_DAYS     | memory/mod.rs, compression.rs | fact decay half-life base  |
 // | FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS | memory/mod.rs, compression.rs | fact decay per support  |
