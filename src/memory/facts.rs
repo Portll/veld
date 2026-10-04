@@ -294,6 +294,60 @@ fn fact_is_valid_at(fact: &SemanticFact, at: chrono::DateTime<chrono::Utc>) -> b
     }
 }
 
+/// What [`SemanticFactStore::ingest_candidate`] decided about one extracted fact. Every
+/// variant reports writes already made.
+#[derive(Debug, Clone)]
+pub enum FactIngestOutcome {
+    /// Matched an active fact and brought source memories it did not cite: reinforced.
+    Reinforced {
+        fact: SemanticFact,
+        confidence_before: f32,
+    },
+    /// Matched an active fact without new evidence: nothing written.
+    AlreadyAttested { fact_id: String },
+    /// Matched a superseded, expired or purged fact: nothing written, and it stays retired.
+    MatchedInactive {
+        fact_id: String,
+        superseded_by: Option<String>,
+    },
+    /// New and contradicting nothing: stored active.
+    Stored { fact: SemanticFact },
+    /// Contradicted an active fact and won: the loser is superseded, the winner stored.
+    Superseded {
+        winner: SemanticFact,
+        loser_id: String,
+    },
+    /// Contradicted a better-supported fact and lost: stored superseded, for the record.
+    Rejected {
+        loser: SemanticFact,
+        winner_id: String,
+    },
+}
+
+impl FactIngestOutcome {
+    /// The fact newly written and active: the only one a caller may connect to the graph or
+    /// report as extracted. A rejected newcomer is excluded, or the losing claim would stay
+    /// reachable by traversal.
+    pub fn newly_active_fact(&self) -> Option<&SemanticFact> {
+        match self {
+            Self::Stored { fact } => Some(fact),
+            Self::Superseded { winner, .. } => Some(winner),
+            _ => None,
+        }
+    }
+
+    /// The reinforced fact and its confidence before reinforcement.
+    pub fn reinforced_fact(&self) -> Option<(&SemanticFact, f32)> {
+        match self {
+            Self::Reinforced {
+                fact,
+                confidence_before,
+            } => Some((fact, *confidence_before)),
+            _ => None,
+        }
+    }
+}
+
 /// Storage for semantic facts with indexing
 pub struct SemanticFactStore {
     /// Default-keyspace rows under `facts:`/`facts_by_*:`/`facts_embedding:`
@@ -317,12 +371,12 @@ impl SemanticFactStore {
 
     /// Store a semantic fact
     pub fn store(&self, user_id: &str, fact: &SemanticFact) -> Result<()> {
-        // Primary storage
-        let key = format!("facts:{}:{}", user_id, fact.id);
-        let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
-        self.store.put_bytes(key.as_bytes(), &value)?;
+        self.store.put_many(&Self::record_pairs(user_id, fact)?)
+    }
 
-        // Entity index - index by each related entity
+    /// The primary row of a fact plus its entity and type index rows.
+    fn record_pairs(user_id: &str, fact: &SemanticFact) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut pairs = vec![Self::primary_pair(user_id, fact)?];
         for entity in &fact.related_entities {
             let entity_key = format!(
                 "facts_by_entity:{}:{}:{}",
@@ -330,17 +384,27 @@ impl SemanticFactStore {
                 entity.to_lowercase(),
                 fact.id
             );
-            self.store
-                .put_bytes(entity_key.as_bytes(), fact.id.as_bytes())?;
+            pairs.push((entity_key.into_bytes(), fact.id.as_bytes().to_vec()));
         }
+        let type_key = format!("facts_by_type:{}:{:?}:{}", user_id, fact.fact_type, fact.id);
+        pairs.push((type_key.into_bytes(), fact.id.as_bytes().to_vec()));
+        Ok(pairs)
+    }
 
-        // Type index
-        let type_name = format!("{:?}", fact.fact_type);
-        let type_key = format!("facts_by_type:{}:{}:{}", user_id, type_name, fact.id);
-        self.store
-            .put_bytes(type_key.as_bytes(), fact.id.as_bytes())?;
+    fn primary_pair(user_id: &str, fact: &SemanticFact) -> Result<(Vec<u8>, Vec<u8>)> {
+        let key = format!("facts:{}:{}", user_id, fact.id);
+        let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
+        Ok((key.into_bytes(), value))
+    }
 
-        Ok(())
+    fn embedding_pair(
+        user_id: &str,
+        fact_id: &str,
+        embedding: &[f32],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let key = format!("facts_embedding:{user_id}:{fact_id}");
+        let value = bincode::serde::encode_to_vec(embedding, bincode::config::standard())?;
+        Ok((key.into_bytes(), value))
     }
 
     /// Store multiple facts in a batch
@@ -870,6 +934,133 @@ impl SemanticFactStore {
         Ok(best_match.map(|(_, fact)| fact))
     }
 
+    /// Admits one freshly extracted fact under the single arbitration policy that every
+    /// ingest path shares.
+    ///
+    /// 1. Dedup ([`Self::find_similar`]). A match on an inactive fact absorbs the restatement
+    ///    and writes nothing, so a retired claim stays retired. A match on an active fact is
+    ///    reinforced only when the candidate brings source memories the fact does not cite:
+    ///    re-deriving a fact from evidence already counted writes nothing, so a full re-scan
+    ///    cannot ratchet confidence or hand out a fresh half-life.
+    /// 2. Contradiction ([`Self::find_contradiction`]). The newer fact wins unless the stored
+    ///    one has strictly greater support; ties go to the newcomer. Confidence is not the
+    ///    tie-breaker: it rises with every re-derivation and would make an old claim ever
+    ///    harder to correct. The loser is superseded, never deleted, and keeps its sources.
+    /// 3. Otherwise the fact is new and is stored.
+    ///
+    /// Each outcome is one atomic write, so no crash leaves two active contradicting facts or
+    /// a superseded fact without its winner. `now` lets a batch stamp one instant on every
+    /// decision.
+    pub fn ingest_candidate(
+        &self,
+        user_id: &str,
+        candidate: &SemanticFact,
+        embedding: Option<&[f32]>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<FactIngestOutcome> {
+        use crate::constants::FACT_REINFORCEMENT_BOOST;
+
+        let with_embedding = |mut pairs: Vec<(Vec<u8>, Vec<u8>)>, fact_id: &str| {
+            if let Some(emb) = embedding {
+                pairs.push(Self::embedding_pair(user_id, fact_id, emb)?);
+            }
+            Ok::<_, anyhow::Error>(pairs)
+        };
+
+        if let Some(mut existing) = self.find_similar(
+            user_id,
+            &candidate.fact,
+            &candidate.related_entities,
+            embedding,
+        )? {
+            if !fact_is_active(&existing, now) {
+                return Ok(FactIngestOutcome::MatchedInactive {
+                    fact_id: existing.id,
+                    superseded_by: existing.superseded_by,
+                });
+            }
+
+            let mut new_sources_added = false;
+            for src in &candidate.source_memories {
+                if !existing.source_memories.contains(src) {
+                    existing.source_memories.push(src.clone());
+                    new_sources_added = true;
+                }
+            }
+            if !new_sources_added {
+                return Ok(FactIngestOutcome::AlreadyAttested {
+                    fact_id: existing.id,
+                });
+            }
+
+            let confidence_before = existing.confidence;
+            existing.support_count += 1;
+            existing.last_reinforced = now;
+            existing.confidence = (existing.confidence
+                + FACT_REINFORCEMENT_BOOST * (1.0 - existing.confidence))
+                .min(1.0);
+            for entity in &candidate.related_entities {
+                if !existing.related_entities.contains(entity) {
+                    existing.related_entities.push(entity.clone());
+                }
+            }
+            // The latest encoding replaces the stored one, so dedup and contradiction compare
+            // against the embedder in use now.
+            let pairs = with_embedding(Self::record_pairs(user_id, &existing)?, &existing.id)?;
+            self.store.put_many(&pairs)?;
+            return Ok(FactIngestOutcome::Reinforced {
+                fact: existing,
+                confidence_before,
+            });
+        }
+
+        if let Some(mut existing) = self.find_contradiction(
+            user_id,
+            &candidate.fact,
+            &candidate.related_entities,
+            embedding,
+        )? {
+            if candidate.support_count >= existing.support_count {
+                let mut winner = candidate.clone();
+                winner.record_superseded(&existing.id);
+                existing.supersede(Some(&winner.id), now);
+                let mut pairs = vec![Self::primary_pair(user_id, &existing)?];
+                pairs.extend(Self::record_pairs(user_id, &winner)?);
+                self.store.put_many(&with_embedding(pairs, &winner.id)?)?;
+                tracing::info!(
+                    superseded = %existing.id,
+                    winner = %winner.id,
+                    "Fact contradiction: newer claim supersedes"
+                );
+                return Ok(FactIngestOutcome::Superseded {
+                    winner,
+                    loser_id: existing.id,
+                });
+            }
+
+            let mut loser = candidate.clone();
+            loser.supersede(Some(&existing.id), now);
+            existing.record_superseded(&loser.id);
+            let mut pairs = vec![Self::primary_pair(user_id, &existing)?];
+            pairs.extend(Self::record_pairs(user_id, &loser)?);
+            self.store.put_many(&with_embedding(pairs, &loser.id)?)?;
+            tracing::info!(
+                rejected = %loser.id,
+                winner = %existing.id,
+                "Fact contradiction: better-supported claim holds"
+            );
+            return Ok(FactIngestOutcome::Rejected {
+                loser,
+                winner_id: existing.id,
+            });
+        }
+
+        let fact = candidate.clone();
+        let pairs = with_embedding(Self::record_pairs(user_id, &fact)?, &fact.id)?;
+        self.store.put_many(&pairs)?;
+        Ok(FactIngestOutcome::Stored { fact })
+    }
+
     // =========================================================================
     // BI-TEMPORAL INVALIDATION
     // =========================================================================
@@ -1254,6 +1445,236 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restated.map(|f| f.id), Some("dead".to_string()));
+    }
+
+    // Identical embeddings satisfy every similarity gate, so only polarity, support and
+    // liveness decide an outcome.
+    const EMB: &[f32] = &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+
+    fn candidate(id: &str, text: &str, support: usize, sources: usize) -> SemanticFact {
+        let mut fact = create_test_fact(id, text);
+        fact.support_count = support;
+        fact.source_memories = (0..sources)
+            .map(|_| crate::memory::MemoryId(uuid::Uuid::new_v4()))
+            .collect();
+        fact
+    }
+
+    fn active_count(store: &SemanticFactStore, user: &str) -> usize {
+        let now = chrono::Utc::now();
+        store
+            .list_filtered(user, 100, true)
+            .unwrap()
+            .iter()
+            .filter(|f| fact_is_active(f, now))
+            .count()
+    }
+
+    #[test]
+    fn a_contradiction_ends_with_exactly_one_active_fact_the_newer_one() {
+        on_both_backends(a_contradiction_ends_with_exactly_one_active_fact_the_newer_one_body);
+    }
+
+    fn a_contradiction_ends_with_exactly_one_active_fact_the_newer_one_body(
+        store: SemanticFactStore,
+    ) {
+        let user = "arb";
+        let claim = candidate("claim", "four crew were injured in the incident", 1, 1);
+        store
+            .ingest_candidate(user, &claim, Some(EMB), chrono::Utc::now())
+            .unwrap();
+        let correction = candidate(
+            "correction",
+            "four crew were not injured in the incident",
+            1,
+            1,
+        );
+        let outcome = store
+            .ingest_candidate(user, &correction, Some(EMB), chrono::Utc::now())
+            .unwrap();
+        match &outcome {
+            FactIngestOutcome::Superseded { winner, loser_id } => {
+                assert_eq!(winner.id, "correction");
+                assert_eq!(loser_id, "claim");
+            }
+            other => panic!("expected the correction to supersede the claim, got {other:?}"),
+        }
+        assert_eq!(active_count(&store, user), 1);
+
+        let settled_claim = store.get(user, "claim").unwrap().expect("kept");
+        assert!(!fact_is_active(&settled_claim, chrono::Utc::now()));
+        assert_eq!(settled_claim.superseded_by.as_deref(), Some("correction"));
+        assert!(!settled_claim.source_memories.is_empty());
+        let settled_correction = store.get(user, "correction").unwrap().expect("stored");
+        assert!(fact_is_active(&settled_correction, chrono::Utc::now()));
+        assert_eq!(settled_correction.supersedes, vec!["claim".to_string()]);
+        assert!(store.get_embedding(user, "correction").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_better_supported_claim_holds_and_the_newcomer_is_stored_retired() {
+        on_both_backends(a_better_supported_claim_holds_and_the_newcomer_is_stored_retired_body);
+    }
+
+    fn a_better_supported_claim_holds_and_the_newcomer_is_stored_retired_body(
+        store: SemanticFactStore,
+    ) {
+        let user = "arb";
+        let established = candidate(
+            "established",
+            "four crew were injured in the incident",
+            5,
+            5,
+        );
+        store
+            .ingest_candidate(user, &established, Some(EMB), chrono::Utc::now())
+            .unwrap();
+        let stray = candidate("stray", "four crew were not injured in the incident", 1, 1);
+        let outcome = store
+            .ingest_candidate(user, &stray, Some(EMB), chrono::Utc::now())
+            .unwrap();
+        match &outcome {
+            FactIngestOutcome::Rejected { loser, winner_id } => {
+                assert_eq!(loser.id, "stray");
+                assert_eq!(winner_id, "established");
+            }
+            other => panic!("expected the better-supported claim to hold, got {other:?}"),
+        }
+        assert!(outcome.newly_active_fact().is_none());
+        assert_eq!(active_count(&store, user), 1);
+        let stray = store
+            .get(user, "stray")
+            .unwrap()
+            .expect("kept for the record");
+        assert!(!fact_is_active(&stray, chrono::Utc::now()));
+        let established = store.get(user, "established").unwrap().unwrap();
+        assert_eq!(established.supersedes, vec!["stray".to_string()]);
+    }
+
+    #[test]
+    fn a_repeatedly_re_extracted_wrong_claim_does_not_flip_flop() {
+        on_both_backends(a_repeatedly_re_extracted_wrong_claim_does_not_flip_flop_body);
+    }
+
+    fn a_repeatedly_re_extracted_wrong_claim_does_not_flip_flop_body(store: SemanticFactStore) {
+        let user = "flipflop";
+        let claim = candidate("claim", "four crew were injured in the incident", 1, 1);
+        store
+            .ingest_candidate(user, &claim, Some(EMB), chrono::Utc::now())
+            .unwrap();
+        let correction = candidate(
+            "correction",
+            "four crew were not injured in the incident",
+            1,
+            1,
+        );
+        store
+            .ingest_candidate(user, &correction, Some(EMB), chrono::Utc::now())
+            .unwrap();
+        let retired_before = store.get(user, "claim").unwrap().unwrap();
+
+        for cycle in 0..5 {
+            let redo = candidate(
+                &format!("redo-{cycle}"),
+                "four crew were injured in the incident",
+                1,
+                1,
+            );
+            let outcome = store
+                .ingest_candidate(user, &redo, Some(EMB), chrono::Utc::now())
+                .unwrap();
+            match &outcome {
+                FactIngestOutcome::MatchedInactive { fact_id, .. } => {
+                    assert_eq!(fact_id, "claim", "lands back on its own retired row");
+                }
+                other => {
+                    panic!("cycle {cycle}: expected the retired row to absorb it, got {other:?}")
+                }
+            }
+        }
+
+        assert_eq!(active_count(&store, user), 1);
+        assert!(fact_is_active(
+            &store.get(user, "correction").unwrap().unwrap(),
+            chrono::Utc::now()
+        ));
+        let retired_after = store.get(user, "claim").unwrap().unwrap();
+        assert_eq!(
+            retired_after.last_reinforced,
+            retired_before.last_reinforced
+        );
+        assert_eq!(retired_after.support_count, retired_before.support_count);
+        assert_eq!(store.list_filtered(user, 100, true).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reinforcement_is_idempotent_when_no_new_evidence_arrives() {
+        on_both_backends(reinforcement_is_idempotent_when_no_new_evidence_arrives_body);
+    }
+
+    fn reinforcement_is_idempotent_when_no_new_evidence_arrives_body(store: SemanticFactStore) {
+        let user = "idem";
+        let first = candidate("f1", "the reactor was scrammed at 04:12", 1, 1);
+        store
+            .ingest_candidate(user, &first, Some(EMB), chrono::Utc::now())
+            .unwrap();
+        let stored = store.get(user, "f1").unwrap().unwrap();
+
+        for cycle in 0..4 {
+            let mut redo = candidate(
+                &format!("redo-{cycle}"),
+                "the reactor was scrammed at 04:12",
+                1,
+                0,
+            );
+            redo.source_memories = stored.source_memories.clone();
+            let later = chrono::Utc::now() + chrono::Duration::days(cycle + 1);
+            let outcome = store
+                .ingest_candidate(user, &redo, Some(EMB), later)
+                .unwrap();
+            assert!(
+                matches!(outcome, FactIngestOutcome::AlreadyAttested { .. }),
+                "cycle {cycle}: already-counted evidence must be inert, got {outcome:?}"
+            );
+        }
+
+        let after = store.get(user, "f1").unwrap().unwrap();
+        assert_eq!(after.confidence, stored.confidence);
+        assert_eq!(after.last_reinforced, stored.last_reinforced);
+        assert_eq!(after.support_count, stored.support_count);
+    }
+
+    #[test]
+    fn genuinely_new_evidence_still_reinforces() {
+        on_both_backends(genuinely_new_evidence_still_reinforces_body);
+    }
+
+    fn genuinely_new_evidence_still_reinforces_body(store: SemanticFactStore) {
+        let user = "reinforce";
+        let first = candidate("f1", "the reactor was scrammed at 04:12", 1, 1);
+        store
+            .ingest_candidate(user, &first, Some(EMB), chrono::Utc::now())
+            .unwrap();
+        let before = store.get(user, "f1").unwrap().unwrap();
+
+        let mut corroboration = candidate("f2", "the reactor was scrammed at 04:12", 1, 1);
+        corroboration.related_entities.push("reactor".to_string());
+        let outcome = store
+            .ingest_candidate(user, &corroboration, Some(EMB), chrono::Utc::now())
+            .unwrap();
+        let (fact, confidence_before) = outcome
+            .reinforced_fact()
+            .expect("new source evidence reinforces");
+        assert_eq!(fact.id, "f1", "reinforcement lands on the existing row");
+        assert_eq!(confidence_before, before.confidence);
+        assert!(fact.confidence > before.confidence);
+        assert_eq!(fact.support_count, before.support_count + 1);
+        assert_eq!(store.list(user, 100).unwrap().len(), 1);
+        assert_eq!(
+            store.find_by_entity(user, "reactor", 10).unwrap().len(),
+            1,
+            "an entity the reinforcement adds is indexed"
+        );
     }
 
     #[test]
