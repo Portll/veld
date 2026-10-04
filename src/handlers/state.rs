@@ -1133,7 +1133,9 @@ impl MultiUserMemoryManager {
         let user_id = user_id.to_string();
         let persisted_user_id = user_id.clone();
 
-        tokio::task::spawn_blocking(move || {
+        // Tracked, not a bare spawn_blocking: the task holds its own handle on the audit store,
+        // so an untracked write outlives a drain and keeps the store open after the manager drops.
+        self.task_tracker.spawn_blocking(move || {
             if let Err(e) = audit_store.append_event(&persisted_user_id, &storage_event) {
                 tracing::error!("Failed to persist audit log: {}", e);
             }
@@ -1165,7 +1167,7 @@ impl MultiUserMemoryManager {
             let audit_retention_days = self.server_config.audit_retention_days as i64;
             let audit_max_entries = self.server_config.audit_max_entries_per_user;
 
-            tokio::task::spawn_blocking(move || {
+            self.task_tracker.spawn_blocking(move || {
                 let manager = MultiUserMemoryManagerRotationHelper {
                     audit_store,
                     audit_logs,
@@ -5137,5 +5139,53 @@ mod background_task_tests {
             "the drain returns once the tracked task finishes"
         );
         assert!(state.task_tracker.is_empty());
+    }
+
+    /// The blocking pool is pinned to one thread and that thread is held, so the audit writes are
+    /// still queued when the drain starts rather than usually finished. The burst crosses
+    /// `audit_rotation_check_interval`, so the rotation task is queued as well as the writes.
+    #[test]
+    fn a_drained_manager_releases_the_shared_db_despite_queued_audit_writes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let home = tempfile::tempdir().expect("temp home");
+            let state = Arc::new(manager(home.path(), 4));
+            let audit_store = Arc::downgrade(&state.audit_store);
+            #[cfg(feature = "rocksdb")]
+            let shared_db = state.shared_db.rocksdb().map(Arc::downgrade);
+
+            // Released by time, not by a signal: a drain that waits for the queued writes must
+            // also wait for this.
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(300)));
+            let events = state.server_config.audit_rotation_check_interval + 1;
+            for i in 0..events {
+                state.log_event(
+                    "drain-probe",
+                    "PROBE",
+                    &format!("probe-{i}"),
+                    "queued write",
+                );
+            }
+
+            assert!(state.drain_background_tasks(Duration::from_secs(30)).await);
+            drop(state);
+
+            assert!(
+                audit_store.upgrade().is_none(),
+                "a queued audit task still holds the audit store after drain and drop, so \
+                 reopening this data directory fails on the store's lock"
+            );
+            #[cfg(feature = "rocksdb")]
+            if let Some(shared_db) = shared_db {
+                assert!(
+                    shared_db.upgrade().is_none(),
+                    "the shared RocksDB is still open after drain and drop"
+                );
+            }
+        });
     }
 }
