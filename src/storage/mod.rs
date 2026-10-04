@@ -977,6 +977,12 @@ mod backend_coverage_matrix {
             45 - redb_ok,
             "a redb method failed that rocksdb also fails — the gap list is not the whole story"
         );
+        // ADR 0007: redb implements every trait method. A capability added for RocksDB alone
+        // lands here, by name, rather than as a refusal at run time.
+        assert!(
+            gap.is_empty(),
+            "redb lacks trait methods rocksdb has: {gap:?}"
+        );
     }
 }
 
