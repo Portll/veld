@@ -1095,9 +1095,17 @@ pub async fn restore_backup(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let user_id = req.user_id.clone();
-    let all_restored = state
-        .restore_user_backup_with_options(&user_id, req.backup_id, req.max_lsn)
-        .map_err(AppError::Internal)?;
+    // Off the async runtime: a restore is file I/O and may wait for the tenant's store to close.
+    let all_restored = {
+        let state = state.clone();
+        let user_id = user_id.clone();
+        tokio::task::spawn_blocking(move || {
+            state.restore_user_backup_with_options(&user_id, req.backup_id, req.max_lsn)
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("restore task failed: {e}")))?
+        .map_err(AppError::Internal)?
+    };
 
     state.log_event(
         &user_id,
