@@ -717,32 +717,6 @@ impl SemanticFactStore {
         })
     }
 
-    /// Find the creation timestamp of the most recent fact for a user.
-    ///
-    /// Used at startup to initialize the fact extraction watermark when no
-    /// persisted watermark exists. Returns None if user has no facts.
-    pub fn latest_fact_created_at(&self, user_id: &str) -> Option<i64> {
-        let prefix = format!("facts:{user_id}:");
-        let mut max_millis: Option<i64> = None;
-
-        // scan_prefix enforces the bound AND propagates read errors — the old
-        // loop broke silently on a mid-scan error, returning a truncated set
-        // that looked complete.
-        for (key, value) in self.store.scan_prefix(prefix.as_bytes(), None).ok()? {
-            let key_str = String::from_utf8_lossy(&key);
-            // Skip index keys (entity/type sub-keys have extra colons)
-            if key_str.matches(':').count() > 2 {
-                continue;
-            }
-            if let Ok((fact, _is_legacy)) = decode_semantic_fact_with_fallback(&value) {
-                let millis = fact.created_at.timestamp_millis();
-                max_millis = Some(max_millis.map_or(millis, |cur| cur.max(millis)));
-            }
-        }
-
-        max_millis
-    }
-
     /// Find facts that should decay (no reinforcement for too long)
     pub fn find_decaying_facts(
         &self,
@@ -1293,7 +1267,10 @@ impl SemanticFactStore {
 /// Returns `true` for positive polarity (even negation count, including 0),
 /// `false` for negative polarity (odd negation count).
 /// Handles double-negation: "not unlike" = positive.
-fn detect_polarity(text_lower: &str) -> bool {
+///
+/// Extraction-time clustering uses the same notion as store-time dedup, so "the same claim
+/// restated" is defined once.
+pub(crate) fn detect_polarity(text_lower: &str) -> bool {
     use crate::constants::FACT_NEGATION_MARKERS;
     let words: Vec<&str> = text_lower.split_whitespace().collect();
     let negation_count = words

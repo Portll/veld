@@ -829,6 +829,10 @@ pub struct CausalFactLink {
 pub struct ConsolidationResult {
     /// Number of memories processed
     pub memories_processed: usize,
+    /// Memories that passed the age gate and went through extraction. Fewer than
+    /// `memories_processed` means part of the corpus is still aging in and a later cycle must
+    /// extract again even if nothing new is written.
+    pub memories_eligible: usize,
     /// Number of new facts extracted
     pub facts_extracted: usize,
     /// Number of existing facts reinforced
@@ -864,6 +868,10 @@ pub struct SemanticConsolidator {
 struct PatternCluster {
     /// Stemmed tokens of the cluster's first member; every later member is compared to these.
     stem_set: HashSet<String>,
+    /// Negation polarity of the first member. A negation is often one word away from its
+    /// claim and shares most of its stems, so without this a claim and its correction merge
+    /// into one cluster and the correction never reaches arbitration.
+    polarity: bool,
     /// All candidate entries: (pattern_text, memory_id, confidence)
     members: Vec<(String, MemoryId, f32)>,
 }
@@ -1049,9 +1057,19 @@ impl SemanticConsolidator {
             })
             .collect();
 
+        result.memories_eligible = eligible.len();
         if eligible.is_empty() {
             return result;
         }
+
+        let created_by_id: HashMap<&MemoryId, chrono::DateTime<chrono::Utc>> =
+            eligible.iter().map(|m| (&m.id, m.created_at)).collect();
+        let created_of = |id: &MemoryId| {
+            created_by_id
+                .get(id)
+                .copied()
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        };
 
         // Phase 1: Extract candidates using multi-extractor pipeline
         let mut all_candidates: Vec<(String, MemoryId, f32)> = Vec::new();
@@ -1065,6 +1083,15 @@ impl SemanticConsolidator {
         if all_candidates.is_empty() {
             return result;
         }
+
+        // Greedy clustering depends on order, and memories arrive in storage order (random
+        // ids). Ordering by evidence age, then text, makes a corpus cluster the same way every
+        // time, with each cluster anchored on the earliest phrasing of its claim.
+        all_candidates.sort_by(|a, b| {
+            created_of(&a.1)
+                .cmp(&created_of(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // Phase 2: Group by stemmed-token Jaccard similarity
         let clusters =
@@ -1120,6 +1147,23 @@ impl SemanticConsolidator {
             }
         }
 
+        // Oldest evidence first: callers ingest in this order, and arbitration gives a support
+        // tie to the incoming fact, so the claim backed by the newest evidence wins, as a
+        // later correction should. Text breaks ties within a cohort written at one instant.
+        let newest_evidence = |fact: &SemanticFact| {
+            fact.source_memories
+                .iter()
+                .map(&created_of)
+                .max()
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        };
+        result.new_facts.sort_by(|a, b| {
+            newest_evidence(a)
+                .cmp(&newest_evidence(b))
+                .then_with(|| a.fact.cmp(&b.fact))
+        });
+        result.new_fact_ids = result.new_facts.iter().map(|f| f.id.clone()).collect();
+
         result
     }
 
@@ -1169,11 +1213,14 @@ impl SemanticConsolidator {
             if tokens.is_empty() {
                 continue;
             }
+            let polarity = super::facts::detect_polarity(&pattern.to_lowercase());
 
             let mut best_idx = None;
             let mut best_sim = 0.0f32;
             for (i, cluster) in clusters.iter().enumerate() {
-                if cluster.members.len() >= CONSOLIDATION_CLUSTER_SIZE_CAP {
+                if cluster.members.len() >= CONSOLIDATION_CLUSTER_SIZE_CAP
+                    || cluster.polarity != polarity
+                {
                     continue;
                 }
                 let sim = Self::jaccard_similarity(&tokens, &cluster.stem_set);
@@ -1191,6 +1238,7 @@ impl SemanticConsolidator {
             } else {
                 clusters.push(PatternCluster {
                     stem_set: tokens,
+                    polarity,
                     members: vec![(pattern.clone(), memory_id.clone(), *confidence)],
                 });
             }
@@ -2779,6 +2827,147 @@ mod tests {
                 .any(|f| f.fact.contains("crew members were injured")),
             "two corroborating memories must mint the sentence, got {:?}",
             paired.new_facts
+        );
+    }
+
+    fn observation_aged(content: &str, days: i64) -> Memory {
+        Memory::new(
+            MemoryId(Uuid::new_v4()),
+            Experience {
+                content: content.to_string(),
+                experience_type: ExperienceType::Observation,
+                ..Default::default()
+            },
+            0.8,
+            None,
+            None,
+            None,
+            Some(chrono::Utc::now() - chrono::Duration::days(days)),
+        )
+    }
+
+    const CLAIM: &str =
+        "Initial reports said four crew members were injured in the bridge collapse.";
+    const CLAIM_ECHO: &str =
+        "Early reports said four crew members were injured in the bridge collapse.";
+    const CORRECTION: &str =
+        "Corrected reports confirm no crew members were injured in the bridge collapse.";
+    const CORRECTION_ECHO: &str =
+        "Later reports confirm no crew members were injured in the bridge collapse.";
+
+    #[test]
+    fn contradicting_statements_never_share_a_cluster() {
+        let consolidator = SemanticConsolidator::new();
+        let memories: Vec<Memory> = [CLAIM, CLAIM_ECHO, CORRECTION, CORRECTION_ECHO]
+            .iter()
+            .map(|content| observation_aged(content, 8))
+            .collect();
+
+        let result = consolidator.consolidate(&memories);
+        assert_eq!(
+            result.facts_extracted, 2,
+            "claim and correction mint as separate facts: {:?}",
+            result.new_facts
+        );
+        assert!(result
+            .new_facts
+            .iter()
+            .any(|f| f.fact.contains("four crew members were injured")));
+        assert!(result
+            .new_facts
+            .iter()
+            .any(|f| f.fact.contains("no crew members were injured")));
+    }
+
+    #[test]
+    fn minted_facts_are_ordered_by_evidence_recency() {
+        let consolidator = SemanticConsolidator::new();
+        let memories = vec![
+            observation_aged(CORRECTION, 20),
+            observation_aged(CLAIM, 40),
+            observation_aged(CORRECTION_ECHO, 20),
+            observation_aged(CLAIM_ECHO, 40),
+        ];
+
+        let result = consolidator.consolidate(&memories);
+        assert_eq!(result.facts_extracted, 2);
+        assert!(
+            result.new_facts[0]
+                .fact
+                .contains("four crew members were injured"),
+            "the older claim is ingested first: {:?}",
+            result.new_facts
+        );
+        assert!(result.new_facts[1]
+            .fact
+            .contains("no crew members were injured"));
+        assert_eq!(
+            result.new_fact_ids,
+            result
+                .new_facts
+                .iter()
+                .map(|f| f.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn consolidation_does_not_depend_on_input_order() {
+        let consolidator = SemanticConsolidator::new();
+        let memories: Vec<Memory> = [
+            CLAIM,
+            CORRECTION,
+            CLAIM_ECHO,
+            CORRECTION_ECHO,
+            "The salvage barge cleared the shipping channel after six weeks of work.",
+            "After six weeks of work the salvage barge cleared the shipping channel.",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, content)| observation_aged(content, 10 + i as i64))
+        .collect();
+        let forward: Vec<String> = consolidator
+            .consolidate(&memories)
+            .new_facts
+            .into_iter()
+            .map(|f| f.fact)
+            .collect();
+        let mut reversed = memories.clone();
+        reversed.reverse();
+        let backward: Vec<String> = consolidator
+            .consolidate(&reversed)
+            .new_facts
+            .into_iter()
+            .map(|f| f.fact)
+            .collect();
+        assert!(!forward.is_empty());
+        assert_eq!(forward, backward);
+    }
+
+    /// Two different zeros: a fresh corpus mints nothing because the age gate looked at
+    /// nothing, while an aged corpus of unique statements mints nothing because none is
+    /// corroborated. `memories_eligible` tells them apart.
+    #[test]
+    fn an_age_gated_zero_is_distinguishable_from_a_corroboration_zero() {
+        let unique = [
+            "MSC Brianna completed cargo operations at Seagirt berth 3 and departed on the evening tide.",
+            "Crane STS-07 at Seagirt completed its 4,000-hour preventive maintenance.",
+            "Fog delayed pilot boardings in the Craighill Channel for two hours.",
+        ];
+
+        let fresh: Vec<Memory> = unique.iter().map(|c| observation_aged(c, 0)).collect();
+        let gated = SemanticConsolidator::new().consolidate(&fresh);
+        assert_eq!(gated.memories_eligible, 0);
+        assert_eq!(gated.facts_extracted, 0);
+
+        // Past the consolidator's three-day floor, with the age gate lowered to zero.
+        let aged: Vec<Memory> = unique.iter().map(|c| observation_aged(c, 4)).collect();
+        let eager = SemanticConsolidator::with_thresholds(CONSOLIDATION_MIN_SUPPORT, 0);
+        let result = eager.consolidate(&aged);
+        assert_eq!(result.memories_eligible, aged.len());
+        assert_eq!(
+            result.facts_extracted, 0,
+            "unique statements are not corroborated"
         );
     }
 
