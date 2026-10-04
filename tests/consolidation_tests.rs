@@ -1345,3 +1345,108 @@ fn test_consolidation_event_count() {
         "Event count should increase after operations"
     );
 }
+
+// =============================================================================
+// FACT CORRECTION — END TO END
+// =============================================================================
+
+/// A creation time `days` in the past at whole milliseconds, so it round-trips through
+/// storage exactly.
+fn days_ago_ms(days: i64) -> chrono::DateTime<chrono::Utc> {
+    let t = chrono::Utc::now() - chrono::Duration::days(days);
+    chrono::DateTime::from_timestamp_millis(t.timestamp_millis()).expect("valid timestamp")
+}
+
+/// remember, extraction, contradiction and supersession in one run. The non-vacuity check
+/// comes first: the claim must be extracted before anything about arbitration is asserted.
+#[test]
+fn a_corrected_report_supersedes_the_initial_claim_end_to_end() {
+    use veld::memory::compression::is_active;
+    use veld::similarity::cosine_similarity;
+
+    let (system, _dir) = setup_memory_system();
+    let user = "e2e-correction";
+    const CLAIM: &str =
+        "Initial reports said four crew members were injured in the bridge collapse.";
+    const CLAIM_ECHO: &str =
+        "Early reports said four crew members were injured in the bridge collapse.";
+    // The correction is a minimal negation of the claim: find_contradiction reuses dedup's
+    // thresholds with polarity inverted, and the wording, not the thresholds, has to clear them.
+    const CORRECTION: &str =
+        "Corrected reports confirm no crew members were injured in the bridge collapse.";
+    const CORRECTION_ECHO: &str =
+        "Later reports confirm no crew members were injured in the bridge collapse.";
+
+    for content in [CLAIM, CLAIM_ECHO] {
+        system
+            .remember(create_experience(content), Some(days_ago_ms(40)))
+            .expect("remember claim");
+    }
+    system
+        .run_maintenance(1.0, user, true)
+        .expect("heavy maintenance");
+
+    let after_claim = system.get_facts(user, 100).expect("facts");
+    let claim_fact = after_claim
+        .iter()
+        .find(|f| f.fact.contains("four crew members were injured"))
+        .unwrap_or_else(|| {
+            panic!("two corroborating declarative memories minted no claim fact: {after_claim:?}")
+        })
+        .clone();
+
+    for content in [CORRECTION, CORRECTION_ECHO] {
+        system
+            .remember(create_experience(content), Some(days_ago_ms(20)))
+            .expect("remember correction");
+    }
+    system
+        .run_maintenance(1.0, user, true)
+        .expect("heavy maintenance");
+
+    let after_correction = system.get_facts(user, 100).expect("facts");
+    let correction_fact = after_correction
+        .iter()
+        .find(|f| f.fact.contains("no crew members were injured"))
+        .unwrap_or_else(|| panic!("the correction was never extracted: {after_correction:?}"))
+        .clone();
+
+    let store = system.fact_store();
+    let settled_claim = store
+        .get(user, &claim_fact.id)
+        .expect("read claim")
+        .expect("a superseded claim is kept, not deleted");
+    let now = chrono::Utc::now();
+    if is_active(&settled_claim, now) {
+        let cosine = match (
+            store.get_embedding(user, &claim_fact.id).ok().flatten(),
+            store
+                .get_embedding(user, &correction_fact.id)
+                .ok()
+                .flatten(),
+        ) {
+            (Some(a), Some(b)) => cosine_similarity(&a, &b),
+            _ => f32::NAN,
+        };
+        panic!(
+            "the correction did not supersede the claim. cosine {cosine} (needs >= 0.80), claim \
+             entities {:?}, correction entities {:?}",
+            claim_fact.related_entities, correction_fact.related_entities
+        );
+    }
+    assert_eq!(
+        settled_claim.superseded_by.as_deref(),
+        Some(correction_fact.id.as_str()),
+        "the superseded claim names its winner"
+    );
+    assert!(!settled_claim.source_memories.is_empty());
+    let settled_correction = store
+        .get(user, &correction_fact.id)
+        .expect("read correction")
+        .expect("correction stored");
+    assert!(is_active(&settled_correction, now));
+    assert!(
+        settled_correction.supersedes.contains(&claim_fact.id),
+        "the winner records what it displaced"
+    );
+}
