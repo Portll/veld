@@ -1176,7 +1176,8 @@ pub async fn get_consolidation_report(
             })?
             .with_timezone(&chrono::Utc)
     } else {
-        now - chrono::Duration::hours(1)
+        // Consolidation runs on multi-hour schedules, and clients document a 24-hour default.
+        now - chrono::Duration::hours(24)
     };
 
     let until = if let Some(until_str) = &req.until {

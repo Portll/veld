@@ -1100,6 +1100,124 @@ async fn graph_data_authenticated() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+async fn todos_resolve_dependencies_link_memories_and_report_what_completion_unblocks() {
+    use veld::memory::Experience;
+
+    let h = Harness::new();
+    let user = "potent-todos";
+    let create = |body: serde_json::Value| authed_post("/api/todos/add", body);
+
+    let (status, body) = json_of(
+        h.app(),
+        create(json!({"user_id": user, "content": "Ship it", "blocked_by": ["SHO-999"]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown dependency: {body}"
+    );
+
+    let memory_id = {
+        let memory = h.mgr.get_user_memory(user).expect("memory");
+        let guard = memory.read();
+        guard
+            .remember(
+                Experience {
+                    content: "The release needs a signed changelog.".to_string(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("remember")
+    };
+    let (status, body) = json_of(
+        h.app(),
+        create(json!({
+            "user_id": user,
+            "content": "Write the changelog",
+            "related_memory_ids": [memory_id.0.to_string()],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let blocker = body["todo"]["id"].as_str().expect("id").to_string();
+    let linked = &body["todo"]["related_memory_ids"];
+    assert!(
+        linked
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == &json!(memory_id.0.to_string()))),
+        "{body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        create(json!({
+            "user_id": user,
+            "content": "Tag the release",
+            "blocked_by": [blocker.clone()],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let dependent = body["todo"]["id"].as_str().expect("id").to_string();
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/todos", json!({"user_id": user, "query": "changelog"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["todos"][0]["id"].as_str(),
+        Some(blocker.as_str()),
+        "{body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{blocker}/complete"),
+            json!({"user_id": user}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["unblocked"][0]["id"].as_str(),
+        Some(dependent.as_str()),
+        "{body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{dependent}/reorder"),
+            json!({"user_id": user, "direction": "sideways"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{dependent}/comments"),
+            json!({"user_id": user, "content": "Waiting on the changelog."}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let comment_id = body["comment"]["id"].as_str().expect("comment id");
+    assert!(
+        body["formatted"]
+            .as_str()
+            .is_some_and(|f| f.contains(comment_id)),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn todo_lifecycle() {
     let h = Harness::new();
 
