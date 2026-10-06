@@ -48,7 +48,7 @@ impl StorageCapabilities {
         match backend {
             StorageBackend::Redb => Self {
                 embedded: true,
-                default_target: true,
+                default_target: false,
                 legacy_compatibility: false,
                 supports_prefix_scan: true,
                 supports_transactional_batch: true,
@@ -58,7 +58,7 @@ impl StorageCapabilities {
             },
             StorageBackend::RocksDb => Self {
                 embedded: true,
-                default_target: false,
+                default_target: true,
                 legacy_compatibility: true,
                 supports_prefix_scan: true,
                 supports_transactional_batch: true,
@@ -651,9 +651,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redb_is_the_default_target_backend() {
+    fn redb_is_not_the_default_target_backend() {
         let capabilities = StorageCapabilities::for_backend(StorageBackend::Redb);
-        assert!(capabilities.default_target);
+        assert!(!capabilities.default_target);
         assert!(!capabilities.legacy_compatibility);
         assert!(capabilities.supports_transactional_batch);
     }
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn rocksdb_is_marked_legacy_compatibility() {
         let capabilities = StorageCapabilities::for_backend(StorageBackend::RocksDb);
-        assert!(!capabilities.default_target);
+        assert!(capabilities.default_target);
         assert!(capabilities.legacy_compatibility);
         assert!(capabilities.supports_prefix_scan);
     }
@@ -733,7 +733,7 @@ mod tests {
     fn redb_factory_reports_backend_and_capabilities() {
         let factory = RedbStorageFactory;
         assert_eq!(factory.backend(), StorageBackend::Redb);
-        assert!(factory.capabilities().default_target);
+        assert!(!factory.capabilities().default_target);
     }
 }
 
