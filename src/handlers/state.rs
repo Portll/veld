@@ -576,9 +576,6 @@ impl MultiUserMemoryManager {
             shared_rocksdb_cache.as_ref(),
         )?;
 
-        if let Err(e) = shared_stores.todo_store.load_vector_indices() {
-            tracing::warn!("Failed to load todo vector indices: {}, semantic todo search will rebuild on first use", e);
-        }
         info!("Todo store initialized");
 
         let backup_engine = Self::open_backup_engine(&base_path, &server_config)?;

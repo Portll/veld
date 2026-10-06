@@ -163,9 +163,26 @@ pub fn format_todo_list_with_total(
 
     let mut output = header;
 
-    // Separate parent todos and subtasks
-    let parent_todos: Vec<_> = todos.iter().filter(|t| t.parent_id.is_none()).collect();
-    let subtasks: Vec<_> = todos.iter().filter(|t| t.parent_id.is_some()).collect();
+    // Top-level rows are todos without a parent plus subtasks whose parent is not in this
+    // list (the subtasks view, or a filter that matched the child only): a subtask is never
+    // dropped because its parent is absent.
+    let ids_in_list: std::collections::HashSet<_> = todos.iter().map(|t| &t.id).collect();
+    let parent_todos: Vec<_> = todos
+        .iter()
+        .filter(|t| {
+            t.parent_id
+                .as_ref()
+                .is_none_or(|pid| !ids_in_list.contains(pid))
+        })
+        .collect();
+    let subtasks: Vec<_> = todos
+        .iter()
+        .filter(|t| {
+            t.parent_id
+                .as_ref()
+                .is_some_and(|pid| ids_in_list.contains(pid))
+        })
+        .collect();
 
     // Group by status in workflow order
     let status_order = [
@@ -350,6 +367,53 @@ pub fn format_todo_updated(todo: &Todo, project_name: Option<&str>) -> String {
 /// Format todo deleted confirmation
 pub fn format_todo_deleted(todo_id: &str) -> String {
     format!("✓ Deleted {}", todo_id)
+}
+
+fn comment_type_icon(comment_type: &super::types::TodoCommentType) -> &'static str {
+    use super::types::TodoCommentType;
+    match comment_type {
+        TodoCommentType::Comment => "💬",
+        TodoCommentType::Progress => "📊",
+        TodoCommentType::Resolution => "✅",
+        TodoCommentType::Activity => "🔄",
+    }
+}
+
+/// The comment list for a todo. Each line carries the comment id, which update and delete
+/// need and which a client reading formatted output has no other way to find.
+pub fn format_comment_list(todo_short_id: &str, comments: &[super::types::TodoComment]) -> String {
+    if comments.is_empty() {
+        return format!("No comments on {todo_short_id}");
+    }
+    let mut output = format!(
+        "📝 Comments on {} ({} total)\n\n",
+        todo_short_id,
+        comments.len()
+    );
+    for (i, comment) in comments.iter().enumerate() {
+        output.push_str(&format!(
+            "{}. {} {} ({}) [id: {}]\n   {}\n\n",
+            i + 1,
+            comment_type_icon(&comment.comment_type),
+            comment.author,
+            comment.created_at.format("%Y-%m-%d %H:%M"),
+            comment.id.0,
+            comment.content
+        ));
+    }
+    output
+}
+
+/// The confirmation for a new comment, with its id so the caller can update or delete it.
+pub fn format_comment_added(todo_short_id: &str, comment: &super::types::TodoComment) -> String {
+    format!(
+        "✓ Added comment to {} [id: {}]\n\n  {} ({}):\n  {}",
+        todo_short_id,
+        comment.id.0,
+        comment.author,
+        comment.created_at.format("%Y-%m-%d %H:%M"),
+        comment.content
+    )
 }
 
 /// Format project list with sub-project hierarchy
@@ -640,5 +704,37 @@ mod tests {
         let future = now + Duration::days(3);
         let text = format_due_date(&future);
         assert!(text.contains("Due"));
+    }
+
+    #[test]
+    fn a_subtask_whose_parent_is_absent_still_renders() {
+        let mut child = Todo::new("u".to_string(), "The child task".to_string());
+        child.parent_id = Some(super::super::types::TodoId::new());
+        let out = format_todo_list(&[child], &[]);
+        assert!(out.contains("The child task"), "{out}");
+    }
+
+    #[test]
+    fn a_subtask_nests_under_its_parent_when_both_are_listed() {
+        let parent = Todo::new("u".to_string(), "Parent task".to_string());
+        let mut child = Todo::new("u".to_string(), "Child task".to_string());
+        child.parent_id = Some(parent.id);
+        let out = format_todo_list(&[parent, child], &[]);
+        let p = out.find("Parent task").expect("parent rendered");
+        let c = out.find("Child task").expect("child rendered");
+        assert!(c > p, "{out}");
+    }
+
+    #[test]
+    fn comment_renderings_carry_the_comment_id() {
+        use super::super::types::{TodoComment, TodoId};
+        let comment =
+            TodoComment::new(TodoId::new(), "varun".to_string(), "First note".to_string());
+        let listed = format_comment_list("SHO-8", std::slice::from_ref(&comment));
+        assert!(listed.contains(&comment.id.0.to_string()), "{listed}");
+        assert!(listed.contains("First note"));
+        let added = format_comment_added("SHO-8", &comment);
+        assert!(added.contains(&comment.id.0.to_string()), "{added}");
+        assert_eq!(format_comment_list("SHO-8", &[]), "No comments on SHO-8");
     }
 }
