@@ -496,9 +496,8 @@ fn refuse_if_encrypted(storage_dir: &Path) -> Result<()> {
     let keystore = storage_dir.join("keystore.json");
     if exists(&keystore)? {
         bail!(
-            "{} uses record-level encryption ({} is present). The redb backend has no \
-             at-rest encryption and a portable dump is plaintext, so migrating would \
-             decrypt every record to disk — refusing.",
+            "{} uses record-level encryption ({} is present). migrate does not carry a \
+             keystore or sealed records between engines yet — refusing.",
             storage_dir.display(),
             keystore.display()
         );

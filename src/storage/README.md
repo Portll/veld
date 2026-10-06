@@ -34,7 +34,9 @@ veld migrate --from rocksdb --to redb --user all --dry-run
 
 - The RocksDB backup engine in `src/backup.rs` (redb backups go through export and import).
 - The RocksDB `MemoryStorage` in `src/memory/storage.rs`.
-- Record-level at-rest encryption (encryption-v2); redb refuses encrypted records.
+
+Record-level encryption (encryption-v2) runs on both engines. `veld migrate` refuses an encrypted
+store in either direction: it does not yet carry the keystore and sealed records across.
 
 The semantic merge pass and its tombstone GC (`memory::merge`) are one implementation over
 `PrimaryMemoryStore` and run on both engines; RocksDB answers the GC's citation check from its

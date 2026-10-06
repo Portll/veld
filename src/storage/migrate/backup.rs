@@ -525,8 +525,8 @@ impl PendingBackup<'_> {
             },
             Component {
                 name: "user_auth".into(),
-                captured: false,
-                detail: "user-auth requires the rocksdb engine and has no redb store".into(),
+                captured: shared_tables.iter().any(|t| t == crate::user_auth::store::CF_USER_AUTH),
+                detail: "the shared.redb user_auth table, present once VELD_USER_AUTH_ENABLED has opened it".into(),
             },
             Component {
                 name: "projections".into(),
