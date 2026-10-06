@@ -35,8 +35,14 @@ veld migrate --from rocksdb --to redb --user all --dry-run
 - The RocksDB backup engine in `src/backup.rs` (redb backups go through export and import).
 - The RocksDB `MemoryStorage` in `src/memory/storage.rs`.
 
-Record-level encryption (encryption-v2) runs on both engines. `veld migrate` refuses an encrypted
-store in either direction: it does not yet carry the keystore and sealed records across.
+Record-level encryption (encryption-v2) runs on both engines, and `veld migrate` moves an
+encrypted tenant in either direction. Sealed records travel as stored and are never opened to disk;
+the keystore is copied from `<user>/storage/keystore.json` (RocksDB) to `<user>/keystore.json` (redb)
+or back, and the keystore generation sentinel goes with it. Every sealed record is opened under the
+source keystore before the copy and under the copied keystore after it, so migrate, and its dry run,
+needs `VELD_MASTER_PASSPHRASE` (or `VELD_KMS_WRAP_KEY`) and refuses without it. A target that
+already holds a different keystore is refused. `veld export` still refuses an encrypted RocksDB
+store, because a dump does not carry a keystore.
 
 The semantic merge pass and its tombstone GC (`memory::merge`) are one implementation over
 `PrimaryMemoryStore` and run on both engines; RocksDB answers the GC's citation check from its
