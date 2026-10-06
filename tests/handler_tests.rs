@@ -1004,6 +1004,47 @@ async fn project_lifecycle() {
 }
 
 #[tokio::test]
+async fn codebase_scan_and_index_refuse_system_and_data_directories() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/projects",
+            json!({"user_id": "test-user", "name": "Confined"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create project: {body}");
+
+    let data_dir = h._dir.path().to_string_lossy().to_string();
+    for route in ["scan", "index"] {
+        for path in ["/etc", "/", data_dir.as_str()] {
+            let (status, body) = json_of(
+                h.app(),
+                authed_post(
+                    &format!("/api/projects/Confined/{route}"),
+                    json!({"user_id": "test-user", "codebase_path": path}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {path}: {body}");
+        }
+    }
+
+    let code = TempDir::new().unwrap();
+    std::fs::write(code.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/projects/Confined/scan",
+            json!({"user_id": "test-user", "codebase_path": code.path()}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "scan a project directory: {body}");
+}
+
+#[tokio::test]
 async fn list_reminders_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
