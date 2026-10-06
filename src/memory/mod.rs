@@ -4854,6 +4854,46 @@ impl MemorySystem {
         Ok(())
     }
 
+    /// Records on a memory that `todo_id` cites it: the memory half of the todo-memory link.
+    pub fn link_related_todo(&self, memory_id: &MemoryId, todo_id: TodoId) -> Result<()> {
+        self.mutate_related_todos(memory_id, move |memory| memory.add_related_todo(todo_id))
+    }
+
+    /// Drops `todo_id` from a memory's back-links, when the todo stops citing it or is deleted.
+    pub fn unlink_related_todo(&self, memory_id: &MemoryId, todo_id: &TodoId) -> Result<()> {
+        self.mutate_related_todos(memory_id, |memory| memory.remove_related_todo(todo_id))
+    }
+
+    /// Applies a back-link edit to storage and the cached tier copies. Not a full memory
+    /// update: only `related_todo_ids` changes, which neither the vector nor the BM25 index
+    /// reads, as in [`Self::set_memory_parent`].
+    fn mutate_related_todos(
+        &self,
+        memory_id: &MemoryId,
+        edit: impl FnOnce(&mut Memory),
+    ) -> Result<()> {
+        let mut memory = self.long_term_memory.get(memory_id)?;
+        edit(&mut memory);
+        self.long_term_memory.update(&memory)?;
+
+        let updated = Arc::new(memory);
+        {
+            let mut wm = self.working_memory.write();
+            if wm.contains(memory_id) {
+                let _ = wm.remove(memory_id);
+                let _ = wm.add_shared(Arc::clone(&updated));
+            }
+        }
+        {
+            let mut sm = self.session_memory.write();
+            if sm.contains(memory_id) {
+                let _ = sm.remove(memory_id);
+                let _ = sm.add_shared(Arc::clone(&updated));
+            }
+        }
+        Ok(())
+    }
+
     /// Agent-initiated tier move. Updates the persistent record's `tier`
     /// field and adjusts hot-cache (working/session) membership to match.
     /// Returns the previous tier so callers can audit the transition.
