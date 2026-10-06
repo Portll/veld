@@ -631,24 +631,30 @@ fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
 /// re-derivation from the target reproduces it byte for byte; anything else is decoded
 /// through the legacy chain and re-encoded once. `Memory` holds `HashMap`s, so
 /// re-encoding is not byte-stable and must not be applied to already-current records.
-/// Encrypted records are refused: a cross-engine dump cannot carry a record the target
-/// has no key for. A redb backup carries its own sealed records verbatim instead.
+/// Sealed records are refused here; the callers that carry them carry them verbatim.
 pub(crate) fn portable_memory_value(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     if crate::keystore::is_encrypted_record(data) {
         return Err(anyhow!(
             "record is encrypted; a portable dump cannot carry it"
         ));
     }
-    let limited = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
-    if let Ok((_, used)) = bincode::serde::decode_from_slice::<Memory, _>(data, limited) {
-        if used == data.len() {
-            return Ok(std::borrow::Cow::Borrowed(data));
-        }
+    if is_current_memory_encoding(data) {
+        return Ok(std::borrow::Cow::Borrowed(data));
     }
     let (memory, _) = deserialize_memory(data)?;
     let encoded = bincode::serde::encode_to_vec(&memory, bincode::config::standard())
         .context("re-encoding a decoded memory")?;
     Ok(std::borrow::Cow::Owned(encoded))
+}
+
+/// Whether `data` is exactly one `Memory` in the current plain-bincode layout, which
+/// the readers of both engines decode.
+pub(crate) fn is_current_memory_encoding(data: &[u8]) -> bool {
+    let limited = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
+    matches!(
+        bincode::serde::decode_from_slice::<Memory, _>(data, limited),
+        Ok((_, used)) if used == data.len()
+    )
 }
 
 #[cfg(feature = "rocksdb")]
@@ -1233,7 +1239,7 @@ fn crc32_simple(data: &[u8]) -> u32 {
 const CF_INDEX: &str = "memory_index";
 /// Sentinel (in `CF_INDEX`) holding the last-seen keystore generation; rollback guard.
 #[cfg(feature = "rocksdb")]
-const KEYSTORE_GENERATION_KEY: &[u8] = b"meta:keystore_generation";
+const KEYSTORE_GENERATION_KEY: &[u8] = crate::keystore::GENERATION_SENTINEL_KEY;
 /// General-purpose key-value column family for small per-user blobs (e.g. the
 /// `CognitiveDials` tuning surface) that don't fit the memory/index schemas.
 /// Created on open via `create_missing_column_families`, so it materializes on

@@ -532,7 +532,7 @@ fn check_keystore_generation(database: &redb::Database, generation: u64) -> Resu
 pub const KEYSTORE_FILE: &str = "keystore.json";
 
 /// Rollback sentinel for the keystore generation, in the default table.
-const KEYSTORE_GENERATION_KEY: &[u8] = b"meta:keystore_generation";
+const KEYSTORE_GENERATION_KEY: &[u8] = crate::keystore::GENERATION_SENTINEL_KEY;
 
 pub struct RedbPrimaryMemoryStore {
     database: Arc<redb::Database>,

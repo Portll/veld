@@ -749,23 +749,40 @@ pub struct UnsealedRecordKeys {
 /// keystore present but not unsealable is an error, so ciphertext is never served
 /// as plaintext. Integrity is verified before the keys are returned.
 pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<UnsealedRecordKeys>> {
+    if keystore_path.exists() {
+        let json =
+            std::fs::read_to_string(keystore_path).context("Failed to read keystore.json")?;
+        return unseal_record_keys(&json).map(Some);
+    }
+    let Some(pass) = std::env::var("VELD_MASTER_PASSPHRASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let ks = Keystore::create(&pass, KdfParams::production())?;
+    ks.save_to_path(keystore_path)
+        .context("Failed to write keystore.json")?;
+    let kek = ks.unseal_with_passphrase(&pass)?;
+    tracing::info!("Created new encryption keystore at {keystore_path:?}");
+    record_keys(&ks, &kek).map(Some)
+}
+
+/// Unseal an existing keystore's JSON for record-level encryption, with
+/// `VELD_MASTER_PASSPHRASE`, or `VELD_KMS_WRAP_KEY` when no passphrase is set.
+/// Never creates a keystore.
+pub fn unseal_record_keys(json: &str) -> Result<UnsealedRecordKeys> {
+    let ks = Keystore::from_json(json)?;
     let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
         .ok()
         .filter(|s| !s.is_empty());
-
-    let (ks, kek) = match (keystore_path.exists(), passphrase) {
-        (true, Some(pass)) => {
-            let json =
-                std::fs::read_to_string(keystore_path).context("Failed to read keystore.json")?;
-            let ks = Keystore::from_json(&json)?;
+    let kek = match passphrase {
+        Some(pass) => {
             let kek = ks.unseal_with_passphrase(&pass)?;
             tracing::info!("Record-level encryption: keystore unsealed (passphrase)");
-            (ks, kek)
+            kek
         }
-        (true, None) => {
-            let json =
-                std::fs::read_to_string(keystore_path).context("Failed to read keystore.json")?;
-            let ks = Keystore::from_json(&json)?;
+        None => {
             let kms = LocalAeadKms::from_env()?.ok_or_else(|| {
                 anyhow!(
                     "keystore.json is present but neither VELD_MASTER_PASSPHRASE nor \
@@ -775,27 +792,25 @@ pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<Unseal
             })?;
             let kek = ks.unseal_with_kms(&kms)?;
             tracing::info!("Record-level encryption: keystore unsealed (KMS)");
-            (ks, kek)
+            kek
         }
-        (false, Some(pass)) => {
-            let ks = Keystore::create(&pass, KdfParams::production())?;
-            ks.save_to_path(keystore_path)
-                .context("Failed to write keystore.json")?;
-            let kek = ks.unseal_with_passphrase(&pass)?;
-            tracing::info!("Created new encryption keystore at {keystore_path:?}");
-            (ks, kek)
-        }
-        (false, None) => return Ok(None),
     };
-
-    ks.verify_integrity(&kek)
-        .context("keystore integrity verification failed")?;
-    Ok(Some(UnsealedRecordKeys {
-        cryptors: RecordCryptors::from_keystore(&ks, &kek)?,
-        blinder: IndexBlinder::derive_from_kek(&kek),
-        generation: ks.generation,
-    }))
+    record_keys(&ks, &kek)
 }
+
+fn record_keys(ks: &Keystore, kek: &SecretKey) -> Result<UnsealedRecordKeys> {
+    ks.verify_integrity(kek)
+        .context("keystore integrity verification failed")?;
+    Ok(UnsealedRecordKeys {
+        cryptors: RecordCryptors::from_keystore(ks, kek)?,
+        blinder: IndexBlinder::derive_from_kek(kek),
+        generation: ks.generation,
+    })
+}
+
+/// Where both engines keep the last keystore generation they saw: RocksDB in its
+/// `memory_index` family, redb in its `default` table.
+pub const GENERATION_SENTINEL_KEY: &[u8] = b"meta:keystore_generation";
 
 /// The rollback guard's decision for a store whose sentinel holds `stored` and
 /// whose keystore file is at `generation`. `Ok(Some(g))`: write `g` to the
