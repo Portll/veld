@@ -52,17 +52,17 @@ in	49cc4a82	233	2026-04-15	embeddings-vectors	W8	pending
 in	ef0de730	232	2026-04-15	http-api	W10	pending		
 in	dacebb0c	234	2026-04-16	embeddings-vectors	W8	pending		
 in	05a0ef89	235	2026-04-17	facts-todos	W5	ported	2b92620c	build_fact_narratives; veld adds purged_at and is_active
-in	0738ba85	236	2026-04-17	facts-todos	W5	pending		
+in	0738ba85	236	2026-04-17	facts-todos	W5	partial	3a2741dc	the session-start briefing rewrite in hooks/memory-hook.ts is not taken: it reads /api/sessions/history, which veld does not serve (W9); the purge endpoint is veld's soft purge (5ce880f7), whose route this restores; no destructive purge MCP tool for agents
 in	a3f87a1e	237	2026-04-19	facts-todos	W5	ported	2b92620c	
 in	b08fa351	239	2026-04-19	robotics-geo	W12	pending		
 in	00695870	241	2026-04-19	http-api	W10	pending		
 in	7b882ace	240	2026-04-19	http-api	W10	pending		
-in	82cf1c90	242	2026-04-19	facts-todos	W5	pending		
+in	82cf1c90	242	2026-04-19	facts-todos	W5	adapted	7dfa0892	the spatial/mission and session_id pre-flight in /api/recall does not apply (veld's recall has neither); veld's backup already refuses without its graph; a batch reports an unknown type per item instead of failing the batch
 in	674abc7c	243	2026-04-19	storage-integrity	W1	adapted	aef47086	only the iterator-error propagation in the legacy-DB migrations applies, now in veld at all three sites (the two in memory/storage.rs and import_separate_db_into_cf); the lint fixes are to upstream's own code
 in	38b818dd	244	2026-04-19	robotics-geo	W12	pending		
 in	25d54a51	245	2026-04-19	ner-entities	W6	pending		
-in	5e59f676		2026-04-19	facts-todos	W5	pending		
-in	9dbe3a73	246	2026-04-19	facts-todos	W5	pending		
+in	5e59f676		2026-04-19	facts-todos	W5	ported	288a2d2a	
+in	9dbe3a73	246	2026-04-19	facts-todos	W5	partial	2cb14cbb	the entity-blocklist edits wait on #214 (72dfb6ce, W6), which brings the blocklist; a stronger lineage re-inference updates inferred edges only
 in	193bfff6	247	2026-04-19	retrieval	W2	pending		
 in	0184d6de	248	2026-04-20	robotics-geo	W12	pending		
 in	ca5a4638	249	2026-04-21	web-ui	W11	pending		
@@ -214,8 +214,8 @@ in	b91c5e22	447	2026-08-08	retrieval	W2	pending
 in	804985d2	448	2026-08-08	web-ui	W11	pending		
 in	0111c562	449	2026-08-08	web-ui	W11	pending		
 in	a857609d	450	2026-08-08	retrieval	W2	pending		
-in	6655b73a	442	2026-08-08	facts-todos	W5	partial	daddfcc4	tier trust applies only to the graph term; the Session and Archive tier choices are deferred
-in	7b79eb2d	445	2026-08-08	facts-todos	W5	pending		
+in	6655b73a	442	2026-08-08	facts-todos	W5	partial	daddfcc4,8415afab	fact invalidation is carried on veld's bi-temporal fields (valid_until, superseded_by, supersedes) with no record change; working-to-session promotion is persisted; the edge-tier invariants (promoted_at, per-tier decay) are left for W3; retiring Archive, a terminal promote(), deleting demote() and RetrievalFeedback are declined: veld assigns Archive through agent tier moves and reinforce_batch takes RetrievalFeedback
+in	7b79eb2d	445	2026-08-08	facts-todos	W5	adapted	6573927c	the distill_facts guard has nothing to guard in veld, whose distill_facts had no dedup step; the shared ingest of #459 covers it
 in	c25c5691	451	2026-08-08	robotics-geo	W12	pending		
 in	2bad9638	452	2026-08-08	anomaly	W12	pending		
 in	4c1b93ac	453	2026-08-08	web-ui	W11	pending		
@@ -225,7 +225,7 @@ in	e180aab1	456	2026-08-08	mcp-hooks	W9	pending
 in	d4551d59	457	2026-08-09	anomaly	W12	pending		
 in	85e35537	458	2026-08-09	anomaly	W12	pending		
 in	e1c8a06f	461	2026-08-09	graph	W3	pending		
-in	2cdc403f	459	2026-08-09	facts-todos	W5	pending		
+in	2cdc403f	459	2026-08-09	facts-todos	W5	adapted	24ceaf4e	arbitration on veld's bi-temporal fields with one atomic put_many per outcome; the graph rebuild uses veld's delete_episode, which drops the edges the episode sourced; the HTTP tests poll instead of draining task_tracker; graph wiring of distilled facts is #341 (W6)
 in	cac4c0b3	460	2026-08-09	ner-entities	W6	pending		
 in	fe95da84	463	2026-08-09	web-ui	W11	pending		
 in	6298ce66	464	2026-08-09	lineage	W4	pending		
@@ -236,12 +236,12 @@ in	a7344bbd	467	2026-08-09	eval	W0	pending
 in	e24b1ab3	469	2026-08-09	mcp-hooks	W9	pending		
 in	ca72b5c1	470	2026-08-09	mcp-hooks	W9	pending		
 in	90a5092b	462	2026-08-09	retrieval	W2	partial	103e60c9	repeat-stable graph-leg edge ordering (523a32ac) ported with veld's own determinism fixes; the open-domain recall changes in the rest of #462 are W2's
-in	28f9c836	471	2026-08-09	facts-todos	W5	pending		
+in	28f9c836	471	2026-08-09	facts-todos	W5	adapted	0a36e88d	Todo.blocked_by is not added: veld's depends_on is the same structured dependency list, so blocked_by is a request alias; todos are stored as JSON, so no layout changes
 in	9a3e0ef8	472	2026-08-09	web-ui	W11	pending		
 in	4baf0d3f	474	2026-08-09	infra	-	declined		configures Dependabot for upstream's repository, including /seat and /front/ui; veld has no .github/dependabot.yml, and adopting Dependabot would be a veld CI decision, not a port
 in	689a89a7	484	2026-08-09	web-ui	W11	pending		
 in	6d9b8042	425	2026-08-09	storage-integrity	W7	pending		
-in	1500ac24	486	2026-08-10	facts-todos	W5	pending		
+in	1500ac24	486	2026-08-10	facts-todos	W5	adapted	b44dc780	PrimaryMemoryStore keeps get_fact_watermark and set_fact_watermark for the _watermark: keys migrate carries; the fact_yield_report instrument is not taken; veld's three-day consolidator floor stays
 in	9b9ad634	416	2026-08-10	security	W1	veld-origin	f15e6840	Portll PR
 in	7c34a1cd	485	2026-08-10	mcp-hooks	W9	pending		
 in	2ffa24ef	480	2026-08-10	infra	-	declined		bumps actions in upstream's 22 workflow files, 19 of which veld does not have; veld's ci.yml, recall.yml and release.yml are its own and pin checkout@v4, cache@v4 and upload-artifact@v4, so moving them is a veld CI change
@@ -266,7 +266,7 @@ in	3eb23f1b	498	2026-08-29	embeddings-vectors	W8	pending
 in	171ae467	503	2026-08-29	eval	W0	pending		
 in	699033ca	504	2026-08-29	ner-entities	W6	pending		
 in	c94570e0	505	2026-08-29	lineage	W4	pending		
-in	6a7028fa	508	2026-08-30	facts-todos	W5	pending		
+in	6a7028fa	508	2026-08-30	facts-todos	W5	ported	a5b6d018	
 in	8aad89b6	525	2026-08-31	graph	W3	pending		
 in	49bd8088	524	2026-08-31	eval	W0	pending		
 in	16269ca3	528	2026-08-31	eval	W0	pending		
