@@ -118,7 +118,7 @@ in	9c86d086	310	2026-05-30	eval	W0	pending
 in	ab0bce52	312	2026-05-30	eval	W0	ported	4d5d44d9	
 in	9908d304	313	2026-05-30	eval	W0	pending		
 in	c1098786	284	2026-06-05	security	W1	veld-origin		Portll PR
-in	86dc3af7	325	2026-06-12	eval	W0	partial	78a530d5,3c8a3028,433ad8a0	no silent hash embeddings, gold_funnel and fusion_features, causal cue extractor; OpenIE, CATENA, spaCy and the relation typer not ported
+in	86dc3af7	325	2026-06-12	eval	W0	partial	78a530d5,3c8a3028,433ad8a0,3498be86	no silent hash embeddings, gold_funnel and fusion_features, causal cue extractor, the hebbian term off by default (#321; a learned replacement is SPINE veld-embedder-long-inputs-20261003 task 8.6); OpenIE, CATENA, spaCy and the relation typer not ported
 in	34abc71c	326	2026-06-13	eval	W0	pending		
 in	4e04649a	327	2026-06-13	eval	W0	pending		
 in	2f413837	328	2026-06-13	eval	W0	pending		
