@@ -1217,6 +1217,188 @@ async fn todos_resolve_dependencies_link_memories_and_report_what_completion_unb
     );
 }
 
+async fn create_todo_id(h: &Harness, user: &str, content: &str) -> String {
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({"user_id": user, "content": content}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["todo"]["id"].as_str().expect("id").to_string()
+}
+
+#[tokio::test]
+async fn flat_todo_aliases_take_the_todo_id_from_the_body() {
+    let h = Harness::new();
+    let user = "flat-alias";
+
+    let id = create_todo_id(&h, user, "alias update target").await;
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/update",
+            json!({"user_id": user, "todo_id": id, "notes": "set via flat alias"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["todo"]["notes"], "set via flat alias");
+
+    let id = create_todo_id(&h, user, "alias complete target").await;
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/complete",
+            json!({"user_id": user, "todo_id": id}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["todo"]["status"], "done");
+
+    let id = create_todo_id(&h, user, "alias reorder target").await;
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/reorder",
+            json!({"user_id": user, "todo_id": id, "direction": "up"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let id = create_todo_id(&h, user, "alias delete target").await;
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/todos/delete", json!({"user_id": user, "todo_id": id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let gone = h
+        .mgr
+        .todo_store
+        .get_todo(user, &veld::memory::TodoId(id.parse().unwrap()))
+        .unwrap();
+    assert!(gone.is_none(), "the flat delete alias deletes");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/todos/update", json!({"user_id": user, "notes": "x"})),
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a missing todo_id is a 4xx: {status} {body}"
+    );
+}
+
+#[tokio::test]
+async fn todo_responses_omit_the_embedding_that_storage_keeps() {
+    let h = Harness::new();
+    let user = "embedding-wire";
+    let id = create_todo_id(&h, user, "semantic search target").await;
+    let stored = h
+        .mgr
+        .todo_store
+        .get_todo(user, &veld::memory::TodoId(id.parse().unwrap()))
+        .unwrap()
+        .expect("stored");
+    assert!(stored.embedding.is_some(), "storage keeps the embedding");
+
+    let (_, body) = json_of(h.app(), authed_post("/api/todos", json!({"user_id": user}))).await;
+    assert!(body["todos"][0].get("embedding").is_none(), "{body}");
+    let (_, body) = json_of(
+        h.app(),
+        authed_get(&format!("/api/todos/{id}?user_id={user}")),
+    )
+    .await;
+    assert!(body["todo"].get("embedding").is_none(), "{body}");
+    let (_, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/complete",
+            json!({"user_id": user, "todo_id": id}),
+        ),
+    )
+    .await;
+    assert!(body["todo"].get("embedding").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn a_todo_memory_link_is_written_on_both_sides_and_revoked_on_delete() {
+    use veld::memory::{Experience, MemoryId, TodoId};
+
+    let h = Harness::new();
+    let user = "backlink";
+    let (mem_a, mem_b) = {
+        let memory = h.mgr.get_user_memory(user).unwrap();
+        let guard = memory.read();
+        let remember = |content: &str| {
+            guard
+                .remember(
+                    Experience {
+                        content: content.to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap()
+        };
+        (remember("source memory A"), remember("source memory B"))
+    };
+    let back_links = |mid: &MemoryId| -> Vec<TodoId> {
+        let memory = h.mgr.get_user_memory(user).unwrap();
+        let guard = memory.read();
+        guard.get_memory(mid).unwrap().related_todo_ids
+    };
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({"user_id": user, "content": "motivated by A",
+                   "related_memory_ids": [mem_a.0.to_string()]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id_str = body["todo"]["id"].as_str().unwrap().to_string();
+    let todo_id = TodoId(id_str.parse().unwrap());
+    assert_eq!(back_links(&mem_a), vec![todo_id]);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{id_str}/update"),
+            json!({"user_id": user, "related_memory_ids": [mem_b.0.to_string()]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        back_links(&mem_a).is_empty(),
+        "a dropped memory loses its back-link"
+    );
+    assert_eq!(back_links(&mem_b), vec![todo_id]);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/delete",
+            json!({"user_id": user, "todo_id": id_str}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        back_links(&mem_b).is_empty(),
+        "deletion leaves no dangling id"
+    );
+}
+
 #[tokio::test]
 async fn todo_lifecycle() {
     let h = Harness::new();
