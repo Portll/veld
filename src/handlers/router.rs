@@ -493,10 +493,12 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/todos", post(todos::list_todos))
         .route("/api/todos/list", post(todos::list_todos)) // TUI compatibility
         .route("/api/todos/add", post(todos::create_todo))
-        .route("/api/todos/update", post(todos::update_todo))
-        .route("/api/todos/complete", post(todos::complete_todo))
-        .route("/api/todos/delete", post(todos::delete_todo))
-        .route("/api/todos/reorder", post(todos::reorder_todo))
+        // Flat aliases have no path capture, so they name the todo in the body (`todo_id`)
+        // and cannot bind the path-style handlers, whose Path extractor refuses them.
+        .route("/api/todos/update", post(todos::update_todo_flat))
+        .route("/api/todos/complete", post(todos::complete_todo_flat))
+        .route("/api/todos/delete", post(todos::delete_todo_flat))
+        .route("/api/todos/reorder", post(todos::reorder_todo_flat))
         .route("/api/todos/due", post(todos::list_due_todos))
         .route("/api/todos/{todo_id}", get(todos::get_todo))
         .route("/api/todos/{todo_id}", delete(todos::delete_todo)) // TUI uses DELETE

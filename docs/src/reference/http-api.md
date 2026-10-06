@@ -473,14 +473,14 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 |---|---|---|
 | `POST` | `/api/todos` | `todos::list_todos` |
 | `POST` | `/api/todos/add` | `todos::create_todo` |
-| `POST` | `/api/todos/complete` | `todos::complete_todo` |
-| `POST` | `/api/todos/delete` | `todos::delete_todo` |
+| `POST` | `/api/todos/complete` | `todos::complete_todo_flat` |
+| `POST` | `/api/todos/delete` | `todos::delete_todo_flat` |
 | `POST` | `/api/todos/due` | `todos::list_due_todos` |
 | `POST` | `/api/todos/list` | `todos::list_todos` |
 | `POST` | `/api/todos/ready` | `todos::list_ready_todos` |
-| `POST` | `/api/todos/reorder` | `todos::reorder_todo` |
+| `POST` | `/api/todos/reorder` | `todos::reorder_todo_flat` |
 | `POST` | `/api/todos/stats` | `todos::get_todo_stats` |
-| `POST` | `/api/todos/update` | `todos::update_todo` |
+| `POST` | `/api/todos/update` | `todos::update_todo_flat` |
 | `DELETE` | `/api/todos/{todo_id}` | `todos::delete_todo` |
 | `GET` | `/api/todos/{todo_id}` | `todos::get_todo` |
 | `POST` | `/api/todos/{todo_id}/comments` | `todos::add_todo_comment` |
