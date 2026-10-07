@@ -166,6 +166,10 @@ pub struct RecallRequest {
     /// filtered. MemoryQuery already enforced the filter; only the wiring was missing.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Pipeline rung for per-layer attribution: "vamana_only", "+spreading", "+bm25",
+    /// "+rerank", "+facts" or "full". Omitted means full, the production pipeline.
+    #[serde(default)]
+    pub layers: Option<String>,
 }
 
 pub fn default_recall_limit() -> usize {
