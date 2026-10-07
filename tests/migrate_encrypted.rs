@@ -553,3 +553,45 @@ fn hex_key(text: &str) -> [u8; 32] {
     }
     key
 }
+
+#[test]
+fn a_plaintext_store_migrates_while_a_passphrase_is_set_and_stays_plaintext() {
+    let _env = Env::lock();
+    for (from, to) in [
+        (StorageBackend::Redb, StorageBackend::RocksDb),
+        (StorageBackend::RocksDb, StorageBackend::Redb),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let base = temp.path();
+        let dir = base.join(USER);
+        std::fs::create_dir_all(&dir).unwrap();
+        let memory = sample(PLAIN, &["plain"]);
+        match from {
+            StorageBackend::Redb => RedbPrimaryMemoryStore::open(&dir)
+                .unwrap()
+                .store(&memory)
+                .unwrap(),
+            StorageBackend::RocksDb => MemoryStorage::new(&dir, None)
+                .unwrap()
+                .store(&memory)
+                .unwrap(),
+        }
+        env::set_var("VELD_MASTER_PASSPHRASE", PASSPHRASE);
+
+        let report = run(base, from, to, false)
+            .unwrap_or_else(|e| panic!("{from} -> {to} with a passphrase set: {e:#}"));
+        assert_eq!(
+            report.imported[0].verified_sealed_records, 0,
+            "{from} -> {to}"
+        );
+        let target_keystore = match to {
+            StorageBackend::RocksDb => dir.join("storage/keystore.json"),
+            StorageBackend::Redb => dir.join("keystore.json"),
+        };
+        assert!(
+            !target_keystore.exists(),
+            "{from} -> {to}: migrate created a keystore on the plaintext target"
+        );
+        env::remove_var("VELD_MASTER_PASSPHRASE");
+    }
+}

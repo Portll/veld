@@ -1788,10 +1788,11 @@ fn apply_rocks_primary(user_dir: &Path, records: Vec<PortableRecord>, sealed: bo
             db.flush_cf(db.cf_handle(family).expect("opened above"))?;
         }
     }
-    let rebuilt = crate::memory::storage::MemoryStorage::new(user_dir, None)
-        .context("reopening the imported rocksdb store to rebuild its index")?
-        .rebuild_index()
-        .context("rebuilding memory_index on the imported rocksdb store")?;
+    let rebuilt =
+        crate::memory::storage::MemoryStorage::open_without_creating_keystore(user_dir, None)
+            .context("reopening the imported rocksdb store to rebuild its index")?
+            .rebuild_index()
+            .context("rebuilding memory_index on the imported rocksdb store")?;
     tracing::info!(records = rebuilt, dir = %storage.display(), "memory_index rebuilt after import");
     Ok(())
 }

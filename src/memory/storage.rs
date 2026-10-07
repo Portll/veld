@@ -1287,6 +1287,23 @@ impl MemoryStorage {
     /// the shared LRU cache (recommended for multi-tenant server mode). When
     /// `None`, a small per-instance cache is created (standalone / test use).
     pub fn new(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
+        Self::open(path, shared_cache, true)
+    }
+
+    /// Open the store with the keystore already beside it, if any, and never create one:
+    /// a store written in plaintext stays plaintext whatever VELD_MASTER_PASSPHRASE holds.
+    pub fn open_without_creating_keystore(
+        path: &Path,
+        shared_cache: Option<&rocksdb::Cache>,
+    ) -> Result<Self> {
+        Self::open(path, shared_cache, false)
+    }
+
+    fn open(
+        path: &Path,
+        shared_cache: Option<&rocksdb::Cache>,
+        create_keystore: bool,
+    ) -> Result<Self> {
         use crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES;
 
         // Create directories if they don't exist
@@ -1382,11 +1399,11 @@ impl MemoryStorage {
         // passphrase and no keystore creates one. A keystore present without the
         // passphrase is a hard error (it would otherwise serve ciphertext as
         // plaintext). No keystore + no passphrase = plaintext (backward compatible).
-        let (record_cryptors, index_blinder) = match Self::open_record_cryptor(&db, &storage_path)?
-        {
-            Some((cryptors, blinder)) => (Some(cryptors), Some(blinder)),
-            None => (None, None),
-        };
+        let (record_cryptors, index_blinder) =
+            match Self::open_record_cryptor(&db, &storage_path, create_keystore)? {
+                Some((cryptors, blinder)) => (Some(cryptors), Some(blinder)),
+                None => (None, None),
+            };
 
         Ok(Self {
             db,
@@ -1402,14 +1419,18 @@ impl MemoryStorage {
     fn open_record_cryptor(
         db: &DB,
         storage_path: &Path,
+        create_keystore: bool,
     ) -> Result<
         Option<(
             crate::keystore::RecordCryptors,
             crate::keystore::IndexBlinder,
         )>,
     > {
-        let Some(keys) = crate::keystore::open_record_keys(&storage_path.join("keystore.json"))?
-        else {
+        let keystore = storage_path.join("keystore.json");
+        if !create_keystore && !keystore.exists() {
+            return Ok(None);
+        }
+        let Some(keys) = crate::keystore::open_record_keys(&keystore)? else {
             return Ok(None);
         };
         Self::check_keystore_generation(db, keys.generation)?;
