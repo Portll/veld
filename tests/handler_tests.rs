@@ -2602,3 +2602,598 @@ async fn every_protected_route_refuses_a_request_without_an_api_key() {
         routes.len()
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Declared (typed) entities on remember / upsert / batch
+// ═══════════════════════════════════════════════════════════════════════
+
+const SERVE: &str = "commitwork:admin/serve.mjs";
+const COMMIT: &str = "commitwork@1a2b3c4d5e6f";
+
+fn declared_pair() -> serde_json::Value {
+    json!([
+        {"name": SERVE, "label": "FilePath"},
+        {"name": COMMIT, "label": "Commit", "weight": 0.8}
+    ])
+}
+
+/// The graph entity named exactly `name` (exact or case-insensitive tier only).
+fn named_graph_entity(
+    h: &Harness,
+    user: &str,
+    name: &str,
+) -> Option<veld::graph_memory::EntityNode> {
+    let graph = h.mgr.get_user_graph(user).expect("graph");
+    let graph = graph.read();
+    graph.find_entity_by_name_strict(name).expect("lookup")
+}
+
+fn edges_of(
+    h: &Harness,
+    user: &str,
+    entity: &veld::uuid::Uuid,
+) -> Vec<veld::graph_memory::RelationshipEdge> {
+    let graph = h.mgr.get_user_graph(user).expect("graph");
+    let graph = graph.read();
+    graph.get_entity_relationships(entity).expect("edges")
+}
+
+fn stored_tags(h: &Harness, user: &str, id: &str) -> Vec<String> {
+    let id = veld::uuid::Uuid::parse_str(id).unwrap();
+    let memory = h.mgr.get_user_memory(user).expect("memory");
+    let guard = memory.read();
+    guard
+        .get_memory(&veld::memory::MemoryId(id))
+        .expect("stored")
+        .experience
+        .tags
+        .clone()
+}
+
+#[tokio::test]
+async fn declared_entities_reach_the_graph_typed_and_survive_the_derived_cut() {
+    use veld::graph_memory::{EdgeSource, EntityLabel, LtpStatus};
+
+    let h = Harness::new();
+    let user = "declared-user";
+    // Twelve tags alone exceed max_entities_per_memory (10) before NER and YAKE add more.
+    let tags: Vec<String> = [
+        "routing",
+        "dispatch",
+        "middleware",
+        "session",
+        "cookie",
+        "redirect",
+        "handler",
+        "timeout",
+        "listener",
+        "gateway",
+        "upstream",
+        "fallback",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({
+                "user_id": user,
+                "content": "Alice Moreau and Bijan Farahani moved the auth check in Kubernetes \
+                            ahead of the REST gateway dispatch for SHO-412 and JIRA-77 in Lisbon.",
+                "tags": tags,
+                "entities": declared_pair()
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id_str = body["id"].as_str().expect("id").to_string();
+    let id = veld::uuid::Uuid::parse_str(&id_str).unwrap();
+    wait_for_episode_entity(&h, user, id, &SERVE.to_lowercase()).await;
+
+    let names = episode_entity_names(&h, user, &id);
+    assert!(names.contains(&COMMIT.to_lowercase()), "{names:?}");
+    // The derived list is cut to 10; the two declared ones are on top of that.
+    assert_eq!(names.len(), 12, "{names:?}");
+
+    let serve = named_graph_entity(&h, user, SERVE).expect("FilePath entity");
+    assert!(
+        serve.labels.contains(&EntityLabel::FilePath),
+        "{:?}",
+        serve.labels
+    );
+    let commit = named_graph_entity(&h, user, COMMIT).expect("Commit entity");
+    assert!(
+        commit.labels.contains(&EntityLabel::Commit),
+        "{:?}",
+        commit.labels
+    );
+
+    // Edges are written after the episode, by the same background pass.
+    let mut serve_edges = Vec::new();
+    for _ in 0..300 {
+        serve_edges = edges_of(&h, user, &serve.uuid);
+        if serve_edges.len() >= 11 && !edges_of(&h, user, &commit.uuid).is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        serve_edges.len(),
+        11,
+        "linked to every other entity of the memory"
+    );
+    for e in &serve_edges {
+        assert_eq!(
+            e.ltp_status,
+            LtpStatus::Weekly,
+            "declared edges are protected"
+        );
+        assert_eq!(e.created_by, EdgeSource::Explicit);
+        assert!(
+            (e.strength - 0.9).abs() < 1e-6,
+            "default weight: {}",
+            e.strength
+        );
+    }
+    for e in edges_of(&h, user, &commit.uuid) {
+        let other = if e.from_entity == commit.uuid {
+            e.to_entity
+        } else {
+            e.from_entity
+        };
+        let want = if other == serve.uuid { 0.9 } else { 0.8 };
+        assert!((e.strength - want).abs() < 1e-6, "{} vs {want}", e.strength);
+    }
+
+    // Stored as the memory's authored tags, leading the list, labelled declared.
+    let tags = stored_tags(&h, user, &id_str);
+    assert_eq!(
+        tags[..2],
+        [SERVE.to_string(), COMMIT.to_string()],
+        "{tags:?}"
+    );
+    let memory = h.mgr.get_user_memory(user).expect("memory");
+    let row = memory
+        .read()
+        .tag_source_store()
+        .get(&veld::memory::MemoryId(id))
+        .expect("ledger")
+        .expect("row");
+    assert_eq!(
+        row.tags[0].source,
+        veld::memory::tag_sources::TagSource::Declared
+    );
+    assert_eq!(
+        row.tags[1].source,
+        veld::memory::tag_sources::TagSource::Declared
+    );
+}
+
+#[tokio::test]
+async fn invalid_declared_entities_are_refused_not_filed_as_other() {
+    let h = Harness::new();
+    let user = "declared-invalid";
+    let remember = |entities: serde_json::Value| {
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user, "content": "An entity declaration to refuse.", "entities": entities}),
+        )
+    };
+
+    let (status, body) = json_of(
+        h.app(),
+        remember(json!([{"name": "x", "label": "Filepth"}])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let text = body.to_string();
+    for label in [
+        "Filepth", "FilePath", "Commit", "Template", "Person", "Module",
+    ] {
+        assert!(text.contains(label), "{label} missing from {text}");
+    }
+
+    let (status, body) = json_of(
+        h.app(),
+        remember(json!([{"name": "x", "label": "Tool", "weight": 1.5}])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let many: Vec<serde_json::Value> = (0..51)
+        .map(|i| json!({"name": format!("tool:t{i}"), "label": "Tool"}))
+        .collect();
+    let (status, body) = json_of(h.app(), remember(json!(many))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-bad", "content": "Upsert to refuse.",
+                   "entities": [{"name": "x", "label": "Nope"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Nothing above was stored.
+    let memory = h.mgr.get_user_memory(user).expect("memory");
+    assert!(memory.read().get_all_memories().expect("all").is_empty());
+
+    // In a batch the bad item fails and the good one is stored, as an unknown type does.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember/batch",
+            json!({"user_id": user, "memories": [
+                {"content": "Batch item with a valid declaration.",
+                 "entities": [{"name": "tool:Edit", "label": "tool"}]},
+                {"content": "Batch item with a bad weight.",
+                 "entities": [{"name": "tool:Edit", "label": "Tool", "weight": -1}]}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], 1, "{body}");
+    assert_eq!(body["errors"][0]["index"], 1, "{body}");
+    assert!(
+        body["errors"][0]["error"].to_string().contains("weight"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn upsert_and_batch_carry_declared_entities() {
+    use veld::graph_memory::EntityLabel;
+
+    let h = Harness::new();
+    let user = "declared-upsert";
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-typed", "content": "First pass on the route table.",
+                   "entities": [{"name": SERVE, "label": "FilePath"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    // Upsert builds the graph before it responds.
+    assert!(episode_entity_names(&h, user, &id).contains(&SERVE.to_lowercase()));
+    assert!(named_graph_entity(&h, user, SERVE)
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::FilePath));
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-typed", "content": "Second pass on the route table.",
+                   "entities": [{"name": COMMIT, "label": "Commit"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["was_update"], json!(true), "{body}");
+    let names = episode_entity_names(&h, user, &id);
+    assert!(names.contains(&COMMIT.to_lowercase()), "{names:?}");
+    assert!(
+        !names.contains(&SERVE.to_lowercase()),
+        "an update rebuilds the episode from its own entities: {names:?}"
+    );
+    assert!(named_graph_entity(&h, user, COMMIT)
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::Commit));
+    assert_eq!(stored_tags(&h, user, &id.to_string())[0], COMMIT);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember/batch",
+            json!({"user_id": user, "memories": [
+                {"content": "Batch item about a session.",
+                 "entities": [{"name": "cc:sess-42", "label": "Session"},
+                              {"name": "cc:sess-42/agent-7", "label": "Agent"}]},
+                {"content": "Batch item with no extraction, still typed."}
+            ], "options": {"extract_entities": true}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], 2, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["memory_ids"][0].as_str().unwrap()).unwrap();
+    wait_for_episode_entity(&h, user, id, "cc:sess-42/agent-7").await;
+    assert!(named_graph_entity(&h, user, "cc:sess-42")
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::Session));
+    assert!(named_graph_entity(&h, user, "cc:sess-42/agent-7")
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::Agent));
+
+    // The no-extraction batch path carries them too.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember/batch",
+            json!({"user_id": user, "memories": [
+                {"content": "Batch item on the cheap path.", "tags": ["cheap"],
+                 "entities": [{"name": "skill:/sauron", "label": "Tool"}]}
+            ], "options": {"extract_entities": false}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id_str = body["memory_ids"][0].as_str().unwrap().to_string();
+    let id = veld::uuid::Uuid::parse_str(&id_str).unwrap();
+    wait_for_episode_entity(&h, user, id, "skill:/sauron").await;
+    assert_eq!(stored_tags(&h, user, &id_str), ["skill:/sauron", "cheap"]);
+}
+
+#[tokio::test]
+async fn a_write_without_entities_behaves_as_before() {
+    let h = Harness::new();
+    let content =
+        "Rotated the staging TLS certificate and restarted the Envoy sidecars in Frankfurt.";
+    let mut stored = Vec::new();
+    for (user, body) in [
+        (
+            "plain-omitted",
+            json!({"user_id": "plain-omitted", "content": content, "tags": ["tls"]}),
+        ),
+        (
+            "plain-empty",
+            json!({"user_id": "plain-empty", "content": content, "tags": ["tls"], "entities": []}),
+        ),
+    ] {
+        let (status, resp) = json_of(h.app(), authed_post("/api/remember", body)).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let mut keys: Vec<&str> = resp
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["id", "success"], "{resp}");
+        let id_str = resp["id"].as_str().unwrap().to_string();
+        let id = veld::uuid::Uuid::parse_str(&id_str).unwrap();
+        wait_for_episode_entity(&h, user, id, "tls").await;
+        let mut names = episode_entity_names(&h, user, &id);
+        names.sort();
+        stored.push((stored_tags(&h, user, &id_str), names));
+    }
+    assert_eq!(
+        stored[0], stored[1],
+        "omitted and empty must store the same thing"
+    );
+    assert_eq!(stored[0].0[0], "tls", "caller tags still lead");
+}
+
+#[tokio::test]
+async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
+    use veld::constants::MAX_ENTITY_DEGREE;
+    use veld::graph_memory::{EntityLabel, EntityNode, RelationType, RelationshipEdge};
+
+    let h = Harness::new();
+    let user = "gate-user";
+
+    // 1. Generic words do not become derived entities, however often they appear.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user,
+                   "content": "File File FILE. Code code CODE. The file has code; the code has lines. \
+                               Lines of code in the file, first test, moved line, operator description.",
+                   "tags": ["File", "Code", "Lines", "kestrel"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    wait_for_episode_entity(&h, user, id, "kestrel").await;
+    for word in [
+        "file",
+        "files",
+        "code",
+        "first",
+        "moved",
+        "line",
+        "lines",
+        "test",
+        "description",
+        "operator",
+    ] {
+        assert!(
+            named_graph_entity(&h, user, word).is_none(),
+            "generic word '{word}' became an entity"
+        );
+    }
+
+    // 2. A derived entity already at the cap gets no edge and causes no prune; a declared
+    //    entity at the cap still links, and the cap's pruning makes room for it.
+    let graph = h.mgr.get_user_graph(user).expect("graph");
+    let node = |name: &str| EntityNode {
+        uuid: veld::uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        labels: vec![EntityLabel::Concept],
+        created_at: veld::chrono::Utc::now(),
+        last_seen_at: veld::chrono::Utc::now(),
+        mention_count: 1,
+        summary: String::new(),
+        attributes: std::collections::HashMap::new(),
+        name_embedding: None,
+        salience: 0.5,
+        is_proper_noun: true,
+        pii_classification: Default::default(),
+    };
+    let seed_hub = |name: &str| -> veld::uuid::Uuid {
+        let g = graph.read();
+        let hub = g.add_entity(node(name)).unwrap();
+        for i in 0..MAX_ENTITY_DEGREE {
+            let peer = g.add_entity(node(&format!("{name}-peer-{i}"))).unwrap();
+            let now = veld::chrono::Utc::now();
+            g.add_relationship(RelationshipEdge {
+                uuid: veld::uuid::Uuid::new_v4(),
+                from_entity: hub,
+                to_entity: peer,
+                relation_type: RelationType::RelatedTo,
+                strength: 0.3,
+                created_at: now,
+                valid_at: now,
+                invalidated_at: None,
+                source_episode_id: None,
+                context: String::new(),
+                last_activated: now,
+                activation_count: 1,
+                ltp_status: Default::default(),
+                tier: Default::default(),
+                activation_timestamps: None,
+                entity_confidence: None,
+                created_by: Default::default(),
+                forward_strength: 0.3,
+                backward_strength: 0.3,
+            })
+            .unwrap();
+        }
+        hub
+    };
+    let lighthouse = seed_hub("lighthouse");
+    let bash = seed_hub("tool:Bash");
+    let edge_ids = |uuid: &veld::uuid::Uuid| -> std::collections::BTreeSet<veld::uuid::Uuid> {
+        edges_of(&h, user, uuid)
+            .into_iter()
+            .map(|e| e.uuid)
+            .collect()
+    };
+    let lighthouse_before = edge_ids(&lighthouse);
+    assert_eq!(lighthouse_before.len(), MAX_ENTITY_DEGREE);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user,
+                   "content": "The keeper climbed the stairs at dusk.",
+                   "tags": ["lighthouse", "keeper"],
+                   "entities": [{"name": "tool:Bash", "label": "Tool"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    wait_for_episode_entity(&h, user, id, "keeper").await;
+    let keeper = named_graph_entity(&h, user, "keeper").expect("keeper").uuid;
+
+    assert_eq!(
+        edge_ids(&lighthouse),
+        lighthouse_before,
+        "a derived hub gained or lost an edge"
+    );
+    let bash_edges = edges_of(&h, user, &bash);
+    assert_eq!(
+        bash_edges.len(),
+        MAX_ENTITY_DEGREE,
+        "the declared hub stays at the cap"
+    );
+    assert!(
+        bash_edges
+            .iter()
+            .any(|e| e.from_entity == keeper || e.to_entity == keeper),
+        "the declared hub was skipped"
+    );
+    assert!(named_graph_entity(&h, user, "tool:Bash")
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::Tool));
+}
+
+#[tokio::test]
+async fn a_declared_file_path_is_recalled_by_its_file_name() {
+    let h = Harness::new();
+    let user = "recall-declared";
+    let distractors = [
+        "Changed the retry budget in the payment worker from three to five attempts.",
+        "observe.mjs now batches telemetry before flushing it to the collector.",
+        "server.mjs was renamed during the express upgrade and nothing else changed.",
+        "The nightly backup job moved to 02:00 to avoid the index rebuild window.",
+        "Bumped the Postgres connection pool after the load test saturated it.",
+        "What changed in the onboarding email copy: shorter subject, one call to action.",
+        "The CSV export now escapes embedded quotes in the notes column.",
+        "Dashboard tiles were reordered so error rate sits beside latency.",
+        "The webhook signature check now rejects timestamps older than five minutes.",
+        "Pinned the image digest for the scanner container in CI.",
+        "Changed the cache TTL for avatars from a day to an hour.",
+        "admin/routes/serve-static.mjs gained a content-type allowlist.",
+        "Rewrote the changelog generator to group entries by scope.",
+        "Changed the feature flag default for the new editor to off.",
+        "The search page debounces keystrokes by 250 milliseconds now.",
+        "Moved the docs build to a separate workflow so it no longer blocks tests.",
+        "The rate limiter keys on the API token rather than the client address.",
+        "Changed how the CLI prints errors: one line, then the hint.",
+        "Deleted the unused geo lookup module and its fixtures.",
+        "The worker pool shrinks to two threads when the queue is idle.",
+    ];
+    for content in distractors {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember",
+                json!({"user_id": user, "content": content}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user,
+                   "content": "Moved the auth check ahead of route dispatch and dropped the legacy redirect.",
+                   "entities": [{"name": SERVE, "label": "FilePath"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let target = body["id"].as_str().unwrap().to_string();
+    let target_uuid = veld::uuid::Uuid::parse_str(&target).unwrap();
+    wait_for_episode_entity(&h, user, target_uuid, &SERVE.to_lowercase()).await;
+
+    for query in [
+        "what changed in serve.mjs",
+        "what changed in admin/serve.mjs",
+    ] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/recall",
+                json!({"user_id": user, "query": query, "limit": 5}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body["memories"]
+            .as_array()
+            .expect("memories")
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids.first().copied(),
+            Some(target.as_str()),
+            "{query}: {:#}",
+            body["memories"]
+        );
+    }
+}

@@ -466,6 +466,13 @@ fn parse_entity_label(s: &str) -> EntityLabel {
         "team" => EntityLabel::Team,
         "role" => EntityLabel::Role,
         "module" => EntityLabel::Module,
+        "filepath" => EntityLabel::FilePath,
+        "commit" => EntityLabel::Commit,
+        "symbol" => EntityLabel::Symbol,
+        "session" => EntityLabel::Session,
+        "agent" => EntityLabel::Agent,
+        "tool" => EntityLabel::Tool,
+        "template" => EntityLabel::Template,
         other => EntityLabel::Other(other.to_string()),
     }
 }

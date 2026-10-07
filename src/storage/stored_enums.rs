@@ -247,6 +247,13 @@ fn graph_enums_keep_their_positions() {
         EntityLabel::Role,
         EntityLabel::Module,
         EntityLabel::Other(String::new()),
+        EntityLabel::FilePath,
+        EntityLabel::Commit,
+        EntityLabel::Symbol,
+        EntityLabel::Session,
+        EntityLabel::Agent,
+        EntityLabel::Tool,
+        EntityLabel::Template,
     );
     pinned!(
         EdgeTier::L1Working,
@@ -326,4 +333,96 @@ fn fact_enums_keep_their_positions() {
         FactType::Definition,
         FactType::Pattern,
     );
+}
+
+/// An entity written before the declared labels existed decodes unchanged. The mirror below is
+/// `EntityNode` with the label enum as it stood (23 named variants, then `Other`), so the bytes
+/// are exactly what an older build stored.
+#[test]
+fn entity_records_written_before_the_declared_labels_still_decode() {
+    use std::collections::HashMap;
+
+    use chrono::{DateTime, Utc};
+    use uuid::Uuid;
+
+    use crate::graph_memory::EntityNode;
+
+    #[allow(dead_code)]
+    #[derive(Serialize)]
+    enum OldEntityLabel {
+        Person,
+        Organization,
+        Location,
+        Technology,
+        Concept,
+        Event,
+        Date,
+        Product,
+        Skill,
+        Keyword,
+        Project,
+        Task,
+        Document,
+        Repository,
+        Service,
+        Database,
+        Metric,
+        Configuration,
+        Environment,
+        Pipeline,
+        Team,
+        Role,
+        Module,
+        Other(String),
+    }
+
+    #[derive(Serialize)]
+    struct OldEntityNode {
+        uuid: Uuid,
+        name: String,
+        labels: Vec<OldEntityLabel>,
+        created_at: DateTime<Utc>,
+        last_seen_at: DateTime<Utc>,
+        mention_count: usize,
+        summary: String,
+        attributes: HashMap<String, String>,
+        name_embedding: Option<Vec<f32>>,
+        salience: f32,
+        is_proper_noun: bool,
+        pii_classification: PiiClassification,
+    }
+
+    let now = Utc::now();
+    let old = OldEntityNode {
+        uuid: Uuid::new_v4(),
+        name: "veld".to_string(),
+        labels: vec![
+            OldEntityLabel::Person,
+            OldEntityLabel::Module,
+            OldEntityLabel::Other("MISC".to_string()),
+        ],
+        created_at: now,
+        last_seen_at: now,
+        mention_count: 3,
+        summary: String::new(),
+        attributes: HashMap::new(),
+        name_embedding: None,
+        salience: 0.7,
+        is_proper_noun: true,
+        pii_classification: PiiClassification::Clean,
+    };
+    let bytes = bincode::serde::encode_to_vec(&old, bincode::config::standard()).unwrap();
+    let (decoded, used): (EntityNode, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    assert_eq!(used, bytes.len());
+    assert_eq!(decoded.name, "veld");
+    assert_eq!(
+        decoded.labels,
+        vec![
+            EntityLabel::Person,
+            EntityLabel::Module,
+            EntityLabel::Other("MISC".to_string()),
+        ]
+    );
+    assert_eq!(decoded.mention_count, 3);
 }
