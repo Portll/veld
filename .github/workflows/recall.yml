@@ -44,8 +44,11 @@ on:
 permissions:
   contents: read
 
+# A dispatched run is a deliberate measurement and is never redundant with another, so it gets a
+# group of its own: a second arm dispatched on the same branch must not cancel the first. A
+# scheduled run still supersedes the one before it.
 concurrency:
-  group: recall-${{ github.ref }}
+  group: recall-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
   cancel-in-progress: true
 
 env:
