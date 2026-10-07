@@ -61,6 +61,8 @@ const WEEKS: usize = 12;
 /// p90 of measured revisit intervals (9.9 days); a memory younger than this has not had its chance.
 const NEVER_ASKED_MIN_AGE_HOURS: i64 = 238;
 const DECAY_IMPORTANCE_FLOOR: f32 = 0.05;
+/// A memory whose decay estimate is under this many days is on the about-to-forget shelf.
+const ABOUT_TO_FORGET_DAYS: f32 = 30.0;
 const SHELF_ITEMS: usize = 20;
 
 // ============================================================================
@@ -727,6 +729,9 @@ pub struct MemoryCard {
     pub authored_tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_days_to_decay: Option<f32>,
+    /// Times this memory came back in a recall, counted from the recall event log.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recalled: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -827,6 +832,7 @@ fn memory_card(m: &Memory, sources: Option<&HashMap<MemoryId, TagSources>>) -> M
         anchored: m.is_anchored(),
         authored_tags,
         estimated_days_to_decay: estimated_days_to_decay(m.importance()),
+        recalled: None,
     }
 }
 
@@ -857,6 +863,9 @@ const W_FACTS: &str = "FactStore::list (active facts; skips rows it cannot decod
 const W_ENTITIES: &str = "GraphMemory::get_all_entities (skips rows it cannot decode)";
 const W_EDGES: &str = "GraphMemory::get_all_relationships, tier L3, not invalidated";
 const W_RECALLS: &str = "RecallEventStore::since";
+/// `access_count` is updated in memory on recall and persisted only when something else rewrites
+/// the record, so it reads zero after a restart; recall hits are counted from the log instead.
+const W_RECALL_HITS: &str = "RecallEventStore hits since the log's horizon";
 const W_SOURCES: &str = "TagSourceStore::all";
 
 pub struct KnowsInputs<'a> {
@@ -1021,6 +1030,74 @@ pub fn build_knows(i: KnowsInputs<'_>) -> Knows {
     let now = i.now;
     let never_age = Duration::hours(NEVER_ASKED_MIN_AGE_HOURS);
 
+    let (most_asked, known_but_never_asked) = match (&i.recalls, mems) {
+        (Err(e), _) => (
+            Field::unmeasured(format!("{e:#}"), W_RECALL_HITS),
+            Field::unmeasured(format!("{e:#}"), W_RECALL_HITS),
+        ),
+        (_, None) => (
+            Field::unmeasured(mem_err(), W_MEMORIES),
+            Field::unmeasured(mem_err(), W_MEMORIES),
+        ),
+        (Ok(events), Some(ms)) => {
+            let horizon = events.first().map(|e| e.at);
+            let mut hits: HashMap<&str, usize> = HashMap::new();
+            for e in events {
+                for h in &e.hits {
+                    *hits.entry(h.memory_id.as_str()).or_insert(0) += 1;
+                }
+            }
+            let since = horizon
+                .map(|h| format!("since {}", h.to_rfc3339()))
+                .unwrap_or_else(|| "the recall log is empty".into());
+            let card = |m: &Memory| {
+                let mut c = memory_card(m, sources);
+                c.recalled = Some(hits.get(m.id.0.to_string().as_str()).copied().unwrap_or(0));
+                c
+            };
+            let mut asked: Vec<&Memory> = ms
+                .iter()
+                .map(|m| m.as_ref())
+                .filter(|m| hits.contains_key(m.id.0.to_string().as_str()))
+                .collect();
+            asked.sort_by_key(|m| {
+                std::cmp::Reverse(hits.get(m.id.0.to_string().as_str()).copied().unwrap_or(0))
+            });
+            let mut most = Field::measured(
+                shelf(asked.into_iter().map(card).collect(), SHELF_ITEMS),
+                W_RECALL_HITS,
+            );
+            most.reason = Some(since.clone());
+
+            let never = match horizon {
+                Some(h) if now - h >= never_age => {
+                    let mut v: Vec<&Memory> = ms
+                        .iter()
+                        .map(|m| m.as_ref())
+                        .filter(|m| {
+                            m.created_at <= h && !hits.contains_key(m.id.0.to_string().as_str())
+                        })
+                        .collect();
+                    v.sort_by_key(|m| m.created_at);
+                    let mut f = Field::measured(
+                        shelf(v.into_iter().map(card).collect(), SHELF_ITEMS),
+                        W_RECALL_HITS,
+                    );
+                    f.reason = Some(since);
+                    f
+                }
+                _ => Field::undetermined(
+                    format!(
+                        "the recall log has to span {NEVER_ASKED_MIN_AGE_HOURS}h (the p90 revisit \
+                         interval) before an unrecalled memory means anything; {since}"
+                    ),
+                    W_RECALL_HITS,
+                ),
+            };
+            (most, never)
+        }
+    };
+
     let asked_but_not_known = match &i.recalls {
         Err(e) => Field::unmeasured(format!("{e:#}"), W_RECALLS),
         Ok(events) => {
@@ -1120,19 +1197,19 @@ pub fn build_knows(i: KnowsInputs<'_>) -> Knows {
         ]),
         who_and_what,
         strongest_associations,
-        about_to_forget: memory_shelf(&|m| !m.is_anchored(), &|a, b| {
-            a.importance().total_cmp(&b.importance())
-        }),
+        about_to_forget: memory_shelf(
+            &|m| {
+                !m.is_anchored()
+                    && estimated_days_to_decay(m.importance())
+                        .is_none_or(|d| d < ABOUT_TO_FORGET_DAYS)
+            },
+            &|a, b| a.importance().total_cmp(&b.importance()),
+        ),
         pinned: memory_shelf(&|m| m.is_anchored(), &|a, b| {
             b.created_at.cmp(&a.created_at)
         }),
-        known_but_never_asked: memory_shelf(
-            &|m| m.access_count() == 0 && now - m.created_at >= never_age,
-            &|a, b| a.created_at.cmp(&b.created_at),
-        ),
-        most_asked: memory_shelf(&|m| m.access_count() > 0, &|a, b| {
-            b.access_count().cmp(&a.access_count())
-        }),
+        known_but_never_asked,
+        most_asked,
         asked_but_not_known,
         suspected_unknowns: Field::unmeasured(
             "Planet-X candidates are computed by spine-skills get_planet_x, not by veld",
@@ -1539,6 +1616,54 @@ mod tests {
             Some(v) => std::env::set_var(UI_USER_ENV, v),
             None => std::env::remove_var(UI_USER_ENV),
         }
+    }
+
+    #[test]
+    fn asked_shelves_come_from_the_recall_log_and_wait_for_it_to_span_the_revisit_interval() {
+        let memories: anyhow::Result<Vec<std::sync::Arc<Memory>>> = Ok(vec![]);
+        let sources: anyhow::Result<HashMap<MemoryId, TagSources>> = Ok(HashMap::new());
+        let at = |hours_ago: i64| {
+            let mut e = RecallEvent::new("/api/recall", "q", None, vec![]);
+            e.at = now() - Duration::hours(hours_ago);
+            e
+        };
+        let knows = |recalls: Vec<RecallEvent>| {
+            build_knows(KnowsInputs {
+                memories: &memories,
+                sources: &sources,
+                facts: Ok(vec![]),
+                entities: Ok(vec![]),
+                edges: Ok(vec![]),
+                recalls: Ok(recalls),
+                now: now(),
+            })
+        };
+
+        let young = knows(vec![at(5)]);
+        assert_eq!(young.known_but_never_asked.state, FieldState::Undetermined);
+        assert!(young
+            .known_but_never_asked
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("238h"));
+        assert_eq!(young.most_asked.state, FieldState::Measured);
+        assert!(young
+            .most_asked
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("since "));
+
+        let old = knows(vec![at(NEVER_ASKED_MIN_AGE_HOURS + 1)]);
+        assert_eq!(old.known_but_never_asked.state, FieldState::Measured);
+
+        let empty = knows(vec![]);
+        assert_eq!(empty.known_but_never_asked.state, FieldState::Undetermined);
+        assert_eq!(
+            empty.most_asked.reason.as_deref(),
+            Some("the recall log is empty")
+        );
     }
 
     #[test]
