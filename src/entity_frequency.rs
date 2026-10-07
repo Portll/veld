@@ -170,7 +170,9 @@ mod tests {
         }
     }
 
-    fn fixture() -> (Vec<EpisodicNode>, HashMap<Uuid, (String, bool)>, Uuid, Uuid, Uuid) {
+    type Fixture = (Vec<EpisodicNode>, HashMap<Uuid, (String, bool)>, Uuid, Uuid, Uuid);
+
+    fn fixture() -> Fixture {
         let alpha = Uuid::from_u128(1);
         let stamp = Uuid::from_u128(2);
         let ghost = Uuid::from_u128(3);
