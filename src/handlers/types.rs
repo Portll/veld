@@ -166,6 +166,9 @@ pub struct RecallRequest {
     /// filtered. MemoryQuery already enforced the filter; only the wiring was missing.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// The asking session's transcript id, recorded on the recall event log.
+    #[serde(default)]
+    pub episode_id: Option<String>,
 }
 
 pub fn default_recall_limit() -> usize {
