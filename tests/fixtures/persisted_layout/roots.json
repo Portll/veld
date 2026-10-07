@@ -607,6 +607,27 @@
         "Other": {
           "NEWTYPE": "STR"
         }
+      },
+      "24": {
+        "FilePath": "UNIT"
+      },
+      "25": {
+        "Commit": "UNIT"
+      },
+      "26": {
+        "Symbol": "UNIT"
+      },
+      "27": {
+        "Session": "UNIT"
+      },
+      "28": {
+        "Agent": "UNIT"
+      },
+      "29": {
+        "Tool": "UNIT"
+      },
+      "30": {
+        "Template": "UNIT"
       }
     }
   },

@@ -33,11 +33,17 @@ pub enum TagSource {
     Ner,
     Yake,
     ColdStart,
+    /// A typed entity the writer declared (`entities` on the write); see
+    /// `crate::declared_entities`.
+    Declared,
 }
 
 impl TagSource {
     pub fn is_authored(self) -> bool {
-        matches!(self, TagSource::Caller | TagSource::Intent)
+        matches!(
+            self,
+            TagSource::Caller | TagSource::Intent | TagSource::Declared
+        )
     }
 
     pub fn as_str(self) -> &'static str {
@@ -48,6 +54,7 @@ impl TagSource {
             TagSource::Ner => "ner",
             TagSource::Yake => "yake",
             TagSource::ColdStart => "cold-start",
+            TagSource::Declared => "declared",
         }
     }
 }
@@ -368,6 +375,7 @@ mod tests {
             TagSource::Ner,
             TagSource::Yake,
             TagSource::ColdStart,
+            TagSource::Declared,
         ];
         let json: Vec<String> = all
             .iter()
@@ -381,7 +389,8 @@ mod tests {
                 "\"ingest\"",
                 "\"ner\"",
                 "\"yake\"",
-                "\"cold-start\""
+                "\"cold-start\"",
+                "\"declared\""
             ]
         );
         for s in all {

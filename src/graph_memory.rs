@@ -178,6 +178,23 @@ pub enum EntityLabel {
     /// Code modules, packages, crates, libraries, ROS2 packages
     Module,
     Other(String),
+    // Writer-declared identifier types. Appended AFTER `Other` because bincode stores a variant
+    // as its position: anything inserted above would relabel every stored entity after it
+    // (src/storage/stored_enums.rs pins the order).
+    /// A file in a named tree, canonically `repo:relative/path`
+    FilePath,
+    /// A commit, canonically `repo@sha`
+    Commit,
+    /// A code symbol: function, type, constant
+    Symbol,
+    /// An agent session, canonically `cc:<sessionId>`
+    Session,
+    /// An agent within a session, canonically `cc:<sessionId>/<agentId>`
+    Agent,
+    /// A tool or skill an agent invoked, canonically `tool:<name>` / `skill:/<name>`
+    Tool,
+    /// A prompt or tool template, canonically `template:<tool>@<sha8>`
+    Template,
 }
 
 /// Whether an entity of this kind denotes the same referent regardless of
@@ -227,6 +244,37 @@ impl MergeClass {
     }
 }
 
+/// Most candidates [`GraphMemory::find_file_paths_by_suffix`] reads for one term.
+pub const FILE_PATH_SUFFIX_MAX_CANDIDATES: usize = 16;
+/// Most `/`-separated suffixes indexed for one name.
+pub const FILE_PATH_SUFFIX_MAX_DEPTH: usize = 32;
+
+/// The lowercased `/`-boundary suffixes of the path in a `prefix:path` name, longest first:
+/// `commitwork:admin/serve.mjs` → `["admin/serve.mjs", "serve.mjs"]`. Empty for any other shape.
+pub fn path_suffixes(name: &str) -> Vec<String> {
+    let lower = name.to_lowercase();
+    let Some((prefix, path)) = lower.split_once(':') else {
+        return Vec::new();
+    };
+    if prefix.is_empty() || prefix.contains('/') || prefix.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let path = path.trim_start_matches('/');
+    if path.is_empty() || path.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let mut out = vec![path.to_string()];
+    for (i, c) in path.char_indices() {
+        if out.len() >= FILE_PATH_SUFFIX_MAX_DEPTH {
+            break;
+        }
+        if c == '/' && i + 1 < path.len() {
+            out.push(path[i + 1..].to_string());
+        }
+    }
+    out
+}
+
 impl EntityLabel {
     /// Get string representation of the entity label
     #[allow(unused)] // Public API for serialization/display
@@ -256,7 +304,88 @@ impl EntityLabel {
             Self::Role => "Role",
             Self::Module => "Module",
             Self::Other(s) => s.as_str(),
+            Self::FilePath => "FilePath",
+            Self::Commit => "Commit",
+            Self::Symbol => "Symbol",
+            Self::Session => "Session",
+            Self::Agent => "Agent",
+            Self::Tool => "Tool",
+            Self::Template => "Template",
         }
+    }
+
+    /// Every label a client may declare on a write, in the spelling the error message names.
+    /// `Other` is not declarable: an unrecognised label is refused, never filed as `Other`.
+    pub const DECLARABLE: &'static [&'static str] = &[
+        "Person",
+        "Organization",
+        "Location",
+        "Technology",
+        "Concept",
+        "Event",
+        "Date",
+        "Product",
+        "Skill",
+        "Keyword",
+        "Project",
+        "Task",
+        "Document",
+        "Repository",
+        "Service",
+        "Database",
+        "Metric",
+        "Configuration",
+        "Environment",
+        "Pipeline",
+        "Team",
+        "Role",
+        "Module",
+        "FilePath",
+        "Commit",
+        "Symbol",
+        "Session",
+        "Agent",
+        "Tool",
+        "Template",
+    ];
+
+    /// Parse a client-declared label, case-insensitively. `None` for anything not in
+    /// [`Self::DECLARABLE`].
+    pub fn parse_declared(s: &str) -> Option<EntityLabel> {
+        let label = match s.trim().to_ascii_lowercase().as_str() {
+            "person" => Self::Person,
+            "organization" => Self::Organization,
+            "location" => Self::Location,
+            "technology" => Self::Technology,
+            "concept" => Self::Concept,
+            "event" => Self::Event,
+            "date" => Self::Date,
+            "product" => Self::Product,
+            "skill" => Self::Skill,
+            "keyword" => Self::Keyword,
+            "project" => Self::Project,
+            "task" => Self::Task,
+            "document" => Self::Document,
+            "repository" => Self::Repository,
+            "service" => Self::Service,
+            "database" => Self::Database,
+            "metric" => Self::Metric,
+            "configuration" => Self::Configuration,
+            "environment" => Self::Environment,
+            "pipeline" => Self::Pipeline,
+            "team" => Self::Team,
+            "role" => Self::Role,
+            "module" => Self::Module,
+            "filepath" => Self::FilePath,
+            "commit" => Self::Commit,
+            "symbol" => Self::Symbol,
+            "session" => Self::Session,
+            "agent" => Self::Agent,
+            "tool" => Self::Tool,
+            "template" => Self::Template,
+            _ => return None,
+        };
+        Some(label)
     }
 
     /// Static type hierarchy: returns parent labels for ontological matching.
@@ -342,6 +471,16 @@ impl EntityLabel {
             // Unrecognised type, unknown referential scope. Fail toward not
             // merging.
             Self::Other(_) => BandRelative,
+
+            // Writer-declared identifiers whose canonical form carries its own
+            // scope: a commit sha, a session or agent id, a tool name and a
+            // template's content hash each name one referent wherever they
+            // appear.
+            Self::Commit | Self::Session | Self::Agent => Global,
+            Self::Tool | Self::Template => Global,
+            // A path or symbol is relative to its tree unless the writer
+            // qualified it, and the label cannot tell whether it did.
+            Self::FilePath | Self::Symbol => BandRelative,
         }
     }
 }
@@ -1753,6 +1892,10 @@ pub struct GraphMemory {
     /// Key: Porter-stemmed lowercase name, Value: Entity UUID
     entity_stemmed_index: Arc<parking_lot::RwLock<HashMap<String, Uuid>>>,
 
+    /// In-memory path-suffix index for `prefix:path`-shaped names (see
+    /// [`GraphMemory::find_file_paths_by_suffix`]). Derived from the name index; not persisted.
+    entity_path_suffix_index: Arc<parking_lot::RwLock<HashMap<String, Vec<Uuid>>>>,
+
     // === Atomic counters for O(1) stats (P1 fix) ===
     /// Entity count - initialized from entity_name_index.len(), updated on add
     entity_count: Arc<AtomicUsize>,
@@ -1953,6 +2096,7 @@ impl GraphMemory {
             Self::load_or_migrate_stemmed_index(store.as_ref(), &entity_name_index)?;
 
         let entity_count = entity_name_index.len();
+        let entity_path_suffix_index = Self::build_path_suffix_index(&entity_name_index);
 
         // Count relationships and episodes during startup (one-time cost)
         // This is O(n) at startup, but get_stats() will be O(1) at runtime
@@ -1977,6 +2121,7 @@ impl GraphMemory {
             entity_name_index: Arc::new(parking_lot::RwLock::new(entity_name_index)),
             entity_lowercase_index: Arc::new(parking_lot::RwLock::new(entity_lowercase_index)),
             entity_stemmed_index: Arc::new(parking_lot::RwLock::new(entity_stemmed_index)),
+            entity_path_suffix_index: Arc::new(parking_lot::RwLock::new(entity_path_suffix_index)),
             entity_count: Arc::new(AtomicUsize::new(entity_count)),
             relationship_count: Arc::new(AtomicUsize::new(relationship_count)),
             episode_count: Arc::new(AtomicUsize::new(episode_count)),
@@ -2423,6 +2568,7 @@ impl GraphMemory {
             let mut stemmed_index = self.entity_stemmed_index.write();
             stemmed_index.insert(stemmed_name.clone(), entity.uuid);
         }
+        self.index_path_suffixes(&entity.name, entity.uuid);
 
         // Update entity embedding cache for future concept merges
         if let Some(ref emb) = entity.name_embedding {
@@ -2556,6 +2702,7 @@ impl GraphMemory {
         }
         self.store
             .delete_cf(CF_STEMMED_INDEX, stemmed_name.as_bytes())?;
+        self.unindex_path_suffixes(&entity.name, uuid);
 
         // 5. Remove from embedding cache
         {
@@ -3058,22 +3205,7 @@ impl GraphMemory {
         use crate::constants::MAX_ENTITY_DEGREE;
 
         // Fast path: count edges without loading them
-        let prefix = format!("{entity_uuid}:");
-        let iter = self
-            .store
-            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
-            .into_iter()
-            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
-
-        let mut edge_count = 0usize;
-        for (key, _) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with(&prefix) {
-                    break;
-                }
-                edge_count += 1;
-            }
-        }
+        let edge_count = self.entity_degree(entity_uuid)?;
 
         if edge_count <= MAX_ENTITY_DEGREE {
             return Ok(());
@@ -3153,8 +3285,12 @@ impl GraphMemory {
             }
         }
 
+        // Debug, not info: a hub at the cap prunes on EVERY new edge, one edge at a time, so an
+        // info line here was measured at ~1,900 lines/min on the live store after ~485 writes.
+        // The total stays observable through veld_graph_degree_cap_pruned_edges_total.
         if !to_prune.is_empty() {
-            tracing::info!(
+            crate::metrics::GRAPH_DEGREE_CAP_PRUNED_EDGES.inc_by(to_prune.len() as u64);
+            tracing::debug!(
                 entity = %entity_uuid,
                 pruned = to_prune.len(),
                 remaining = MAX_ENTITY_DEGREE,
@@ -3163,6 +3299,106 @@ impl GraphMemory {
         }
 
         Ok(())
+    }
+
+    /// Number of edges indexed against an entity, counted from the entity→edge index without
+    /// loading the edges.
+    pub fn entity_degree(&self, entity_uuid: &Uuid) -> Result<usize> {
+        let prefix = format!("{entity_uuid}:");
+        let mut edge_count = 0usize;
+        for (key, _) in self
+            .store
+            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
+        {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
+                edge_count += 1;
+            }
+        }
+        Ok(edge_count)
+    }
+
+    /// Entities labelled [`EntityLabel::FilePath`] whose path ends with `term` at a `/`
+    /// boundary: `serve.mjs` and `admin/serve.mjs` both resolve `commitwork:admin/serve.mjs`,
+    /// `observe.mjs` does not.
+    ///
+    /// Cost: one hash probe into the in-memory suffix index, then one entity read per candidate,
+    /// at most [`FILE_PATH_SUFFIX_MAX_CANDIDATES`]. The index holds one key per `/`-separated
+    /// suffix of every `prefix:path`-shaped entity name (capped at
+    /// [`FILE_PATH_SUFFIX_MAX_DEPTH`] per name), built once from the name index at open and
+    /// extended on insert. Keys are shape-based because labels are not in the name index, so
+    /// the label is checked here, on the candidates only.
+    pub fn find_file_paths_by_suffix(&self, term: &str) -> Result<Vec<EntityNode>> {
+        let key = term.trim().trim_start_matches('/').to_lowercase();
+        if key.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates: Vec<Uuid> = {
+            let index = self.entity_path_suffix_index.read();
+            match index.get(&key) {
+                Some(uuids) => uuids
+                    .iter()
+                    .take(FILE_PATH_SUFFIX_MAX_CANDIDATES)
+                    .copied()
+                    .collect(),
+                None => return Ok(Vec::new()),
+            }
+        };
+        let mut found = Vec::new();
+        for uuid in candidates {
+            if let Some(entity) = self.get_entity(&uuid)? {
+                if entity.labels.contains(&EntityLabel::FilePath) {
+                    found.push(entity);
+                }
+            }
+        }
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(found)
+    }
+
+    fn index_path_suffixes(&self, name: &str, uuid: Uuid) {
+        let suffixes = path_suffixes(name);
+        if suffixes.is_empty() {
+            return;
+        }
+        let mut index = self.entity_path_suffix_index.write();
+        for suffix in suffixes {
+            let entry = index.entry(suffix).or_default();
+            if !entry.contains(&uuid) {
+                entry.push(uuid);
+            }
+        }
+    }
+
+    fn unindex_path_suffixes(&self, name: &str, uuid: &Uuid) {
+        let suffixes = path_suffixes(name);
+        if suffixes.is_empty() {
+            return;
+        }
+        let mut index = self.entity_path_suffix_index.write();
+        for suffix in suffixes {
+            if let Some(entry) = index.get_mut(&suffix) {
+                entry.retain(|u| u != uuid);
+                if entry.is_empty() {
+                    index.remove(&suffix);
+                }
+            }
+        }
+    }
+
+    fn build_path_suffix_index(name_index: &HashMap<String, Uuid>) -> HashMap<String, Vec<Uuid>> {
+        let mut index: HashMap<String, Vec<Uuid>> = HashMap::new();
+        for (name, uuid) in name_index {
+            for suffix in path_suffixes(name) {
+                let entry = index.entry(suffix).or_default();
+                if !entry.contains(uuid) {
+                    entry.push(*uuid);
+                }
+            }
+        }
+        index
     }
 
     /// Get relationships for an entity with optional limit
@@ -3703,6 +3939,7 @@ impl GraphMemory {
         self.entity_name_index.write().clear();
         self.entity_lowercase_index.write().clear();
         self.entity_stemmed_index.write().clear();
+        self.entity_path_suffix_index.write().clear();
 
         // Reset counters
         self.entity_count.store(0, Ordering::Relaxed);
@@ -6114,6 +6351,13 @@ fn entity_type_color(label: Option<&EntityLabel>) -> String {
         Some(EntityLabel::Role) => "#8E44AD".to_string(),   // Dark purple — roles
         Some(EntityLabel::Module) => "#D35400".to_string(), // Pumpkin — code modules
         Some(EntityLabel::Other(_)) => "#AEB6BF".to_string(), // Gray
+        Some(EntityLabel::FilePath) => "#C0392B".to_string(), // Dark red — files
+        Some(EntityLabel::Commit) => "#7F8C8D".to_string(), // Slate — commits
+        Some(EntityLabel::Symbol) => "#E59866".to_string(), // Tan — symbols
+        Some(EntityLabel::Session) => "#5DADE2".to_string(), // Light blue — sessions
+        Some(EntityLabel::Agent) => "#48C9B0".to_string(),  // Aqua — agents
+        Some(EntityLabel::Tool) => "#F4D03F".to_string(),   // Yellow — tools
+        Some(EntityLabel::Template) => "#AF7AC5".to_string(), // Lilac — templates
         None => "#AEB6BF".to_string(),                      // Gray default
     }
 }
@@ -7204,6 +7448,11 @@ impl EntityExtractor {
             EntityLabel::Role => 0.55,          // Roles are semi-generic
             EntityLabel::Module => 0.55,        // Modules are code-level entities
             EntityLabel::Other(_) => 0.3,       // Unknown types get low salience
+            // Writer-declared identifiers are specific by construction.
+            EntityLabel::FilePath | EntityLabel::Symbol => 0.65,
+            EntityLabel::Commit | EntityLabel::Template => 0.6,
+            EntityLabel::Session | EntityLabel::Agent => 0.5,
+            EntityLabel::Tool => 0.55,
         };
 
         // Proper nouns get a 20% boost
@@ -9232,15 +9481,22 @@ mod tests {
             EntityLabel::Role,
             EntityLabel::Module,
             EntityLabel::Other("unrecognised".into()),
+            EntityLabel::FilePath,
+            EntityLabel::Commit,
+            EntityLabel::Symbol,
+            EntityLabel::Session,
+            EntityLabel::Agent,
+            EntityLabel::Tool,
+            EntityLabel::Template,
         ];
-        assert_eq!(all.len(), 24, "vocabulary changed — revisit merge classes");
+        assert_eq!(all.len(), 31, "vocabulary changed — revisit merge classes");
 
         let global = all
             .iter()
             .filter(|l| l.merge_class() == MergeClass::Global)
             .count();
-        assert_eq!(global, 13, "expected 13 global labels");
-        assert_eq!(all.len() - global, 11, "expected 11 band-relative labels");
+        assert_eq!(global, 18, "expected 18 global labels");
+        assert_eq!(all.len() - global, 13, "expected 13 band-relative labels");
     }
 
     #[test]
@@ -9777,6 +10033,109 @@ mod tests {
             graph.find_entity_by_name("Vornak").unwrap().map(|e| e.uuid),
             Some(reactor)
         );
+    }
+
+    #[test]
+    fn path_suffixes_split_at_slash_boundaries_after_the_prefix() {
+        assert_eq!(
+            path_suffixes("commitwork:admin/serve.mjs"),
+            vec!["admin/serve.mjs".to_string(), "serve.mjs".to_string()]
+        );
+        assert_eq!(
+            path_suffixes("Repo:README.md"),
+            vec!["readme.md".to_string()]
+        );
+        assert!(path_suffixes("commitwork@1a2b3c4d").is_empty(), "no prefix");
+        assert!(
+            path_suffixes("New York: the city").is_empty(),
+            "prose is not a path"
+        );
+        assert!(path_suffixes("a/b:c").is_empty(), "a prefix holds no slash");
+        assert!(path_suffixes("repo:").is_empty());
+    }
+
+    fn declared_file(name: &str) -> EntityNode {
+        let mut e = named_entity(name);
+        e.labels = vec![EntityLabel::FilePath];
+        e.is_proper_noun = true;
+        e
+    }
+
+    #[test]
+    fn file_paths_resolve_by_suffix_at_a_boundary_and_only_when_labelled_filepath() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let serve = graph
+            .add_entity(declared_file("commitwork:admin/serve.mjs"))
+            .unwrap();
+        let observe = graph
+            .add_entity(declared_file("commitwork:lib/observe.mjs"))
+            .unwrap();
+        // Same shape, not a file: must never be returned by the FilePath lookup.
+        graph.add_entity(named_entity("intent:serve.mjs")).unwrap();
+
+        let by = |t: &str| -> Vec<Uuid> {
+            graph
+                .find_file_paths_by_suffix(t)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.uuid)
+                .collect()
+        };
+        assert_eq!(by("serve.mjs"), vec![serve]);
+        assert_eq!(by("Admin/Serve.mjs"), vec![serve], "case-insensitive");
+        assert_eq!(by("/admin/serve.mjs"), vec![serve]);
+        assert_eq!(by("observe.mjs"), vec![observe]);
+        assert!(by("erve.mjs").is_empty(), "not at a boundary");
+        assert!(by("missing.mjs").is_empty());
+
+        // The index is rebuilt from the name index on reopen, not persisted.
+        drop(graph);
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let found = graph.find_file_paths_by_suffix("serve.mjs").unwrap();
+        assert_eq!(
+            found.iter().map(|e| e.uuid).collect::<Vec<_>>(),
+            vec![serve]
+        );
+
+        assert!(graph.delete_entity(&serve).unwrap());
+        assert!(graph
+            .find_file_paths_by_suffix("serve.mjs")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn degree_cap_pruning_removes_unpotentiated_edges_before_declared_ones() {
+        use crate::constants::MAX_ENTITY_DEGREE;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let hub = graph.add_entity(named_entity("hub")).unwrap();
+        let mut protected = Vec::new();
+        for i in 0..MAX_ENTITY_DEGREE + 5 {
+            let peer = graph.add_entity(named_entity(&format!("peer{i}"))).unwrap();
+            let mut edge = typed_edge(hub, peer, RelationType::RelatedTo, 0.95);
+            edge.tier = EdgeTier::L1Working;
+            if i % 100 == 0 {
+                // A declared edge: protected, but weaker than every plain one.
+                edge.strength = 0.1;
+                edge.ltp_status = LtpStatus::Weekly;
+                edge.created_by = EdgeSource::Explicit;
+                protected.push(graph.add_relationship(edge).unwrap());
+            } else {
+                graph.add_relationship(edge).unwrap();
+            }
+        }
+        assert_eq!(graph.entity_degree(&hub).unwrap(), MAX_ENTITY_DEGREE);
+        let remaining: std::collections::HashSet<Uuid> = graph
+            .get_entity_relationships(&hub)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.uuid)
+            .collect();
+        for id in &protected {
+            assert!(remaining.contains(id), "a declared edge was pruned first");
+        }
     }
 
     #[test]

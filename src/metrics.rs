@@ -669,6 +669,28 @@ pub static WRITE_GATE_ABSORBED: LazyLock<IntCounter> = LazyLock::new(|| {
 });
 
 // ============================================================================
+// Graph Degree Metrics
+// ============================================================================
+
+/// Edges deleted by the insert-time degree cap (`MAX_ENTITY_DEGREE`)
+pub static GRAPH_DEGREE_CAP_PRUNED_EDGES: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_graph_degree_cap_pruned_edges_total",
+        "Graph edges deleted by the insert-time per-entity degree cap",
+    )
+    .expect("GRAPH_DEGREE_CAP_PRUNED_EDGES metric must be valid at compile time")
+});
+
+/// Co-occurrence edges not created because a derived endpoint was already at the degree cap
+pub static GRAPH_HUB_EDGES_SKIPPED: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_graph_hub_edges_skipped_total",
+        "Co-occurrence edges skipped because a derived entity was already at the degree cap",
+    )
+    .expect("GRAPH_HUB_EDGES_SKIPPED metric must be valid at compile time")
+});
+
+// ============================================================================
 // Dream Replay Metrics (Consolidation Discovery)
 // ============================================================================
 
@@ -923,6 +945,13 @@ fn do_register_metrics() -> Result<(), MetricsError> {
 
     // Write gate metrics
     register!(WRITE_GATE_ABSORBED, "WRITE_GATE_ABSORBED");
+
+    // Graph degree metrics
+    register!(
+        GRAPH_DEGREE_CAP_PRUNED_EDGES,
+        "GRAPH_DEGREE_CAP_PRUNED_EDGES"
+    );
+    register!(GRAPH_HUB_EDGES_SKIPPED, "GRAPH_HUB_EDGES_SKIPPED");
 
     // Dream replay metrics
     register!(DREAM_REPLAY_EDGES_CREATED, "DREAM_REPLAY_EDGES_CREATED");
