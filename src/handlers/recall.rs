@@ -546,6 +546,9 @@ pub async fn recall(
                 prospective_signals: prospective_signals.clone(),
                 competition_mode: req.competition_mode,
                 rrf_k: rrf_k_for_recall,
+                // Parsed since FIX-11 and dropped here until now. Downstream already bounds it by
+                // max_results * 2, and a cognitive-dials rerank_count still takes precedence.
+                rerank_count: req.rerank_count,
                 as_of: req.as_of,
                 tags: tags_for_recall,
                 ..Default::default()
