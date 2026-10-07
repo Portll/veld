@@ -94,6 +94,22 @@ mod c31_injection_tests {
 
 /// Map API mode string to RetrievalMode enum.
 /// Defaults to Hybrid for unknown values (backward compat).
+/// The rung named by `/api/recall`'s `layers` field: a `LayerMode::report_key()` or its
+/// `recall-eval --layer` spelling. `None` for anything else, which the handler refuses rather
+/// than run the full pipeline under another rung's name.
+fn parse_layer_mode(s: &str) -> Option<crate::memory::types::LayerMode> {
+    use crate::memory::types::LayerMode;
+    match s {
+        "vamana_only" | "vamana-only" => Some(LayerMode::VamanaOnly),
+        "+spreading" | "plus_spreading" | "plus-spreading" => Some(LayerMode::PlusSpreading),
+        "+bm25" | "plus_bm25" | "plus-bm25" => Some(LayerMode::PlusBm25),
+        "+rerank" | "plus_rerank" | "plus-rerank" => Some(LayerMode::PlusRerank),
+        "+facts" | "plus_facts" | "plus-facts" => Some(LayerMode::PlusFacts),
+        "full" => Some(LayerMode::Full),
+        _ => None,
+    }
+}
+
 fn parse_retrieval_mode(mode: &str) -> RetrievalMode {
     match mode {
         "semantic" | "similarity" => RetrievalMode::Similarity,
@@ -440,6 +456,16 @@ pub async fn recall(
     let mode = req.mode.clone();
     let retrieval_mode_for_recall = parse_retrieval_mode(&mode);
     let rrf_k_for_recall = req.rrf_k.map(|k| k.clamp(1.0, 200.0));
+    let layers_for_recall = match req.layers.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(parse_layer_mode(s).ok_or_else(|| AppError::InvalidInput {
+            field: "layers".to_string(),
+            reason: format!(
+                "unknown layer mode '{s}'; expected one of: vamana_only, +spreading, +bm25, \
+                 +rerank, +facts, full"
+            ),
+        })?),
+    };
 
     // PROSPECTIVE MEMORY + RECALL: Run inside a single spawn_blocking to share
     // the computed query embedding between prospective semantic matching and recall.
@@ -528,6 +554,7 @@ pub async fn recall(
                 rrf_k: rrf_k_for_recall,
                 as_of: req.as_of,
                 tags: tags_for_recall,
+                layers: layers_for_recall,
                 ..Default::default()
             };
 
@@ -3001,5 +3028,39 @@ mod b4_recall_surface_tests {
         assert!(json.contains("2024-03-15"));
         assert!(json.contains("temporal_fact"));
         assert!(json.contains("mem-id-123"));
+    }
+}
+
+#[cfg(test)]
+mod layer_mode_parsing_tests {
+    use super::parse_layer_mode;
+    use crate::memory::types::LayerMode;
+
+    /// The keys must be `LayerMode::report_key()`'s, the strings recall-eval reports.
+    #[test]
+    fn parses_every_report_key() {
+        for mode in LayerMode::ALL {
+            assert_eq!(parse_layer_mode(mode.report_key()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn accepts_the_recall_eval_spellings() {
+        assert_eq!(parse_layer_mode("vamana-only"), Some(LayerMode::VamanaOnly));
+        assert_eq!(
+            parse_layer_mode("plus-spreading"),
+            Some(LayerMode::PlusSpreading)
+        );
+        assert_eq!(parse_layer_mode("plus_bm25"), Some(LayerMode::PlusBm25));
+        assert_eq!(parse_layer_mode("plus-rerank"), Some(LayerMode::PlusRerank));
+        assert_eq!(parse_layer_mode("plus_facts"), Some(LayerMode::PlusFacts));
+    }
+
+    #[test]
+    fn rejects_unknown_layer_strings() {
+        assert_eq!(parse_layer_mode("unknown"), None);
+        assert_eq!(parse_layer_mode("Full"), None);
+        assert_eq!(parse_layer_mode("+SPREADING"), None);
+        assert_eq!(parse_layer_mode(""), None);
     }
 }
