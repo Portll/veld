@@ -482,6 +482,35 @@ fn authored_tags(declared: &[DeclaredEntity], tags: &[String]) -> (Vec<String>, 
     (merged, sources)
 }
 
+/// Whether a write's content is code or markdown, where NER's PER and LOC are not to be trusted.
+///
+/// The NER is a small news-trained model. On the live store (2026-10-07) it typed "File",
+/// "Code", "Lines", "test" and "operator" as people and concepts in code-heavy memories, and each
+/// became a hub. The ingest format detector decides code and markdown; a fenced block also counts,
+/// because agent-written memories carry code inline without a filename to detect from.
+pub(crate) fn content_is_code_or_markdown(filename: Option<&str>, content: &str) -> bool {
+    matches!(
+        crate::ingest::detect_format(filename, content),
+        crate::ingest::InputFormat::Code | crate::ingest::InputFormat::Markdown
+    ) || content.contains("```")
+}
+
+/// Drop NER person and location records from code or markdown content. ORG and MISC stay: product,
+/// library and project names land there and are the useful part of NER on technical text.
+pub(crate) fn drop_person_location_in_code(
+    records: Vec<NerEntityRecord>,
+    filename: Option<&str>,
+    content: &str,
+) -> Vec<NerEntityRecord> {
+    if !content_is_code_or_markdown(filename, content) {
+        return records;
+    }
+    records
+        .into_iter()
+        .filter(|r| r.entity_type != "PER" && r.entity_type != "LOC")
+        .collect()
+}
+
 // =============================================================================
 // HANDLERS
 // =============================================================================
@@ -693,6 +722,8 @@ pub async fn remember(
             Vec::new()
         }
     };
+    let ner_entities =
+        drop_person_location_in_code(ner_entities, req.filename.as_deref(), &req.content);
     let extracted_keywords = match yake_result {
         Ok(keywords) => keywords,
         Err(e) => {
@@ -1504,6 +1535,7 @@ pub async fn batch_remember(
                     Vec::new()
                 }
             };
+            let ner_records = drop_person_location_in_code(ner_records, None, &item.content);
 
             // YAKE for common nouns, verbs, concepts
             let extracted_keywords: Vec<String> = keyword_extractor.extract_texts(&item.content);
@@ -2008,6 +2040,7 @@ pub async fn upsert_memory(
             Vec::new()
         }
     };
+    let ner_entities = drop_person_location_in_code(ner_entities, None, &req.content);
 
     // Extract keywords via YAKE for common nouns, verbs, concepts
     let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
@@ -2348,9 +2381,20 @@ mod client_source_type_tests {
 
 #[cfg(test)]
 mod declared_and_ner_tests {
-    use super::authored_tags;
+    use super::{authored_tags, content_is_code_or_markdown, drop_person_location_in_code};
     use crate::declared_entities::{validate, DeclaredEntityInput};
     use crate::memory::tag_sources::TagSource;
+    use crate::memory::types::NerEntityRecord;
+
+    fn record(text: &str, kind: &str) -> NerEntityRecord {
+        NerEntityRecord {
+            text: text.to_string(),
+            entity_type: kind.to_string(),
+            confidence: 0.9,
+            start_char: None,
+            end_char: None,
+        }
+    }
 
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -2379,5 +2423,37 @@ mod declared_and_ner_tests {
             authored_tags(&declared, &tags(&["auth", "Commitwork:Admin/Serve.mjs"]));
         assert_eq!(merged, tags(&["commitwork:admin/serve.mjs", "auth"]));
         assert_eq!(sources, vec![TagSource::Declared, TagSource::Caller]);
+    }
+
+    #[test]
+    fn person_and_location_are_dropped_only_from_code_or_markdown() {
+        let records = || {
+            vec![
+                record("File", "PER"),
+                record("Lines", "LOC"),
+                record("Kubernetes", "ORG"),
+                record("Python", "MISC"),
+            ]
+        };
+        let code = "Changed the parser:\n```rust\nfn parse() {}\n```";
+        let kept: Vec<String> = drop_person_location_in_code(records(), None, code)
+            .into_iter()
+            .map(|r| r.text)
+            .collect();
+        assert_eq!(kept, tags(&["Kubernetes", "Python"]));
+
+        let by_name = drop_person_location_in_code(records(), Some("main.rs"), "fn main() {}");
+        assert_eq!(by_name.len(), 2, "a code filename decides it too");
+
+        let markdown = "# Notes\n\nAlice reviewed the draft in Berlin.";
+        assert!(content_is_code_or_markdown(None, markdown));
+
+        let prose = "Alice reviewed the draft in Berlin.";
+        assert!(!content_is_code_or_markdown(None, prose));
+        assert_eq!(
+            drop_person_location_in_code(records(), None, prose).len(),
+            4,
+            "plain prose keeps every NER type"
+        );
     }
 }

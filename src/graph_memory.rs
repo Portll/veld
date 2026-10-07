@@ -244,6 +244,37 @@ impl MergeClass {
     }
 }
 
+/// Most candidates [`GraphMemory::find_file_paths_by_suffix`] reads for one term.
+pub const FILE_PATH_SUFFIX_MAX_CANDIDATES: usize = 16;
+/// Most `/`-separated suffixes indexed for one name.
+pub const FILE_PATH_SUFFIX_MAX_DEPTH: usize = 32;
+
+/// The lowercased `/`-boundary suffixes of the path in a `prefix:path` name, longest first:
+/// `commitwork:admin/serve.mjs` → `["admin/serve.mjs", "serve.mjs"]`. Empty for any other shape.
+pub fn path_suffixes(name: &str) -> Vec<String> {
+    let lower = name.to_lowercase();
+    let Some((prefix, path)) = lower.split_once(':') else {
+        return Vec::new();
+    };
+    if prefix.is_empty() || prefix.contains('/') || prefix.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let path = path.trim_start_matches('/');
+    if path.is_empty() || path.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let mut out = vec![path.to_string()];
+    for (i, c) in path.char_indices() {
+        if out.len() >= FILE_PATH_SUFFIX_MAX_DEPTH {
+            break;
+        }
+        if c == '/' && i + 1 < path.len() {
+            out.push(path[i + 1..].to_string());
+        }
+    }
+    out
+}
+
 impl EntityLabel {
     /// Get string representation of the entity label
     #[allow(unused)] // Public API for serialization/display
@@ -1861,6 +1892,10 @@ pub struct GraphMemory {
     /// Key: Porter-stemmed lowercase name, Value: Entity UUID
     entity_stemmed_index: Arc<parking_lot::RwLock<HashMap<String, Uuid>>>,
 
+    /// In-memory path-suffix index for `prefix:path`-shaped names (see
+    /// [`GraphMemory::find_file_paths_by_suffix`]). Derived from the name index; not persisted.
+    entity_path_suffix_index: Arc<parking_lot::RwLock<HashMap<String, Vec<Uuid>>>>,
+
     // === Atomic counters for O(1) stats (P1 fix) ===
     /// Entity count - initialized from entity_name_index.len(), updated on add
     entity_count: Arc<AtomicUsize>,
@@ -2061,6 +2096,7 @@ impl GraphMemory {
             Self::load_or_migrate_stemmed_index(store.as_ref(), &entity_name_index)?;
 
         let entity_count = entity_name_index.len();
+        let entity_path_suffix_index = Self::build_path_suffix_index(&entity_name_index);
 
         // Count relationships and episodes during startup (one-time cost)
         // This is O(n) at startup, but get_stats() will be O(1) at runtime
@@ -2085,6 +2121,7 @@ impl GraphMemory {
             entity_name_index: Arc::new(parking_lot::RwLock::new(entity_name_index)),
             entity_lowercase_index: Arc::new(parking_lot::RwLock::new(entity_lowercase_index)),
             entity_stemmed_index: Arc::new(parking_lot::RwLock::new(entity_stemmed_index)),
+            entity_path_suffix_index: Arc::new(parking_lot::RwLock::new(entity_path_suffix_index)),
             entity_count: Arc::new(AtomicUsize::new(entity_count)),
             relationship_count: Arc::new(AtomicUsize::new(relationship_count)),
             episode_count: Arc::new(AtomicUsize::new(episode_count)),
@@ -2531,6 +2568,7 @@ impl GraphMemory {
             let mut stemmed_index = self.entity_stemmed_index.write();
             stemmed_index.insert(stemmed_name.clone(), entity.uuid);
         }
+        self.index_path_suffixes(&entity.name, entity.uuid);
 
         // Update entity embedding cache for future concept merges
         if let Some(ref emb) = entity.name_embedding {
@@ -2664,6 +2702,7 @@ impl GraphMemory {
         }
         self.store
             .delete_cf(CF_STEMMED_INDEX, stemmed_name.as_bytes())?;
+        self.unindex_path_suffixes(&entity.name, uuid);
 
         // 5. Remove from embedding cache
         {
@@ -3281,6 +3320,87 @@ impl GraphMemory {
         Ok(edge_count)
     }
 
+    /// Entities labelled [`EntityLabel::FilePath`] whose path ends with `term` at a `/`
+    /// boundary: `serve.mjs` and `admin/serve.mjs` both resolve `commitwork:admin/serve.mjs`,
+    /// `observe.mjs` does not.
+    ///
+    /// Cost: one hash probe into the in-memory suffix index, then one entity read per candidate,
+    /// at most [`FILE_PATH_SUFFIX_MAX_CANDIDATES`]. The index holds one key per `/`-separated
+    /// suffix of every `prefix:path`-shaped entity name (capped at
+    /// [`FILE_PATH_SUFFIX_MAX_DEPTH`] per name), built once from the name index at open and
+    /// extended on insert. Keys are shape-based because labels are not in the name index, so
+    /// the label is checked here, on the candidates only.
+    pub fn find_file_paths_by_suffix(&self, term: &str) -> Result<Vec<EntityNode>> {
+        let key = term.trim().trim_start_matches('/').to_lowercase();
+        if key.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates: Vec<Uuid> = {
+            let index = self.entity_path_suffix_index.read();
+            match index.get(&key) {
+                Some(uuids) => uuids
+                    .iter()
+                    .take(FILE_PATH_SUFFIX_MAX_CANDIDATES)
+                    .copied()
+                    .collect(),
+                None => return Ok(Vec::new()),
+            }
+        };
+        let mut found = Vec::new();
+        for uuid in candidates {
+            if let Some(entity) = self.get_entity(&uuid)? {
+                if entity.labels.contains(&EntityLabel::FilePath) {
+                    found.push(entity);
+                }
+            }
+        }
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(found)
+    }
+
+    fn index_path_suffixes(&self, name: &str, uuid: Uuid) {
+        let suffixes = path_suffixes(name);
+        if suffixes.is_empty() {
+            return;
+        }
+        let mut index = self.entity_path_suffix_index.write();
+        for suffix in suffixes {
+            let entry = index.entry(suffix).or_default();
+            if !entry.contains(&uuid) {
+                entry.push(uuid);
+            }
+        }
+    }
+
+    fn unindex_path_suffixes(&self, name: &str, uuid: &Uuid) {
+        let suffixes = path_suffixes(name);
+        if suffixes.is_empty() {
+            return;
+        }
+        let mut index = self.entity_path_suffix_index.write();
+        for suffix in suffixes {
+            if let Some(entry) = index.get_mut(&suffix) {
+                entry.retain(|u| u != uuid);
+                if entry.is_empty() {
+                    index.remove(&suffix);
+                }
+            }
+        }
+    }
+
+    fn build_path_suffix_index(name_index: &HashMap<String, Uuid>) -> HashMap<String, Vec<Uuid>> {
+        let mut index: HashMap<String, Vec<Uuid>> = HashMap::new();
+        for (name, uuid) in name_index {
+            for suffix in path_suffixes(name) {
+                let entry = index.entry(suffix).or_default();
+                if !entry.contains(uuid) {
+                    entry.push(*uuid);
+                }
+            }
+        }
+        index
+    }
+
     /// Get relationships for an entity with optional limit
     ///
     /// Uses batch reading (multi_get) to eliminate N+1 query pattern.
@@ -3819,6 +3939,7 @@ impl GraphMemory {
         self.entity_name_index.write().clear();
         self.entity_lowercase_index.write().clear();
         self.entity_stemmed_index.write().clear();
+        self.entity_path_suffix_index.write().clear();
 
         // Reset counters
         self.entity_count.store(0, Ordering::Relaxed);
@@ -9912,6 +10033,76 @@ mod tests {
             graph.find_entity_by_name("Vornak").unwrap().map(|e| e.uuid),
             Some(reactor)
         );
+    }
+
+    #[test]
+    fn path_suffixes_split_at_slash_boundaries_after_the_prefix() {
+        assert_eq!(
+            path_suffixes("commitwork:admin/serve.mjs"),
+            vec!["admin/serve.mjs".to_string(), "serve.mjs".to_string()]
+        );
+        assert_eq!(
+            path_suffixes("Repo:README.md"),
+            vec!["readme.md".to_string()]
+        );
+        assert!(path_suffixes("commitwork@1a2b3c4d").is_empty(), "no prefix");
+        assert!(
+            path_suffixes("New York: the city").is_empty(),
+            "prose is not a path"
+        );
+        assert!(path_suffixes("a/b:c").is_empty(), "a prefix holds no slash");
+        assert!(path_suffixes("repo:").is_empty());
+    }
+
+    fn declared_file(name: &str) -> EntityNode {
+        let mut e = named_entity(name);
+        e.labels = vec![EntityLabel::FilePath];
+        e.is_proper_noun = true;
+        e
+    }
+
+    #[test]
+    fn file_paths_resolve_by_suffix_at_a_boundary_and_only_when_labelled_filepath() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let serve = graph
+            .add_entity(declared_file("commitwork:admin/serve.mjs"))
+            .unwrap();
+        let observe = graph
+            .add_entity(declared_file("commitwork:lib/observe.mjs"))
+            .unwrap();
+        // Same shape, not a file: must never be returned by the FilePath lookup.
+        graph.add_entity(named_entity("intent:serve.mjs")).unwrap();
+
+        let by = |t: &str| -> Vec<Uuid> {
+            graph
+                .find_file_paths_by_suffix(t)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.uuid)
+                .collect()
+        };
+        assert_eq!(by("serve.mjs"), vec![serve]);
+        assert_eq!(by("Admin/Serve.mjs"), vec![serve], "case-insensitive");
+        assert_eq!(by("/admin/serve.mjs"), vec![serve]);
+        assert_eq!(by("observe.mjs"), vec![observe]);
+        assert!(by("erve.mjs").is_empty(), "not at a boundary");
+        assert!(by("missing.mjs").is_empty());
+
+        // The index is rebuilt from the name index on reopen, not persisted.
+        drop(graph);
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let found = graph.find_file_paths_by_suffix("serve.mjs").unwrap();
+        assert_eq!(
+            found.iter().map(|e| e.uuid).collect::<Vec<_>>(),
+            vec![serve]
+        );
+
+        assert!(graph.delete_entity(&serve).unwrap());
+        assert!(graph
+            .find_file_paths_by_suffix("serve.mjs")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

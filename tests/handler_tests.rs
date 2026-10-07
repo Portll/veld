@@ -3117,3 +3117,83 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
         .labels
         .contains(&EntityLabel::Tool));
 }
+
+#[tokio::test]
+async fn a_declared_file_path_is_recalled_by_its_file_name() {
+    let h = Harness::new();
+    let user = "recall-declared";
+    let distractors = [
+        "Changed the retry budget in the payment worker from three to five attempts.",
+        "observe.mjs now batches telemetry before flushing it to the collector.",
+        "server.mjs was renamed during the express upgrade and nothing else changed.",
+        "The nightly backup job moved to 02:00 to avoid the index rebuild window.",
+        "Bumped the Postgres connection pool after the load test saturated it.",
+        "What changed in the onboarding email copy: shorter subject, one call to action.",
+        "The CSV export now escapes embedded quotes in the notes column.",
+        "Dashboard tiles were reordered so error rate sits beside latency.",
+        "The webhook signature check now rejects timestamps older than five minutes.",
+        "Pinned the image digest for the scanner container in CI.",
+        "Changed the cache TTL for avatars from a day to an hour.",
+        "admin/routes/serve-static.mjs gained a content-type allowlist.",
+        "Rewrote the changelog generator to group entries by scope.",
+        "Changed the feature flag default for the new editor to off.",
+        "The search page debounces keystrokes by 250 milliseconds now.",
+        "Moved the docs build to a separate workflow so it no longer blocks tests.",
+        "The rate limiter keys on the API token rather than the client address.",
+        "Changed how the CLI prints errors: one line, then the hint.",
+        "Deleted the unused geo lookup module and its fixtures.",
+        "The worker pool shrinks to two threads when the queue is idle.",
+    ];
+    for content in distractors {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember",
+                json!({"user_id": user, "content": content}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user,
+                   "content": "Moved the auth check ahead of route dispatch and dropped the legacy redirect.",
+                   "entities": [{"name": SERVE, "label": "FilePath"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let target = body["id"].as_str().unwrap().to_string();
+    let target_uuid = veld::uuid::Uuid::parse_str(&target).unwrap();
+    wait_for_episode_entity(&h, user, target_uuid, &SERVE.to_lowercase()).await;
+
+    for query in [
+        "what changed in serve.mjs",
+        "what changed in admin/serve.mjs",
+    ] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/recall",
+                json!({"user_id": user, "query": query, "limit": 5}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body["memories"]
+            .as_array()
+            .expect("memories")
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids.first().copied(),
+            Some(target.as_str()),
+            "{query}: {:#}",
+            body["memories"]
+        );
+    }
+}
