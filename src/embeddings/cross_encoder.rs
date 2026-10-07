@@ -57,6 +57,9 @@ const MAX_PAIR_LENGTH: usize = 512;
 /// quality, or stack via `VELD_CROSS_ENCODERS=…`.
 const DEFAULT_CROSS_ENCODER_ID: &str = "mxbai-rerank-xsmall-v1";
 
+/// The query and the candidate the background pre-warm scores.
+pub const WARMUP_TEXT: &str = "warmup";
+
 // -----------------------------------------------------------------------------
 // Trait
 // -----------------------------------------------------------------------------
@@ -920,12 +923,14 @@ pub fn prewarm(model: Arc<dyn CrossEncoderModel>) {
     }
     std::thread::Builder::new()
         .name(format!("cross-encoder-prewarm-{id}"))
-        .spawn(move || match model.score_pairs("warmup", &["warmup"]) {
-            Ok(_) => tracing::info!("Cross-encoder pre-warmed: {id}"),
-            Err(e) => tracing::warn!(
-                "Cross-encoder pre-warm failed for {id} (lazy fallback engaged): {e}"
-            ),
-        })
+        .spawn(
+            move || match model.score_pairs(WARMUP_TEXT, &[WARMUP_TEXT]) {
+                Ok(_) => tracing::info!("Cross-encoder pre-warmed: {id}"),
+                Err(e) => tracing::warn!(
+                    "Cross-encoder pre-warm failed for {id} (lazy fallback engaged): {e}"
+                ),
+            },
+        )
         .ok();
 }
 
