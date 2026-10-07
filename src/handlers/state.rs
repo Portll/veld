@@ -625,16 +625,13 @@ impl MultiUserMemoryManager {
                 shared_stores.shared_db.column_store(),
             ) {
                 Ok(store) => {
-                    let totp_encryptor = match crate::keystore::SecretCryptor::from_env("totp") {
-                        Ok(encryptor) => encryptor,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "keystore (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE) present but unusable; user-auth runtime starts without an encryptor (2FA enrollment will be refused in production mode)"
-                            );
-                            None
-                        }
-                    };
+                    // A configured keystore that cannot be used refuses the start, as the
+                    // record store does: starting without an encryptor stored TOTP secrets
+                    // in plaintext outside production mode.
+                    let totp_encryptor = crate::keystore::SecretCryptor::from_env("totp").context(
+                        "keystore (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE) is configured but \
+                         unusable; refusing to start user-auth without an encryptor",
+                    )?;
                     info!(
                         encryption = totp_encryptor.is_some(),
                         "user-auth runtime initialised (VELD_USER_AUTH_ENABLED=true)"
