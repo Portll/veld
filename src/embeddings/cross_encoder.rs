@@ -552,6 +552,10 @@ impl OnnxCrossEncoder {
                     return Err(e.to_string());
                 }
             };
+            super::model_tape::register_model(
+                super::model_tape::Model::CrossEncoder,
+                &[&model_path, &tokenizer_path],
+            );
 
             let tokenizer = match Tokenizer::from_file(&tokenizer_path) {
                 Ok(t) => t,
@@ -680,7 +684,26 @@ impl CrossEncoderModel for OnnxCrossEncoder {
             return Ok(Vec::new());
         }
 
+        // Loaded first even under a replay, so the tape can check which model files it was
+        // recorded from. Each pair is keyed on its own.
         let model = self.ensure_loaded()?;
+        if let Some(taped) = super::model_tape::cross_encode(query, documents, || {
+            self.score_pairs_live(model, query, documents)
+        }) {
+            return taped;
+        }
+        self.score_pairs_live(model, query, documents)
+    }
+}
+
+impl OnnxCrossEncoder {
+    /// One forward pass per pair; `documents` is non-empty.
+    fn score_pairs_live(
+        &self,
+        model: &LazyOnnx,
+        query: &str,
+        documents: &[&str],
+    ) -> Result<Vec<f32>> {
         let mut session = model
             .session
             .try_lock_for(std::time::Duration::from_secs(30))

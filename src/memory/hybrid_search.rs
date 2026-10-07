@@ -926,6 +926,9 @@ pub struct CrossEncoderReranker {
     cross_encoder: Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel>,
 }
 
+/// The query and the candidate [`CrossEncoderReranker::probe`] scores.
+pub const CROSS_ENCODER_PROBE: &str = "probe";
+
 /// Weight for cross-encoder score in the blend (0.7 = 70%)
 const CROSS_ENCODER_BLEND_WEIGHT: f32 = 0.70;
 /// Weight for bi-encoder score in the blend (0.3 = 30%)
@@ -962,7 +965,8 @@ impl CrossEncoderReranker {
     /// Score one pair through the cross-encoder, loading it if it has not loaded yet, and
     /// return its id. An error means [`Self::rerank`] would fall back to bi-encoder scores.
     pub fn probe(&self) -> Result<String> {
-        self.cross_encoder.score_pairs("probe", &["probe"])?;
+        self.cross_encoder
+            .score_pairs(CROSS_ENCODER_PROBE, &[CROSS_ENCODER_PROBE])?;
         Ok(self.cross_encoder.id().to_string())
     }
 
