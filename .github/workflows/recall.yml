@@ -25,6 +25,15 @@ on:
         default: 'full'
         type: choice
         options: ['full', 'all']
+      suite:
+        description: >-
+          locomo-gate is the 100-case gate. locomo is the 1,531-case held-out set, for a question
+          the gate is too coarse to settle: whole-case metrics move in steps of 1/n, 0.01 overall
+          and 0.04 on multi_hop at n=100, both above a 2% allowance. locomo runs ungated.
+        required: false
+        default: 'locomo-gate'
+        type: choice
+        options: ['locomo-gate', 'locomo']
       record:
         description: 'Record a new baseline: run ungated and upload the reports'
         required: false
@@ -47,6 +56,9 @@ env:
   # The schedule always runs the gated `full` rung; only a dispatch widens to every rung. The gate
   # reads `full` alone, so `all` still gates.
   LAYER: ${{ github.event.inputs.layer || 'full' }}
+  # The schedule runs the gate suite; only a dispatch reaches the held-out set, which has no
+  # baseline and is never gated.
+  SUITE: ${{ github.event.inputs.suite || 'locomo-gate' }}
   RECORD: ${{ github.event.inputs.record || 'false' }}
 
 jobs:
@@ -108,11 +120,11 @@ jobs:
           set +e
           set -o pipefail
           gate_args=()
-          if [ "$RECORD" != "true" ]; then
+          if [ "$RECORD" != "true" ] && [ "$SUITE" = "locomo-gate" ]; then
             gate_args=(--baseline tests/recall/locomo-gate-baseline.json --tolerance "$TOLERANCE")
           fi
           ./target/release/recall-eval \
-            --suite locomo-gate \
+            --suite "$SUITE" \
             --layer "$LAYER" \
             --repeats "$REPEATS" \
             --output "current-${{ matrix.engine }}.json" \
@@ -121,8 +133,13 @@ jobs:
             --storage ./recall-storage 2>&1 | tee "recall-eval-${{ matrix.engine }}.log"
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
+      - name: Test the diff renderer
+        if: always()
+        working-directory: scripts
+        run: python3 test_recall_diff.py
+
       - name: Render the diff table
-        if: always() && hashFiles(format('current-{0}.json', matrix.engine)) != ''
+        if: always() && env.SUITE == 'locomo-gate' && hashFiles(format('current-{0}.json', matrix.engine)) != ''
         run: |
           python3 scripts/recall_diff.py tests/recall/locomo-gate-baseline.json \
             "current-${{ matrix.engine }}.json" --tolerance "$TOLERANCE" > "recall-diff-${{ matrix.engine }}.md"
