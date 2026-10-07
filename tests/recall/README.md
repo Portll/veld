@@ -22,7 +22,8 @@ reason to accept or decline a port (`docs/upstream/PLAN.md`, 1.5).
 `.github/workflows/recall.yml` runs the 100-case `locomo-gate` suite and compares each engine's
 run against two checked-in files:
 
-- `locomo-gate-baseline.json`: aggregate metrics. `recall-eval` gates on these; its exit code is
+- `locomo-gate-baseline.json`: aggregate metrics and the rerank setting they were measured
+  under. `recall-eval` gates on these, and refuses a run reranked differently; its exit code is
   the pass or fail.
 - `locomo-gate-baseline.per-case.json`: the per-case records from the same run.
   `scripts/recall_diff.py` uses them to list every case whose result moved: lost gold, gained
@@ -155,4 +156,4 @@ per mode.
 | ---------- | --------- | -------------- | ------------------------------ |
 | 2026-05-03 | `6756665` | minilm-l6-v2   | Initial capture (RH-6, #268).  |
 | 2026-08-08 | `ec7abd2` | minilm-l6-v2   | LOCOMO gate baseline; producer not in repo. |
-| 2026-10-06 | `2f1f823` | minilm-l6-v2   | `locomo-gate`, veld's own: RocksDB report of run 37485608452, 3 repeats, redb equal on every metric. The per-case file from the same run was added on 2026-10-07. |
+| 2026-10-06 | `2f1f823` | minilm-l6-v2   | `locomo-gate`, veld's own: RocksDB report of run 37485608452, 3 repeats, redb equal on every metric. The per-case file from the same run was added on 2026-10-07, and so was its `rerank` field (mxbai-rerank-xsmall-v1, cap 20): an arm64 rerun of the tree with reranking on differed from it in 1 case of 100, with reranking off in 40. |

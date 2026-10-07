@@ -30,7 +30,7 @@ use super::report::{
     aggregate_category, aggregate_layer, median, AblationCaseRow, AblationReport, AblationRow,
     CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure, LayerReport,
     LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord,
-    ReachabilityCategory, ReachabilityReport, Report, SMOKE_K,
+    ReachabilityCategory, ReachabilityReport, Report, RerankSetting, SMOKE_K,
 };
 
 /// Embedder identifier emitted in the report. Matches the model wired into
@@ -320,6 +320,17 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
     // `infrastructure` failure so reviewers see the full picture.
     // ------------------------------------------------------------------
     let mut failures: Vec<Failure> = passes[0].failures.clone();
+    for (i, pass) in passes.iter().enumerate().skip(1) {
+        if pass.rerank != passes[0].rerank {
+            failures.push(Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "repeat {i} reranked under {:?}, repeat 0 under {:?}",
+                    pass.rerank, passes[0].rerank
+                ),
+            });
+        }
+    }
     if repeats > 1 {
         for mode in &layer_modes {
             let ref_pass = passes[0]
@@ -413,6 +424,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
     let report = Report {
         suite: inputs.suite.clone(),
         embedder,
+        rerank: Some(passes[0].rerank.clone()),
         git_sha: inputs.git_sha.clone(),
         timestamp: chrono::Utc::now(),
         layers,
@@ -554,6 +566,7 @@ struct ModePassResult {
 struct OnePassResult {
     per_mode: BTreeMap<LayerMode, ModePassResult>,
     failures: Vec<Failure>,
+    rerank: RerankSetting,
 }
 
 /// Run a single ingest pass, then run the case loop once per `LayerMode`.
@@ -576,7 +589,7 @@ fn run_one_pass(
     // is actually built, then query the per-user `MemorySystem` (which now has a
     // populated graph wired in). The manager is kept alive for the whole pass.
     let manager = build_manager(storage_path)?;
-    guard_cross_encoder(&manager)?;
+    let cross_encoder = guard_cross_encoder(&manager)?;
 
     // The NER-backend gate now lives in `ingest_corpus`, so every measurement
     // path is covered rather than only the two that remembered to ask.
@@ -923,7 +936,12 @@ fn run_one_pass(
         }
     }
 
-    Ok(OnePassResult { per_mode, failures })
+    let rerank = RerankSetting::of(&system.read(), cross_encoder);
+    Ok(OnePassResult {
+        per_mode,
+        failures,
+        rerank,
+    })
 }
 
 /// Pin parallel runtimes to a single thread for the harness process.
@@ -1781,25 +1799,26 @@ fn preflight_ablation_env(configs: &[AblationConfig]) -> Result<()> {
 /// the shipped one's name. Loads the model now and scores one pair. Nothing is
 /// checked when the `use_reranking` dial is off, since then no reranker runs.
 /// `cfg!(test)` is exempt, as in [`guard_ner_backend`]: lib tests exercise the
-/// harness machinery on machines that may lack the model.
-pub(crate) fn guard_cross_encoder(manager: &MultiUserMemoryManager) -> Result<()> {
+/// harness machinery on machines that may lack the model. Returns the id of the
+/// cross-encoder that loaded, `None` when none was checked.
+pub(crate) fn guard_cross_encoder(manager: &MultiUserMemoryManager) -> Result<Option<String>> {
     if cfg!(test) {
-        return Ok(());
+        return Ok(None);
     }
     let system = manager.get_user_memory(EVAL_USER)?;
     let system = system.read();
     if system.cognitive_dials().use_reranking == Some(false) {
         eprintln!("CROSS_ENCODER=off (use_reranking dial)");
-        return Ok(());
+        return Ok(None);
     }
     match system.probe_cross_encoder() {
         None => {
             eprintln!("CROSS_ENCODER=none (no reranker configured)");
-            Ok(())
+            Ok(None)
         }
         Some(Ok(id)) => {
             eprintln!("CROSS_ENCODER={id}");
-            Ok(())
+            Ok(Some(id))
         }
         Some(Err(e)) => anyhow::bail!(
             "recall harness refusing to run: the cross-encoder did not load ({e:#}), so \
