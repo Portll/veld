@@ -456,6 +456,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             post(graph::get_entity_frequency),
         )
         .route(
+            "/api/graph/tags/stamped-cores",
+            post(graph::get_stamped_cores),
+        )
+        .route(
             "/api/graph/relationship/invalidate",
             post(graph::invalidate_relationship),
         )

@@ -17,6 +17,7 @@ use crate::auth::AuthenticatedUser;
 use crate::entity_frequency::{frequency, Bucket, Frequency, Window};
 use crate::entity_hygiene::{classify, Shelf};
 use crate::errors::{AppError, ValidationErrorExt};
+use crate::tag_cores::{stamped_cores, CoreThresholds, StampedCores};
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, GraphTraversal, MemoryUniverse};
 use crate::memory::{Experience, MemoryId};
 use crate::validation;
@@ -740,5 +741,74 @@ mod entity_frequency_route_tests {
         assert!(req.include_embeddings, "embeddings stay on by default for existing readers");
         assert!(!req.with_sources);
         assert!(req.shelf.is_none());
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StampedCoresRequest {
+    pub user_id: String,
+    pub min_records: Option<usize>,
+    pub min_tags: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+/// POST /api/graph/tags/stamped-cores - Tags that sit on exactly the same records.
+///
+/// Read-only over the tag-source store. The census is a signal about producers, not about
+/// words: a core of ordinary vocabulary shared by hundreds of records is a hook stamping
+/// boilerplate, and the fix belongs at that hook.
+pub async fn get_stamped_cores(
+    State(state): State<AppState>,
+    Json(req): Json<StampedCoresRequest>,
+) -> Result<Json<StampedCores>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let defaults = CoreThresholds::default();
+    let thresholds = CoreThresholds {
+        min_records: req.min_records.unwrap_or(defaults.min_records),
+        min_tags: req.min_tags.unwrap_or(defaults.min_tags),
+        limit: req.limit.unwrap_or(defaults.limit),
+    };
+    for (field, value) in [
+        ("min_records", thresholds.min_records),
+        ("min_tags", thresholds.min_tags),
+        ("limit", thresholds.limit),
+    ] {
+        if value == 0 {
+            return Err(AppError::InvalidInput {
+                field: field.to_string(),
+                reason: "must be at least 1".to_string(),
+            });
+        }
+    }
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+    let rows = blocking(move || memory.read().tag_source_store().all()).await?;
+    Ok(Json(stamped_cores(&rows, thresholds)))
+}
+
+#[cfg(test)]
+mod stamped_cores_route_tests {
+    use std::fs;
+    use std::path::Path;
+
+    const ROUTE: &str = "/api/graph/tags/stamped-cores";
+
+    #[test]
+    fn the_stamped_cores_route_is_mounted_as_post_behind_auth() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/router.rs");
+        let src = fs::read_to_string(p).expect("router.rs must be readable");
+        let protected_at = src
+            .find("pub fn build_protected_routes")
+            .expect("build_protected_routes must exist");
+        let route_at = src.find(ROUTE).expect("route must be mounted");
+        assert!(route_at > protected_at, "{ROUTE} sits on a public or probe router");
+        assert!(src[route_at..route_at + 200].contains("post(graph::get_stamped_cores)"));
+    }
+
+    #[test]
+    fn thresholds_default_when_omitted() {
+        let req: super::StampedCoresRequest = serde_json::from_str(r#"{"user_id":"u"}"#).unwrap();
+        assert!(req.min_records.is_none() && req.min_tags.is_none() && req.limit.is_none());
     }
 }
