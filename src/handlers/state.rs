@@ -27,6 +27,7 @@ use crate::ab_testing;
 use crate::backup;
 use crate::backup::BackupMetadata;
 use crate::config::{ServerConfig, StorageBackend};
+use crate::declared_entities::DeclaredEntity;
 use crate::embeddings::{
     are_ner_models_downloaded, auto_download_models_enabled, download_ner_models,
     get_ner_models_dir, ner::NerEntityType, neural_ner_enabled, KeywordExtractor, NerConfig,
@@ -3689,6 +3690,18 @@ impl MultiUserMemoryManager {
         experience: &Experience,
         memory_id: &MemoryId,
     ) -> Result<()> {
+        self.rebuild_experience_graph_declared(user_id, experience, memory_id, &[])
+    }
+
+    /// [`rebuild_experience_graph`](Self::rebuild_experience_graph) with the writer's declared
+    /// entities, as [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared).
+    pub fn rebuild_experience_graph_declared(
+        &self,
+        user_id: &str,
+        experience: &Experience,
+        memory_id: &MemoryId,
+        declared: &[DeclaredEntity],
+    ) -> Result<()> {
         if let Ok(graph) = self.get_user_graph(user_id) {
             match graph.read().delete_episode(&memory_id.0) {
                 Ok(true) => tracing::debug!(
@@ -3703,7 +3716,7 @@ impl MultiUserMemoryManager {
                 ),
             }
         }
-        self.process_experience_into_graph(user_id, experience, memory_id)
+        self.process_experience_into_graph_declared(user_id, experience, memory_id, declared)
     }
 
     /// Process an experience and extract entities/relationships into the graph
@@ -3720,6 +3733,30 @@ impl MultiUserMemoryManager {
         experience: &Experience,
         memory_id: &MemoryId,
     ) -> Result<()> {
+        self.process_experience_into_graph_declared(user_id, experience, memory_id, &[])
+    }
+
+    /// [`process_experience_into_graph`](Self::process_experience_into_graph) plus the entities
+    /// the writer declared (see [`crate::declared_entities`]).
+    ///
+    /// Declared entities keep their labels, are appended AFTER the derived list is cut to
+    /// `max_entities_per_memory` (so they never compete for a slot), are never stopped by the
+    /// generic-entity gate, and their co-occurrence edges carry the declared weight with
+    /// `LtpStatus::Weekly` and `EdgeSource::Explicit`, so degree-cap pruning — which removes
+    /// unpotentiated edges before potentiated ones — reaches them last. Weekly rather than Burst
+    /// because a burst expires to `None` after 48h, and rather than Full because a declaration is
+    /// one observation, not ten.
+    ///
+    /// Derived entities pass a stop list of words measured as hubs on a code-heavy store, and a
+    /// derived entity already at `MAX_ENTITY_DEGREE` gets no new edges from this memory: at the
+    /// cap, every new edge only bought a prune of an older one.
+    pub fn process_experience_into_graph_declared(
+        &self,
+        user_id: &str,
+        experience: &Experience,
+        memory_id: &MemoryId,
+        declared: &[DeclaredEntity],
+    ) -> Result<()> {
         let graph = self.get_user_graph(user_id)?;
 
         // =====================================================================
@@ -3730,14 +3767,21 @@ impl MultiUserMemoryManager {
 
         let now = chrono::Utc::now();
 
-        // Stop words for filtering
+        // Stop words for filtering DERIVED entities. Declared entities never pass through this.
+        // The second row is the generic-entity gate: each was a hub at MAX_ENTITY_DEGREE on the
+        // live store on 2026-10-07, typed Person/Concept by a news-trained NER reading code-heavy
+        // text, and pruned on every new edge. They name no particular thing in that corpus.
         let stop_words: std::collections::HashSet<&str> = [
             "the", "and", "for", "that", "this", "with", "from", "have", "been", "are", "was",
             "were", "will", "would", "could", "should", "may", "might",
         ]
         .iter()
+        .chain(GENERIC_DERIVED_ENTITY_WORDS.iter())
         .cloned()
         .collect();
+        // A name the writer declared is the declared entity, not also a derived one.
+        let declared_names: std::collections::HashSet<String> =
+            declared.iter().map(|d| d.name.to_lowercase()).collect();
 
         // Use pre-extracted NER records for proper entity labels when available
         // This avoids redundant NER inference — the handler already ran NER in Pass 1
@@ -3812,6 +3856,9 @@ impl MultiUserMemoryManager {
                 if name.len() < 5 && e.confidence < 0.8 {
                     return false;
                 }
+                if declared_names.contains(&name.to_lowercase()) {
+                    return false;
+                }
                 true
             })
             .collect();
@@ -3861,7 +3908,11 @@ impl MultiUserMemoryManager {
             .iter()
             .filter_map(|tag| {
                 let tag_name = tag.trim();
-                if tag_name.len() >= 2 && !stop_words.contains(tag_name.to_lowercase().as_str()) {
+                let lower = tag_name.to_lowercase();
+                if tag_name.len() >= 2
+                    && !stop_words.contains(lower.as_str())
+                    && !declared_names.contains(&lower)
+                {
                     Some((
                         tag_name.to_string(),
                         EntityNode {
@@ -3890,6 +3941,7 @@ impl MultiUserMemoryManager {
             .iter()
             .map(|(name, _)| name.clone())
             .chain(tag_entities.iter().map(|(name, _)| name.clone()))
+            .chain(declared.iter().map(|d| d.name.clone()))
             .collect();
 
         // Extract all-caps terms (API, TUI, NER, REST, etc.)
@@ -4017,6 +4069,32 @@ impl MultiUserMemoryManager {
         let entity_cap = self.server_config.max_entities_per_memory;
         all_entities.truncate(entity_cap);
 
+        // Declared entities go in after the cut, so the cap bounds only what veld derived.
+        let declared_nodes: Vec<(String, EntityNode, f32)> = declared
+            .iter()
+            .map(|d| {
+                (
+                    d.name.clone(),
+                    EntityNode {
+                        uuid: uuid::Uuid::new_v4(),
+                        name: d.name.clone(),
+                        labels: d.labels.clone(),
+                        created_at: now,
+                        last_seen_at: now,
+                        mention_count: 1,
+                        summary: String::new(),
+                        attributes: HashMap::new(),
+                        name_embedding: None,
+                        salience: d.weight,
+                        // An identifier, not a word: keeps it out of the stemmed merge tier.
+                        is_proper_noun: true,
+                        pii_classification: Default::default(),
+                    },
+                    d.weight,
+                )
+            })
+            .collect();
+
         // =====================================================================
         // PHASE 2: GRAPH INSERTION (WITH LOCK)
         // Only fast I/O operations happen here.
@@ -4025,12 +4103,37 @@ impl MultiUserMemoryManager {
         let graph_guard = graph.read();
 
         let mut entity_uuids = Vec::new();
+        // Per entry of `entity_uuids`: Some(weight) for a declared entity, None for derived.
+        let mut declared_weight: Vec<Option<f32>> = Vec::new();
+        // Per entry: a derived entity already at the degree cap takes no new edges.
+        let mut at_cap: Vec<bool> = Vec::new();
 
         // Insert all pre-built entities
         for (name, entity) in all_entities {
             match graph_guard.add_entity(entity) {
-                Ok(uuid) => entity_uuids.push((name, uuid)),
+                Ok(uuid) => {
+                    let hub = match graph_guard.entity_degree(&uuid) {
+                        Ok(degree) => degree >= crate::constants::MAX_ENTITY_DEGREE,
+                        Err(e) => {
+                            tracing::debug!("Degree read failed for {}: {}", name, e);
+                            false
+                        }
+                    };
+                    entity_uuids.push((name, uuid));
+                    declared_weight.push(None);
+                    at_cap.push(hub);
+                }
                 Err(e) => tracing::debug!("Failed to add entity {}: {}", name, e),
+            }
+        }
+        for (name, entity, weight) in declared_nodes {
+            match graph_guard.add_entity(entity) {
+                Ok(uuid) => {
+                    entity_uuids.push((name, uuid));
+                    declared_weight.push(Some(weight));
+                    at_cap.push(false);
+                }
+                Err(e) => tracing::debug!("Failed to add declared entity {}: {}", name, e),
             }
         }
 
@@ -4091,9 +4194,20 @@ impl MultiUserMemoryManager {
             })
             .collect();
 
+        let mut hub_edges_skipped = 0u64;
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
-                let state_edge_init = EdgeTier::L1Working.initial_weight();
+                if at_cap[i] || at_cap[j] {
+                    hub_edges_skipped += 1;
+                    continue;
+                }
+                let declared_strength = match (declared_weight[i], declared_weight[j]) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                let state_edge_init =
+                    declared_strength.unwrap_or_else(|| EdgeTier::L1Working.initial_weight());
                 let mut from_entity = entity_uuids[i].1;
                 let mut to_entity = entity_uuids[j].1;
                 let cue_hit =
@@ -4129,11 +4243,19 @@ impl MultiUserMemoryManager {
                     context: truncated_context.clone(),
                     last_activated: now,
                     activation_count: 1,
-                    ltp_status: LtpStatus::None,
+                    ltp_status: if declared_strength.is_some() {
+                        LtpStatus::Weekly
+                    } else {
+                        LtpStatus::None
+                    },
                     tier: EdgeTier::L1Working,
                     activation_timestamps: None,
                     entity_confidence: None,
-                    created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+                    created_by: if declared_strength.is_some() {
+                        crate::graph_memory::EdgeSource::Explicit
+                    } else {
+                        crate::graph_memory::EdgeSource::CoOccurrence
+                    },
                     forward_strength: state_edge_init,
                     backward_strength: state_edge_init,
                 };
@@ -4143,11 +4265,40 @@ impl MultiUserMemoryManager {
                 }
             }
         }
+        if hub_edges_skipped > 0 {
+            crate::metrics::GRAPH_HUB_EDGES_SKIPPED.inc_by(hub_edges_skipped);
+            tracing::debug!(
+                memory_id = %memory_id.0,
+                skipped = hub_edges_skipped,
+                hubs = ?entity_uuids
+                    .iter()
+                    .zip(&at_cap)
+                    .filter(|(_, hub)| **hub)
+                    .map(|((name, _), _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                "Skipped co-occurrence edges on entities already at the degree cap"
+            );
+        }
         // Lock released here
 
         Ok(())
     }
 }
+
+/// Words that never become DERIVED graph entities (matched case-insensitively). Declared
+/// entities are not subject to this list.
+pub const GENERIC_DERIVED_ENTITY_WORDS: &[&str] = &[
+    "file",
+    "files",
+    "code",
+    "first",
+    "moved",
+    "line",
+    "lines",
+    "test",
+    "description",
+    "operator",
+];
 
 /// W6 query-planner integration: surface each tenant's live Vamana
 /// indices to the planner's vector adapter (`RealVectorQuerier`).

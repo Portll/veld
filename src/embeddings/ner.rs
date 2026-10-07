@@ -952,7 +952,14 @@ impl NeuralNer {
                     | EntityLabel::Pipeline
                     | EntityLabel::Role
                     | EntityLabel::Module
-                    | EntityLabel::Other(_) => NerEntityType::Misc,
+                    | EntityLabel::Other(_)
+                    | EntityLabel::FilePath
+                    | EntityLabel::Commit
+                    | EntityLabel::Symbol
+                    | EntityLabel::Session
+                    | EntityLabel::Agent
+                    | EntityLabel::Tool
+                    | EntityLabel::Template => NerEntityType::Misc,
                 };
 
                 // Use salience as confidence (scaled appropriately)

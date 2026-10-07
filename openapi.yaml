@@ -104,6 +104,43 @@ components:
           format: date-time
           description: Optional timestamp (ISO 8601). Defaults to current time.
           example: "2025-12-15T06:30:00Z"
+        entities:
+          type: array
+          maxItems: 50
+          description: >-
+            Typed entities the writer declares this memory is about. Exempt from the
+            derived-entity cap, linked with protected edges, stored as authored tags.
+            Also accepted on POST /api/upsert and on each item of /api/remember/batch.
+          items:
+            $ref: '#/components/schemas/DeclaredEntity'
+
+    DeclaredEntity:
+      type: object
+      required:
+        - name
+        - label
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: 1..=512 characters after trimming, no control characters.
+          example: "commitwork:admin/serve.mjs"
+        label:
+          type: string
+          description: >-
+            Case-insensitive. An unknown label is a 400 naming the accepted labels.
+          enum: [Person, Organization, Location, Technology, Concept, Event, Date, Product,
+                 Skill, Keyword, Project, Task, Document, Repository, Service, Database,
+                 Metric, Configuration, Environment, Pipeline, Team, Role, Module, FilePath,
+                 Commit, Symbol, Session, Agent, Tool, Template]
+          example: "FilePath"
+        weight:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.9
+          description: Strength of the declared entity's edges. Outside [0, 1] is a 400.
 
     RememberResponse:
       type: object
@@ -388,6 +425,12 @@ components:
                   type: string
               memory_type:
                 type: string
+              entities:
+                type: array
+                maxItems: 50
+                description: An invalid declaration fails this item only.
+                items:
+                  $ref: '#/components/schemas/DeclaredEntity'
 
     BatchRememberResponse:
       type: object

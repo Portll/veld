@@ -23,6 +23,7 @@ pub mod constants;
 pub mod datasets;
 pub mod decay;
 pub mod decay_scales;
+pub mod declared_entities;
 pub mod embeddings;
 pub mod entity_cap;
 pub mod entity_frequency;
