@@ -25,12 +25,12 @@ use crate::memory::{Experience, Query};
 use super::fixtures::{
     self, CorpusItem, SmokeCase, SmokeCategory, SMOKE_CASES_PATH, SMOKE_CORPUS_PATH,
 };
-use super::metrics::Metrics;
+use super::metrics::{paired_bootstrap_ci, Metrics};
 use super::report::{
-    aggregate_category, aggregate_layer, median, AblationReport, AblationRow, CategoryReport,
-    Failure, FunnelReport, FunnelStageRow, GraphStructure, LayerReport, LearningCurveArm,
-    LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord, ReachabilityCategory,
-    ReachabilityReport, Report, SMOKE_K,
+    aggregate_category, aggregate_layer, median, AblationCaseRow, AblationReport, AblationRow,
+    CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure, LayerReport,
+    LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord,
+    ReachabilityCategory, ReachabilityReport, Report, SMOKE_K,
 };
 
 /// Embedder identifier emitted in the report. Matches the model wired into
@@ -1510,55 +1510,129 @@ pub fn run_longmemeval(
     })
 }
 
-/// One ablation arm: display name and the env overrides it applies.
-pub(crate) type AblationArm = (&'static str, Vec<(&'static str, &'static str)>);
+/// The arm every other ablation arm is measured against.
+pub(crate) const ABLATION_BASELINE: &str = "baseline (facts on)";
+/// Bootstrap resamples per paired delta. At 2000 the Monte-Carlo wobble of an
+/// interval endpoint is about 0.06 standard errors of the mean difference, small
+/// against the interval's own width.
+const ABLATION_BOOTSTRAP_RESAMPLES: usize = 2000;
+/// Fixed so a report regenerated from the same per-case data carries the same
+/// intervals.
+const ABLATION_BOOTSTRAP_SEED: u64 = 0x5EED_AB1A;
+/// How a row names the dial the `-ce` arm turns.
+pub(crate) const RERANK_OFF_FLAG: &str = "dials.use_reranking=false";
 
-/// Query-time ablation arms. Add a row whenever a query-time fix lands; that is
-/// how a fix becomes a measured, comparable line in the study. An arm that
-/// cannot differ from baseline reports a number attributable to nothing, so
-/// before adding one confirm the flag is read on the live path, or register it
-/// in [`UNAVAILABLE_IN_VELD`]. The guard test
+/// One arm of the ablation matrix: the env overrides it applies, whether it turns
+/// the cross-encoder rerank off, and the arm it is measured against.
+pub(crate) struct AblationConfig {
+    pub(crate) name: &'static str,
+    pub(crate) env: Vec<(&'static str, &'static str)>,
+    /// Runs the arm with the `use_reranking` dial off. A dial, not an env flag:
+    /// the dials read the environment once, when the memory system is built.
+    pub(crate) rerank_off: bool,
+    /// `None` only for the baseline. Every other arm is its reference plus what it
+    /// adds, so its delta is attributable to exactly that.
+    pub(crate) reference: Option<&'static str>,
+}
+
+impl AblationConfig {
+    #[cfg(test)]
+    fn sets(&self, key: &str) -> bool {
+        self.env.iter().any(|(k, _)| *k == key)
+    }
+
+    fn flags(&self) -> Vec<String> {
+        let mut flags: Vec<String> = self.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        if self.rerank_off {
+            flags.push(RERANK_OFF_FLAG.to_string());
+        }
+        flags
+    }
+}
+
+/// Every arm of the ablation matrix.
+///
+/// Add an arm whenever a query-time lever lands; that is how a lever becomes a
+/// measured, comparable line in the study. An arm that cannot differ from its
+/// reference reports a number attributable to nothing, so before adding one
+/// confirm the flag is read on the live path, or register it in
+/// [`UNAVAILABLE_IN_VELD`]. The guard test
 /// `every_ablation_arm_flag_is_read_in_src_or_declared_unavailable` enforces this.
-pub(crate) fn ablation_arms() -> Vec<AblationArm> {
+///
+/// The baseline is the pipeline as veld ships it, cross-encoder rerank included,
+/// so the leave-one-out arms read each component's marginal contribution at the
+/// operating point users get, and `-ce` reads the reranker's.
+///
+/// Setting `SHODH_DISABLE_BOOSTS` replaces its default-disabled set, so every arm
+/// that sets it names `hebbian` (or `all`) to keep the term off, except `+hebbian`,
+/// which empties the list to switch it on.
+pub(crate) fn ablation_configs() -> Vec<AblationConfig> {
+    fn arm(name: &'static str, env: &[(&'static str, &'static str)]) -> AblationConfig {
+        AblationConfig {
+            name,
+            env: env.to_vec(),
+            rerank_off: false,
+            reference: Some(ABLATION_BASELINE),
+        }
+    }
     vec![
-        (
+        AblationConfig {
+            name: ABLATION_BASELINE,
+            env: vec![],
+            rerank_off: false,
+            reference: None,
+        },
+        arm(
             "facts-off (lexical+graph)",
-            vec![("SHODH_DISABLE_FACT_LAYERS", "1")],
+            &[("SHODH_DISABLE_FACT_LAYERS", "1")],
         ),
-        ("baseline (facts on)", vec![]),
-        ("graph-off", vec![("SHODH_GRAPH_FUSION_WEIGHT", "0")]),
-        ("+graph-expand(K5)", vec![("SHODH_GRAPH_EXPAND_K", "5")]),
-        (
+        arm("graph-off", &[("SHODH_GRAPH_FUSION_WEIGHT", "0")]),
+        arm("+graph-expand(K5)", &[("SHODH_GRAPH_EXPAND_K", "5")]),
+        arm(
             "+graph-expand+margin",
-            vec![
+            &[
                 ("SHODH_GRAPH_EXPAND_K", "5"),
                 ("SHODH_GRAPH_EXPAND_MIN_STRENGTH", "0.3"),
             ],
         ),
-        (
+        arm(
             "+graph-boost-mult",
-            vec![("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1")],
+            &[("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1")],
         ),
-        ("+edge-dir", vec![("SHODH_GRAPH_EDGE_DIR", "1")]),
-        ("+graph-traverse", vec![("SHODH_GRAPH_TRAVERSE", "1")]),
-        // Setting SHODH_DISABLE_BOOSTS replaces its default, so these arms restate
-        // `hebbian` to keep the term off; +hebbian empties the list to switch it on.
-        (
+        arm("+edge-dir", &[("SHODH_GRAPH_EDGE_DIR", "1")]),
+        arm("+graph-traverse", &[("SHODH_GRAPH_TRAVERSE", "1")]),
+        arm(
             "-lateral-inhibition",
-            vec![("SHODH_DISABLE_BOOSTS", "hebbian,lateral_inhibition")],
+            &[("SHODH_DISABLE_BOOSTS", "hebbian,lateral_inhibition")],
         ),
-        (
+        arm(
             "-graph-potentiation",
-            vec![("SHODH_DISABLE_BOOSTS", "hebbian,graph_potentiation")],
+            &[("SHODH_DISABLE_BOOSTS", "hebbian,graph_potentiation")],
         ),
-        ("+hebbian", vec![("SHODH_DISABLE_BOOSTS", "")]),
-        (
+        arm("+hebbian", &[("SHODH_DISABLE_BOOSTS", "")]),
+        arm(
             "+graph-boost-mult+expand",
-            vec![
+            &[
                 ("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1"),
                 ("SHODH_GRAPH_EXPAND_K", "5"),
             ],
         ),
+        // Leave-one-out: each removes one leg or stage from the shipped pipeline, so
+        // its delta is that component's marginal contribution. The cumulative
+        // `--layer all` ladder attributes each stage conditional on the ones before.
+        arm("-bm25", &[("SHODH_ABLATE_BM25", "1")]),
+        arm("-spreading", &[("SHODH_ABLATE_SPREADING", "1")]),
+        arm("-boost-stack", &[("SHODH_DISABLE_BOOSTS", "all")]),
+        // Single-leg isolation: one leg's candidates only.
+        arm("leg=vector", &[("SHODH_LEG", "vector")]),
+        arm("leg=bm25", &[("SHODH_LEG", "bm25")]),
+        arm("leg=graph", &[("SHODH_LEG", "graph")]),
+        AblationConfig {
+            name: "-ce",
+            env: vec![],
+            rerank_off: true,
+            reference: Some(ABLATION_BASELINE),
+        },
     ]
 }
 
@@ -1586,27 +1660,44 @@ pub(crate) const UNAVAILABLE_IN_VELD: &[(&str, &str)] = &[
         "SHODH_GRAPH_TRAVERSE",
         "veld has no intent-matching beam traversal (upstream traverse_beam)",
     ),
+    (
+        "SHODH_ABLATE_BM25",
+        "veld's recall reads no leave-one-out switch for the BM25 leg (upstream #378); the switch belongs in memory/recall.rs",
+    ),
+    (
+        "SHODH_ABLATE_SPREADING",
+        "veld's recall reads no leave-one-out switch for graph spreading (upstream #378); the switch belongs in memory/recall.rs",
+    ),
+    (
+        "SHODH_LEG",
+        "veld's recall has no single-leg isolation (upstream SHODH_LEG)",
+    ),
 ];
 
 /// The row for an arm that was not run: no metrics, and the reason in their place.
-fn unavailable_row(name: &str, env: &[(&str, &str)], reason: String) -> AblationRow {
+fn unavailable_row(config: &AblationConfig, reason: String) -> AblationRow {
     AblationRow {
-        name: name.to_string(),
-        flags: env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        name: config.name.to_string(),
+        flags: config.flags(),
         recall_at_10: None,
         ndcg_at_10: None,
         mrr: None,
         p_at_1: None,
         by_category_recall: Default::default(),
         retrieval_fingerprint: 0,
-        vacuous_vs_baseline: false,
+        vacuous_vs_reference: false,
         unavailable_in_veld: Some(reason),
+        reference: config.reference.map(str::to_string),
+        delta_recall_at_10: None,
+        delta_p_at_1: None,
+        per_case: Vec::new(),
     }
 }
 
 /// Why `env` cannot be measured in veld, or `None` when every flag it sets
 /// reaches a live code path.
 pub(crate) fn arm_unavailable_in_veld(env: &[(&str, &str)]) -> Option<String> {
+    use crate::memory::ablation::{DEFAULT_DISABLED, FAMILIES};
     let mut reasons = Vec::new();
     for (k, v) in env {
         if let Some((_, why)) = UNAVAILABLE_IN_VELD.iter().find(|(f, _)| f == k) {
@@ -1614,12 +1705,24 @@ pub(crate) fn arm_unavailable_in_veld(env: &[(&str, &str)]) -> Option<String> {
         }
         if *k == crate::memory::ablation::DISABLE_BOOSTS_VAR {
             for tok in v.split(',').map(|t| t.trim().to_ascii_lowercase()) {
-                if tok.is_empty() || tok == "all" {
+                if tok.is_empty() {
                     continue;
                 }
-                if let Some(why) = crate::memory::ablation::unavailable_reason(&tok) {
+                if tok == "all" {
+                    // `all` can only differ from the default through a family that is
+                    // on by default and live under the harness's read-only recall.
+                    let live = FAMILIES.iter().any(|f| {
+                        !DEFAULT_DISABLED.contains(f)
+                            && !(*f == "graph_potentiation" && crate::memory::recall_readonly())
+                    });
+                    if !live {
+                        reasons.push(format!(
+                            "{k}=all: veld gates {FAMILIES:?}; {DEFAULT_DISABLED:?} is off by default and SHODH_RECALL_READONLY=1 suppresses graph_potentiation, so `all` disables nothing more than the default"
+                        ));
+                    }
+                } else if let Some(why) = crate::memory::ablation::unavailable_reason(&tok) {
                     reasons.push(format!("{k} family `{tok}`: {why}"));
-                } else if !crate::memory::ablation::FAMILIES.contains(&tok.as_str()) {
+                } else if !FAMILIES.contains(&tok.as_str()) {
                     reasons.push(format!("{k} family `{tok}` is not declared"));
                 } else if tok == "graph_potentiation" && crate::memory::recall_readonly() {
                     reasons.push(format!(
@@ -1632,14 +1735,81 @@ pub(crate) fn arm_unavailable_in_veld(env: &[(&str, &str)]) -> Option<String> {
     (!reasons.is_empty()).then(|| reasons.join("; "))
 }
 
-/// Unified ablation matrix: one ingest, one row per [`ablation_arms`] entry, so the
-/// study shows every component's contribution — "don't fly blind". An arm naming a
-/// flag veld has no code path for is reported unavailable, not measured.
+/// The keys some arm sets that `is_set` reports as already present, sorted and
+/// deduplicated.
+fn preset_ablation_keys(
+    configs: &[AblationConfig],
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    let mut preset: Vec<&'static str> = configs
+        .iter()
+        .flat_map(|c| c.env.iter().map(|(k, _)| *k))
+        .filter(|k| is_set(k))
+        .collect();
+    preset.sort_unstable();
+    preset.dedup();
+    preset
+}
+
+/// Refuse to run when the process already carries a key some arm sets.
+///
+/// Each arm sets its keys and removes them afterwards. A key already in the
+/// environment would be on for every arm before the one that sets it and gone for
+/// every arm after, so the arms would stop sharing a reference point and the
+/// deltas would measure arm order.
+fn preflight_ablation_env(configs: &[AblationConfig]) -> Result<()> {
+    let preset = preset_ablation_keys(configs, |k| std::env::var_os(k).is_some());
+    if !preset.is_empty() {
+        anyhow::bail!(
+            "ablation matrix refusing to run: {} already set in the environment. Every arm \
+             sets and then removes its own keys, so a preset key would be on for some arms \
+             and off for others, and the deltas would measure arm order. Unset them, or add \
+             an arm that sets them.",
+            preset.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to measure a reranked pipeline whose cross-encoder does not load.
+///
+/// `CrossEncoderReranker::rerank` falls back to bi-encoder scores when the model
+/// is missing, so without this a run would report the unreranked pipeline under
+/// the shipped one's name. Loads the model now and scores one pair. Nothing is
+/// checked when the `use_reranking` dial is off, since then no reranker runs.
+pub(crate) fn guard_cross_encoder(manager: &MultiUserMemoryManager) -> Result<()> {
+    let system = manager.get_user_memory(EVAL_USER)?;
+    let system = system.read();
+    if system.cognitive_dials().use_reranking == Some(false) {
+        eprintln!("CROSS_ENCODER=off (use_reranking dial)");
+        return Ok(());
+    }
+    match system.probe_cross_encoder() {
+        None => {
+            eprintln!("CROSS_ENCODER=none (no reranker configured)");
+            Ok(())
+        }
+        Some(Ok(id)) => {
+            eprintln!("CROSS_ENCODER={id}");
+            Ok(())
+        }
+        Some(Err(e)) => anyhow::bail!(
+            "recall harness refusing to run: the cross-encoder did not load ({e:#}), so \
+             reranking would fall back to bi-encoder scores and the run would measure a \
+             pipeline veld does not ship. Provide the model, or switch reranking off with \
+             VELD_DIALS_USE_RERANKING=false to measure without it."
+        ),
+    }
+}
+
+/// Unified ablation matrix: one ingest, one row per [`ablation_configs`] entry, so
+/// the study shows every component's contribution. Each delta is paired against
+/// the arm's own reference over cases, with a seeded bootstrap interval. An arm
+/// naming a flag veld has no code path for is reported unavailable, not measured.
 ///
 /// Only QUERY-TIME flags are ablatable here (they are read per-recall against the
 /// same ingested corpus). Ingest-time flags (concept entities, IDF edges, hub cap)
-/// change what is stored and need separate ingests — run those via the workflow's
-/// before/after `ref` A/B instead.
+/// change what is stored and need separate ingests.
 pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
     pin_harness_threads();
 
@@ -1657,18 +1827,40 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
         .with_context(|| format!("loading cases from {}", cases_path.display()))?;
     fixtures::validate_structure(&corpus, &cases)
         .with_context(|| format!("{} suite failed structural validation", inputs.suite))?;
+    // The same fast-read caps as the recall run and the funnel; unset means full scale.
+    let (cases, corpus) = apply_eval_caps(cases, corpus);
+
+    let configs = ablation_configs();
+    preflight_ablation_env(&configs)?;
 
     let manager = build_manager(&inputs.storage_path)?;
+    guard_cross_encoder(&manager)?;
     let id_map = ingest_corpus(&manager, &corpus)?;
     let system = manager.get_user_memory(EVAL_USER)?;
 
-    let configs = ablation_arms();
+    // One case through the live recall path, under whatever env and dials are set now.
+    let recall_ids = |case: &SmokeCase| -> Vec<Uuid> {
+        let query = Query {
+            query_text: Some(case.query.clone()),
+            max_results: SMOKE_K,
+            layers: Some(LayerMode::Full),
+            ..Default::default()
+        };
+        system
+            .read()
+            .recall(&query)
+            .unwrap_or_default()
+            .iter()
+            .map(|m| m.id.0)
+            .collect()
+    };
 
     let mut rows: Vec<AblationRow> = Vec::with_capacity(configs.len());
-    for (name, env) in &configs {
+    for config in &configs {
+        let (name, env) = (config.name, &config.env);
         if let Some(reason) = arm_unavailable_in_veld(env) {
             eprintln!("  -- ARM `{name}` unavailable in veld: {reason}");
-            rows.push(unavailable_row(name, env, reason));
+            rows.push(unavailable_row(config, reason));
             continue;
         }
         // SAFETY: the harness is single-threaded (pin_harness_threads) and the
@@ -1679,35 +1871,40 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
                 std::env::set_var(k, v);
             }
         }
+        let dials_before = config.rerank_off.then(|| {
+            let guard = system.read();
+            let before = guard.cognitive_dials();
+            let mut off = before.clone();
+            off.use_reranking = Some(false);
+            guard.set_cognitive_dials(off);
+            before
+        });
 
         let mut by_cat: HashMap<SmokeCategory, Vec<f64>> = HashMap::new();
         let mut all: Vec<Metrics> = Vec::with_capacity(cases.len());
+        let mut per_case: Vec<AblationCaseRow> = Vec::with_capacity(cases.len());
         // Order-sensitive fingerprint over every retrieved id. An arm that
-        // matches baseline here provably changed nothing.
+        // matches its reference here provably changed nothing.
         let mut fp = std::collections::hash_map::DefaultHasher::new();
         for case in &cases {
-            let query = Query {
-                query_text: Some(case.query.clone()),
-                max_results: SMOKE_K,
-                layers: Some(LayerMode::Full),
-                ..Default::default()
-            };
-            let memories = system.read().recall(&query).unwrap_or_default();
-            let retrieved: Vec<Uuid> = memories.iter().map(|m| m.id.0).collect();
-            {
-                use std::hash::{Hash, Hasher};
-                for id in &retrieved {
-                    id.hash(&mut fp);
-                }
-                // Separator so [a],[b] and [a,b] cannot collide.
-                0xFFu8.hash(&mut fp);
-            }
+            let retrieved = recall_ids(case);
+            hash_retrieved(&mut fp, &retrieved);
             let relevance = build_relevance_map(case, &id_map);
             let m = Metrics::compute(&retrieved, &relevance, SMOKE_K);
             by_cat.entry(case.category).or_default().push(m.recall_at_k);
+            per_case.push(AblationCaseRow {
+                case_id: case.id.clone(),
+                category: category_name(case.category).to_string(),
+                recall_at_k: m.recall_at_k,
+                p_at_1: m.p_at_1,
+                ndcg_at_k: m.ndcg_at_k,
+            });
             all.push(m);
         }
 
+        if let Some(before) = dials_before {
+            system.read().set_cognitive_dials(before);
+        }
         unsafe {
             for (k, _) in env {
                 std::env::remove_var(k);
@@ -1724,63 +1921,354 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
             .collect();
         rows.push(AblationRow {
             name: name.to_string(),
-            flags: env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+            flags: config.flags(),
             recall_at_10: Some(all.iter().map(|m| m.recall_at_k).sum::<f64>() / n),
             ndcg_at_10: Some(all.iter().map(|m| m.ndcg_at_k).sum::<f64>() / n),
             mrr: Some(all.iter().map(|m| m.mrr).sum::<f64>() / n),
             p_at_1: Some(all.iter().map(|m| m.p_at_1).sum::<f64>() / n),
             by_category_recall,
-            retrieval_fingerprint: {
-                use std::hash::Hasher;
-                fp.finish()
-            },
-            vacuous_vs_baseline: false,
+            retrieval_fingerprint: std::hash::Hasher::finish(&fp),
+            vacuous_vs_reference: false,
             unavailable_in_veld: None,
+            reference: config.reference.map(str::to_string),
+            delta_recall_at_10: None,
+            delta_p_at_1: None,
+            per_case,
         });
     }
 
-    // Vacuity check. An arm whose retrieved ids are byte-identical to baseline's
-    // did not exercise the code path it names, and its metrics are attributable
-    // to nothing. The `+spread-fix` arms were vacuous this way for months --
-    // SHODH_SPREAD_FIX only reached the legacy BFS spread, but SHODH_PPR defaults
-    // ON and its branch precedes it, so the flag could not execute while the rows
-    // read as evidence. Flag it in the report rather than failing the run: an arm
-    // may also be legitimately inert (it executed and changed no ranking), and
-    // only the fingerprint distinguishes the two.
-    let baseline_fp = rows
-        .iter()
-        .find(|r| r.name.starts_with("baseline"))
-        .map(|r| r.retrieval_fingerprint);
-    if let Some(base) = baseline_fp {
-        for row in rows.iter_mut() {
-            if row.name.starts_with("baseline")
-                || row.flags.is_empty()
-                || row.unavailable_in_veld.is_some()
-            {
-                continue;
-            }
-            if row.retrieval_fingerprint == base {
-                row.vacuous_vs_baseline = true;
-                tracing::warn!(
-                    arm = %row.name,
-                    flags = %row.flags.join(" "),
-                    "VACUOUS ABLATION ARM: retrieval is byte-identical to baseline, so this                      config did not reach the code path it names. Its numbers measure nothing.                      Confirm the flag is readable from the live path before trusting this row."
-                );
-                eprintln!(
-                    "  !! VACUOUS ARM `{}` ({}) -- byte-identical to baseline, measures nothing",
-                    row.name,
-                    row.flags.join(" ")
-                );
-            }
+    // Trailing baseline replicate: the baseline's queries again, with no arm
+    // setting, after every arm has run. A flag read once into a cache would stay
+    // stuck for every later arm, and those arms would still differ from their
+    // reference, so only re-measuring the reference point at the end can show it.
+    let replicate_fp = {
+        let mut fp = std::collections::hash_map::DefaultHasher::new();
+        for case in &cases {
+            hash_retrieved(&mut fp, &recall_ids(case));
         }
+        std::hash::Hasher::finish(&fp)
+    };
+    let baseline_replicate_identical = rows
+        .iter()
+        .find(|r| r.reference.is_none() && r.unavailable_in_veld.is_none())
+        .map(|r| r.retrieval_fingerprint == replicate_fp);
+    match baseline_replicate_identical {
+        Some(true) => eprintln!("  baseline replicate: identical to the first baseline pass"),
+        Some(false) => {
+            tracing::warn!("ABLATION BASELINE REPLICATE DIFFERS from the first baseline pass");
+            eprintln!(
+                "  !! baseline replicate DIFFERS from the first pass: an arm left state \
+                 behind, or query-time retrieval is not deterministic on a fixed ingest. \
+                 Every delta in this matrix carries that difference as noise."
+            );
+        }
+        None => {}
     }
+
+    resolve_against_references(&mut rows)?;
 
     Ok(AblationReport {
         suite: inputs.suite.clone(),
         git_sha: inputs.git_sha.clone(),
         case_count: cases.len(),
         rows,
+        baseline_replicate_identical,
     })
+}
+
+/// Fold one case's ranked ids into an order-sensitive run fingerprint.
+fn hash_retrieved(fp: &mut std::collections::hash_map::DefaultHasher, ids: &[Uuid]) {
+    use std::hash::Hash;
+    for id in ids {
+        id.hash(fp);
+    }
+    // Separator so [a],[b] and [a,b] cannot collide.
+    0xFFu8.hash(fp);
+}
+
+/// Fill each measured arm's paired deltas and vacuity flag from the arm it names
+/// as its reference.
+///
+/// Vacuity: an arm whose retrieved ids are byte-identical to its reference's did
+/// not exercise the code path its flags name. It is flagged rather than failed,
+/// because an arm may also be legitimately inert (it executed and changed no
+/// ranking), and only the fingerprint can tell the two apart.
+fn resolve_against_references(rows: &mut [AblationRow]) -> Result<()> {
+    let snapshot: HashMap<String, (u64, Vec<f64>, Vec<f64>, bool)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.name.clone(),
+                (
+                    r.retrieval_fingerprint,
+                    r.per_case.iter().map(|c| c.recall_at_k).collect(),
+                    r.per_case.iter().map(|c| c.p_at_1).collect(),
+                    r.unavailable_in_veld.is_some(),
+                ),
+            )
+        })
+        .collect();
+    let ci = |control: &[f64], treatment: &[f64]| {
+        paired_bootstrap_ci(
+            control,
+            treatment,
+            ABLATION_BOOTSTRAP_RESAMPLES,
+            ABLATION_BOOTSTRAP_SEED,
+        )
+        .map(|(mean, lo, hi)| DeltaCi { mean, lo, hi })
+    };
+
+    for row in rows.iter_mut() {
+        let Some(reference) = row.reference.clone() else {
+            continue;
+        };
+        let Some((ref_fp, ref_recall, ref_p1, ref_unavailable)) = snapshot.get(&reference) else {
+            anyhow::bail!(
+                "ablation arm `{}` names `{reference}` as its reference, which is not an arm",
+                row.name
+            );
+        };
+        if row.unavailable_in_veld.is_some() || *ref_unavailable {
+            continue;
+        }
+        let recall: Vec<f64> = row.per_case.iter().map(|c| c.recall_at_k).collect();
+        let p1: Vec<f64> = row.per_case.iter().map(|c| c.p_at_1).collect();
+        row.delta_recall_at_10 = ci(ref_recall, &recall);
+        row.delta_p_at_1 = ci(ref_p1, &p1);
+
+        if row.retrieval_fingerprint == *ref_fp {
+            row.vacuous_vs_reference = true;
+            tracing::warn!(
+                arm = %row.name,
+                reference = %reference,
+                flags = %row.flags.join(" "),
+                "VACUOUS ABLATION ARM: retrieval is byte-identical to its reference, so the \
+                 flags it adds did not reach the code path they name. Its delta measures nothing."
+            );
+            eprintln!(
+                "  !! VACUOUS ARM `{}` ({}) -- byte-identical to `{}`, measures nothing",
+                row.name,
+                row.flags.join(" "),
+                reference
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ablation_config_tests {
+    use super::*;
+
+    fn configs_by_name(configs: &[AblationConfig]) -> HashMap<&'static str, &AblationConfig> {
+        configs.iter().map(|c| (c.name, c)).collect()
+    }
+
+    #[test]
+    fn arm_names_are_unique() {
+        let configs = ablation_configs();
+        assert_eq!(configs_by_name(&configs).len(), configs.len());
+    }
+
+    #[test]
+    fn only_the_baseline_lacks_a_reference_and_it_sets_nothing() {
+        let configs = ablation_configs();
+        let roots: Vec<&AblationConfig> =
+            configs.iter().filter(|c| c.reference.is_none()).collect();
+        assert_eq!(roots.len(), 1, "exactly one arm may be unreferenced");
+        assert_eq!(roots[0].name, ABLATION_BASELINE);
+        assert!(
+            roots[0].env.is_empty() && !roots[0].rerank_off,
+            "the baseline must be the pipeline as it ships"
+        );
+    }
+
+    #[test]
+    fn every_arm_is_its_reference_plus_at_least_one_flag() {
+        let configs = ablation_configs();
+        let by_name = configs_by_name(&configs);
+        for c in &configs {
+            let Some(reference) = c.reference else {
+                continue;
+            };
+            assert_ne!(reference, c.name, "`{}` references itself", c.name);
+            let r = by_name
+                .get(reference)
+                .unwrap_or_else(|| panic!("`{}` references unknown arm `{reference}`", c.name));
+            for pair in &r.env {
+                assert!(
+                    c.env.contains(pair),
+                    "`{}` drops {pair:?} from its reference `{reference}`, so its delta \
+                     is not attributable to the flags it adds",
+                    c.name
+                );
+            }
+            assert!(
+                !r.rerank_off || c.rerank_off,
+                "`{}` turns the reranker back on against `{reference}`",
+                c.name
+            );
+            assert!(
+                c.flags().len() > r.flags().len(),
+                "`{}` adds nothing to its reference `{reference}`",
+                c.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_rerank_off_arm_names_its_dial_in_its_flags() {
+        let configs = ablation_configs();
+        let ce = configs
+            .iter()
+            .find(|c| c.rerank_off)
+            .expect("an arm measures the cross-encoder");
+        assert_eq!(ce.flags(), vec![RERANK_OFF_FLAG.to_string()]);
+        assert_eq!(ce.reference, Some(ABLATION_BASELINE));
+    }
+
+    #[test]
+    fn preset_keys_are_reported_once_each_and_only_if_an_arm_sets_them() {
+        let configs = ablation_configs();
+        let preset = preset_ablation_keys(&configs, |k| {
+            matches!(
+                k,
+                "SHODH_LEG" | "SHODH_DISABLE_BOOSTS" | "SHODH_NOT_AN_ARM_KEY"
+            )
+        });
+        assert_eq!(preset, vec!["SHODH_DISABLE_BOOSTS", "SHODH_LEG"]);
+        assert!(preset_ablation_keys(&configs, |_| false).is_empty());
+    }
+
+    /// `all` reaches nothing the default does not, under the harness's read-only
+    /// recall, so `-boost-stack` is reported unavailable instead of run as a
+    /// baseline copy.
+    #[test]
+    fn disabling_all_boosts_is_unavailable_under_read_only_recall() {
+        let _guard = crate::memory::ablation::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("VELD_RECALL_READONLY").ok();
+        std::env::set_var("VELD_RECALL_READONLY", "1");
+        let why = arm_unavailable_in_veld(&[("SHODH_DISABLE_BOOSTS", "all")]);
+        std::env::set_var("VELD_RECALL_READONLY", "0");
+        let writable = arm_unavailable_in_veld(&[("SHODH_DISABLE_BOOSTS", "all")]);
+        match prev {
+            Some(v) => std::env::set_var("VELD_RECALL_READONLY", v),
+            None => std::env::remove_var("VELD_RECALL_READONLY"),
+        }
+        assert!(
+            why.is_some_and(|w| w.contains("nothing more than the default")),
+            "read-only: `all` must be unavailable"
+        );
+        assert_eq!(
+            writable, None,
+            "with writes on, `all` also disables graph_potentiation"
+        );
+    }
+
+    fn row(name: &str, reference: Option<&str>, fingerprint: u64, recalls: &[f64]) -> AblationRow {
+        AblationRow {
+            name: name.to_string(),
+            flags: if reference.is_some() {
+                vec![format!("FLAG_FOR_{name}=1")]
+            } else {
+                vec![]
+            },
+            recall_at_10: Some(recalls.iter().sum::<f64>() / recalls.len() as f64),
+            ndcg_at_10: Some(0.0),
+            mrr: Some(0.0),
+            p_at_1: Some(0.0),
+            by_category_recall: BTreeMap::new(),
+            retrieval_fingerprint: fingerprint,
+            vacuous_vs_reference: false,
+            unavailable_in_veld: None,
+            reference: reference.map(str::to_string),
+            delta_recall_at_10: None,
+            delta_p_at_1: None,
+            per_case: recalls
+                .iter()
+                .enumerate()
+                .map(|(i, &r)| AblationCaseRow {
+                    case_id: format!("case-{i}"),
+                    category: "single_hop".to_string(),
+                    recall_at_k: r,
+                    p_at_1: r,
+                    ndcg_at_k: 0.0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_keeps_case_boundaries_and_rank_order() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let finish = |cases: &[Vec<Uuid>]| {
+            let mut fp = std::collections::hash_map::DefaultHasher::new();
+            for ids in cases {
+                hash_retrieved(&mut fp, ids);
+            }
+            std::hash::Hasher::finish(&fp)
+        };
+        assert_ne!(finish(&[vec![a], vec![b]]), finish(&[vec![a, b]]));
+        assert_ne!(finish(&[vec![a, b]]), finish(&[vec![b, a]]));
+        assert_eq!(finish(&[vec![a, b]]), finish(&[vec![a, b]]));
+    }
+
+    #[test]
+    fn an_arm_identical_to_its_reference_is_vacuous_with_a_zero_delta() {
+        let mut rows = vec![
+            row("base", None, 7, &[0.0, 0.5, 1.0]),
+            row("inert", Some("base"), 7, &[0.0, 0.5, 1.0]),
+        ];
+        resolve_against_references(&mut rows).unwrap();
+        assert!(rows[1].vacuous_vs_reference);
+        let d = rows[1].delta_recall_at_10.unwrap();
+        assert_eq!((d.mean, d.lo, d.hi), (0.0, 0.0, 0.0));
+        assert!(
+            !rows[0].vacuous_vs_reference,
+            "the baseline has nothing to be vacuous against"
+        );
+        assert!(rows[0].delta_recall_at_10.is_none());
+    }
+
+    #[test]
+    fn a_nested_arm_is_measured_against_its_own_reference_not_the_baseline() {
+        // base 0.2 -> mid 0.6 -> child 0.5. Against its reference the child loses
+        // 0.1; against the baseline it would appear to gain 0.3.
+        let mut rows = vec![
+            row("base", None, 1, &[0.2; 4]),
+            row("mid", Some("base"), 2, &[0.6; 4]),
+            row("child", Some("mid"), 3, &[0.5; 4]),
+        ];
+        resolve_against_references(&mut rows).unwrap();
+        let child = rows[2].delta_recall_at_10.unwrap();
+        assert!((child.mean + 0.1).abs() < 1e-12, "got {}", child.mean);
+        assert!(child.excludes_zero());
+        let mid = rows[1].delta_recall_at_10.unwrap();
+        assert!((mid.mean - 0.4).abs() < 1e-12, "got {}", mid.mean);
+        assert!(!rows[2].vacuous_vs_reference);
+    }
+
+    #[test]
+    fn an_unavailable_arm_gets_no_delta_and_is_never_vacuous() {
+        let mut unavailable = row("missing-lever", Some("base"), 0, &[]);
+        unavailable.unavailable_in_veld = Some("no code path".into());
+        let mut rows = vec![row("base", None, 0, &[0.2, 0.4]), unavailable];
+        resolve_against_references(&mut rows).unwrap();
+        assert!(rows[1].delta_recall_at_10.is_none());
+        assert!(!rows[1].vacuous_vs_reference);
+    }
+
+    #[test]
+    fn an_unknown_reference_is_an_error_not_a_skipped_row() {
+        let mut rows = vec![
+            row("base", None, 1, &[0.2]),
+            row("orphan", Some("missing"), 2, &[0.3]),
+        ];
+        let err = resolve_against_references(&mut rows).unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+    }
 }
 
 /// Whole-word / phrase containment: does `name` appear in `text_lc` at word boundaries?
@@ -4317,8 +4805,8 @@ mod tests {
             "scanner invents a reader"
         );
 
-        let arms = ablation_arms();
-        for (name, env) in &arms {
+        let arms = ablation_configs();
+        for AblationConfig { name, env, .. } in &arms {
             for (k, v) in env {
                 let read = reads_env(&sources, k);
                 let declared = UNAVAILABLE_IN_VELD.iter().any(|(f, _)| f == k);
@@ -4332,6 +4820,9 @@ mod tests {
                 );
                 if *k == DISABLE_BOOSTS_VAR {
                     for tok in v.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                        if tok == "all" {
+                            continue;
+                        }
                         if FAMILIES.contains(&tok) {
                             assert!(gates_family(&sources, tok), "family `{tok}` has no gate");
                         } else {
@@ -4346,8 +4837,7 @@ mod tests {
         }
         for (flag, _) in UNAVAILABLE_IN_VELD {
             assert!(
-                arms.iter()
-                    .any(|(_, env)| env.iter().any(|(k, _)| k == flag)),
+                arms.iter().any(|c| c.sets(flag)),
                 "{flag} is declared unavailable but no arm sets it"
             );
         }
@@ -4371,7 +4861,7 @@ mod tests {
 
     #[test]
     fn every_boost_ablation_but_plus_hebbian_keeps_hebbian_off() {
-        for (name, env) in ablation_arms() {
+        for AblationConfig { name, env, .. } in ablation_configs() {
             for (k, v) in env {
                 if k != crate::memory::ablation::DISABLE_BOOSTS_VAR || name == "+hebbian" {
                     continue;
@@ -4437,7 +4927,15 @@ mod tests {
             None => std::env::remove_var("VELD_RECALL_READONLY"),
         }
 
-        let row = unavailable_row("+x", &[("SHODH_GRAPH_TRAVERSE", "1")], "why".into());
+        let row = unavailable_row(
+            &AblationConfig {
+                name: "+x",
+                env: vec![("SHODH_GRAPH_TRAVERSE", "1")],
+                rerank_off: false,
+                reference: Some(ABLATION_BASELINE),
+            },
+            "why".into(),
+        );
         let json = serde_json::to_value(&row).unwrap();
         assert!(
             json["recall@10"].is_null(),
