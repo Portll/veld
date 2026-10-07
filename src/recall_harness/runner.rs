@@ -1024,11 +1024,14 @@ fn finish_model_tape(
 ///
 /// The queries are the ones the run sent to the reranker. The candidates are the
 /// corpus contents, which must include every text the reranker saw apart from the
-/// harness's own load probe: if one is not a corpus item, candidates are built some
-/// other way and the corpus cannot complete the table.
+/// pairs that only load the model (the harness's probe and the background pre-warm):
+/// if one is not a corpus item, candidates are built some other way and the corpus
+/// cannot complete the table.
 fn fill_cross_encoder_table(corpus: &[CorpusItem]) -> Result<usize> {
+    use crate::embeddings::cross_encoder::WARMUP_TEXT;
     use crate::embeddings::model_tape as tape;
     use crate::memory::hybrid_search::CROSS_ENCODER_PROBE;
+    let loads_only = |t: &str| t == CROSS_ENCODER_PROBE || t == WARMUP_TEXT;
     let ce = crate::embeddings::cross_encoder::load_cross_encoder_from_env();
     let mut seen = std::collections::HashSet::new();
     let docs: Vec<&str> = corpus
@@ -1038,7 +1041,7 @@ fn fill_cross_encoder_table(corpus: &[CorpusItem]) -> Result<usize> {
         .collect();
     let foreign: Vec<String> = tape::cross_encoder_docs()
         .into_iter()
-        .filter(|d| d != CROSS_ENCODER_PROBE && !seen.contains(d.as_str()))
+        .filter(|d| !loads_only(d) && !seen.contains(d.as_str()))
         .collect();
     if let Some(first) = foreign.first() {
         anyhow::bail!(
@@ -1050,7 +1053,7 @@ fn fill_cross_encoder_table(corpus: &[CorpusItem]) -> Result<usize> {
     }
     let mut scored = 0;
     for query in tape::cross_encoder_queries() {
-        if query == CROSS_ENCODER_PROBE {
+        if loads_only(&query) {
             continue;
         }
         let missing: Vec<&str> = docs
