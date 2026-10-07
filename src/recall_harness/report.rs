@@ -28,6 +28,13 @@ pub struct Report {
     /// refuses: "not recorded" is not the same as "off".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<RerankSetting>,
+    /// sha256 of the model tape the run replayed its model outputs from, or `None` when the
+    /// models ran live (see `crate::embeddings::model_tape`). Two runs that replayed one tape
+    /// saw byte-identical model outputs, whatever CPU they ran on; a live run and a replayed
+    /// one, or two different tapes, are two sets of model outputs, and
+    /// [`compare_to_baseline`] refuses them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_tape: Option<String>,
     /// Git SHA of the working tree the run was produced from.
     pub git_sha: String,
     /// RFC3339 timestamp at the start of the run.
@@ -643,6 +650,22 @@ pub fn compare_to_baseline(
             ),
         }];
     }
+    if baseline.model_tape != current.model_tape {
+        let describe = |t: &Option<String>| match t {
+            Some(d) => format!("replayed from tape {}", &d[..d.len().min(12)]),
+            None => "computed live".to_string(),
+        };
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "model outputs differ: baseline {}, current {}. These are two sets of \
+                 embeddings, entities and reranker scores, so their difference is not a change \
+                 in the code. Compare against a baseline recorded from the same tape",
+                describe(&baseline.model_tape),
+                describe(&current.model_tape)
+            ),
+        }];
+    }
     let (base_rerank, cur_rerank) = match (&baseline.rerank, &current.rerank) {
         (Some(b), Some(c)) => (b, c),
         (b, _) => {
@@ -1100,6 +1123,7 @@ mod tests {
                 model: Some("mxbai-rerank-xsmall-v1".to_string()),
                 depth: 20,
             }),
+            model_tape: None,
             git_sha: "deadbeef".to_string(),
             timestamp: chrono::Utc::now(),
             layers,
@@ -1141,6 +1165,54 @@ mod tests {
         let baseline = report_with_full(0.60, 0.70, 0.50, 0.40);
         let current = report_with_full(0.80, 0.90, 0.70, 0.60);
         assert!(compare_to_baseline(&baseline, &current, 2.0).is_empty());
+    }
+
+    const TAPE_A: &str = "aaaaaaaaaaaa1111111111111111111111111111111111111111111111111111";
+    const TAPE_B: &str = "bbbbbbbbbbbb2222222222222222222222222222222222222222222222222222";
+
+    /// Two runs that replayed one tape are compared, and a real drop is a regression.
+    #[test]
+    fn same_tape_is_compared() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        baseline.model_tape = Some(TAPE_A.to_string());
+        current.model_tape = Some(TAPE_A.to_string());
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// Different tapes, or one live run and one replayed run, are two sets of model outputs.
+    /// Refused before any metric, in either order.
+    #[test]
+    fn different_model_outputs_are_refused_in_either_order() {
+        for (b, c) in [
+            (Some(TAPE_A), Some(TAPE_B)),
+            (Some(TAPE_A), None),
+            (None, Some(TAPE_A)),
+        ] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+            baseline.model_tape = b.map(str::to_string);
+            current.model_tape = c.map(str::to_string);
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(
+                failures[0].detail.contains("model outputs differ"),
+                "{}",
+                failures[0].detail
+            );
+        }
+    }
+
+    /// Reports written before the field existed ran their models live.
+    #[test]
+    fn report_without_model_tape_key_parses_as_live() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("model_tape");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.model_tape, None);
     }
 
     /// A run with reranking off against the reranked baseline is two pipelines, not a

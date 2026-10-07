@@ -434,6 +434,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         suite: inputs.suite.clone(),
         embedder,
         rerank: Some(passes[0].rerank.clone()),
+        model_tape: crate::embeddings::model_tape::replay_digest(),
         git_sha: inputs.git_sha.clone(),
         timestamp: chrono::Utc::now(),
         layers,
