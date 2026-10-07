@@ -180,6 +180,17 @@ pub struct UpsertRequest {
     pub changed_by: Option<String>,
     #[serde(default)]
     pub change_reason: Option<String>,
+    /// Provenance, as [`RememberRequest`] accepts it. Stored as `remember` stores it on create;
+    /// on update a provided field overwrites and an omitted one keeps the stored value.
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub episode_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// See [`RememberRequest::writer`].
+    #[serde(default)]
+    pub writer: Option<crate::memory::facets::DeclaredWriter>,
 }
 
 fn default_change_type() -> String {
@@ -1868,10 +1879,20 @@ pub async fn upsert_memory(
         );
     }
 
-    // Stamp the upsert with the active agent / worktree / branch — the
-    // upsert path is otherwise a writer that records no context, which would
-    // strand the AgentSession facet at default-empty.
-    let context = Some(crate::memory::session_detect::rich_context_with_session());
+    // Built the way `remember` builds it, so an upsert-created record carries the same
+    // AgentSession facet, declared writer, received_at stamp and episode context. Only the
+    // episode id and writer are fields upsert accepts; the other hints stay unset.
+    let context = build_rich_context(
+        None,
+        None,
+        None,
+        None,
+        None,
+        req.episode_id.clone(),
+        None,
+        None,
+        req.writer.clone(),
+    );
 
     let experience = Experience {
         content: req.content.clone(),
@@ -1890,13 +1911,26 @@ pub async fn upsert_memory(
     let external_id = req.external_id.clone();
     let changed_by = req.changed_by.clone();
     let change_reason = req.change_reason.clone();
+    let provenance = crate::memory::UpsertProvenance {
+        agent_id: req.agent_id.clone(),
+        created_at: req.created_at,
+        episode_id: req.episode_id.clone(),
+        writer: req.writer.clone(),
+    };
 
     let (memory_id, was_update) = {
         let memory = memory_system.clone();
         let exp = experience.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            memory_guard.upsert(external_id, exp, change_type, changed_by, change_reason)
+            memory_guard.upsert_with_provenance(
+                external_id,
+                exp,
+                change_type,
+                changed_by,
+                change_reason,
+                provenance,
+            )
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
