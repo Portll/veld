@@ -609,6 +609,17 @@ fn build_ner_lookup(
         .collect()
 }
 
+/// The BM25 index for a standalone system: in memory when the store seals its
+/// records, since on disk it would hold their content in plaintext.
+fn open_standalone_bm25(path: &std::path::Path, sealed: bool) -> Result<hybrid_search::BM25Index> {
+    if sealed {
+        hybrid_search::BM25Index::in_memory(path)
+    } else {
+        hybrid_search::BM25Index::new(path)
+    }
+    .context("Failed to open BM25 index for hybrid search")
+}
+
 impl MemorySystem {
     /// Create a new memory system.
     ///
@@ -645,24 +656,48 @@ impl MemorySystem {
         let primary = crate::storage::redb::RedbPrimaryMemoryStore::open(&config.storage_path)
             .with_context(|| format!("Failed to open storage at {:?}", config.storage_path))?;
         let database = primary.database();
-        let bm25_index = Arc::new(
-            hybrid_search::BM25Index::new(&config.storage_path.join(BM25_INDEX_DIR))
-                .context("Failed to open BM25 index for hybrid search")?,
-        );
+        let bm25_index = Arc::new(open_standalone_bm25(
+            &config.storage_path.join(BM25_INDEX_DIR),
+            primary.encrypts_records(),
+        )?);
         let mut system =
             Self::with_primary_store_and_bm25_index(config, Arc::new(primary), None, bm25_index)?;
         system.attach_redb_backup_db(database);
+        system.backfill_in_memory_bm25()?;
         Ok(system)
     }
 
     #[cfg(feature = "rocksdb")]
     pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
         let bm25_path = config.storage_path.join(BM25_INDEX_DIR);
-        let bm25_index = Arc::new(
-            hybrid_search::BM25Index::new(&bm25_path)
-                .context("Failed to open BM25 index for hybrid search")?,
-        );
-        Self::with_storage_and_bm25_index(config, storage, bm25_index)
+        let bm25_index = Arc::new(open_standalone_bm25(
+            &bm25_path,
+            storage.encrypts_records(),
+        )?);
+        let system = Self::with_storage_and_bm25_index(config, storage, bm25_index)?;
+        system.backfill_in_memory_bm25()?;
+        Ok(system)
+    }
+
+    /// Standalone mode has no journal to replay, so an in-memory index (a sealed
+    /// store) is filled from the store itself when the system opens.
+    fn backfill_in_memory_bm25(&self) -> Result<()> {
+        if !self.hybrid_search.bm25_in_memory() {
+            return Ok(());
+        }
+        let mut indexed = 0usize;
+        for memory in self.long_term_memory.get_all()? {
+            self.hybrid_search.index_memory(
+                &memory.id,
+                &memory.experience.content,
+                &memory.experience.tags,
+                &memory.experience.entities,
+            )?;
+            indexed += 1;
+        }
+        self.hybrid_search.commit_and_reload()?;
+        tracing::info!(indexed, "in-memory BM25 index filled from the sealed store");
+        Ok(())
     }
 
     /// Create a memory system around an already-opened primary store *and*

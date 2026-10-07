@@ -491,11 +491,12 @@ pub struct BM25Index {
     tags_field: Field,
     entities_field: Field,
     stemmed_content_field: Field,
+    /// Held in RAM only (an encrypted tenant): nothing of it is on disk.
+    in_memory: bool,
 }
 
 impl BM25Index {
-    /// Create or open a BM25 index at the given path
-    pub fn new(path: &Path) -> Result<Self> {
+    fn schema() -> Schema {
         let mut schema_builder = Schema::builder();
 
         // Memory ID (stored, not tokenized)
@@ -513,7 +514,12 @@ impl BM25Index {
         // Stemmed content for morphological matching (search-only, not stored)
         schema_builder.add_text_field("stemmed_content", TEXT);
 
-        let schema = schema_builder.build();
+        schema_builder.build()
+    }
+
+    /// Create or open a BM25 index at the given path
+    pub fn new(path: &Path) -> Result<Self> {
+        let schema = Self::schema();
 
         // Create or open index
         std::fs::create_dir_all(path)?;
@@ -540,7 +546,38 @@ impl BM25Index {
         } else {
             Index::create_in_dir(path, schema).context("Failed to create BM25 index")?
         };
+        info!("BM25 index initialized at {:?}", path);
+        Self::from_index(index, false)
+    }
 
+    /// The index for an ENCRYPTED tenant: built in RAM, never written to disk.
+    ///
+    /// It stores each memory's `content` and every token's positions, so on disk
+    /// beside a sealed store and journal it would be a plaintext copy of every
+    /// memory. It starts empty and its projection replays the whole intent log;
+    /// an index left at `path` from before encryption is deleted as plaintext.
+    pub fn in_memory(path: &Path) -> Result<Self> {
+        if path.exists() {
+            std::fs::remove_dir_all(path).with_context(|| {
+                format!(
+                    "Failed to remove the plaintext BM25 index at {path:?} for an encrypted tenant"
+                )
+            })?;
+            tracing::warn!(
+                "removed the on-disk BM25 index at {:?}: for an encrypted tenant it is a plaintext \
+                 copy of every memory. It is rebuilt in memory from the journal on each start.",
+                path
+            );
+        }
+        Self::from_index(Index::create_in_ram(Self::schema()), true)
+    }
+
+    /// Whether this index lives only in memory.
+    pub fn is_in_memory(&self) -> bool {
+        self.in_memory
+    }
+
+    fn from_index(index: Index, in_memory: bool) -> Result<Self> {
         let actual_schema = index.schema();
         let id_field = actual_schema
             .get_field("id")
@@ -569,8 +606,6 @@ impl BM25Index {
             .try_into()
             .context("Failed to create index reader")?;
 
-        info!("BM25 index initialized at {:?}", path);
-
         Ok(Self {
             index,
             reader,
@@ -580,6 +615,7 @@ impl BM25Index {
             tags_field,
             entities_field,
             stemmed_content_field,
+            in_memory,
         })
     }
 
@@ -1226,6 +1262,11 @@ impl HybridSearchEngine {
     }
 
     /// Commit and reload in one call for immediate searchability
+    /// Whether the BM25 index is held only in memory.
+    pub fn bm25_in_memory(&self) -> bool {
+        self.bm25_index.is_in_memory()
+    }
+
     pub fn commit_and_reload(&self) -> Result<()> {
         // Counted HERE, not at the seven call sites: a caller added later
         // cannot forget to record its own loss.
@@ -1785,6 +1826,42 @@ impl HybridSearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An encrypted tenant's index never reaches disk, and an index left there from
+    /// before encryption is removed rather than reopened.
+    #[test]
+    fn an_in_memory_index_writes_nothing_and_removes_the_plaintext_one() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("bm25_projection_index");
+        {
+            let on_disk = BM25Index::new(&path).unwrap();
+            on_disk
+                .upsert(&MemoryId(uuid::Uuid::new_v4()), "the secret plan", &[], &[])
+                .unwrap();
+            on_disk.commit().unwrap();
+        }
+        assert!(path.exists(), "precondition: a plaintext index on disk");
+
+        let index = BM25Index::in_memory(&path).unwrap();
+        assert!(index.is_in_memory());
+        assert!(
+            !path.exists(),
+            "the plaintext index left on disk is removed"
+        );
+        let id = MemoryId(uuid::Uuid::new_v4());
+        index.upsert(&id, "the sealed plan", &[], &[]).unwrap();
+        index.commit().unwrap();
+        index.reload().unwrap();
+        assert_eq!(
+            index
+                .search("plan", 5)
+                .unwrap()
+                .first()
+                .map(|(hit, _)| hit.clone()),
+            Some(id)
+        );
+        assert!(!path.exists(), "indexing wrote nothing to disk");
+    }
     use crate::storage::KeyValueStore;
 
     #[test]
