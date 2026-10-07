@@ -14,7 +14,7 @@ use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
-    memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time,
+    memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time, ui,
     storage_migration, todos, user_auth, users, visualization, webhooks,
 };
 
@@ -212,6 +212,12 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         // RECALL ENDPOINTS
         // =================================================================
+        // =================================================================
+        // INTEGRATED GUI (read-only; user bound from the credential — see handlers/ui.rs)
+        // =================================================================
+        .route("/api/ui/tags", get(ui::ui_tags))
+        .route("/api/ui/recall-log", get(ui::ui_recall_log))
+        .route("/api/ui/knows", get(ui::ui_knows))
         .route("/api/recall", post(recall::recall))
         .route("/api/recall/tracked", post(recall::recall_tracked))
         .route("/api/recall/tags", post(recall::recall_by_tags))

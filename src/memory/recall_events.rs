@@ -22,6 +22,8 @@ pub const RECALL_EVENT_MAX: usize = 20_000;
 /// The cap is enforced every this many writes, not on each: enforcement scans the prefix.
 const ENFORCE_EVERY: u64 = 256;
 pub const RECALL_EVENTS_SCHEMA: u32 = 1;
+/// Proactive context sends whole prompts; the log keeps the head of each.
+pub const RECALL_QUERY_MAX_CHARS: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecallHit {
@@ -37,6 +39,8 @@ pub struct RecallEvent {
     pub at: DateTime<Utc>,
     pub endpoint: String,
     pub query: String,
+    /// Length of the query as asked, before truncation to `RECALL_QUERY_MAX_CHARS`.
+    pub query_chars: usize,
     /// Tokens in the query replaced by a credential class label.
     pub query_redactions: usize,
     pub episode_id: Option<String>,
@@ -52,7 +56,9 @@ impl RecallEvent {
         episode_id: Option<String>,
         hits: Vec<RecallHit>,
     ) -> Self {
+        let query_chars = query.chars().count();
         let (query, query_redactions) = redact_query(query);
+        let query: String = query.chars().take(RECALL_QUERY_MAX_CHARS).collect();
         let best_score = hits.iter().map(|h| h.score).reduce(f32::max);
         Self {
             v: RECALL_EVENTS_SCHEMA,
@@ -60,6 +66,7 @@ impl RecallEvent {
             at: Utc::now(),
             endpoint: endpoint.to_string(),
             query,
+            query_chars,
             query_redactions,
             episode_id: episode_id.filter(|e| !e.trim().is_empty()),
             result_count: hits.len(),
@@ -68,7 +75,9 @@ impl RecallEvent {
         }
     }
 
-    pub fn hits_from_scored<'a>(scored: impl IntoIterator<Item = (&'a str, f32)>) -> Vec<RecallHit> {
+    pub fn hits_from_scored<'a>(
+        scored: impl IntoIterator<Item = (&'a str, f32)>,
+    ) -> Vec<RecallHit> {
         scored
             .into_iter()
             .enumerate()
@@ -199,6 +208,14 @@ mod tests {
     }
 
     #[test]
+    fn a_long_query_is_truncated_after_redaction_and_its_length_kept() {
+        let long = "word ".repeat(400);
+        let event = RecallEvent::new("/api/proactive_context", &long, None, vec![]);
+        assert_eq!(event.query.chars().count(), RECALL_QUERY_MAX_CHARS);
+        assert_eq!(event.query_chars, long.chars().count());
+    }
+
+    #[test]
     fn hits_carry_rank_and_best_score() {
         let hits = RecallEvent::hits_from_scored([("a", 0.4), ("b", 0.9)]);
         let event = RecallEvent::new("/api/recall", "q", Some("  ".into()), hits);
@@ -226,7 +243,10 @@ mod tests {
 
             kv.put_bytes(format!("{RECALL_EVENT_PREFIX}zz").as_bytes(), b"{")
                 .unwrap();
-            assert!(store.since(DateTime::<Utc>::MIN_UTC).is_err(), "{backend:?}");
+            assert!(
+                store.since(DateTime::<Utc>::MIN_UTC).is_err(),
+                "{backend:?}"
+            );
         }
     }
 }

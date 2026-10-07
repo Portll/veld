@@ -9,6 +9,7 @@ use axum::{extract::State, response::Json};
 use super::health::AppState;
 use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
+use crate::memory::tag_sources::{TagSource, TagSources};
 use crate::memory::{
     types::{
         ChangeType, EmotionalContext, EpisodeContext, NerEntityRecord, RichContext, SourceContext,
@@ -16,7 +17,6 @@ use crate::memory::{
     },
     Experience, ExperienceType, SessionEvent,
 };
-use crate::memory::tag_sources::{TagSource, TagSources};
 use crate::metrics;
 use crate::user_memory::SharedUserMemory;
 use crate::validation;
@@ -62,7 +62,9 @@ async fn record_tag_sources(
     .await;
     match joined {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(memory_id = %memory_id.0, error = %e, "tag sources: write failed"),
+        Ok(Err(e)) => {
+            tracing::warn!(memory_id = %memory_id.0, error = %e, "tag sources: write failed")
+        }
         Err(e) => tracing::warn!(memory_id = %memory_id.0, error = %e, "tag sources: task failed"),
     }
 }
@@ -834,7 +836,14 @@ pub async fn remember(
     // downstream pass runs on the merged experience, not the request's.
     let rebuild_graph = outcome.needs_graph_rebuild();
     let experience = outcome.merged_experience.unwrap_or(experience);
-    record_tag_sources(&memory, &memory_id, labelled_tags, Some(experience.tags.clone()), true).await;
+    record_tag_sources(
+        &memory,
+        &memory_id,
+        labelled_tags,
+        Some(experience.tags.clone()),
+        true,
+    )
+    .await;
 
     // Background: complete embedding + vector indexing.
     // The memory is already searchable via BM25; vector search follows in ~150ms.
@@ -1552,7 +1561,8 @@ pub async fn batch_remember(
     };
 
     for (index, id, effective, _) in &memory_results {
-        let (Some(labelled), Ok(uuid)) = (labelled_by_index.remove(index), uuid::Uuid::parse_str(id))
+        let (Some(labelled), Ok(uuid)) =
+            (labelled_by_index.remove(index), uuid::Uuid::parse_str(id))
         else {
             continue;
         };
@@ -2052,7 +2062,14 @@ pub async fn upsert_memory(
     };
     // The stored list, not the request's: an upsert's tags are the record's new tags, and the
     // ledger has to describe the record.
-    record_tag_sources(&memory_system, &memory_id, labelled_tags, stored_tags, false).await;
+    record_tag_sources(
+        &memory_system,
+        &memory_id,
+        labelled_tags,
+        stored_tags,
+        false,
+    )
+    .await;
 
     // W5: journal the upsert as a `Remember` (create) or `Update`
     // (existing) payload. The opaque memory bincode bytes are the same

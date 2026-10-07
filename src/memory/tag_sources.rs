@@ -141,7 +141,12 @@ impl TagSources {
         existing: Option<TagSources>,
         stored: &[String],
     ) -> Option<Self> {
-        if incoming.tags.iter().map(|t| t.tag.as_str()).eq(stored.iter().map(String::as_str)) {
+        if incoming
+            .tags
+            .iter()
+            .map(|t| t.tag.as_str())
+            .eq(stored.iter().map(String::as_str))
+        {
             return Some(incoming);
         }
         let mut redacted = incoming.redacted.clone();
@@ -278,7 +283,13 @@ mod tests {
         let before = s(&["project:veld", "Alice", "budget"]);
         let after = before.clone();
         let kept = s(&["budget", "project:veld"]);
-        let got = TagSources::label(&sources, &before, &after, &kept, &RedactionReport::default());
+        let got = TagSources::label(
+            &sources,
+            &before,
+            &after,
+            &kept,
+            &RedactionReport::default(),
+        );
         assert_eq!(got.tags.len(), 2);
         assert_eq!(got.tags[0].tag, "budget");
         assert_eq!(got.tags[0].source, TagSource::Yake);
@@ -294,7 +305,10 @@ mod tests {
         let sources = [TagSource::Caller, TagSource::Yake];
         let got = TagSources::label(&sources, &before, &after, &after, &report);
         assert!(got.tags[0].redacted);
-        assert_ne!(got.tags[0].tag, before[0], "the credential must not reach the ledger");
+        assert_ne!(
+            got.tags[0].tag, before[0],
+            "the credential must not reach the ledger"
+        );
         assert_eq!(got.tags[0].source, TagSource::Caller);
         assert!(!got.tags[1].redacted);
         assert_eq!(got.redacted.key, 1);
@@ -325,9 +339,12 @@ mod tests {
             &s(&["old"]),
             &r,
         );
-        let merged =
-            TagSources::reconcile(incoming.clone(), Some(existing.clone()), &s(&["old", "new"]))
-                .unwrap();
+        let merged = TagSources::reconcile(
+            incoming.clone(),
+            Some(existing.clone()),
+            &s(&["old", "new"]),
+        )
+        .unwrap();
         assert_eq!(merged.tags[0].source, TagSource::Ner);
         assert_eq!(merged.tags[1].source, TagSource::Caller);
 
@@ -368,7 +385,10 @@ mod tests {
             ]
         );
         for s in all {
-            assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{}\"", s.as_str()));
+            assert_eq!(
+                serde_json::to_string(&s).unwrap(),
+                format!("\"{}\"", s.as_str())
+            );
         }
     }
 
@@ -384,7 +404,11 @@ mod tests {
             let second =
                 TagSources::all_caller(&s(&["b"]), &s(&["b"]), &RedactionReport::default());
             store.put(&id, &second).unwrap();
-            assert_eq!(store.get(&id).unwrap(), Some(second.clone()), "{backend:?}: replaced");
+            assert_eq!(
+                store.get(&id).unwrap(),
+                Some(second.clone()),
+                "{backend:?}: replaced"
+            );
             assert_eq!(store.all().unwrap().len(), 1, "{backend:?}");
 
             kv.put_bytes(
@@ -392,7 +416,10 @@ mod tests {
                 b"not json",
             )
             .unwrap();
-            assert!(store.all().is_err(), "{backend:?}: a corrupt row is an error, not a gap");
+            assert!(
+                store.all().is_err(),
+                "{backend:?}: a corrupt row is an error, not a gap"
+            );
 
             store.delete(&id).unwrap();
             assert_eq!(store.get(&id).unwrap(), None, "{backend:?}: deleted");
