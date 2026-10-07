@@ -8,6 +8,7 @@ use axum::{extract::State, response::Json};
 
 use super::health::AppState;
 use super::types::MemoryEvent;
+use crate::declared_entities::{DeclaredEntity, DeclaredEntityInput};
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::tag_sources::{TagSource, TagSources};
 use crate::memory::{
@@ -129,6 +130,11 @@ pub struct RememberRequest {
     /// the server.
     #[serde(default)]
     pub writer: Option<crate::memory::facets::DeclaredWriter>,
+    /// Typed entities the writer declares this memory is about. See
+    /// [`crate::declared_entities`]: validated (400 on an unknown label, a weight outside
+    /// [0, 1], or more than 50), exempt from the derived-entity cut, and stored as authored tags.
+    #[serde(default)]
+    pub entities: Vec<DeclaredEntityInput>,
 }
 
 /// Remember response
@@ -195,6 +201,10 @@ pub struct BatchMemoryItem {
     /// same model.
     #[serde(default)]
     pub writer: Option<crate::memory::facets::DeclaredWriter>,
+    /// Per-item declared entities — see [`RememberRequest::entities`]. An invalid declaration
+    /// fails its item, as an unknown memory type does.
+    #[serde(default)]
+    pub entities: Vec<DeclaredEntityInput>,
 }
 
 /// Error detail for batch item
@@ -240,6 +250,9 @@ pub struct UpsertRequest {
     /// See [`RememberRequest::writer`].
     #[serde(default)]
     pub writer: Option<crate::memory::facets::DeclaredWriter>,
+    /// See [`RememberRequest::entities`]. On an update the graph episode is rebuilt from these.
+    #[serde(default)]
+    pub entities: Vec<DeclaredEntityInput>,
 }
 
 fn default_change_type() -> String {
@@ -445,6 +458,30 @@ pub fn build_rich_context(
     Some(ctx)
 }
 
+/// Start a write's tag list with the declared entity names, then the caller's tags.
+///
+/// Declared names lead because they are authored and `entity_cap::cap_by_selectivity` keeps the
+/// leading authored entries; at most 50 can be declared, so the 50-cap never reaches one. A caller
+/// tag repeating a declared name (case-insensitively) is the same entity and is not listed twice.
+/// With nothing declared this is exactly the caller's tags, all labelled `Caller`.
+fn authored_tags(declared: &[DeclaredEntity], tags: &[String]) -> (Vec<String>, Vec<TagSource>) {
+    let declared_lower: HashSet<String> = declared.iter().map(|d| d.name.to_lowercase()).collect();
+    let mut merged = Vec::with_capacity(declared.len() + tags.len());
+    let mut sources = Vec::with_capacity(declared.len() + tags.len());
+    for d in declared {
+        merged.push(d.name.clone());
+        sources.push(TagSource::Declared);
+    }
+    for tag in tags {
+        if declared_lower.contains(&tag.to_lowercase()) {
+            continue;
+        }
+        merged.push(tag.clone());
+        sources.push(TagSource::Caller);
+    }
+    (merged, sources)
+}
+
 // =============================================================================
 // HANDLERS
 // =============================================================================
@@ -610,6 +647,7 @@ pub async fn remember(
     };
 
     let experience_type = parse_experience_type(req.memory_type.as_ref())?;
+    let mut declared = crate::declared_entities::validate(&req.entities)?;
 
     // PERF: Run NER and YAKE extraction in parallel using spawn_blocking
     // Both are CPU-bound and independent - parallelization reduces latency by ~40%
@@ -667,8 +705,7 @@ pub async fn remember(
         }
     };
 
-    let mut merged_entities: Vec<String> = req.tags.clone();
-    let mut tag_sources = vec![TagSource::Caller; merged_entities.len()];
+    let (mut merged_entities, mut tag_sources) = authored_tags(&declared, &req.tags);
     // FIX-10: Merge semantic intent tags with "intent:" prefix for importance boost
     for tag in &req.intent_tags {
         merged_entities.push(format!("intent:{tag}"));
@@ -731,6 +768,7 @@ pub async fn remember(
     // displaced a legitimate entity, and the cap cuts by arrival order rather than by relevance.
     let assembled_tags = merged_entities.clone();
     let redaction = crate::redaction::redact_entities(&mut merged_entities);
+    crate::declared_entities::retain_unredacted(&mut declared);
     let redacted_tags = merged_entities.clone();
     if redaction.total() > 0 {
         // Counts and classes only. The value is never logged — that would move the disclosure from
@@ -994,9 +1032,19 @@ pub async fn remember(
                 let mid = memory_id.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     if rebuild_graph {
-                        state.rebuild_experience_graph(&user_id, &experience, &mid)
+                        state.rebuild_experience_graph_declared(
+                            &user_id,
+                            &experience,
+                            &mid,
+                            &declared,
+                        )
                     } else {
-                        state.process_experience_into_graph(&user_id, &experience, &mid)
+                        state.process_experience_into_graph_declared(
+                            &user_id,
+                            &experience,
+                            &mid,
+                            &declared,
+                        )
                     }
                 })
                 .await
@@ -1358,7 +1406,8 @@ pub async fn batch_remember(
 
     // Pre-validate all items
     let mut validation_errors: Vec<BatchErrorItem> = Vec::new();
-    let mut valid_items: Vec<(usize, BatchMemoryItem, ExperienceType)> = Vec::new();
+    let mut valid_items: Vec<(usize, BatchMemoryItem, ExperienceType, Vec<DeclaredEntity>)> =
+        Vec::new();
 
     let mut seen_content: HashSet<u64> = HashSet::new();
     for (index, item) in req.memories.into_iter().enumerate() {
@@ -1397,7 +1446,17 @@ pub async fn batch_remember(
                 continue;
             }
         };
-        valid_items.push((index, item, experience_type));
+        let declared = match crate::declared_entities::validate(&item.entities) {
+            Ok(d) => d,
+            Err(e) => {
+                validation_errors.push(BatchErrorItem {
+                    index,
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        };
+        valid_items.push((index, item, experience_type, declared));
     }
 
     let memory = state
@@ -1419,8 +1478,10 @@ pub async fn batch_remember(
     let mut parent_ids: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
     let mut labelled_by_index: std::collections::HashMap<usize, TagSources> =
         std::collections::HashMap::new();
+    let mut declared_by_index: std::collections::HashMap<usize, Vec<DeclaredEntity>> =
+        std::collections::HashMap::new();
 
-    for (index, item, experience_type) in valid_items {
+    for (index, item, experience_type, mut declared) in valid_items {
         if let Some(ref pid) = item.parent_id {
             parent_ids.insert(index, pid.clone());
         }
@@ -1447,8 +1508,7 @@ pub async fn batch_remember(
             // YAKE for common nouns, verbs, concepts
             let extracted_keywords: Vec<String> = keyword_extractor.extract_texts(&item.content);
 
-            let mut merged: Vec<String> = item.tags.clone();
-            let mut sources = vec![TagSource::Caller; merged.len()];
+            let (mut merged, mut sources) = authored_tags(&declared, &item.tags);
             // Derived from here on — see crate::entity_cap.
             let authored_batch_count = merged.len();
             let mut seen: HashSet<String> = merged.iter().map(|t| t.to_lowercase()).collect();
@@ -1466,6 +1526,7 @@ pub async fn batch_remember(
             }
             let assembled = merged.clone();
             let redaction = crate::redaction::redact_entities(&mut merged);
+            crate::declared_entities::retain_unredacted(&mut declared);
             let redacted = merged.clone();
             if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
                 tracing::debug!(
@@ -1495,12 +1556,15 @@ pub async fn batch_remember(
             // The extraction branch is skipped here, so this path would otherwise reach the graph
             // with no redaction at all — a bypass that exists precisely when the cheap path is
             // taken. Submitted tags are still tags, and a caller can put a key in one.
-            let mut plain = item.tags.clone();
+            let (mut plain, sources) = authored_tags(&declared, &item.tags);
+            let before = plain.clone();
             let redaction = crate::redaction::redact_entities(&mut plain);
-            let labelled = TagSources::all_caller(&plain, &item.tags, &redaction);
+            crate::declared_entities::retain_unredacted(&mut declared);
+            let labelled = TagSources::label(&sources, &before, &plain, &plain, &redaction);
             (plain, Vec::new(), labelled)
         };
         labelled_by_index.insert(index, labelled_tags);
+        declared_by_index.insert(index, declared);
 
         let context = build_rich_context(
             item.emotional_valence,
@@ -1600,7 +1664,8 @@ pub async fn batch_remember(
         tracker.spawn(async move {
             // Task 1: Build episodic graph for each stored memory
             let mut batch_memory_ids: Vec<crate::memory::MemoryId> = Vec::new();
-            for (_, id_str, experience, rebuild) in &memory_results_bg {
+            let mut declared_by_index = declared_by_index;
+            for (index, id_str, experience, rebuild) in &memory_results_bg {
                 if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
                     let memory_id = crate::memory::MemoryId(uuid);
                     let state = state.clone();
@@ -1608,11 +1673,13 @@ pub async fn batch_remember(
                     let exp = experience.clone();
                     let mid = memory_id.clone();
                     let rebuild = *rebuild;
+                    let declared = declared_by_index.remove(index).unwrap_or_default();
                     if let Err(e) = tokio::task::spawn_blocking(move || {
                         if rebuild {
-                            state.rebuild_experience_graph(&uid, &exp, &mid)
+                            state.rebuild_experience_graph_declared(&uid, &exp, &mid, &declared)
                         } else {
-                            state.process_experience_into_graph(&uid, &exp, &mid)
+                            state
+                                .process_experience_into_graph_declared(&uid, &exp, &mid, &declared)
                         }
                     })
                     .await
@@ -1922,6 +1989,7 @@ pub async fn upsert_memory(
         "importance_adjusted" => ChangeType::ImportanceAdjusted,
         _ => ChangeType::ContentUpdated,
     };
+    let mut declared = crate::declared_entities::validate(&req.entities)?;
 
     // Extract entities via NER (preserve full records for graph label propagation)
     let ner_entities: Vec<NerEntityRecord> = match state.get_neural_ner().extract(&req.content) {
@@ -1944,8 +2012,7 @@ pub async fn upsert_memory(
     // Extract keywords via YAKE for common nouns, verbs, concepts
     let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
 
-    let mut merged_entities: Vec<String> = req.tags.clone();
-    let mut tag_sources = vec![TagSource::Caller; merged_entities.len()];
+    let (mut merged_entities, mut tag_sources) = authored_tags(&declared, &req.tags);
     // Derived from here on — see crate::entity_cap.
     let authored_entity_count = merged_entities.len();
     let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
@@ -1963,6 +2030,7 @@ pub async fn upsert_memory(
     }
     let assembled_tags = merged_entities.clone();
     let redaction = crate::redaction::redact_entities(&mut merged_entities);
+    crate::declared_entities::retain_unredacted(&mut declared);
     let redacted_tags = merged_entities.clone();
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         // Selectivity-ordered, same as the store path. See crate::entity_cap.
@@ -2152,9 +2220,14 @@ pub async fn upsert_memory(
     // Build episodic graph for multi-hop retrieval. An update rebuilds the episode, so the
     // graph does not keep the old entity set.
     let graph_result = if was_update {
-        state.rebuild_experience_graph(&req.user_id, &experience, &memory_id)
+        state.rebuild_experience_graph_declared(&req.user_id, &experience, &memory_id, &declared)
     } else {
-        state.process_experience_into_graph(&req.user_id, &experience, &memory_id)
+        state.process_experience_into_graph_declared(
+            &req.user_id,
+            &experience,
+            &memory_id,
+            &declared,
+        )
     };
     if let Err(e) = graph_result {
         tracing::debug!("Graph processing failed (non-fatal): {}", e);
@@ -2270,5 +2343,41 @@ mod client_source_type_tests {
                 "{t:?} grants source_trusted in recall.rs but is assertable by a caller"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod declared_and_ner_tests {
+    use super::authored_tags;
+    use crate::declared_entities::{validate, DeclaredEntityInput};
+    use crate::memory::tag_sources::TagSource;
+
+    fn tags(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn with_nothing_declared_the_authored_list_is_the_callers_tags() {
+        let (merged, sources) = authored_tags(&[], &tags(&["b", "a", "b"]));
+        assert_eq!(
+            merged,
+            tags(&["b", "a", "b"]),
+            "order and repeats as before"
+        );
+        assert_eq!(sources, vec![TagSource::Caller; 3]);
+    }
+
+    #[test]
+    fn declared_names_lead_and_a_repeating_tag_is_not_listed_twice() {
+        let declared = validate(&[DeclaredEntityInput {
+            name: "commitwork:admin/serve.mjs".into(),
+            label: "FilePath".into(),
+            weight: None,
+        }])
+        .unwrap();
+        let (merged, sources) =
+            authored_tags(&declared, &tags(&["auth", "Commitwork:Admin/Serve.mjs"]));
+        assert_eq!(merged, tags(&["commitwork:admin/serve.mjs", "auth"]));
+        assert_eq!(sources, vec![TagSource::Declared, TagSource::Caller]);
     }
 }

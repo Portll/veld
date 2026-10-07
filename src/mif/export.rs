@@ -483,6 +483,13 @@ fn label_to_string(label: &EntityLabel) -> String {
         EntityLabel::Role => "role".to_string(),
         EntityLabel::Module => "module".to_string(),
         EntityLabel::Other(s) => s.to_lowercase(),
+        EntityLabel::FilePath => "filepath".to_string(),
+        EntityLabel::Commit => "commit".to_string(),
+        EntityLabel::Symbol => "symbol".to_string(),
+        EntityLabel::Session => "session".to_string(),
+        EntityLabel::Agent => "agent".to_string(),
+        EntityLabel::Tool => "tool".to_string(),
+        EntityLabel::Template => "template".to_string(),
     }
 }
 

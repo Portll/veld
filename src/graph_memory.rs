@@ -178,6 +178,23 @@ pub enum EntityLabel {
     /// Code modules, packages, crates, libraries, ROS2 packages
     Module,
     Other(String),
+    // Writer-declared identifier types. Appended AFTER `Other` because bincode stores a variant
+    // as its position: anything inserted above would relabel every stored entity after it
+    // (src/storage/stored_enums.rs pins the order).
+    /// A file in a named tree, canonically `repo:relative/path`
+    FilePath,
+    /// A commit, canonically `repo@sha`
+    Commit,
+    /// A code symbol: function, type, constant
+    Symbol,
+    /// An agent session, canonically `cc:<sessionId>`
+    Session,
+    /// An agent within a session, canonically `cc:<sessionId>/<agentId>`
+    Agent,
+    /// A tool or skill an agent invoked, canonically `tool:<name>` / `skill:/<name>`
+    Tool,
+    /// A prompt or tool template, canonically `template:<tool>@<sha8>`
+    Template,
 }
 
 /// Whether an entity of this kind denotes the same referent regardless of
@@ -256,7 +273,88 @@ impl EntityLabel {
             Self::Role => "Role",
             Self::Module => "Module",
             Self::Other(s) => s.as_str(),
+            Self::FilePath => "FilePath",
+            Self::Commit => "Commit",
+            Self::Symbol => "Symbol",
+            Self::Session => "Session",
+            Self::Agent => "Agent",
+            Self::Tool => "Tool",
+            Self::Template => "Template",
         }
+    }
+
+    /// Every label a client may declare on a write, in the spelling the error message names.
+    /// `Other` is not declarable: an unrecognised label is refused, never filed as `Other`.
+    pub const DECLARABLE: &'static [&'static str] = &[
+        "Person",
+        "Organization",
+        "Location",
+        "Technology",
+        "Concept",
+        "Event",
+        "Date",
+        "Product",
+        "Skill",
+        "Keyword",
+        "Project",
+        "Task",
+        "Document",
+        "Repository",
+        "Service",
+        "Database",
+        "Metric",
+        "Configuration",
+        "Environment",
+        "Pipeline",
+        "Team",
+        "Role",
+        "Module",
+        "FilePath",
+        "Commit",
+        "Symbol",
+        "Session",
+        "Agent",
+        "Tool",
+        "Template",
+    ];
+
+    /// Parse a client-declared label, case-insensitively. `None` for anything not in
+    /// [`Self::DECLARABLE`].
+    pub fn parse_declared(s: &str) -> Option<EntityLabel> {
+        let label = match s.trim().to_ascii_lowercase().as_str() {
+            "person" => Self::Person,
+            "organization" => Self::Organization,
+            "location" => Self::Location,
+            "technology" => Self::Technology,
+            "concept" => Self::Concept,
+            "event" => Self::Event,
+            "date" => Self::Date,
+            "product" => Self::Product,
+            "skill" => Self::Skill,
+            "keyword" => Self::Keyword,
+            "project" => Self::Project,
+            "task" => Self::Task,
+            "document" => Self::Document,
+            "repository" => Self::Repository,
+            "service" => Self::Service,
+            "database" => Self::Database,
+            "metric" => Self::Metric,
+            "configuration" => Self::Configuration,
+            "environment" => Self::Environment,
+            "pipeline" => Self::Pipeline,
+            "team" => Self::Team,
+            "role" => Self::Role,
+            "module" => Self::Module,
+            "filepath" => Self::FilePath,
+            "commit" => Self::Commit,
+            "symbol" => Self::Symbol,
+            "session" => Self::Session,
+            "agent" => Self::Agent,
+            "tool" => Self::Tool,
+            "template" => Self::Template,
+            _ => return None,
+        };
+        Some(label)
     }
 
     /// Static type hierarchy: returns parent labels for ontological matching.
@@ -342,6 +440,16 @@ impl EntityLabel {
             // Unrecognised type, unknown referential scope. Fail toward not
             // merging.
             Self::Other(_) => BandRelative,
+
+            // Writer-declared identifiers whose canonical form carries its own
+            // scope: a commit sha, a session or agent id, a tool name and a
+            // template's content hash each name one referent wherever they
+            // appear.
+            Self::Commit | Self::Session | Self::Agent => Global,
+            Self::Tool | Self::Template => Global,
+            // A path or symbol is relative to its tree unless the writer
+            // qualified it, and the label cannot tell whether it did.
+            Self::FilePath | Self::Symbol => BandRelative,
         }
     }
 }
@@ -3058,22 +3166,7 @@ impl GraphMemory {
         use crate::constants::MAX_ENTITY_DEGREE;
 
         // Fast path: count edges without loading them
-        let prefix = format!("{entity_uuid}:");
-        let iter = self
-            .store
-            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
-            .into_iter()
-            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
-
-        let mut edge_count = 0usize;
-        for (key, _) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with(&prefix) {
-                    break;
-                }
-                edge_count += 1;
-            }
-        }
+        let edge_count = self.entity_degree(entity_uuid)?;
 
         if edge_count <= MAX_ENTITY_DEGREE {
             return Ok(());
@@ -3153,8 +3246,12 @@ impl GraphMemory {
             }
         }
 
+        // Debug, not info: a hub at the cap prunes on EVERY new edge, one edge at a time, so an
+        // info line here was measured at ~1,900 lines/min on the live store after ~485 writes.
+        // The total stays observable through veld_graph_degree_cap_pruned_edges_total.
         if !to_prune.is_empty() {
-            tracing::info!(
+            crate::metrics::GRAPH_DEGREE_CAP_PRUNED_EDGES.inc_by(to_prune.len() as u64);
+            tracing::debug!(
                 entity = %entity_uuid,
                 pruned = to_prune.len(),
                 remaining = MAX_ENTITY_DEGREE,
@@ -3163,6 +3260,25 @@ impl GraphMemory {
         }
 
         Ok(())
+    }
+
+    /// Number of edges indexed against an entity, counted from the entity→edge index without
+    /// loading the edges.
+    pub fn entity_degree(&self, entity_uuid: &Uuid) -> Result<usize> {
+        let prefix = format!("{entity_uuid}:");
+        let mut edge_count = 0usize;
+        for (key, _) in self
+            .store
+            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
+        {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
+                edge_count += 1;
+            }
+        }
+        Ok(edge_count)
     }
 
     /// Get relationships for an entity with optional limit
@@ -6114,6 +6230,13 @@ fn entity_type_color(label: Option<&EntityLabel>) -> String {
         Some(EntityLabel::Role) => "#8E44AD".to_string(),   // Dark purple — roles
         Some(EntityLabel::Module) => "#D35400".to_string(), // Pumpkin — code modules
         Some(EntityLabel::Other(_)) => "#AEB6BF".to_string(), // Gray
+        Some(EntityLabel::FilePath) => "#C0392B".to_string(), // Dark red — files
+        Some(EntityLabel::Commit) => "#7F8C8D".to_string(), // Slate — commits
+        Some(EntityLabel::Symbol) => "#E59866".to_string(), // Tan — symbols
+        Some(EntityLabel::Session) => "#5DADE2".to_string(), // Light blue — sessions
+        Some(EntityLabel::Agent) => "#48C9B0".to_string(),  // Aqua — agents
+        Some(EntityLabel::Tool) => "#F4D03F".to_string(),   // Yellow — tools
+        Some(EntityLabel::Template) => "#AF7AC5".to_string(), // Lilac — templates
         None => "#AEB6BF".to_string(),                      // Gray default
     }
 }
@@ -7204,6 +7327,11 @@ impl EntityExtractor {
             EntityLabel::Role => 0.55,          // Roles are semi-generic
             EntityLabel::Module => 0.55,        // Modules are code-level entities
             EntityLabel::Other(_) => 0.3,       // Unknown types get low salience
+            // Writer-declared identifiers are specific by construction.
+            EntityLabel::FilePath | EntityLabel::Symbol => 0.65,
+            EntityLabel::Commit | EntityLabel::Template => 0.6,
+            EntityLabel::Session | EntityLabel::Agent => 0.5,
+            EntityLabel::Tool => 0.55,
         };
 
         // Proper nouns get a 20% boost
@@ -9232,15 +9360,22 @@ mod tests {
             EntityLabel::Role,
             EntityLabel::Module,
             EntityLabel::Other("unrecognised".into()),
+            EntityLabel::FilePath,
+            EntityLabel::Commit,
+            EntityLabel::Symbol,
+            EntityLabel::Session,
+            EntityLabel::Agent,
+            EntityLabel::Tool,
+            EntityLabel::Template,
         ];
-        assert_eq!(all.len(), 24, "vocabulary changed — revisit merge classes");
+        assert_eq!(all.len(), 31, "vocabulary changed — revisit merge classes");
 
         let global = all
             .iter()
             .filter(|l| l.merge_class() == MergeClass::Global)
             .count();
-        assert_eq!(global, 13, "expected 13 global labels");
-        assert_eq!(all.len() - global, 11, "expected 11 band-relative labels");
+        assert_eq!(global, 18, "expected 18 global labels");
+        assert_eq!(all.len() - global, 13, "expected 13 band-relative labels");
     }
 
     #[test]
@@ -9777,6 +9912,39 @@ mod tests {
             graph.find_entity_by_name("Vornak").unwrap().map(|e| e.uuid),
             Some(reactor)
         );
+    }
+
+    #[test]
+    fn degree_cap_pruning_removes_unpotentiated_edges_before_declared_ones() {
+        use crate::constants::MAX_ENTITY_DEGREE;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let hub = graph.add_entity(named_entity("hub")).unwrap();
+        let mut protected = Vec::new();
+        for i in 0..MAX_ENTITY_DEGREE + 5 {
+            let peer = graph.add_entity(named_entity(&format!("peer{i}"))).unwrap();
+            let mut edge = typed_edge(hub, peer, RelationType::RelatedTo, 0.95);
+            edge.tier = EdgeTier::L1Working;
+            if i % 100 == 0 {
+                // A declared edge: protected, but weaker than every plain one.
+                edge.strength = 0.1;
+                edge.ltp_status = LtpStatus::Weekly;
+                edge.created_by = EdgeSource::Explicit;
+                protected.push(graph.add_relationship(edge).unwrap());
+            } else {
+                graph.add_relationship(edge).unwrap();
+            }
+        }
+        assert_eq!(graph.entity_degree(&hub).unwrap(), MAX_ENTITY_DEGREE);
+        let remaining: std::collections::HashSet<Uuid> = graph
+            .get_entity_relationships(&hub)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.uuid)
+            .collect();
+        for id in &protected {
+            assert!(remaining.contains(id), "a declared edge was pruned first");
+        }
     }
 
     #[test]
