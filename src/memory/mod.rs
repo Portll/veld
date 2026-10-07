@@ -38,6 +38,7 @@ pub mod prefetch_tick;
 pub mod prospective;
 pub mod query_parser;
 mod recall;
+pub mod recall_events;
 pub mod relation_extraction;
 pub mod replay;
 pub mod retrieval;
@@ -47,6 +48,7 @@ pub mod sessions;
 pub mod sleep_time;
 pub mod slow_store;
 pub mod storage;
+pub mod tag_sources;
 pub mod temporal_facts;
 pub mod todo_formatter;
 pub mod todos;
@@ -409,6 +411,12 @@ pub struct MemorySystem {
     /// the row to TRAINING. Per-user (backed by this MemorySystem's own KV store).
     /// Never read by the live scoring path — capture is side-effect-only.
     retrieval_trace_store: feedback::RetrievalTraceStore,
+
+    /// Source of every stored tag (caller, intent, ingest, NER, YAKE, cold-start), per memory.
+    tag_source_store: tag_sources::TagSourceStore,
+
+    /// One row per recall, including empty ones — the question side the trace store lacks.
+    recall_event_store: recall_events::RecallEventStore,
 
     /// R3a (F3): per-user PERSISTENT store for the learned-weight ranker vector.
     /// Closes the in-memory-only reset-on-restart defect by persisting/loading
@@ -1349,6 +1357,12 @@ impl MemorySystem {
             retrieval_trace_store: feedback::RetrievalTraceStore::with_kv(
                 primary_store.key_value_store(),
             ),
+            tag_source_store: tag_sources::TagSourceStore::with_kv(
+                primary_store.key_value_store(),
+            ),
+            recall_event_store: recall_events::RecallEventStore::with_kv(
+                primary_store.key_value_store(),
+            ),
             // R3a (F3): per-user persistent learned-weight store over this user's
             // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
             // weights are loaded on init (below) but NOT injected into scoring.
@@ -1525,6 +1539,14 @@ impl MemorySystem {
     /// never influence scoring or retrieval.
     pub fn retrieval_trace_store(&self) -> &feedback::RetrievalTraceStore {
         &self.retrieval_trace_store
+    }
+
+    pub fn tag_source_store(&self) -> &tag_sources::TagSourceStore {
+        &self.tag_source_store
+    }
+
+    pub fn recall_event_store(&self) -> &recall_events::RecallEventStore {
+        &self.recall_event_store
     }
 
     /// R3a (F3): read-only handle on the per-user persistent learned-weight

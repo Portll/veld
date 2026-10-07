@@ -16,9 +16,56 @@ use crate::memory::{
     },
     Experience, ExperienceType, SessionEvent,
 };
+use crate::memory::tag_sources::{TagSource, TagSources};
 use crate::metrics;
 use crate::user_memory::SharedUserMemory;
 use crate::validation;
+
+/// Write the tag-source row for a stored memory (see `memory::tag_sources`).
+///
+/// `merge_existing` is true where the write can fold into an existing record, so the stored list
+/// is a union; an upsert replaces the record's tags and its row with them. `stored: None` means
+/// the stored record could not be read back, so the row is removed. Failure to write is
+/// logged, not raised: the memory is stored, and a missing row reads as undetermined, which is
+/// true. A failure to READ the existing row removes the row rather than guessing.
+async fn record_tag_sources(
+    memory: &SharedUserMemory,
+    memory_id: &crate::memory::MemoryId,
+    incoming: TagSources,
+    stored: Option<Vec<String>>,
+    merge_existing: bool,
+) {
+    let memory = memory.clone();
+    let id = memory_id.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        let guard = memory.read();
+        let store = guard.tag_source_store();
+        let Some(stored) = stored else {
+            return store.delete(&id);
+        };
+        let existing = if merge_existing {
+            match store.get(&id) {
+                Ok(existing) => existing,
+                Err(e) => {
+                    tracing::warn!(memory_id = %id.0, error = %e, "tag sources: existing row unreadable; removing");
+                    return store.delete(&id);
+                }
+            }
+        } else {
+            None
+        };
+        match TagSources::reconcile(incoming, existing, &stored) {
+            Some(row) => store.put(&id, &row),
+            None => store.delete(&id),
+        }
+    })
+    .await;
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(memory_id = %memory_id.0, error = %e, "tag sources: write failed"),
+        Err(e) => tracing::warn!(memory_id = %memory_id.0, error = %e, "tag sources: task failed"),
+    }
+}
 
 // =============================================================================
 // REQUEST/RESPONSE TYPES
@@ -619,9 +666,11 @@ pub async fn remember(
     };
 
     let mut merged_entities: Vec<String> = req.tags.clone();
+    let mut tag_sources = vec![TagSource::Caller; merged_entities.len()];
     // FIX-10: Merge semantic intent tags with "intent:" prefix for importance boost
     for tag in &req.intent_tags {
         merged_entities.push(format!("intent:{tag}"));
+        tag_sources.push(TagSource::Intent);
     }
     // Everything appended from here on is DERIVED — nobody chose it. The split is what lets the cap
     // protect the writer's own tags while ranking the rest, and it has to be taken here because
@@ -632,16 +681,19 @@ pub async fn remember(
     for tag in &ingest_tags {
         if seen.insert(tag.to_lowercase()) {
             merged_entities.push(tag.clone());
+            tag_sources.push(TagSource::Ingest);
         }
     }
     for record in &ner_entities {
         if seen.insert(record.text.to_lowercase()) {
             merged_entities.push(record.text.clone());
+            tag_sources.push(TagSource::Ner);
         }
     }
     for keyword in extracted_keywords {
         if seen.insert(keyword.to_lowercase()) {
             merged_entities.push(keyword);
+            tag_sources.push(TagSource::Yake);
         }
     }
 
@@ -665,6 +717,7 @@ pub async fn remember(
             for e in cold_entities {
                 if seen.insert(e.text.to_lowercase()) {
                     merged_entities.push(e.text);
+                    tag_sources.push(TagSource::ColdStart);
                 }
             }
         }
@@ -674,7 +727,9 @@ pub async fn remember(
     // forget path does not touch the graph — so this is the only point the decision can be made.
     // Order matters twice over: filtering after truncate would mean a credential had already
     // displaced a legitimate entity, and the cap cuts by arrival order rather than by relevance.
+    let assembled_tags = merged_entities.clone();
     let redaction = crate::redaction::redact_entities(&mut merged_entities);
+    let redacted_tags = merged_entities.clone();
     if redaction.total() > 0 {
         // Counts and classes only. The value is never logged — that would move the disclosure from
         // the graph into the log, which is not a fix.
@@ -711,6 +766,13 @@ pub async fn remember(
             "Capped entities by selectivity"
         );
     }
+    let labelled_tags = TagSources::label(
+        &tag_sources,
+        &assembled_tags,
+        &redacted_tags,
+        &merged_entities,
+        &redaction,
+    );
 
     let experience_type_str = format!("{:?}", experience_type);
 
@@ -772,6 +834,7 @@ pub async fn remember(
     // downstream pass runs on the merged experience, not the request's.
     let rebuild_graph = outcome.needs_graph_rebuild();
     let experience = outcome.merged_experience.unwrap_or(experience);
+    record_tag_sources(&memory, &memory_id, labelled_tags, Some(experience.tags.clone()), true).await;
 
     // Background: complete embedding + vector indexing.
     // The memory is already searchable via BM25; vector search follows in ~150ms.
@@ -1345,13 +1408,15 @@ pub async fn batch_remember(
         Option<chrono::DateTime<chrono::Utc>>,
     )> = Vec::with_capacity(valid_items.len());
     let mut parent_ids: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut labelled_by_index: std::collections::HashMap<usize, TagSources> =
+        std::collections::HashMap::new();
 
     for (index, item, experience_type) in valid_items {
         if let Some(ref pid) = item.parent_id {
             parent_ids.insert(index, pid.clone());
         }
 
-        let (merged_entities, ner_records) = if extract_entities {
+        let (merged_entities, ner_records, labelled_tags) = if extract_entities {
             // NER for named entities (Person, Org, Location, Misc)
             let ner_records: Vec<NerEntityRecord> = match neural_ner.extract(&item.content) {
                 Ok(entities) => entities
@@ -1374,20 +1439,25 @@ pub async fn batch_remember(
             let extracted_keywords: Vec<String> = keyword_extractor.extract_texts(&item.content);
 
             let mut merged: Vec<String> = item.tags.clone();
+            let mut sources = vec![TagSource::Caller; merged.len()];
             // Derived from here on — see crate::entity_cap.
             let authored_batch_count = merged.len();
             let mut seen: HashSet<String> = merged.iter().map(|t| t.to_lowercase()).collect();
             for record in &ner_records {
                 if seen.insert(record.text.to_lowercase()) {
                     merged.push(record.text.clone());
+                    sources.push(TagSource::Ner);
                 }
             }
             for keyword in extracted_keywords {
                 if seen.insert(keyword.to_lowercase()) {
                     merged.push(keyword);
+                    sources.push(TagSource::Yake);
                 }
             }
-            crate::redaction::redact_entities(&mut merged);
+            let assembled = merged.clone();
+            let redaction = crate::redaction::redact_entities(&mut merged);
+            let redacted = merged.clone();
             if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
                 tracing::debug!(
                     batch_index = index,
@@ -1410,15 +1480,18 @@ pub async fn batch_remember(
                     "Capped batch entities by selectivity"
                 );
             }
-            (merged, ner_records)
+            let labelled = TagSources::label(&sources, &assembled, &redacted, &merged, &redaction);
+            (merged, ner_records, labelled)
         } else {
             // The extraction branch is skipped here, so this path would otherwise reach the graph
             // with no redaction at all — a bypass that exists precisely when the cheap path is
             // taken. Submitted tags are still tags, and a caller can put a key in one.
             let mut plain = item.tags.clone();
-            crate::redaction::redact_entities(&mut plain);
-            (plain, Vec::new())
+            let redaction = crate::redaction::redact_entities(&mut plain);
+            let labelled = TagSources::all_caller(&plain, &item.tags, &redaction);
+            (plain, Vec::new(), labelled)
         };
+        labelled_by_index.insert(index, labelled_tags);
 
         let context = build_rich_context(
             item.emotional_valence,
@@ -1477,6 +1550,21 @@ pub async fn batch_remember(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
+
+    for (index, id, effective, _) in &memory_results {
+        let (Some(labelled), Ok(uuid)) = (labelled_by_index.remove(index), uuid::Uuid::parse_str(id))
+        else {
+            continue;
+        };
+        record_tag_sources(
+            &memory,
+            &crate::memory::MemoryId(uuid),
+            labelled,
+            Some(effective.tags.clone()),
+            true,
+        )
+        .await;
+    }
 
     let memory_ids: Vec<String> = memory_results
         .iter()
@@ -1847,20 +1935,25 @@ pub async fn upsert_memory(
     let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
 
     let mut merged_entities: Vec<String> = req.tags.clone();
+    let mut tag_sources = vec![TagSource::Caller; merged_entities.len()];
     // Derived from here on — see crate::entity_cap.
     let authored_entity_count = merged_entities.len();
     let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
     for record in &ner_entities {
         if seen.insert(record.text.to_lowercase()) {
             merged_entities.push(record.text.clone());
+            tag_sources.push(TagSource::Ner);
         }
     }
     for keyword in extracted_keywords {
         if seen.insert(keyword.to_lowercase()) {
             merged_entities.push(keyword);
+            tag_sources.push(TagSource::Yake);
         }
     }
-    crate::redaction::redact_entities(&mut merged_entities);
+    let assembled_tags = merged_entities.clone();
+    let redaction = crate::redaction::redact_entities(&mut merged_entities);
+    let redacted_tags = merged_entities.clone();
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         // Selectivity-ordered, same as the store path. See crate::entity_cap.
         let mentions = mention_counts_for(&state, &req.user_id, &merged_entities);
@@ -1878,6 +1971,13 @@ pub async fn upsert_memory(
             "Capped entities by selectivity in upsert"
         );
     }
+    let labelled_tags = TagSources::label(
+        &tag_sources,
+        &assembled_tags,
+        &redacted_tags,
+        &merged_entities,
+        &redaction,
+    );
 
     // Built the way `remember` builds it, so an upsert-created record carries the same
     // AgentSession facet, declared writer, received_at stamp and episode context. Only the
@@ -1937,19 +2037,22 @@ pub async fn upsert_memory(
         .map_err(AppError::Internal)?
     };
 
-    let version = {
+    let (version, stored_tags) = {
         let memory = memory_system.clone();
         let mid = memory_id.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            memory_guard
-                .get_memory(&mid)
-                .map(|m| m.version)
-                .unwrap_or(1)
+            match memory_guard.get_memory(&mid) {
+                Ok(m) => (m.version, Some(m.experience.tags.clone())),
+                Err(_) => (1, None),
+            }
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
+    // The stored list, not the request's: an upsert's tags are the record's new tags, and the
+    // ledger has to describe the record.
+    record_tag_sources(&memory_system, &memory_id, labelled_tags, stored_tags, false).await;
 
     // W5: journal the upsert as a `Remember` (create) or `Update`
     // (existing) payload. The opaque memory bincode bytes are the same
