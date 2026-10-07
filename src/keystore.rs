@@ -748,7 +748,19 @@ pub struct UnsealedRecordKeys {
 /// when there is neither a keystore nor a passphrase: a plaintext store. A
 /// keystore present but not unsealable is an error, so ciphertext is never served
 /// as plaintext. Integrity is verified before the keys are returned.
-pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<UnsealedRecordKeys>> {
+// Serialises open-or-create of a store keystore. The record store and the journal of
+// the same tenant both unseal it; on a first run with a passphrase each would otherwise
+// create one, and records sealed under the overwritten keystore's key would be lost.
+static RECORD_KEYSTORE_OPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Unseal — or, on a first run with a passphrase, create — the store keystore at
+/// `keystore_path`. `Ok(None)` only when there is no keystore and no passphrase.
+fn unseal_record_keystore(
+    keystore_path: &std::path::Path,
+) -> Result<Option<(Keystore, SecretKey)>> {
+    let _guard = RECORD_KEYSTORE_OPEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
         .ok()
         .filter(|s| !s.is_empty());
@@ -779,6 +791,11 @@ pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<Unseal
         }
         (false, Some(pass)) => {
             let ks = Keystore::create(&pass, KdfParams::production())?;
+            // The journal can open first on a fresh tenant, before the store made
+            // its directory.
+            if let Some(dir) = keystore_path.parent() {
+                std::fs::create_dir_all(dir).context("Failed to create the keystore directory")?;
+            }
             ks.save_to_path(keystore_path)
                 .context("Failed to write keystore.json")?;
             let kek = ks.unseal_with_passphrase(&pass)?;
@@ -790,6 +807,13 @@ pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<Unseal
 
     ks.verify_integrity(&kek)
         .context("keystore integrity verification failed")?;
+    Ok(Some((ks, kek)))
+}
+
+pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<UnsealedRecordKeys>> {
+    let Some((ks, kek)) = unseal_record_keystore(keystore_path)? else {
+        return Ok(None);
+    };
     Ok(Some(UnsealedRecordKeys {
         cryptors: RecordCryptors::from_keystore(&ks, &kek)?,
         blinder: IndexBlinder::derive_from_kek(&kek),
@@ -1015,6 +1039,19 @@ impl SecretCryptor {
         };
         let (_ks, kek) = Keystore::open_or_create_at(&path, &pass)?;
         Ok(Some(Self::new(derive_secret_key(&kek, purpose))))
+    }
+
+    /// A `purpose`-bound key derived from the tenant's STORE keystore, the one its
+    /// sealed records use. Without `VELD_KEYSTORE_PATH`, records are sealed under
+    /// this keystore alone, and a journal or secret left unsealed beside them would
+    /// be a plaintext copy of what the records protect: one keystore, one decision.
+    /// `Ok(None)` when the store has no keystore and no passphrase is set.
+    pub fn from_record_keystore(
+        keystore_path: &std::path::Path,
+        purpose: &str,
+    ) -> Result<Option<Self>> {
+        Ok(unseal_record_keystore(keystore_path)?
+            .map(|(_ks, kek)| Self::new(derive_secret_key(&kek, purpose))))
     }
 
     /// Encrypt a secret blob. `aad_ctx` binds it to a caller identity (e.g. the

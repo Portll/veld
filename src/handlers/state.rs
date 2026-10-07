@@ -1214,6 +1214,30 @@ impl MultiUserMemoryManager {
         }
     }
 
+    /// Where the tenant's record store keeps its keystore: beside `storage.redb`,
+    /// or inside the RocksDB `storage/` directory.
+    fn record_keystore_path(&self, user_id: &str) -> Result<std::path::PathBuf> {
+        let user = self.user_dir(user_id)?;
+        Ok(match self.server_config.effective_storage_backend {
+            crate::config::StorageBackend::RocksDb => user.join("storage").join("keystore.json"),
+            crate::config::StorageBackend::Redb => user.join("keystore.json"),
+        })
+    }
+
+    /// Whether this tenant's data is sealed at rest: a global keystore is set, a
+    /// passphrase is set (the store creates its keystore from it), or the store
+    /// already has one (a KMS-only unseal).
+    fn tenant_encrypted(&self, user_id: &str) -> Result<bool> {
+        let set = |k: &str| {
+            std::env::var(k)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        };
+        Ok(set("VELD_KEYSTORE_PATH")
+            || set("VELD_MASTER_PASSPHRASE")
+            || self.record_keystore_path(user_id)?.exists())
+    }
+
     /// The per-user state directory, with the identifier validated as a single path component
     /// BEFORE it is joined — `user_id` arrives from HTTP/MCP/CLI callers, and `../` or an
     /// absolute path in it would escape `base_path` at every join below. Every user-scoped path
@@ -1983,8 +2007,21 @@ impl MultiUserMemoryManager {
         // keystore-derived "journal" purpose key — so the WAL never holds
         // plaintext memory snapshots on disk (or in backups). `None` (no keystore
         // configured) keeps the journal plaintext, backward compatible.
-        let journal_cryptor = crate::keystore::SecretCryptor::from_env("journal")
-            .with_context(|| format!("derive journal encryptor for user {user_id}"))?;
+        // Without VELD_KEYSTORE_PATH the key comes from the store's own keystore:
+        // a passphrase alone seals the records, and the journal beside them holds
+        // the same memories, so it is sealed under the same keystore.
+        let journal_cryptor = match crate::keystore::SecretCryptor::from_env("journal")
+            .with_context(|| format!("derive journal encryptor for user {user_id}"))?
+        {
+            Some(cryptor) => Some(cryptor),
+            None => crate::keystore::SecretCryptor::from_record_keystore(
+                &self.record_keystore_path(user_id)?,
+                "journal",
+            )
+            .with_context(|| {
+                format!("derive journal encryptor for user {user_id} from its store keystore")
+            })?,
+        };
         let log = crate::intent_log::IntentLog::open_with_cryptor(&log_path, journal_cryptor)
             .with_context(|| format!("open intent log for user {user_id}"))?;
         let checkpoint_store = std::sync::Arc::new(parking_lot::Mutex::new(
