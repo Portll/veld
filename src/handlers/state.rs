@@ -1939,11 +1939,20 @@ impl MultiUserMemoryManager {
         }
         let user_path = self.user_dir(user_id)?;
         let bm25_path = user_path.join(crate::memory::BM25_INDEX_DIR);
-        std::fs::create_dir_all(&bm25_path)?;
-        let index = std::sync::Arc::new(
-            crate::memory::BM25Index::new(&bm25_path)
-                .with_context(|| format!("open BM25 projection index for user {user_id}"))?,
-        );
+        // An encrypted tenant's index stays in memory: on disk it would be a
+        // plaintext copy of the content its sealed records and journal protect.
+        let index = if self.tenant_encrypted(user_id)? {
+            std::sync::Arc::new(
+                crate::memory::BM25Index::in_memory(&bm25_path)
+                    .with_context(|| format!("open in-memory BM25 index for user {user_id}"))?,
+            )
+        } else {
+            std::fs::create_dir_all(&bm25_path)?;
+            std::sync::Arc::new(
+                crate::memory::BM25Index::new(&bm25_path)
+                    .with_context(|| format!("open BM25 projection index for user {user_id}"))?,
+            )
+        };
         self.bm25_indices.insert(user_id.to_string(), index.clone());
         Ok(index)
     }
@@ -2139,8 +2148,16 @@ impl MultiUserMemoryManager {
         // Third projection: BM25 inverted index. Same independent-checkpoint
         // pattern — a stalled BM25 can't block the others' catch-up.
         let bm25_index = self.get_user_bm25_index(user_id)?;
-        let mut bm25_projection =
-            crate::memory::Bm25Projection::new(bm25_index.clone(), checkpoint_store.clone());
+        // An in-memory index starts empty every time, so its projection replays
+        // the whole log rather than resuming from the checkpoint a past index wrote.
+        let mut bm25_projection = if bm25_index.is_in_memory() {
+            crate::memory::Bm25Projection::new_from_start(
+                bm25_index.clone(),
+                checkpoint_store.clone(),
+            )
+        } else {
+            crate::memory::Bm25Projection::new(bm25_index.clone(), checkpoint_store.clone())
+        };
         let bm25_applied = crate::intent_log::replay(
             &log,
             &mut bm25_projection,
