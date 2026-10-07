@@ -959,6 +959,13 @@ impl CrossEncoderReranker {
         }
     }
 
+    /// Score one pair through the cross-encoder, loading it if it has not loaded yet, and
+    /// return its id. An error means [`Self::rerank`] would fall back to bi-encoder scores.
+    pub fn probe(&self) -> Result<String> {
+        self.cross_encoder.score_pairs("probe", &["probe"])?;
+        Ok(self.cross_encoder.id().to_string())
+    }
+
     /// Rerank candidates using true cross-encoder with bi-encoder fallback
     ///
     /// Takes (memory_id, content, current_score, stored_embedding) and returns
