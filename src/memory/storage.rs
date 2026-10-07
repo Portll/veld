@@ -586,6 +586,18 @@ impl LegacyMemoryV2 {
 ///
 /// Returns (Memory, needs_migration) where needs_migration=true means the data
 /// was in a legacy format and should be re-written for future performance.
+/// Content in the retired field-level format is opened here and the record flagged,
+/// so the lazy migration rewrites it sealed under the keystore.
+fn open_legacy_field((mut memory, needs_migration): (Memory, bool)) -> Result<(Memory, bool)> {
+    match crate::legacy_field_encryption::open_legacy_content(&memory.experience.content)? {
+        Some(plain) => {
+            memory.experience.content = plain;
+            Ok((memory, true))
+        }
+        None => Ok((memory, needs_migration)),
+    }
+}
+
 fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
     // Reject obviously corrupt entries before any deserialization attempt.
     // A single memory should never exceed 64MB — corrupt varint length fields
@@ -1268,6 +1280,11 @@ pub struct MemoryStorage {
 
 #[cfg(feature = "rocksdb")]
 impl MemoryStorage {
+    /// Whether this store seals its records (a keystore is unsealed).
+    pub fn encrypts_records(&self) -> bool {
+        self.record_cryptors.is_some()
+    }
+
     /// CF accessor for the memory_index column family
     fn index_cf(&self) -> &ColumnFamily {
         self.db
@@ -1381,6 +1398,7 @@ impl MemoryStorage {
             Some((cryptors, blinder)) => (Some(cryptors), Some(blinder)),
             None => (None, None),
         };
+        crate::legacy_field_encryption::check_config(record_cryptors.is_some())?;
 
         Ok(Self {
             db,
@@ -1483,9 +1501,9 @@ impl MemoryStorage {
             let plaintext = cryptor
                 .decrypt_record(data, id)
                 .context("Failed to decrypt memory record")?;
-            deserialize_memory(&plaintext)
+            open_legacy_field(deserialize_memory(&plaintext)?)
         } else {
-            deserialize_memory(data)
+            open_legacy_field(deserialize_memory(data)?)
         }
     }
 
