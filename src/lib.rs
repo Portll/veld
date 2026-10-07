@@ -25,6 +25,7 @@ pub mod decay;
 pub mod decay_scales;
 pub mod embeddings;
 pub mod entity_cap;
+pub mod entity_frequency;
 pub mod entity_hygiene;
 pub mod errors;
 #[cfg(feature = "multi-tenant")]

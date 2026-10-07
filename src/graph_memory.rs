@@ -5843,6 +5843,25 @@ impl GraphMemory {
         Ok(entities)
     }
 
+    /// Every episode, plus the number of rows that did not decode. The caller reports that
+    /// number rather than this function hiding it: a count over a partially readable store is a
+    /// lower bound, not a measurement.
+    pub fn get_all_episodes(&self) -> Result<(Vec<EpisodicNode>, usize)> {
+        let mut episodes = Vec::new();
+        let mut undecodable = 0usize;
+        for (_, value) in self.store.scan_cf(CF_EPISODES, None, None)? {
+            match bincode::serde::decode_from_slice::<EpisodicNode, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                Ok((episode, _)) => episodes.push(episode),
+                Err(_) => undecodable += 1,
+            }
+        }
+        episodes.sort_by(|a, b| a.valid_at.cmp(&b.valid_at).then_with(|| a.uuid.cmp(&b.uuid)));
+        Ok((episodes, undecodable))
+    }
+
     /// Count of edges per relation type, descending then alphabetical.
     /// Read by the recall harness's ontology report.
     pub fn relation_type_distribution(&self) -> Result<Vec<(String, usize)>> {

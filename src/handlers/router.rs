@@ -452,6 +452,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/graph/entity/delete", delete(graph::delete_entity))
         .route("/api/graph/entities/all", post(graph::get_all_entities))
         .route(
+            "/api/graph/entities/frequency",
+            post(graph::get_entity_frequency),
+        )
+        .route(
             "/api/graph/relationship/invalidate",
             post(graph::invalidate_relationship),
         )

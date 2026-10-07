@@ -14,6 +14,8 @@ use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
 use super::utils::resolve_request_user_id;
 use crate::auth::AuthenticatedUser;
+use crate::entity_frequency::{frequency, Bucket, Frequency, Window};
+use crate::entity_hygiene::{classify, Shelf};
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, GraphTraversal, MemoryUniverse};
 use crate::memory::{Experience, MemoryId};
@@ -148,6 +150,46 @@ pub async fn get_episode(
 pub struct GetAllEntitiesRequest {
     pub user_id: String,
     pub limit: Option<usize>,
+    /// Keep only entities whose lexical shelf matches, applied before `limit`.
+    #[serde(default)]
+    pub shelf: Option<Shelf>,
+    /// Join each entity's tag-source provenance (one scan of the tag_source store).
+    #[serde(default)]
+    pub with_sources: bool,
+    /// `name_embedding` is 768 floats per row; a client that draws names does not need it.
+    #[serde(default = "default_true")]
+    pub include_embeddings: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Per-tag provenance folded over every memory that stored the tag. Absent when no row names
+/// the tag: records written before the store existed are undetermined, not caller-authored.
+#[derive(Debug, Default, serde::Serialize)]
+struct EntityProvenance {
+    memories: usize,
+    redacted: usize,
+    sources: std::collections::BTreeMap<&'static str, usize>,
+}
+
+fn fold_provenance(
+    rows: &std::collections::HashMap<MemoryId, crate::memory::tag_sources::TagSources>,
+) -> std::collections::HashMap<String, EntityProvenance> {
+    let mut out: std::collections::HashMap<String, EntityProvenance> =
+        std::collections::HashMap::new();
+    for sources in rows.values() {
+        for tag in &sources.tags {
+            let entry = out.entry(tag.tag.clone()).or_default();
+            entry.memories += 1;
+            if tag.redacted {
+                entry.redacted += 1;
+            }
+            *entry.sources.entry(tag.source.as_str()).or_default() += 1;
+        }
+    }
+    out
 }
 
 /// POST /api/graph/entities/all - Get all entities
@@ -163,14 +205,123 @@ pub async fn get_all_entities(
 
     let entities = blocking(move || graph.read().get_all_entities()).await?;
 
+    let provenance = if req.with_sources {
+        let memory = state
+            .get_user_memory(&req.user_id)
+            .map_err(AppError::Internal)?;
+        let rows = blocking(move || memory.read().tag_source_store().all()).await?;
+        Some(fold_provenance(&rows))
+    } else {
+        None
+    };
+
+    let total = entities.len();
     let limit = req.limit.unwrap_or(100);
-    let entities: Vec<_> = entities.into_iter().take(limit).collect();
-    let count = entities.len();
+    let mut rows = Vec::new();
+    let mut shelf_counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for mut entity in entities {
+        let hygiene = classify(&entity.name, entity.is_proper_noun);
+        *shelf_counts.entry(shelf_name(hygiene.shelf)).or_default() += 1;
+        if req.shelf.is_some_and(|s| s != hygiene.shelf) {
+            continue;
+        }
+        if rows.len() >= limit {
+            continue;
+        }
+        if !req.include_embeddings {
+            entity.name_embedding = None;
+        }
+        let mut row = serde_json::to_value(&entity).map_err(|e| AppError::Internal(e.into()))?;
+        row["hygiene"] = serde_json::to_value(hygiene).map_err(|e| AppError::Internal(e.into()))?;
+        if let Some(provenance) = &provenance {
+            row["provenance"] = match provenance.get(&entity.name) {
+                Some(p) => serde_json::to_value(p).map_err(|e| AppError::Internal(e.into()))?,
+                None => serde_json::Value::Null,
+            };
+        }
+        rows.push(row);
+    }
+    let count = rows.len();
 
     Ok(Json(serde_json::json!({
-        "entities": entities,
-        "count": count
+        "entities": rows,
+        "count": count,
+        "total": total,
+        "shelves": shelf_counts,
+        "witness": "graph.entities",
     })))
+}
+
+fn shelf_name(shelf: Shelf) -> &'static str {
+    match shelf {
+        Shelf::Cast => "cast",
+        Shelf::Vocabulary => "vocabulary",
+        Shelf::Noise => "noise",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EntityFrequencyRequest {
+    pub user_id: String,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub bucket: Bucket,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub shelf: Option<Shelf>,
+}
+
+/// POST /api/graph/entities/frequency - Entity mentions per day or week over a window.
+///
+/// The window defaults to the 28 days ending now and is echoed back, so two readers can tell
+/// whether they measured the same thing.
+pub async fn get_entity_frequency(
+    State(state): State<AppState>,
+    Json(req): Json<EntityFrequencyRequest>,
+) -> Result<Json<Frequency>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let until = req.until.unwrap_or_else(chrono::Utc::now);
+    let since = req.since.unwrap_or(until - chrono::Duration::days(28));
+    if since >= until {
+        return Err(AppError::InvalidInput {
+            field: "since".to_string(),
+            reason: "since must be before until".to_string(),
+        });
+    }
+    let limit = req.limit.unwrap_or(50);
+    if limit == 0 {
+        return Err(AppError::InvalidInput {
+            field: "limit".to_string(),
+            reason: "limit must be at least 1".to_string(),
+        });
+    }
+    let window = Window {
+        since,
+        until,
+        bucket: req.bucket,
+        limit,
+        shelf: req.shelf,
+    };
+
+    let graph = state
+        .get_user_graph(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let result = blocking(move || {
+        let graph = graph.read();
+        let (episodes, undecodable) = graph.get_all_episodes()?;
+        let names: std::collections::HashMap<_, _> = graph
+            .get_all_entities()?
+            .into_iter()
+            .map(|e| (e.uuid, (e.name, e.is_proper_noun)))
+            .collect();
+        Ok(frequency(&episodes, undecodable, &names, &window))
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// GET /api/graph/{user_id}/universe - Get Memory Universe visualization
@@ -537,5 +688,57 @@ mod delete_entity_route_tests {
             body.contains("authenticated_user"),
             "delete_entity does not take the authenticated user extension"
         );
+    }
+}
+
+#[cfg(test)]
+mod entity_frequency_route_tests {
+    use std::fs;
+    use std::path::Path;
+
+    const ROUTE: &str = "/api/graph/entities/frequency";
+
+    fn router_src() -> String {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/router.rs");
+        fs::read_to_string(p).expect("router.rs must be readable")
+    }
+
+    #[test]
+    fn the_frequency_route_is_mounted_as_post_behind_auth() {
+        let src = router_src();
+        let protected_at = src
+            .find("pub fn build_protected_routes")
+            .expect("build_protected_routes must exist");
+        let route_at = src.find(ROUTE).expect("route must be mounted");
+        assert!(route_at > protected_at, "{ROUTE} sits on a public or probe router");
+        let after = &src[route_at..route_at + 200];
+        assert!(
+            after.contains("post(graph::get_entity_frequency)"),
+            "{ROUTE} must be mounted as POST on graph::get_entity_frequency"
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_window_fields_deserialises_to_defaults() {
+        let req: super::EntityFrequencyRequest =
+            serde_json::from_str(r#"{"user_id":"u"}"#).unwrap();
+        assert!(req.since.is_none() && req.until.is_none());
+        assert_eq!(req.bucket, super::Bucket::Day);
+        assert!(req.shelf.is_none());
+        let req: super::EntityFrequencyRequest =
+            serde_json::from_str(r#"{"user_id":"u","bucket":"week","shelf":"noise","limit":3}"#)
+                .unwrap();
+        assert_eq!(req.bucket, super::Bucket::Week);
+        assert_eq!(req.shelf, Some(super::Shelf::Noise));
+        assert_eq!(req.limit, Some(3));
+    }
+
+    #[test]
+    fn entities_all_request_defaults_keep_the_old_shape() {
+        let req: super::GetAllEntitiesRequest =
+            serde_json::from_str(r#"{"user_id":"u","limit":5}"#).unwrap();
+        assert!(req.include_embeddings, "embeddings stay on by default for existing readers");
+        assert!(!req.with_sources);
+        assert!(req.shelf.is_none());
     }
 }
