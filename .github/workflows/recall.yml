@@ -42,14 +42,16 @@ on:
         options: ['false', 'true']
       model_tape:
         description: >-
-          Model tape (src/embeddings/model_tape.rs). record runs the models and uploads every
-          output they gave as the model-tape-<engine> artifact. replay answers every model call
-          from the RocksDB tape of run tape_run instead, so no model arithmetic happens and the
-          result cannot depend on the CPU.
+          Model tape (src/embeddings/model_tape.rs). pinned replays the tape named in
+          tests/recall/model-tape.json, as the schedule does, so no model arithmetic happens and
+          the result cannot depend on the CPU; with no pin file the models run live. record runs
+          the models and uploads every output they gave as the model-tape-<engine> artifact.
+          replay answers every model call from the RocksDB tape of run tape_run. off runs the
+          models live.
         required: false
-        default: 'off'
+        default: 'pinned'
         type: choice
-        options: ['off', 'record', 'replay']
+        options: ['pinned', 'off', 'record', 'replay']
       tape_run:
         description: 'Run id whose model-tape-rocksdb artifact to replay (model_tape=replay only)'
         required: false
@@ -79,7 +81,8 @@ env:
   # baseline and is never gated.
   SUITE: ${{ github.event.inputs.suite || 'locomo-gate' }}
   RECORD: ${{ github.event.inputs.record || 'false' }}
-  MODEL_TAPE: ${{ github.event.inputs.model_tape || 'off' }}
+  # Scheduled runs replay the pinned tape: the same model outputs on every runner.
+  MODEL_TAPE: ${{ github.event.inputs.model_tape || 'pinned' }}
 
 jobs:
   gate:
@@ -129,19 +132,60 @@ jobs:
           path: ~/.cache/veld/cross-encoder
           key: veld-cross-encoder-${{ runner.os }}-${{ hashFiles('src/embeddings/cross_encoder.rs') }}
 
-      - name: Fetch the model tape to replay
-        if: env.MODEL_TAPE == 'replay'
+      - name: Cache the pinned model tape
+        if: env.MODEL_TAPE == 'pinned' && hashFiles('tests/recall/model-tape.json') != ''
+        uses: actions/cache@v4
+        with:
+          path: model-tape
+          key: model-tape-${{ hashFiles('tests/recall/model-tape.json') }}
+
+      # Decides where this run's model outputs come from and exports TAPE_PATH (empty: the models
+      # run live). A pinned tape is checked against its pinned sha256; recall-eval records the same
+      # digest in its report, and compare_to_baseline refuses two reports whose model outputs came
+      # from different places.
+      - name: Resolve the model tape
         env:
           GH_TOKEN: ${{ github.token }}
           TAPE_RUN: ${{ github.event.inputs.tape_run }}
         run: |
           set -euo pipefail
-          if [ -z "$TAPE_RUN" ]; then
-            echo "::error::model_tape=replay needs tape_run, the id of a run that recorded one."
-            exit 1
-          fi
-          gh run download "$TAPE_RUN" --repo "$GITHUB_REPOSITORY" -n model-tape-rocksdb -D model-tape
-          ls -la model-tape
+          TAPE_PATH=""
+          case "$MODEL_TAPE" in
+            pinned)
+              PIN=tests/recall/model-tape.json
+              if [ -f "$PIN" ]; then
+                TAG=$(jq -r '.tag' "$PIN")
+                ASSET=$(jq -r '.asset' "$PIN")
+                SHA=$(jq -r '.sha256' "$PIN")
+                mkdir -p model-tape
+                if [ ! -f "model-tape/$ASSET" ]; then
+                  gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "$ASSET" -D model-tape
+                fi
+                echo "$SHA  model-tape/$ASSET" | sha256sum -c - || {
+                  echo "::error::model-tape/$ASSET does not match the sha256 pinned in $PIN."
+                  exit 1
+                }
+                TAPE_PATH="model-tape/$ASSET"
+              else
+                echo "::notice::No pinned model tape ($PIN), so the models run live."
+              fi
+              ;;
+            replay)
+              if [ -z "$TAPE_RUN" ]; then
+                echo "::error::model_tape=replay needs tape_run, the id of a run that recorded one."
+                exit 1
+              fi
+              gh run download "$TAPE_RUN" --repo "$GITHUB_REPOSITORY" -n model-tape-rocksdb -D model-tape
+              TAPE_PATH="model-tape/model-tape-rocksdb.jsonl.gz"
+              ;;
+            record|off) ;;
+            *)
+              echo "::error::unknown model_tape value '$MODEL_TAPE'"
+              exit 1
+              ;;
+          esac
+          echo "Model tape: mode=$MODEL_TAPE path=${TAPE_PATH:-<none, models run live>}"
+          echo "TAPE_PATH=$TAPE_PATH" >> "$GITHUB_ENV"
 
       - name: Build recall-eval
         run: cargo build --release --bin recall-eval ${{ matrix.features }}
@@ -154,7 +198,7 @@ jobs:
           # GLiNER.
           SHODH_ALLOW_FALLBACK_NER: '1'
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
-          VELD_MODEL_TAPE_REPLAY: ${{ env.MODEL_TAPE == 'replay' && 'model-tape/model-tape-rocksdb.jsonl.gz' || '' }}
+          VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
         run: |
           set +e
           set -o pipefail

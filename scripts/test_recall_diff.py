@@ -24,6 +24,7 @@ from recall_diff import (
     render_case_moves,
     rerank_note,
     resolution_note,
+    tape_note,
 )
 
 CASES = {"multi_hop": 25, "open_domain": 10, "single_hop": 35, "temporal": 30}
@@ -269,11 +270,27 @@ class TestRerankNote:
             assert any("Not comparable" in l for l in lines)
 
 
+class TestTapeNote:
+    def test_same_tape_does_not_warn(self):
+        lines = tape_note({"model_tape": "a" * 64}, {"model_tape": "a" * 64})
+        assert lines[0] == f"Model outputs: baseline replayed from tape `{'a' * 12}` → current replayed from tape `{'a' * 12}`"
+        assert not any("Not comparable" in l for l in lines)
+
+    def test_live_against_replay_or_two_tapes_warns(self):
+        for base, cur in (({}, {"model_tape": "a" * 64}), ({"model_tape": "a" * 64}, {"model_tape": "b" * 64})):
+            assert any("Not comparable" in l for l in tape_note(base, cur))
+
+    def test_two_live_runs_do_not_warn(self):
+        lines = tape_note({}, {})
+        assert lines[0] == "Model outputs: baseline computed live → current computed live"
+        assert not any("Not comparable" in l for l in lines)
+
+
 if __name__ == "__main__":
     # A plain runner, because this repo ships no python test dependency and a
     # test that cannot be run is documentation.
     failed = 0
-    for cls in (TestCaseCounts, TestResolutionNote, TestCaseMoves, TestRerankNote):
+    for cls in (TestCaseCounts, TestResolutionNote, TestCaseMoves, TestRerankNote, TestTapeNote):
         instance = cls()
         for name in sorted(n for n in dir(cls) if n.startswith("test_")):
             try:

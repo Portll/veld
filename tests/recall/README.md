@@ -53,7 +53,26 @@ MiniLM embedder, the cross-encoder and, when it loads, the neural NER give, keye
 replay miss, a tape recorded from other model files, or a model the replay never loaded fails the
 run as infrastructure rather than falling back. A recording also scores every (query, corpus item)
 cross-encoder pair the run did not, so a retrieval change that hands the reranker another candidate
-still finds it. The workflow's `model_tape` input (`record`, `replay` with `tape_run`) drives both.
+still finds it.
+
+The workflow's `model_tape` input drives it. `pinned`, the default and what the schedule runs,
+replays the tape named in `tests/recall/model-tape.json` (`{"tag", "asset", "sha256"}`, a GitHub
+release asset) after checking its sha256; with no pin file, as now, the models run live. `record`
+uploads each engine's tape as `model-tape-<engine>`; `replay` with `tape_run` replays another run's
+RocksDB tape. Every report records the tape it replayed as `model_tape`, and `recall-eval` refuses
+to compare a live run with a replayed one, or two different tapes. So pinning a tape is three steps
+taken together:
+
+1. `gh workflow run recall.yml --ref main -f model_tape=record`, and check the run reports no tape
+   problem and that repeats after the first added no entries.
+2. Publish `model-tape-rocksdb.jsonl.gz` as a release asset under a new tag, and write the pin
+   file with that tag, the asset name and its sha256.
+3. Record the baseline again with `model_tape=pinned` and `record=true`. The baseline and the pin
+   must name the same tape.
+
+A change to what a model is fed (another corpus text, a prefix, another candidate source) or a
+model or ONNX Runtime upgrade needs a new tape: replay misses fail the run, and the tape refuses
+model files other than the ones it was recorded from.
 
 ## Files
 

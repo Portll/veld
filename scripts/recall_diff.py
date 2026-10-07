@@ -317,6 +317,33 @@ def rerank_note(baseline: dict[str, Any], current: dict[str, Any]) -> list[str]:
     return lines
 
 
+def tape_note(baseline: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    """Say where each side's model outputs came from, and warn when they differ.
+
+    A replayed run answers every model call from a recorded tape, so two runs of one tape saw
+    byte-identical embeddings, entities and reranker scores. A live run and a replayed one, or
+    two tapes, are two sets of model outputs; the Rust comparator refuses such a pair and this
+    says why.
+    """
+
+    def describe(report: dict[str, Any]) -> str:
+        t = report.get("model_tape")
+        return f"replayed from tape `{t[:12]}`" if t else "computed live"
+
+    lines = [f"Model outputs: baseline {describe(baseline)} → current {describe(current)}"]
+    if baseline.get("model_tape") != current.get("model_tape"):
+        lines += [
+            "",
+            "> [!WARNING]",
+            "> **Not comparable: the two runs' model outputs came from different "
+            "places.** The numbers below compare two sets of embeddings, entities and "
+            "reranker scores, not two versions of the code. The gate refuses this "
+            "comparison as infrastructure.",
+        ]
+    lines.append("")
+    return lines
+
+
 def render(
     baseline: dict[str, Any],
     current: dict[str, Any],
@@ -334,6 +361,7 @@ def render(
         f"({current.get('embedder', '?')}) · tolerance **{tolerance_pct:.1f}%**"
     )
     lines.extend(rerank_note(baseline, current))
+    lines.extend(tape_note(baseline, current))
     base_repeats = baseline.get("repeats", 1)
     cur_repeats = current.get("repeats", 1)
     lines.append(
@@ -517,6 +545,8 @@ def render(
 
 __all__ = [
     "COMMENT_MARKER",
+    "rerank_note",
+    "tape_note",
     "classify_case_moves",
     "load_per_case",
     "load_report",
