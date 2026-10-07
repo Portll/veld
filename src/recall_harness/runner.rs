@@ -576,6 +576,7 @@ fn run_one_pass(
     // is actually built, then query the per-user `MemorySystem` (which now has a
     // populated graph wired in). The manager is kept alive for the whole pass.
     let manager = build_manager(storage_path)?;
+    guard_cross_encoder(&manager)?;
 
     // The NER-backend gate now lives in `ingest_corpus`, so every measurement
     // path is covered rather than only the two that remembered to ask.
@@ -778,6 +779,32 @@ fn run_one_pass(
                 );
             }
 
+            // Only emit the "missing relevance map" failure once across modes
+            // — the relevance map is a function of fixtures + ingest, not
+            // the mode, so duplicating it would clutter the failure list.
+            if relevance.is_empty() && *mode == layer_modes[0] {
+                failures.push(Failure {
+                    kind: "case".to_string(),
+                    detail: format!(
+                        "case {}: every relevant corpus item was missing from id_map (ingest skipped them)",
+                        case.id
+                    ),
+                });
+            }
+
+            let metrics = Metrics::compute(&retrieved_uuids, &relevance, SMOKE_K);
+            by_category_cases
+                .entry(case.category)
+                .or_default()
+                .push(metrics);
+            per_case.push(metrics);
+        }
+
+        // Diagnostic recalls run after the last timed recall, never between two of them, so
+        // whatever they leave behind in caches or the allocator cannot shape the gated
+        // latency. They are read-only and aligned with the rank lists by index.
+        for (k, case) in cases.iter().enumerate() {
+            let relevance = build_relevance_map(case, &id_map);
             // Depth diagnostics: a second, production-shaped recall at
             // `max_results = diag_k` feeds ONLY the per-case recall@50/@100
             // fields (see the diag_k comment above for why it must not be the
@@ -821,11 +848,7 @@ fn run_one_pass(
             } else {
                 // Diagnostic off: the depth fields degrade to the production
                 // list, exactly as before the two-query split.
-                ranks
-                    .last()
-                    .expect("production rank list was pushed above")
-                    .retrieved
-                    .clone()
+                ranks[k].retrieved.clone()
             };
             if pool_export.is_some() && matches!(*mode, LayerMode::Full) {
                 // Corpus ids, matching `pool` -- `relevance` is keyed by Uuid while
@@ -856,26 +879,6 @@ fn run_one_pass(
                 case_id: case.id.clone(),
                 retrieved: deep_retrieved,
             });
-
-            // Only emit the "missing relevance map" failure once across modes
-            // — the relevance map is a function of fixtures + ingest, not
-            // the mode, so duplicating it would clutter the failure list.
-            if relevance.is_empty() && *mode == layer_modes[0] {
-                failures.push(Failure {
-                    kind: "case".to_string(),
-                    detail: format!(
-                        "case {}: every relevant corpus item was missing from id_map (ingest skipped them)",
-                        case.id
-                    ),
-                });
-            }
-
-            let metrics = Metrics::compute(&retrieved_uuids, &relevance, SMOKE_K);
-            by_category_cases
-                .entry(case.category)
-                .or_default()
-                .push(metrics);
-            per_case.push(metrics);
         }
 
         per_mode.insert(
@@ -1777,7 +1780,12 @@ fn preflight_ablation_env(configs: &[AblationConfig]) -> Result<()> {
 /// is missing, so without this a run would report the unreranked pipeline under
 /// the shipped one's name. Loads the model now and scores one pair. Nothing is
 /// checked when the `use_reranking` dial is off, since then no reranker runs.
+/// `cfg!(test)` is exempt, as in [`guard_ner_backend`]: lib tests exercise the
+/// harness machinery on machines that may lack the model.
 pub(crate) fn guard_cross_encoder(manager: &MultiUserMemoryManager) -> Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
     let system = manager.get_user_memory(EVAL_USER)?;
     let system = system.read();
     if system.cognitive_dials().use_reranking == Some(false) {
