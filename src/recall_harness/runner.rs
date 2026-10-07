@@ -293,7 +293,10 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
     // RH-8: within each pass, ingest happens once and the case loop runs
     // once per `LayerMode`. Determinism check is per-mode.
     let mut passes: Vec<OnePassResult> = Vec::with_capacity(repeats);
+    // Model tape coverage: inputs the models were first asked for in each repeat.
+    let mut tape_growth: Vec<(usize, usize)> = Vec::new();
     for i in 0..repeats {
+        let tape_before = crate::embeddings::model_tape::entry_count();
         let pass_storage = if repeats == 1 {
             // Preserve the historical layout for single-repeat runs so
             // existing CI artifacts and the integration test stay valid.
@@ -310,7 +313,12 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         )
         .with_context(|| format!("repeat {i} of {repeats}"))?;
         passes.push(pass);
+        let added = crate::embeddings::model_tape::entry_count() - tape_before;
+        if i > 0 && added > 0 {
+            tape_growth.push((i, added));
+        }
     }
+    let tape_failures = finish_model_tape(&corpus, &tape_growth, &inputs.git_sha);
 
     // ------------------------------------------------------------------
     // Determinism check across repeats. Two passes against the same
@@ -320,6 +328,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
     // `infrastructure` failure so reviewers see the full picture.
     // ------------------------------------------------------------------
     let mut failures: Vec<Failure> = passes[0].failures.clone();
+    failures.extend(tape_failures);
     for (i, pass) in passes.iter().enumerate().skip(1) {
         if pass.rerank != passes[0].rerank {
             failures.push(Failure {
@@ -942,6 +951,120 @@ fn run_one_pass(
         failures,
         rerank,
     })
+}
+
+/// Close out a model tape at the end of a suite run, returning what must fail the run.
+///
+/// Recording: every (query, corpus item) cross-encoder pair the run did not score is
+/// scored now, so a later retrieval change that puts another candidate in the pool
+/// still finds it on the tape; then the tape is written. Replaying: every model in the
+/// tape's header must have been checked against the files this process loaded. Either
+/// way, any miss, mismatch or failed model call becomes an `infrastructure` failure,
+/// because the numbers did not come from the tape they claim to. `growth` lists the
+/// repeats after the first that asked the models for new inputs.
+fn finish_model_tape(
+    corpus: &[CorpusItem],
+    growth: &[(usize, usize)],
+    git_sha: &str,
+) -> Vec<Failure> {
+    use crate::embeddings::model_tape as tape;
+    let mut failures = Vec::new();
+    if !tape::active() {
+        return failures;
+    }
+    let infra = |detail: String| Failure {
+        kind: "infrastructure".to_string(),
+        detail: format!("model tape: {detail}"),
+    };
+    for (repeat, added) in growth {
+        failures.push(infra(format!(
+            "repeat {repeat} asked the models for {added} inputs that no earlier repeat \
+             did, so what a run asks for is not stable and one recording cannot cover it"
+        )));
+    }
+    if tape::recording() {
+        match fill_cross_encoder_table(corpus) {
+            Ok(n) => eprintln!("  model tape: scored {n} cross-encoder pairs the run did not"),
+            Err(e) => failures.push(infra(format!("{e:#}"))),
+        }
+        let conflicts = tape::conflicts();
+        let provenance = serde_json::json!({
+            "git_sha": git_sha,
+            "arch": std::env::consts::ARCH,
+            "os": std::env::consts::OS,
+            "conflicts": conflicts,
+            "recorded_at": chrono::Utc::now().to_rfc3339(),
+        });
+        match tape::write_recording(provenance) {
+            Ok((path, n)) => eprintln!(
+                "  model tape: {n} entries -> {} (conflicts {conflicts:?})",
+                path.display()
+            ),
+            Err(e) => failures.push(infra(format!("writing the tape: {e:#}"))),
+        }
+    } else {
+        tape::require_verified_models();
+    }
+    let problems = tape::take_problems();
+    const SHOWN: usize = 20;
+    for p in problems.iter().take(SHOWN) {
+        failures.push(infra(p.clone()));
+    }
+    if problems.len() > SHOWN {
+        failures.push(infra(format!(
+            "and {} more problems",
+            problems.len() - SHOWN
+        )));
+    }
+    failures
+}
+
+/// Score, through the tape, every (query, corpus item) pair it does not hold yet.
+///
+/// The queries are the ones the run sent to the reranker. The candidates are the
+/// corpus contents, which must include every text the reranker saw apart from the
+/// harness's own load probe: if one is not a corpus item, candidates are built some
+/// other way and the corpus cannot complete the table.
+fn fill_cross_encoder_table(corpus: &[CorpusItem]) -> Result<usize> {
+    use crate::embeddings::model_tape as tape;
+    use crate::memory::hybrid_search::CROSS_ENCODER_PROBE;
+    let ce = crate::embeddings::cross_encoder::load_cross_encoder_from_env();
+    let mut seen = std::collections::HashSet::new();
+    let docs: Vec<&str> = corpus
+        .iter()
+        .map(|c| c.content.as_str())
+        .filter(|d| seen.insert(*d))
+        .collect();
+    let foreign: Vec<String> = tape::cross_encoder_docs()
+        .into_iter()
+        .filter(|d| d != CROSS_ENCODER_PROBE && !seen.contains(d.as_str()))
+        .collect();
+    if let Some(first) = foreign.first() {
+        anyhow::bail!(
+            "{} candidate texts the reranker saw are not corpus contents (first: {:?}), \
+             so the corpus cannot complete the cross-encoder table",
+            foreign.len(),
+            first.chars().take(80).collect::<String>()
+        );
+    }
+    let mut scored = 0;
+    for query in tape::cross_encoder_queries() {
+        if query == CROSS_ENCODER_PROBE {
+            continue;
+        }
+        let missing: Vec<&str> = docs
+            .iter()
+            .copied()
+            .filter(|d| !tape::has_cross_encoding(&query, d))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        ce.score_pairs(&query, &missing)
+            .with_context(|| format!("scoring pairs for query {query:?}"))?;
+        scored += missing.len();
+    }
+    Ok(scored)
 }
 
 /// Pin parallel runtimes to a single thread for the harness process.

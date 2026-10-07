@@ -43,6 +43,18 @@ moved quality:
    `locomo-gate-baseline.per-case.json`. Check that `git_sha` names the commit you meant.
 4. Add a row to the regeneration history below, naming the run.
 
+## Model tapes
+
+ONNX Runtime chooses its kernels by CPU, so the embedder and the cross-encoder return different low
+bits on different runner classes and near-ties flip. A model tape (`src/embeddings/model_tape.rs`)
+takes the models out of the measurement: `VELD_MODEL_TAPE_RECORD=<path>` records every output the
+MiniLM embedder, the cross-encoder and, when it loads, the neural NER give, keyed by the exact input;
+`VELD_MODEL_TAPE_REPLAY=<path>` answers every call from the tape and runs no model arithmetic. A
+replay miss, a tape recorded from other model files, or a model the replay never loaded fails the
+run as infrastructure rather than falling back. A recording also scores every (query, corpus item)
+cross-encoder pair the run did not, so a retrieval change that hands the reranker another candidate
+still finds it. The workflow's `model_tape` input (`record`, `replay` with `tape_run`) drives both.
+
 ## Files
 
 - `corpora/shodh-smoke.jsonl` — L1 smoke corpus (memories ingested by the runner).
