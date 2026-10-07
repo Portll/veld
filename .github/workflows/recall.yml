@@ -19,6 +19,12 @@ on:
         description: 'Ingest+query repeats'
         required: false
         default: '5'
+      layer:
+        description: 'Layer attribution: full (gated) or all (every cumulative rung, for diagnosis)'
+        required: false
+        default: 'full'
+        type: choice
+        options: ['full', 'all']
       record:
         description: 'Record a new baseline: run ungated and upload the reports'
         required: false
@@ -38,6 +44,9 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: 0
   TOLERANCE: ${{ github.event.inputs.tolerance || '2.0' }}
   REPEATS: ${{ github.event.inputs.repeats || '5' }}
+  # The schedule always runs the gated `full` rung; only a dispatch widens to every rung. The gate
+  # reads `full` alone, so `all` still gates.
+  LAYER: ${{ github.event.inputs.layer || 'full' }}
   RECORD: ${{ github.event.inputs.record || 'false' }}
 
 jobs:
@@ -104,7 +113,7 @@ jobs:
           fi
           ./target/release/recall-eval \
             --suite locomo-gate \
-            --layer full \
+            --layer "$LAYER" \
             --repeats "$REPEATS" \
             --output "current-${{ matrix.engine }}.json" \
             --per-case-output "per-case-${{ matrix.engine }}.json" \
