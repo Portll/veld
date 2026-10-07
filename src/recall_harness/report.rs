@@ -23,6 +23,11 @@ pub struct Report {
     pub suite: String,
     /// Embedding model name, e.g. `"minilm-l6-v2"`.
     pub embedder: String,
+    /// Whether the run reranked with the cross-encoder, with which model and at what cap.
+    /// `None` on reports written before this field existed, which [`compare_to_baseline`]
+    /// refuses: "not recorded" is not the same as "off".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<RerankSetting>,
     /// Git SHA of the working tree the run was produced from.
     pub git_sha: String,
     /// RFC3339 timestamp at the start of the run.
@@ -48,6 +53,53 @@ pub struct Report {
 
 fn default_repeats() -> usize {
     1
+}
+
+/// Layer 5.3's cross-encoder budget for an undecomposed query when the `rerank_count` dial is
+/// unset (`memory/recall.rs`).
+pub const DEFAULT_RERANK_CAP: usize = 20;
+
+/// The cross-encoder setting a run measured under.
+///
+/// Reranking moves p@1 by several points on the gate, so a run with it off, with another
+/// cross-encoder or with another budget measures another pipeline, and a diff against the
+/// baseline would read as a regression no code caused.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RerankSetting {
+    /// Whether recall reranks: the `use_reranking` dial is not off and a reranker is configured.
+    pub enabled: bool,
+    /// The cross-encoder that loaded, by registry id. `None` when reranking is off.
+    pub model: Option<String>,
+    /// Candidates an undecomposed query hands the cross-encoder at most: the `rerank_count` dial,
+    /// or [`DEFAULT_RERANK_CAP`]. Compared only when both runs rerank.
+    pub depth: usize,
+}
+
+impl RerankSetting {
+    /// The setting `system` recalls under, given the cross-encoder that loaded for it.
+    pub fn of(system: &crate::memory::MemorySystem, model: Option<String>) -> Self {
+        let dials = system.cognitive_dials();
+        let enabled = dials.use_reranking != Some(false) && model.is_some();
+        Self {
+            enabled,
+            model: if enabled { model } else { None },
+            depth: dials.rerank_count.unwrap_or(DEFAULT_RERANK_CAP),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match (&self.model, self.enabled) {
+            (Some(m), true) => format!("cross-encoder {m}, cap {}", self.depth),
+            _ => "cross-encoder off".to_string(),
+        }
+    }
+
+    fn same_pipeline(&self, other: &Self) -> bool {
+        if self.enabled != other.enabled {
+            return false;
+        }
+        !self.enabled || (self.model == other.model && self.depth == other.depth)
+    }
 }
 
 /// Per-case diagnostics for the highest (gated) layer.
@@ -591,6 +643,32 @@ pub fn compare_to_baseline(
             ),
         }];
     }
+    let (base_rerank, cur_rerank) = match (&baseline.rerank, &current.rerank) {
+        (Some(b), Some(c)) => (b, c),
+        (b, _) => {
+            let which = if b.is_none() { "baseline" } else { "current" };
+            return vec![Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "{which} report does not record whether it reranked with the cross-encoder; \
+                     reranking moves p@1 by several points, so a run of unknown setting is not \
+                     diffable. Record the baseline again as tests/recall/README.md describes"
+                ),
+            }];
+        }
+    };
+    if !base_rerank.same_pipeline(cur_rerank) {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "reranker setting differs: baseline {}, current {}. These are two pipelines, so \
+                 their difference is not a regression or an improvement of either. Compare \
+                 against a baseline recorded under the same setting",
+                base_rerank.describe(),
+                cur_rerank.describe()
+            ),
+        }];
+    }
     let Some(base_full) = baseline.layers.get("full") else {
         return vec![Failure {
             kind: "infrastructure".to_string(),
@@ -1017,6 +1095,11 @@ mod tests {
         Report {
             suite: "smoke".to_string(),
             embedder: "test".to_string(),
+            rerank: Some(RerankSetting {
+                enabled: true,
+                model: Some("mxbai-rerank-xsmall-v1".to_string()),
+                depth: 20,
+            }),
             git_sha: "deadbeef".to_string(),
             timestamp: chrono::Utc::now(),
             layers,
@@ -1058,6 +1141,99 @@ mod tests {
         let baseline = report_with_full(0.60, 0.70, 0.50, 0.40);
         let current = report_with_full(0.80, 0.90, 0.70, 0.60);
         assert!(compare_to_baseline(&baseline, &current, 2.0).is_empty());
+    }
+
+    /// A run with reranking off against the reranked baseline is two pipelines, not a
+    /// regression. The current side would fail every gate, so a comparison that ran would show.
+    #[test]
+    fn different_rerank_setting_refuses_before_any_metric_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+        current.rerank = Some(RerankSetting {
+            enabled: false,
+            model: None,
+            depth: 20,
+        });
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        let detail = &failures[0].detail;
+        assert!(detail.contains("reranker setting differs"), "{detail}");
+        assert!(
+            detail.contains("mxbai-rerank-xsmall-v1, cap 20"),
+            "{detail}"
+        );
+        assert!(detail.contains("cross-encoder off"), "{detail}");
+    }
+
+    /// Another cross-encoder or another cap hands the reranker other work, so both are refused.
+    #[test]
+    fn different_rerank_model_or_cap_refuses_when_both_rerank() {
+        for (model, depth) in [("ms-marco-minilm-l6", 20), ("mxbai-rerank-xsmall-v1", 30)] {
+            let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            current.rerank = Some(RerankSetting {
+                enabled: true,
+                model: Some(model.to_string()),
+                depth,
+            });
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+        }
+    }
+
+    /// With reranking off on both sides the cap is never read, so a different cap is the same
+    /// pipeline and the comparison runs.
+    #[test]
+    fn rerank_cap_is_ignored_when_neither_side_reranks() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        baseline.rerank = Some(RerankSetting {
+            enabled: false,
+            model: None,
+            depth: 20,
+        });
+        current.rerank = Some(RerankSetting {
+            enabled: false,
+            model: None,
+            depth: 30,
+        });
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// Not recorded is refused on either side: it is not the same as off.
+    #[test]
+    fn unrecorded_rerank_setting_is_refused_on_either_side() {
+        let set = report_with_full(0.6, 0.7, 0.5, 0.4).rerank;
+        for (b, c) in [(None, set.clone()), (set.clone(), None), (None, None)] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            baseline.rerank = b.clone();
+            current.rerank = c.clone();
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(
+                failures[0]
+                    .detail
+                    .contains("does not record whether it reranked"),
+                "{}",
+                failures[0].detail
+            );
+        }
+    }
+
+    /// A report written before the field existed has no `rerank` key. It must parse, as not
+    /// recorded.
+    #[test]
+    fn report_without_rerank_key_parses_as_unrecorded() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("rerank");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.rerank, None);
     }
 
     /// Two embedders, identical numbers: not a pass, not a regression, a refusal — and no

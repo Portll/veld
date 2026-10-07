@@ -22,6 +22,7 @@ from recall_diff import (
     load_per_case,
     render,
     render_case_moves,
+    rerank_note,
     resolution_note,
 )
 
@@ -236,11 +237,43 @@ class TestCaseMoves:
         assert "Cases that moved vs baseline (4)" in text
 
 
+class TestRerankNote:
+    ON = {"enabled": True, "model": "mxbai-rerank-xsmall-v1", "depth": 20}
+
+    def test_same_setting_does_not_warn(self):
+        lines = rerank_note({"rerank": self.ON}, {"rerank": dict(self.ON)})
+        assert lines[1] == (
+            "Reranker: baseline cross-encoder mxbai-rerank-xsmall-v1, cap 20 → "
+            "current cross-encoder mxbai-rerank-xsmall-v1, cap 20"
+        )
+        assert not any("Not comparable" in l for l in lines)
+
+    def test_off_against_on_warns(self):
+        lines = rerank_note({"rerank": self.ON}, {"rerank": {"enabled": False, "model": None, "depth": 20}})
+        assert "cross-encoder off" in lines[1]
+        assert any("Not comparable" in l for l in lines)
+
+    def test_model_and_cap_matter_only_when_reranking(self):
+        other_model = dict(self.ON, model="ms-marco-minilm-l6")
+        other_cap = dict(self.ON, depth=30)
+        for cur in (other_model, other_cap):
+            assert any("Not comparable" in l for l in rerank_note({"rerank": self.ON}, {"rerank": cur}))
+        off20 = {"enabled": False, "model": None, "depth": 20}
+        off30 = {"enabled": False, "model": None, "depth": 30}
+        assert not any("Not comparable" in l for l in rerank_note({"rerank": off20}, {"rerank": off30}))
+
+    def test_unrecorded_warns(self):
+        for base, cur in (({}, {"rerank": self.ON}), ({"rerank": self.ON}, {}), ({}, {})):
+            lines = rerank_note(base, cur)
+            assert "not recorded" in lines[1]
+            assert any("Not comparable" in l for l in lines)
+
+
 if __name__ == "__main__":
     # A plain runner, because this repo ships no python test dependency and a
     # test that cannot be run is documentation.
     failed = 0
-    for cls in (TestCaseCounts, TestResolutionNote, TestCaseMoves):
+    for cls in (TestCaseCounts, TestResolutionNote, TestCaseMoves, TestRerankNote):
         instance = cls()
         for name in sorted(n for n in dir(cls) if n.startswith("test_")):
             try:

@@ -1221,6 +1221,15 @@ fn summarise(report: &Report) {
         "recall-eval: suite={} cases={} repeats={} embedder={} sha={}",
         report.suite, report.case_count, report.repeats, report.embedder, report.git_sha
     );
+    match &report.rerank {
+        Some(r) if r.enabled => eprintln!(
+            "recall-eval: rerank=cross-encoder model={} cap={}",
+            r.model.as_deref().unwrap_or("?"),
+            r.depth
+        ),
+        Some(_) => eprintln!("recall-eval: rerank=off"),
+        None => eprintln!("recall-eval: rerank=<not recorded>"),
+    }
     // Print modes in pipeline order (vamana_only → full), not BTreeMap order.
     // Match against the canonical mode keys so any unknown key just falls
     // through to the BTreeMap iteration at the bottom.
