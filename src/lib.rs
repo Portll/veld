@@ -56,6 +56,7 @@ pub mod server_runtime;
 pub mod similarity;
 pub mod storage;
 pub mod streaming;
+pub mod tag_cores;
 pub mod tracing_setup;
 pub mod user_auth;
 pub mod user_memory;
