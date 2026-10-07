@@ -86,8 +86,9 @@ jobs:
     name: Recall gate (${{ matrix.engine }})
     runs-on: ubuntu-latest
     # A recording runs every model live on every call, then scores the rest of the 100 x 629
-    # cross-encoder table, so it gets longer.
-    timeout-minutes: ${{ github.event.inputs.model_tape == 'record' && 180 || 90 }}
+    # cross-encoder table, so it gets longer. The held-out suite (1,531 questions over 5,882
+    # turns, reranked) gets the job maximum: upstream's runs of it were cancelled at 60 minutes.
+    timeout-minutes: ${{ github.event.inputs.suite == 'locomo' && 360 || github.event.inputs.model_tape == 'record' && 180 || 90 }}
     strategy:
       fail-fast: false
       matrix:
