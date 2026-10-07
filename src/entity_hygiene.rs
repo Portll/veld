@@ -6,8 +6,8 @@
 //! decided it, so a reader can filter the cloud and a test can hold the rule to its fire rate.
 //!
 //! `is_proper_noun` never decides a shelf. Measured 2026-10-07 over 23,582 entities: the flag is
-//! set on capitalised common words, and the NER labels beside it carry the literal string
-//! `[object Object]` on 1,312 of them. It is passed through as an unverified hint. Cast therefore
+//! set on capitalised common words (`files`, `controls`, `evidence`), and the NER labels beside
+//! it put `Person` on utility names. It is passed through as an unverified hint. Cast therefore
 //! means identifier-shaped, and its recall against a human's notion of "a name" is bounded by
 //! design (0.44 to 0.61 on the two gold sets), while its precision measured 1.0 on both.
 //!
