@@ -664,6 +664,212 @@ async fn upsert_memory() {
     assert!(status.is_success(), "upsert returned {status}");
 }
 
+/// Every memory carrying `external_id`, read from the store rather than from the response.
+fn upserted(h: &Harness, user: &str, external_id: &str) -> Vec<veld::memory::Memory> {
+    let memory = h.mgr.get_user_memory(user).expect("memory");
+    let guard = memory.read();
+    guard
+        .get_all_memories()
+        .expect("all memories")
+        .into_iter()
+        .filter(|m| m.external_id.as_deref() == Some(external_id))
+        .map(|m| (*m).clone())
+        .collect()
+}
+
+fn the_one(h: &Harness, user: &str, external_id: &str) -> veld::memory::Memory {
+    let mut found = upserted(h, user, external_id);
+    assert_eq!(found.len(), 1, "expected one memory for {external_id}");
+    found.remove(0)
+}
+
+const TRANSCRIPT_CREATED: &str = "2026-09-01T10:00:00Z";
+
+fn transcript_upsert(user: &str, content: &str) -> serde_json::Value {
+    json!({
+        "user_id": user,
+        "external_id": "cc:transcript:sess-1",
+        "content": content,
+        "episode_id": "ep-sess-1",
+        "agent_id": "agent-main",
+        "created_at": TRANSCRIPT_CREATED,
+        "writer": {"session_id": "sess-1", "transcript_id": "tx-1", "model_id": "model-a"}
+    })
+}
+
+#[tokio::test]
+async fn upsert_stores_provenance_on_insert_as_remember_does() {
+    let h = Harness::new();
+    let user = "upsert-provenance";
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            transcript_upsert(user, "Transcript sess-1, first pass."),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["was_update"], json!(false), "{body}");
+
+    let stored = the_one(&h, user, "cc:transcript:sess-1");
+    let created: veld::chrono::DateTime<veld::chrono::Utc> = TRANSCRIPT_CREATED.parse().unwrap();
+    assert_eq!(stored.agent_id.as_deref(), Some("agent-main"));
+    assert_eq!(stored.created_at, created);
+    let ctx = stored.experience.context.as_ref().expect("context");
+    assert_eq!(ctx.episode.episode_id.as_deref(), Some("ep-sess-1"));
+    assert_eq!(ctx.session.declared.transcript_id.as_deref(), Some("tx-1"));
+    assert_eq!(ctx.session.declared.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(ctx.session.declared.model_id.as_deref(), Some("model-a"));
+
+    // Parity: the same provenance sent to /api/remember is stored identically.
+    let mut via_remember = transcript_upsert(user, "Same provenance, written by remember.");
+    via_remember.as_object_mut().unwrap().remove("external_id");
+    let (status, body) = json_of(h.app(), authed_post("/api/remember", via_remember)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let remembered = {
+        let id = veld::uuid::Uuid::parse_str(body["id"].as_str().expect("id")).unwrap();
+        let memory = h.mgr.get_user_memory(user).expect("memory");
+        let guard = memory.read();
+        guard
+            .get_memory(&veld::memory::MemoryId(id))
+            .expect("stored")
+    };
+    let rctx = remembered.experience.context.as_ref().expect("context");
+    assert_eq!(remembered.agent_id, stored.agent_id);
+    assert_eq!(remembered.created_at, stored.created_at);
+    assert_eq!(rctx.episode.episode_id, ctx.episode.episode_id);
+    assert_eq!(rctx.session.declared, ctx.session.declared);
+    assert_eq!(rctx.source.source_type, ctx.source.source_type);
+    assert_eq!(rctx.source.credibility, ctx.source.credibility);
+}
+
+#[tokio::test]
+async fn a_second_upsert_updates_the_one_memory() {
+    let h = Harness::new();
+    let user = "upsert-twice";
+    let (status, first) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            transcript_upsert(user, "Transcript sess-1, first pass."),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            transcript_upsert(user, "Transcript sess-1, grown."),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["was_update"], json!(true), "{second}");
+    assert_eq!(second["id"], first["id"]);
+    assert_eq!(second["version"], json!(2), "{second}");
+
+    let stored = the_one(&h, user, "cc:transcript:sess-1");
+    assert_eq!(stored.experience.content, "Transcript sess-1, grown.");
+    assert_eq!(stored.history.len(), 1, "the first pass is kept in history");
+}
+
+#[tokio::test]
+async fn an_update_keeps_omitted_provenance_and_overwrites_provided() {
+    let h = Harness::new();
+    let user = "upsert-omit";
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            transcript_upsert(user, "Transcript sess-1, first pass."),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // No episode_id, agent_id or created_at; a different writer.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({
+                "user_id": user,
+                "external_id": "cc:transcript:sess-1",
+                "content": "Transcript sess-1, grown.",
+                "writer": {"session_id": "sess-1", "transcript_id": "tx-2"}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["was_update"], json!(true), "{body}");
+
+    let stored = the_one(&h, user, "cc:transcript:sess-1");
+    let created: veld::chrono::DateTime<veld::chrono::Utc> = TRANSCRIPT_CREATED.parse().unwrap();
+    let ctx = stored.experience.context.as_ref().expect("context");
+    assert_eq!(ctx.episode.episode_id.as_deref(), Some("ep-sess-1"));
+    assert_eq!(stored.agent_id.as_deref(), Some("agent-main"));
+    assert_eq!(stored.created_at, created);
+    assert_eq!(ctx.session.declared.transcript_id.as_deref(), Some("tx-2"));
+    assert_eq!(
+        ctx.session.declared.model_id, None,
+        "a provided writer replaces the whole writer"
+    );
+}
+
+#[tokio::test]
+async fn an_upsert_without_provenance_behaves_as_before() {
+    let h = Harness::new();
+    let user = "upsert-plain";
+    let before = veld::chrono::Utc::now();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-plain", "content": "Plain upsert."}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["id", "success", "version", "was_update"], "{body}");
+    assert_eq!(body["was_update"], json!(false));
+    assert_eq!(body["version"], json!(1));
+
+    let stored = the_one(&h, user, "ext-plain");
+    assert_eq!(stored.agent_id, None);
+    assert!(stored.created_at >= before, "created_at defaults to now");
+    let ctx = stored.experience.context.as_ref().expect("context");
+    assert_eq!(ctx.episode.episode_id, None);
+    assert_eq!(
+        ctx.session.declared,
+        veld::memory::facets::DeclaredWriter::default()
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-plain", "content": "Plain upsert, edited."}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["was_update"], json!(true));
+    assert_eq!(body["version"], json!(2));
+    let stored = the_one(&h, user, "ext-plain");
+    assert_eq!(stored.experience.content, "Plain upsert, edited.");
+    assert_eq!(stored.agent_id, None);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // recall.rs
 // ═══════════════════════════════════════════════════════════════════════

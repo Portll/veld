@@ -604,6 +604,39 @@ fn build_ner_lookup(
         .collect()
 }
 
+/// Provenance an upsert caller declares, as `remember` accepts it. On update, `None` means
+/// "leave the stored value", never "clear it".
+#[derive(Debug, Clone, Default)]
+pub struct UpsertProvenance {
+    pub agent_id: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub episode_id: Option<String>,
+    pub writer: Option<crate::memory::facets::DeclaredWriter>,
+}
+
+/// Write a declared episode id and writer onto a record's context, creating the context from
+/// `fallback` (or the detected session) when the record has none. Fields left `None` are not
+/// touched, so an update that omits them keeps what is stored.
+fn overlay_declared_context(
+    slot: &mut Option<types::RichContext>,
+    fallback: Option<types::RichContext>,
+    episode_id: Option<String>,
+    writer: Option<crate::memory::facets::DeclaredWriter>,
+) {
+    if episode_id.is_none() && writer.is_none() {
+        return;
+    }
+    let ctx = slot.get_or_insert_with(|| {
+        fallback.unwrap_or_else(crate::memory::session_detect::rich_context_with_session)
+    });
+    if let Some(episode_id) = episode_id {
+        ctx.episode.episode_id = Some(episode_id);
+    }
+    if let Some(writer) = writer {
+        ctx.session.declared = writer;
+    }
+}
+
 /// What a remember call did: created a memory, or found identical content and merged the
 /// duplicate's enrichment into it. The graph episode is built by the handler, so only the
 /// handler can rebuild it, and it needs this report to know when.
@@ -5571,11 +5604,40 @@ impl MemorySystem {
     pub fn upsert(
         &self,
         external_id: String,
-        mut experience: Experience,
+        experience: Experience,
         change_type: ChangeType,
         changed_by: Option<String>,
         change_reason: Option<String>,
     ) -> Result<(MemoryId, bool)> {
+        self.upsert_with_provenance(
+            external_id,
+            experience,
+            change_type,
+            changed_by,
+            change_reason,
+            UpsertProvenance::default(),
+        )
+    }
+
+    /// [`Self::upsert`] carrying the provenance `remember` accepts.
+    ///
+    /// On create, `agent_id` and `created_at` are stored as `remember` stores them, and the
+    /// episode and declared writer travel in `experience.context`, which the caller builds with
+    /// the same `build_rich_context` that `remember` uses. On update, each provided field
+    /// overwrites the stored value and each `None` leaves it as it was.
+    pub fn upsert_with_provenance(
+        &self,
+        external_id: String,
+        mut experience: Experience,
+        change_type: ChangeType,
+        changed_by: Option<String>,
+        change_reason: Option<String>,
+        provenance: UpsertProvenance,
+    ) -> Result<(MemoryId, bool)> {
+        // C1: the find-then-create below must be atomic, or two concurrent upserts of one
+        // external_id both miss the lookup and both create. Same per-user lock as remember_impl.
+        let _write_guard = self.write_lock.lock();
+
         // Try to find existing memory with this external_id
         if let Some(mut existing) = self.long_term_memory.find_by_external_id(&external_id)? {
             // === UPDATE PATH ===
@@ -5587,6 +5649,21 @@ impl MemorySystem {
                 change_type,
                 changed_by,
                 change_reason,
+            );
+
+            // Provenance: a provided field overwrites, an omitted one keeps the stored value.
+            if let Some(agent_id) = provenance.agent_id {
+                existing.agent_id = Some(agent_id);
+            }
+            if let Some(created_at) = provenance.created_at {
+                existing.created_at = created_at;
+                existing.when.encoded_at = Some(created_at);
+            }
+            overlay_declared_context(
+                &mut existing.experience.context,
+                experience.context.take(),
+                provenance.episode_id,
+                provenance.writer,
             );
 
             // Update entities if provided
@@ -5710,16 +5787,23 @@ impl MemorySystem {
             // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
             experience.migrate_robotics_to_facets();
 
+            overlay_declared_context(
+                &mut experience.context,
+                None,
+                provenance.episode_id,
+                provenance.writer,
+            );
+
             // Create memory with external_id
             let memory = Arc::new(Memory::new_with_external_id(
                 memory_id.clone(),
                 experience,
                 importance,
                 external_id.clone(),
-                None, // agent_id
+                provenance.agent_id,
                 None, // run_id
                 None, // actor_id
-                None, // created_at
+                provenance.created_at,
             ));
 
             // Persist to storage
