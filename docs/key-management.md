@@ -16,6 +16,8 @@ open it:
 | `passphrase` | `VELD_MASTER_PASSPHRASE` | How the server unseals at start. Rotated, never revoked. |
 | `recovery` | a recovery code | 192 bits, issued once in a recovery kit. Any number; each revocable. |
 | `kms` | `VELD_KMS_WRAP_KEY` | Unattended start without a passphrase. |
+| `secure-enclave` | Touch ID on one Mac | A Secure Enclave key, through the `veld-enclave` helper. |
+| `passkey` | a passkey's PRF secret | Touch ID, Face ID or a security key, through a browser. |
 | `ring` | the keyring | Present on every keystore enrolled in a keyring. |
 
 ## The keyring
@@ -62,6 +64,57 @@ It asks for the recovery code and a new passphrase, or reads `VELD_RECOVERY_CODE
 keyring and every keystore under the new passphrase. The used code is revoked and a
 replacement kit is written. Set the new passphrase where the server reads it before
 the next start.
+
+Recover with Touch ID or a passkey instead of a code with `veld keys recover --touch-id <id>` or
+`veld keys recover --passkey`. A device factor stays enrolled after it recovers.
+
+## Touch ID and passkeys
+
+Both are device factors: something you hold releases a 32-byte secret, and the keyring's
+master key is wrapped under a key derived from it (HKDF-SHA256, bound to the factor's
+kind). Every `veld keys` command that opens the keyring takes `--with-touch-id <id>`,
+`--with-passkey` or `--with-recovery-code` instead of the passphrase.
+
+**Touch ID** (macOS). Build the helper once and put it beside `veld` or on `PATH`, or
+point `VELD_ENCLAVE_HELPER` at it:
+
+```sh
+swift build -c release --package-path packaging/macos/veld-enclave
+veld keys enrol-touch-id --label "MacBook"
+```
+
+The helper creates a P-256 key inside the Secure Enclave that only the current
+fingerprints can use (`--policy presence` also accepts the login password). It agrees a
+secret with that key through an ephemeral key, asks for Touch ID once to prove the secret
+comes back, and keeps a handle in `~/Library/Application Support/veld/enclave/`. The
+private key never leaves the Secure Enclave, so the factor works on that Mac only, and
+adding or removing a fingerprint invalidates it. Keep a recovery code as well.
+
+**Passkeys.** `veld keys enrol-passkey` opens a page on `http://localhost:<port>` in the
+browser. It creates a passkey with the WebAuthn PRF extension and posts the PRF secret
+back. The relying party is `localhost`, so the same passkey unlocks a keyring on this
+machine when no server can start. Passkeys from iCloud Keychain (macOS 15 and later) and
+most FIDO2 security keys support PRF; an authenticator without it is refused at
+enrolment.
+
+## The Monitor's Security tab and the HTTP API
+
+Veld Monitor's 🔐 Security tab covers the same operations against the instance in the
+active tab. Signing in uses user auth (`VELD_USER_AUTH_ENABLED=true`, see
+[user-auth.md](user-auth.md)). Key management needs an admin account with 2FA. Each change
+asks for a 2FA code (one per five minutes per session) and for something that opens the
+keyring: the passphrase, a recovery code, or Touch ID on the Mac running the Monitor.
+Recovery kits are saved where you choose, readable by you only. A passkey added from the
+Monitor is created in the system browser on the server's own origin, so its relying party
+is the server's host name.
+
+The routes are under `/api/user_auth/admin/keys/`: `status`, `init`, `recovery_codes`,
+`revoke`, `rotate_passphrase`, `rotate_data_keys`, `rotate_master_keys`, `factors` and
+`passkey`. A change carries the unlock factor in its body as one of
+`{"passphrase": …}`, `{"recovery_code": …}`, `{"secure_enclave": {"id", "secret"}}` or
+`{"passkey": {"id", "secret"}}`. Failed unlocks share one budget across the server. On a
+non-loopback bind the routes refuse unless `VELD_TLS_ACK=true` says TLS terminates in
+front of veld, because the bodies carry passphrases. Every change is in the audit trail.
 
 ## Rotate
 

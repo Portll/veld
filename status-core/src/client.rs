@@ -228,6 +228,58 @@ impl StatusClient {
         }
         Ok(resp.json::<serde_json::Value>().await?)
     }
+
+    /// One call to the user-auth API (`/api/user_auth/*`, key management included),
+    /// carrying the session token and, for a change, the step-up code. Returns the
+    /// status with the JSON body whatever the status, so the caller can show the
+    /// server's reason. Nothing outside that prefix is reachable this way.
+    pub async fn security_request(
+        base_url: &str,
+        method: &str,
+        path: &str,
+        session: Option<&str>,
+        step_up: Option<&str>,
+        body: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<(u16, serde_json::Value)> {
+        let base = normalize_base_url(base_url)?;
+        if !path.starts_with("/api/user_auth/") || path.contains("..") {
+            return Err(StatusError::InvalidBaseUrl(
+                path.to_string(),
+                "not a /api/user_auth/ path".to_string(),
+            ));
+        }
+        let http = Client::builder().timeout(timeout).build()?;
+        let url = format!("{base}{path}");
+        let mut request = match method {
+            "GET" => http.get(&url),
+            "POST" => http.post(&url),
+            other => {
+                return Err(StatusError::InvalidBaseUrl(
+                    other.to_string(),
+                    "method must be GET or POST".to_string(),
+                ))
+            }
+        };
+        if let Some(token) = session.filter(|t| !t.is_empty()) {
+            request = request.bearer_auth(token);
+        }
+        if let Some(code) = step_up.filter(|c| !c.is_empty()) {
+            request = request.header("X-Veld-Step-Up", code);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let resp = request.send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let json = if text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+        };
+        Ok((status, json))
+    }
 }
 
 impl Drop for StatusClient {

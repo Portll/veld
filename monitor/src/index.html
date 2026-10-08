@@ -25,6 +25,7 @@
       <span id="uptime" class="muted">—</span>
       <span id="version" class="muted">—</span>
       <button id="open-graph" class="header-btn" title="Open the knowledge-graph viewer">🧠 Graph</button>
+      <button id="open-security" class="header-btn" title="Keys, recovery and logins">🔐 Security</button>
     </header>
     <nav id="tabs" class="tabs hidden"></nav>
     <main>
@@ -69,6 +70,16 @@
         </span>
       </div>
       <iframe id="graph-frame" title="Veld Memory Graph"></iframe>
+    </div>
+    <div id="security-overlay" class="hidden">
+      <div id="security-bar">
+        <span>🔐 Security <span id="sec-where" class="muted"></span></span>
+        <nav id="sec-nav"></nav>
+        <button id="security-close" type="button" title="Back to monitor">✕ Close</button>
+      </div>
+      <p id="sec-flash" class="sec-flash hidden" role="status"></p>
+      <div id="sec-body"></div>
+      <div id="sec-modal" class="hidden"></div>
     </div>
     <div id="first-run" class="hidden">
       <div id="first-run-card">

@@ -2,6 +2,8 @@
 // Subscribes to "snapshot-updated" events from the Rust side, falls back to
 // polling get_snapshot() if the event channel hasn't delivered for >5s.
 
+import { setupSecurity } from "./security.js";
+
 // ─── Diagnostics ────────────────────────────────────────────────────────────
 // Accumulated log of script-level events. Hidden by default; toggle with
 // Ctrl+D (or Cmd+D on macOS) to pop it out as an overlay. Errors auto-pop.
@@ -95,6 +97,7 @@ let currentUserId = "";
 let instances = [];
 let activeBaseUrl = "";
 let userSelectedInstance = false;
+window.veldActiveBaseUrl = () => activeBaseUrl || currentBaseUrl;
 
 function fmtCount(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -619,6 +622,7 @@ async function pullInstances() {
 
   if (nextBaseUrl && nextBaseUrl !== activeBaseUrl) {
     activeBaseUrl = nextBaseUrl;
+    window.dispatchEvent(new Event("veld-active-instance"));
     currentDials = null;
     pull();
     pullDials();
@@ -655,6 +659,7 @@ function setActiveInstance(base) {
   if (base === activeBaseUrl) return;
   userSelectedInstance = true;
   activeBaseUrl = base;
+  window.dispatchEvent(new Event("veld-active-instance"));
   currentDials = null; // force a dials reload for the newly-selected instance
   renderTabs();
   pull();
@@ -824,6 +829,7 @@ async function init() {
   }
 
   await setupFirstRun();
+  setupSecurity();
 
   setInterval(() => {
     pullInstances(); // refresh the tab list as instances come/go
