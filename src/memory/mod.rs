@@ -5839,6 +5839,13 @@ impl MemorySystem {
                     memory_id.0,
                     e
                 );
+                if let Err(record_err) = self.embedding_backlog.record(
+                    &memory_id,
+                    embedding_backlog::EnqueueReason::IndexFailed,
+                    Some(&e.to_string()),
+                ) {
+                    tracing::error!("embedding backlog: could not record {}: {record_err}", &memory_id.0);
+                }
             }
 
             // Re-index in BM25 with updated content
@@ -5896,6 +5903,13 @@ impl MemorySystem {
                         }
                         Err(e) => {
                             tracing::warn!("Failed to generate embedding: {}", e);
+                            if let Err(record_err) = self.embedding_backlog.record(
+                                &memory_id,
+                                embedding_backlog::EnqueueReason::EmbedFailed,
+                                Some(&e.to_string()),
+                            ) {
+                                tracing::error!("embedding backlog: could not record {}: {record_err}", &memory_id.0);
+                            }
                         }
                     }
                 }
@@ -5946,6 +5960,13 @@ impl MemorySystem {
             // Index in vector DB
             if let Err(e) = self.retriever.index_memory(&memory) {
                 tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
+                if let Err(record_err) = self.embedding_backlog.record(
+                    &memory.id,
+                    embedding_backlog::EnqueueReason::IndexFailed,
+                    Some(&e.to_string()),
+                ) {
+                    tracing::error!("embedding backlog: could not record {}: {record_err}", &memory.id.0);
+                }
             }
 
             // Add entities to knowledge graph with co-occurrence edges
