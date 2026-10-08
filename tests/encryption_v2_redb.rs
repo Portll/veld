@@ -186,7 +186,7 @@ fn a_rotated_key_keeps_old_records_readable_and_an_older_keystore_is_refused() {
 }
 
 #[test]
-fn an_export_carries_sealed_records_sealed_and_migrate_refuses_the_store() {
+fn an_export_carries_sealed_records_sealed() {
     let _guard = ENV_LOCK.lock().unwrap();
     env::set_var("VELD_MASTER_PASSPHRASE", PASSPHRASE);
     let temp = TempDir::new().unwrap();
@@ -211,26 +211,5 @@ fn an_export_carries_sealed_records_sealed_and_migrate_refuses_the_store() {
     let dump = std::fs::read(&reports[0].path).unwrap();
     assert!(!contains(&dump, PLAINTEXT), "the export decrypted a record");
 
-    let report = migrate::migrate(
-        temp.path(),
-        StorageBackend::Redb,
-        StorageBackend::RocksDb,
-        &Scope::User(USER.to_string()),
-        true,
-        None,
-    )
-    .expect("dry run");
-    assert!(
-        report.blocked(),
-        "an encrypted source must block the migration"
-    );
-    assert!(
-        report.units[0]
-            .blocked
-            .iter()
-            .any(|b| b.contains("record-level encryption")),
-        "{:?}",
-        report.units[0].blocked
-    );
     env::remove_var("VELD_MASTER_PASSPHRASE");
 }

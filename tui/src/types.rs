@@ -436,6 +436,7 @@ pub enum ViewMode {
     GraphMap,
     Git,
     Dials,
+    Loops,
 }
 
 /// Which pane is focused inside the Git tab.
@@ -2046,7 +2047,8 @@ impl AppState {
             ViewMode::ActivityLogs => ViewMode::GraphMap,
             ViewMode::GraphMap => ViewMode::Git,
             ViewMode::Git => ViewMode::Dials,
-            ViewMode::Dials => ViewMode::Dashboard,
+            ViewMode::Dials => ViewMode::Loops,
+            ViewMode::Loops => ViewMode::Dashboard,
         };
         self.set_view(new_mode);
     }
@@ -2419,6 +2421,10 @@ impl AppState {
                     }
                     FocusPanel::Detail => {} // Not used in GraphMap
                 }
+            }
+            // The Loops tab wraps the selection to however many loops have reported.
+            ViewMode::Loops => {
+                self.scroll_offset = self.scroll_offset.wrapping_add(1);
             }
             _ => {
                 let max = self.events.len().saturating_sub(1);

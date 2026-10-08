@@ -1617,6 +1617,90 @@ impl PartialOrd for SearchCandidate {
 mod tests {
     use super::*;
 
+    fn unit_vectors(rng: &mut impl rand::Rng, n: usize, dim: usize) -> Vec<Vec<f32>> {
+        (0..n)
+            .map(|_| {
+                let v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.into_iter().map(|x| x / norm).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn initial_graph_gives_each_node_distinct_random_neighbors() {
+        for (n, max_degree) in [(50usize, 8usize), (5, 8), (1, 8), (2, 1)] {
+            let mut index = VamanaIndex::new(VamanaConfig {
+                dimension: 4,
+                max_degree,
+                use_mmap: false,
+                ..Default::default()
+            })
+            .unwrap();
+            index.initialize_graph(n, 7).unwrap();
+            let graph = index.graph.read();
+            assert_eq!(graph.len(), n);
+            for (i, node) in graph.iter().enumerate() {
+                assert_eq!(node.id as usize, i);
+                assert_eq!(node.neighbors.len(), max_degree.min(n - 1), "n={n}");
+                let distinct: std::collections::HashSet<_> = node.neighbors.iter().collect();
+                assert_eq!(distinct.len(), node.neighbors.len(), "duplicate neighbor");
+                assert!(node
+                    .neighbors
+                    .iter()
+                    .all(|&j| (j as usize) < n && j as usize != i));
+            }
+        }
+    }
+
+    /// recall@10 against brute force over five random corpora of unit vectors. The random start
+    /// graph is replaced by robust pruning during the build, so recall must not hinge on which
+    /// random neighbours a node starts with.
+    #[test]
+    fn built_index_recall_against_brute_force() {
+        use rand::SeedableRng;
+        let (n, dim, k) = (2000, 32, 10);
+        let mut recalls = Vec::new();
+        for seed in 1..=5u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let vectors = unit_vectors(&mut rng, n, dim);
+            let queries = unit_vectors(&mut rng, 100, dim);
+
+            let mut index = VamanaIndex::new(VamanaConfig {
+                dimension: dim,
+                use_mmap: false,
+                ..Default::default()
+            })
+            .unwrap();
+            index.build(vectors.clone()).unwrap();
+
+            let mut hits = 0usize;
+            for q in &queries {
+                let mut exact: Vec<(usize, f32)> = vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i, v.iter().zip(q).map(|(a, b)| a * b).sum::<f32>()))
+                    .collect();
+                exact.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let truth: std::collections::HashSet<u32> =
+                    exact[..k].iter().map(|(i, _)| *i as u32).collect();
+                hits += index
+                    .search(q, k)
+                    .unwrap()
+                    .iter()
+                    .filter(|(id, _)| truth.contains(id))
+                    .count();
+            }
+            recalls.push(hits as f64 / (queries.len() * k) as f64);
+        }
+        let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
+        eprintln!("vamana recall@{k}: per corpus {recalls:.4?}, mean {mean:.4}");
+        assert!(
+            mean >= 0.75 && recalls.iter().all(|r| *r >= 0.70),
+            "recall@{k} fell: mean {mean} over {recalls:?}"
+        );
+    }
+
     #[test]
     fn test_vamana_construction() {
         let mut index = VamanaIndex::new(VamanaConfig {

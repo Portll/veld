@@ -511,6 +511,29 @@ pub const IMPORTANCE_RECENCY_DAYS: f64 = 7.0;
 /// - Higher values (3-5) for more confidence but slower learning
 pub const CONSOLIDATION_MIN_SUPPORT: usize = 2;
 
+/// Corpus-size tiers for min_support: the bar for minting a fact rises with the number of
+/// eligible memories, so a large store needs more corroboration before noise becomes a fact.
+/// A caller's explicit min_support is a floor under the tier, never a way below it.
+pub const CONSOLIDATION_MIN_SUPPORT_SMALL: usize = 2; // <= 100 eligible memories
+pub const CONSOLIDATION_MIN_SUPPORT_MEDIUM: usize = 3; // <= 1000 eligible memories
+pub const CONSOLIDATION_MIN_SUPPORT_LARGE: usize = 4; // > 1000 eligible memories
+
+/// Minimum non-stop-words a sentence needs to be a declarative fact candidate
+/// (`SemanticConsolidator::extract_salient_statement`).
+///
+/// Justification:
+/// - Four is the smallest floor that needs a clause rather than a caption: at three, a
+///   20-character heading ("Bridge collapse update") still qualifies.
+/// - Not higher: declarative sentences in news and technical prose routinely carry 5-8
+///   content words, and a floor of 5 starts discarding them.
+/// - Corroboration (`CONSOLIDATION_MIN_SUPPORT`, two or more distinct memories) decides what
+///   becomes a fact; this floor is the cheap structural half.
+pub const CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS: usize = 4;
+
+/// Maximum members in one consolidation cluster. A full cluster takes no more members, so a
+/// greedy pass cannot grow one cluster that absorbs everything.
+pub const CONSOLIDATION_CLUSTER_SIZE_CAP: usize = 20;
+
 /// Minimum age in days before consolidation (legacy gate, still used as fallback)
 ///
 /// Justification:
@@ -645,13 +668,25 @@ pub const FACT_DEDUP_COSINE_THRESHOLD: f32 = 0.80;
 /// - Prevents pure embedding hallucination from causing false merges
 pub const FACT_DEDUP_JACCARD_FLOOR: f32 = 0.30;
 
-/// Legacy Jaccard-only threshold (fallback when embedder is unavailable)
+/// Jaccard-only threshold (fallback when embedder is unavailable)
 ///
 /// Justification:
-/// - Original threshold for pure Jaccard dedup (preserved for graceful degradation)
 /// - Used when embedder fails (circuit breaker open, model load failure)
 /// - Also used per-candidate when an existing fact has no stored embedding
-pub const FACT_DEDUP_JACCARD_FALLBACK: f32 = 0.70;
+/// - 0.75 sits close to the cosine path (cosine 0.80 plus Jaccard 0.30), so a pair the
+///   embedding path keeps apart is not merged on the fallback path
+pub const FACT_DEDUP_JACCARD_FALLBACK: f32 = 0.75;
+
+/// Confidence boost when a stored fact is re-attested by new source evidence, as a fraction of
+/// the remaining headroom (`c += k * (1 - c)`).
+///
+/// Justification:
+/// - Diminishing returns: a confident fact gains little, a weak one a lot, and it never
+///   passes 1.0.
+/// - Applied only when the candidate brings source memories the fact does not cite;
+///   boosting on already-counted evidence would make confidence a cycle counter
+///   (`SemanticFactStore::ingest_candidate`).
+pub const FACT_REINFORCEMENT_BOOST: f32 = 0.1;
 
 /// Negation markers for polarity detection in fact deduplication
 ///
@@ -1805,9 +1840,15 @@ pub const IC_VERB: f32 = 1.0;
 /// Maximum time to wait for the full graceful shutdown sequence.
 ///
 /// Justification:
-/// - 120 seconds accommodates drain (5s) + flush (30s) + vector save (60s)
+/// - 120 seconds accommodates drain (5s) + background tasks (10s) + flush (30s) + vector save (60s)
 /// - Overall budget prevents indefinite hangs even if individual phases stall
 pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
+
+/// Background task drain timeout in seconds
+///
+/// Maximum time shutdown waits for tracked fire-and-forget writes (graph processing, deferred
+/// embedding, audit persistence) before it flushes the databases anyway.
+pub const BACKGROUND_TASK_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 /// Database flush timeout in seconds
 ///
@@ -2661,12 +2702,16 @@ pub const RECONSOLIDATION_WORKING_MEMORY_THRESHOLD: u32 = 5;
 // | CONSOLIDATION_MIN_AGE_DAYS    | memory/compression.rs | consolidate_semantic_facts()      |
 // | CONSOLIDATION_JACCARD_THRESHOLD | memory/compression.rs | group_candidates_by_similarity()  |
 // | CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY | memory/compression.rs | extract_fact_candidates() |
+// | CONSOLIDATION_MIN_SUPPORT_SMALL/MEDIUM/LARGE | memory/compression.rs | consolidate()     |
+// | CONSOLIDATION_CLUSTER_SIZE_CAP | memory/compression.rs | group_candidates_by_similarity()  |
+// | CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS | memory/compression.rs | extract_salient_statement() |
 // | FACT_DECAY_GRACE_DAYS              | memory/mod.rs, compression.rs | fact decay grace period     |
 // | FACT_DECAY_HALF_LIFE_BASE_DAYS     | memory/mod.rs, compression.rs | fact decay half-life base  |
 // | FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS | memory/mod.rs, compression.rs | fact decay per support  |
 // | FACT_DEDUP_COSINE_THRESHOLD   | memory/facts.rs       | find_similar() hybrid dedup       |
 // | FACT_DEDUP_JACCARD_FLOOR      | memory/facts.rs       | find_similar() hybrid dedup       |
 // | FACT_DEDUP_JACCARD_FALLBACK   | memory/facts.rs       | find_similar() fallback mode      |
+// | FACT_REINFORCEMENT_BOOST      | memory/facts.rs       | ingest_candidate() reinforcement  |
 // | FACT_NEGATION_MARKERS         | memory/facts.rs       | detect_polarity()                 |
 //
 // ## Default Configuration Constants
@@ -2706,6 +2751,7 @@ pub const RECONSOLIDATION_WORKING_MEMORY_THRESHOLD: u32 = 5;
 // | Constant                      | File      | Function/Context                        |
 // |-------------------------------|-----------|-----------------------------------------|
 // | GRACEFUL_SHUTDOWN_TIMEOUT_SECS| main.rs   | graceful_shutdown() - request drain     |
+// | BACKGROUND_TASK_DRAIN_TIMEOUT_SECS | server.rs | run_shutdown_cleanup() - tracked tasks |
 // | DATABASE_FLUSH_TIMEOUT_SECS   | main.rs   | graceful_shutdown() - RocksDB flush     |
 // | VECTOR_INDEX_SAVE_TIMEOUT_SECS| main.rs   | graceful_shutdown() - HNSW persist      |
 //

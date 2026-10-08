@@ -1107,6 +1107,182 @@ pub struct Experience {
     pub cooccurrence_pairs: Vec<(String, String)>,
 }
 
+/// What [`Experience::merge_enrichment_from`] changed. Empty means the duplicate carried
+/// nothing the stored copy lacked, the common case of a retried request.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EnrichmentDelta {
+    /// Entity names added, in arrival order: what the memory's graph episode lacks.
+    pub entities_added: Vec<String>,
+    /// Tags added.
+    pub tags_added: Vec<String>,
+    /// Other fields that gained a value.
+    pub fields_filled: Vec<&'static str>,
+}
+
+impl EnrichmentDelta {
+    pub fn is_empty(&self) -> bool {
+        self.entities_added.is_empty()
+            && self.tags_added.is_empty()
+            && self.fields_filled.is_empty()
+    }
+}
+
+impl Experience {
+    /// Folds the enrichment a content-identical duplicate carries into this stored experience
+    /// and reports what changed.
+    ///
+    /// Every rule only adds, so a stale or thinner duplicate cannot damage a richer record and
+    /// arrival order stops mattering:
+    /// - collections are set unions, stored entries first;
+    /// - `Option` fields fill only when empty: a later `None` is "not provided", and a later
+    ///   `Some` never overwrites, so a merge cannot relocate a memory or restate its severity;
+    /// - maps add keys the stored copy lacks, keeping its values;
+    /// - `is_failure` and `is_anomaly` OR, since `false` is also "not provided";
+    /// - `experience_type` is not merged: it scales the edges and activation of the existing
+    ///   episode;
+    /// - `content` and the embeddings are identical by construction and are not touched.
+    pub fn merge_enrichment_from(&mut self, incoming: &Experience) -> EnrichmentDelta {
+        fn union<T: Clone + PartialEq>(stored: &mut Vec<T>, incoming: &[T]) -> Vec<T> {
+            let mut added = Vec::new();
+            for item in incoming {
+                if !stored.contains(item) {
+                    stored.push(item.clone());
+                    added.push(item.clone());
+                }
+            }
+            added
+        }
+
+        let mut delta = EnrichmentDelta {
+            entities_added: union(&mut self.entities, &incoming.entities),
+            tags_added: union(&mut self.tags, &incoming.tags),
+            fields_filled: Vec::new(),
+        };
+
+        macro_rules! union_field {
+            ($field:ident) => {
+                if !union(&mut self.$field, &incoming.$field).is_empty() {
+                    delta.fields_filled.push(stringify!($field));
+                }
+            };
+        }
+        union_field!(temporal_refs);
+        union_field!(outcomes);
+        union_field!(alternatives_considered);
+        union_field!(cooccurrence_pairs);
+        union_field!(related_memories);
+        union_field!(causal_chain);
+
+        // A re-extracted span with a different confidence is the same NER record.
+        let mut ner_added = false;
+        for record in &incoming.ner_entities {
+            if !self
+                .ner_entities
+                .iter()
+                .any(|r| r.text == record.text && r.entity_type == record.entity_type)
+            {
+                self.ner_entities.push(record.clone());
+                ner_added = true;
+            }
+        }
+        if ner_added {
+            delta.fields_filled.push("ner_entities");
+        }
+
+        let mut media_added = false;
+        for media in &incoming.media_refs {
+            if !self.media_refs.iter().any(|m| m.uri == media.uri) {
+                self.media_refs.push(media.clone());
+                media_added = true;
+            }
+        }
+        if media_added {
+            delta.fields_filled.push("media_refs");
+        }
+
+        macro_rules! fill_if_none {
+            ($($field:ident),* $(,)?) => {
+                $(
+                    if self.$field.is_none() && incoming.$field.is_some() {
+                        self.$field = incoming.$field.clone();
+                        delta.fields_filled.push(stringify!($field));
+                    }
+                )*
+            };
+        }
+        fill_if_none!(
+            context,
+            image_embeddings,
+            audio_embeddings,
+            video_embeddings,
+            robot_id,
+            mission_id,
+            geo_location,
+            local_position,
+            heading,
+            action_type,
+            reward,
+            decision_context,
+            action_params,
+            outcome_type,
+            outcome_details,
+            confidence,
+            weather,
+            terrain_type,
+            lighting,
+            severity,
+            recovery_action,
+            root_cause,
+            pattern_id,
+            predicted_outcome,
+            prediction_accurate,
+        );
+
+        // No identity field to union on: taken whole, and only when the stored copy has none.
+        if self.nearby_agents.is_empty() && !incoming.nearby_agents.is_empty() {
+            self.nearby_agents = incoming.nearby_agents.clone();
+            delta.fields_filled.push("nearby_agents");
+        }
+
+        let mut metadata_added = false;
+        for (k, v) in &incoming.metadata {
+            if !self.metadata.contains_key(k) {
+                self.metadata.insert(k.clone(), v.clone());
+                metadata_added = true;
+            }
+        }
+        if metadata_added {
+            delta.fields_filled.push("metadata");
+        }
+
+        let mut sensor_added = false;
+        for (k, v) in &incoming.sensor_data {
+            if !self.sensor_data.contains_key(k) {
+                self.sensor_data.insert(k.clone(), *v);
+                sensor_added = true;
+            }
+        }
+        if sensor_added {
+            delta.fields_filled.push("sensor_data");
+        }
+
+        if incoming.is_failure && !self.is_failure {
+            self.is_failure = true;
+            delta.fields_filled.push("is_failure");
+        }
+        if incoming.is_anomaly && !self.is_anomaly {
+            self.is_anomaly = true;
+            delta.fields_filled.push("is_anomaly");
+        }
+
+        if !delta.fields_filled.is_empty() {
+            self.migrate_robotics_to_facets();
+        }
+
+        delta
+    }
+}
+
 impl Default for Experience {
     fn default() -> Self {
         Self {
@@ -5849,5 +6025,132 @@ mod tests {
             query.effective_competition_mode(),
             CompetitionMode::SurfaceBoth
         );
+    }
+}
+
+#[cfg(test)]
+mod enrichment_merge_tests {
+    use super::*;
+
+    fn stored_rich() -> Experience {
+        let mut e = Experience {
+            content: "the gripper stalled on the third lift".to_string(),
+            experience_type: ExperienceType::Decision,
+            entities: vec!["gripper".to_string(), "lift".to_string()],
+            tags: vec!["robotics".to_string()],
+            geo_location: Some([39.2904, -76.6122, 3.0]),
+            severity: Some("error".to_string()),
+            is_failure: true,
+            ..Default::default()
+        };
+        e.metadata
+            .insert("source".to_string(), "telemetry".to_string());
+        e
+    }
+
+    #[test]
+    fn merge_unions_entities_and_reports_exactly_what_it_added() {
+        let mut stored = stored_rich();
+        let incoming = Experience {
+            content: stored.content.clone(),
+            entities: vec!["gripper".to_string(), "Baltimore Terminal".to_string()],
+            tags: vec!["robotics".to_string(), "incident".to_string()],
+            ..Default::default()
+        };
+        let delta = stored.merge_enrichment_from(&incoming);
+        assert_eq!(delta.entities_added, vec!["Baltimore Terminal".to_string()]);
+        assert_eq!(delta.tags_added, vec!["incident".to_string()]);
+        assert_eq!(
+            stored.entities,
+            vec![
+                "gripper".to_string(),
+                "lift".to_string(),
+                "Baltimore Terminal".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_never_overwrites_or_nulls_what_was_already_asserted() {
+        let mut stored = stored_rich();
+        let before_geo = stored.geo_location;
+        let impoverished = Experience {
+            content: stored.content.clone(),
+            experience_type: ExperienceType::Observation,
+            geo_location: None,
+            severity: Some("info".to_string()),
+            is_failure: false,
+            ..Default::default()
+        };
+        stored.merge_enrichment_from(&impoverished);
+        assert_eq!(stored.geo_location, before_geo, "None is 'not provided'");
+        assert_eq!(
+            stored.severity.as_deref(),
+            Some("error"),
+            "first assertion wins"
+        );
+        assert!(
+            stored.is_failure,
+            "a flag cannot be retracted by its absence"
+        );
+        assert_eq!(stored.experience_type, ExperienceType::Decision);
+
+        let relocating = Experience {
+            content: stored.content.clone(),
+            geo_location: Some([0.0, 0.0, 0.0]),
+            ..Default::default()
+        };
+        stored.merge_enrichment_from(&relocating);
+        assert_eq!(
+            stored.geo_location, before_geo,
+            "a merge cannot relocate a memory"
+        );
+    }
+
+    #[test]
+    fn merge_of_a_byte_identical_duplicate_changes_nothing() {
+        let mut stored = stored_rich();
+        let identical = stored.clone();
+        assert!(stored.merge_enrichment_from(&identical).is_empty());
+    }
+
+    #[test]
+    fn merge_fills_absent_scalars_and_keeps_stored_map_values() {
+        let mut stored = Experience {
+            content: "survey pass complete".to_string(),
+            ..Default::default()
+        };
+        stored.metadata.insert("run".to_string(), "one".to_string());
+        let mut incoming = Experience {
+            content: stored.content.clone(),
+            geo_location: Some([12.5, 77.5, 0.0]),
+            robot_id: Some("drone-002".to_string()),
+            reward: Some(0.5),
+            ..Default::default()
+        };
+        incoming
+            .metadata
+            .insert("run".to_string(), "two".to_string());
+        incoming
+            .metadata
+            .insert("operator".to_string(), "kestrel".to_string());
+
+        let delta = stored.merge_enrichment_from(&incoming);
+        assert_eq!(stored.geo_location, Some([12.5, 77.5, 0.0]));
+        assert_eq!(stored.robot_id.as_deref(), Some("drone-002"));
+        assert_eq!(stored.reward, Some(0.5));
+        assert!(delta.fields_filled.contains(&"geo_location"));
+        assert_eq!(stored.metadata.get("run").map(String::as_str), Some("one"));
+        assert_eq!(
+            stored.metadata.get("operator").map(String::as_str),
+            Some("kestrel")
+        );
+        let place_is_geo = stored.context.as_ref().is_some_and(|c| {
+            c.place
+                .places
+                .iter()
+                .any(|p| matches!(p, Place::Geo { .. }))
+        });
+        assert!(place_is_geo, "a filled geo fix reaches the WHERE facet too");
     }
 }

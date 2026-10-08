@@ -27,6 +27,7 @@ use crate::ab_testing;
 use crate::backup;
 use crate::backup::BackupMetadata;
 use crate::config::{ServerConfig, StorageBackend};
+use crate::declared_entities::DeclaredEntity;
 use crate::embeddings::{
     are_ner_models_downloaded, auto_download_models_enabled, download_ner_models,
     get_ner_models_dir, ner::NerEntityType, neural_ner_enabled, KeywordExtractor, NerConfig,
@@ -346,6 +347,11 @@ pub struct MultiUserMemoryManager {
     /// Service Unavailable with a clear reason.
     pub sleep_time_orchestrator:
         parking_lot::RwLock<Option<Arc<crate::memory::sleep_time::SleepTimeOrchestrator>>>,
+
+    /// Fire-and-forget writes spawned on behalf of requests (graph processing, deferred
+    /// embedding, audit persistence). Shutdown closes it and waits, so the stores are not
+    /// flushed or released under a write still in flight.
+    pub task_tracker: tokio_util::task::TaskTracker,
 }
 
 /// User directories under the data root. An unreadable entry is an error, not a
@@ -579,9 +585,6 @@ impl MultiUserMemoryManager {
             shared_rocksdb_cache.as_ref(),
         )?;
 
-        if let Err(e) = shared_stores.todo_store.load_vector_indices() {
-            tracing::warn!("Failed to load todo vector indices: {}, semantic todo search will rebuild on first use", e);
-        }
         info!("Todo store initialized");
 
         let backup_engine = Self::open_backup_engine(&base_path, &server_config)?;
@@ -723,6 +726,7 @@ impl MultiUserMemoryManager {
             // rest of state is settled and a tokio runtime is available.
             // See `set_sleep_time_orchestrator()`.
             sleep_time_orchestrator: parking_lot::RwLock::new(None),
+            task_tracker: tokio_util::task::TaskTracker::new(),
         };
 
         info!("Running initial audit log rotation...");
@@ -1107,6 +1111,15 @@ impl MultiUserMemoryManager {
         Ok(())
     }
 
+    /// Closes the task tracker and waits up to `timeout` for every tracked task. Returns false
+    /// when the wait timed out. Tasks spawned after the close are still tracked and waited for.
+    pub async fn drain_background_tasks(&self, timeout: std::time::Duration) -> bool {
+        self.task_tracker.close();
+        tokio::time::timeout(timeout, self.task_tracker.wait())
+            .await
+            .is_ok()
+    }
+
     /// Log audit event (non-blocking with background persistence)
     pub fn log_event(&self, user_id: &str, event_type: &str, memory_id: &str, details: &str) {
         let event = AuditEvent {
@@ -1121,7 +1134,9 @@ impl MultiUserMemoryManager {
         let user_id = user_id.to_string();
         let persisted_user_id = user_id.clone();
 
-        tokio::task::spawn_blocking(move || {
+        // Tracked, not a bare spawn_blocking: the task holds its own handle on the audit store,
+        // so an untracked write outlives a drain and keeps the store open after the manager drops.
+        self.task_tracker.spawn_blocking(move || {
             if let Err(e) = audit_store.append_event(&persisted_user_id, &storage_event) {
                 tracing::error!("Failed to persist audit log: {}", e);
             }
@@ -1153,7 +1168,7 @@ impl MultiUserMemoryManager {
             let audit_retention_days = self.server_config.audit_retention_days as i64;
             let audit_max_entries = self.server_config.audit_max_entries_per_user;
 
-            tokio::task::spawn_blocking(move || {
+            self.task_tracker.spawn_blocking(move || {
                 let manager = MultiUserMemoryManagerRotationHelper {
                     audit_store,
                     audit_logs,
@@ -3737,6 +3752,46 @@ impl MultiUserMemoryManager {
         backed_up
     }
 
+    /// Rebuilds a memory's graph episode after its entity set changed: an upsert rewrote it,
+    /// or a content-identical duplicate merged in entities or tags. The episode is deleted,
+    /// with the edges it sourced, and built again from `experience` by the same pass that
+    /// built it, so there is one implementation of edge construction. It scans the
+    /// relationships, so callers run it only on a real delta.
+    pub fn rebuild_experience_graph(
+        &self,
+        user_id: &str,
+        experience: &Experience,
+        memory_id: &MemoryId,
+    ) -> Result<()> {
+        self.rebuild_experience_graph_declared(user_id, experience, memory_id, &[])
+    }
+
+    /// [`rebuild_experience_graph`](Self::rebuild_experience_graph) with the writer's declared
+    /// entities, as [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared).
+    pub fn rebuild_experience_graph_declared(
+        &self,
+        user_id: &str,
+        experience: &Experience,
+        memory_id: &MemoryId,
+        declared: &[DeclaredEntity],
+    ) -> Result<()> {
+        if let Ok(graph) = self.get_user_graph(user_id) {
+            match graph.read().delete_episode(&memory_id.0) {
+                Ok(true) => tracing::debug!(
+                    "Cleaned up old episode {} before graph rebuild",
+                    &memory_id.0.to_string()[..8]
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::debug!(
+                    "Old episode cleanup failed for {} (non-fatal): {}",
+                    &memory_id.0.to_string()[..8],
+                    e
+                ),
+            }
+        }
+        self.process_experience_into_graph_declared(user_id, experience, memory_id, declared)
+    }
+
     /// Process an experience and extract entities/relationships into the graph
     ///
     /// SHO-102: Improved graph building with:
@@ -3751,6 +3806,30 @@ impl MultiUserMemoryManager {
         experience: &Experience,
         memory_id: &MemoryId,
     ) -> Result<()> {
+        self.process_experience_into_graph_declared(user_id, experience, memory_id, &[])
+    }
+
+    /// [`process_experience_into_graph`](Self::process_experience_into_graph) plus the entities
+    /// the writer declared (see [`crate::declared_entities`]).
+    ///
+    /// Declared entities keep their labels, are appended AFTER the derived list is cut to
+    /// `max_entities_per_memory` (so they never compete for a slot), are never stopped by the
+    /// generic-entity gate, and their co-occurrence edges carry the declared weight with
+    /// `LtpStatus::Weekly` and `EdgeSource::Explicit`, so degree-cap pruning — which removes
+    /// unpotentiated edges before potentiated ones — reaches them last. Weekly rather than Burst
+    /// because a burst expires to `None` after 48h, and rather than Full because a declaration is
+    /// one observation, not ten.
+    ///
+    /// Derived entities pass a stop list of words measured as hubs on a code-heavy store, and a
+    /// derived entity already at `MAX_ENTITY_DEGREE` gets no new edges from this memory: at the
+    /// cap, every new edge only bought a prune of an older one.
+    pub fn process_experience_into_graph_declared(
+        &self,
+        user_id: &str,
+        experience: &Experience,
+        memory_id: &MemoryId,
+        declared: &[DeclaredEntity],
+    ) -> Result<()> {
         let graph = self.get_user_graph(user_id)?;
 
         // =====================================================================
@@ -3761,14 +3840,21 @@ impl MultiUserMemoryManager {
 
         let now = chrono::Utc::now();
 
-        // Stop words for filtering
+        // Stop words for filtering DERIVED entities. Declared entities never pass through this.
+        // The second row is the generic-entity gate: each was a hub at MAX_ENTITY_DEGREE on the
+        // live store on 2026-10-07, typed Person/Concept by a news-trained NER reading code-heavy
+        // text, and pruned on every new edge. They name no particular thing in that corpus.
         let stop_words: std::collections::HashSet<&str> = [
             "the", "and", "for", "that", "this", "with", "from", "have", "been", "are", "was",
             "were", "will", "would", "could", "should", "may", "might",
         ]
         .iter()
+        .chain(GENERIC_DERIVED_ENTITY_WORDS.iter())
         .cloned()
         .collect();
+        // A name the writer declared is the declared entity, not also a derived one.
+        let declared_names: std::collections::HashSet<String> =
+            declared.iter().map(|d| d.name.to_lowercase()).collect();
 
         // Use pre-extracted NER records for proper entity labels when available
         // This avoids redundant NER inference — the handler already ran NER in Pass 1
@@ -3843,6 +3929,9 @@ impl MultiUserMemoryManager {
                 if name.len() < 5 && e.confidence < 0.8 {
                     return false;
                 }
+                if declared_names.contains(&name.to_lowercase()) {
+                    return false;
+                }
                 true
             })
             .collect();
@@ -3892,7 +3981,11 @@ impl MultiUserMemoryManager {
             .iter()
             .filter_map(|tag| {
                 let tag_name = tag.trim();
-                if tag_name.len() >= 2 && !stop_words.contains(tag_name.to_lowercase().as_str()) {
+                let lower = tag_name.to_lowercase();
+                if tag_name.len() >= 2
+                    && !stop_words.contains(lower.as_str())
+                    && !declared_names.contains(&lower)
+                {
                     Some((
                         tag_name.to_string(),
                         EntityNode {
@@ -3921,6 +4014,7 @@ impl MultiUserMemoryManager {
             .iter()
             .map(|(name, _)| name.clone())
             .chain(tag_entities.iter().map(|(name, _)| name.clone()))
+            .chain(declared.iter().map(|d| d.name.clone()))
             .collect();
 
         // Extract all-caps terms (API, TUI, NER, REST, etc.)
@@ -4048,6 +4142,32 @@ impl MultiUserMemoryManager {
         let entity_cap = self.server_config.max_entities_per_memory;
         all_entities.truncate(entity_cap);
 
+        // Declared entities go in after the cut, so the cap bounds only what veld derived.
+        let declared_nodes: Vec<(String, EntityNode, f32)> = declared
+            .iter()
+            .map(|d| {
+                (
+                    d.name.clone(),
+                    EntityNode {
+                        uuid: uuid::Uuid::new_v4(),
+                        name: d.name.clone(),
+                        labels: d.labels.clone(),
+                        created_at: now,
+                        last_seen_at: now,
+                        mention_count: 1,
+                        summary: String::new(),
+                        attributes: HashMap::new(),
+                        name_embedding: None,
+                        salience: d.weight,
+                        // An identifier, not a word: keeps it out of the stemmed merge tier.
+                        is_proper_noun: true,
+                        pii_classification: Default::default(),
+                    },
+                    d.weight,
+                )
+            })
+            .collect();
+
         // =====================================================================
         // PHASE 2: GRAPH INSERTION (WITH LOCK)
         // Only fast I/O operations happen here.
@@ -4056,12 +4176,37 @@ impl MultiUserMemoryManager {
         let graph_guard = graph.read();
 
         let mut entity_uuids = Vec::new();
+        // Per entry of `entity_uuids`: Some(weight) for a declared entity, None for derived.
+        let mut declared_weight: Vec<Option<f32>> = Vec::new();
+        // Per entry: a derived entity already at the degree cap takes no new edges.
+        let mut at_cap: Vec<bool> = Vec::new();
 
         // Insert all pre-built entities
         for (name, entity) in all_entities {
             match graph_guard.add_entity(entity) {
-                Ok(uuid) => entity_uuids.push((name, uuid)),
+                Ok(uuid) => {
+                    let hub = match graph_guard.entity_degree(&uuid) {
+                        Ok(degree) => degree >= crate::constants::MAX_ENTITY_DEGREE,
+                        Err(e) => {
+                            tracing::debug!("Degree read failed for {}: {}", name, e);
+                            false
+                        }
+                    };
+                    entity_uuids.push((name, uuid));
+                    declared_weight.push(None);
+                    at_cap.push(hub);
+                }
                 Err(e) => tracing::debug!("Failed to add entity {}: {}", name, e),
+            }
+        }
+        for (name, entity, weight) in declared_nodes {
+            match graph_guard.add_entity(entity) {
+                Ok(uuid) => {
+                    entity_uuids.push((name, uuid));
+                    declared_weight.push(Some(weight));
+                    at_cap.push(false);
+                }
+                Err(e) => tracing::debug!("Failed to add declared entity {}: {}", name, e),
             }
         }
 
@@ -4122,9 +4267,20 @@ impl MultiUserMemoryManager {
             })
             .collect();
 
+        let mut hub_edges_skipped = 0u64;
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
-                let state_edge_init = EdgeTier::L1Working.initial_weight();
+                if at_cap[i] || at_cap[j] {
+                    hub_edges_skipped += 1;
+                    continue;
+                }
+                let declared_strength = match (declared_weight[i], declared_weight[j]) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                let state_edge_init =
+                    declared_strength.unwrap_or_else(|| EdgeTier::L1Working.initial_weight());
                 let mut from_entity = entity_uuids[i].1;
                 let mut to_entity = entity_uuids[j].1;
                 let cue_hit =
@@ -4160,11 +4316,19 @@ impl MultiUserMemoryManager {
                     context: truncated_context.clone(),
                     last_activated: now,
                     activation_count: 1,
-                    ltp_status: LtpStatus::None,
+                    ltp_status: if declared_strength.is_some() {
+                        LtpStatus::Weekly
+                    } else {
+                        LtpStatus::None
+                    },
                     tier: EdgeTier::L1Working,
                     activation_timestamps: None,
                     entity_confidence: None,
-                    created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+                    created_by: if declared_strength.is_some() {
+                        crate::graph_memory::EdgeSource::Explicit
+                    } else {
+                        crate::graph_memory::EdgeSource::CoOccurrence
+                    },
                     forward_strength: state_edge_init,
                     backward_strength: state_edge_init,
                 };
@@ -4174,11 +4338,40 @@ impl MultiUserMemoryManager {
                 }
             }
         }
+        if hub_edges_skipped > 0 {
+            crate::metrics::GRAPH_HUB_EDGES_SKIPPED.inc_by(hub_edges_skipped);
+            tracing::debug!(
+                memory_id = %memory_id.0,
+                skipped = hub_edges_skipped,
+                hubs = ?entity_uuids
+                    .iter()
+                    .zip(&at_cap)
+                    .filter(|(_, hub)| **hub)
+                    .map(|((name, _), _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                "Skipped co-occurrence edges on entities already at the degree cap"
+            );
+        }
         // Lock released here
 
         Ok(())
     }
 }
+
+/// Words that never become DERIVED graph entities (matched case-insensitively). Declared
+/// entities are not subject to this list.
+pub const GENERIC_DERIVED_ENTITY_WORDS: &[&str] = &[
+    "file",
+    "files",
+    "code",
+    "first",
+    "moved",
+    "line",
+    "lines",
+    "test",
+    "description",
+    "operator",
+];
 
 /// W6 query-planner integration: surface each tenant's live Vamana
 /// indices to the planner's vector adapter (`RealVectorQuerier`).
@@ -5152,5 +5345,128 @@ mod shared_purge_tests {
                 "{backend:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod background_task_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn manager(
+        base: &std::path::Path,
+        audit_rotation_check_interval: usize,
+    ) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: base.to_path_buf(),
+            backup_enabled: false,
+            audit_rotation_check_interval,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(base.to_path_buf(), config).expect("manager")
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_tracked_tasks_and_reports_a_timeout() {
+        let home = tempfile::tempdir().expect("temp home");
+        let state = manager(home.path(), 100);
+
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        state.task_tracker.spawn(async move {
+            let _ = released.await;
+        });
+
+        assert!(
+            !state
+                .drain_background_tasks(Duration::from_millis(50))
+                .await,
+            "a drain must report the timeout while a tracked task is still running"
+        );
+        release.send(()).expect("task still waiting");
+        assert!(
+            state.drain_background_tasks(Duration::from_secs(30)).await,
+            "the drain returns once the tracked task finishes"
+        );
+        assert!(state.task_tracker.is_empty());
+    }
+
+    /// The blocking pool is pinned to one thread and that thread is held, so the audit writes are
+    /// still queued when the drain starts rather than usually finished. The burst crosses
+    /// `audit_rotation_check_interval`, so the rotation task is queued as well as the writes.
+    #[test]
+    fn a_drained_manager_releases_the_shared_db_despite_queued_audit_writes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let home = tempfile::tempdir().expect("temp home");
+            let state = Arc::new(manager(home.path(), 4));
+            let audit_store = Arc::downgrade(&state.audit_store);
+            #[cfg(feature = "rocksdb")]
+            let shared_db = state.shared_db.rocksdb().map(Arc::downgrade);
+
+            // Released by time, not by a signal: a drain that waits for the queued writes must
+            // also wait for this.
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(300)));
+            let events = state.server_config.audit_rotation_check_interval + 1;
+            for i in 0..events {
+                state.log_event(
+                    "drain-probe",
+                    "PROBE",
+                    &format!("probe-{i}"),
+                    "queued write",
+                );
+            }
+
+            assert!(state.drain_background_tasks(Duration::from_secs(30)).await);
+            drop(state);
+
+            assert!(
+                audit_store.upgrade().is_none(),
+                "a queued audit task still holds the audit store after drain and drop, so \
+                 reopening this data directory fails on the store's lock"
+            );
+            #[cfg(feature = "rocksdb")]
+            if let Some(shared_db) = shared_db {
+                assert!(
+                    shared_db.upgrade().is_none(),
+                    "the shared RocksDB is still open after drain and drop"
+                );
+            }
+        });
+    }
+}
+
+impl MultiUserMemoryManager {
+    /// Drain every cached user's embedding backlog, reconciling first when asked. Only users
+    /// already in the cache: loading a cold user is seconds of work that a tick must not do.
+    pub fn drain_embedding_backlogs(
+        &self,
+        limit_per_user: usize,
+        reconcile: bool,
+    ) -> Vec<(String, anyhow::Result<crate::memory::embedding_backlog::DrainReport>)> {
+        let mut out = Vec::new();
+        for user_id in self.list_cached_users() {
+            let Some(memory) = self.user_memories.get(&user_id) else {
+                continue;
+            };
+            let guard = memory.read();
+            if reconcile {
+                if let Err(e) = guard.reconcile_embedding_backlog() {
+                    out.push((user_id, Err(e)));
+                    continue;
+                }
+            }
+            let result = guard.drain_embedding_backlog(limit_per_user);
+            if let Ok(report) = guard.embedding_backlog_report() {
+                crate::metrics::EMBEDDING_BACKLOG_PENDING
+                    .with_label_values(&[user_id.as_str()])
+                    .set(report.pending as i64);
+            }
+            out.push((user_id, result));
+        }
+        out
     }
 }

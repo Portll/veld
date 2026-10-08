@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::remember::parse_experience_type;
 use super::state::MultiUserMemoryManager;
 use crate::constants::{
     SEED_DEFAULT_MAX_FILES, SEED_IMPORTANCE_CONFIG, SEED_IMPORTANCE_README, SEED_IMPORTANCE_SOURCE,
@@ -550,14 +549,14 @@ pub async fn seed_project(
 
             let importance = file_importance(file_path, &project_path);
             let exp_type = if importance >= SEED_IMPORTANCE_CONFIG {
-                "context"
+                ExperienceType::Context
             } else {
-                "observation"
+                ExperienceType::Observation
             };
 
             let experience = Experience {
                 content: format!("File: {}\n\n{}", rel_str, content),
-                experience_type: parse_experience_type(Some(&exp_type.to_string())),
+                experience_type: exp_type,
                 tags: vec!["_seed".to_string(), file_name.to_string()],
                 entities: vec![file_name.to_string(), project_name.clone()],
                 ..Default::default()

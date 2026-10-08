@@ -40,7 +40,7 @@ All behavior-changing security controls ship **secure by default**. Operators wh
 | `VELD_ALLOW_UNSIGNED_WEBHOOKS` | `false` | Set to `true` to process webhooks when no `*_WEBHOOK_SECRET` is configured (not recommended). Default rejects with 503. |
 | `VELD_PUBLIC_RATE_LIMIT` | `true` | Set to `false` to exempt non-probe public routes from rate limiting. Probe routes (`/health*`) are never rate-limited regardless. |
 | `VELD_METRICS_PUBLIC` | `false` | Set to `true` to expose `/metrics` without authentication (for unauthenticated Prometheus scrapers). Default requires `Authorization: Bearer <key>`. |
-| `VELD_ENFORCE_HTTPS` | `false` | Set to `true` to reject insecure `http://` overrides for `LINEAR_API_URL`/`GITHUB_API_URL` (falls back to the compiled-in HTTPS default). Default warns only. |
+| `VELD_ENFORCE_HTTPS` | `true` | Set to `false` (or `0`) to honour an insecure `http://` override of `LINEAR_API_URL`/`GITHUB_API_URL` for a non-localhost host, sending the token in cleartext. Default rejects it and uses the compiled-in HTTPS URL; any other value also enforces. Localhost `http://` is always allowed. |
 | `VELD_ADMIN_API_KEY` | unset | Set to a secret string to enable `/api/admin/*` endpoints. These endpoints use a separate key from `VELD_API_KEYS` — a leaked user key does not grant admin access. |
 
 ### Webhook Security

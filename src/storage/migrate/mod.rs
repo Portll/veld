@@ -23,6 +23,12 @@
 //! memories on a rocksdb target. Keyspaces are emitted in name order and keys in byte
 //! order, so an extraction of the target after an import reproduces the dump's frames
 //! exactly — which is how an import proves itself against the trailer.
+//!
+//! A tenant with record-level encryption migrates sealed. Its keystore (`<u>/storage/
+//! keystore.json` on rocksdb, `<u>/keystore.json` on redb) is copied to the target's
+//! place; sealed memories travel as stored, each one opened under the keystore on the
+//! way out and again on the target; and the keystore generation sentinel travels as
+//! `primary/default` `meta:keystore_generation`, which rocksdb keeps in `memory_index`.
 
 #[cfg(feature = "storage-redb")]
 pub mod backup;
@@ -40,6 +46,7 @@ use crate::storage::portable::{self, PortableRecord, PortableWriter};
 pub const FORMAT: &str = "veld-logical-1";
 const MANIFEST: &str = "MANIFEST.json";
 const META: &str = "meta";
+const KEYSTORE: &str = "keystore.json";
 #[cfg(feature = "rocksdb")]
 const VMAPPING: &[u8] = b"vmapping:";
 #[cfg(feature = "rocksdb")]
@@ -114,6 +121,13 @@ pub struct Extraction {
     pub quarantined: u64,
     pub quarantined_keys: Vec<String>,
     pub derived_rows_not_carried: u64,
+    /// Sealed memories carried as stored, each shown to open under the keystore.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub sealed_records: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Extraction {
@@ -152,6 +166,9 @@ pub struct ImportReport {
     /// trailer by construction of `Ok`; reported so the equality is visible.
     pub verified_frames: u64,
     pub verified_digest: String,
+    /// Sealed memories on the target, each opened under the keystore copied there.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub verified_sealed_records: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,13 +323,33 @@ pub struct QuarantineWriter {
     listing: Vec<serde_json::Value>,
 }
 
+/// How an extraction treats memory records sealed by record-level encryption.
+#[derive(Clone, Copy)]
+enum Sealed<'k> {
+    /// export and import: an encrypted rocksdb store is refused, and redb carries sealed
+    /// records as stored for a backup that restores under the same keystore.
+    AsStored,
+    /// migrate: a sealed record is carried as stored once it opens under the keys;
+    /// without keys it is undecodable.
+    Opened(Option<Keys<'k>>),
+}
+
+#[derive(Clone, Copy)]
+struct Keys<'k> {
+    cryptors: &'k crate::keystore::RecordCryptors,
+    /// Source side: the keystore's generation, carried as the sentinel once the store's
+    /// own sentinel is shown not to be ahead of it. Target side, `None`: the sentinel as stored.
+    generation: Option<u64>,
+}
+
 struct Sink<'q, W: Write> {
     writer: PortableWriter<W>,
     stats: Extraction,
     quarantine: Option<&'q mut QuarantineWriter>,
+    sealed: Sealed<'q>,
 }
 
-impl<W: Write> Sink<'_, W> {
+impl<'q, W: Write> Sink<'q, W> {
     fn frame(&mut self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
         self.writer.write_record(&PortableRecord {
             cf: cf.to_string(),
@@ -354,6 +391,102 @@ impl<W: Write> Sink<'_, W> {
         }
         Ok(())
     }
+
+    fn keys(&self) -> Option<Keys<'q>> {
+        match self.sealed {
+            Sealed::Opened(keys) => keys,
+            Sealed::AsStored => None,
+        }
+    }
+
+    fn opens_sealed(&self) -> bool {
+        matches!(self.sealed, Sealed::Opened(_))
+    }
+
+    fn sealed_memory(&mut self, key: &[u8], value: &[u8], label: String) -> Result<()> {
+        match open_sealed(self.keys(), key, value) {
+            Ok(()) => {
+                self.stats.sealed_records += 1;
+                self.put("primary/memories", key, value)
+            }
+            Err(reason) => self.fail(
+                "primary/memories",
+                key,
+                value,
+                format!("{label} ({reason})"),
+            ),
+        }
+    }
+
+    /// A `primary/default` row, with the keystore generation sentinel spliced in at its key's place.
+    fn put_default(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        sentinel: &mut Option<Vec<u8>>,
+    ) -> Result<()> {
+        if sentinel.is_some() && key >= GENERATION_SENTINEL {
+            self.flush_sentinel(sentinel)?;
+            if key == GENERATION_SENTINEL {
+                return Ok(());
+            }
+        }
+        self.put("primary/default", key, value)
+    }
+
+    fn flush_sentinel(&mut self, sentinel: &mut Option<Vec<u8>>) -> Result<()> {
+        match sentinel.take() {
+            Some(value) => self.put("primary/default", GENERATION_SENTINEL, &value),
+            None => Ok(()),
+        }
+    }
+}
+
+const GENERATION_SENTINEL: &[u8] = crate::keystore::GENERATION_SENTINEL_KEY;
+
+/// The sentinel frame an encrypted store contributes, given the value it holds.
+fn sentinel_frame(
+    keys: Keys<'_>,
+    stored: Option<Vec<u8>>,
+    store: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let Some(generation) = keys.generation else {
+        return Ok(stored);
+    };
+    let seen = stored
+        .as_deref()
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0);
+    crate::keystore::keystore_generation_sentinel(seen, generation)
+        .with_context(|| format!("{} and its keystore", store.display()))?;
+    Ok(Some(generation.to_le_bytes().to_vec()))
+}
+
+/// `Ok` when a sealed memory opens under `keys` to a memory in the current layout,
+/// which both engines read; otherwise why not.
+fn open_sealed(
+    keys: Option<Keys<'_>>,
+    key: &[u8],
+    value: &[u8],
+) -> std::result::Result<(), String> {
+    let keys = keys.ok_or("sealed, and the store has no keystore")?;
+    if key.len() != 16 {
+        return Err("sealed under a key that is not a memory id".to_string());
+    }
+    let epoch = crate::keystore::record_epoch(value).ok_or("sealed record header is truncated")?;
+    let cryptor = keys.cryptors.for_epoch(epoch).ok_or_else(|| {
+        format!("sealed under epoch {epoch}, which the keystore holds no key for")
+    })?;
+    let plaintext = zeroize::Zeroizing::new(
+        cryptor
+            .decrypt_record(value, key)
+            .map_err(|e| format!("does not open under the keystore: {e}"))?,
+    );
+    if !crate::memory::storage::is_current_memory_encoding(&plaintext) {
+        return Err("opens, but not to a memory in the current layout".to_string());
+    }
+    Ok(())
 }
 
 fn meta_frames(unit: &Unit) -> Vec<(&'static str, Vec<u8>)> {
@@ -377,7 +510,7 @@ pub fn extract<W: Write>(
     unit: &Unit,
     out: W,
 ) -> Result<Extraction> {
-    extract_with(base, backend, unit, out, None)
+    extract_with(base, backend, unit, out, None, Sealed::AsStored)
 }
 
 fn extract_with<W: Write>(
@@ -386,39 +519,46 @@ fn extract_with<W: Write>(
     unit: &Unit,
     out: W,
     quarantine: Option<&mut QuarantineWriter>,
+    sealed: Sealed<'_>,
 ) -> Result<Extraction> {
-    run_sink(unit, out, quarantine, |sink| match (backend, unit) {
-        (StorageBackend::RocksDb, Unit::User(id)) => {
-            let dir = user_dir(base, id)?;
-            rocks_primary(sink, &dir.join("storage"))?;
-            rocks_families(sink, &dir.join("graph/graph"), |cf| format!("graph/{cf}"))
+    run_sink(unit, out, quarantine, sealed, |sink| {
+        match (backend, unit) {
+            (StorageBackend::RocksDb, Unit::User(id)) => {
+                let dir = user_dir(base, id)?;
+                rocks_primary(sink, &dir.join("storage"))?;
+                rocks_families(sink, &dir.join("graph/graph"), |cf| format!("graph/{cf}"))
+            }
+            (StorageBackend::RocksDb, Unit::Shared) => {
+                rocks_families(sink, &base.join("shared"), |cf| {
+                    if cf == "audit" {
+                        "audit/audit".to_string()
+                    } else {
+                        format!("shared/{cf}")
+                    }
+                })
+            }
+            #[cfg(feature = "storage-redb")]
+            (StorageBackend::Redb, _) => redb_unit(sink, base, unit, &LiveRedb::default()),
+            #[cfg(not(feature = "storage-redb"))]
+            (StorageBackend::Redb, _) => {
+                bail!("this build has no redb backend (feature storage-redb)")
+            }
         }
-        (StorageBackend::RocksDb, Unit::Shared) => {
-            rocks_families(sink, &base.join("shared"), |cf| {
-                if cf == "audit" {
-                    "audit/audit".to_string()
-                } else {
-                    format!("shared/{cf}")
-                }
-            })
-        }
-        #[cfg(feature = "storage-redb")]
-        (StorageBackend::Redb, _) => redb_unit(sink, base, unit, &LiveRedb::default()),
-        #[cfg(not(feature = "storage-redb"))]
-        (StorageBackend::Redb, _) => bail!("this build has no redb backend (feature storage-redb)"),
     })
 }
 
-fn run_sink<W: Write>(
+fn run_sink<'q, W: Write>(
     unit: &Unit,
     out: W,
-    quarantine: Option<&mut QuarantineWriter>,
-    body: impl FnOnce(&mut Sink<'_, W>) -> Result<()>,
+    quarantine: Option<&'q mut QuarantineWriter>,
+    sealed: Sealed<'q>,
+    body: impl FnOnce(&mut Sink<'q, W>) -> Result<()>,
 ) -> Result<Extraction> {
     let mut sink = Sink {
         writer: PortableWriter::new(out)?,
         stats: Extraction::default(),
         quarantine,
+        sealed,
     };
     for (key, value) in meta_frames(unit) {
         sink.frame(META, key.as_bytes(), &value)?;
@@ -488,17 +628,18 @@ pub fn extract_live<W: Write>(
     live: &LiveRedb,
     out: W,
 ) -> Result<Extraction> {
-    run_sink(unit, out, None, |sink| redb_unit(sink, base, unit, live))
+    run_sink(unit, out, None, Sealed::AsStored, |sink| {
+        redb_unit(sink, base, unit, live)
+    })
 }
 
 #[cfg(feature = "rocksdb")]
 fn refuse_if_encrypted(storage_dir: &Path) -> Result<()> {
-    let keystore = storage_dir.join("keystore.json");
+    let keystore = storage_dir.join(KEYSTORE);
     if exists(&keystore)? {
         bail!(
-            "{} uses record-level encryption ({} is present). The redb backend has no \
-             at-rest encryption and a portable dump is plaintext, so migrating would \
-             decrypt every record to disk — refusing.",
+            "{} uses record-level encryption ({} is present). An export or import does not \
+             carry a keystore; `veld migrate` moves an encrypted store between engines — refusing.",
             storage_dir.display(),
             keystore.display()
         );
@@ -534,14 +675,20 @@ fn apply_rocks_raw(
 }
 
 #[cfg(not(feature = "rocksdb"))]
-fn apply_rocks_primary(_user_dir: &Path, _records: Vec<PortableRecord>) -> Result<()> {
+fn apply_rocks_primary(
+    _user_dir: &Path,
+    _records: Vec<PortableRecord>,
+    _sealed: bool,
+) -> Result<()> {
     bail!(NO_ROCKSDB)
 }
 
 #[cfg(feature = "rocksdb")]
 fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
     use rocksdb::{Direction, IteratorMode};
-    refuse_if_encrypted(dir)?;
+    if !sink.opens_sealed() {
+        refuse_if_encrypted(dir)?;
+    }
     let Some(store) = readonly::open_rocks(dir)? else {
         return Ok(());
     };
@@ -558,14 +705,30 @@ fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
         .ok_or_else(|| anyhow!("{} has no default column family", dir.display()))?;
     let is_memory =
         |key: &[u8]| key.len() == 16 && !NON_MEMORY_PREFIXES.iter().any(|p| key.starts_with(p));
+    let index = db.cf_handle("memory_index");
+    let carries_sentinel = sink.keys().is_some();
+    let mut sentinel = match sink.keys() {
+        None => None,
+        Some(keys) => {
+            if db.get_cf(default, GENERATION_SENTINEL)?.is_some() {
+                bail!("{} holds a keystore generation sentinel in its default family, where rocksdb never reads one — refusing to guess which is current", dir.display());
+            }
+            let stored = match index {
+                Some(cf) => db.get_cf(cf, GENERATION_SENTINEL)?,
+                None => None,
+            };
+            sentinel_frame(keys, stored, dir)?
+        }
+    };
 
     for item in db.iterator_cf(default, IteratorMode::Start) {
         let (key, value) = item?;
         if is_memory(&key) || key.starts_with(VMAPPING) {
             continue;
         }
-        sink.put("primary/default", &key, &value)?;
+        sink.put_default(&key, &value, &mut sentinel)?;
     }
+    sink.flush_sentinel(&mut sentinel)?;
     if let Some(kv) = db.cf_handle("kv") {
         for item in db.iterator_cf(kv, IteratorMode::Start) {
             let (key, value) = item?;
@@ -577,19 +740,21 @@ fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
         if !is_memory(&key) {
             continue;
         }
+        let label = || {
+            format!(
+                "primary/memories {}",
+                uuid::Uuid::from_slice(&key)
+                    .map(|u| u.to_string())
+                    .unwrap_or_default()
+            )
+        };
+        if sink.opens_sealed() && crate::keystore::is_encrypted_record(&value) {
+            sink.sealed_memory(&key, &value, label())?;
+            continue;
+        }
         match crate::memory::storage::portable_memory_value(&value) {
             Ok(bytes) => sink.put("primary/memories", &key, &bytes)?,
-            Err(_) => sink.fail(
-                "primary/memories",
-                &key,
-                &value,
-                format!(
-                    "primary/memories {}",
-                    uuid::Uuid::from_slice(&key)
-                        .map(|u| u.to_string())
-                        .unwrap_or_default()
-                ),
-            )?,
+            Err(_) => sink.fail("primary/memories", &key, &value, label())?,
         }
     }
     let mut mappings = Vec::new();
@@ -618,9 +783,12 @@ fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
     for (id, value) in mappings {
         sink.put("primary/vector_mappings", &id, &value)?;
     }
-    if let Some(index) = db.cf_handle("memory_index") {
+    if let Some(index) = index {
         for item in db.iterator_cf(index, IteratorMode::Start) {
-            item?;
+            let (key, _) = item?;
+            if carries_sentinel && &*key == GENERATION_SENTINEL {
+                continue;
+            }
             sink.stats.derived_rows_not_carried += 1;
         }
     }
@@ -688,8 +856,25 @@ fn redb_primary_db<W: Write>(sink: &mut Sink<W>, db: &redb::Database, path: &Pat
     {
         bail!("{} has table '{t}', which this migration does not know how to carry — refusing rather than dropping it", path.display());
     }
+    let has = |table: &str| names.iter().any(|n| n == table);
+    let mut sentinel = match sink.keys() {
+        Some(keys) if keys.generation.is_some() => {
+            let stored = if has("default") {
+                read.open_table(RawTable::new("default"))?
+                    .get(GENERATION_SENTINEL)?
+                    .map(|v| v.value().to_vec())
+            } else {
+                None
+            };
+            sentinel_frame(keys, stored, path)?
+        }
+        _ => None,
+    };
     for table in ["default", "kv", "memories", "vector_mappings"] {
-        if !names.iter().any(|n| n == table) {
+        if table != "default" {
+            sink.flush_sentinel(&mut sentinel)?;
+        }
+        if !has(table) {
             continue;
         }
         let handle = read.open_table(RawTable::new(table))?;
@@ -697,9 +882,13 @@ fn redb_primary_db<W: Write>(sink: &mut Sink<W>, db: &redb::Database, path: &Pat
             let (k, v) = row?;
             let (key, value) = (k.value(), v.value());
             match table {
-                // A sealed record travels sealed: the backup it lands in restores into the
-                // same store, under the same keystore. `migrate` refuses an encrypted
-                // source before it gets here.
+                "default" => sink.put_default(key, value, &mut sentinel)?,
+                "memories"
+                    if sink.opens_sealed() && crate::keystore::is_encrypted_record(value) =>
+                {
+                    sink.sealed_memory(key, value, format!("primary/memories {}", redb_label(key)))?
+                }
+                // A backup restores into the same store, under the same keystore.
                 "memories" if key.len() == 16 && crate::keystore::is_encrypted_record(value) => {
                     sink.put("primary/memories", key, value)?
                 }
@@ -842,9 +1031,10 @@ fn export_unit(
     unit: &Unit,
     path: &Path,
     quarantine_dir: Option<&Path>,
+    sealed: Sealed<'_>,
 ) -> Result<(Extraction, Option<QuarantineReport>)> {
     write_dump(unit, path, quarantine_dir, |out, quarantine| {
-        extract_with(base, backend, unit, out, quarantine)
+        extract_with(base, backend, unit, out, quarantine, sealed)
     })
 }
 
@@ -982,7 +1172,7 @@ pub fn export(
     let mut failures = Vec::new();
     for unit in &units {
         let path = out_dir.join(dump_file_name(unit));
-        match export_unit(base, backend, unit, &path, quarantine_dir) {
+        match export_unit(base, backend, unit, &path, quarantine_dir, Sealed::AsStored) {
             Ok((stats, quarantine)) => reports.push(DumpReport {
                 unit: unit.clone(),
                 path,
@@ -1238,7 +1428,7 @@ pub fn import(base: &Path, backend: StorageBackend, input: &Path) -> Result<Vec<
     }
     let mut reports = Vec::new();
     for p in pending {
-        reports.push(import_one(base, backend, &p).with_context(|| {
+        reports.push(import_one(base, backend, &p, None).with_context(|| {
             let done: Vec<String> = reports
                 .iter()
                 .map(|r: &ImportReport| r.unit.to_string())
@@ -1269,7 +1459,13 @@ fn refuse_populated_target(base: &Path, backend: StorageBackend, unit: &Unit) ->
     Ok(())
 }
 
-fn import_one(base: &Path, backend: StorageBackend, p: &PendingImport) -> Result<ImportReport> {
+/// `keystore`: where migrate installed an encrypted unit's keystore on the target.
+fn import_one(
+    base: &Path,
+    backend: StorageBackend,
+    p: &PendingImport,
+    keystore: Option<&Path>,
+) -> Result<ImportReport> {
     let records = portable::read_all(std::fs::File::open(&p.path)?)?;
     let (unit, data) = parse_dump(records)?;
     if unit != p.unit {
@@ -1279,8 +1475,28 @@ fn import_one(base: &Path, backend: StorageBackend, p: &PendingImport) -> Result
         );
     }
     let record_count = data.len() as u64;
-    apply(base, backend, &unit, data)?;
-    let verified = verify(base, backend, &unit, p.frames, &p.digest)?;
+    apply(base, backend, &unit, data, keystore.is_some())?;
+    let verified = match keystore {
+        None => verify_with(base, backend, &unit, p.frames, &p.digest, Sealed::AsStored)?,
+        Some(path) => {
+            let json = std::fs::read_to_string(path)
+                .with_context(|| format!("reading the keystore copied to {}", path.display()))?;
+            let keys = crate::keystore::unseal_record_keys(&json)
+                .with_context(|| format!("unsealing the keystore copied to {}", path.display()))?;
+            let target = Keys {
+                cryptors: &keys.cryptors,
+                generation: None,
+            };
+            verify_with(
+                base,
+                backend,
+                &unit,
+                p.frames,
+                &p.digest,
+                Sealed::Opened(Some(target)),
+            )?
+        }
+    };
     Ok(ImportReport {
         unit,
         source: p.path.clone(),
@@ -1289,6 +1505,7 @@ fn import_one(base: &Path, backend: StorageBackend, p: &PendingImport) -> Result
         digest: portable::hex(&p.digest),
         verified_frames: verified.frames,
         verified_digest: verified.digest,
+        verified_sealed_records: verified.sealed_records,
     })
 }
 
@@ -1301,7 +1518,18 @@ pub fn verify(
     frames: u64,
     digest: &[u8; 32],
 ) -> Result<Extraction> {
-    let derived = extract(base, backend, unit, std::io::sink())?;
+    verify_with(base, backend, unit, frames, digest, Sealed::AsStored)
+}
+
+fn verify_with(
+    base: &Path,
+    backend: StorageBackend,
+    unit: &Unit,
+    frames: u64,
+    digest: &[u8; 32],
+    sealed: Sealed<'_>,
+) -> Result<Extraction> {
+    let derived = extract_with(base, backend, unit, std::io::sink(), None, sealed)?;
     let expected = portable::hex(digest);
     if derived.frames != frames || derived.digest != expected || derived.decode_failures > 0 {
         bail!(
@@ -1321,11 +1549,13 @@ fn split_keyspace<'a>(cf: &'a str, component: &str) -> Option<&'a str> {
         .and_then(|rest| rest.strip_prefix('/'))
 }
 
+/// `sealed`: an encrypted unit whose keystore migrate has already installed on the target.
 fn apply(
     base: &Path,
     backend: StorageBackend,
     unit: &Unit,
     data: Vec<PortableRecord>,
+    sealed: bool,
 ) -> Result<()> {
     match (backend, unit) {
         (StorageBackend::RocksDb, Unit::User(id)) => {
@@ -1333,7 +1563,7 @@ fn apply(
             let (primary, graph): (Vec<_>, Vec<_>) =
                 data.into_iter().partition(|r| r.cf.starts_with("primary/"));
             if !primary.is_empty() {
-                apply_rocks_primary(&dir, primary)?;
+                apply_rocks_primary(&dir, primary, sealed)?;
             }
             if !graph.is_empty() {
                 apply_rocks_raw(&dir.join("graph/graph"), graph, |cf| {
@@ -1514,9 +1744,16 @@ fn apply_rocks_raw(
 }
 
 #[cfg(feature = "rocksdb")]
-fn apply_rocks_primary(user_dir: &Path, records: Vec<PortableRecord>) -> Result<()> {
+fn apply_rocks_primary(user_dir: &Path, records: Vec<PortableRecord>, sealed: bool) -> Result<()> {
     let storage = user_dir.join("storage");
-    refuse_if_encrypted(&storage)?;
+    if !sealed {
+        refuse_if_encrypted(&storage)?;
+    } else if !exists(&storage.join(KEYSTORE))? {
+        bail!(
+            "{} has no keystore to open the sealed records with — refusing to let the index rebuild create one",
+            storage.display()
+        );
+    }
     {
         let db = open_rocks_for_import(&storage, &["kv".to_string(), "memory_index".to_string()])?;
         write_rocks(
@@ -1524,6 +1761,9 @@ fn apply_rocks_primary(user_dir: &Path, records: Vec<PortableRecord>) -> Result<
             records.into_iter().map(|r| {
                 let key = r.key;
                 match r.cf.as_str() {
+                    "primary/default" if sealed && key == GENERATION_SENTINEL => {
+                        Ok(("memory_index".to_string(), key, r.value))
+                    }
                     "primary/default" => Ok(("default".to_string(), key, r.value)),
                     "primary/kv" => Ok(("kv".to_string(), key, r.value)),
                     "primary/memories" if key.len() == 16 => {
@@ -1544,14 +1784,15 @@ fn apply_rocks_primary(user_dir: &Path, records: Vec<PortableRecord>) -> Result<
                 }
             }),
         )?;
-        for family in ["default", "kv"] {
+        for family in ["default", "kv", "memory_index"] {
             db.flush_cf(db.cf_handle(family).expect("opened above"))?;
         }
     }
-    let rebuilt = crate::memory::storage::MemoryStorage::new(user_dir, None)
-        .context("reopening the imported rocksdb store to rebuild its index")?
-        .rebuild_index()
-        .context("rebuilding memory_index on the imported rocksdb store")?;
+    let rebuilt =
+        crate::memory::storage::MemoryStorage::open_without_creating_keystore(user_dir, None)
+            .context("reopening the imported rocksdb store to rebuild its index")?
+            .rebuild_index()
+            .context("rebuilding memory_index on the imported rocksdb store")?;
     tracing::info!(records = rebuilt, dir = %storage.display(), "memory_index rebuilt after import");
     Ok(())
 }
@@ -1562,6 +1803,9 @@ fn apply_rocks_primary(user_dir: &Path, records: Vec<PortableRecord>) -> Result<
 /// The source is only ever opened read-only. With `dry_run` nothing is written and the
 /// report says what a real run would find; without it, any blocked unit refuses the
 /// whole migration before a single row is written.
+///
+/// An encrypted unit needs its keys, in the dry run too: the plan is only as good as
+/// the proof that every sealed record opens under the keystore that goes with it.
 pub fn migrate(
     base: &Path,
     from: StorageBackend,
@@ -1583,6 +1827,7 @@ pub fn migrate(
         imported: Vec::new(),
         quarantined: Vec::new(),
     };
+    let mut keystores = Vec::new();
     for unit in units {
         let mut plan = UnitPlan {
             unit: unit.clone(),
@@ -1590,31 +1835,36 @@ pub fn migrate(
             target: None,
             blocked: Vec::new(),
         };
-        #[cfg(feature = "storage-redb")]
-        if let (StorageBackend::Redb, Unit::User(id)) = (from, &unit) {
-            let keystore = user_dir(base, id)?.join(crate::storage::redb::KEYSTORE_FILE);
-            if exists(&keystore)? {
-                plan.blocked.push(format!(
-                    "the redb store uses record-level encryption ({} is present); the {to} \
-                     target would hold records it has no key for",
-                    keystore.display()
-                ));
+        let keystore = match unit_keystore(base, from, to, &unit) {
+            Ok(keystore) => Some(keystore),
+            Err(e) => {
+                plan.blocked.push(format!("{e:#}"));
+                None
             }
-        }
-        match extract(base, from, &unit, std::io::sink()) {
-            Ok(source) => {
-                if source.decode_failures > 0 && quarantine_dir.is_none() {
-                    plan.blocked.push(format!(
-                        "{} source record(s) fail to decode: {}",
-                        source.decode_failures,
-                        source.failed_keys.join(", ")
-                    ));
+        };
+        if let Some(keystore) = &keystore {
+            let sealed = keystore
+                .as_ref()
+                .map_or(Sealed::AsStored, |k| Sealed::Opened(Some(k.source_keys())));
+            match extract_with(base, from, &unit, std::io::sink(), None, sealed) {
+                Ok(source) => {
+                    if source.decode_failures > 0 && quarantine_dir.is_none() {
+                        plan.blocked.push(format!(
+                            "{} source record(s) fail to decode: {}",
+                            source.decode_failures,
+                            source.failed_keys.join(", ")
+                        ));
+                    }
+                    plan.source = Some(source);
                 }
-                plan.source = Some(source);
+                Err(e) => plan.blocked.push(format!("source: {e:#}")),
             }
-            Err(e) => plan.blocked.push(format!("source: {e:#}")),
         }
-        match extract(base, to, &unit, std::io::sink()) {
+        let target_sealed = match &keystore {
+            Some(Some(_)) => Sealed::Opened(None),
+            _ => Sealed::AsStored,
+        };
+        match extract_with(base, to, &unit, std::io::sink(), None, target_sealed) {
             Ok(target) => {
                 if target.holds_anything() {
                     plan.blocked.push(format!(
@@ -1627,6 +1877,7 @@ pub fn migrate(
             Err(e) => plan.blocked.push(format!("target: {e:#}")),
         }
         report.units.push(plan);
+        keystores.push(keystore.flatten());
     }
     if dry_run {
         return Ok(report);
@@ -1648,9 +1899,13 @@ pub fn migrate(
         prepare_private_dir(q, "quarantine directory")?;
     }
     let work = WorkDir::create()?;
-    for plan in &report.units {
+    for (plan, keystore) in report.units.iter().zip(&keystores) {
         let path = work.path.join(dump_file_name(&plan.unit));
-        let (exported, quarantine) = export_unit(base, from, &plan.unit, &path, quarantine_dir)?;
+        let sealed = keystore
+            .as_ref()
+            .map_or(Sealed::AsStored, |k| Sealed::Opened(Some(k.source_keys())));
+        let (exported, quarantine) =
+            export_unit(base, from, &plan.unit, &path, quarantine_dir, sealed)?;
         let planned = plan
             .source
             .as_ref()
@@ -1664,13 +1919,18 @@ pub fn migrate(
             );
         }
         report.quarantined.extend(quarantine);
+        if let Some(keystore) = keystore {
+            install_keystore(&keystore.target, &keystore.json)
+                .with_context(|| format!("{}: installing the keystore", plan.unit))?;
+        }
         let pending = PendingImport {
             path: path.clone(),
             unit: plan.unit.clone(),
             frames: exported.frames,
             digest: portable::read_trailer(&path)?.1,
         };
-        let imported = import_one(base, to, &pending).with_context(|| {
+        let installed = keystore.as_ref().map(|k| k.target.as_path());
+        let imported = import_one(base, to, &pending, installed).with_context(|| {
             let done: Vec<String> = report.imported.iter().map(|r| r.unit.to_string()).collect();
             format!(
                 "migrating {} (already migrated and verified: [{}])",
@@ -1685,6 +1945,129 @@ pub fn migrate(
         });
     }
     Ok(report)
+}
+
+fn keystore_path(user_dir: &Path, backend: StorageBackend) -> PathBuf {
+    match backend {
+        StorageBackend::RocksDb => user_dir.join("storage").join(KEYSTORE),
+        StorageBackend::Redb => user_dir.join(KEYSTORE),
+    }
+}
+
+/// An encrypted unit's keystore: the source file's text, where its copy goes, and the
+/// keys it unseals to.
+struct UnitKeystore {
+    json: String,
+    target: PathBuf,
+    keys: crate::keystore::UnsealedRecordKeys,
+}
+
+impl UnitKeystore {
+    fn source_keys(&self) -> Keys<'_> {
+        Keys {
+            cryptors: &self.keys.cryptors,
+            generation: Some(self.keys.generation),
+        }
+    }
+}
+
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn same_keystore(a: &str, b: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(a),
+        serde_json::from_str::<serde_json::Value>(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `Ok(None)` for a unit with no keystore. An encrypted unit whose keys are not at
+/// hand, or whose target already holds another keystore, is an error.
+fn unit_keystore(
+    base: &Path,
+    from: StorageBackend,
+    to: StorageBackend,
+    unit: &Unit,
+) -> Result<Option<UnitKeystore>> {
+    let Unit::User(id) = unit else {
+        return Ok(None);
+    };
+    let dir = user_dir(base, id)?;
+    let source = keystore_path(&dir, from);
+    let Some(json) = read_optional(&source)? else {
+        return Ok(None);
+    };
+    let set = |name: &str| std::env::var(name).is_ok_and(|v| !v.trim().is_empty());
+    if !set("VELD_MASTER_PASSPHRASE") && !set("VELD_KMS_WRAP_KEY") {
+        bail!(
+            "the {from} store uses record-level encryption ({} is present) and neither \
+             VELD_MASTER_PASSPHRASE nor VELD_KMS_WRAP_KEY is set. migrate opens every sealed \
+             record under the keystore to verify the copy; set the one that unseals it.",
+            source.display()
+        );
+    }
+    let keys = crate::keystore::unseal_record_keys(&json).with_context(|| {
+        format!(
+            "{} does not unseal with the VELD_MASTER_PASSPHRASE or VELD_KMS_WRAP_KEY set here",
+            source.display()
+        )
+    })?;
+    let target = keystore_path(&dir, to);
+    if let Some(existing) = read_optional(&target)? {
+        if !same_keystore(&existing, &json) {
+            bail!(
+                "the {to} target already has a keystore at {} that differs from the source's {} — \
+                 refusing to put records sealed under one beside the other",
+                target.display(),
+                source.display()
+            );
+        }
+    }
+    Ok(Some(UnitKeystore { json, target, keys }))
+}
+
+/// Write the source keystore's text at `path`, owner-only, never over another file. An
+/// identical keystore already there is kept.
+fn install_keystore(path: &Path, json: &str) -> Result<()> {
+    match read_optional(path)? {
+        Some(existing) if same_keystore(&existing, json) => return Ok(()),
+        Some(_) => bail!(
+            "{} holds a different keystore than the one planned — refusing to replace it",
+            path.display()
+        ),
+        None => {}
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let staged = path.with_extension("json.migrate");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let result = (|| -> Result<()> {
+        let mut file = options
+            .open(&staged)
+            .with_context(|| format!("creating {}", staged.display()))?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        std::fs::hard_link(&staged, path)
+            .with_context(|| format!("placing the keystore at {}", path.display()))?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&staged);
+    result
 }
 
 /// A private scratch directory for migrate's intermediate dumps, removed on drop:

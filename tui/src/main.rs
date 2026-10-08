@@ -54,6 +54,7 @@ fn generate_title(state: &AppState) -> String {
         ViewMode::GraphMap => "Graph",
         ViewMode::Git => "Git",
         ViewMode::Dials => "Dials",
+        ViewMode::Loops => "Loops",
     };
 
     format!("🦣 Veld - {}", view_name)
@@ -1806,6 +1807,7 @@ async fn run_tui(
                                 continue;
                             }
                         }
+                        KeyCode::Char('6') => g.set_view(ViewMode::Loops),
                         KeyCode::Char('d') => g.set_view(ViewMode::Dashboard),
                         KeyCode::Char('p') => g.set_view(ViewMode::Projects),
                         KeyCode::Char('a') => g.set_view(ViewMode::ActivityLogs),

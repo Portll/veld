@@ -884,6 +884,24 @@ impl super::MemorySystem {
                         query_entities.push(ent.uuid);
                     }
                 }
+                // A path-shaped query word also seeds every declared FilePath entity whose path
+                // ends with it at a `/` boundary: "serve.mjs" and "admin/serve.mjs" reach
+                // `commitwork:admin/serve.mjs`, which no name tier above resolves without also
+                // admitting `observe.mjs`. One index probe per path-shaped word, at most
+                // FILE_PATH_SUFFIX_MAX_CANDIDATES entity reads each.
+                for word in query_text.split_whitespace() {
+                    let token = clean_query_token(word);
+                    if !token.contains('.') && !token.contains('/') {
+                        continue;
+                    }
+                    if let Ok(found) = g.find_file_paths_by_suffix(&token) {
+                        for ent in found {
+                            if !query_entities.contains(&ent.uuid) {
+                                query_entities.push(ent.uuid);
+                            }
+                        }
+                    }
+                }
 
                 // Calculate PER-ENTITY density (not global graph density)
                 // Sparse entities = trust graph, Dense entities = trust vector
@@ -1840,10 +1858,7 @@ impl super::MemorySystem {
                     .to_lowercase()
                     .split_whitespace()
                     .filter(|w| w.len() > 2)
-                    .map(|w| {
-                        let cleaned: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                        stemmer.stem(&cleaned).to_string()
-                    })
+                    .map(|w| stem_query_token(&stemmer, &clean_query_token(w)))
                     .filter(|s| !s.is_empty() && s.len() > 1 && !STOP_WORDS.contains(&s.as_str()))
                     .collect();
 
@@ -1873,19 +1888,33 @@ impl super::MemorySystem {
                         let entities = get_entities(id);
                         let entity_stems: Vec<String> = entities
                             .iter()
-                            .map(|e| stemmer.stem(&e.to_lowercase()).to_string())
+                            .map(|e| stem_query_token(&stemmer, &e.to_lowercase()))
                             .collect();
-                        let overlap = query_stems
+                        let matched: Vec<&String> = query_stems
                             .iter()
-                            .filter(|qs| entity_stems.iter().any(|es| es.contains(qs.as_str())))
-                            .count();
+                            .filter(|qs| {
+                                entity_stems
+                                    .iter()
+                                    .any(|es| query_token_matches_entity(qs, es))
+                            })
+                            .collect();
+                        let overlap = matched.len();
                         if overlap >= 1 {
                             // Dampen entity overlap for abstract/decomposed queries:
                             // generic stems like "perform" match many memories equally,
                             // adding noise rather than signal. Reduce from 0.10 to 0.04.
+                            // An identifier match ("serve.mjs" against a declared
+                            // `repo:admin/serve.mjs`) is not a generic stem — it matches at a
+                            // name boundary or not at all — so it keeps the undampened rate
+                            // whether or not the query was decomposed.
+                            let identifiers =
+                                matched.iter().filter(|qs| is_structured_token(qs)).count();
+                            let words = overlap - identifiers;
                             let per_match = if decomposed { 0.04 } else { 0.10 };
                             let cap = if decomposed { 0.16 } else { 0.40 };
-                            let boost = (per_match * overlap as f32).min(cap);
+                            let boost = ((per_match * words as f32).min(cap)
+                                + 0.10 * identifiers as f32)
+                                .min(0.40);
                             if let Some(score) = fused.get_mut(id) {
                                 *score += boost;
                             }
@@ -3184,13 +3213,46 @@ impl super::MemorySystem {
                 // HTTP embedder (5–6s/call for CPU Nomic). The reranker
                 // dim-checks against the query embedding and falls back to
                 // `embedder.encode(content)` on mismatch.
+                //
+                // The cross-encoder reads content only. A memory whose writer declared what it is
+                // about (`repo:admin/serve.mjs`) often never names that thing in its text, so a
+                // query naming it scored the memory as unrelated and the blend undid every
+                // entity signal before it. When the query names an identifier the memory
+                // carries as an entity, that entity is put in front of the text the
+                // cross-encoder reads. Nothing changes for a query with no identifier in it.
+                let query_identifiers: Vec<String> = query_text
+                    .split_whitespace()
+                    .map(clean_query_token)
+                    .map(|t| t.to_lowercase())
+                    .filter(|t| is_structured_token(t))
+                    .collect();
                 let candidates: Vec<(MemoryId, String, f32, Option<Vec<f32>>)> = memories
                     .iter()
                     .take(rerank_budget)
                     .map(|m| {
+                        let named: Vec<&str> = if query_identifiers.is_empty() {
+                            Vec::new()
+                        } else {
+                            m.experience
+                                .entities
+                                .iter()
+                                .filter(|e| {
+                                    let e = e.to_lowercase();
+                                    query_identifiers
+                                        .iter()
+                                        .any(|q| query_token_matches_entity(q, &e))
+                                })
+                                .map(String::as_str)
+                                .collect()
+                        };
+                        let text = if named.is_empty() {
+                            m.experience.content.clone()
+                        } else {
+                            format!("{}\n{}", named.join(" "), m.experience.content)
+                        };
                         (
                             m.id.clone(),
-                            m.experience.content.clone(),
+                            text,
                             m.score.unwrap_or(0.0),
                             m.experience.embeddings.clone(),
                         )
@@ -5301,6 +5363,55 @@ impl super::MemorySystem {
     }
 }
 
+/// Punctuation kept inside a query token besides alphanumerics. Canonical entity names and file
+/// names are made of it — `commitwork:admin/serve.mjs`, `repo@1a2b3c4d`, `cc:<session>/<agent>`,
+/// `#123`, `snake_case`, `kebab-case` — and stripping it turned `harvest.mjs` into `harvestmjs`,
+/// which matches nothing.
+const QUERY_TOKEN_KEEP: &[char] = &['.', '/', '_', ':', '@', '#', '-'];
+
+/// Clean one whitespace-separated query word for entity matching: keep alphanumerics and
+/// [`QUERY_TOKEN_KEEP`], then trim anything non-alphanumeric off both ends, which is sentence
+/// punctuation rather than part of a name (`serve.mjs.`, `(harvest.mjs)`, `"admin/serve.mjs"`).
+pub(crate) fn clean_query_token(word: &str) -> String {
+    let kept: String = word
+        .chars()
+        .filter(|c| c.is_alphanumeric() || QUERY_TOKEN_KEEP.contains(c))
+        .collect();
+    kept.trim_matches(|c: char| !c.is_alphanumeric())
+        .to_string()
+}
+
+/// A token carrying interior [`QUERY_TOKEN_KEEP`] punctuation is an identifier, not a word.
+pub(crate) fn is_structured_token(token: &str) -> bool {
+    token.chars().any(|c| QUERY_TOKEN_KEEP.contains(&c))
+}
+
+/// Porter-stem a word; leave an identifier alone. The stemmer works on English suffixes and
+/// would read `serve.mjs` as a plural.
+pub(crate) fn stem_query_token(stemmer: &rust_stemmers::Stemmer, token: &str) -> String {
+    if is_structured_token(token) {
+        token.to_string()
+    } else {
+        stemmer.stem(token).to_string()
+    }
+}
+
+/// Whether a cleaned query token matches an entity's (stemmed or identifier) form. A plain word
+/// matches as a substring, as it always has. An identifier must start at a boundary in the entity
+/// — the start or after a non-alphanumeric — so `serve.mjs` matches `commitwork:admin/serve.mjs`
+/// and not `commitwork:lib/observe.mjs`.
+pub(crate) fn query_token_matches_entity(token: &str, entity: &str) -> bool {
+    if !is_structured_token(token) {
+        return entity.contains(token);
+    }
+    entity.match_indices(token).any(|(at, _)| {
+        entity[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric())
+    })
+}
+
 /// Orders each run of exactly equal scores in a score-sorted list by content, then id.
 ///
 /// Fused scores tie often, and the map they come from iterates in a per-instance hash order.
@@ -5681,5 +5792,58 @@ mod score_tie_order_tests {
 
         let order: Vec<&str> = items.iter().map(|(id, _)| content[id].as_str()).collect();
         assert_eq!(order, ["top", "alpha", "charlie", "delta", "bottom"]);
+    }
+}
+
+#[cfg(test)]
+mod query_token_tests {
+    use super::{clean_query_token, query_token_matches_entity, stem_query_token};
+    use rust_stemmers::{Algorithm, Stemmer};
+
+    #[test]
+    fn identifiers_survive_cleaning_and_sentence_punctuation_does_not() {
+        assert_eq!(clean_query_token("harvest.mjs"), "harvest.mjs");
+        assert_eq!(clean_query_token("(harvest.mjs)?"), "harvest.mjs");
+        assert_eq!(clean_query_token("serve.mjs."), "serve.mjs");
+        assert_eq!(clean_query_token("\"admin/serve.mjs\","), "admin/serve.mjs");
+        assert_eq!(
+            clean_query_token("commitwork:admin/serve.mjs"),
+            "commitwork:admin/serve.mjs"
+        );
+        assert_eq!(
+            clean_query_token("commitwork@1a2b3c4d"),
+            "commitwork@1a2b3c4d"
+        );
+        assert_eq!(clean_query_token("cc:abc/def"), "cc:abc/def");
+        assert_eq!(clean_query_token("snake_case-name"), "snake_case-name");
+        assert_eq!(
+            clean_query_token("what's"),
+            "whats",
+            "other punctuation still goes"
+        );
+        assert_eq!(clean_query_token("..."), "");
+    }
+
+    #[test]
+    fn identifiers_are_not_stemmed_and_words_still_are() {
+        let stemmer = Stemmer::create(Algorithm::English);
+        assert_eq!(stem_query_token(&stemmer, "harvest.mjs"), "harvest.mjs");
+        assert_eq!(stem_query_token(&stemmer, "serve.mjs"), "serve.mjs");
+        assert_eq!(stem_query_token(&stemmer, "changes"), "chang");
+        assert_eq!(stem_query_token(&stemmer, "risks"), "risk");
+    }
+
+    #[test]
+    fn an_identifier_matches_only_at_a_boundary() {
+        let entity = "commitwork:admin/serve.mjs";
+        assert!(query_token_matches_entity("serve.mjs", entity));
+        assert!(query_token_matches_entity("admin/serve.mjs", entity));
+        assert!(query_token_matches_entity(entity, entity));
+        assert!(!query_token_matches_entity(
+            "serve.mjs",
+            "commitwork:lib/observe.mjs"
+        ));
+        // A plain word keeps the old substring rule.
+        assert!(query_token_matches_entity("serv", "observer"));
     }
 }

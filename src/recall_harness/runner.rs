@@ -1541,17 +1541,17 @@ pub(crate) fn ablation_arms() -> Vec<AblationArm> {
         ),
         ("+edge-dir", vec![("SHODH_GRAPH_EDGE_DIR", "1")]),
         ("+graph-traverse", vec![("SHODH_GRAPH_TRAVERSE", "1")]),
-        // Upstream prefixes "hebbian," here to restate its own default; veld ships
-        // hebbian on, so the prefix would confound these arms with -hebbian.
+        // Setting SHODH_DISABLE_BOOSTS replaces its default, so these arms restate
+        // `hebbian` to keep the term off; +hebbian empties the list to switch it on.
         (
             "-lateral-inhibition",
-            vec![("SHODH_DISABLE_BOOSTS", "lateral_inhibition")],
+            vec![("SHODH_DISABLE_BOOSTS", "hebbian,lateral_inhibition")],
         ),
         (
             "-graph-potentiation",
-            vec![("SHODH_DISABLE_BOOSTS", "graph_potentiation")],
+            vec![("SHODH_DISABLE_BOOSTS", "hebbian,graph_potentiation")],
         ),
-        ("-hebbian", vec![("SHODH_DISABLE_BOOSTS", "hebbian")]),
+        ("+hebbian", vec![("SHODH_DISABLE_BOOSTS", "")]),
         (
             "+graph-boost-mult+expand",
             vec![
@@ -4272,7 +4272,7 @@ mod tests {
                     "{k} is now read in src/; delete its UNAVAILABLE_IN_VELD entry"
                 );
                 if *k == DISABLE_BOOSTS_VAR {
-                    for tok in v.split(',').map(str::trim) {
+                    for tok in v.split(',').map(str::trim).filter(|t| !t.is_empty()) {
                         if FAMILIES.contains(&tok) {
                             assert!(gates_family(&sources, tok), "family `{tok}` has no gate");
                         } else {
@@ -4311,6 +4311,24 @@ mod tests {
     }
 
     #[test]
+    fn every_boost_ablation_but_plus_hebbian_keeps_hebbian_off() {
+        for (name, env) in ablation_arms() {
+            for (k, v) in env {
+                if k != crate::memory::ablation::DISABLE_BOOSTS_VAR || name == "+hebbian" {
+                    continue;
+                }
+                assert!(
+                    v.split(',')
+                        .map(str::trim)
+                        .any(|t| t == "hebbian" || t == "all"),
+                    "`{name}` sets {k}={v} without `hebbian`, which switches the default-off \
+                     hebbian term back on and measures two changes at once"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unavailable_arms_are_reported_not_run_as_baseline() {
         let _guard = crate::memory::ablation::ENV_LOCK
             .lock()
@@ -4323,6 +4341,7 @@ mod tests {
             vec![("SHODH_GRAPH_FUSION_WEIGHT", "0")],
             vec![("SHODH_DISABLE_BOOSTS", "hebbian")],
             vec![("SHODH_DISABLE_BOOSTS", "graph_potentiation")],
+            vec![("SHODH_DISABLE_BOOSTS", "")],
         ] {
             assert_eq!(arm_unavailable_in_veld(&env), None, "{env:?} is wired");
         }
@@ -4481,7 +4500,7 @@ mod tests {
 
         for (k, v) in [
             ("SHODH_DISABLE_FACT_LAYERS", "1"),
-            ("SHODH_DISABLE_BOOSTS", "hebbian"),
+            ("SHODH_DISABLE_BOOSTS", ""),
             ("SHODH_GRAPH_FUSION_WEIGHT", "0"),
         ] {
             let arm = recall(&[(k, v)]);

@@ -658,6 +658,7 @@ fn test_fact_type_default() {
 fn test_consolidation_result_structure() {
     let result = ConsolidationResult {
         memories_processed: 10,
+        memories_eligible: 7,
         facts_extracted: 3,
         facts_reinforced: 5,
         new_fact_ids: vec!["f1".to_string(), "f2".to_string(), "f3".to_string()],
@@ -665,6 +666,7 @@ fn test_consolidation_result_structure() {
     };
 
     assert_eq!(result.memories_processed, 10);
+    assert_eq!(result.memories_eligible, 7);
     assert_eq!(result.facts_extracted, 3);
     assert_eq!(result.facts_reinforced, 5);
     assert_eq!(result.new_fact_ids.len(), 3);

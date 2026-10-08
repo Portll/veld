@@ -24,3 +24,4 @@ pointing back at it with `supersedes:` in the frontmatter and add
 | [0005](0005-facts-purge-and-narratives.md) | Facts purge, narratives, and the `purged_at` field | accepted | 2026-05-29 |
 | [0006](0006-backend-parity-and-on-demand-migration.md) | Backend parity and on-demand migration | proposed | 2026-09-11 |
 | [0007](0007-rocksdb-default-engine.md) | RocksDB is the default engine and the port target | accepted | 2026-10-03 |
+| [0008](0008-local-ipc-transport.md) | Whether veld takes upstream's authenticated local IPC transport | proposed | 2026-10-04 |

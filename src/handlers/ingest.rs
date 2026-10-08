@@ -139,7 +139,7 @@ pub async fn ingest(
     };
 
     // ── NER + YAKE extraction in parallel ───────────────────────────────
-    let experience_type = parse_experience_type(req.memory_type.as_ref());
+    let experience_type = parse_experience_type(req.memory_type.as_ref())?;
 
     let ner = state.get_neural_ner();
     let yake = state.get_keyword_extractor();
@@ -296,11 +296,12 @@ pub async fn ingest(
 
     // Background graph processing
     {
+        let tracker = state.task_tracker.clone();
         let state = state.clone();
         let user_id = req.user_id.clone();
         let experience = experience.clone();
         let mid = memory_id.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = tokio::task::spawn_blocking(move || {
                 state.process_experience_into_graph(&user_id, &experience, &mid)
             })

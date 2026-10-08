@@ -581,11 +581,11 @@ impl OnnxCrossEncoder {
                 .unwrap_or(default_threads);
 
             // ort's `load-dynamic` PANICS (not Errs) when libonnxruntime cannot be
-            // dlopen'd, and this server is built with `panic = "abort"` — so an
-            // unresolved runtime here aborts the whole process instead of engaging
-            // the lazy fallback below. Resolve + verify the runtime path before
-            // touching any ort API, and fail soft (cross-encoder disabled) if it is
-            // unavailable. Cross-platform: checks the resolved .dylib/.dll/.so path.
+            // dlopen'd, which ends the calling thread instead of engaging the lazy
+            // fallback below (and the whole process in the abort-built fortress
+            // profile). Resolve + verify the runtime path before touching any ort
+            // API, and fail soft (cross-encoder disabled) if it is unavailable.
+            // Cross-platform: checks the resolved .dylib/.dll/.so path.
             super::minilm::pre_init_ort_runtime(
                 std::env::var("VELD_OFFLINE").is_ok_and(|v| v == "true" || v == "1"),
             );

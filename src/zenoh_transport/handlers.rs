@@ -321,7 +321,13 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     }
 
     let op_start = std::time::Instant::now();
-    let experience_type = parse_experience_type(req.memory_type.as_ref());
+    let experience_type = match parse_experience_type(req.memory_type.as_ref()) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(user_id = %req.user_id, "Validation failed: {}", e);
+            return;
+        }
+    };
 
     // Parallel NER + YAKE extraction (same as HTTP handler)
     let ner = manager.get_neural_ner();
@@ -453,17 +459,17 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     let run_id = req.run_id.clone();
     let created_at = req.created_at;
 
-    let memory_id = match tokio::task::spawn_blocking(move || {
+    let outcome = match tokio::task::spawn_blocking(move || {
         let guard = user_mem_clone.read();
         if agent_id.is_some() || run_id.is_some() {
-            guard.remember_with_agent(exp_clone, created_at, agent_id, run_id)
+            guard.remember_with_agent_detailed(exp_clone, created_at, agent_id, run_id)
         } else {
-            guard.remember(exp_clone, created_at)
+            guard.remember_detailed(exp_clone, created_at)
         }
     })
     .await
     {
-        Ok(Ok(id)) => id,
+        Ok(Ok(outcome)) => outcome,
         Ok(Err(e)) => {
             error!(user_id = %req.user_id, "Failed to store memory: {}", e);
             return;
@@ -473,6 +479,11 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
             return;
         }
     };
+    // The same observation re-sent with a geo fix or a reward the first copy lacked merges
+    // into it; the graph pass then needs the merged experience and a rebuilt episode.
+    let memory_id = outcome.id.clone();
+    let rebuild_graph = outcome.needs_graph_rebuild();
+    let experience = outcome.merged_experience.unwrap_or(experience);
 
     // Tool-aware feedback attribution for robotics:
     // If this remember() carries an action+reward, attribute it to the most recent recall.
@@ -590,7 +601,12 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     let user_id = req.user_id.clone();
     let parent_id = req.parent_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = state.process_experience_into_graph(&user_id, &experience, &memory_id) {
+        let graph_pass = if rebuild_graph {
+            state.rebuild_experience_graph(&user_id, &experience, &memory_id)
+        } else {
+            state.process_experience_into_graph(&user_id, &experience, &memory_id)
+        };
+        if let Err(e) = graph_pass {
             debug!("Graph processing failed (non-fatal): {}", e);
         }
 
