@@ -129,6 +129,9 @@ pub struct HttpEmbedderConfig {
     pub task_prefixes: bool,
     /// The model's input window in tokens; a longer text is embedded in pieces. None: no limit.
     pub max_input_tokens: Option<usize>,
+    /// A second host asked the same question when the primary does not answer
+    /// (VELD_EMBEDDING_API_FALLBACK_URL). Same model, same key; the embedder's id stays the primary's.
+    pub fallback_url: Option<String>,
 }
 
 impl Default for HttpEmbedderConfig {
@@ -178,6 +181,10 @@ impl HttpEmbedderConfig {
                 .unwrap_or(DEFAULT_TIMEOUT_MS),
             task_prefixes,
             max_input_tokens,
+            fallback_url: std::env::var("VELD_EMBEDDING_API_FALLBACK_URL")
+                .ok()
+                .map(|u| u.trim_end_matches('/').to_string())
+                .filter(|u| !u.is_empty()),
         }
     }
 
@@ -459,28 +466,50 @@ impl HttpEmbedder {
         available
     }
 
-    /// Encode a single text via the HTTP API.
-    fn encode_http(&self, text: &str) -> Result<Vec<f32>> {
-        let url = format!("{}/v1/embeddings", self.config.base_url);
-        let req = EmbeddingRequest {
-            model: &self.config.model,
-            input: text,
-        };
-
+    /// POST /v1/embeddings to `base_url`; a transport failure is distinguished from a bad body.
+    fn post_embeddings<T: Serialize>(&self, base_url: &str, req: &T) -> Result<EmbeddingResponse> {
+        let url = format!("{base_url}/v1/embeddings");
         let mut builder = self.client.post(&url);
         if let Some(ref key) = self.config.api_key {
             builder = builder.header("Authorization", &format!("Bearer {key}"));
         }
-
         let resp = builder
-            .send_json(&req)
-            .context("HTTP embedding request failed")?;
-
-        let parsed: EmbeddingResponse = resp
-            .into_body()
+            .send_json(req)
+            .with_context(|| format!("HTTP embedding request to {base_url} failed"))?;
+        resp.into_body()
             .read_json()
-            .context("Failed to parse embedding response")?;
+            .context("Failed to parse embedding response")
+    }
 
+    /// The primary first; when it does not answer and a fallback is configured, the fallback.
+    fn post_embeddings_with_fallback<T: Serialize>(&self, req: &T) -> Result<EmbeddingResponse> {
+        match self.post_embeddings(&self.config.base_url, req) {
+            Ok(resp) => Ok(resp),
+            Err(primary_err) => {
+                let Some(fallback) = self.config.fallback_url.as_deref() else {
+                    return Err(primary_err);
+                };
+                tracing::warn!(
+                    primary = %self.config.base_url,
+                    fallback = %fallback,
+                    "embedder: primary failed ({primary_err:#}); asking the fallback"
+                );
+                let resp = self
+                    .post_embeddings(fallback, req)
+                    .with_context(|| format!("fallback after primary failure: {primary_err:#}"))?;
+                crate::metrics::EMBEDDING_FALLBACK_TOTAL.inc();
+                Ok(resp)
+            }
+        }
+    }
+
+    /// Encode a single text via the HTTP API.
+    fn encode_http(&self, text: &str) -> Result<Vec<f32>> {
+        let req = EmbeddingRequest {
+            model: &self.config.model,
+            input: text,
+        };
+        let parsed = self.post_embeddings_with_fallback(&req)?;
         parsed
             .data
             .into_iter()
@@ -527,7 +556,6 @@ impl Embedder for HttpEmbedder {
             return texts.iter().map(|t| self.encode(t)).collect();
         }
         // Use batch endpoint if available
-        let url = format!("{}/v1/embeddings", self.config.base_url);
         let prefixed: Vec<std::borrow::Cow<'_, str>> =
             texts.iter().map(|t| self.document_text(t)).collect();
         let req = BatchEmbeddingRequest {
@@ -535,20 +563,10 @@ impl Embedder for HttpEmbedder {
             input: prefixed.iter().map(|c| c.as_ref()).collect(),
         };
 
-        let mut builder = self.client.post(&url);
-        if let Some(ref key) = self.config.api_key {
-            builder = builder.header("Authorization", &format!("Bearer {key}"));
-        }
-
-        let resp = match builder.send_json(&req) {
-            Ok(resp) => resp,
+        let parsed = match self.post_embeddings_with_fallback(&req) {
+            Ok(parsed) => parsed,
             Err(_) => return texts.iter().map(|t| self.encode(t)).collect(),
         };
-
-        let parsed: EmbeddingResponse = resp
-            .into_body()
-            .read_json()
-            .context("Failed to parse batch embedding response")?;
 
         if parsed.data.len() != texts.len() {
             // Batch size mismatch — fall back to sequential
@@ -596,6 +614,7 @@ mod tests {
             timeout_ms: 100,
             task_prefixes: default_task_prefixes(model),
             max_input_tokens: default_max_tokens(model),
+            fallback_url: None,
         }
     }
 

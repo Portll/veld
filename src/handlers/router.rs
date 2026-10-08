@@ -338,6 +338,14 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/index/rebuild", post(consolidation::rebuild_index))
         .route("/api/index/reembed", post(consolidation::reembed_all))
         .route(
+            "/api/embeddings/backlog",
+            get(consolidation::get_embedding_backlog),
+        )
+        .route(
+            "/api/embeddings/backlog/drain",
+            post(consolidation::drain_embedding_backlog),
+        )
+        .route(
             "/api/storage/cleanup",
             post(consolidation::cleanup_corrupted),
         )

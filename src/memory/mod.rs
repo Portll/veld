@@ -49,6 +49,7 @@ pub mod sleep_time;
 pub mod slow_store;
 pub mod storage;
 pub mod tag_sources;
+pub mod embedding_backlog;
 pub mod temporal_facts;
 pub mod todo_formatter;
 pub mod todos;
@@ -414,6 +415,9 @@ pub struct MemorySystem {
 
     /// Source of every stored tag (caller, intent, ingest, NER, YAKE, cold-start), per memory.
     tag_source_store: tag_sources::TagSourceStore,
+
+    /// Memories stored without a vector, drained when the embedder answers again.
+    embedding_backlog: embedding_backlog::EmbeddingBacklogStore,
 
     /// One row per recall, including empty ones — the question side the trace store lacks.
     recall_event_store: recall_events::RecallEventStore,
@@ -1363,6 +1367,9 @@ impl MemorySystem {
             recall_event_store: recall_events::RecallEventStore::with_kv(
                 primary_store.key_value_store(),
             ),
+            embedding_backlog: embedding_backlog::EmbeddingBacklogStore::with_kv(
+                primary_store.key_value_store(),
+            ),
             // R3a (F3): per-user persistent learned-weight store over this user's
             // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
             // weights are loaded on init (below) but NOT injected into scoring.
@@ -1725,7 +1732,14 @@ impl MemorySystem {
                     }
                     Err(e) => {
                         tracing::warn!("Failed to generate embedding: {}", e);
-                        // Continue without embedding - will be generated on-demand if needed
+                        // The write goes ahead without a vector; the backlog drain supplies one.
+                        if let Err(record_err) = self.embedding_backlog.record(
+                            &memory_id,
+                            embedding_backlog::EnqueueReason::EmbedFailed,
+                            Some(&e.to_string()),
+                        ) {
+                            tracing::error!("embedding backlog: could not record {}: {record_err}", memory_id.0);
+                        }
                     }
                 }
             }
@@ -1787,6 +1801,13 @@ impl MemorySystem {
         let indexed = if !defer_embedding {
             if let Err(e) = self.retriever.index_memory(&memory) {
                 tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
+                if let Err(record_err) = self.embedding_backlog.record(
+                    &memory.id,
+                    embedding_backlog::EnqueueReason::IndexFailed,
+                    Some(&e.to_string()),
+                ) {
+                    tracing::error!("embedding backlog: could not record {}: {record_err}", memory.id.0);
+                }
                 false
             } else {
                 true
@@ -2279,6 +2300,13 @@ impl MemorySystem {
                     }
                     Err(e) => {
                         tracing::warn!("Background embedding generation failed: {e}");
+                        if let Err(record_err) = self.embedding_backlog.record(
+                            memory_id,
+                            embedding_backlog::EnqueueReason::EmbedFailed,
+                            Some(&e.to_string()),
+                        ) {
+                            tracing::error!("embedding backlog: could not record {}: {record_err}", memory_id.0);
+                        }
                         // Non-fatal: memory is still searchable via BM25
                         return Ok(());
                     }
@@ -2334,8 +2362,18 @@ impl MemorySystem {
         let memory_arc = Arc::new(memory);
         if let Err(e) = self.retriever.index_memory(&memory_arc) {
             tracing::warn!("Background vector indexing failed for {}: {e}", memory_id.0);
+            if let Err(record_err) = self.embedding_backlog.record(
+                memory_id,
+                embedding_backlog::EnqueueReason::IndexFailed,
+                Some(&e.to_string()),
+            ) {
+                tracing::error!("embedding backlog: could not record {}: {record_err}", memory_id.0);
+            }
         } else {
             self.stats.write().vector_index_count += 1;
+            if let Err(e) = self.embedding_backlog.delete(memory_id) {
+                tracing::error!("embedding backlog: could not clear {}: {e}", memory_id.0);
+            }
         }
 
         // Write gate + interference detection (retroactive + proactive)
@@ -5289,6 +5327,72 @@ impl MemorySystem {
         );
 
         Ok(result)
+    }
+
+    pub fn embedding_backlog_report(&self) -> Result<embedding_backlog::BacklogReport> {
+        self.embedding_backlog.report()
+    }
+
+    /// Bring the backlog in line with what is stored and what is indexed. A live memory the
+    /// index lacks gets a row whatever path lost it; a row for an indexed or deleted memory goes.
+    pub fn reconcile_embedding_backlog(&self) -> Result<embedding_backlog::ReconcileReport> {
+        let indexed = self.retriever.get_indexed_memory_ids();
+        let mut stored = Vec::new();
+        for id in self.long_term_memory.get_all_ids()? {
+            if indexed.contains(&id) {
+                stored.push(id);
+                continue;
+            }
+            match self.long_term_memory.get(&id) {
+                Ok(memory) if memory.is_forgotten() => {}
+                Ok(_) => stored.push(id),
+                Err(e) => tracing::warn!("embedding backlog reconcile: cannot read {}: {e}", id.0),
+            }
+        }
+        self.embedding_backlog.reconcile(&stored, &indexed)
+    }
+
+    /// One attempt to give a backlogged memory its vector. The embedder is probed after a
+    /// failure so a host that is down stops the drain, while a memory the embedder refuses on
+    /// its own merits stays in the queue with its error.
+    fn embed_backlog_outcome(&self, memory_id: &MemoryId) -> embedding_backlog::EmbedOutcome {
+        use embedding_backlog::EmbedOutcome;
+        match self.long_term_memory.get(memory_id) {
+            Ok(memory) if memory.is_forgotten() => return EmbedOutcome::MemoryGone,
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("Memory not found") => return EmbedOutcome::MemoryGone,
+            Err(e) => return EmbedOutcome::Failed(e.to_string()),
+        }
+        if let Err(e) = self.embed_and_index(memory_id) {
+            return EmbedOutcome::Failed(e.to_string());
+        }
+        if self.retriever.is_indexed(memory_id) {
+            return EmbedOutcome::Indexed;
+        }
+        let last_error = self
+            .embedding_backlog
+            .get(memory_id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.last_error)
+            .unwrap_or_else(|| "not indexed after embed_and_index".to_string());
+        match self.embedder.encode("veld embedder probe") {
+            Ok(_) => EmbedOutcome::Failed(last_error),
+            Err(probe) => EmbedOutcome::EmbedderUnavailable(format!("{last_error}; probe: {probe}")),
+        }
+    }
+
+    /// Embed and index up to `limit` backlogged memories, oldest first.
+    pub fn drain_embedding_backlog(&self, limit: usize) -> Result<embedding_backlog::DrainReport> {
+        let report = self
+            .embedding_backlog
+            .drain_with(limit, |id| self.embed_backlog_outcome(id))?;
+        if report.drained > 0 {
+            if let Err(e) = self.retriever.save() {
+                tracing::warn!("embedding backlog: index save after drain failed: {e}");
+            }
+        }
+        Ok(report)
     }
 
     /// Save vector index to disk (shutdown persistence)

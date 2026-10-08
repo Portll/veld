@@ -5365,3 +5365,35 @@ mod background_task_tests {
         });
     }
 }
+
+impl MultiUserMemoryManager {
+    /// Drain every cached user's embedding backlog, reconciling first when asked. Only users
+    /// already in the cache: loading a cold user is seconds of work that a tick must not do.
+    pub fn drain_embedding_backlogs(
+        &self,
+        limit_per_user: usize,
+        reconcile: bool,
+    ) -> Vec<(String, anyhow::Result<crate::memory::embedding_backlog::DrainReport>)> {
+        let mut out = Vec::new();
+        for user_id in self.list_cached_users() {
+            let Some(memory) = self.user_memories.get(&user_id) else {
+                continue;
+            };
+            let guard = memory.read();
+            if reconcile {
+                if let Err(e) = guard.reconcile_embedding_backlog() {
+                    out.push((user_id, Err(e)));
+                    continue;
+                }
+            }
+            let result = guard.drain_embedding_backlog(limit_per_user);
+            if let Ok(report) = guard.embedding_backlog_report() {
+                crate::metrics::EMBEDDING_BACKLOG_PENDING
+                    .with_label_values(&[user_id.as_str()])
+                    .set(report.pending as i64);
+            }
+            out.push((user_id, result));
+        }
+        out
+    }
+}
