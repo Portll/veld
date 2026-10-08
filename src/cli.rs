@@ -285,6 +285,20 @@ enum Commands {
     },
 }
 
+/// What opens the keyring for a `veld keys` command: the passphrase by default.
+#[derive(clap::Args, Clone, Default)]
+struct UnlockArgs {
+    /// Unlock with a recovery code (VELD_RECOVERY_CODE, or asked for)
+    #[arg(long, conflicts_with_all = ["with_touch_id", "with_passkey"])]
+    with_recovery_code: bool,
+    /// Unlock with Touch ID: the id of an enrolled Secure Enclave factor (see `status`)
+    #[arg(long, value_name = "ID", conflicts_with = "with_passkey")]
+    with_touch_id: Option<String>,
+    /// Unlock with an enrolled passkey, in the browser
+    #[arg(long)]
+    with_passkey: bool,
+}
+
 /// Secrets come from the named environment variable, or are prompted for on a terminal.
 #[derive(Subcommand)]
 enum KeysAction {
@@ -304,22 +318,38 @@ enum KeysAction {
         kit: Option<PathBuf>,
         #[arg(long)]
         label: Option<String>,
-        /// Unlock with a recovery code (VELD_RECOVERY_CODE) instead of the passphrase
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    /// Enrol Touch ID on this Mac through the veld-enclave helper
+    EnrolTouchId {
         #[arg(long)]
-        with_recovery_code: bool,
+        label: Option<String>,
+        /// `biometry` (current fingerprints only) or `presence` (Touch ID or the login password)
+        #[arg(long, default_value = "biometry")]
+        policy: String,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    /// Enrol a passkey (Touch ID, Face ID, a security key) through the browser
+    EnrolPasskey {
+        #[arg(long)]
+        label: Option<String>,
+        #[command(flatten)]
+        unlock: UnlockArgs,
     },
     /// Revoke a recovery code or device factor by id (see `status`)
     Revoke {
         id: String,
-        #[arg(long)]
-        with_recovery_code: bool,
+        #[command(flatten)]
+        unlock: UnlockArgs,
     },
     /// Re-wrap the keyring and every keystore under VELD_NEW_MASTER_PASSPHRASE
     RotatePassphrase,
     /// Start a new data-key epoch in every keystore; earlier records stay readable
     RotateDataKeys {
-        #[arg(long)]
-        with_recovery_code: bool,
+        #[command(flatten)]
+        unlock: UnlockArgs,
     },
     /// Replace every master key; recovery codes and device factors are dropped and a new code issued
     RotateMasterKeys {
@@ -328,11 +358,17 @@ enum KeysAction {
         #[arg(long)]
         label: Option<String>,
     },
-    /// Lost passphrase: open the keyring with VELD_RECOVERY_CODE and re-seal everything under VELD_NEW_MASTER_PASSPHRASE
+    /// Lost passphrase: open the keyring with a recovery code, Touch ID or a passkey and re-seal everything under VELD_NEW_MASTER_PASSPHRASE
     Recover {
-        /// Where to write the replacement recovery kit
+        /// Where to write the replacement recovery kit when a recovery code was used
         #[arg(long)]
         kit: Option<PathBuf>,
+        /// Recover with Touch ID: the id of an enrolled Secure Enclave factor
+        #[arg(long, value_name = "ID", conflicts_with = "passkey")]
+        touch_id: Option<String>,
+        /// Recover with an enrolled passkey, in the browser
+        #[arg(long)]
+        passkey: bool,
     },
 }
 
@@ -2402,25 +2438,93 @@ fn deliver_kit(
     Ok(serde_json::json!({ "id": issued.id, "label": issued.label, "kit": path }))
 }
 
-fn keys(storage: &std::path::Path, action: KeysAction) -> anyhow::Result<serde_json::Value> {
-    use veld::keyring;
-    use veld::keystore::Factor;
-    const PASS: &str = "VELD_MASTER_PASSPHRASE";
-    const NEW_PASS: &str = "VELD_NEW_MASTER_PASSPHRASE";
-    const CODE: &str = "VELD_RECOVERY_CODE";
-    let unlock_secret = |with_code: bool| {
-        if with_code {
-            secret(CODE, "Recovery code").map(|s| (true, s))
-        } else {
-            secret(PASS, "Passphrase").map(|s| (false, s))
-        }
-    };
-    fn factor(unlock: &(bool, zeroize::Zeroizing<String>)) -> Factor<'_> {
-        match unlock {
-            (true, code) => Factor::RecoveryCode(code),
-            (false, passphrase) => Factor::Passphrase(passphrase),
+/// An unlock factor with the secret it carries, zeroized on drop.
+enum Unlocker {
+    Passphrase(zeroize::Zeroizing<String>),
+    RecoveryCode(zeroize::Zeroizing<String>),
+    Device {
+        provider: &'static str,
+        id: String,
+        secret: zeroize::Zeroizing<Vec<u8>>,
+    },
+}
+
+impl Unlocker {
+    fn factor(&self) -> veld::keystore::Factor<'_> {
+        use veld::keystore::Factor;
+        match self {
+            Unlocker::Passphrase(p) => Factor::Passphrase(p),
+            Unlocker::RecoveryCode(c) => Factor::RecoveryCode(c),
+            Unlocker::Device {
+                provider,
+                id,
+                secret,
+            } => Factor::Secret {
+                provider,
+                id,
+                secret,
+            },
         }
     }
+}
+
+const PASSKEY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn touch_id(id: &str) -> anyhow::Result<Unlocker> {
+    let released = veld::keyring::enclave::unlock(id, "unlock the veld keyring")?;
+    Ok(Unlocker::Device {
+        provider: veld::keystore::PROVIDER_SECURE_ENCLAVE,
+        id: released.id,
+        secret: released.secret,
+    })
+}
+
+fn passkey(storage: &std::path::Path) -> anyhow::Result<Unlocker> {
+    let factors: Vec<String> = veld::keyring::status(storage)?
+        .keyring
+        .map(|k| k.factors)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| f.provider == veld::keystore::PROVIDER_PASSKEY)
+        .map(|f| f.id)
+        .collect();
+    if factors.is_empty() {
+        anyhow::bail!("no passkey is enrolled on the keyring");
+    }
+    let released =
+        tokio::runtime::Handle::current().block_on(veld::keyring::passkey::run_on_loopback(
+            veld::keyring::passkey::Ceremony::Unlock { factors },
+            PASSKEY_TIMEOUT,
+        ))?;
+    Ok(Unlocker::Device {
+        provider: veld::keystore::PROVIDER_PASSKEY,
+        id: released.id,
+        secret: released.secret,
+    })
+}
+
+fn unlocker(storage: &std::path::Path, args: &UnlockArgs) -> anyhow::Result<Unlocker> {
+    if args.with_recovery_code {
+        Ok(Unlocker::RecoveryCode(secret(
+            "VELD_RECOVERY_CODE",
+            "Recovery code",
+        )?))
+    } else if let Some(id) = &args.with_touch_id {
+        touch_id(id)
+    } else if args.with_passkey {
+        passkey(storage)
+    } else {
+        Ok(Unlocker::Passphrase(secret(
+            "VELD_MASTER_PASSPHRASE",
+            "Passphrase",
+        )?))
+    }
+}
+
+fn keys(storage: &std::path::Path, action: KeysAction) -> anyhow::Result<serde_json::Value> {
+    use veld::keyring;
+    const PASS: &str = "VELD_MASTER_PASSPHRASE";
+    const NEW_PASS: &str = "VELD_NEW_MASTER_PASSPHRASE";
     Ok(match action {
         KeysAction::Status => serde_json::to_value(keyring::status(storage)?)?,
         KeysAction::Init { kit, label } => {
@@ -2430,30 +2534,58 @@ fn keys(storage: &std::path::Path, action: KeysAction) -> anyhow::Result<serde_j
             value["recovery"] = deliver_kit(report.recovery, kit.as_deref())?;
             value
         }
-        KeysAction::AddRecoveryCode {
-            kit,
-            label,
-            with_recovery_code,
-        } => {
-            let unlock = unlock_secret(with_recovery_code)?;
-            let issued = keyring::add_recovery_code(storage, &factor(&unlock), label.as_deref())?;
+        KeysAction::AddRecoveryCode { kit, label, unlock } => {
+            let unlock = unlocker(storage, &unlock)?;
+            let issued = keyring::add_recovery_code(storage, &unlock.factor(), label.as_deref())?;
             deliver_kit(issued, kit.as_deref())?
         }
-        KeysAction::Revoke {
-            id,
-            with_recovery_code,
+        KeysAction::EnrolTouchId {
+            label,
+            policy,
+            unlock,
         } => {
-            let unlock = unlock_secret(with_recovery_code)?;
-            serde_json::to_value(keyring::revoke(storage, &factor(&unlock), &id)?)?
+            let unlock = unlocker(storage, &unlock)?;
+            let enrolled = keyring::enclave::enrol(label.as_deref(), &policy)?;
+            serde_json::to_value(keyring::enrol_secret(
+                storage,
+                &unlock.factor(),
+                veld::keystore::PROVIDER_SECURE_ENCLAVE,
+                &enrolled.id,
+                enrolled.label.as_deref().or(label.as_deref()),
+                &enrolled.secret,
+            )?)?
+        }
+        KeysAction::EnrolPasskey { label, unlock } => {
+            let unlock = unlocker(storage, &unlock)?;
+            let label = label.unwrap_or_else(|| "passkey (localhost)".to_string());
+            let created =
+                tokio::runtime::Handle::current().block_on(keyring::passkey::run_on_loopback(
+                    keyring::passkey::Ceremony::Enrol {
+                        label: label.clone(),
+                    },
+                    PASSKEY_TIMEOUT,
+                ))?;
+            serde_json::to_value(keyring::enrol_secret(
+                storage,
+                &unlock.factor(),
+                veld::keystore::PROVIDER_PASSKEY,
+                &created.id,
+                Some(&label),
+                &created.secret,
+            )?)?
+        }
+        KeysAction::Revoke { id, unlock } => {
+            let unlock = unlocker(storage, &unlock)?;
+            serde_json::to_value(keyring::revoke(storage, &unlock.factor(), &id)?)?
         }
         KeysAction::RotatePassphrase => {
             let old = secret(PASS, "Current passphrase")?;
             let new = secret(NEW_PASS, "New passphrase")?;
             serde_json::to_value(keyring::rotate_passphrase(storage, &old, &new)?)?
         }
-        KeysAction::RotateDataKeys { with_recovery_code } => {
-            let unlock = unlock_secret(with_recovery_code)?;
-            serde_json::to_value(keyring::rotate_data_keys(storage, &factor(&unlock))?)?
+        KeysAction::RotateDataKeys { unlock } => {
+            let unlock = unlocker(storage, &unlock)?;
+            serde_json::to_value(keyring::rotate_data_keys(storage, &unlock.factor())?)?
         }
         KeysAction::RotateMasterKeys { kit, label } => {
             let pass = secret(PASS, "Passphrase")?;
@@ -2462,10 +2594,20 @@ fn keys(storage: &std::path::Path, action: KeysAction) -> anyhow::Result<serde_j
             value["recovery"] = deliver_kit(report.recovery, kit.as_deref())?;
             value
         }
-        KeysAction::Recover { kit } => {
-            let code = secret(CODE, "Recovery code")?;
+        KeysAction::Recover {
+            kit,
+            touch_id: enclave_id,
+            passkey: with_passkey,
+        } => {
+            let unlock = match (&enclave_id, with_passkey) {
+                (Some(id), _) => touch_id(id)?,
+                (None, true) => passkey(storage)?,
+                (None, false) => {
+                    Unlocker::RecoveryCode(secret("VELD_RECOVERY_CODE", "Recovery code")?)
+                }
+            };
             let new = secret(NEW_PASS, "New passphrase")?;
-            let report = keyring::recover(storage, &Factor::RecoveryCode(&code), &new)?;
+            let report = keyring::recover(storage, &unlock.factor(), &new)?;
             let mut value = serde_json::to_value(&report)?;
             if let Some(issued) = report.reissued {
                 value["reissued"] = deliver_kit(issued, kit.as_deref())?;

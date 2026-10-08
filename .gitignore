@@ -149,3 +149,6 @@ bench_data_*/
 # not source. Includes alignment TOMLs/scripts; re-add with `git add -f` if
 # you need to track any specific file.
 evaluations/
+
+# Swift build output of the Touch ID helper
+/packaging/macos/veld-enclave/.build
