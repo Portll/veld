@@ -629,6 +629,236 @@ impl LineageGraph {
                     .unwrap_or(&0.75),
             )),
 
+            // Hook-generated types (CodeEdit, FileAccess, Search, Command), the most common
+            // types from Claude Code hooks.
+
+            // CodeEdit acts like Task (implementation work)
+            (Error, CodeEdit) | (Task, CodeEdit) => Some((
+                CausalRelation::ResolvedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::ResolvedBy)
+                    .unwrap_or(&0.85)
+                    * 0.85,
+            )),
+            (CodeEdit, Error) | (Command, Error) => Some((
+                CausalRelation::Caused,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::Caused)
+                    .unwrap_or(&0.8)
+                    * 0.80,
+            )),
+            (CodeEdit, Learning) | (Command, Learning) => Some((
+                CausalRelation::ResolvedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::ResolvedBy)
+                    .unwrap_or(&0.85)
+                    * 0.80,
+            )),
+            (Decision, CodeEdit) | (Learning, CodeEdit) | (Discovery, CodeEdit) => Some((
+                CausalRelation::InformedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::InformedBy)
+                    .unwrap_or(&0.7)
+                    * 0.85,
+            )),
+            (Observation, CodeEdit) | (Conversation, CodeEdit) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.80,
+            )),
+            (CodeEdit, CodeEdit) => Some((
+                CausalRelation::InformedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::InformedBy)
+                    .unwrap_or(&0.7)
+                    * 0.75, // sequential edits — weakest same-type
+            )),
+            (CodeEdit, Decision) => Some((
+                CausalRelation::InformedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::InformedBy)
+                    .unwrap_or(&0.7)
+                    * 0.80,
+            )),
+            (CodeEdit, Task) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.80,
+            )),
+            (CodeEdit, Discovery) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.75,
+            )),
+
+            // FileAccess and Search act like Observation (research/exploration)
+            (FileAccess, Decision) | (Search, Decision) => Some((
+                CausalRelation::InformedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::InformedBy)
+                    .unwrap_or(&0.7)
+                    * 0.80,
+            )),
+            (FileAccess, CodeEdit) | (Search, CodeEdit) => Some((
+                CausalRelation::InformedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::InformedBy)
+                    .unwrap_or(&0.7)
+                    * 0.80,
+            )),
+            (FileAccess, Task) | (Search, Task) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.80,
+            )),
+            (FileAccess, Learning) | (Search, Learning) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.80,
+            )),
+            (FileAccess, Discovery) | (Search, Discovery) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.80,
+            )),
+            (FileAccess, Error) | (Search, Error) => Some((
+                CausalRelation::Caused,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::Caused)
+                    .unwrap_or(&0.8)
+                    * 0.70, // reading/searching rarely causes errors
+            )),
+            (FileAccess, FileAccess)
+            | (Search, Search)
+            | (FileAccess, Search)
+            | (Search, FileAccess) => Some((
+                CausalRelation::InformedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::InformedBy)
+                    .unwrap_or(&0.7)
+                    * 0.70, // sequential research
+            )),
+
+            // Command acts like Task (system action)
+            (Error, Command) | (Task, Command) => Some((
+                CausalRelation::ResolvedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::ResolvedBy)
+                    .unwrap_or(&0.85)
+                    * 0.80,
+            )),
+            (Decision, Command) | (Learning, Command) => Some((
+                CausalRelation::InformedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::InformedBy)
+                    .unwrap_or(&0.7)
+                    * 0.80,
+            )),
+            (Observation, Command) | (Conversation, Command) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.80,
+            )),
+            (Command, Command) => Some((
+                CausalRelation::InformedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::InformedBy)
+                    .unwrap_or(&0.7)
+                    * 0.70,
+            )),
+            (Command, Decision) | (Command, Task) | (Command, CodeEdit) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.75,
+            )),
+            (Command, Discovery) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.75,
+            )),
+
+            // Cross-type hooks: FileAccess/Search → Command and vice versa
+            (FileAccess, Command) | (Search, Command) => Some((
+                CausalRelation::InformedBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::InformedBy)
+                    .unwrap_or(&0.7)
+                    * 0.75,
+            )),
+            (Command, FileAccess) | (Command, Search) => Some((
+                CausalRelation::TriggeredBy,
+                *self
+                    .config
+                    .relation_confidence
+                    .get(&CausalRelation::TriggeredBy)
+                    .unwrap_or(&0.75)
+                    * 0.70,
+            )),
+
             // Default: RelatedTo if same type or generic relation
             _ => {
                 // Only suggest RelatedTo for semantically related types
@@ -1098,6 +1328,55 @@ mod tests {
         assert_eq!(relation, CausalRelation::Caused);
         // With perfect overlap (1.0) and 1 day gap: 0.8 * 1.0 * 0.93 ≈ 0.74
         assert!(confidence > 0.4, "confidence was {}", confidence);
+    }
+
+    #[test]
+    fn hook_types_infer_causal_relations_instead_of_related_to() {
+        on_both_backends(hook_types_infer_causal_relations_instead_of_related_to_body);
+    }
+
+    fn hook_types_infer_causal_relations_instead_of_related_to_body(graph: LineageGraph) {
+        let pairs = [
+            (
+                ExperienceType::Error,
+                ExperienceType::CodeEdit,
+                CausalRelation::ResolvedBy,
+            ),
+            (
+                ExperienceType::CodeEdit,
+                ExperienceType::Error,
+                CausalRelation::Caused,
+            ),
+            (
+                ExperienceType::Search,
+                ExperienceType::Decision,
+                CausalRelation::InformedBy,
+            ),
+            (
+                ExperienceType::FileAccess,
+                ExperienceType::Task,
+                CausalRelation::TriggeredBy,
+            ),
+            (
+                ExperienceType::Command,
+                ExperienceType::Learning,
+                CausalRelation::ResolvedBy,
+            ),
+            (
+                ExperienceType::Command,
+                ExperienceType::FileAccess,
+                CausalRelation::TriggeredBy,
+            ),
+        ];
+        for (from_type, to_type, expected) in pairs {
+            let from = create_test_memory(from_type.clone(), vec!["auth", "login"]);
+            let mut to = create_test_memory(to_type.clone(), vec!["auth", "login"]);
+            to.created_at = from.created_at + Duration::hours(1);
+            let (relation, _) = graph
+                .infer_relation(&from, &to)
+                .unwrap_or_else(|| panic!("{from_type:?} -> {to_type:?} inferred nothing"));
+            assert_eq!(relation, expected, "{from_type:?} -> {to_type:?}");
+        }
     }
 
     #[test]

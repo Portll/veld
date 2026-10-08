@@ -155,6 +155,68 @@ pub async fn list_project_files(
     }))
 }
 
+/// System directories a codebase scan or index must not read. macOS keeps `/etc` and `/var` under
+/// `/private`, which is where a canonicalised path points.
+const BLOCKED_CODEBASE_ROOTS: &[&str] = &[
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/boot",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/root",
+    "/opt",
+    "/private/etc",
+    "/System",
+    "C:/Windows",
+    "C:/Program Files",
+];
+
+/// The canonical directory a codebase request may read: it exists, is a directory, and is not the
+/// filesystem root, a system directory or veld's own data directory (`storage_root`).
+fn confine_codebase_path(
+    raw: &str,
+    storage_root: &std::path::Path,
+) -> Result<std::path::PathBuf, AppError> {
+    let invalid = |reason: String| AppError::InvalidInput {
+        field: "codebase_path".to_string(),
+        reason,
+    };
+    let canonical = std::path::Path::new(raw).canonicalize().map_err(|e| {
+        invalid(format!(
+            "Path does not exist or cannot be read: {raw} ({e})"
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(invalid(format!("Path is not a directory: {raw}")));
+    }
+    let slashed = canonical.to_string_lossy().replace('\\', "/");
+    // Windows canonicalises to a verbatim path, `\\?\C:\...`.
+    let normalised = std::path::PathBuf::from(slashed.trim_start_matches("//?/"));
+    let is_root = canonical.parent().is_none();
+    let blocked = BLOCKED_CODEBASE_ROOTS
+        .iter()
+        .any(|root| normalised.starts_with(root));
+    if is_root || blocked {
+        return Err(invalid(
+            "Access to system directories is blocked for security reasons".to_string(),
+        ));
+    }
+    let storage_root = storage_root
+        .canonicalize()
+        .unwrap_or_else(|_| storage_root.to_path_buf());
+    if canonical.starts_with(&storage_root) || storage_root.starts_with(&canonical) {
+        return Err(invalid(
+            "A codebase path may not contain or lie inside veld's data directory".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
 /// POST /api/projects/{project_id}/scan - Scan codebase
 pub async fn scan_project_codebase(
     State(state): State<AppState>,
@@ -178,23 +240,11 @@ pub async fn scan_project_codebase(
         })
         .ok_or_else(|| AppError::ProjectNotFound(project_id.clone()))?;
 
-    let codebase_path = std::path::Path::new(&req.codebase_path);
-    if !codebase_path.exists() {
-        return Err(AppError::InvalidInput {
-            field: "codebase_path".to_string(),
-            reason: format!("Path does not exist: {}", req.codebase_path),
-        });
-    }
-    if !codebase_path.is_dir() {
-        return Err(AppError::InvalidInput {
-            field: "codebase_path".to_string(),
-            reason: format!("Path is not a directory: {}", req.codebase_path),
-        });
-    }
+    let codebase_path = confine_codebase_path(&req.codebase_path, state.base_path())?;
 
     let scan_result = state
         .file_store
-        .scan_codebase(codebase_path, None)
+        .scan_codebase(&codebase_path, None)
         .map_err(AppError::Internal)?;
 
     let message = if scan_result.limit_reached {
@@ -257,13 +307,7 @@ pub async fn index_project_codebase(
         });
     }
 
-    let codebase_path = std::path::Path::new(&req.codebase_path);
-    if !codebase_path.exists() {
-        return Err(AppError::InvalidInput {
-            field: "codebase_path".to_string(),
-            reason: format!("Path does not exist: {}", req.codebase_path),
-        });
-    }
+    let codebase_path = confine_codebase_path(&req.codebase_path, state.base_path())?;
 
     if req.force && project.codebase_indexed {
         state
@@ -274,7 +318,7 @@ pub async fn index_project_codebase(
 
     let result = state
         .file_store
-        .index_codebase(codebase_path, &project.id, &req.user_id, None)
+        .index_codebase(&codebase_path, &project.id, &req.user_id, None)
         .map_err(AppError::Internal)?;
 
     project.codebase_path = Some(req.codebase_path.clone());
@@ -406,4 +450,84 @@ pub async fn get_file_stats(
         success: true,
         stats,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(raw: &str, storage: &std::path::Path) -> bool {
+        matches!(
+            confine_codebase_path(raw, storage),
+            Err(AppError::InvalidInput { .. })
+        )
+    }
+
+    #[test]
+    fn a_project_directory_is_allowed_and_canonicalised() {
+        let storage = tempfile::TempDir::new().unwrap();
+        let code = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(code.path().join("src")).unwrap();
+        let dotted = format!("{}/src/..", code.path().display());
+        assert_eq!(
+            confine_codebase_path(&dotted, storage.path()).unwrap(),
+            code.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn system_directories_and_the_root_are_refused() {
+        let storage = tempfile::TempDir::new().unwrap();
+        assert!(refused("/", storage.path()));
+        assert!(refused("/etc", storage.path()));
+        assert!(refused("/usr/bin", storage.path()));
+    }
+
+    #[test]
+    fn dot_dot_and_symlinks_cannot_reach_a_system_directory() {
+        let storage = tempfile::TempDir::new().unwrap();
+        let code = tempfile::TempDir::new().unwrap();
+        assert!(refused(
+            &format!("{}/../../../../../../etc", code.path().display()),
+            storage.path()
+        ));
+        #[cfg(unix)]
+        {
+            let link = code.path().join("innocent");
+            std::os::unix::fs::symlink("/etc", &link).unwrap();
+            assert!(refused(&link.to_string_lossy(), storage.path()));
+        }
+    }
+
+    #[test]
+    fn veld_data_directory_and_its_parents_are_refused() {
+        let base = tempfile::TempDir::new().unwrap();
+        let storage = base.path().join("veld");
+        std::fs::create_dir_all(storage.join("portll")).unwrap();
+        assert!(refused(&storage.to_string_lossy(), &storage));
+        assert!(refused(&storage.join("portll").to_string_lossy(), &storage));
+        assert!(refused(&base.path().to_string_lossy(), &storage));
+    }
+
+    #[test]
+    fn a_name_that_only_shares_a_prefix_is_not_blocked() {
+        let storage = tempfile::TempDir::new().unwrap();
+        let code = tempfile::TempDir::new().unwrap();
+        let etcetera = code.path().join("etcetera");
+        std::fs::create_dir(&etcetera).unwrap();
+        assert!(confine_codebase_path(&etcetera.to_string_lossy(), storage.path()).is_ok());
+    }
+
+    #[test]
+    fn a_file_or_missing_path_is_refused() {
+        let storage = tempfile::TempDir::new().unwrap();
+        let code = tempfile::TempDir::new().unwrap();
+        let file = code.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        assert!(refused(&file.to_string_lossy(), storage.path()));
+        assert!(refused(
+            &code.path().join("absent").to_string_lossy(),
+            storage.path()
+        ));
+    }
 }

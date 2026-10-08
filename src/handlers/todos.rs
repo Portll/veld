@@ -20,9 +20,9 @@ use crate::memory::sessions::SessionEvent;
 use crate::memory::todo_formatter;
 use crate::memory::{Experience, ExperienceType};
 use crate::memory::{
-    Project, ProjectId, ProjectStats, ProjectStatus, ProspectiveTask, ProspectiveTaskId,
+    MemoryId, Project, ProjectId, ProjectStats, ProjectStatus, ProspectiveTask, ProspectiveTaskId,
     ProspectiveTaskStatus, ProspectiveTrigger, Recurrence, Todo, TodoComment, TodoCommentId,
-    TodoCommentType, TodoPriority, TodoStatus, UserTodoStats,
+    TodoCommentType, TodoId, TodoPriority, TodoStatus, UserTodoStats,
 };
 use crate::validation;
 
@@ -189,15 +189,51 @@ pub struct CreateTodoRequest {
     #[serde(default)]
     pub external_id: Option<String>,
     /// Structured dependencies: list of todo short IDs (e.g. ["SHO-1", "BOLT-3"]) or UUIDs.
-    /// This todo cannot start until all listed todos are Done.
-    #[serde(default)]
+    /// This todo cannot start until all listed todos are Done. `blocked_by` is upstream's name
+    /// for the same list. An unknown reference is a 400.
+    #[serde(default, alias = "blocked_by")]
     pub depends_on: Option<Vec<String>>,
+    /// Memory UUIDs that motivated this todo, verified to exist.
+    #[serde(default)]
+    pub related_memory_ids: Option<Vec<String>>,
+}
+
+/// Wire form of a todo: the stored record without its embedding. The embedding cannot be
+/// skipped on the field itself, because TodoStore persists todos through that same Serialize
+/// impl and the stored embedding is what semantic todo search reads. No client reads it, and it
+/// was most of every response's bytes.
+mod todo_wire {
+    use super::Todo;
+    use serde::ser::SerializeSeq;
+    use serde::{Serialize, Serializer};
+
+    fn stripped(todo: &Todo) -> Todo {
+        let mut todo = todo.clone();
+        todo.embedding = None;
+        todo
+    }
+
+    pub fn opt<S: Serializer>(todo: &Option<Todo>, ser: S) -> Result<S::Ok, S::Error> {
+        match todo {
+            Some(todo) => stripped(todo).serialize(ser),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn list<S: Serializer>(todos: &[Todo], ser: S) -> Result<S::Ok, S::Error> {
+        let mut seq = ser.serialize_seq(Some(todos.len()))?;
+        for todo in todos {
+            seq.serialize_element(&stripped(todo))?;
+        }
+        seq.end()
+    }
 }
 
 /// Response for todo operations
 #[derive(Debug, Serialize)]
 pub struct TodoResponse {
     pub success: bool,
+    #[serde(serialize_with = "todo_wire::opt")]
     pub todo: Option<Todo>,
     pub project: Option<Project>,
     pub formatted: String,
@@ -208,6 +244,7 @@ pub struct TodoResponse {
 pub struct TodoListResponse {
     pub success: bool,
     pub count: usize,
+    #[serde(serialize_with = "todo_wire::list")]
     pub todos: Vec<Todo>,
     pub projects: Vec<Project>,
     pub formatted: String,
@@ -217,8 +254,13 @@ pub struct TodoListResponse {
 #[derive(Debug, Serialize)]
 pub struct TodoCompleteResponse {
     pub success: bool,
+    #[serde(serialize_with = "todo_wire::opt")]
     pub todo: Option<Todo>,
+    #[serde(serialize_with = "todo_wire::opt")]
     pub next_recurrence: Option<Todo>,
+    /// Todos whose dependencies are all closed now that this one is done.
+    #[serde(serialize_with = "todo_wire::list")]
+    pub unblocked: Vec<Todo>,
     pub formatted: String,
 }
 
@@ -277,8 +319,16 @@ pub struct UpdateTodoRequest {
     #[serde(default)]
     pub external_id: Option<String>,
     /// Structured dependencies: list of todo short IDs (e.g. ["SHO-1", "BOLT-3"]) or UUIDs.
-    #[serde(default)]
+    /// Replaces the set; an empty list clears it. Unknown references and cycles are a 400.
+    #[serde(default, alias = "blocked_by")]
     pub depends_on: Option<Vec<String>>,
+    /// Replaces the set of linked memory UUIDs; an empty list clears it.
+    #[serde(default)]
+    pub related_memory_ids: Option<Vec<String>>,
+    /// The target todo, named in the body by the flat `/api/todos/update` alias; the path-style
+    /// route takes it from the URL.
+    #[serde(default)]
+    pub todo_id: Option<String>,
 }
 
 /// Request to reorder a todo
@@ -286,6 +336,17 @@ pub struct UpdateTodoRequest {
 pub struct ReorderTodoRequest {
     pub user_id: String,
     pub direction: String,
+    /// The target todo, named in the body by the flat `/api/todos/reorder` alias.
+    #[serde(default)]
+    pub todo_id: Option<String>,
+}
+
+/// Body of the flat `/api/todos/complete` and `/api/todos/delete` aliases, which have no path
+/// capture and name their target here.
+#[derive(Debug, Deserialize)]
+pub struct FlatTodoRequest {
+    pub user_id: String,
+    pub todo_id: String,
 }
 
 /// Request to get due todos
@@ -431,14 +492,181 @@ pub struct ListProjectsRequest {
 // =============================================================================
 
 /// Parse recurrence string to Recurrence enum
-fn parse_recurrence(s: &str) -> Option<Recurrence> {
+fn parse_recurrence(s: &str) -> Result<Recurrence, AppError> {
     match s.to_lowercase().as_str() {
-        "daily" => Some(Recurrence::Daily),
-        "weekly" => Some(Recurrence::Weekly {
+        "daily" => Ok(Recurrence::Daily),
+        "weekly" => Ok(Recurrence::Weekly {
             days: vec![1, 2, 3, 4, 5],
         }),
-        "monthly" => Some(Recurrence::Monthly { day: 1 }),
-        _ => None,
+        "monthly" => Ok(Recurrence::Monthly { day: 1 }),
+        _ => Err(AppError::InvalidInput {
+            field: "recurrence".to_string(),
+            reason: format!("Unknown recurrence '{s}'. Valid values: daily, weekly, monthly"),
+        }),
+    }
+}
+
+fn parse_todo_status(s: &str) -> Result<TodoStatus, AppError> {
+    TodoStatus::from_str_loose(s).ok_or_else(|| AppError::InvalidInput {
+        field: "status".to_string(),
+        reason: format!(
+            "Unknown todo status '{s}'. Valid values: backlog, todo, in_progress, blocked, done, \
+             cancelled"
+        ),
+    })
+}
+
+fn parse_todo_priority(s: &str) -> Result<TodoPriority, AppError> {
+    TodoPriority::from_str_loose(s).ok_or_else(|| AppError::InvalidInput {
+        field: "priority".to_string(),
+        reason: format!("Unknown priority '{s}'. Valid values: urgent, high, medium, low, none"),
+    })
+}
+
+/// Resolves todo references (short keys like "SHO-3", sequence numbers or UUIDs) to ids. A
+/// dependency on a todo that does not exist is a data error, not something to drop silently.
+fn resolve_todo_refs(
+    state: &AppState,
+    user_id: &str,
+    refs: &[String],
+    field: &str,
+) -> Result<Vec<TodoId>, AppError> {
+    let mut resolved = Vec::with_capacity(refs.len());
+    for r in refs {
+        let todo = state
+            .todo_store
+            .find_todo_by_prefix(user_id, r)
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::InvalidInput {
+                field: field.to_string(),
+                reason: format!("No todo found matching '{r}'"),
+            })?;
+        if !resolved.contains(&todo.id) {
+            resolved.push(todo.id);
+        }
+    }
+    Ok(resolved)
+}
+
+/// Parses memory UUIDs and checks each exists, so a todo never links a memory that is not
+/// there.
+async fn verify_memory_ids(
+    state: &AppState,
+    user_id: &str,
+    ids: &[String],
+) -> Result<Vec<MemoryId>, AppError> {
+    let mut parsed = Vec::with_capacity(ids.len());
+    for id_str in ids {
+        let uuid = uuid::Uuid::parse_str(id_str).map_err(|_| AppError::InvalidInput {
+            field: "related_memory_ids".to_string(),
+            reason: format!("'{id_str}' is not a valid memory UUID"),
+        })?;
+        let mid = MemoryId(uuid);
+        if !parsed.contains(&mid) {
+            parsed.push(mid);
+        }
+    }
+    if parsed.is_empty() {
+        return Ok(parsed);
+    }
+
+    let memory_system = state.get_user_memory(user_id).map_err(AppError::Internal)?;
+    let to_check = parsed.clone();
+    let missing = tokio::task::spawn_blocking(move || {
+        let guard = memory_system.read();
+        to_check
+            .into_iter()
+            .find(|mid| guard.get_memory(mid).is_err())
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Memory verification task panicked: {e}")))?;
+    if let Some(mid) = missing {
+        return Err(AppError::InvalidInput {
+            field: "related_memory_ids".to_string(),
+            reason: format!("No memory found with id '{}'", mid.0),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Every todo under a project and its sub-projects: the set TodoStore::delete_project
+/// cascades over.
+fn collect_project_todos(
+    state: &AppState,
+    user_id: &str,
+    project_id: &ProjectId,
+    out: &mut Vec<Todo>,
+) -> Result<(), AppError> {
+    out.extend(
+        state
+            .todo_store
+            .list_todos_by_project(user_id, project_id)
+            .map_err(AppError::Internal)?,
+    );
+    for sub in state
+        .todo_store
+        .list_subprojects(user_id, project_id)
+        .map_err(AppError::Internal)?
+    {
+        collect_project_todos(state, user_id, &sub.id, out)?;
+    }
+    Ok(())
+}
+
+/// Writes the memory half of the todo-memory link: `add` memories gain a back-link to the
+/// todo, `remove` memories lose it, so a replaced link set stays consistent on both sides. A
+/// back-link is bookkeeping: a memory deleted since is logged and skipped, not a failed write.
+async fn sync_memory_back_links(
+    state: &AppState,
+    user_id: &str,
+    todo_id: &TodoId,
+    add: Vec<MemoryId>,
+    remove: Vec<MemoryId>,
+) -> Result<(), AppError> {
+    if add.is_empty() && remove.is_empty() {
+        return Ok(());
+    }
+    let memory_system = state.get_user_memory(user_id).map_err(AppError::Internal)?;
+    let todo_id = *todo_id;
+    tokio::task::spawn_blocking(move || {
+        let guard = memory_system.read();
+        for memory_id in remove {
+            if let Err(e) = guard.unlink_related_todo(&memory_id, &todo_id) {
+                tracing::warn!(memory_id = %memory_id.0, todo_id = %todo_id, "Failed to remove todo back-link: {e}");
+            }
+        }
+        for memory_id in add {
+            if let Err(e) = guard.link_related_todo(&memory_id, todo_id) {
+                tracing::warn!(memory_id = %memory_id.0, todo_id = %todo_id, "Failed to write todo back-link: {e}");
+            }
+        }
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Back-link task panicked: {e}")))
+}
+
+/// The target of a flat alias, named in its body. A missing id is a 400, never the Path
+/// extractor's 500.
+fn flat_todo_id(todo_id: Option<String>) -> Result<String, AppError> {
+    match todo_id {
+        Some(id) if !id.trim().is_empty() => Ok(id),
+        _ => Err(AppError::InvalidInput {
+            field: "todo_id".to_string(),
+            reason: "This endpoint takes the target todo in the request body; pass \"todo_id\", \
+                     or use the path-style route (/api/todos/{todo_id}/...)."
+                .to_string(),
+        }),
+    }
+}
+
+/// Links a memory the todo flow just stored back to its todo, so the todo's provenance can be
+/// walked with the memory tools.
+fn link_todo_memory(state: &AppState, user_id: &str, todo_id: &TodoId, memory_id: &MemoryId) {
+    if let Err(e) = state
+        .todo_store
+        .add_related_memory(user_id, todo_id, memory_id.clone())
+    {
+        tracing::debug!("Failed to link memory {} to todo: {e}", memory_id.0);
     }
 }
 
@@ -562,13 +790,22 @@ pub async fn list_reminders(
 ) -> Result<Json<ListRemindersResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let status_filter = req.status.as_ref().and_then(|s| match s.as_str() {
-        "pending" => Some(ProspectiveTaskStatus::Pending),
-        "triggered" => Some(ProspectiveTaskStatus::Triggered),
-        "dismissed" => Some(ProspectiveTaskStatus::Dismissed),
-        "expired" => Some(ProspectiveTaskStatus::Expired),
-        _ => None,
-    });
+    let status_filter = match req.status.as_deref() {
+        Some("pending") => Some(ProspectiveTaskStatus::Pending),
+        Some("triggered") => Some(ProspectiveTaskStatus::Triggered),
+        Some("dismissed") => Some(ProspectiveTaskStatus::Dismissed),
+        Some("expired") => Some(ProspectiveTaskStatus::Expired),
+        Some("all") | None => None,
+        Some(unknown) => {
+            return Err(AppError::InvalidInput {
+                field: "status".to_string(),
+                reason: format!(
+                    "Unknown reminder status '{unknown}'. Valid values: pending, triggered, \
+                     dismissed, expired, all"
+                ),
+            });
+        }
+    };
 
     let tasks = state
         .prospective_store
@@ -906,11 +1143,11 @@ pub async fn create_todo(
     let mut todo = Todo::new(req.user_id.clone(), req.content.clone());
 
     if let Some(ref status_str) = req.status {
-        todo.status = TodoStatus::from_str_loose(status_str).unwrap_or_default();
+        todo.status = parse_todo_status(status_str)?;
     }
 
     if let Some(ref priority_str) = req.priority {
-        todo.priority = TodoPriority::from_str_loose(priority_str).unwrap_or_default();
+        todo.priority = parse_todo_priority(priority_str)?;
     }
 
     let mut project_name = None;
@@ -958,25 +1195,18 @@ pub async fn create_todo(
     todo.external_id = req.external_id;
 
     if let Some(ref recurrence_str) = req.recurrence {
-        todo.recurrence = parse_recurrence(recurrence_str);
+        todo.recurrence = Some(parse_recurrence(recurrence_str)?);
     }
 
-    // Resolve structured dependencies from short IDs / UUIDs
+    // A new todo has no dependents yet, so its dependencies cannot form a cycle.
     if let Some(ref dep_ids) = req.depends_on {
-        for dep_str in dep_ids {
-            if let Some(dep_todo) = state
-                .todo_store
-                .find_todo_by_prefix(&req.user_id, dep_str)
-                .map_err(AppError::Internal)?
-            {
-                // Cycle detection: adding dep_todo as a dependency of this new todo
-                // cannot cycle since the new todo has no dependents yet, but check anyway
-                // in case someone passes self-referential IDs.
-                if dep_todo.id != todo.id {
-                    todo.add_dependency(dep_todo.id);
-                }
-            }
+        for dep_id in resolve_todo_refs(&state, &req.user_id, dep_ids, "depends_on")? {
+            todo.add_dependency(dep_id);
         }
+    }
+
+    if let Some(ref memory_ids) = req.related_memory_ids {
+        todo.related_memory_ids = verify_memory_ids(&state, &req.user_id, memory_ids).await?;
     }
 
     // Compute embedding for semantic search
@@ -998,17 +1228,7 @@ pub async fn create_todo(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?
         {
-            todo.embedding = Some(embedding.clone());
-
-            if let Ok(vector_id) =
-                state
-                    .todo_store
-                    .index_todo_embedding(&req.user_id, &todo.id, &embedding)
-            {
-                let _ = state
-                    .todo_store
-                    .store_vector_id_mapping(&req.user_id, vector_id, &todo.id);
-            }
+            todo.embedding = Some(embedding);
         }
     }
 
@@ -1016,6 +1236,15 @@ pub async fn create_todo(
         .todo_store
         .store_todo(&todo)
         .map_err(AppError::Internal)?;
+
+    sync_memory_back_links(
+        &state,
+        &req.user_id,
+        &todo.id,
+        todo.related_memory_ids.clone(),
+        Vec::new(),
+    )
+    .await?;
 
     let activity_msg = if let Some(ref proj) = project_name {
         format!("Created in project '{}'", proj)
@@ -1058,8 +1287,9 @@ pub async fn create_todo(
         let exp_clone = experience.clone();
         let state_clone = state.clone();
         let user_id = req.user_id.clone();
+        let todo_id = todo.id;
 
-        tokio::spawn(async move {
+        state.task_tracker.spawn(async move {
             let memory_result = tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_clone.read();
                 memory_guard.remember(exp_clone, None)
@@ -1076,6 +1306,7 @@ pub async fn create_todo(
                         e
                     );
                 }
+                link_todo_memory(&state_clone, &user_id, &todo_id, &memory_id);
                 tracing::debug!(memory_id = %memory_id.0, "Todo creation stored as memory");
             }
         });
@@ -1142,45 +1373,39 @@ pub async fn list_todos(
 ) -> Result<Json<TodoListResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let status_filter: Option<Vec<TodoStatus>> = req.status.as_ref().map(|statuses| {
-        statuses
-            .iter()
-            .filter_map(|s| TodoStatus::from_str_loose(s))
-            .collect()
-    });
+    let status_filter: Option<Vec<TodoStatus>> = req
+        .status
+        .as_ref()
+        .map(|statuses| statuses.iter().map(|s| parse_todo_status(s)).collect())
+        .transpose()?;
 
     let mut todos = if let Some(ref query) = req.query {
         if query.trim().is_empty() {
             Vec::new()
         } else {
-            let memory_system = state
-                .get_user_memory(&req.user_id)
-                .map_err(AppError::Internal)?;
+            // Semantic and lexical: an exact word match surfaces even when the embedder is
+            // down or the todo predates embeddings.
+            let query_embedding: Option<Vec<f32>> =
+                if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+                    let query_clone = query.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let memory_guard = memory_system.read();
+                        memory_guard.compute_query_embedding(&query_clone).ok()
+                    })
+                    .await
+                    .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding failed: {e}")))?
+                } else {
+                    None
+                };
 
-            let query_clone = query.clone();
-            let query_embedding: Vec<f32> = tokio::task::spawn_blocking(move || {
-                let memory_guard = memory_system.read();
-                memory_guard
-                    .compute_query_embedding(&query_clone)
-                    .unwrap_or_default()
-            })
-            .await
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding failed: {e}")))?;
-
-            if query_embedding.is_empty() {
-                Vec::new()
-            } else {
-                let limit = req.limit.unwrap_or(50);
-                let search_results = state
-                    .todo_store
-                    .search_similar(&req.user_id, &query_embedding, limit * 2)
-                    .map_err(AppError::Internal)?;
-
-                search_results
-                    .into_iter()
-                    .map(|(todo, _score)| todo)
-                    .collect()
-            }
+            let limit = req.limit.unwrap_or(50);
+            state
+                .todo_store
+                .search_todos(&req.user_id, query, query_embedding.as_deref(), limit * 2)
+                .map_err(AppError::Internal)?
+                .into_iter()
+                .map(|(todo, _score)| todo)
+                .collect()
         }
     } else if let Some(ref statuses) = status_filter {
         state
@@ -1272,17 +1497,23 @@ pub async fn list_todos(
                         .unwrap_or(false)
                 });
             }
-            _ => {}
+            "all" => {}
+            _ => {
+                return Err(AppError::InvalidInput {
+                    field: "due".to_string(),
+                    reason: format!(
+                        "Unknown due filter '{due_filter}'. Valid values: today, overdue, this_week, \
+                         all"
+                    ),
+                });
+            }
         }
     }
 
     // Filter by priority
     if let Some(ref priority_str) = req.priority {
-        if let Some(target_priority) =
-            crate::memory::types::TodoPriority::from_str_loose(priority_str)
-        {
-            todos.retain(|t| t.priority == target_priority);
-        }
+        let target_priority = parse_todo_priority(priority_str)?;
+        todos.retain(|t| t.priority == target_priority);
     }
 
     // Apply pagination
@@ -1368,7 +1599,32 @@ pub async fn get_todo(
         None
     };
 
-    let formatted = todo_formatter::format_todo_line(&todo, project_name.as_deref(), true);
+    let mut formatted = todo_formatter::format_todo_line(&todo, project_name.as_deref(), true);
+    if !todo.depends_on.is_empty() {
+        let deps: Vec<String> = todo
+            .depends_on
+            .iter()
+            .map(|id| match state.todo_store.get_todo(&query.user_id, id) {
+                Ok(Some(dep)) => {
+                    format!(
+                        "{} ({})",
+                        dep.short_id(),
+                        format!("{:?}", dep.status).to_lowercase()
+                    )
+                }
+                _ => format!("{} (deleted)", id.short()),
+            })
+            .collect();
+        formatted.push_str(&format!("\n  Depends on: {}", deps.join(", ")));
+    }
+    if !todo.related_memory_ids.is_empty() {
+        let ids: Vec<String> = todo
+            .related_memory_ids
+            .iter()
+            .map(|m| m.0.to_string())
+            .collect();
+        formatted.push_str(&format!("\n  Linked memories: {}", ids.join(", ")));
+    }
 
     Ok(Json(TodoResponse {
         success: true,
@@ -1384,6 +1640,23 @@ pub async fn update_todo(
     Path(todo_id): Path<String>,
     Json(req): Json<UpdateTodoRequest>,
 ) -> Result<Json<TodoResponse>, AppError> {
+    update_todo_core(state, todo_id, req).await
+}
+
+/// POST /api/todos/update - Update a todo named in the body
+pub async fn update_todo_flat(
+    State(state): State<AppState>,
+    Json(req): Json<UpdateTodoRequest>,
+) -> Result<Json<TodoResponse>, AppError> {
+    let todo_id = flat_todo_id(req.todo_id.clone())?;
+    update_todo_core(state, todo_id, req).await
+}
+
+async fn update_todo_core(
+    state: AppState,
+    todo_id: String,
+    req: UpdateTodoRequest,
+) -> Result<Json<TodoResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let mut todo = state
@@ -1391,19 +1664,16 @@ pub async fn update_todo(
         .find_todo_by_prefix(&req.user_id, &todo_id)
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
+    let links_before = todo.related_memory_ids.clone();
 
     if let Some(ref content) = req.content {
         todo.content = content.clone();
     }
     if let Some(ref status_str) = req.status {
-        if let Some(status) = TodoStatus::from_str_loose(status_str) {
-            todo.status = status;
-        }
+        todo.status = parse_todo_status(status_str)?;
     }
     if let Some(ref priority_str) = req.priority {
-        if let Some(priority) = TodoPriority::from_str_loose(priority_str) {
-            todo.priority = priority;
-        }
+        todo.priority = parse_todo_priority(priority_str)?;
     }
     if let Some(ref contexts) = req.contexts {
         todo.contexts = contexts.clone();
@@ -1434,28 +1704,28 @@ pub async fn update_todo(
         }
     }
 
-    // Resolve structured dependencies
-    if let Some(ref dep_ids) = req.depends_on {
+    // Resolve structured dependencies: replace semantics, unknown references and cycles
+    // rejected.
+    if let Some(ref dep_refs) = req.depends_on {
+        let resolved = resolve_todo_refs(&state, &req.user_id, dep_refs, "depends_on")?;
         todo.depends_on.clear();
-        for dep_str in dep_ids {
-            if let Some(dep_todo) = state
+        for (dep_ref, dep_id) in dep_refs.iter().zip(resolved) {
+            if state
                 .todo_store
-                .find_todo_by_prefix(&req.user_id, dep_str)
+                .would_create_cycle(&req.user_id, &todo.id, &dep_id)
                 .map_err(AppError::Internal)?
             {
-                if state
-                    .todo_store
-                    .would_create_cycle(&req.user_id, &todo.id, &dep_todo.id)
-                    .map_err(AppError::Internal)?
-                {
-                    return Err(AppError::InvalidInput {
-                        field: "depends_on".to_string(),
-                        reason: format!("Adding dependency on {} would create a cycle", dep_str),
-                    });
-                }
-                todo.add_dependency(dep_todo.id);
+                return Err(AppError::InvalidInput {
+                    field: "depends_on".to_string(),
+                    reason: format!("Adding dependency on {dep_ref} would create a cycle"),
+                });
             }
+            todo.add_dependency(dep_id);
         }
+    }
+
+    if let Some(ref memory_ids) = req.related_memory_ids {
+        todo.related_memory_ids = verify_memory_ids(&state, &req.user_id, memory_ids).await?;
     }
 
     let mut project_name = None;
@@ -1470,18 +1740,8 @@ pub async fn update_todo(
 
     todo.updated_at = chrono::Utc::now();
 
-    // Re-compute embedding if needed.
-    // IMPORTANT: call update_todo() FIRST so remove_todo_indices() cleans up
-    // the OLD vector mapping. Then add the new embedding afterwards, so the
-    // new vector/mapping aren't immediately deleted by remove_todo_indices().
-    let needs_reindex = req.content.is_some() || req.notes.is_some() || req.tags.is_some();
-
-    state
-        .todo_store
-        .update_todo(&todo)
-        .map_err(AppError::Internal)?;
-
-    if needs_reindex {
+    // The embedding is recomputed before the one write, so the todo is stored once with it.
+    if req.content.is_some() || req.notes.is_some() || req.tags.is_some() {
         let embedding_text = format!(
             "{} {} {}",
             todo.content,
@@ -1500,24 +1760,28 @@ pub async fn update_todo(
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?
             {
-                todo.embedding = Some(embedding.clone());
-
-                if let Ok(vector_id) =
-                    state
-                        .todo_store
-                        .index_todo_embedding(&req.user_id, &todo.id, &embedding)
-                {
-                    let _ =
-                        state
-                            .todo_store
-                            .store_vector_id_mapping(&req.user_id, vector_id, &todo.id);
-                }
-
-                // Persist the embedding field on the todo
-                let _ = state.todo_store.update_todo(&todo);
+                todo.embedding = Some(embedding);
             }
         }
     }
+
+    state
+        .todo_store
+        .update_todo(&todo)
+        .map_err(AppError::Internal)?;
+
+    let added: Vec<MemoryId> = todo
+        .related_memory_ids
+        .iter()
+        .filter(|id| !links_before.contains(id))
+        .cloned()
+        .collect();
+    let removed: Vec<MemoryId> = links_before
+        .iter()
+        .filter(|id| !todo.related_memory_ids.contains(id))
+        .cloned()
+        .collect();
+    sync_memory_back_links(&state, &req.user_id, &todo.id, added, removed).await?;
 
     let update_description = {
         let mut changes = Vec::new();
@@ -1603,8 +1867,9 @@ pub async fn update_todo(
             let exp_clone = experience.clone();
             let state_clone = state.clone();
             let user_id = req.user_id.clone();
+            let todo_id = todo.id;
 
-            tokio::spawn(async move {
+            state.task_tracker.spawn(async move {
                 let memory_result = tokio::task::spawn_blocking(move || {
                     let memory_guard = memory_clone.read();
                     memory_guard.remember(exp_clone, None)
@@ -1621,6 +1886,7 @@ pub async fn update_todo(
                             e
                         );
                     }
+                    link_todo_memory(&state_clone, &user_id, &todo_id, &memory_id);
                     tracing::debug!(memory_id = %memory_id.0, "Todo update stored as memory");
                 }
             });
@@ -1677,6 +1943,24 @@ pub async fn complete_todo(
     Path(todo_id): Path<String>,
     Json(req): Json<TodoQuery>,
 ) -> Result<Json<TodoCompleteResponse>, AppError> {
+    complete_todo_core(state, todo_id, req.user_id).await
+}
+
+/// POST /api/todos/complete - Complete a todo named in the body
+pub async fn complete_todo_flat(
+    State(state): State<AppState>,
+    Json(req): Json<FlatTodoRequest>,
+) -> Result<Json<TodoCompleteResponse>, AppError> {
+    let todo_id = flat_todo_id(Some(req.todo_id))?;
+    complete_todo_core(state, todo_id, req.user_id).await
+}
+
+async fn complete_todo_core(
+    state: AppState,
+    todo_id: String,
+    user_id: String,
+) -> Result<Json<TodoCompleteResponse>, AppError> {
+    let req = TodoQuery { user_id };
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let todo = state
@@ -1727,8 +2011,9 @@ pub async fn complete_todo(
             let exp_clone = experience.clone();
             let state_clone = state.clone();
             let user_id = req.user_id.clone();
+            let todo_id = todo.id;
 
-            tokio::spawn(async move {
+            state.task_tracker.spawn(async move {
                 let memory_result = tokio::task::spawn_blocking(move || {
                     let memory_guard = memory_clone.read();
                     memory_guard.remember(exp_clone, None)
@@ -1745,6 +2030,7 @@ pub async fn complete_todo(
                             e
                         );
                     }
+                    link_todo_memory(&state_clone, &user_id, &todo_id, &memory_id);
                     tracing::debug!(memory_id = %memory_id.0, "Todo completion stored as searchable memory");
                 }
             });
@@ -1753,7 +2039,30 @@ pub async fn complete_todo(
 
     match result {
         Some((completed, next)) => {
-            let formatted = todo_formatter::format_todo_completed(&completed, next.as_ref());
+            // The next occurrence of a recurring todo copies its memory links, so its own id
+            // needs the back-links too.
+            if let Some(ref next_todo) = next {
+                sync_memory_back_links(
+                    &state,
+                    &req.user_id,
+                    &next_todo.id,
+                    next_todo.related_memory_ids.clone(),
+                    Vec::new(),
+                )
+                .await?;
+            }
+            let unblocked = state
+                .todo_store
+                .unblocked_by_completion(&req.user_id, &completed.id)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to compute unblocked todos");
+                    Vec::new()
+                });
+            let mut formatted = todo_formatter::format_todo_completed(&completed, next.as_ref());
+            if !unblocked.is_empty() {
+                let ids: Vec<String> = unblocked.iter().map(|t| t.short_id()).collect();
+                formatted.push_str(&format!("\n\n  → Unblocked: {}", ids.join(", ")));
+            }
 
             state.emit_event(MemoryEvent {
                 event_type: "TODO_COMPLETE".to_string(),
@@ -1800,6 +2109,7 @@ pub async fn complete_todo(
                 success: true,
                 todo: Some(completed),
                 next_recurrence: next,
+                unblocked,
                 formatted,
             }))
         }
@@ -1813,6 +2123,24 @@ pub async fn delete_todo(
     Path(todo_id): Path<String>,
     Query(query): Query<TodoQuery>,
 ) -> Result<Json<TodoResponse>, AppError> {
+    delete_todo_core(state, todo_id, query.user_id).await
+}
+
+/// POST /api/todos/delete - Delete a todo named in the body
+pub async fn delete_todo_flat(
+    State(state): State<AppState>,
+    Json(req): Json<FlatTodoRequest>,
+) -> Result<Json<TodoResponse>, AppError> {
+    let todo_id = flat_todo_id(Some(req.todo_id))?;
+    delete_todo_core(state, todo_id, req.user_id).await
+}
+
+async fn delete_todo_core(
+    state: AppState,
+    todo_id: String,
+    user_id: String,
+) -> Result<Json<TodoResponse>, AppError> {
+    let query = TodoQuery { user_id };
     validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
 
     let todo = state
@@ -1825,6 +2153,16 @@ pub async fn delete_todo(
         .todo_store
         .delete_todo(&query.user_id, &todo.id)
         .map_err(AppError::Internal)?;
+    if success {
+        sync_memory_back_links(
+            &state,
+            &query.user_id,
+            &todo.id,
+            Vec::new(),
+            todo.related_memory_ids.clone(),
+        )
+        .await?;
+    }
 
     let formatted = if success {
         todo_formatter::format_todo_deleted(&todo.short_id())
@@ -1867,7 +2205,33 @@ pub async fn reorder_todo(
     Path(todo_id): Path<String>,
     Json(req): Json<ReorderTodoRequest>,
 ) -> Result<Json<TodoResponse>, AppError> {
+    reorder_todo_core(state, todo_id, req).await
+}
+
+/// POST /api/todos/reorder - Reorder a todo named in the body
+pub async fn reorder_todo_flat(
+    State(state): State<AppState>,
+    Json(req): Json<ReorderTodoRequest>,
+) -> Result<Json<TodoResponse>, AppError> {
+    let todo_id = flat_todo_id(req.todo_id.clone())?;
+    reorder_todo_core(state, todo_id, req).await
+}
+
+async fn reorder_todo_core(
+    state: AppState,
+    todo_id: String,
+    req: ReorderTodoRequest,
+) -> Result<Json<TodoResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    if req.direction != "up" && req.direction != "down" {
+        return Err(AppError::InvalidInput {
+            field: "direction".to_string(),
+            reason: format!(
+                "Unknown direction '{}'. Valid values: up, down",
+                req.direction
+            ),
+        });
+    }
 
     let todo = state
         .todo_store
@@ -1882,11 +2246,7 @@ pub async fn reorder_todo(
 
     match result {
         Some(updated) => {
-            let formatted = format!(
-                "Moved {} {}",
-                updated.short_id(),
-                if req.direction == "up" { "up" } else { "down" }
-            );
+            let formatted = format!("Moved {} {}", updated.short_id(), req.direction);
 
             state.emit_event(MemoryEvent {
                 event_type: "TODO_REORDER".to_string(),
@@ -2184,16 +2544,24 @@ pub async fn add_todo_comment(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
 
-    let comment_type = req
-        .comment_type
-        .as_ref()
-        .and_then(|ct| match ct.to_lowercase().as_str() {
-            "comment" => Some(TodoCommentType::Comment),
-            "progress" => Some(TodoCommentType::Progress),
-            "resolution" => Some(TodoCommentType::Resolution),
-            "activity" => Some(TodoCommentType::Activity),
-            _ => None,
-        });
+    let comment_type = match req.comment_type.as_deref() {
+        None => None,
+        Some(ct) => Some(match ct.to_lowercase().as_str() {
+            "comment" => TodoCommentType::Comment,
+            "progress" => TodoCommentType::Progress,
+            "resolution" => TodoCommentType::Resolution,
+            "activity" => TodoCommentType::Activity,
+            _ => {
+                return Err(AppError::InvalidInput {
+                    field: "comment_type".to_string(),
+                    reason: format!(
+                        "Unknown comment type '{ct}'. Valid values: comment, progress, \
+                         resolution, activity"
+                    ),
+                });
+            }
+        }),
+    };
 
     let author = req.author.unwrap_or_else(|| req.user_id.clone());
 
@@ -2266,6 +2634,7 @@ pub async fn add_todo_comment(
                 );
             }
 
+            link_todo_memory(&state, &req.user_id, &todo.id, &memory_id);
             tracing::debug!(
                 memory_id = %memory_id.0,
                 todo_id = %todo.id,
@@ -2274,13 +2643,7 @@ pub async fn add_todo_comment(
         }
     }
 
-    let formatted = format!(
-        "✓ Added comment to {}\n\n  {} ({}):\n  {}",
-        todo.short_id(),
-        author,
-        comment.created_at.format("%Y-%m-%d %H:%M"),
-        req.content
-    );
+    let formatted = todo_formatter::format_comment_added(&todo.short_id(), &comment);
 
     state.emit_event(MemoryEvent {
         event_type: "TODO_COMMENT_ADD".to_string(),
@@ -2332,32 +2695,7 @@ pub async fn list_todo_comments(
         .get_comments(&query.user_id, &todo.id)
         .map_err(AppError::Internal)?;
 
-    let formatted = if comments.is_empty() {
-        format!("No comments on {}", todo.short_id())
-    } else {
-        let mut output = format!(
-            "📝 Comments on {} ({} total)\n\n",
-            todo.short_id(),
-            comments.len()
-        );
-        for (i, comment) in comments.iter().enumerate() {
-            let type_icon = match comment.comment_type {
-                TodoCommentType::Comment => "💬",
-                TodoCommentType::Progress => "📊",
-                TodoCommentType::Resolution => "✅",
-                TodoCommentType::Activity => "🔄",
-            };
-            output.push_str(&format!(
-                "{}. {} {} ({})\n   {}\n\n",
-                i + 1,
-                type_icon,
-                comment.author,
-                comment.created_at.format("%Y-%m-%d %H:%M"),
-                comment.content
-            ));
-        }
-        output
-    };
+    let formatted = todo_formatter::format_comment_list(&todo.short_id(), &comments);
 
     tracing::debug!(
         user_id = %query.user_id,
@@ -2746,15 +3084,16 @@ pub async fn delete_project(
         })
         .ok_or_else(|| AppError::ProjectNotFound(project_id.clone()))?;
 
-    let todos_count = if req.delete_todos {
-        state
-            .todo_store
-            .list_todos_by_project(&req.user_id, &project.id)
-            .map_err(AppError::Internal)?
-            .len()
+    // delete_project cascades into sub-projects, so their todos are counted and lose their
+    // memory back-links too.
+    let doomed_todos = if req.delete_todos {
+        let mut collected = Vec::new();
+        collect_project_todos(&state, &req.user_id, &project.id, &mut collected)?;
+        collected
     } else {
-        0
+        Vec::new()
     };
+    let todos_count = doomed_todos.len();
 
     let deleted = state
         .todo_store
@@ -2763,6 +3102,17 @@ pub async fn delete_project(
 
     if !deleted {
         return Err(AppError::ProjectNotFound(project_id));
+    }
+
+    for todo in &doomed_todos {
+        sync_memory_back_links(
+            &state,
+            &req.user_id,
+            &todo.id,
+            Vec::new(),
+            todo.related_memory_ids.clone(),
+        )
+        .await?;
     }
 
     let formatted = todo_formatter::format_project_deleted(&project, todos_count);

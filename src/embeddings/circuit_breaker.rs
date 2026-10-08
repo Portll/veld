@@ -342,33 +342,28 @@ impl Embedder for ResilientEmbedder {
             return Ok(texts.iter().map(|t| self.generate_fallback(t)).collect());
         }
 
-        // Process batch with individual tracking
-        let mut results = Vec::with_capacity(texts.len());
-        let mut any_success = false;
-        let mut any_failure = false;
+        self.total_calls
+            .fetch_add(texts.len() as u64, Ordering::Relaxed);
 
-        for text in texts {
-            self.total_calls.fetch_add(1, Ordering::Relaxed);
-            match self.inner.encode(text) {
-                Ok(embedding) => {
-                    any_success = true;
-                    results.push(embedding);
-                }
-                Err(_) => {
-                    any_failure = true;
-                    results.push(self.generate_fallback(text));
-                }
+        // One batched inference; only a failed batch falls back to per-text encoding.
+        match self.inner.encode_batch(texts) {
+            Ok(embeddings) => {
+                self.record_success();
+                Ok(embeddings)
+            }
+            Err(e) => {
+                self.record_failure();
+                tracing::warn!("Batch embedding failed (circuit breaker tracking): {}", e);
+                Ok(texts
+                    .iter()
+                    .map(|text| {
+                        self.inner
+                            .encode(text)
+                            .unwrap_or_else(|_| self.generate_fallback(text))
+                    })
+                    .collect())
             }
         }
-
-        // Update circuit state based on batch results
-        if any_failure && !any_success {
-            self.record_failure();
-        } else if any_success {
-            self.record_success();
-        }
-
-        Ok(results)
     }
 }
 
@@ -417,6 +412,20 @@ mod tests {
 
         assert!(metrics.total_calls >= 1);
         assert_eq!(metrics.state, CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_encode_batch_matches_encode_and_counts_every_text() {
+        let embedder = create_test_embedder();
+        let resilient = ResilientEmbedder::with_defaults(embedder);
+        let texts = ["first text", "", "third text"];
+
+        let batch = resilient.encode_batch(&texts).unwrap();
+        assert_eq!(resilient.metrics().total_calls, texts.len() as u64);
+        assert_eq!(resilient.state(), CircuitState::Closed);
+
+        let single: Vec<Vec<f32>> = texts.iter().map(|t| resilient.encode(t).unwrap()).collect();
+        assert_eq!(batch, single);
     }
 
     #[test]

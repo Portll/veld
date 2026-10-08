@@ -1,5 +1,6 @@
 use super::*;
 use crate::graph_memory::{EntityLabel, EntityNode, GraphMemory, PiiClassification};
+use crate::keystore::{Keystore, RecordCryptors};
 use crate::memory::storage::{SearchCriteria, VectorMappingEntry};
 use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId, MemoryTier};
 use crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore;
@@ -775,4 +776,201 @@ fn the_planted_record_is_undecodable_to_the_runtime_reader_and_the_portable_dump
     // quarantine tests above exercise a record no arm accepts.
     assert!(crate::memory::storage::portable_memory_value(UNDECODABLE_VALUE).is_err());
     assert!(crate::memory::storage::deserialize_memory_for_test(UNDECODABLE_VALUE).is_err());
+}
+
+const SEALED_SECRET: &str = "sealed-in-the-source-and-never-in-a-dump-K4R";
+
+type Row = (Vec<u8>, Vec<u8>);
+
+/// A keystore at `<u>/storage/keystore.json` that has rotated once (epochs 0 and 1,
+/// generation 1), with one memory sealed under each epoch and the rollback sentinel at 1.
+/// Returns the keystore and the sealed rows as stored.
+fn seal_rocks_user(base: &Path, id: &str) -> (Keystore, Vec<Row>) {
+    use crate::keystore::KdfParams;
+    let storage = base.join(id).join("storage");
+    let mut ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+    let kek = ks.unseal_with_passphrase("pw").unwrap();
+    let before = RecordCryptors::from_keystore(&ks, &kek).unwrap();
+    ks.rotate_dek(&kek).unwrap();
+    let after = RecordCryptors::from_keystore(&ks, &kek).unwrap();
+    std::fs::write(storage.join(KEYSTORE), ks.to_json().unwrap()).unwrap();
+
+    let db = rocksdb::DB::open_cf(
+        &rocksdb::Options::default(),
+        &storage,
+        ["default", "kv", "memory_index"],
+    )
+    .unwrap();
+    let mut rows = Vec::new();
+    for (cryptors, n) in [(&before, 0), (&after, 1)] {
+        let m = memory(&format!("{SEALED_SECRET} {n}"), "sealed");
+        let plain = bincode::serde::encode_to_vec(&m, bincode::config::standard()).unwrap();
+        let sealed = cryptors
+            .active()
+            .encrypt_record(&plain, m.id.0.as_bytes())
+            .unwrap();
+        db.put(m.id.0.as_bytes(), &sealed).unwrap();
+        rows.push((m.id.0.as_bytes().to_vec(), sealed));
+    }
+    let index = db.cf_handle("memory_index").unwrap();
+    db.put_cf(index, GENERATION_SENTINEL, 1u64.to_le_bytes())
+        .unwrap();
+    db.flush().unwrap();
+    (ks, rows)
+}
+
+fn record_keys(ks: &Keystore) -> RecordCryptors {
+    let kek = ks.unseal_with_passphrase("pw").unwrap();
+    RecordCryptors::from_keystore(ks, &kek).unwrap()
+}
+
+fn contains(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
+}
+
+#[test]
+fn a_migration_dump_carries_sealed_records_as_stored_and_no_plaintext() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    rocks_user(base, "sol", &["plain"]);
+    let (ks, sealed) = seal_rocks_user(base, "sol");
+    let cryptors = record_keys(&ks);
+    let keys = Keys {
+        cryptors: &cryptors,
+        generation: Some(ks.generation),
+    };
+
+    let dump = tmp.path().join("sol.veldport");
+    let (stats, _) = export_unit(
+        base,
+        StorageBackend::RocksDb,
+        &Unit::User("sol".to_string()),
+        &dump,
+        None,
+        Sealed::Opened(Some(keys)),
+    )
+    .expect("a migration export of an encrypted store");
+    assert_eq!(stats.sealed_records, 2);
+    assert_eq!(stats.decode_failures, 0);
+
+    let bytes = std::fs::read(&dump).unwrap();
+    assert!(
+        !contains(&bytes, SEALED_SECRET),
+        "a sealed record reached the dump opened"
+    );
+    let records = portable::read_all(bytes.as_slice()).unwrap();
+    for (key, value) in &sealed {
+        let carried = records
+            .iter()
+            .find(|r| r.cf == "primary/memories" && &r.key == key)
+            .expect("sealed record carried");
+        assert_eq!(
+            &carried.value, value,
+            "a sealed record was not carried as stored"
+        );
+    }
+    let sentinel: Vec<_> = records
+        .iter()
+        .filter(|r| r.key == GENERATION_SENTINEL)
+        .collect();
+    assert_eq!(sentinel.len(), 1);
+    assert_eq!(sentinel[0].cf, "primary/default");
+    assert_eq!(sentinel[0].value, 1u64.to_le_bytes());
+    let defaults: Vec<&[u8]> = records
+        .iter()
+        .filter(|r| r.cf == "primary/default")
+        .map(|r| r.key.as_slice())
+        .collect();
+    assert!(
+        defaults.windows(2).all(|w| w[0] < w[1]),
+        "the sentinel is out of key order"
+    );
+}
+
+#[test]
+fn a_sealed_record_that_does_not_open_under_the_keystore_is_not_carried() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    rocks_user(base, "tor", &["plain"]);
+    let (ks, sealed) = seal_rocks_user(base, "tor");
+    let other = Keystore::create("pw", crate::keystore::KdfParams::fast_for_tests()).unwrap();
+    let foreign = record_keys(&other)
+        .active()
+        .encrypt_record(b"never a memory", uuid::Uuid::nil().as_bytes())
+        .unwrap();
+    let relocated = uuid::Uuid::new_v4();
+    {
+        let db = rocksdb::DB::open_cf(
+            &rocksdb::Options::default(),
+            base.join("tor/storage"),
+            ["default", "kv", "memory_index"],
+        )
+        .unwrap();
+        db.put(uuid::Uuid::new_v4().as_bytes(), &foreign).unwrap();
+        db.put(relocated.as_bytes(), &sealed[0].1).unwrap();
+        db.flush().unwrap();
+    }
+    let cryptors = record_keys(&ks);
+    let extraction = extract_with(
+        base,
+        StorageBackend::RocksDb,
+        &Unit::User("tor".to_string()),
+        std::io::sink(),
+        None,
+        Sealed::Opened(Some(Keys {
+            cryptors: &cryptors,
+            generation: Some(ks.generation),
+        })),
+    )
+    .unwrap();
+    assert_eq!(extraction.sealed_records, 2);
+    assert_eq!(
+        extraction.decode_failures, 2,
+        "{:?}",
+        extraction.failed_keys
+    );
+    assert!(
+        extraction
+            .failed_keys
+            .iter()
+            .any(|k| k.contains(&relocated.to_string()) && k.contains("does not open")),
+        "{:?}",
+        extraction.failed_keys
+    );
+}
+
+#[test]
+fn a_source_sentinel_ahead_of_its_keystore_refuses_the_extraction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    rocks_user(base, "uma", &["plain"]);
+    let (ks, _) = seal_rocks_user(base, "uma");
+    {
+        let db = rocksdb::DB::open_cf(
+            &rocksdb::Options::default(),
+            base.join("uma/storage"),
+            ["default", "kv", "memory_index"],
+        )
+        .unwrap();
+        let index = db.cf_handle("memory_index").unwrap();
+        db.put_cf(index, GENERATION_SENTINEL, 5u64.to_le_bytes())
+            .unwrap();
+        db.flush().unwrap();
+    }
+    let cryptors = record_keys(&ks);
+    let err = extract_with(
+        base,
+        StorageBackend::RocksDb,
+        &Unit::User("uma".to_string()),
+        std::io::sink(),
+        None,
+        Sealed::Opened(Some(Keys {
+            cryptors: &cryptors,
+            generation: Some(ks.generation),
+        })),
+    )
+    .expect_err("a keystore older than the store's sentinel");
+    assert!(format!("{err:#}").contains("rollback"), "{err:#}");
 }

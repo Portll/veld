@@ -110,8 +110,12 @@ jobs:
       - name: Run Clippy
         run: |
           set -o pipefail
-          cargo clippy --all-targets -- -W clippy::all 2>&1 | tee clippy-output.txt
-          cargo clippy --all-targets --no-default-features --features storage-redb -- -W clippy::all 2>&1 | tee -a clippy-output.txt
+          # clippy::all stays at -W while its style and complexity lints are cleared. The correctness
+          # group is denied: -W clippy::all would downgrade those deny-by-default lints, which flag
+          # code that is almost certainly wrong, such as an assert that can never fail. The -D comes
+          # after the -W so it wins for that group.
+          cargo clippy --all-targets -- -W clippy::all -D clippy::correctness 2>&1 | tee clippy-output.txt
+          cargo clippy --all-targets --no-default-features --features storage-redb -- -W clippy::all -D clippy::correctness 2>&1 | tee -a clippy-output.txt
           WARNINGS=$(grep -c "warning:" clippy-output.txt || true)
           echo "### Clippy Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

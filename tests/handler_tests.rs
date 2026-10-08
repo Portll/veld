@@ -451,6 +451,182 @@ async fn remember_with_tags_and_type() {
 }
 
 #[tokio::test]
+async fn unknown_memory_type_is_rejected_not_stored_as_observation() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({
+                "user_id": "test-user",
+                "content": "A memory whose type is a typo.",
+                "memory_type": "Decsion"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("Decsion"), "{body}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember/batch",
+            json!({
+                "user_id": "test-user",
+                "memories": [
+                    {"content": "First batch item with a valid type.", "memory_type": "Learning"},
+                    {"content": "Second batch item with a typo type.", "memory_type": "Lerning"}
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], 1, "{body}");
+    assert_eq!(body["failed"], 1, "{body}");
+    assert_eq!(body["errors"][0]["index"], 1, "{body}");
+}
+
+#[tokio::test]
+async fn todo_filters_and_fields_reject_unknown_values() {
+    let h = Harness::new();
+    for (uri, body) in [
+        (
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Bad status", "status": "finished"}),
+        ),
+        (
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Bad priority", "priority": "critical"}),
+        ),
+        (
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Bad recurrence", "recurrence": "yearly"}),
+        ),
+        (
+            "/api/todos",
+            json!({"user_id": "test-user", "status": ["todo", "finished"]}),
+        ),
+        (
+            "/api/todos",
+            json!({"user_id": "test-user", "due": "tomorrow"}),
+        ),
+        (
+            "/api/todos",
+            json!({"user_id": "test-user", "priority": "critical"}),
+        ),
+        (
+            "/api/reminders",
+            json!({"user_id": "test-user", "status": "snoozed"}),
+        ),
+    ] {
+        let (status, resp) = json_of(h.app(), authed_post(uri, body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}: {resp}");
+    }
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/todos", json!({"user_id": "test-user", "due": "all"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "due=all lists everything: {body}");
+}
+
+#[tokio::test]
+async fn multimodal_search_refuses_modes_it_cannot_parameterise() {
+    let h = Harness::new();
+    for mode in ["spatial", "mission"] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/search/multimodal",
+                json!({"user_id": "test-user", "query_text": "dock", "mode": mode}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{mode}: {body}");
+        assert!(body.to_string().contains("/api/search/robotics"), "{body}");
+    }
+}
+
+/// Names of the entities a memory's graph episode references.
+fn episode_entity_names(h: &Harness, user: &str, id: &veld::uuid::Uuid) -> Vec<String> {
+    let graph = h.mgr.get_user_graph(user).expect("graph");
+    let graph = graph.read();
+    match graph.get_episode(id).expect("read episode") {
+        Some(episode) => episode
+            .entity_refs
+            .iter()
+            .filter_map(|e| graph.get_entity(e).ok().flatten())
+            .map(|e| e.name.to_lowercase())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Waits for the background graph pass to give a memory's episode an entity.
+async fn wait_for_episode_entity(h: &Harness, user: &str, id: veld::uuid::Uuid, name: &str) {
+    for _ in 0..300 {
+        if episode_entity_names(h, user, &id).iter().any(|n| n == name) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!(
+        "the graph episode never gained '{name}': {:?}",
+        episode_entity_names(h, user, &id)
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_with_new_tags_reaches_the_stored_memory_and_its_graph_episode() {
+    use veld::memory::MemoryId;
+
+    let h = Harness::new();
+    let user = "merge-user";
+    // Short enough that the episode stays under max_entities_per_memory (10) after the merge.
+    let content = "The tender drifted overnight.";
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user, "content": content, "tags": ["mooring"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["id"].as_str().expect("id")).unwrap();
+    wait_for_episode_entity(&h, user, id, "mooring").await;
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user, "content": content, "tags": ["kestrel"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"].as_str(), Some(id.to_string().as_str()));
+
+    let stored = {
+        let memory = h.mgr.get_user_memory(user).expect("memory");
+        let guard = memory.read();
+        guard.get_memory(&MemoryId(id)).expect("stored")
+    };
+    for name in ["mooring", "kestrel"] {
+        assert!(
+            stored.experience.entities.iter().any(|e| e == name),
+            "{name} missing from {:?}",
+            stored.experience.entities
+        );
+    }
+    wait_for_episode_entity(&h, user, id, "kestrel").await;
+}
+
+#[tokio::test]
 async fn batch_remember() {
     let h = Harness::new();
     let (status, _) = json_of(
@@ -486,6 +662,212 @@ async fn upsert_memory() {
     )
     .await;
     assert!(status.is_success(), "upsert returned {status}");
+}
+
+/// Every memory carrying `external_id`, read from the store rather than from the response.
+fn upserted(h: &Harness, user: &str, external_id: &str) -> Vec<veld::memory::Memory> {
+    let memory = h.mgr.get_user_memory(user).expect("memory");
+    let guard = memory.read();
+    guard
+        .get_all_memories()
+        .expect("all memories")
+        .into_iter()
+        .filter(|m| m.external_id.as_deref() == Some(external_id))
+        .map(|m| (*m).clone())
+        .collect()
+}
+
+fn the_one(h: &Harness, user: &str, external_id: &str) -> veld::memory::Memory {
+    let mut found = upserted(h, user, external_id);
+    assert_eq!(found.len(), 1, "expected one memory for {external_id}");
+    found.remove(0)
+}
+
+const TRANSCRIPT_CREATED: &str = "2026-09-01T10:00:00Z";
+
+fn transcript_upsert(user: &str, content: &str) -> serde_json::Value {
+    json!({
+        "user_id": user,
+        "external_id": "cc:transcript:sess-1",
+        "content": content,
+        "episode_id": "ep-sess-1",
+        "agent_id": "agent-main",
+        "created_at": TRANSCRIPT_CREATED,
+        "writer": {"session_id": "sess-1", "transcript_id": "tx-1", "model_id": "model-a"}
+    })
+}
+
+#[tokio::test]
+async fn upsert_stores_provenance_on_insert_as_remember_does() {
+    let h = Harness::new();
+    let user = "upsert-provenance";
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            transcript_upsert(user, "Transcript sess-1, first pass."),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["was_update"], json!(false), "{body}");
+
+    let stored = the_one(&h, user, "cc:transcript:sess-1");
+    let created: veld::chrono::DateTime<veld::chrono::Utc> = TRANSCRIPT_CREATED.parse().unwrap();
+    assert_eq!(stored.agent_id.as_deref(), Some("agent-main"));
+    assert_eq!(stored.created_at, created);
+    let ctx = stored.experience.context.as_ref().expect("context");
+    assert_eq!(ctx.episode.episode_id.as_deref(), Some("ep-sess-1"));
+    assert_eq!(ctx.session.declared.transcript_id.as_deref(), Some("tx-1"));
+    assert_eq!(ctx.session.declared.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(ctx.session.declared.model_id.as_deref(), Some("model-a"));
+
+    // Parity: the same provenance sent to /api/remember is stored identically.
+    let mut via_remember = transcript_upsert(user, "Same provenance, written by remember.");
+    via_remember.as_object_mut().unwrap().remove("external_id");
+    let (status, body) = json_of(h.app(), authed_post("/api/remember", via_remember)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let remembered = {
+        let id = veld::uuid::Uuid::parse_str(body["id"].as_str().expect("id")).unwrap();
+        let memory = h.mgr.get_user_memory(user).expect("memory");
+        let guard = memory.read();
+        guard
+            .get_memory(&veld::memory::MemoryId(id))
+            .expect("stored")
+    };
+    let rctx = remembered.experience.context.as_ref().expect("context");
+    assert_eq!(remembered.agent_id, stored.agent_id);
+    assert_eq!(remembered.created_at, stored.created_at);
+    assert_eq!(rctx.episode.episode_id, ctx.episode.episode_id);
+    assert_eq!(rctx.session.declared, ctx.session.declared);
+    assert_eq!(rctx.source.source_type, ctx.source.source_type);
+    assert_eq!(rctx.source.credibility, ctx.source.credibility);
+}
+
+#[tokio::test]
+async fn a_second_upsert_updates_the_one_memory() {
+    let h = Harness::new();
+    let user = "upsert-twice";
+    let (status, first) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            transcript_upsert(user, "Transcript sess-1, first pass."),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            transcript_upsert(user, "Transcript sess-1, grown."),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["was_update"], json!(true), "{second}");
+    assert_eq!(second["id"], first["id"]);
+    assert_eq!(second["version"], json!(2), "{second}");
+
+    let stored = the_one(&h, user, "cc:transcript:sess-1");
+    assert_eq!(stored.experience.content, "Transcript sess-1, grown.");
+    assert_eq!(stored.history.len(), 1, "the first pass is kept in history");
+}
+
+#[tokio::test]
+async fn an_update_keeps_omitted_provenance_and_overwrites_provided() {
+    let h = Harness::new();
+    let user = "upsert-omit";
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            transcript_upsert(user, "Transcript sess-1, first pass."),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // No episode_id, agent_id or created_at; a different writer.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({
+                "user_id": user,
+                "external_id": "cc:transcript:sess-1",
+                "content": "Transcript sess-1, grown.",
+                "writer": {"session_id": "sess-1", "transcript_id": "tx-2"}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["was_update"], json!(true), "{body}");
+
+    let stored = the_one(&h, user, "cc:transcript:sess-1");
+    let created: veld::chrono::DateTime<veld::chrono::Utc> = TRANSCRIPT_CREATED.parse().unwrap();
+    let ctx = stored.experience.context.as_ref().expect("context");
+    assert_eq!(ctx.episode.episode_id.as_deref(), Some("ep-sess-1"));
+    assert_eq!(stored.agent_id.as_deref(), Some("agent-main"));
+    assert_eq!(stored.created_at, created);
+    assert_eq!(ctx.session.declared.transcript_id.as_deref(), Some("tx-2"));
+    assert_eq!(
+        ctx.session.declared.model_id, None,
+        "a provided writer replaces the whole writer"
+    );
+}
+
+#[tokio::test]
+async fn an_upsert_without_provenance_behaves_as_before() {
+    let h = Harness::new();
+    let user = "upsert-plain";
+    let before = veld::chrono::Utc::now();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-plain", "content": "Plain upsert."}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["id", "success", "version", "was_update"], "{body}");
+    assert_eq!(body["was_update"], json!(false));
+    assert_eq!(body["version"], json!(1));
+
+    let stored = the_one(&h, user, "ext-plain");
+    assert_eq!(stored.agent_id, None);
+    assert!(stored.created_at >= before, "created_at defaults to now");
+    let ctx = stored.experience.context.as_ref().expect("context");
+    assert_eq!(ctx.episode.episode_id, None);
+    assert_eq!(
+        ctx.session.declared,
+        veld::memory::facets::DeclaredWriter::default()
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-plain", "content": "Plain upsert, edited."}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["was_update"], json!(true));
+    assert_eq!(body["version"], json!(2));
+    let stored = the_one(&h, user, "ext-plain");
+    assert_eq!(stored.experience.content, "Plain upsert, edited.");
+    assert_eq!(stored.agent_id, None);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -764,6 +1146,41 @@ async fn facts_stats() {
     assert!(status.is_success());
 }
 
+#[tokio::test]
+async fn facts_narratives_preview_purge_and_purge_are_routed() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/facts/narratives", json!({"user_id": "test-user"})),
+    )
+    .await;
+    assert!(status.is_success(), "narratives: {status} {body}");
+    assert_eq!(body["total_clusters"], 0);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/facts/preview-purge",
+            json!({"user_id": "test-user", "pattern": "relates to"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "preview-purge: {status} {body}");
+    assert_eq!(body["match_bucket"], "none");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/facts/purge",
+            json!({"user_id": "test-user", "pattern": "relates to"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "purge: {status} {body}");
+    assert_eq!(body["dry_run"], true, "purge defaults to a dry run");
+    assert_eq!(body["purged"], 0);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // compression.rs
 // ═══════════════════════════════════════════════════════════════════════
@@ -889,6 +1306,306 @@ async fn graph_data_authenticated() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+async fn todos_resolve_dependencies_link_memories_and_report_what_completion_unblocks() {
+    use veld::memory::Experience;
+
+    let h = Harness::new();
+    let user = "potent-todos";
+    let create = |body: serde_json::Value| authed_post("/api/todos/add", body);
+
+    let (status, body) = json_of(
+        h.app(),
+        create(json!({"user_id": user, "content": "Ship it", "blocked_by": ["SHO-999"]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown dependency: {body}"
+    );
+
+    let memory_id = {
+        let memory = h.mgr.get_user_memory(user).expect("memory");
+        let guard = memory.read();
+        guard
+            .remember(
+                Experience {
+                    content: "The release needs a signed changelog.".to_string(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("remember")
+    };
+    let (status, body) = json_of(
+        h.app(),
+        create(json!({
+            "user_id": user,
+            "content": "Write the changelog",
+            "related_memory_ids": [memory_id.0.to_string()],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let blocker = body["todo"]["id"].as_str().expect("id").to_string();
+    let linked = &body["todo"]["related_memory_ids"];
+    assert!(
+        linked
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == &json!(memory_id.0.to_string()))),
+        "{body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        create(json!({
+            "user_id": user,
+            "content": "Tag the release",
+            "blocked_by": [blocker.clone()],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let dependent = body["todo"]["id"].as_str().expect("id").to_string();
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/todos", json!({"user_id": user, "query": "changelog"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["todos"][0]["id"].as_str(),
+        Some(blocker.as_str()),
+        "{body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{blocker}/complete"),
+            json!({"user_id": user}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["unblocked"][0]["id"].as_str(),
+        Some(dependent.as_str()),
+        "{body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{dependent}/reorder"),
+            json!({"user_id": user, "direction": "sideways"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{dependent}/comments"),
+            json!({"user_id": user, "content": "Waiting on the changelog."}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let comment_id = body["comment"]["id"].as_str().expect("comment id");
+    assert!(
+        body["formatted"]
+            .as_str()
+            .is_some_and(|f| f.contains(comment_id)),
+        "{body}"
+    );
+}
+
+async fn create_todo_id(h: &Harness, user: &str, content: &str) -> String {
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({"user_id": user, "content": content}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["todo"]["id"].as_str().expect("id").to_string()
+}
+
+#[tokio::test]
+async fn flat_todo_aliases_take_the_todo_id_from_the_body() {
+    let h = Harness::new();
+    let user = "flat-alias";
+
+    let id = create_todo_id(&h, user, "alias update target").await;
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/update",
+            json!({"user_id": user, "todo_id": id, "notes": "set via flat alias"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["todo"]["notes"], "set via flat alias");
+
+    let id = create_todo_id(&h, user, "alias complete target").await;
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/complete",
+            json!({"user_id": user, "todo_id": id}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["todo"]["status"], "done");
+
+    let id = create_todo_id(&h, user, "alias reorder target").await;
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/reorder",
+            json!({"user_id": user, "todo_id": id, "direction": "up"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let id = create_todo_id(&h, user, "alias delete target").await;
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/todos/delete", json!({"user_id": user, "todo_id": id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let gone = h
+        .mgr
+        .todo_store
+        .get_todo(user, &veld::memory::TodoId(id.parse().unwrap()))
+        .unwrap();
+    assert!(gone.is_none(), "the flat delete alias deletes");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/todos/update", json!({"user_id": user, "notes": "x"})),
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a missing todo_id is a 4xx: {status} {body}"
+    );
+}
+
+#[tokio::test]
+async fn todo_responses_omit_the_embedding_that_storage_keeps() {
+    let h = Harness::new();
+    let user = "embedding-wire";
+    let id = create_todo_id(&h, user, "semantic search target").await;
+    let stored = h
+        .mgr
+        .todo_store
+        .get_todo(user, &veld::memory::TodoId(id.parse().unwrap()))
+        .unwrap()
+        .expect("stored");
+    assert!(stored.embedding.is_some(), "storage keeps the embedding");
+
+    let (_, body) = json_of(h.app(), authed_post("/api/todos", json!({"user_id": user}))).await;
+    assert!(body["todos"][0].get("embedding").is_none(), "{body}");
+    let (_, body) = json_of(
+        h.app(),
+        authed_get(&format!("/api/todos/{id}?user_id={user}")),
+    )
+    .await;
+    assert!(body["todo"].get("embedding").is_none(), "{body}");
+    let (_, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/complete",
+            json!({"user_id": user, "todo_id": id}),
+        ),
+    )
+    .await;
+    assert!(body["todo"].get("embedding").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn a_todo_memory_link_is_written_on_both_sides_and_revoked_on_delete() {
+    use veld::memory::{Experience, MemoryId, TodoId};
+
+    let h = Harness::new();
+    let user = "backlink";
+    let (mem_a, mem_b) = {
+        let memory = h.mgr.get_user_memory(user).unwrap();
+        let guard = memory.read();
+        let remember = |content: &str| {
+            guard
+                .remember(
+                    Experience {
+                        content: content.to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap()
+        };
+        (remember("source memory A"), remember("source memory B"))
+    };
+    let back_links = |mid: &MemoryId| -> Vec<TodoId> {
+        let memory = h.mgr.get_user_memory(user).unwrap();
+        let guard = memory.read();
+        guard.get_memory(mid).unwrap().related_todo_ids
+    };
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({"user_id": user, "content": "motivated by A",
+                   "related_memory_ids": [mem_a.0.to_string()]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id_str = body["todo"]["id"].as_str().unwrap().to_string();
+    let todo_id = TodoId(id_str.parse().unwrap());
+    assert_eq!(back_links(&mem_a), vec![todo_id]);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{id_str}/update"),
+            json!({"user_id": user, "related_memory_ids": [mem_b.0.to_string()]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        back_links(&mem_a).is_empty(),
+        "a dropped memory loses its back-link"
+    );
+    assert_eq!(back_links(&mem_b), vec![todo_id]);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/delete",
+            json!({"user_id": user, "todo_id": id_str}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        back_links(&mem_b).is_empty(),
+        "deletion leaves no dangling id"
+    );
+}
+
+#[tokio::test]
 async fn todo_lifecycle() {
     let h = Harness::new();
 
@@ -1001,6 +1718,47 @@ async fn project_lifecycle() {
     )
     .await;
     assert!(status.is_success());
+}
+
+#[tokio::test]
+async fn codebase_scan_and_index_refuse_system_and_data_directories() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/projects",
+            json!({"user_id": "test-user", "name": "Confined"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create project: {body}");
+
+    let data_dir = h._dir.path().to_string_lossy().to_string();
+    for route in ["scan", "index"] {
+        for path in ["/etc", "/", data_dir.as_str()] {
+            let (status, body) = json_of(
+                h.app(),
+                authed_post(
+                    &format!("/api/projects/Confined/{route}"),
+                    json!({"user_id": "test-user", "codebase_path": path}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {path}: {body}");
+        }
+    }
+
+    let code = TempDir::new().unwrap();
+    std::fs::write(code.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/projects/Confined/scan",
+            json!({"user_id": "test-user", "codebase_path": code.path()}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "scan a project directory: {body}");
 }
 
 #[tokio::test]
@@ -1843,4 +2601,599 @@ async fn every_protected_route_refuses_a_request_without_an_api_key() {
         answered.len(),
         routes.len()
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Declared (typed) entities on remember / upsert / batch
+// ═══════════════════════════════════════════════════════════════════════
+
+const SERVE: &str = "commitwork:admin/serve.mjs";
+const COMMIT: &str = "commitwork@1a2b3c4d5e6f";
+
+fn declared_pair() -> serde_json::Value {
+    json!([
+        {"name": SERVE, "label": "FilePath"},
+        {"name": COMMIT, "label": "Commit", "weight": 0.8}
+    ])
+}
+
+/// The graph entity named exactly `name` (exact or case-insensitive tier only).
+fn named_graph_entity(
+    h: &Harness,
+    user: &str,
+    name: &str,
+) -> Option<veld::graph_memory::EntityNode> {
+    let graph = h.mgr.get_user_graph(user).expect("graph");
+    let graph = graph.read();
+    graph.find_entity_by_name_strict(name).expect("lookup")
+}
+
+fn edges_of(
+    h: &Harness,
+    user: &str,
+    entity: &veld::uuid::Uuid,
+) -> Vec<veld::graph_memory::RelationshipEdge> {
+    let graph = h.mgr.get_user_graph(user).expect("graph");
+    let graph = graph.read();
+    graph.get_entity_relationships(entity).expect("edges")
+}
+
+fn stored_tags(h: &Harness, user: &str, id: &str) -> Vec<String> {
+    let id = veld::uuid::Uuid::parse_str(id).unwrap();
+    let memory = h.mgr.get_user_memory(user).expect("memory");
+    let guard = memory.read();
+    guard
+        .get_memory(&veld::memory::MemoryId(id))
+        .expect("stored")
+        .experience
+        .tags
+        .clone()
+}
+
+#[tokio::test]
+async fn declared_entities_reach_the_graph_typed_and_survive_the_derived_cut() {
+    use veld::graph_memory::{EdgeSource, EntityLabel, LtpStatus};
+
+    let h = Harness::new();
+    let user = "declared-user";
+    // Twelve tags alone exceed max_entities_per_memory (10) before NER and YAKE add more.
+    let tags: Vec<String> = [
+        "routing",
+        "dispatch",
+        "middleware",
+        "session",
+        "cookie",
+        "redirect",
+        "handler",
+        "timeout",
+        "listener",
+        "gateway",
+        "upstream",
+        "fallback",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({
+                "user_id": user,
+                "content": "Alice Moreau and Bijan Farahani moved the auth check in Kubernetes \
+                            ahead of the REST gateway dispatch for SHO-412 and JIRA-77 in Lisbon.",
+                "tags": tags,
+                "entities": declared_pair()
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id_str = body["id"].as_str().expect("id").to_string();
+    let id = veld::uuid::Uuid::parse_str(&id_str).unwrap();
+    wait_for_episode_entity(&h, user, id, &SERVE.to_lowercase()).await;
+
+    let names = episode_entity_names(&h, user, &id);
+    assert!(names.contains(&COMMIT.to_lowercase()), "{names:?}");
+    // The derived list is cut to 10; the two declared ones are on top of that.
+    assert_eq!(names.len(), 12, "{names:?}");
+
+    let serve = named_graph_entity(&h, user, SERVE).expect("FilePath entity");
+    assert!(
+        serve.labels.contains(&EntityLabel::FilePath),
+        "{:?}",
+        serve.labels
+    );
+    let commit = named_graph_entity(&h, user, COMMIT).expect("Commit entity");
+    assert!(
+        commit.labels.contains(&EntityLabel::Commit),
+        "{:?}",
+        commit.labels
+    );
+
+    // Edges are written after the episode, by the same background pass.
+    let mut serve_edges = Vec::new();
+    for _ in 0..300 {
+        serve_edges = edges_of(&h, user, &serve.uuid);
+        if serve_edges.len() >= 11 && !edges_of(&h, user, &commit.uuid).is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        serve_edges.len(),
+        11,
+        "linked to every other entity of the memory"
+    );
+    for e in &serve_edges {
+        assert_eq!(
+            e.ltp_status,
+            LtpStatus::Weekly,
+            "declared edges are protected"
+        );
+        assert_eq!(e.created_by, EdgeSource::Explicit);
+        assert!(
+            (e.strength - 0.9).abs() < 1e-6,
+            "default weight: {}",
+            e.strength
+        );
+    }
+    for e in edges_of(&h, user, &commit.uuid) {
+        let other = if e.from_entity == commit.uuid {
+            e.to_entity
+        } else {
+            e.from_entity
+        };
+        let want = if other == serve.uuid { 0.9 } else { 0.8 };
+        assert!((e.strength - want).abs() < 1e-6, "{} vs {want}", e.strength);
+    }
+
+    // Stored as the memory's authored tags, leading the list, labelled declared.
+    let tags = stored_tags(&h, user, &id_str);
+    assert_eq!(
+        tags[..2],
+        [SERVE.to_string(), COMMIT.to_string()],
+        "{tags:?}"
+    );
+    let memory = h.mgr.get_user_memory(user).expect("memory");
+    let row = memory
+        .read()
+        .tag_source_store()
+        .get(&veld::memory::MemoryId(id))
+        .expect("ledger")
+        .expect("row");
+    assert_eq!(
+        row.tags[0].source,
+        veld::memory::tag_sources::TagSource::Declared
+    );
+    assert_eq!(
+        row.tags[1].source,
+        veld::memory::tag_sources::TagSource::Declared
+    );
+}
+
+#[tokio::test]
+async fn invalid_declared_entities_are_refused_not_filed_as_other() {
+    let h = Harness::new();
+    let user = "declared-invalid";
+    let remember = |entities: serde_json::Value| {
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user, "content": "An entity declaration to refuse.", "entities": entities}),
+        )
+    };
+
+    let (status, body) = json_of(
+        h.app(),
+        remember(json!([{"name": "x", "label": "Filepth"}])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let text = body.to_string();
+    for label in [
+        "Filepth", "FilePath", "Commit", "Template", "Person", "Module",
+    ] {
+        assert!(text.contains(label), "{label} missing from {text}");
+    }
+
+    let (status, body) = json_of(
+        h.app(),
+        remember(json!([{"name": "x", "label": "Tool", "weight": 1.5}])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let many: Vec<serde_json::Value> = (0..51)
+        .map(|i| json!({"name": format!("tool:t{i}"), "label": "Tool"}))
+        .collect();
+    let (status, body) = json_of(h.app(), remember(json!(many))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-bad", "content": "Upsert to refuse.",
+                   "entities": [{"name": "x", "label": "Nope"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Nothing above was stored.
+    let memory = h.mgr.get_user_memory(user).expect("memory");
+    assert!(memory.read().get_all_memories().expect("all").is_empty());
+
+    // In a batch the bad item fails and the good one is stored, as an unknown type does.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember/batch",
+            json!({"user_id": user, "memories": [
+                {"content": "Batch item with a valid declaration.",
+                 "entities": [{"name": "tool:Edit", "label": "tool"}]},
+                {"content": "Batch item with a bad weight.",
+                 "entities": [{"name": "tool:Edit", "label": "Tool", "weight": -1}]}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], 1, "{body}");
+    assert_eq!(body["errors"][0]["index"], 1, "{body}");
+    assert!(
+        body["errors"][0]["error"].to_string().contains("weight"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn upsert_and_batch_carry_declared_entities() {
+    use veld::graph_memory::EntityLabel;
+
+    let h = Harness::new();
+    let user = "declared-upsert";
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-typed", "content": "First pass on the route table.",
+                   "entities": [{"name": SERVE, "label": "FilePath"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    // Upsert builds the graph before it responds.
+    assert!(episode_entity_names(&h, user, &id).contains(&SERVE.to_lowercase()));
+    assert!(named_graph_entity(&h, user, SERVE)
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::FilePath));
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/upsert",
+            json!({"user_id": user, "external_id": "ext-typed", "content": "Second pass on the route table.",
+                   "entities": [{"name": COMMIT, "label": "Commit"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["was_update"], json!(true), "{body}");
+    let names = episode_entity_names(&h, user, &id);
+    assert!(names.contains(&COMMIT.to_lowercase()), "{names:?}");
+    assert!(
+        !names.contains(&SERVE.to_lowercase()),
+        "an update rebuilds the episode from its own entities: {names:?}"
+    );
+    assert!(named_graph_entity(&h, user, COMMIT)
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::Commit));
+    assert_eq!(stored_tags(&h, user, &id.to_string())[0], COMMIT);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember/batch",
+            json!({"user_id": user, "memories": [
+                {"content": "Batch item about a session.",
+                 "entities": [{"name": "cc:sess-42", "label": "Session"},
+                              {"name": "cc:sess-42/agent-7", "label": "Agent"}]},
+                {"content": "Batch item with no extraction, still typed."}
+            ], "options": {"extract_entities": true}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], 2, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["memory_ids"][0].as_str().unwrap()).unwrap();
+    wait_for_episode_entity(&h, user, id, "cc:sess-42/agent-7").await;
+    assert!(named_graph_entity(&h, user, "cc:sess-42")
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::Session));
+    assert!(named_graph_entity(&h, user, "cc:sess-42/agent-7")
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::Agent));
+
+    // The no-extraction batch path carries them too.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember/batch",
+            json!({"user_id": user, "memories": [
+                {"content": "Batch item on the cheap path.", "tags": ["cheap"],
+                 "entities": [{"name": "skill:/sauron", "label": "Tool"}]}
+            ], "options": {"extract_entities": false}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id_str = body["memory_ids"][0].as_str().unwrap().to_string();
+    let id = veld::uuid::Uuid::parse_str(&id_str).unwrap();
+    wait_for_episode_entity(&h, user, id, "skill:/sauron").await;
+    assert_eq!(stored_tags(&h, user, &id_str), ["skill:/sauron", "cheap"]);
+}
+
+#[tokio::test]
+async fn a_write_without_entities_behaves_as_before() {
+    let h = Harness::new();
+    let content =
+        "Rotated the staging TLS certificate and restarted the Envoy sidecars in Frankfurt.";
+    let mut stored = Vec::new();
+    for (user, body) in [
+        (
+            "plain-omitted",
+            json!({"user_id": "plain-omitted", "content": content, "tags": ["tls"]}),
+        ),
+        (
+            "plain-empty",
+            json!({"user_id": "plain-empty", "content": content, "tags": ["tls"], "entities": []}),
+        ),
+    ] {
+        let (status, resp) = json_of(h.app(), authed_post("/api/remember", body)).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let mut keys: Vec<&str> = resp
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["id", "success"], "{resp}");
+        let id_str = resp["id"].as_str().unwrap().to_string();
+        let id = veld::uuid::Uuid::parse_str(&id_str).unwrap();
+        wait_for_episode_entity(&h, user, id, "tls").await;
+        let mut names = episode_entity_names(&h, user, &id);
+        names.sort();
+        stored.push((stored_tags(&h, user, &id_str), names));
+    }
+    assert_eq!(
+        stored[0], stored[1],
+        "omitted and empty must store the same thing"
+    );
+    assert_eq!(stored[0].0[0], "tls", "caller tags still lead");
+}
+
+#[tokio::test]
+async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
+    use veld::constants::MAX_ENTITY_DEGREE;
+    use veld::graph_memory::{EntityLabel, EntityNode, RelationType, RelationshipEdge};
+
+    let h = Harness::new();
+    let user = "gate-user";
+
+    // 1. Generic words do not become derived entities, however often they appear.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user,
+                   "content": "File File FILE. Code code CODE. The file has code; the code has lines. \
+                               Lines of code in the file, first test, moved line, operator description.",
+                   "tags": ["File", "Code", "Lines", "kestrel"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    wait_for_episode_entity(&h, user, id, "kestrel").await;
+    for word in [
+        "file",
+        "files",
+        "code",
+        "first",
+        "moved",
+        "line",
+        "lines",
+        "test",
+        "description",
+        "operator",
+    ] {
+        assert!(
+            named_graph_entity(&h, user, word).is_none(),
+            "generic word '{word}' became an entity"
+        );
+    }
+
+    // 2. A derived entity already at the cap gets no edge and causes no prune; a declared
+    //    entity at the cap still links, and the cap's pruning makes room for it.
+    let graph = h.mgr.get_user_graph(user).expect("graph");
+    let node = |name: &str| EntityNode {
+        uuid: veld::uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        labels: vec![EntityLabel::Concept],
+        created_at: veld::chrono::Utc::now(),
+        last_seen_at: veld::chrono::Utc::now(),
+        mention_count: 1,
+        summary: String::new(),
+        attributes: std::collections::HashMap::new(),
+        name_embedding: None,
+        salience: 0.5,
+        is_proper_noun: true,
+        pii_classification: Default::default(),
+    };
+    let seed_hub = |name: &str| -> veld::uuid::Uuid {
+        let g = graph.read();
+        let hub = g.add_entity(node(name)).unwrap();
+        for i in 0..MAX_ENTITY_DEGREE {
+            let peer = g.add_entity(node(&format!("{name}-peer-{i}"))).unwrap();
+            let now = veld::chrono::Utc::now();
+            g.add_relationship(RelationshipEdge {
+                uuid: veld::uuid::Uuid::new_v4(),
+                from_entity: hub,
+                to_entity: peer,
+                relation_type: RelationType::RelatedTo,
+                strength: 0.3,
+                created_at: now,
+                valid_at: now,
+                invalidated_at: None,
+                source_episode_id: None,
+                context: String::new(),
+                last_activated: now,
+                activation_count: 1,
+                ltp_status: Default::default(),
+                tier: Default::default(),
+                activation_timestamps: None,
+                entity_confidence: None,
+                created_by: Default::default(),
+                forward_strength: 0.3,
+                backward_strength: 0.3,
+            })
+            .unwrap();
+        }
+        hub
+    };
+    let lighthouse = seed_hub("lighthouse");
+    let bash = seed_hub("tool:Bash");
+    let edge_ids = |uuid: &veld::uuid::Uuid| -> std::collections::BTreeSet<veld::uuid::Uuid> {
+        edges_of(&h, user, uuid)
+            .into_iter()
+            .map(|e| e.uuid)
+            .collect()
+    };
+    let lighthouse_before = edge_ids(&lighthouse);
+    assert_eq!(lighthouse_before.len(), MAX_ENTITY_DEGREE);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user,
+                   "content": "The keeper climbed the stairs at dusk.",
+                   "tags": ["lighthouse", "keeper"],
+                   "entities": [{"name": "tool:Bash", "label": "Tool"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = veld::uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    wait_for_episode_entity(&h, user, id, "keeper").await;
+    let keeper = named_graph_entity(&h, user, "keeper").expect("keeper").uuid;
+
+    assert_eq!(
+        edge_ids(&lighthouse),
+        lighthouse_before,
+        "a derived hub gained or lost an edge"
+    );
+    let bash_edges = edges_of(&h, user, &bash);
+    assert_eq!(
+        bash_edges.len(),
+        MAX_ENTITY_DEGREE,
+        "the declared hub stays at the cap"
+    );
+    assert!(
+        bash_edges
+            .iter()
+            .any(|e| e.from_entity == keeper || e.to_entity == keeper),
+        "the declared hub was skipped"
+    );
+    assert!(named_graph_entity(&h, user, "tool:Bash")
+        .unwrap()
+        .labels
+        .contains(&EntityLabel::Tool));
+}
+
+#[tokio::test]
+async fn a_declared_file_path_is_recalled_by_its_file_name() {
+    let h = Harness::new();
+    let user = "recall-declared";
+    let distractors = [
+        "Changed the retry budget in the payment worker from three to five attempts.",
+        "observe.mjs now batches telemetry before flushing it to the collector.",
+        "server.mjs was renamed during the express upgrade and nothing else changed.",
+        "The nightly backup job moved to 02:00 to avoid the index rebuild window.",
+        "Bumped the Postgres connection pool after the load test saturated it.",
+        "What changed in the onboarding email copy: shorter subject, one call to action.",
+        "The CSV export now escapes embedded quotes in the notes column.",
+        "Dashboard tiles were reordered so error rate sits beside latency.",
+        "The webhook signature check now rejects timestamps older than five minutes.",
+        "Pinned the image digest for the scanner container in CI.",
+        "Changed the cache TTL for avatars from a day to an hour.",
+        "admin/routes/serve-static.mjs gained a content-type allowlist.",
+        "Rewrote the changelog generator to group entries by scope.",
+        "Changed the feature flag default for the new editor to off.",
+        "The search page debounces keystrokes by 250 milliseconds now.",
+        "Moved the docs build to a separate workflow so it no longer blocks tests.",
+        "The rate limiter keys on the API token rather than the client address.",
+        "Changed how the CLI prints errors: one line, then the hint.",
+        "Deleted the unused geo lookup module and its fixtures.",
+        "The worker pool shrinks to two threads when the queue is idle.",
+    ];
+    for content in distractors {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember",
+                json!({"user_id": user, "content": content}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user,
+                   "content": "Moved the auth check ahead of route dispatch and dropped the legacy redirect.",
+                   "entities": [{"name": SERVE, "label": "FilePath"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let target = body["id"].as_str().unwrap().to_string();
+    let target_uuid = veld::uuid::Uuid::parse_str(&target).unwrap();
+    wait_for_episode_entity(&h, user, target_uuid, &SERVE.to_lowercase()).await;
+
+    for query in [
+        "what changed in serve.mjs",
+        "what changed in admin/serve.mjs",
+    ] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/recall",
+                json!({"user_id": user, "query": query, "limit": 5}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body["memories"]
+            .as_array()
+            .expect("memories")
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids.first().copied(),
+            Some(target.as_str()),
+            "{query}: {:#}",
+            body["memories"]
+        );
+    }
 }

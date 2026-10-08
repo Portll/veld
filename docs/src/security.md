@@ -24,7 +24,7 @@ in trusted environments.
 | `VELD_ALLOW_UNSIGNED_WEBHOOKS` | `false` | `true` processes webhooks even when no `*_WEBHOOK_SECRET` is configured. Default rejects with 503. |
 | `VELD_PUBLIC_RATE_LIMIT` | `true` | `false` exempts non-probe public routes from rate limiting. Probe routes are never rate-limited regardless. |
 | `VELD_METRICS_PUBLIC` | `false` | `true` exposes `/metrics` without authentication. Default requires `Authorization: Bearer <key>`. |
-| `VELD_ENFORCE_HTTPS` | `false` | `true` rejects insecure `http://` overrides for `LINEAR_API_URL`/`GITHUB_API_URL`. Default warns only. |
+| `VELD_ENFORCE_HTTPS` | `true` | `false` (or `0`) honours an insecure non-localhost `http://` override of `LINEAR_API_URL`/`GITHUB_API_URL`. Default rejects it and uses the HTTPS URL; localhost `http://` is always allowed. |
 | `VELD_ADMIN_API_KEY` | unset | Set to a secret string to enable `/api/admin/*` endpoints. Separate from `VELD_API_KEYS`. |
 
 ## Webhook security

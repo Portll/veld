@@ -249,6 +249,10 @@ pub struct RelevanceRequest {
     /// Current context text (conversation turn, user message, etc.)
     pub context: String,
 
+    /// The asking session's transcript id, recorded on the recall event log.
+    #[serde(default)]
+    pub episode_id: Option<String>,
+
     /// Optional pre-extracted entities (skip NER if provided)
     #[serde(default)]
     pub entities: Vec<String>,

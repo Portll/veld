@@ -15,7 +15,8 @@ use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, keys,
     lineage, memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions,
-    sleep_time, storage_migration, todos, user_admin, user_auth, users, visualization, webhooks,
+    sleep_time, storage_migration, todos, ui, user_admin, user_auth, users, visualization,
+    webhooks,
 };
 
 /// Application state type alias
@@ -296,6 +297,12 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         // RECALL ENDPOINTS
         // =================================================================
+        // =================================================================
+        // INTEGRATED GUI (read-only; user bound from the credential — see handlers/ui.rs)
+        // =================================================================
+        .route("/api/ui/tags", get(ui::ui_tags))
+        .route("/api/ui/recall-log", get(ui::ui_recall_log))
+        .route("/api/ui/knows", get(ui::ui_knows))
         .route("/api/recall", post(recall::recall))
         .route("/api/recall/tracked", post(recall::recall_tracked))
         .route("/api/recall/tags", post(recall::recall_by_tags))
@@ -416,6 +423,14 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/index/rebuild", post(consolidation::rebuild_index))
         .route("/api/index/reembed", post(consolidation::reembed_all))
         .route(
+            "/api/embeddings/backlog",
+            get(consolidation::get_embedding_backlog),
+        )
+        .route(
+            "/api/embeddings/backlog/drain",
+            post(consolidation::drain_embedding_backlog),
+        )
+        .route(
             "/api/storage/cleanup",
             post(consolidation::cleanup_corrupted),
         )
@@ -453,6 +468,9 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/facts/search", post(facts::search_facts))
         .route("/api/facts/by-entity", post(facts::facts_by_entity))
         .route("/api/facts/stats", post(facts::get_facts_stats))
+        .route("/api/facts/narratives", post(facts::fact_narratives))
+        .route("/api/facts/preview-purge", post(facts::facts_preview_purge))
+        .route("/api/facts/purge", post(facts::facts_purge))
         // =================================================================
         // TEMPORAL FACTS
         // =================================================================
@@ -527,6 +545,14 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/graph/entity/delete", delete(graph::delete_entity))
         .route("/api/graph/entities/all", post(graph::get_all_entities))
         .route(
+            "/api/graph/entities/frequency",
+            post(graph::get_entity_frequency),
+        )
+        .route(
+            "/api/graph/tags/stamped-cores",
+            post(graph::get_stamped_cores),
+        )
+        .route(
             "/api/graph/relationship/invalidate",
             post(graph::invalidate_relationship),
         )
@@ -574,10 +600,12 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/todos", post(todos::list_todos))
         .route("/api/todos/list", post(todos::list_todos)) // TUI compatibility
         .route("/api/todos/add", post(todos::create_todo))
-        .route("/api/todos/update", post(todos::update_todo))
-        .route("/api/todos/complete", post(todos::complete_todo))
-        .route("/api/todos/delete", post(todos::delete_todo))
-        .route("/api/todos/reorder", post(todos::reorder_todo))
+        // Flat aliases have no path capture, so they name the todo in the body (`todo_id`)
+        // and cannot bind the path-style handlers, whose Path extractor refuses them.
+        .route("/api/todos/update", post(todos::update_todo_flat))
+        .route("/api/todos/complete", post(todos::complete_todo_flat))
+        .route("/api/todos/delete", post(todos::delete_todo_flat))
+        .route("/api/todos/reorder", post(todos::reorder_todo_flat))
         .route("/api/todos/due", post(todos::list_due_todos))
         .route("/api/todos/{todo_id}", get(todos::get_todo))
         .route("/api/todos/{todo_id}", delete(todos::delete_todo)) // TUI uses DELETE

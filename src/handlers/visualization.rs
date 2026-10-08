@@ -4,12 +4,14 @@
 //! Includes live browser-based graph visualization with SSE updates.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::{Html, IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::GraphStats as VisualizationStats;
 use crate::validation;
@@ -52,8 +54,14 @@ pub struct BrainStats {
 /// GET /api/brain/{user_id} - Get brain state visualization
 pub async fn get_brain_state(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<BrainStateResponse>, AppError> {
+    // SEC: the path names a user; a tenant-bound key may only name its own.
+    let user_id = resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
@@ -276,8 +284,14 @@ fn fresh_csp_nonce() -> String {
 /// GET /api/graph/data/{user_id} - Get graph data as JSON for d3.js
 pub async fn get_graph_data(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<GraphDataResponse>, AppError> {
+    // SEC: the path names a user; a tenant-bound key may only name its own.
+    let user_id = resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state

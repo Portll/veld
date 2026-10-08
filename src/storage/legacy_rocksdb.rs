@@ -698,7 +698,13 @@ pub fn import_separate_db_into_cf(db: &DB, old_dir: &Path, cf_name: &str) -> Res
     };
     let mut batch = WriteBatch::default();
     let mut count = 0usize;
-    for (key, value) in old_db.iterator(IteratorMode::Start).flatten() {
+    for item in old_db.iterator(IteratorMode::Start) {
+        let (key, value) = item.map_err(|e| {
+            anyhow!(
+                "RocksDB iterator error while importing {}: {e}",
+                old_dir.display()
+            )
+        })?;
         batch.put_cf(cf, &key, &value);
         count += 1;
         if count.is_multiple_of(10_000) {
@@ -1117,6 +1123,44 @@ mod migration_export_tests {
             ColumnFamilyDescriptor::new("kv", Options::default()),
         ];
         Arc::new(DB::open_cf_descriptors(&opts, dir, cfs).expect("open"))
+    }
+
+    /// A read error part-way through the old DB must stop the import before the old directory
+    /// is renamed aside; skipping the unreadable rows would retire the only copy of them.
+    #[test]
+    fn a_legacy_db_that_fails_to_read_is_not_renamed_away() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_dir = dir.path().join("legacy_kv");
+        {
+            let old = DB::open_default(&old_dir).expect("open legacy");
+            for i in 0..500u32 {
+                old.put(format!("key-{i:05}"), vec![i as u8; 128]).unwrap();
+            }
+            old.flush().unwrap();
+        }
+        for entry in std::fs::read_dir(&old_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "log") {
+                // The WAL would replay every row into the memtable and hide the damaged table.
+                std::fs::remove_file(&path).unwrap();
+            } else if path.extension().is_some_and(|e| e == "sst") {
+                let mut bytes = std::fs::read(&path).unwrap();
+                for b in &mut bytes[64..256] {
+                    *b ^= 0xA5;
+                }
+                std::fs::write(&path, bytes).unwrap();
+            }
+        }
+
+        let target_dir = dir.path().join("target");
+        let db = db_with_families(&target_dir);
+        let result = import_separate_db_into_cf(&db, &old_dir, "kv");
+
+        assert!(result.is_err(), "a damaged data block must fail the import");
+        assert!(
+            old_dir.is_dir(),
+            "the old DB was renamed away after a failed read"
+        );
     }
 
     #[test]

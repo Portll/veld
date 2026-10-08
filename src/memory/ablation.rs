@@ -15,9 +15,11 @@
 //!   23; the rest name components veld either lacks (`lateral_inhibition`) or has
 //!   never gated. Those are in [`UPSTREAM_ONLY_FAMILIES`] so a harness arm that
 //!   names one reports the ablation as unavailable instead of measuring baseline.
-//! * [`DEFAULT_DISABLED`] is empty. Upstream disables `hebbian` by default on the
-//!   strength of a bisect run on upstream's pipeline; veld ships the hebbian term
-//!   on, and declaring a gate must not change shipped ranking.
+//!
+//! [`DEFAULT_DISABLED`] holds `hebbian`, as upstream's does (shodh-memory #321). The
+//! term adds a graph hop decay of up to 1.0, scaled by 0.1, to fused scores whose top
+//! ten spread over about 0.007, and only for memories the graph leg reached. On the
+//! LoCoMo gate, switching it off lifted nDCG@10 from 0.383 to about 0.44.
 
 use std::collections::HashSet;
 
@@ -27,8 +29,9 @@ pub const DISABLE_BOOSTS_VAR: &str = "SHODH_DISABLE_BOOSTS";
 /// Every family veld gates, each with an [`is_enabled`] call at its site.
 ///
 /// * `hebbian` — the Layer-5 hebbian term `score + hebbian_boost * 0.1` in
-///   `recall.rs`. Also switchable through the `hebbian` cognitive-dial signal; the
-///   term runs only when both allow it.
+///   `recall.rs`. Off by default ([`DEFAULT_DISABLED`]); `SHODH_DISABLE_BOOSTS` set
+///   without it, even to the empty string, switches it on. Also switchable through
+///   the `hebbian` cognitive-dial signal; the term runs only when both allow it.
 /// * `graph_potentiation` — retrieval-driven edge strengthening
 ///   (`batch_strengthen_synapses`) in the graph leg's traversals
 ///   (`traverse_from_entity_filtered`, `traverse_weighted`, `traverse_bidirectional`).
@@ -65,9 +68,8 @@ pub const UPSTREAM_ONLY_FAMILIES: [&str; 21] = [
     "size_gated_final_sort",
 ];
 
-/// Families disabled when `SHODH_DISABLE_BOOSTS` is unset. Empty in veld; see the
-/// module docs.
-pub const DEFAULT_DISABLED: [&str; 0] = [];
+/// Families disabled when `SHODH_DISABLE_BOOSTS` is unset; see the module docs.
+pub const DEFAULT_DISABLED: [&str; 1] = ["hebbian"];
 
 /// Why an ablation of `family` cannot run in veld, or `None` if it can.
 pub fn unavailable_reason(family: &str) -> Option<&'static str> {
@@ -191,13 +193,18 @@ mod tests {
     }
 
     #[test]
-    fn unset_env_disables_nothing() {
+    fn unset_env_disables_only_hebbian() {
         with_env(None, || {
+            assert!(is_disabled("hebbian"));
+            assert!(is_enabled("graph_potentiation"));
+        });
+    }
+
+    #[test]
+    fn an_empty_value_replaces_the_default() {
+        with_env(Some(""), || {
             for f in FAMILIES {
-                assert!(
-                    is_enabled(f),
-                    "family must be enabled when env is unset: {f}"
-                );
+                assert!(is_enabled(f), "an empty list must enable {f}");
             }
         });
     }
@@ -227,11 +234,11 @@ mod tests {
     #[test]
     fn the_env_is_read_at_call_time() {
         with_env(None, || {
-            assert!(is_enabled("hebbian"));
-            std::env::set_var(DISABLE_BOOSTS_VAR, "hebbian");
-            assert!(is_disabled("hebbian"), "a set after first read was ignored");
+            assert!(is_disabled("hebbian"));
+            std::env::set_var(DISABLE_BOOSTS_VAR, "graph_potentiation");
+            assert!(is_enabled("hebbian"), "a set after first read was ignored");
             std::env::remove_var(DISABLE_BOOSTS_VAR);
-            assert!(is_enabled("hebbian"));
+            assert!(is_disabled("hebbian"));
         });
     }
 

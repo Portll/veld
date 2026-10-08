@@ -22,6 +22,7 @@ use super::utils::{is_bare_question, is_boilerplate_response, strip_system_noise
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::feedback;
 // Note: compute_relevance removed - using unified 5-layer pipeline scoring instead
+use crate::memory::recall_events::{RecallEvent, RecallHit};
 use crate::memory::segmentation::{InputSource, SegmentationEngine};
 use crate::memory::sessions::SessionEvent;
 use crate::memory::storage::SearchCriteria;
@@ -32,7 +33,26 @@ use crate::memory::{
 use crate::memory::{ProspectiveTrigger, TodoStatus};
 use crate::metrics;
 use crate::relevance;
+use crate::user_memory::SharedUserMemory;
 use crate::validation;
+
+/// Append one row to the recall event log without holding up the response. A failed write is
+/// logged; the log's horizon and count are what a reader sees, never a fabricated row.
+fn log_recall_event(
+    memory: &SharedUserMemory,
+    endpoint: &'static str,
+    query: &str,
+    episode_id: Option<String>,
+    hits: Vec<RecallHit>,
+) {
+    let event = RecallEvent::new(endpoint, query, episode_id, hits);
+    let memory = memory.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = memory.read().recall_event_store().record(&event) {
+            tracing::warn!(endpoint, error = %e, "recall event log: write failed");
+        }
+    });
+}
 
 /// Application state type alias
 pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
@@ -526,6 +546,9 @@ pub async fn recall(
                 prospective_signals: prospective_signals.clone(),
                 competition_mode: req.competition_mode,
                 rrf_k: rrf_k_for_recall,
+                // Parsed since FIX-11 and dropped here until now. Downstream already bounds it by
+                // max_results * 2, and a cognitive-dials rerank_count still takes precedence.
+                rerank_count: req.rerank_count,
                 as_of: req.as_of,
                 tags: tags_for_recall,
                 ..Default::default()
@@ -718,7 +741,10 @@ pub async fn recall(
                 facts
             })
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!("Fact fetch task panicked: {e} — facts excluded from recall");
+                Vec::new()
+            })
         };
 
         // Deduplicate by fact ID and take top 5 by confidence
@@ -789,7 +815,12 @@ pub async fn recall(
                 edges
             })
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Lineage edge fetch task panicked: {e} — lineage excluded from recall"
+                );
+                Vec::new()
+            })
         } else {
             Vec::new()
         }
@@ -873,6 +904,14 @@ pub async fn recall(
         entities: None,
         results: Some(results_json),
     });
+
+    log_recall_event(
+        &memory,
+        "/api/recall",
+        &req.query,
+        req.episode_id.clone(),
+        RecallEvent::hits_from_scored(recall_memories.iter().map(|m| (m.id.as_str(), m.score))),
+    );
 
     // Track session event
     if count > 0 {
@@ -2453,6 +2492,14 @@ pub async fn proactive_context(
         "proactive_context [phase:total] === COMPLETE ==="
     );
 
+    log_recall_event(
+        &memory_system,
+        "/api/proactive_context",
+        &req.context,
+        req.episode_id.clone(),
+        RecallEvent::hits_from_scored(memories.iter().map(|m| (m.id.as_str(), m.score))),
+    );
+
     Ok(Json(ProactiveContextResponse {
         memories,
         due_reminders,
@@ -2528,6 +2575,19 @@ pub async fn surface_relevant(
         entities: None,
         results: None,
     });
+
+    log_recall_event(
+        &memory_sys,
+        "/api/relevant",
+        &req.context,
+        req.episode_id.clone(),
+        RecallEvent::hits_from_scored(
+            response
+                .memories
+                .iter()
+                .map(|m| (m.id.as_str(), m.relevance_score)),
+        ),
+    );
 
     Ok(Json(response))
 }

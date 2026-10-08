@@ -1312,12 +1312,59 @@ pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<Unseal
     let Some((ks, kek)) = unseal_record_keystore(keystore_path)? else {
         return Ok(None);
     };
-    Ok(Some(UnsealedRecordKeys {
-        cryptors: RecordCryptors::from_keystore(&ks, &kek)?,
-        blinder: IndexBlinder::derive_from_root(&ks.root_key(&kek)?),
-        generation: ks.generation,
-    }))
+    record_keys(&ks, &kek).map(Some)
 }
+
+/// Unseal an existing keystore's JSON for record-level encryption: through the
+/// keyring when the keystore carries its ring wrap, otherwise with
+/// `VELD_MASTER_PASSPHRASE`, or `VELD_KMS_WRAP_KEY` when no passphrase is set.
+/// Never creates a keystore.
+pub fn unseal_record_keys(json: &str) -> Result<UnsealedRecordKeys> {
+    let ks = Keystore::from_json(json)?;
+    let ring = crate::keyring::installed();
+    let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let kek = match (&ring, passphrase) {
+        (Some(ring), _) if ks.has_ring(ring.id()) => {
+            let kek = ks.unseal(&ring.factor())?;
+            tracing::info!("Record-level encryption: keystore unsealed (keyring)");
+            kek
+        }
+        (_, Some(pass)) => {
+            let kek = ks.unseal_with_passphrase(&pass)?;
+            tracing::info!("Record-level encryption: keystore unsealed (passphrase)");
+            kek
+        }
+        (_, None) => {
+            let kms = LocalAeadKms::from_env()?.ok_or_else(|| {
+                anyhow!(
+                    "keystore.json is present but neither VELD_MASTER_PASSPHRASE nor \
+                     VELD_KMS_WRAP_KEY is set and the keyring does not open it; refusing to \
+                     start (encrypted records would be served as ciphertext)"
+                )
+            })?;
+            let kek = ks.unseal_with_kms(&kms)?;
+            tracing::info!("Record-level encryption: keystore unsealed (KMS)");
+            kek
+        }
+    };
+    record_keys(&ks, &kek)
+}
+
+fn record_keys(ks: &Keystore, kek: &SecretKey) -> Result<UnsealedRecordKeys> {
+    ks.verify_integrity(kek)
+        .context("keystore integrity verification failed")?;
+    Ok(UnsealedRecordKeys {
+        cryptors: RecordCryptors::from_keystore(ks, kek)?,
+        blinder: IndexBlinder::derive_from_root(&ks.root_key(kek)?),
+        generation: ks.generation,
+    })
+}
+
+/// Where both engines keep the last keystore generation they saw: RocksDB in its
+/// `memory_index` family, redb in its `default` table.
+pub const GENERATION_SENTINEL_KEY: &[u8] = b"meta:keystore_generation";
 
 /// The rollback guard's decision for a store whose sentinel holds `stored` and
 /// whose keystore file is at `generation`. `Ok(Some(g))`: write `g` to the

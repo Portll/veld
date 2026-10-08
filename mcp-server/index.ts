@@ -779,6 +779,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "recall_by_tags",
+        description:
+          "Find memories by tags. Returns memories matching ANY of the provided tags, e.g. 'tool:Edit', 'file:src/main.rs', 'source:hook', 'error', 'session-summary'.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Tags to search for (returns memories matching ANY of these tags)",
+            },
+            limit: {
+              type: "number",
+              description: "Maximum number of results (default: 50)",
+              default: 50,
+            },
+          },
+          required: ["tags"],
+        },
+      },
+      {
         name: "context_summary",
         description:
           "Get a condensed summary of recent learnings, decisions, and context. Use this at the start of a session to quickly understand what you've learned before.",
@@ -2179,6 +2201,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         return {
           content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "recall_by_tags": {
+        const { tags, limit: rawTagLimit = 50 } = args as {
+          tags: string[];
+          limit?: number;
+        };
+
+        if (!Array.isArray(tags) || tags.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: 'tags' is required and must contain at least one tag",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const tagLimit = Math.max(1, Math.min(Math.floor(rawTagLimit), MAX_LIMIT));
+        const tagResult = await apiCall<{ memories: Memory[]; count: number }>(
+          "/api/recall/tags",
+          "POST",
+          { user_id: USER_ID, tags, limit: tagLimit },
+        );
+        const tagMemories = tagResult.memories || [];
+
+        if (tagMemories.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No memories found matching tags: ${tags.join(", ")}`,
+              },
+            ],
+          };
+        }
+
+        let tagResponse = `Recall by tags: ${tags.join(", ")}\n`;
+        tagResponse += `Found ${tagMemories.length} memories\n\n`;
+        tagMemories.forEach((m, i) => {
+          const content = getContent(m);
+          const memTags = (m.experience?.tags || []).join(", ");
+          tagResponse += `${String(i + 1).padStart(2)}. ${content.slice(0, 150)}${content.length > 150 ? "..." : ""}\n`;
+          tagResponse += `    ${getType(m)} | tags: [${memTags}] | ${m.id}\n\n`;
+        });
+
+        return {
+          content: [{ type: "text", text: tagResponse.trimEnd() }],
         };
       }
 

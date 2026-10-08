@@ -484,6 +484,7 @@ pub fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
         ViewMode::GraphMap => render_graph_map(f, area, state),
         ViewMode::Git => crate::tabs::git::render(f, area, state),
         ViewMode::Dials => crate::tabs::dials::render(f, area, state),
+        ViewMode::Loops => crate::tabs::loops::render(f, area, state),
     }
 
     // View transition overlay - renders on top of content
@@ -6633,6 +6634,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         ViewMode::GraphMap => "Graph",
         ViewMode::Git => "Git",
         ViewMode::Dials => "Dials",
+        ViewMode::Loops => "Loops",
     };
 
     // Check for error message

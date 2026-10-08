@@ -10,8 +10,10 @@ use std::collections::{HashMap, HashSet};
 use super::types::*;
 use crate::constants::{
     COMPRESSION_ACCESS_THRESHOLD, COMPRESSION_AGE_DAYS, COMPRESSION_IMPORTANCE_HIGH,
-    COMPRESSION_IMPORTANCE_LOW, CONSOLIDATION_JACCARD_THRESHOLD,
+    COMPRESSION_IMPORTANCE_LOW, CONSOLIDATION_CLUSTER_SIZE_CAP, CONSOLIDATION_JACCARD_THRESHOLD,
     CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY, CONSOLIDATION_MIN_AGE_DAYS, CONSOLIDATION_MIN_SUPPORT,
+    CONSOLIDATION_MIN_SUPPORT_LARGE, CONSOLIDATION_MIN_SUPPORT_MEDIUM,
+    CONSOLIDATION_MIN_SUPPORT_SMALL, CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS,
     MAX_COMPRESSION_RATIO, MAX_DECOMPRESSED_SIZE,
 };
 
@@ -669,6 +671,27 @@ pub struct SemanticFact {
     pub purge_reason: Option<PurgeReason>,
 }
 
+impl SemanticFact {
+    /// Ends belief in this fact at `at` in favour of `winner_id`. The first supersession
+    /// stands: a fact already closed keeps its window and its winner, so the record says when
+    /// belief stopped. The window never closes before the fact's own `valid_from`.
+    pub fn supersede(&mut self, winner_id: Option<&str>, at: chrono::DateTime<chrono::Utc>) {
+        if self.valid_until.is_none_or(|until| until > at) {
+            self.valid_until = Some(at.max(self.valid_from.unwrap_or(self.created_at)));
+        }
+        if self.superseded_by.is_none() {
+            self.superseded_by = winner_id.map(str::to_string);
+        }
+    }
+
+    /// Records, on the fact that stays believed, a fact it displaced.
+    pub fn record_superseded(&mut self, loser_id: &str) {
+        if !self.supersedes.iter().any(|id| id == loser_id) {
+            self.supersedes.push(loser_id.to_string());
+        }
+    }
+}
+
 /// Types of semantic facts
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FactType {
@@ -806,6 +829,10 @@ pub struct CausalFactLink {
 pub struct ConsolidationResult {
     /// Number of memories processed
     pub memories_processed: usize,
+    /// Memories that passed the age gate and went through extraction. Fewer than
+    /// `memories_processed` means part of the corpus is still aging in and a later cycle must
+    /// extract again even if nothing new is written.
+    pub memories_eligible: usize,
     /// Number of new facts extracted
     pub facts_extracted: usize,
     /// Number of existing facts reinforced
@@ -839,8 +866,12 @@ pub struct SemanticConsolidator {
 
 /// A cluster of semantically similar pattern candidates
 struct PatternCluster {
-    /// Stemmed token set representing this cluster (union of all members)
+    /// Stemmed tokens of the cluster's first member; every later member is compared to these.
     stem_set: HashSet<String>,
+    /// Negation polarity of the first member. A negation is often one word away from its
+    /// claim and shares most of its stems, so without this a claim and its correction merge
+    /// into one cluster and the correction never reaches arbitration.
+    polarity: bool,
     /// All candidate entries: (pattern_text, memory_id, confidence)
     members: Vec<(String, MemoryId, f32)>,
 }
@@ -1026,9 +1057,19 @@ impl SemanticConsolidator {
             })
             .collect();
 
+        result.memories_eligible = eligible.len();
         if eligible.is_empty() {
             return result;
         }
+
+        let created_by_id: HashMap<&MemoryId, chrono::DateTime<chrono::Utc>> =
+            eligible.iter().map(|m| (&m.id, m.created_at)).collect();
+        let created_of = |id: &MemoryId| {
+            created_by_id
+                .get(id)
+                .copied()
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        };
 
         // Phase 1: Extract candidates using multi-extractor pipeline
         let mut all_candidates: Vec<(String, MemoryId, f32)> = Vec::new();
@@ -1043,13 +1084,31 @@ impl SemanticConsolidator {
             return result;
         }
 
+        // Greedy clustering depends on order, and memories arrive in storage order (random
+        // ids). Ordering by evidence age, then text, makes a corpus cluster the same way every
+        // time, with each cluster anchored on the earliest phrasing of its claim.
+        all_candidates.sort_by(|a, b| {
+            created_of(&a.1)
+                .cmp(&created_of(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
         // Phase 2: Group by stemmed-token Jaccard similarity
         let clusters =
             self.group_candidates_by_similarity(&all_candidates, CONSOLIDATION_JACCARD_THRESHOLD);
 
         // Phase 3: Convert qualifying clusters to facts
+        let effective_min_support = if eligible.len() <= 100 {
+            CONSOLIDATION_MIN_SUPPORT_SMALL
+        } else if eligible.len() <= 1000 {
+            CONSOLIDATION_MIN_SUPPORT_MEDIUM
+        } else {
+            CONSOLIDATION_MIN_SUPPORT_LARGE
+        }
+        .max(self.min_support);
+
         for cluster in clusters {
-            if cluster.members.len() >= self.min_support {
+            if cluster.members.len() >= effective_min_support {
                 let representative = Self::select_representative(&cluster.members);
                 let avg_confidence = cluster.members.iter().map(|(_, _, c)| c).sum::<f32>()
                     / cluster.members.len() as f32;
@@ -1066,7 +1125,9 @@ impl SemanticConsolidator {
                     id: uuid::Uuid::new_v4().to_string(),
                     fact: representative.to_string(),
                     confidence: avg_confidence.min(1.0),
-                    support_count: cluster.members.len(),
+                    // Cluster size sets confidence; support counts consolidation cycles that
+                    // confirm the fact, so a new fact starts at one.
+                    support_count: 1,
                     source_memories: source_ids,
                     related_entities: entities,
                     created_at: now,
@@ -1085,6 +1146,23 @@ impl SemanticConsolidator {
                 result.facts_extracted += 1;
             }
         }
+
+        // Oldest evidence first: callers ingest in this order, and arbitration gives a support
+        // tie to the incoming fact, so the claim backed by the newest evidence wins, as a
+        // later correction should. Text breaks ties within a cohort written at one instant.
+        let newest_evidence = |fact: &SemanticFact| {
+            fact.source_memories
+                .iter()
+                .map(&created_of)
+                .max()
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        };
+        result.new_facts.sort_by(|a, b| {
+            newest_evidence(a)
+                .cmp(&newest_evidence(b))
+                .then_with(|| a.fact.cmp(&b.fact))
+        });
+        result.new_fact_ids = result.new_facts.iter().map(|f| f.id.clone()).collect();
 
         result
     }
@@ -1119,7 +1197,10 @@ impl SemanticConsolidator {
         }
     }
 
-    /// Group candidates into clusters using greedy single-pass Jaccard matching
+    /// Group candidates into clusters by Jaccard similarity to each cluster's first member.
+    ///
+    /// The comparison set never grows, so a chain of near matches cannot carry one cluster
+    /// from "Rust compilation" to "code formatting". Full clusters take no more members.
     fn group_candidates_by_similarity(
         &self,
         candidates: &[(String, MemoryId, f32)],
@@ -1132,11 +1213,16 @@ impl SemanticConsolidator {
             if tokens.is_empty() {
                 continue;
             }
+            let polarity = super::facts::detect_polarity(&pattern.to_lowercase());
 
-            // Find best matching cluster
             let mut best_idx = None;
             let mut best_sim = 0.0f32;
             for (i, cluster) in clusters.iter().enumerate() {
+                if cluster.members.len() >= CONSOLIDATION_CLUSTER_SIZE_CAP
+                    || cluster.polarity != polarity
+                {
+                    continue;
+                }
                 let sim = Self::jaccard_similarity(&tokens, &cluster.stem_set);
                 if sim > best_sim {
                     best_sim = sim;
@@ -1145,16 +1231,14 @@ impl SemanticConsolidator {
             }
 
             if best_sim >= threshold {
-                // Merge into existing cluster — expand the stem set
                 let idx = best_idx.unwrap();
-                clusters[idx].stem_set = clusters[idx].stem_set.union(&tokens).cloned().collect();
                 clusters[idx]
                     .members
                     .push((pattern.clone(), memory_id.clone(), *confidence));
             } else {
-                // Create new cluster
                 clusters.push(PatternCluster {
                     stem_set: tokens,
+                    polarity,
                     members: vec![(pattern.clone(), memory_id.clone(), *confidence)],
                 });
             }
@@ -1174,94 +1258,113 @@ impl SemanticConsolidator {
 
     // ── Multi-Extractor Pipeline ────────────────────────────────────────────
 
-    /// Extract fact candidates from a single memory using all applicable extractors
+    /// Extract fact candidates from a single memory.
+    ///
+    /// Operational traces (Context, Command, CodeEdit, FileAccess, Search) produce no
+    /// candidates. The four specialist extractors each look for one rhetorical shape and run
+    /// only on the experience types that carry it. The declarative extractor runs on every
+    /// other type: a plain factual sentence has no marker to gate on and belongs to no single
+    /// type. Importance scales a candidate's confidence, not whether it exists; corroboration
+    /// across distinct memories decides what becomes a fact. Every candidate must pass
+    /// `is_fact_shaped`.
     fn extract_fact_candidates(&self, memory: &Memory) -> Vec<(String, f32)> {
         let mut candidates = Vec::new();
         let content = &memory.experience.content;
         let importance = memory.importance();
         let exp_type = &memory.experience.experience_type;
 
-        // Run all extractors with type-based confidence multipliers
-        if let Some(fact) = self.extract_procedure(content) {
-            let mult = if *exp_type == ExperienceType::Decision {
-                1.0
-            } else {
-                0.7
-            };
-            candidates.push((fact, importance * mult));
+        if matches!(
+            exp_type,
+            ExperienceType::Context
+                | ExperienceType::Command
+                | ExperienceType::CodeEdit
+                | ExperienceType::FileAccess
+                | ExperienceType::Search
+        ) {
+            return candidates;
         }
 
-        if let Some(fact) = self.extract_definition(content) {
-            let mult = if *exp_type == ExperienceType::Learning
-                || *exp_type == ExperienceType::Discovery
-            {
-                1.2
-            } else {
-                0.8
-            };
-            candidates.push((fact, importance * mult));
+        if matches!(
+            exp_type,
+            ExperienceType::Decision | ExperienceType::Learning | ExperienceType::Task
+        ) {
+            if let Some(fact) = self.extract_procedure(content) {
+                if Self::is_fact_shaped(&fact) {
+                    let mult = if *exp_type == ExperienceType::Decision {
+                        1.0
+                    } else {
+                        0.7
+                    };
+                    candidates.push((fact, importance * mult));
+                }
+            }
         }
 
-        if let Some(fact) = self.extract_pattern(content) {
-            let mult = if *exp_type == ExperienceType::Error {
-                1.1
-            } else {
-                0.7
-            };
-            candidates.push((fact, importance * mult));
+        if matches!(
+            exp_type,
+            ExperienceType::Learning | ExperienceType::Discovery | ExperienceType::Pattern
+        ) {
+            if let Some(fact) = self.extract_definition(content) {
+                if Self::is_fact_shaped(&fact) {
+                    let mult = if *exp_type == ExperienceType::Learning
+                        || *exp_type == ExperienceType::Discovery
+                    {
+                        1.2
+                    } else {
+                        0.8
+                    };
+                    candidates.push((fact, importance * mult));
+                }
+            }
         }
 
-        if let Some(fact) = self.extract_preference(content) {
-            let mult = if *exp_type == ExperienceType::Conversation {
-                1.0
-            } else {
-                0.6
-            };
-            candidates.push((fact, importance * mult));
+        if matches!(
+            exp_type,
+            ExperienceType::Error
+                | ExperienceType::Learning
+                | ExperienceType::Discovery
+                | ExperienceType::Pattern
+        ) {
+            if let Some(fact) = self.extract_pattern(content) {
+                if Self::is_fact_shaped(&fact) {
+                    let mult = if *exp_type == ExperienceType::Error {
+                        1.1
+                    } else {
+                        0.7
+                    };
+                    candidates.push((fact, importance * mult));
+                }
+            }
         }
 
-        // Universal fallback: extract most salient sentence
+        if *exp_type == ExperienceType::Decision
+            || (*exp_type == ExperienceType::Conversation && importance >= 0.5)
+        {
+            if let Some(fact) = self.extract_preference(content) {
+                if Self::is_fact_shaped(&fact) {
+                    let mult = if *exp_type == ExperienceType::Conversation {
+                        1.0
+                    } else {
+                        0.6
+                    };
+                    candidates.push((fact, importance * mult));
+                }
+            }
+        }
+
         if let Some(fact) = self.extract_salient_statement(content, &memory.experience.entities) {
-            candidates.push((fact, importance * 0.6));
+            if Self::is_fact_shaped(&fact) {
+                candidates.push((fact, importance * 0.6));
+            }
         }
+
+        candidates.retain(|(text, _)| Self::is_knowledge_worthy(text));
 
         // Deduplicate overlapping extractions from the same memory
         candidates = self.dedup_within_memory(candidates);
 
         // Cap per-memory candidates
         candidates.truncate(CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY);
-
-        // Entity pair relationships (sorted for determinism)
-        // Filter: min 3 chars, no stop words, remove substring-redundant entities
-        if memory.experience.entities.len() >= 2 {
-            let mut sorted_entities: Vec<String> = memory
-                .experience
-                .entities
-                .iter()
-                .map(|e| e.to_lowercase())
-                .filter(|e| e.len() >= 3 && !self.keyword_extractor.is_stop_word(e))
-                .collect();
-            sorted_entities.sort();
-            sorted_entities.dedup();
-
-            // Remove entities that are substrings of another entity in the set
-            // e.g. "chose" is redundant when "chose rust" exists
-            let before_dedup = sorted_entities.clone();
-            sorted_entities.retain(|entity| {
-                !before_dedup
-                    .iter()
-                    .any(|other| other != entity && other.contains(entity.as_str()))
-            });
-
-            let max_entities = sorted_entities.len().min(4);
-            for i in 0..max_entities {
-                for j in (i + 1)..max_entities {
-                    let relationship =
-                        format!("{} relates to {}", sorted_entities[i], sorted_entities[j]);
-                    candidates.push((relationship, importance * 0.8));
-                }
-            }
-        }
 
         candidates
     }
@@ -1293,14 +1396,14 @@ impl SemanticConsolidator {
 
     // ── Individual Extractors ───────────────────────────────────────────────
 
-    /// Extract a procedure from content (looks for action words)
+    /// Extract a procedure: an action word at the start of a sentence or after instructional
+    /// punctuation ("Step 1: use cargo build"), not one inside prose ("we use Rust").
     fn extract_procedure(&self, content: &str) -> Option<String> {
         // Use to_ascii_lowercase() to preserve byte alignment with `content`.
         // to_lowercase() can change byte lengths for non-ASCII chars (e.g. İ→i̇),
         // making byte offsets from `lower.find()` invalid for indexing into `content`.
         let lower = content.to_ascii_lowercase();
         let action_markers = [
-            "to ",
             "run ",
             "execute ",
             "use ",
@@ -1326,6 +1429,12 @@ impl SemanticConsolidator {
 
         for marker in action_markers {
             if let Some(pos) = lower.find(marker) {
+                if pos > 0 {
+                    let prev_char = content[..pos].trim_end().chars().last().unwrap_or(' ');
+                    if !matches!(prev_char, '.' | ':' | '—' | '-' | '\n' | '!' | '•' | '*') {
+                        continue;
+                    }
+                }
                 if let Some(sentence) = Self::extract_sentence(content, pos) {
                     return Some(sentence);
                 }
@@ -1334,7 +1443,8 @@ impl SemanticConsolidator {
         None
     }
 
-    /// Extract a definition from content
+    /// Extract a definition. The subject must be a name (capitalised, or carrying `_` or `.`)
+    /// of three or more characters and not a pronoun, and the definition ten or more.
     fn extract_definition(&self, content: &str) -> Option<String> {
         // Use to_ascii_lowercase() to preserve byte alignment with `content`.
         let lower = content.to_ascii_lowercase();
@@ -1352,25 +1462,37 @@ impl SemanticConsolidator {
             " stands for ",
             " equivalent to ",
         ];
+        const PRONOUN_SUBJECTS: &[&str] = &[
+            "it", "this", "that", "there", "here", "which", "what", "they", "these", "those",
+        ];
 
         for marker in def_markers {
             if let Some(pos) = lower.find(marker) {
-                // Extract subject and definition
                 let subject_start =
                     content[..pos].rfind(|c: char| !c.is_alphanumeric() && c != '_');
                 let subject_start = subject_start.map(|i| i + 1).unwrap_or(0);
                 let subject = &content[subject_start..pos];
 
-                if subject.len() >= 2 {
-                    let def_end = content[pos + marker.len()..].find(['.', '!', '?', ',']);
-                    let def_end = def_end
-                        .map(|i| pos + marker.len() + i)
-                        .unwrap_or(content.len().min(pos + marker.len() + 100));
+                if subject.len() < 3
+                    || PRONOUN_SUBJECTS
+                        .iter()
+                        .any(|p| subject.eq_ignore_ascii_case(p))
+                {
+                    continue;
+                }
+                let first_char = subject.chars().next().unwrap_or(' ');
+                if !first_char.is_uppercase() && !subject.contains('_') && !subject.contains('.') {
+                    continue;
+                }
 
-                    let definition = &content[pos + marker.len()..def_end];
-                    if definition.len() > 5 {
-                        return Some(format!("{}{}{}", subject, marker, definition.trim()));
-                    }
+                let def_end = content[pos + marker.len()..].find(['.', '!', '?', ',']);
+                let def_end = def_end
+                    .map(|i| pos + marker.len() + i)
+                    .unwrap_or(content.len().min(pos + marker.len() + 100));
+
+                let definition = &content[pos + marker.len()..def_end];
+                if definition.trim().len() >= 10 {
+                    return Some(format!("{}{}{}", subject, marker, definition.trim()));
                 }
             }
         }
@@ -1408,18 +1530,18 @@ impl SemanticConsolidator {
         None
     }
 
-    /// Extract a preference from conversation content (returns the actual sentence)
+    /// Extract a preference: "always"/"never" anywhere, other markers only with a first-person
+    /// subject shortly before them, and "like" never as a simile ("looks like").
     fn extract_preference(&self, content: &str) -> Option<String> {
         // Use to_ascii_lowercase() to preserve byte alignment with `content`.
         let lower = content.to_ascii_lowercase();
-        let pref_markers = [
+        const IMPERATIVE_MARKERS: &[&str] = &["always", "never"];
+        const SUBJECT_MARKERS: &[&str] = &[
             "prefer",
             "like",
             "want",
             "better",
             "should",
-            "always",
-            "never",
             "dislike",
             "avoid",
             "recommend",
@@ -1428,18 +1550,39 @@ impl SemanticConsolidator {
             "instead of",
             "opt for",
         ];
+        const FIRST_PERSON: &[&str] = &["i ", "we ", "my ", "our ", "user "];
+        const SIMILE_PREFIXES: &[&str] = &["looks ", "seems ", "feels ", "sounds ", "acts "];
 
-        for marker in pref_markers {
+        for marker in IMPERATIVE_MARKERS {
             if let Some(pos) = lower.find(marker) {
                 if let Some(sentence) = Self::extract_sentence(content, pos) {
                     return Some(sentence);
                 }
             }
         }
+
+        for marker in SUBJECT_MARKERS {
+            if let Some(pos) = lower.find(marker) {
+                if *marker == "like" && SIMILE_PREFIXES.iter().any(|p| lower[..pos].ends_with(p)) {
+                    continue;
+                }
+                let lookback_start = pos.saturating_sub(30);
+                let before_marker = &lower[lookback_start..pos];
+                if FIRST_PERSON.iter().any(|s| before_marker.contains(s)) {
+                    if let Some(sentence) = Self::extract_sentence(content, pos) {
+                        return Some(sentence);
+                    }
+                }
+            }
+        }
         None
     }
 
-    /// Extract the most information-dense sentence from content
+    /// Extract the most information-dense declarative sentence.
+    ///
+    /// Entity mentions rank sentences; they do not gate them. `entities` comes from NER, which
+    /// is empty for whole classes of records, and a gate on it would extract nothing whenever
+    /// NER is silent.
     fn extract_salient_statement(&self, content: &str, entities: &[String]) -> Option<String> {
         let sentences = Self::split_sentences(content);
         let entity_lower: Vec<String> = entities.iter().map(|e| e.to_lowercase()).collect();
@@ -1465,18 +1608,15 @@ impl SemanticConsolidator {
                 .filter(|w| !w.is_empty() && !self.keyword_extractor.is_stop_word(w))
                 .count();
 
-            // Require at least 3 content words for a meaningful statement
-            if content_words < 3 {
+            if content_words < CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS {
                 continue;
             }
 
-            // Bonus for entity mentions
-            let entity_bonus: f32 = entity_lower
+            let entity_match_count = entity_lower
                 .iter()
                 .filter(|e| lower.contains(e.as_str()))
-                .count() as f32
-                * 2.0;
-
+                .count();
+            let entity_bonus = entity_match_count as f32 * 2.0;
             let score = content_words as f32 + entity_bonus;
 
             if best.as_ref().is_none_or(|(_, s)| score > *s) {
@@ -1485,6 +1625,170 @@ impl SemanticConsolidator {
         }
 
         best.map(|(s, _)| s)
+    }
+
+    // ── Structural Gate ─────────────────────────────────────────────────────
+
+    /// Rejects text that is structurally not a statement of fact: questions, truncated
+    /// fragments, mid-sentence fragments, code or config, log lines and path listings.
+    fn is_fact_shaped(text: &str) -> bool {
+        let trimmed = text.trim();
+
+        if trimmed.ends_with('?') || trimmed.ends_with("..") {
+            return false;
+        }
+
+        if let Some(first) = trimmed.chars().next() {
+            if first.is_lowercase() {
+                const LOWERCASE_STARTERS: &[&str] = &[
+                    "the ", "a ", "an ", "in ", "on ", "at ", "for ", "to ", "if ", "when ",
+                    "but ", "and ", "or ", "so ", "as ", "by ", "with ",
+                ];
+                let lower_start = trimmed.to_ascii_lowercase();
+                if !LOWERCASE_STARTERS
+                    .iter()
+                    .any(|s| lower_start.starts_with(s))
+                {
+                    return false;
+                }
+            }
+        }
+
+        let special_count = trimmed
+            .chars()
+            .filter(|c| {
+                matches!(
+                    c,
+                    '{' | '}'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | ';'
+                        | '='
+                        | '<'
+                        | '>'
+                        | '|'
+                        | '&'
+                        | '#'
+                        | '$'
+                        | '`'
+                        | '\\'
+                )
+            })
+            .count();
+        let alpha_count = trimmed.chars().filter(|c| c.is_alphanumeric()).count();
+        if alpha_count > 0 && special_count as f32 / alpha_count as f32 > 0.25 {
+            return false;
+        }
+
+        const LOG_PATTERNS: &[&str] = &[
+            "[info]",
+            "[warn]",
+            "[error]",
+            "[debug]",
+            "[trace]",
+            "info:",
+            "warn:",
+            "error:",
+            "debug:",
+            "trace:",
+            " at 0x",
+            "thread '",
+            "stack trace",
+        ];
+        let lower = trimmed.to_ascii_lowercase();
+        if LOG_PATTERNS.iter().any(|p| lower.contains(p)) {
+            return false;
+        }
+
+        let slash_count = trimmed.chars().filter(|c| *c == '/' || *c == '\\').count();
+        if slash_count >= 2 && trimmed.split_whitespace().count() < 8 {
+            return false;
+        }
+
+        true
+    }
+
+    // ── Quality Gate ────────────────────────────────────────────────────────
+
+    /// Rejects operational noise: session lifecycle, tool invocations, todo status chatter
+    /// and bare file paths are not domain knowledge.
+    fn is_knowledge_worthy(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        if text.trim().len() < 25 {
+            return false;
+        }
+
+        const SESSION_NOISE: &[&str] = &[
+            "session started",
+            "session ended",
+            "session summary",
+            "context compressed",
+            "context window",
+            "token budget",
+            "tokens used",
+            "proactive_context",
+            "auto_ingest",
+            "memory surfaced",
+            "memories surfaced",
+            "memory stored",
+            "memories stored",
+        ];
+        const TOOL_NOISE: &[&str] = &[
+            "tool call",
+            "tool_name",
+            "mcp tool",
+            "called remember",
+            "called recall",
+            "called forget",
+            "hook triggered",
+            "hook fired",
+        ];
+        const TODO_NOISE: &[&str] = &[
+            "todo created",
+            "todo completed",
+            "todo updated",
+            "task created",
+            "task completed",
+            "task updated",
+            "marked as done",
+            "marked as complete",
+            "moved to backlog",
+            "moved to in_progress",
+        ];
+        // Protocol output that reaches memories verbatim: task notifications, agent output
+        // tags, crash-recovery lines.
+        const SYSTEM_OUTPUT_NOISE: &[&str] = &[
+            "<task-notification>",
+            "</output-file>",
+            "<status>killed</status>",
+            "<status>completed</status>",
+            "[assistant: codeedit]",
+            "[assistant: observation]",
+            "[assistant: search]",
+            "[assistant: decision]",
+            "[assistant: pattern]",
+            "reconnected after",
+            "oom crash",
+            "surfaced 5 memories",
+            "surfaced 3 memories",
+            "agent \"",
+        ];
+        if [SESSION_NOISE, TOOL_NOISE, TODO_NOISE, SYSTEM_OUTPUT_NOISE]
+            .iter()
+            .any(|list| list.iter().any(|s| lower.contains(s)))
+        {
+            return false;
+        }
+
+        // A short text with a path separator is a file reference, not a statement.
+        let path_chars = lower.chars().filter(|c| *c == '/' || *c == '\\').count();
+        if path_chars >= 1 && text.split_whitespace().count() < 6 {
+            return false;
+        }
+
+        true
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
@@ -2205,50 +2509,157 @@ mod tests {
     fn test_similarity_grouping_clusters_similar_patterns() {
         let consolidator = SemanticConsolidator::with_thresholds(2, 0);
 
-        let m1 = create_test_memory(
-            "Rust provides memory safety and performance guarantees",
+        let m1 = create_typed_memory(
+            "Rust is a systems programming language with memory safety and performance guarantees",
             0.8,
+            ExperienceType::Learning,
+            vec!["Rust".to_string(), "memory safety".to_string()],
         );
-        let m2 = create_test_memory("Rust gives memory safety with great performance", 0.7);
-        let m3 = create_test_memory("Python is great for data science and machine learning", 0.6);
+        let m2 = create_typed_memory(
+            "Rust is a compiled language providing memory safety with great performance",
+            0.7,
+            ExperienceType::Learning,
+            vec!["Rust".to_string(), "memory safety".to_string()],
+        );
+        let m3 = create_typed_memory(
+            "Python is a dynamic language great for data science and machine learning workflows",
+            0.6,
+            ExperienceType::Learning,
+            vec!["Python".to_string(), "data science".to_string()],
+        );
 
         let result = consolidator.consolidate(&[m1, m2, m3]);
 
-        // The two Rust/memory/safety memories should cluster and produce a fact
         assert!(
             result.facts_extracted >= 1,
             "Similar memories about Rust should cluster into at least 1 fact, got {}",
             result.facts_extracted
         );
-
-        // Verify the fact contains Rust-related content
         let has_rust_fact = result
             .new_facts
             .iter()
             .any(|f| f.fact.to_lowercase().contains("rust"));
         assert!(has_rust_fact, "Should have a fact about Rust");
+        assert!(
+            result.new_facts.iter().all(|f| f.support_count == 1),
+            "a new fact has been confirmed by one consolidation cycle"
+        );
     }
 
     #[test]
     fn test_multi_extractor_produces_multiple_candidates() {
         let consolidator = SemanticConsolidator::new();
 
-        // This memory has both a definition ("is") and an action word ("use")
+        // Learning runs the definition, pattern and procedure extractors.
         let memory = create_typed_memory(
-            "RocksDB is a high-performance embedded database. We should use it for storage.",
+            "RocksDB is a high-performance embedded key-value database engine. If you see a corruption error, run the repair tool.",
             0.8,
-            ExperienceType::Decision,
+            ExperienceType::Learning,
             vec!["RocksDB".to_string()],
         );
 
         let candidates = consolidator.extract_fact_candidates(&memory);
 
-        // Should produce multiple candidates from different extractors
         assert!(
             candidates.len() >= 2,
             "Multi-extractor should produce >=2 candidates, got {}",
             candidates.len()
         );
+    }
+
+    #[test]
+    fn operational_types_produce_no_candidates() {
+        let consolidator = SemanticConsolidator::new();
+        for exp_type in [
+            ExperienceType::Context,
+            ExperienceType::Command,
+            ExperienceType::CodeEdit,
+            ExperienceType::FileAccess,
+            ExperienceType::Search,
+        ] {
+            let memory = create_typed_memory(
+                "RocksDB is a high-performance embedded key-value database engine used for storage.",
+                0.9,
+                exp_type.clone(),
+                vec!["RocksDB".to_string()],
+            );
+            assert!(
+                consolidator.extract_fact_candidates(&memory).is_empty(),
+                "{exp_type:?} is an execution trace"
+            );
+        }
+    }
+
+    #[test]
+    fn fact_shape_gate_rejects_questions_fragments_code_and_logs() {
+        for text in [
+            "Should the scheduler drain one worker at a time?",
+            "The migration finished but the index was still rebuilding...",
+            "continues the earlier thought about the retry policy",
+            "let x = foo(bar[0]); if (x > 1) { return y; }",
+            "[ERROR] connection refused while opening the replica stream",
+            "src/a/b.rs src/c/d.rs src/e.rs",
+        ] {
+            assert!(!SemanticConsolidator::is_fact_shaped(text), "{text}");
+        }
+        assert!(SemanticConsolidator::is_fact_shaped(
+            "The scheduler drains one worker at a time during rolling restarts."
+        ));
+        assert!(SemanticConsolidator::is_fact_shaped(
+            "the scheduler drains one worker at a time during rolling restarts."
+        ));
+    }
+
+    #[test]
+    fn extractors_reject_pronoun_subjects_similes_and_mid_sentence_actions() {
+        let consolidator = SemanticConsolidator::new();
+        assert_eq!(
+            consolidator.extract_definition("It is a long-running background process."),
+            None
+        );
+        assert!(consolidator
+            .extract_definition("Vamana is a graph index for approximate nearest neighbours.")
+            .is_some());
+        assert_eq!(
+            consolidator.extract_preference("The dashboard looks like a spreadsheet from 1998."),
+            None
+        );
+        assert!(consolidator
+            .extract_preference("We prefer explicit error types over anyhow in library code.")
+            .is_some());
+        assert_eq!(
+            consolidator.extract_procedure("In this project we use Rust for the storage engine."),
+            None
+        );
+        assert!(consolidator
+            .extract_procedure("Step 1: run cargo fmt before every commit to the repository.")
+            .is_some());
+    }
+
+    #[test]
+    fn clusters_compare_to_their_first_member_and_stop_at_the_cap() {
+        let consolidator = SemanticConsolidator::new();
+        let id = || MemoryId(Uuid::new_v4());
+        // The third candidate clears the threshold against the union of the first two
+        // (3 of 6 stems) but not against the first alone (2 of 6).
+        let candidates = vec![
+            ("alpha beta gamma delta".to_string(), id(), 0.5),
+            ("alpha beta gamma epsilon".to_string(), id(), 0.5),
+            ("beta gamma epsilon zeta".to_string(), id(), 0.5),
+        ];
+        let clusters = consolidator.group_candidates_by_similarity(&candidates, 0.45);
+        assert_eq!(
+            clusters.len(),
+            2,
+            "the third candidate starts its own cluster"
+        );
+
+        let same: Vec<(String, MemoryId, f32)> = (0..CONSOLIDATION_CLUSTER_SIZE_CAP + 5)
+            .map(|_| ("alpha beta gamma delta".to_string(), id(), 0.5))
+            .collect();
+        let clusters = consolidator.group_candidates_by_similarity(&same, 0.45);
+        assert_eq!(clusters[0].members.len(), CONSOLIDATION_CLUSTER_SIZE_CAP);
+        assert_eq!(clusters.len(), 2);
     }
 
     #[test]
@@ -2280,42 +2691,372 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_entity_relationships_sorted_deterministic() {
-        let consolidator = SemanticConsolidator::new();
+    const BRIDGE_REPORT: &str =
+        "Initial reports said four crew members were injured in the bridge collapse.";
 
-        let m1 = create_typed_memory(
-            "Testing entity ordering",
+    #[test]
+    fn declarative_sentence_yields_a_candidate_with_no_ner_entities() {
+        let consolidator = SemanticConsolidator::new();
+        let memory = create_typed_memory(BRIDGE_REPORT, 0.3, ExperienceType::Observation, vec![]);
+
+        let candidates = consolidator.extract_fact_candidates(&memory);
+        assert!(
+            candidates
+                .iter()
+                .any(|(t, _)| t.contains("four crew members were injured")),
+            "a plain declarative sentence must mint a candidate without NER entities, got \
+             {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn declarative_extractor_runs_on_every_non_operational_type() {
+        let consolidator = SemanticConsolidator::new();
+        for exp_type in [
+            ExperienceType::Observation,
+            ExperienceType::Conversation,
+            ExperienceType::Task,
+            ExperienceType::Intention,
+            ExperienceType::Decision,
+            ExperienceType::Learning,
+            ExperienceType::Discovery,
+            ExperienceType::Pattern,
+            ExperienceType::Error,
+        ] {
+            let memory = create_typed_memory(BRIDGE_REPORT, 0.3, exp_type.clone(), vec![]);
+            assert!(
+                !consolidator.extract_fact_candidates(&memory).is_empty(),
+                "{exp_type:?} must produce a declarative candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn importance_weights_a_declarative_candidate_instead_of_gating_it() {
+        let consolidator = SemanticConsolidator::new();
+        let low = create_typed_memory(BRIDGE_REPORT, 0.23, ExperienceType::Observation, vec![]);
+        let low = consolidator.extract_fact_candidates(&low);
+        assert!(
+            !low.is_empty(),
+            "importance below 0.5 must not erase the candidate"
+        );
+
+        let high = create_typed_memory(BRIDGE_REPORT, 0.9, ExperienceType::Observation, vec![]);
+        let high = consolidator.extract_fact_candidates(&high);
+        assert!(
+            high[0].1 > low[0].1,
+            "importance must still rank candidates"
+        );
+    }
+
+    #[test]
+    fn entity_mentions_rank_sentences_rather_than_gating_them() {
+        let consolidator = SemanticConsolidator::new();
+        // Identical tails: the second sentence has exactly one more content word, so density
+        // alone picks it, and one entity hit (+2.0) flips the choice to the first.
+        let content = "The Dali blocked the shipping channel for weeks. \
+                       The salvage barge blocked the shipping channel for weeks.";
+
+        let with_entity = create_typed_memory(
+            content,
+            0.6,
+            ExperienceType::Observation,
+            vec!["Dali".to_string()],
+        );
+        let picked = consolidator.extract_fact_candidates(&with_entity);
+        assert!(
+            picked.iter().any(|(t, _)| t.contains("Dali")),
+            "an entity mention must outrank raw density, got {picked:?}"
+        );
+
+        let without_entity = create_typed_memory(content, 0.6, ExperienceType::Observation, vec![]);
+        let fallback = consolidator.extract_fact_candidates(&without_entity);
+        assert!(
+            fallback.iter().any(|(t, _)| t.contains("salvage barge")),
+            "without an entity signal, density decides; got {fallback:?}"
+        );
+    }
+
+    #[test]
+    fn content_word_floor_separates_a_caption_from_a_clause() {
+        assert_eq!(CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS, 4);
+        let consolidator = SemanticConsolidator::new();
+        for w in ["the", "and", "in"] {
+            assert!(
+                consolidator.keyword_extractor.is_stop_word(w),
+                "fixture assumes '{w}' is a stop word"
+            );
+        }
+        for w in ["barge", "tugboat", "harbor", "sank"] {
+            assert!(
+                !consolidator.keyword_extractor.is_stop_word(w),
+                "fixture assumes '{w}' is a content word"
+            );
+        }
+
+        let caption = "The barge and the tugboat in the harbor";
+        assert!(consolidator
+            .extract_salient_statement(caption, &[])
+            .is_none());
+        let clause = "The barge and the tugboat in the harbor sank";
+        assert_eq!(
+            consolidator.extract_salient_statement(clause, &[]),
+            Some(clause.to_string())
+        );
+    }
+
+    #[test]
+    fn repeated_declarative_mentions_reach_the_support_threshold() {
+        let consolidator = SemanticConsolidator::with_thresholds(2, 0);
+        let m1 = create_typed_memory(BRIDGE_REPORT, 0.3, ExperienceType::Observation, vec![]);
+        let m2 = create_typed_memory(
+            "Early reports said four crew members were injured in the bridge collapse.",
+            0.3,
+            ExperienceType::Observation,
+            vec![],
+        );
+
+        let single = consolidator.consolidate(std::slice::from_ref(&m1));
+        assert_eq!(single.facts_extracted, 0, "one mention is an anecdote");
+
+        let paired = consolidator.consolidate(&[m1, m2]);
+        assert!(
+            paired
+                .new_facts
+                .iter()
+                .any(|f| f.fact.contains("crew members were injured")),
+            "two corroborating memories must mint the sentence, got {:?}",
+            paired.new_facts
+        );
+    }
+
+    fn observation_aged(content: &str, days: i64) -> Memory {
+        Memory::new(
+            MemoryId(Uuid::new_v4()),
+            Experience {
+                content: content.to_string(),
+                experience_type: ExperienceType::Observation,
+                ..Default::default()
+            },
+            0.8,
+            None,
+            None,
+            None,
+            Some(chrono::Utc::now() - chrono::Duration::days(days)),
+        )
+    }
+
+    const CLAIM: &str =
+        "Initial reports said four crew members were injured in the bridge collapse.";
+    const CLAIM_ECHO: &str =
+        "Early reports said four crew members were injured in the bridge collapse.";
+    const CORRECTION: &str =
+        "Corrected reports confirm no crew members were injured in the bridge collapse.";
+    const CORRECTION_ECHO: &str =
+        "Later reports confirm no crew members were injured in the bridge collapse.";
+
+    #[test]
+    fn contradicting_statements_never_share_a_cluster() {
+        let consolidator = SemanticConsolidator::new();
+        let memories: Vec<Memory> = [CLAIM, CLAIM_ECHO, CORRECTION, CORRECTION_ECHO]
+            .iter()
+            .map(|content| observation_aged(content, 8))
+            .collect();
+
+        let result = consolidator.consolidate(&memories);
+        assert_eq!(
+            result.facts_extracted, 2,
+            "claim and correction mint as separate facts: {:?}",
+            result.new_facts
+        );
+        assert!(result
+            .new_facts
+            .iter()
+            .any(|f| f.fact.contains("four crew members were injured")));
+        assert!(result
+            .new_facts
+            .iter()
+            .any(|f| f.fact.contains("no crew members were injured")));
+    }
+
+    #[test]
+    fn minted_facts_are_ordered_by_evidence_recency() {
+        let consolidator = SemanticConsolidator::new();
+        let memories = vec![
+            observation_aged(CORRECTION, 20),
+            observation_aged(CLAIM, 40),
+            observation_aged(CORRECTION_ECHO, 20),
+            observation_aged(CLAIM_ECHO, 40),
+        ];
+
+        let result = consolidator.consolidate(&memories);
+        assert_eq!(result.facts_extracted, 2);
+        assert!(
+            result.new_facts[0]
+                .fact
+                .contains("four crew members were injured"),
+            "the older claim is ingested first: {:?}",
+            result.new_facts
+        );
+        assert!(result.new_facts[1]
+            .fact
+            .contains("no crew members were injured"));
+        assert_eq!(
+            result.new_fact_ids,
+            result
+                .new_facts
+                .iter()
+                .map(|f| f.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn consolidation_does_not_depend_on_input_order() {
+        let consolidator = SemanticConsolidator::new();
+        let memories: Vec<Memory> = [
+            CLAIM,
+            CORRECTION,
+            CLAIM_ECHO,
+            CORRECTION_ECHO,
+            "The salvage barge cleared the shipping channel after six weeks of work.",
+            "After six weeks of work the salvage barge cleared the shipping channel.",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, content)| observation_aged(content, 10 + i as i64))
+        .collect();
+        let forward: Vec<String> = consolidator
+            .consolidate(&memories)
+            .new_facts
+            .into_iter()
+            .map(|f| f.fact)
+            .collect();
+        let mut reversed = memories.clone();
+        reversed.reverse();
+        let backward: Vec<String> = consolidator
+            .consolidate(&reversed)
+            .new_facts
+            .into_iter()
+            .map(|f| f.fact)
+            .collect();
+        assert!(!forward.is_empty());
+        assert_eq!(forward, backward);
+    }
+
+    /// Two different zeros: a fresh corpus mints nothing because the age gate looked at
+    /// nothing, while an aged corpus of unique statements mints nothing because none is
+    /// corroborated. `memories_eligible` tells them apart.
+    #[test]
+    fn an_age_gated_zero_is_distinguishable_from_a_corroboration_zero() {
+        let unique = [
+            "MSC Brianna completed cargo operations at Seagirt berth 3 and departed on the evening tide.",
+            "Crane STS-07 at Seagirt completed its 4,000-hour preventive maintenance.",
+            "Fog delayed pilot boardings in the Craighill Channel for two hours.",
+        ];
+
+        let fresh: Vec<Memory> = unique.iter().map(|c| observation_aged(c, 0)).collect();
+        let gated = SemanticConsolidator::new().consolidate(&fresh);
+        assert_eq!(gated.memories_eligible, 0);
+        assert_eq!(gated.facts_extracted, 0);
+
+        // Past the consolidator's three-day floor, with the age gate lowered to zero.
+        let aged: Vec<Memory> = unique.iter().map(|c| observation_aged(c, 4)).collect();
+        let eager = SemanticConsolidator::with_thresholds(CONSOLIDATION_MIN_SUPPORT, 0);
+        let result = eager.consolidate(&aged);
+        assert_eq!(result.memories_eligible, aged.len());
+        assert_eq!(
+            result.facts_extracted, 0,
+            "unique statements are not corroborated"
+        );
+    }
+
+    #[test]
+    fn test_no_relates_to_patterns() {
+        let consolidator = SemanticConsolidator::new();
+        let memory = create_typed_memory(
+            "Testing entity extraction without template patterns",
             0.7,
             ExperienceType::Observation,
             vec!["JWT".to_string(), "Auth".to_string(), "Token".to_string()],
         );
 
-        let m2 = create_typed_memory(
-            "Testing entity ordering",
-            0.7,
-            ExperienceType::Observation,
-            vec!["Token".to_string(), "Auth".to_string(), "JWT".to_string()],
+        let candidates = consolidator.extract_fact_candidates(&memory);
+        assert!(
+            !candidates.iter().any(|(t, _)| t.contains("relates to")),
+            "entity co-occurrence belongs to the graph, not to 'X relates to Y' facts"
         );
+    }
 
-        let c1 = consolidator.extract_fact_candidates(&m1);
-        let c2 = consolidator.extract_fact_candidates(&m2);
+    #[test]
+    fn test_quality_gate_rejects_session_noise() {
+        assert!(!SemanticConsolidator::is_knowledge_worthy(
+            "Session started at 2:15 PM with token budget of 200k"
+        ));
+        assert!(!SemanticConsolidator::is_knowledge_worthy(
+            "Context compressed after reaching 80% of token budget"
+        ));
+        assert!(!SemanticConsolidator::is_knowledge_worthy(
+            "3 memories surfaced via proactive_context for the current query"
+        ));
+    }
 
-        // Entity relationships should be identical regardless of input order
-        let relations1: Vec<&str> = c1
-            .iter()
-            .filter(|(t, _)| t.contains("relates to"))
-            .map(|(t, _)| t.as_str())
-            .collect();
-        let relations2: Vec<&str> = c2
-            .iter()
-            .filter(|(t, _)| t.contains("relates to"))
-            .map(|(t, _)| t.as_str())
-            .collect();
+    #[test]
+    fn test_quality_gate_rejects_todo_noise() {
+        assert!(!SemanticConsolidator::is_knowledge_worthy(
+            "Todo created for implementing the new authentication module"
+        ));
+        assert!(!SemanticConsolidator::is_knowledge_worthy(
+            "Task completed after fixing the database connection pooling issue"
+        ));
+    }
 
-        assert_eq!(
-            relations1, relations2,
-            "Entity relationships should be deterministic regardless of input order"
-        );
+    #[test]
+    fn test_quality_gate_rejects_system_output() {
+        for text in [
+            "<task-notification> background build finished with status ok",
+            "[Assistant: CodeEdit] rewrote the retry loop in the uploader module",
+            "Reconnected after the server restarted at midnight on the build host",
+            "Agent \"reviewer\" completed its pass over the storage module changes",
+        ] {
+            assert!(!SemanticConsolidator::is_knowledge_worthy(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_quality_gate_rejects_short_text() {
+        assert!(!SemanticConsolidator::is_knowledge_worthy("short"));
+        assert!(!SemanticConsolidator::is_knowledge_worthy(
+            "too short to be fact"
+        ));
+    }
+
+    #[test]
+    fn test_quality_gate_rejects_bare_file_paths() {
+        assert!(!SemanticConsolidator::is_knowledge_worthy(
+            "src/memory/compression.rs:919"
+        ));
+        assert!(!SemanticConsolidator::is_knowledge_worthy(
+            "hooks/memory-hook.ts file"
+        ));
+    }
+
+    #[test]
+    fn test_quality_gate_accepts_genuine_knowledge() {
+        for text in [
+            "Rust provides memory safety without garbage collection through its ownership system",
+            "The Vamana index automatically switches to SPANN when the dataset exceeds 100k vectors",
+            "Hebbian learning uses additive boost and multiplicative decay for asymmetric strengthening",
+            "RocksDB column families reduce file descriptor usage by consolidating multiple stores",
+        ] {
+            assert!(SemanticConsolidator::is_knowledge_worthy(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_quality_gate_accepts_file_paths_with_prose() {
+        assert!(SemanticConsolidator::is_knowledge_worthy(
+            "The router configuration in src/handlers/router.rs defines all API endpoint routes for the server"
+        ));
     }
 }

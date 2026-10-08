@@ -634,8 +634,7 @@ impl GitHubClient {
     const DEFAULT_API_URL: &'static str = "https://api.github.com";
 
     pub fn new(token: String) -> Self {
-        let api_url =
-            std::env::var("GITHUB_API_URL").unwrap_or_else(|_| Self::DEFAULT_API_URL.to_string());
+        let api_url = super::resolve_api_url_override("GITHUB_API_URL", Self::DEFAULT_API_URL);
         Self {
             token,
             api_url,
@@ -798,6 +797,16 @@ impl GitHubClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_insecure_remote_api_url_override_is_refused_by_default() {
+        let client = crate::integrations::with_override_env(
+            None,
+            &[("GITHUB_API_URL", "http://evil.example.com")],
+            || GitHubClient::new("ghp_token".to_string()),
+        );
+        assert_eq!(client.api_url, GitHubClient::DEFAULT_API_URL);
+    }
 
     #[test]
     fn test_issue_to_content() {

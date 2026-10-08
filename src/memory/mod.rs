@@ -38,6 +38,7 @@ pub mod prefetch_tick;
 pub mod prospective;
 pub mod query_parser;
 mod recall;
+pub mod recall_events;
 pub mod relation_extraction;
 pub mod replay;
 pub mod retrieval;
@@ -47,6 +48,8 @@ pub mod sessions;
 pub mod sleep_time;
 pub mod slow_store;
 pub mod storage;
+pub mod tag_sources;
+pub mod embedding_backlog;
 pub mod temporal_facts;
 pub mod todo_formatter;
 pub mod todos;
@@ -370,16 +373,11 @@ pub struct MemorySystem {
     /// Resolves relative dates ("next month" → June 2023) for accurate retrieval
     temporal_fact_store: Arc<temporal_facts::TemporalFactStore>,
 
-    /// Flag: new memories stored since last fact extraction cycle.
+    /// Flag: fact extraction has pending work.
     /// When false, fact extraction is skipped entirely (no RocksDB scan, no clones).
-    /// Set to true in remember(), cleared by maintenance after extraction runs.
+    /// Set by remember(); a heavy maintenance cycle consumes it and sets it again while part
+    /// of the corpus is still under the age gate.
     fact_extraction_needed: std::sync::atomic::AtomicBool,
-
-    /// Watermark: only memories with created_at > this timestamp (unix millis) are
-    /// processed for fact extraction. Persisted to RocksDB so server restarts don't
-    /// re-process the entire memory store. Initialized from the latest fact's
-    /// created_at or 0 if no facts exist.
-    fact_extraction_watermark: std::sync::atomic::AtomicI64,
 
     /// Cached wavelet-detected session map.
     /// Invalidated when fact_extraction_needed is set (any new remember call).
@@ -414,6 +412,15 @@ pub struct MemorySystem {
     /// the row to TRAINING. Per-user (backed by this MemorySystem's own KV store).
     /// Never read by the live scoring path — capture is side-effect-only.
     retrieval_trace_store: feedback::RetrievalTraceStore,
+
+    /// Source of every stored tag (caller, intent, ingest, NER, YAKE, cold-start), per memory.
+    tag_source_store: tag_sources::TagSourceStore,
+
+    /// Memories stored without a vector, drained when the embedder answers again.
+    embedding_backlog: embedding_backlog::EmbeddingBacklogStore,
+
+    /// One row per recall, including empty ones — the question side the trace store lacks.
+    recall_event_store: recall_events::RecallEventStore,
 
     /// R3a (F3): per-user PERSISTENT store for the learned-weight ranker vector.
     /// Closes the in-memory-only reset-on-restart defect by persisting/loading
@@ -618,6 +625,85 @@ fn open_standalone_bm25(path: &std::path::Path, sealed: bool) -> Result<hybrid_s
         hybrid_search::BM25Index::new(path)
     }
     .context("Failed to open BM25 index for hybrid search")
+}
+
+/// Provenance an upsert caller declares, as `remember` accepts it. On update, `None` means
+/// "leave the stored value", never "clear it".
+#[derive(Debug, Clone, Default)]
+pub struct UpsertProvenance {
+    pub agent_id: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub episode_id: Option<String>,
+    pub writer: Option<crate::memory::facets::DeclaredWriter>,
+}
+
+/// Write a declared episode id and writer onto a record's context, creating the context from
+/// `fallback` (or the detected session) when the record has none. Fields left `None` are not
+/// touched, so an update that omits them keeps what is stored.
+fn overlay_declared_context(
+    slot: &mut Option<types::RichContext>,
+    fallback: Option<types::RichContext>,
+    episode_id: Option<String>,
+    writer: Option<crate::memory::facets::DeclaredWriter>,
+) {
+    if episode_id.is_none() && writer.is_none() {
+        return;
+    }
+    let ctx = slot.get_or_insert_with(|| {
+        fallback.unwrap_or_else(crate::memory::session_detect::rich_context_with_session)
+    });
+    if let Some(episode_id) = episode_id {
+        ctx.episode.episode_id = Some(episode_id);
+    }
+    if let Some(writer) = writer {
+        ctx.session.declared = writer;
+    }
+}
+
+/// What a remember call did: created a memory, or found identical content and merged the
+/// duplicate's enrichment into it. The graph episode is built by the handler, so only the
+/// handler can rebuild it, and it needs this report to know when.
+#[derive(Debug, Clone)]
+pub struct RememberOutcome {
+    /// The memory's id; on a merge, the existing memory's.
+    pub id: MemoryId,
+    /// True when the content already existed.
+    pub deduped: bool,
+    /// What the merge added. Empty for a new memory and for a duplicate that added nothing.
+    pub delta: EnrichmentDelta,
+    /// The merged experience, present only when the merge changed something. A graph rebuild
+    /// must use it: the incoming experience holds only its own entities.
+    pub merged_experience: Option<Experience>,
+}
+
+impl RememberOutcome {
+    fn created(id: MemoryId) -> Self {
+        Self {
+            id,
+            deduped: false,
+            delta: EnrichmentDelta::default(),
+            merged_experience: None,
+        }
+    }
+
+    fn deduped(
+        id: MemoryId,
+        delta: EnrichmentDelta,
+        merged_experience: Option<Experience>,
+    ) -> Self {
+        Self {
+            id,
+            deduped: true,
+            delta,
+            merged_experience,
+        }
+    }
+
+    /// True when the merge added entities or tags, which the graph builds nodes from, so
+    /// the memory's episode no longer matches it.
+    pub fn needs_graph_rebuild(&self) -> bool {
+        self.deduped && !(self.delta.entities_added.is_empty() && self.delta.tags_added.is_empty())
+    }
 }
 
 impl MemorySystem {
@@ -1290,11 +1376,8 @@ impl MemorySystem {
             learning_history,
             // Temporal fact store for multi-hop temporal reasoning
             temporal_fact_store,
-            // Dirty flag for fact extraction: run on first cycle, then only when new memories stored
+            // Dirty flag for fact extraction: run on the first cycle, then when there is work
             fact_extraction_needed: std::sync::atomic::AtomicBool::new(true),
-            // Watermark for incremental fact extraction — initialized to 0 (sentinel).
-            // On first maintenance call, loaded from RocksDB or derived from latest fact timestamp.
-            fact_extraction_watermark: std::sync::atomic::AtomicI64::new(0),
             // Wavelet session detection cache — recomputed when new memories arrive
             session_map_cache: parking_lot::Mutex::new(None),
             // FIX-R1: Reconsolidation shadow map — tracks labile memories
@@ -1311,6 +1394,15 @@ impl MemorySystem {
             )),
             // R2 (LTR): per-user retrieval-trace store over this user's own KV CF.
             retrieval_trace_store: feedback::RetrievalTraceStore::with_kv(
+                primary_store.key_value_store(),
+            ),
+            tag_source_store: tag_sources::TagSourceStore::with_kv(
+                primary_store.key_value_store(),
+            ),
+            recall_event_store: recall_events::RecallEventStore::with_kv(
+                primary_store.key_value_store(),
+            ),
+            embedding_backlog: embedding_backlog::EmbeddingBacklogStore::with_kv(
                 primary_store.key_value_store(),
             ),
             // R3a (F3): per-user persistent learned-weight store over this user's
@@ -1491,6 +1583,14 @@ impl MemorySystem {
         &self.retrieval_trace_store
     }
 
+    pub fn tag_source_store(&self) -> &tag_sources::TagSourceStore {
+        &self.tag_source_store
+    }
+
+    pub fn recall_event_store(&self) -> &recall_events::RecallEventStore {
+        &self.recall_event_store
+    }
+
     /// R3a (F3): read-only handle on the per-user persistent learned-weight
     /// store. Exposed so a future R3b (and tests) can load/save the vector. This
     /// store is pure persistence side-state — accessing it here never influences
@@ -1562,6 +1662,17 @@ impl MemorySystem {
         experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<MemoryId> {
+        self.remember_detailed(experience, created_at)
+            .map(|outcome| outcome.id)
+    }
+
+    /// [`Self::remember`], reporting whether the content already existed and what a merge
+    /// added to it.
+    pub fn remember_detailed(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RememberOutcome> {
         self.remember_impl(experience, created_at, None, false)
     }
 
@@ -1577,6 +1688,17 @@ impl MemorySystem {
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         external_id: Option<String>,
     ) -> Result<MemoryId> {
+        self.remember_deferred_detailed(experience, created_at, external_id)
+            .map(|outcome| outcome.id)
+    }
+
+    /// [`Self::remember_deferred`], reporting whether a merge happened.
+    pub fn remember_deferred_detailed(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        external_id: Option<String>,
+    ) -> Result<RememberOutcome> {
         self.remember_impl(experience, created_at, external_id, true)
     }
 
@@ -1592,7 +1714,7 @@ impl MemorySystem {
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         external_id: Option<String>,
         defer_embedding: bool,
-    ) -> Result<MemoryId> {
+    ) -> Result<RememberOutcome> {
         // C1: serialize the per-user write path. Every writer (HTTP ingest,
         // WebSocket streaming, hooks) funnels through remember_impl, so holding
         // this lock for the create critical section (store + working_memory +
@@ -1605,19 +1727,14 @@ impl MemorySystem {
         // No-op when no flat fields are populated.
         experience.migrate_robotics_to_facets();
 
-        // IDEMPOTENCY (issue #109): Check content hash index before creating a new memory.
-        // If identical content already exists, return the existing MemoryId instead of
-        // creating a duplicate. Catches all duplication paths: timeout retries, auto_ingest,
-        // and manual re-remembers. O(1) RocksDB index lookup.
+        // IDEMPOTENCY (issue #109): identical content already stored is not stored again;
+        // the duplicate's enrichment is merged into it and its id returned. Catches every
+        // duplication path: timeout retries, auto_ingest and manual re-remembers.
         if let Some(existing_id) = self
             .long_term_memory
             .get_by_content_hash(&experience.content)
         {
-            tracing::debug!(
-                existing_id = %existing_id.0,
-                "Content dedup: returning existing memory (identical content already stored)"
-            );
-            return Ok(existing_id);
+            return self.merge_into_existing(existing_id, &experience);
         }
 
         let memory_id = MemoryId(Uuid::new_v4());
@@ -1650,7 +1767,14 @@ impl MemorySystem {
                     }
                     Err(e) => {
                         tracing::warn!("Failed to generate embedding: {}", e);
-                        // Continue without embedding - will be generated on-demand if needed
+                        // The write goes ahead without a vector; the backlog drain supplies one.
+                        if let Err(record_err) = self.embedding_backlog.record(
+                            &memory_id,
+                            embedding_backlog::EnqueueReason::EmbedFailed,
+                            Some(&e.to_string()),
+                        ) {
+                            tracing::error!("embedding backlog: could not record {}: {record_err}", memory_id.0);
+                        }
                     }
                 }
             }
@@ -1712,6 +1836,13 @@ impl MemorySystem {
         let indexed = if !defer_embedding {
             if let Err(e) = self.retriever.index_memory(&memory) {
                 tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
+                if let Err(record_err) = self.embedding_backlog.record(
+                    &memory.id,
+                    embedding_backlog::EnqueueReason::IndexFailed,
+                    Some(&e.to_string()),
+                ) {
+                    tracing::error!("embedding backlog: could not record {}: {record_err}", memory.id.0);
+                }
                 false
             } else {
                 true
@@ -1968,7 +2099,101 @@ impl MemorySystem {
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        Ok(memory_id)
+        Ok(RememberOutcome::created(memory_id))
+    }
+
+    /// Folds a content-identical duplicate's enrichment into the stored memory.
+    ///
+    /// A duplicate that adds nothing, the common timeout retry, writes nothing. Otherwise the
+    /// stored record and its secondary indices are rewritten (the merge only adds, so an index
+    /// key can only be gained), BM25 is refreshed when tags or entities grew, and cached
+    /// working and session copies are replaced. The vector index is left alone: identical
+    /// content has an identical embedding. Importance can rise with the merged signals, never
+    /// fall. `id`, `created_at`, `tier` and the other identity fields are outside the
+    /// experience and cannot change.
+    fn merge_into_existing(
+        &self,
+        existing_id: MemoryId,
+        incoming: &Experience,
+    ) -> Result<RememberOutcome> {
+        let mut existing = match self.long_term_memory.get(&existing_id) {
+            Ok(memory) => memory,
+            Err(e) => {
+                tracing::debug!(
+                    existing_id = %existing_id.0,
+                    "Content dedup: the existing memory vanished before the merge ({e})"
+                );
+                return Ok(RememberOutcome::deduped(
+                    existing_id,
+                    EnrichmentDelta::default(),
+                    None,
+                ));
+            }
+        };
+
+        let delta = existing.experience.merge_enrichment_from(incoming);
+        if delta.is_empty() {
+            tracing::debug!(
+                existing_id = %existing_id.0,
+                "Content dedup: identical duplicate, nothing to merge"
+            );
+            return Ok(RememberOutcome::deduped(existing_id, delta, None));
+        }
+
+        let enriched = self.calculate_importance(&existing.experience);
+        if enriched > existing.importance() {
+            existing.set_importance(enriched);
+        }
+        self.long_term_memory.update(&existing)?;
+
+        if !delta.entities_added.is_empty() || !delta.tags_added.is_empty() {
+            if let Err(e) = self.hybrid_search.index_memory(
+                &existing_id,
+                &existing.experience.content,
+                &existing.experience.tags,
+                &existing.experience.entities,
+            ) {
+                tracing::warn!(
+                    "Failed to reindex merged memory {} in BM25: {e}",
+                    existing_id.0
+                );
+            }
+            if let Err(e) = self.hybrid_search.commit_and_reload() {
+                tracing::warn!("Failed to commit/reload BM25 index after merge: {e}");
+            }
+        }
+
+        let shared = Arc::new(existing.clone());
+        {
+            let mut working = self.working_memory.write();
+            if working.contains(&existing_id) {
+                working.remove(&existing_id)?;
+                working.add_shared(Arc::clone(&shared))?;
+            }
+        }
+        {
+            let mut session = self.session_memory.write();
+            if session.contains(&existing_id) {
+                session.remove(&existing_id)?;
+                session.add_shared(Arc::clone(&shared))?;
+            }
+        }
+
+        // New entities mean new fact candidates.
+        self.fact_extraction_needed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        tracing::info!(
+            existing_id = %existing_id.0,
+            entities_added = delta.entities_added.len(),
+            fields_filled = ?delta.fields_filled,
+            "Content dedup: merged enrichment into existing memory"
+        );
+        Ok(RememberOutcome::deduped(
+            existing_id,
+            delta,
+            Some(existing.experience),
+        ))
     }
 
     /// Update the per-user TCM drift state (E6) from a memory's embedding and
@@ -2110,6 +2335,13 @@ impl MemorySystem {
                     }
                     Err(e) => {
                         tracing::warn!("Background embedding generation failed: {e}");
+                        if let Err(record_err) = self.embedding_backlog.record(
+                            memory_id,
+                            embedding_backlog::EnqueueReason::EmbedFailed,
+                            Some(&e.to_string()),
+                        ) {
+                            tracing::error!("embedding backlog: could not record {}: {record_err}", memory_id.0);
+                        }
                         // Non-fatal: memory is still searchable via BM25
                         return Ok(());
                     }
@@ -2165,8 +2397,18 @@ impl MemorySystem {
         let memory_arc = Arc::new(memory);
         if let Err(e) = self.retriever.index_memory(&memory_arc) {
             tracing::warn!("Background vector indexing failed for {}: {e}", memory_id.0);
+            if let Err(record_err) = self.embedding_backlog.record(
+                memory_id,
+                embedding_backlog::EnqueueReason::IndexFailed,
+                Some(&e.to_string()),
+            ) {
+                tracing::error!("embedding backlog: could not record {}: {record_err}", memory_id.0);
+            }
         } else {
             self.stats.write().vector_index_count += 1;
+            if let Err(e) = self.embedding_backlog.delete(memory_id) {
+                tracing::error!("embedding backlog: could not clear {}: {e}", memory_id.0);
+            }
         }
 
         // Write gate + interference detection (retroactive + proactive)
@@ -2331,6 +2573,18 @@ impl MemorySystem {
         agent_id: Option<String>,
         run_id: Option<String>,
     ) -> Result<MemoryId> {
+        self.remember_with_agent_detailed(experience, created_at, agent_id, run_id)
+            .map(|outcome| outcome.id)
+    }
+
+    /// [`Self::remember_with_agent`], reporting whether a merge happened.
+    pub fn remember_with_agent_detailed(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<String>,
+        run_id: Option<String>,
+    ) -> Result<RememberOutcome> {
         self.remember_with_agent_impl(experience, created_at, agent_id, run_id, None, false)
     }
 
@@ -2344,6 +2598,25 @@ impl MemorySystem {
         run_id: Option<String>,
         external_id: Option<String>,
     ) -> Result<MemoryId> {
+        self.remember_with_agent_deferred_detailed(
+            experience,
+            created_at,
+            agent_id,
+            run_id,
+            external_id,
+        )
+        .map(|outcome| outcome.id)
+    }
+
+    /// [`Self::remember_with_agent_deferred`], reporting whether a merge happened.
+    pub fn remember_with_agent_deferred_detailed(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<String>,
+        run_id: Option<String>,
+        external_id: Option<String>,
+    ) -> Result<RememberOutcome> {
         self.remember_with_agent_impl(experience, created_at, agent_id, run_id, external_id, true)
     }
 
@@ -2355,20 +2628,17 @@ impl MemorySystem {
         run_id: Option<String>,
         external_id: Option<String>,
         defer_embedding: bool,
-    ) -> Result<MemoryId> {
+    ) -> Result<RememberOutcome> {
         // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
         experience.migrate_robotics_to_facets();
 
-        // IDEMPOTENCY (issue #109): Content hash dedup (same as remember())
+        // IDEMPOTENCY (issue #109): content hash dedup with the enrichment merge, as in
+        // remember().
         if let Some(existing_id) = self
             .long_term_memory
             .get_by_content_hash(&experience.content)
         {
-            tracing::debug!(
-                existing_id = %existing_id.0,
-                "Content dedup: returning existing memory (identical content already stored)"
-            );
-            return Ok(existing_id);
+            return self.merge_into_existing(existing_id, &experience);
         }
 
         let memory_id = MemoryId(Uuid::new_v4());
@@ -2664,7 +2934,7 @@ impl MemorySystem {
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        Ok(memory_id)
+        Ok(RememberOutcome::created(memory_id))
     }
 
     // ==========================================================================
@@ -3605,18 +3875,25 @@ impl MemorySystem {
         }
 
         let count = to_promote.len();
+
+        // Recall's tier trust reads the tier from storage, so the promotion is persisted, and
+        // persisted before the tier maps are locked. If the map move then fails, storage
+        // already says Session and the next cycle re-promotes.
+        let mut promoted: Vec<Memory> = Vec::with_capacity(count);
+        for memory in &to_promote {
+            let mut promoted_memory = (**memory).clone();
+            promoted_memory.promote(); // Working -> Session
+            self.long_term_memory.store(&promoted_memory)?;
+            promoted.push(promoted_memory);
+        }
+
         let mut working = self.working_memory.write();
         let mut session = self.session_memory.write();
 
-        for memory in &to_promote {
-            // Log promotion
+        for (memory, promoted_memory) in to_promote.iter().zip(promoted) {
             self.logger
                 .write()
                 .log_promoted(&memory.id, "working", "session", count);
-
-            // Clone out of Arc and update tier before session storage
-            let mut promoted_memory = (**memory).clone();
-            promoted_memory.promote(); // Working -> Session
             session.add(promoted_memory)?;
             working.remove(&memory.id)?;
         }
@@ -4705,6 +4982,46 @@ impl MemorySystem {
         Ok(())
     }
 
+    /// Records on a memory that `todo_id` cites it: the memory half of the todo-memory link.
+    pub fn link_related_todo(&self, memory_id: &MemoryId, todo_id: TodoId) -> Result<()> {
+        self.mutate_related_todos(memory_id, move |memory| memory.add_related_todo(todo_id))
+    }
+
+    /// Drops `todo_id` from a memory's back-links, when the todo stops citing it or is deleted.
+    pub fn unlink_related_todo(&self, memory_id: &MemoryId, todo_id: &TodoId) -> Result<()> {
+        self.mutate_related_todos(memory_id, |memory| memory.remove_related_todo(todo_id))
+    }
+
+    /// Applies a back-link edit to storage and the cached tier copies. Not a full memory
+    /// update: only `related_todo_ids` changes, which neither the vector nor the BM25 index
+    /// reads, as in [`Self::set_memory_parent`].
+    fn mutate_related_todos(
+        &self,
+        memory_id: &MemoryId,
+        edit: impl FnOnce(&mut Memory),
+    ) -> Result<()> {
+        let mut memory = self.long_term_memory.get(memory_id)?;
+        edit(&mut memory);
+        self.long_term_memory.update(&memory)?;
+
+        let updated = Arc::new(memory);
+        {
+            let mut wm = self.working_memory.write();
+            if wm.contains(memory_id) {
+                let _ = wm.remove(memory_id);
+                let _ = wm.add_shared(Arc::clone(&updated));
+            }
+        }
+        {
+            let mut sm = self.session_memory.write();
+            if sm.contains(memory_id) {
+                let _ = sm.remove(memory_id);
+                let _ = sm.add_shared(Arc::clone(&updated));
+            }
+        }
+        Ok(())
+    }
+
     /// Agent-initiated tier move. Updates the persistent record's `tier`
     /// field and adjusts hot-cache (working/session) membership to match.
     /// Returns the previous tier so callers can audit the transition.
@@ -5047,6 +5364,72 @@ impl MemorySystem {
         Ok(result)
     }
 
+    pub fn embedding_backlog_report(&self) -> Result<embedding_backlog::BacklogReport> {
+        self.embedding_backlog.report()
+    }
+
+    /// Bring the backlog in line with what is stored and what is indexed. A live memory the
+    /// index lacks gets a row whatever path lost it; a row for an indexed or deleted memory goes.
+    pub fn reconcile_embedding_backlog(&self) -> Result<embedding_backlog::ReconcileReport> {
+        let indexed = self.retriever.get_indexed_memory_ids();
+        let mut stored = Vec::new();
+        for id in self.long_term_memory.get_all_ids()? {
+            if indexed.contains(&id) {
+                stored.push(id);
+                continue;
+            }
+            match self.long_term_memory.get(&id) {
+                Ok(memory) if memory.is_forgotten() => {}
+                Ok(_) => stored.push(id),
+                Err(e) => tracing::warn!("embedding backlog reconcile: cannot read {}: {e}", id.0),
+            }
+        }
+        self.embedding_backlog.reconcile(&stored, &indexed)
+    }
+
+    /// One attempt to give a backlogged memory its vector. The embedder is probed after a
+    /// failure so a host that is down stops the drain, while a memory the embedder refuses on
+    /// its own merits stays in the queue with its error.
+    fn embed_backlog_outcome(&self, memory_id: &MemoryId) -> embedding_backlog::EmbedOutcome {
+        use embedding_backlog::EmbedOutcome;
+        match self.long_term_memory.get(memory_id) {
+            Ok(memory) if memory.is_forgotten() => return EmbedOutcome::MemoryGone,
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("Memory not found") => return EmbedOutcome::MemoryGone,
+            Err(e) => return EmbedOutcome::Failed(e.to_string()),
+        }
+        if let Err(e) = self.embed_and_index(memory_id) {
+            return EmbedOutcome::Failed(e.to_string());
+        }
+        if self.retriever.is_indexed(memory_id) {
+            return EmbedOutcome::Indexed;
+        }
+        let last_error = self
+            .embedding_backlog
+            .get(memory_id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.last_error)
+            .unwrap_or_else(|| "not indexed after embed_and_index".to_string());
+        match self.embedder.encode("veld embedder probe") {
+            Ok(_) => EmbedOutcome::Failed(last_error),
+            Err(probe) => EmbedOutcome::EmbedderUnavailable(format!("{last_error}; probe: {probe}")),
+        }
+    }
+
+    /// Embed and index up to `limit` backlogged memories, oldest first.
+    pub fn drain_embedding_backlog(&self, limit: usize) -> Result<embedding_backlog::DrainReport> {
+        let report = self
+            .embedding_backlog
+            .drain_with(limit, |id| self.embed_backlog_outcome(id))?;
+        if report.drained > 0 {
+            if let Err(e) = self.retriever.save() {
+                tracing::warn!("embedding backlog: index save after drain failed: {e}");
+            }
+        }
+        Ok(report)
+    }
+
     /// Save vector index to disk (shutdown persistence)
     /// Uses Vamana persistence format for instant startup on restart
     pub fn save_vector_index(&self, _path: &Path) -> Result<()> {
@@ -5382,11 +5765,40 @@ impl MemorySystem {
     pub fn upsert(
         &self,
         external_id: String,
-        mut experience: Experience,
+        experience: Experience,
         change_type: ChangeType,
         changed_by: Option<String>,
         change_reason: Option<String>,
     ) -> Result<(MemoryId, bool)> {
+        self.upsert_with_provenance(
+            external_id,
+            experience,
+            change_type,
+            changed_by,
+            change_reason,
+            UpsertProvenance::default(),
+        )
+    }
+
+    /// [`Self::upsert`] carrying the provenance `remember` accepts.
+    ///
+    /// On create, `agent_id` and `created_at` are stored as `remember` stores them, and the
+    /// episode and declared writer travel in `experience.context`, which the caller builds with
+    /// the same `build_rich_context` that `remember` uses. On update, each provided field
+    /// overwrites the stored value and each `None` leaves it as it was.
+    pub fn upsert_with_provenance(
+        &self,
+        external_id: String,
+        mut experience: Experience,
+        change_type: ChangeType,
+        changed_by: Option<String>,
+        change_reason: Option<String>,
+        provenance: UpsertProvenance,
+    ) -> Result<(MemoryId, bool)> {
+        // C1: the find-then-create below must be atomic, or two concurrent upserts of one
+        // external_id both miss the lookup and both create. Same per-user lock as remember_impl.
+        let _write_guard = self.write_lock.lock();
+
         // Try to find existing memory with this external_id
         if let Some(mut existing) = self.long_term_memory.find_by_external_id(&external_id)? {
             // === UPDATE PATH ===
@@ -5398,6 +5810,21 @@ impl MemorySystem {
                 change_type,
                 changed_by,
                 change_reason,
+            );
+
+            // Provenance: a provided field overwrites, an omitted one keeps the stored value.
+            if let Some(agent_id) = provenance.agent_id {
+                existing.agent_id = Some(agent_id);
+            }
+            if let Some(created_at) = provenance.created_at {
+                existing.created_at = created_at;
+                existing.when.encoded_at = Some(created_at);
+            }
+            overlay_declared_context(
+                &mut existing.experience.context,
+                experience.context.take(),
+                provenance.episode_id,
+                provenance.writer,
             );
 
             // Update entities if provided
@@ -5447,6 +5874,13 @@ impl MemorySystem {
                     memory_id.0,
                     e
                 );
+                if let Err(record_err) = self.embedding_backlog.record(
+                    &memory_id,
+                    embedding_backlog::EnqueueReason::IndexFailed,
+                    Some(&e.to_string()),
+                ) {
+                    tracing::error!("embedding backlog: could not record {}: {record_err}", &memory_id.0);
+                }
             }
 
             // Re-index in BM25 with updated content
@@ -5504,6 +5938,13 @@ impl MemorySystem {
                         }
                         Err(e) => {
                             tracing::warn!("Failed to generate embedding: {}", e);
+                            if let Err(record_err) = self.embedding_backlog.record(
+                                &memory_id,
+                                embedding_backlog::EnqueueReason::EmbedFailed,
+                                Some(&e.to_string()),
+                            ) {
+                                tracing::error!("embedding backlog: could not record {}: {record_err}", &memory_id.0);
+                            }
                         }
                     }
                 }
@@ -5521,16 +5962,23 @@ impl MemorySystem {
             // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
             experience.migrate_robotics_to_facets();
 
+            overlay_declared_context(
+                &mut experience.context,
+                None,
+                provenance.episode_id,
+                provenance.writer,
+            );
+
             // Create memory with external_id
             let memory = Arc::new(Memory::new_with_external_id(
                 memory_id.clone(),
                 experience,
                 importance,
                 external_id.clone(),
-                None, // agent_id
+                provenance.agent_id,
                 None, // run_id
                 None, // actor_id
-                None, // created_at
+                provenance.created_at,
             ));
 
             // Persist to storage
@@ -5547,6 +5995,13 @@ impl MemorySystem {
             // Index in vector DB
             if let Err(e) = self.retriever.index_memory(&memory) {
                 tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
+                if let Err(record_err) = self.embedding_backlog.record(
+                    &memory.id,
+                    embedding_backlog::EnqueueReason::IndexFailed,
+                    Some(&e.to_string()),
+                ) {
+                    tracing::error!("embedding backlog: could not record {}: {record_err}", &memory.id.0);
+                }
             }
 
             // Add entities to knowledge graph with co-occurrence edges
@@ -6160,42 +6615,24 @@ impl MemorySystem {
         {
             let all_memories = &all_memories_for_heavy;
             if !all_memories.is_empty() {
-                // Incremental: only process memories created since last extraction watermark.
-                // First run (watermark=0) processes everything; subsequent runs only new memories.
-                // Lazy init: if watermark is 0 (startup sentinel), load persisted value
-                // or derive from the latest fact's created_at timestamp.
-                let mut watermark_millis = self
-                    .fact_extraction_watermark
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if watermark_millis == 0 {
-                    watermark_millis = self
-                        .long_term_memory
-                        .get_fact_watermark(user_id)
-                        .or_else(|| self.fact_store.latest_fact_created_at(user_id))
-                        .unwrap_or(0);
-                    if watermark_millis > 0 {
-                        self.fact_extraction_watermark
-                            .store(watermark_millis, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                let watermark_dt = chrono::DateTime::from_timestamp_millis(watermark_millis)
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-
+                // The full corpus, every heavy cycle. An incremental watermark advanced over
+                // memories the age gate had excluded, so each memory was seen once while too
+                // young and never again, and corroboration could not span two cycles.
+                // ingest_candidate makes re-deriving a stored fact from its counted evidence
+                // a no-op, so the re-scan is idempotent.
                 let memories: Vec<Memory> = all_memories
                     .iter()
-                    .filter(|m| m.created_at > watermark_dt)
                     .map(|arc_mem| arc_mem.as_ref().clone())
                     .collect();
 
-                tracing::info!(
-                    total_memories = all_memories.len(),
-                    new_since_watermark = memories.len(),
-                    watermark = %watermark_dt.format("%Y-%m-%dT%H:%M:%S"),
-                    "Incremental fact extraction"
-                );
-
                 let consolidator = compression::SemanticConsolidator::new();
                 let consolidation_result = consolidator.consolidate(&memories);
+                let memories_eligible = consolidation_result.memories_eligible;
+                tracing::info!(
+                    total_memories = memories.len(),
+                    eligible = memories_eligible,
+                    "Fact extraction over the full corpus"
+                );
 
                 if !consolidation_result.new_facts.is_empty() {
                     // Batch-encode all new fact texts for hybrid dedup
@@ -6273,100 +6710,58 @@ impl MemorySystem {
                         })
                         .collect();
 
-                    let mut truly_new: Vec<(SemanticFact, Option<Vec<f32>>)> = Vec::new();
-
-                    for (fact, embedding) in gated.into_iter() {
-                        // Hybrid dedup: embedding cosine + entity gate + polarity + Jaccard floor
-                        match self.fact_store.find_similar(
+                    // One arbitration policy, shared with distill_facts: see
+                    // SemanticFactStore::ingest_candidate.
+                    let mut newly_active: Vec<SemanticFact> = Vec::new();
+                    for (fact, embedding) in gated {
+                        let outcome = match self.fact_store.ingest_candidate(
                             user_id,
-                            &fact.fact,
-                            &fact.related_entities,
+                            &fact,
                             embedding.as_deref(),
+                            now,
                         ) {
-                            Ok(Some(mut existing)) => {
-                                // Reinforce the existing fact
-                                existing.support_count += 1;
-                                existing.last_reinforced = now;
-                                let confidence_before = existing.confidence;
-                                let boost = 0.1 * (1.0 - existing.confidence);
-                                existing.confidence = (existing.confidence + boost).min(1.0);
-
-                                // Extend source memories and related entities
-                                for src in &fact.source_memories {
-                                    if !existing.source_memories.contains(src) {
-                                        existing.source_memories.push(src.clone());
-                                    }
-                                }
-                                for entity in &fact.related_entities {
-                                    if !existing.related_entities.contains(entity) {
-                                        existing.related_entities.push(entity.clone());
-                                    }
-                                }
-
-                                if let Err(e) = self.fact_store.update(user_id, &existing) {
-                                    tracing::debug!("Failed to reinforce fact: {e}");
-                                } else {
-                                    // Update existing fact's embedding with latest encoding
-                                    if let Some(ref emb) = embedding {
-                                        let _ = self.fact_store.store_embedding(
-                                            user_id,
-                                            &existing.id,
-                                            emb,
-                                        );
-                                    }
-                                    facts_reinforced_count += 1;
-                                    self.record_consolidation_event_for_user(
-                                        user_id,
-                                        ConsolidationEvent::FactReinforced {
-                                            fact_id: existing.id.clone(),
-                                            fact_content: existing.fact.clone(),
-                                            confidence_before,
-                                            confidence_after: existing.confidence,
-                                            new_support_count: existing.support_count,
-                                            timestamp: now,
-                                        },
-                                    );
-                                }
+                            Ok(outcome) => outcome,
+                            Err(e) => {
+                                tracing::warn!(
+                                    fact_id = %fact.id,
+                                    "Fact ingest failed during maintenance: {e}"
+                                );
+                                continue;
                             }
-                            _ => {
-                                truly_new.push((fact.clone(), embedding));
-                            }
+                        };
+                        if let Some((reinforced, confidence_before)) = outcome.reinforced_fact() {
+                            facts_reinforced_count += 1;
+                            self.record_consolidation_event_for_user(
+                                user_id,
+                                ConsolidationEvent::FactReinforced {
+                                    fact_id: reinforced.id.clone(),
+                                    fact_content: reinforced.fact.clone(),
+                                    confidence_before,
+                                    confidence_after: reinforced.confidence,
+                                    new_support_count: reinforced.support_count,
+                                    timestamp: now,
+                                },
+                            );
+                        }
+                        if let Some(stored) = outcome.newly_active_fact() {
+                            facts_extracted_count += 1;
+                            self.record_consolidation_event_for_user(
+                                user_id,
+                                ConsolidationEvent::FactExtracted {
+                                    fact_id: stored.id.clone(),
+                                    fact_content: stored.fact.clone(),
+                                    confidence: stored.confidence,
+                                    fact_type: format!("{:?}", stored.fact_type),
+                                    source_memory_count: stored.source_memories.len(),
+                                    timestamp: now,
+                                },
+                            );
+                            newly_active.push(stored.clone());
                         }
                     }
 
-                    // Store new facts
-                    if !truly_new.is_empty() {
-                        let facts_only: Vec<SemanticFact> =
-                            truly_new.iter().map(|(f, _)| f.clone()).collect();
-                        match self.fact_store.store_batch(user_id, &facts_only) {
-                            Ok(stored) => {
-                                facts_extracted_count = stored;
-                                // Store embeddings for newly persisted facts
-                                for (fact, embedding) in &truly_new {
-                                    if let Some(emb) = embedding {
-                                        let _ =
-                                            self.fact_store.store_embedding(user_id, &fact.id, emb);
-                                    }
-                                    self.record_consolidation_event_for_user(
-                                        user_id,
-                                        ConsolidationEvent::FactExtracted {
-                                            fact_id: fact.id.clone(),
-                                            fact_content: fact.fact.clone(),
-                                            confidence: fact.confidence,
-                                            fact_type: format!("{:?}", fact.fact_type),
-                                            source_memory_count: fact.source_memories.len(),
-                                            timestamp: now,
-                                        },
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to store extracted facts: {e}");
-                            }
-                        }
-
-                        // Connect newly extracted facts to the knowledge graph
-                        self.connect_facts_to_graph(&facts_only);
+                    if !newly_active.is_empty() {
+                        self.connect_facts_to_graph(&newly_active);
                     }
 
                     if facts_extracted_count > 0 || facts_reinforced_count > 0 {
@@ -6378,20 +6773,12 @@ impl MemorySystem {
                     }
                 }
 
-                // Advance watermark to the LAST memory's created_at timestamp,
-                // NOT to now(). Using now() would skip memories created during the
-                // (potentially slow) fact extraction cycle — they'd have created_at
-                // < now() and never be processed for facts.
-                if !memories.is_empty() {
-                    let new_watermark = memories
-                        .iter()
-                        .map(|m| m.created_at.timestamp_millis())
-                        .max()
-                        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-                    self.fact_extraction_watermark
-                        .store(new_watermark, std::sync::atomic::Ordering::Relaxed);
-                    self.long_term_memory
-                        .set_fact_watermark(user_id, new_watermark);
+                // Memories still under the age gate are unfinished work: the flag stays set,
+                // so a store written in one burst and then left quiet is extracted once its
+                // memories age in.
+                if memories_eligible < memories.len() {
+                    self.fact_extraction_needed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         } else {
@@ -7030,39 +7417,13 @@ impl MemorySystem {
         min_support: usize,
         min_age_days: i64,
     ) -> Result<ConsolidationResult> {
-        // Get all memories for consolidation
+        // The full corpus, as in run_maintenance; ingest_candidate keeps the re-scan
+        // idempotent.
         let all_memories = self.get_all_memories()?;
-
-        // Incremental: only process memories created since last extraction watermark
-        let mut watermark_millis = self
-            .fact_extraction_watermark
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if watermark_millis == 0 {
-            watermark_millis = self
-                .long_term_memory
-                .get_fact_watermark(user_id)
-                .or_else(|| self.fact_store.latest_fact_created_at(user_id))
-                .unwrap_or(0);
-            if watermark_millis > 0 {
-                self.fact_extraction_watermark
-                    .store(watermark_millis, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        let watermark_dt = chrono::DateTime::from_timestamp_millis(watermark_millis)
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-
         let memories: Vec<Memory> = all_memories
             .iter()
-            .filter(|m| m.created_at > watermark_dt)
             .map(|arc_mem| arc_mem.as_ref().clone())
             .collect();
-
-        tracing::info!(
-            total_memories = all_memories.len(),
-            new_since_watermark = memories.len(),
-            watermark = %watermark_dt.format("%Y-%m-%dT%H:%M:%S"),
-            "Incremental fact extraction (on-demand)"
-        );
 
         // Create consolidator with custom thresholds
         let consolidator =
@@ -7070,6 +7431,11 @@ impl MemorySystem {
 
         // Run consolidation
         let mut result = consolidator.consolidate(&memories);
+        tracing::info!(
+            total_memories = memories.len(),
+            eligible = result.memories_eligible,
+            "On-demand fact distillation over the full corpus"
+        );
 
         // Store extracted facts with quality gating
         if !result.new_facts.is_empty() {
@@ -7138,50 +7504,57 @@ impl MemorySystem {
                     .collect();
             let facts_gated = result.facts_extracted.saturating_sub(gated_facts.len());
 
-            let gated_fact_refs: Vec<SemanticFact> =
-                gated_facts.iter().map(|(f, _)| f.clone()).collect();
-            let stored = self.fact_store.store_batch(user_id, &gated_fact_refs)?;
+            // The same ingest as maintenance: dedup, reinforcement and contradiction
+            // arbitration all happen in SemanticFactStore::ingest_candidate, which writes as
+            // it goes, so facts minted in one batch also dedup against each other.
+            let now = chrono::Utc::now();
+            let mut newly_active: Vec<SemanticFact> = Vec::new();
+            let mut reinforced = 0usize;
+            for (fact, emb) in &gated_facts {
+                let outcome =
+                    match self
+                        .fact_store
+                        .ingest_candidate(user_id, fact, emb.as_deref(), now)
+                    {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            tracing::warn!(
+                                fact_id = %fact.id,
+                                "Fact ingest failed during distillation: {e}"
+                            );
+                            continue;
+                        }
+                    };
+                if outcome.reinforced_fact().is_some() {
+                    reinforced += 1;
+                }
+                if let Some(stored) = outcome.newly_active_fact() {
+                    self.record_consolidation_event_for_user(
+                        user_id,
+                        ConsolidationEvent::FactExtracted {
+                            fact_id: stored.id.clone(),
+                            fact_content: stored.fact.clone(),
+                            confidence: stored.confidence,
+                            fact_type: format!("{:?}", stored.fact_type),
+                            source_memory_count: stored.source_memories.len(),
+                            timestamp: now,
+                        },
+                    );
+                    newly_active.push(stored.clone());
+                }
+            }
             tracing::info!(
                 user_id = %user_id,
                 facts_extracted = result.facts_extracted,
                 facts_gated,
-                facts_stored = stored,
+                facts_stored = newly_active.len(),
+                facts_reinforced = reinforced,
                 "Semantic distillation complete"
             );
 
-            // Store embeddings for distilled facts
-            for (fact, emb) in &gated_facts {
-                if let Some(emb) = emb {
-                    let _ = self.fact_store.store_embedding(user_id, &fact.id, emb);
-                }
-            }
-
-            // Record consolidation event for each fact (persists significant events)
-            for (fact, _) in &gated_facts {
-                self.record_consolidation_event_for_user(
-                    user_id,
-                    ConsolidationEvent::FactExtracted {
-                        fact_id: fact.id.clone(),
-                        fact_content: fact.fact.clone(),
-                        confidence: fact.confidence,
-                        fact_type: format!("{:?}", fact.fact_type),
-                        source_memory_count: fact.source_memories.len(),
-                        timestamp: chrono::Utc::now(),
-                    },
-                );
-            }
-
-            // Update result with gated facts for return value
-            result.new_facts = gated_fact_refs;
-        }
-
-        // Advance watermark after successful extraction
-        if !memories.is_empty() {
-            let new_watermark = chrono::Utc::now().timestamp_millis();
-            self.fact_extraction_watermark
-                .store(new_watermark, std::sync::atomic::Ordering::Relaxed);
-            self.long_term_memory
-                .set_fact_watermark(user_id, new_watermark);
+            result.facts_reinforced = reinforced;
+            result.new_fact_ids = newly_active.iter().map(|f| f.id.clone()).collect();
+            result.new_facts = newly_active;
         }
 
         Ok(result)
@@ -7499,19 +7872,33 @@ impl MemorySystem {
             if let Some((relation, confidence)) =
                 self.lineage_graph.infer_relation(candidate, new_memory)
             {
-                // Check if edge already exists
-                if !self
+                let existing = self
                     .lineage_graph
-                    .edge_exists(user_id, &candidate.id, &new_memory.id)?
-                {
-                    let edge = LineageEdge::inferred(
-                        candidate.id.clone(),
-                        new_memory.id.clone(),
-                        relation,
-                        confidence,
-                    );
-                    self.lineage_graph.store_edge(user_id, &edge)?;
-                    inferred_edges.push(edge);
+                    .get_edges_from(user_id, &candidate.id)?
+                    .into_iter()
+                    .find(|e| e.to == new_memory.id);
+                match existing {
+                    // A stronger re-inference updates an inferred edge; a confirmed or
+                    // explicit edge is a person's statement and stays as it is.
+                    Some(mut old)
+                        if old.source == lineage::LineageSource::Inferred
+                            && confidence > old.confidence =>
+                    {
+                        old.confidence = confidence;
+                        old.relation = relation;
+                        self.lineage_graph.store_edge(user_id, &old)?;
+                    }
+                    Some(_) => {}
+                    None => {
+                        let edge = LineageEdge::inferred(
+                            candidate.id.clone(),
+                            new_memory.id.clone(),
+                            relation,
+                            confidence,
+                        );
+                        self.lineage_graph.store_edge(user_id, &edge)?;
+                        inferred_edges.push(edge);
+                    }
                 }
             }
         }
@@ -7568,9 +7955,13 @@ impl MemorySystem {
         let user_ids = self.fact_store.list_users(100)?;
 
         for user_id in &user_ids {
-            let facts = self.fact_store.list(user_id, 10000)?;
+            // Retired facts decay too; purged ones are the reaper's.
+            let facts = self.fact_store.list_filtered(user_id, 10000, true)?;
 
             for mut fact in facts {
+                if fact.purged_at.is_some() {
+                    continue;
+                }
                 let days_since_reinforcement = (now - fact.last_reinforced).num_days();
 
                 // Grace period: no decay at all
@@ -7583,9 +7974,15 @@ impl MemorySystem {
                 // Exponential half-life decay: confidence × 0.5^(elapsed / half_life)
                 // Half-life grows linearly with support_count — each corroborating source
                 // is genuine evidence that the fact is stable knowledge.
+                // A retired fact loses the support extension: otherwise the more often a
+                // wrong claim was re-derived, the longer it would outlive its correction.
                 let elapsed = (days_since_reinforcement - FACT_DECAY_GRACE_DAYS) as f64;
-                let half_life = FACT_DECAY_HALF_LIFE_BASE_DAYS
-                    + (fact.support_count as f64 * FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS);
+                let support_extension = if compression::is_active(&fact, now) {
+                    fact.support_count as f64 * FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS
+                } else {
+                    0.0
+                };
+                let half_life = FACT_DECAY_HALF_LIFE_BASE_DAYS + support_extension;
                 let decay_factor = (0.5_f64).powf(elapsed / half_life) as f32;
                 fact.confidence = (confidence_before * decay_factor).max(0.0);
 
@@ -8790,6 +9187,309 @@ mod vector_index_reopen_tests {
             assert!(
                 finds(&sys, needle, id),
                 "reopened after the rebuild: {needle}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::config::StorageBackend;
+    use tempfile::TempDir;
+
+    /// One memory system per storage engine this build carries.
+    fn systems() -> Vec<(StorageBackend, MemorySystem, TempDir)> {
+        let config_for = |tmp: &TempDir| MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        #[cfg(feature = "rocksdb")]
+        {
+            let tmp = TempDir::new().expect("temp dir");
+            let system = MemorySystem::new(config_for(&tmp), None).expect("rocksdb system");
+            out.push((StorageBackend::RocksDb, system, tmp));
+        }
+        #[cfg(feature = "storage-redb")]
+        {
+            let tmp = TempDir::new().expect("temp dir");
+            let primary = crate::storage::redb::RedbPrimaryMemoryStore::open(tmp.path())
+                .expect("redb primary store");
+            let bm25 = Arc::new(
+                hybrid_search::BM25Index::new(&tmp.path().join(BM25_INDEX_DIR)).expect("bm25"),
+            );
+            let system = MemorySystem::with_primary_store_and_bm25_index(
+                config_for(&tmp),
+                Arc::new(primary),
+                None,
+                bm25,
+            )
+            .expect("redb system");
+            out.push((StorageBackend::Redb, system, tmp));
+        }
+        assert!(!out.is_empty(), "no storage engine in this build");
+        out
+    }
+
+    fn memory(exp_type: ExperienceType, content: &str) -> Memory {
+        Memory::new(
+            MemoryId(Uuid::new_v4()),
+            Experience {
+                experience_type: exp_type,
+                content: content.to_string(),
+                entities: vec!["auth".to_string(), "login".to_string()],
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_stronger_reinference_updates_an_inferred_lineage_edge_but_not_a_confirmed_one() {
+        for (backend, system, _tmp) in systems() {
+            let user = "lineage-user";
+            let error = memory(ExperienceType::Error, "login fails with a token error");
+            let mut task = memory(ExperienceType::Task, "fix the login token refresh");
+            task.created_at = error.created_at + chrono::Duration::hours(1);
+
+            let weak = LineageEdge::inferred(
+                error.id.clone(),
+                task.id.clone(),
+                CausalRelation::RelatedTo,
+                0.05,
+            );
+            system.lineage_graph().store_edge(user, &weak).unwrap();
+            let created = system
+                .infer_lineage_for_memory(user, &task, std::slice::from_ref(&error))
+                .unwrap();
+            assert!(
+                created.is_empty(),
+                "{backend}: the edge exists, so none is created"
+            );
+            let edges = system
+                .lineage_graph()
+                .get_edges_from(user, &error.id)
+                .unwrap();
+            assert_eq!(edges.len(), 1, "{backend}");
+            assert_eq!(edges[0].relation, CausalRelation::Caused, "{backend}");
+            assert!(edges[0].confidence > 0.05, "{backend}");
+
+            let other_error = memory(ExperienceType::Error, "login fails again after deploy");
+            let mut other_task = memory(ExperienceType::Task, "roll back the login deploy");
+            other_task.created_at = other_error.created_at + chrono::Duration::hours(1);
+            let mut confirmed = LineageEdge::inferred(
+                other_error.id.clone(),
+                other_task.id.clone(),
+                CausalRelation::RelatedTo,
+                0.05,
+            );
+            confirmed.source = LineageSource::Confirmed;
+            system.lineage_graph().store_edge(user, &confirmed).unwrap();
+            system
+                .infer_lineage_for_memory(user, &other_task, std::slice::from_ref(&other_error))
+                .unwrap();
+            let edges = system
+                .lineage_graph()
+                .get_edges_from(user, &other_error.id)
+                .unwrap();
+            assert_eq!(edges.len(), 1, "{backend}");
+            assert_eq!(edges[0].relation, CausalRelation::RelatedTo, "{backend}");
+            assert_eq!(edges[0].confidence, 0.05, "{backend}");
+        }
+    }
+
+    #[test]
+    fn a_content_duplicate_merges_its_enrichment_and_keeps_the_identity() {
+        for (backend, system, _tmp) in systems() {
+            let content =
+                "The mooring line parted during the night watch and the tender drifted free.";
+            let first = system
+                .remember_detailed(
+                    Experience {
+                        content: content.to_string(),
+                        entities: vec!["mooring".to_string()],
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            assert!(!first.deduped, "{backend}");
+            let before = system.long_term_memory.get(&first.id).unwrap();
+
+            let enriched = Experience {
+                content: content.to_string(),
+                entities: vec!["mooring".to_string(), "kestrel".to_string()],
+                geo_location: Some([39.29, -76.61, 0.0]),
+                ..Default::default()
+            };
+            let second = system.remember_detailed(enriched.clone(), None).unwrap();
+            assert!(second.deduped, "{backend}");
+            assert_eq!(second.id, first.id, "{backend}: a merge never mints an id");
+            assert_eq!(second.delta.entities_added, vec!["kestrel".to_string()]);
+            assert!(second.needs_graph_rebuild(), "{backend}");
+
+            let after = system.long_term_memory.get(&first.id).unwrap();
+            assert_eq!(after.created_at, before.created_at, "{backend}");
+            assert!(
+                after.experience.entities.contains(&"kestrel".to_string()),
+                "{backend}: the merge reaches storage"
+            );
+            assert_eq!(after.experience.geo_location, Some([39.29, -76.61, 0.0]));
+
+            let retry = system.remember_detailed(enriched, None).unwrap();
+            assert!(retry.deduped && retry.delta.is_empty(), "{backend}");
+            assert!(retry.merged_experience.is_none(), "{backend}");
+            assert!(!retry.needs_graph_rebuild(), "{backend}");
+        }
+    }
+
+    fn flag(system: &MemorySystem) -> bool {
+        system
+            .fact_extraction_needed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_heavy_cycle_keeps_the_extraction_flag_while_memories_are_aging_in() {
+        for (backend, system, _tmp) in systems() {
+            system
+                .remember(
+                    Experience {
+                        content:
+                            "The build pipeline promotes artifacts to staging on green CI runs."
+                                .to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            assert!(flag(&system), "{backend}");
+            system.run_maintenance(1.0, "flag-user", true).unwrap();
+            assert!(
+                flag(&system),
+                "{backend}: a young corpus is unfinished work for a later cycle"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heavy_cycle_clears_the_flag_when_the_whole_corpus_was_eligible() {
+        for (backend, system, _tmp) in systems() {
+            system
+                .remember(
+                    Experience {
+                        content:
+                            "The scheduler drains one worker at a time during rolling restarts."
+                                .to_string(),
+                        ..Default::default()
+                    },
+                    Some(chrono::Utc::now() - chrono::Duration::days(10)),
+                )
+                .unwrap();
+            system.run_maintenance(1.0, "flag-user", true).unwrap();
+            assert!(!flag(&system), "{backend}: nothing is left to extract");
+        }
+    }
+
+    fn aged_fact(id: &str, days_unreinforced: i64) -> SemanticFact {
+        let now = chrono::Utc::now();
+        SemanticFact {
+            id: id.to_string(),
+            fact: format!("fact {id} about the release train"),
+            confidence: 0.8,
+            support_count: 10,
+            source_memories: vec![MemoryId(Uuid::new_v4())],
+            related_entities: vec!["release".to_string()],
+            created_at: now - chrono::Duration::days(days_unreinforced + 100),
+            last_reinforced: now - chrono::Duration::days(days_unreinforced),
+            fact_type: FactType::Pattern,
+            valid_from: None,
+            valid_until: None,
+            superseded_by: None,
+            supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_retired_fact_decays_on_the_base_half_life() {
+        for (backend, system, _tmp) in systems() {
+            let user = "decay-user";
+            let active = aged_fact("active", 300);
+            let mut retired = aged_fact("retired", 300);
+            retired.supersede(
+                Some("active"),
+                chrono::Utc::now() - chrono::Duration::days(1),
+            );
+            system.fact_store.store(user, &active).unwrap();
+            system.fact_store.store(user, &retired).unwrap();
+
+            system.decay_facts_for_all_users().unwrap();
+
+            let active = system.fact_store.get(user, "active").unwrap().unwrap();
+            let retired = system.fact_store.get(user, "retired").unwrap().unwrap();
+            assert!(active.confidence < 0.8, "{backend}: the active fact decays");
+            assert!(
+                retired.confidence < active.confidence,
+                "{backend}: support no longer extends a retired fact's half-life ({} vs {})",
+                retired.confidence,
+                active.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn working_to_session_promotion_is_persisted() {
+        for (backend, system, _tmp) in systems() {
+            let in_working = |content: &str, age: chrono::Duration| {
+                let memory = Memory::new(
+                    MemoryId(Uuid::new_v4()),
+                    Experience {
+                        content: content.to_string(),
+                        ..Default::default()
+                    },
+                    0.9,
+                    None,
+                    None,
+                    None,
+                    Some(chrono::Utc::now() - age),
+                );
+                system.long_term_memory.store(&memory).unwrap();
+                system
+                    .working_memory
+                    .write()
+                    .add_shared(Arc::new(memory.clone()))
+                    .unwrap();
+                memory.id
+            };
+            let eligible = in_working(
+                "The release train leaves every second Tuesday at noon.",
+                chrono::Duration::hours(2),
+            );
+            let young = in_working(
+                "The canary build is still running on the staging pool.",
+                chrono::Duration::seconds(5),
+            );
+
+            system.promote_working_to_session().unwrap();
+
+            let stored = system.long_term_memory.get(&eligible).unwrap();
+            assert_eq!(
+                stored.tier,
+                MemoryTier::Session,
+                "{backend}: storage follows"
+            );
+            let control = system.long_term_memory.get(&young).unwrap();
+            assert_eq!(
+                control.tier,
+                MemoryTier::Working,
+                "{backend}: a memory under the age threshold is not promoted"
             );
         }
     }

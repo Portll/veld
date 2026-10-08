@@ -46,10 +46,11 @@ pub fn is_insecure_remote_url(url: &str) -> bool {
 
 /// Resolve an operator-supplied API URL override for an integration.
 ///
-/// Reads `env_var`; if unset or empty, returns `default`. When
-/// `VELD_ENFORCE_HTTPS=true`, insecure non-localhost overrides are rejected
-/// and `default` is used instead. Otherwise an insecure override is accepted
-/// with a warning log.
+/// Reads `env_var`; if unset or empty, returns `default`. An `http://` override
+/// for a non-localhost host would send the integration's token in cleartext, so
+/// it is rejected and `default` is used, unless `VELD_ENFORCE_HTTPS` is `false`
+/// or `0`. Any other value enforces, so a typo fails safe. Localhost `http://`
+/// (proxies, test servers) is always allowed.
 pub fn resolve_api_url_override(env_var: &str, default: &str) -> String {
     let candidate = std::env::var(env_var).unwrap_or_default();
     if candidate.is_empty() {
@@ -57,16 +58,22 @@ pub fn resolve_api_url_override(env_var: &str, default: &str) -> String {
     }
     if is_insecure_remote_url(&candidate) {
         let enforce = std::env::var("VELD_ENFORCE_HTTPS")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
+            .map(|v| {
+                let v = v.trim();
+                !(v.eq_ignore_ascii_case("false") || v == "0")
+            })
+            .unwrap_or(true);
         if enforce {
-            tracing::warn!(
-                "{env_var} override rejected (VELD_ENFORCE_HTTPS=true): \
-                 insecure HTTP for non-localhost host; using default"
+            tracing::error!(
+                "{env_var} override rejected: insecure HTTP for a non-localhost host; \
+                 using the default ({default}). Set VELD_ENFORCE_HTTPS=false to allow it."
             );
             return default.to_string();
         }
-        tracing::warn!("{env_var} override uses insecure HTTP for non-localhost host");
+        tracing::warn!(
+            "{env_var} override uses insecure HTTP for a non-localhost host \
+             (VELD_ENFORCE_HTTPS=false); the token travels in cleartext"
+        );
     }
     candidate
 }
@@ -91,5 +98,94 @@ mod tests {
         assert!(!is_insecure_remote_url("https://remote.example.com/api"));
         // non-http schemes → false
         assert!(!is_insecure_remote_url("ftp://remote.example.com/"));
+    }
+}
+
+/// `VELD_ENFORCE_HTTPS` and the URL overrides are process-wide; every test that
+/// sets them holds this lock.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn with_override_env<T>(
+    enforce: Option<&str>,
+    vars: &[(&str, &str)],
+    f: impl FnOnce() -> T,
+) -> T {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    match enforce {
+        Some(v) => std::env::set_var("VELD_ENFORCE_HTTPS", v),
+        None => std::env::remove_var("VELD_ENFORCE_HTTPS"),
+    }
+    for (name, value) in vars {
+        std::env::set_var(name, value);
+    }
+    let out = f();
+    std::env::remove_var("VELD_ENFORCE_HTTPS");
+    for (name, _) in vars {
+        std::env::remove_var(name);
+    }
+    out
+}
+
+#[cfg(test)]
+mod https_default_tests {
+    use super::{resolve_api_url_override, with_override_env};
+
+    const DEFAULT_URL: &str = "https://api.example.com/v1";
+    const VAR: &str = "VELD_TEST_INTEGRATION_URL";
+
+    fn resolve(enforce: Option<&str>, url: &str) -> String {
+        with_override_env(enforce, &[(VAR, url)], || {
+            resolve_api_url_override(VAR, DEFAULT_URL)
+        })
+    }
+
+    #[test]
+    fn insecure_remote_override_is_rejected_by_default() {
+        assert_eq!(resolve(None, "http://evil.example.com/v1"), DEFAULT_URL);
+    }
+
+    #[test]
+    fn explicit_opt_out_allows_the_insecure_override() {
+        for v in ["false", "0", "FALSE", " false "] {
+            assert_eq!(
+                resolve(Some(v), "http://legacy.internal.example.com/v1"),
+                "http://legacy.internal.example.com/v1",
+                "opt-out value {v:?} ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_value_still_enforces() {
+        for v in ["true", "1", "yes", "nope", ""] {
+            assert_eq!(
+                resolve(Some(v), "http://evil.example.com/v1"),
+                DEFAULT_URL,
+                "value {v:?} must not disable enforcement"
+            );
+        }
+    }
+
+    #[test]
+    fn localhost_http_is_always_allowed() {
+        for url in [
+            "http://localhost:8787/v1",
+            "http://127.0.0.1:3000/v1",
+            "http://[::1]:3000/v1",
+        ] {
+            assert_eq!(resolve(None, url), url);
+        }
+    }
+
+    #[test]
+    fn https_and_unset_overrides_resolve_as_before() {
+        assert_eq!(
+            resolve(None, "https://mirror.example.com/v1"),
+            "https://mirror.example.com/v1"
+        );
+        let unset = with_override_env(None, &[], || resolve_api_url_override(VAR, DEFAULT_URL));
+        assert_eq!(unset, DEFAULT_URL);
     }
 }
