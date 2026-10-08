@@ -248,6 +248,16 @@ enum Commands {
         storage_path: PathBuf,
     },
 
+    /// Manage the keyring: recovery codes, device factors, passphrase and key rotation
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+
+        /// Data directory
+        #[arg(long = "storage", global = true, env = "VELD_MEMORY_PATH", default_value_os_t = veld::config::default_storage_path())]
+        storage_path: PathBuf,
+    },
+
     /// Copy stores from one backend to the other in the same data directory, verified; the source is never modified
     Migrate {
         #[arg(long)]
@@ -272,6 +282,57 @@ enum Commands {
         /// Data directory
         #[arg(long = "storage", env = "VELD_MEMORY_PATH", default_value_os_t = veld::config::default_storage_path())]
         storage_path: PathBuf,
+    },
+}
+
+/// Secrets come from the named environment variable, or are prompted for on a terminal.
+#[derive(Subcommand)]
+enum KeysAction {
+    /// Show the keyring and every keystore it manages, with their factors (nothing is unsealed)
+    Status,
+    /// Create the keyring under VELD_MASTER_PASSPHRASE, enrol every keystore in it and issue a recovery code
+    Init {
+        /// Write the recovery kit to this file (created 0600; never overwritten) instead of printing the code
+        #[arg(long)]
+        kit: Option<PathBuf>,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Issue another recovery code; earlier codes stay valid until revoked
+    AddRecoveryCode {
+        #[arg(long)]
+        kit: Option<PathBuf>,
+        #[arg(long)]
+        label: Option<String>,
+        /// Unlock with a recovery code (VELD_RECOVERY_CODE) instead of the passphrase
+        #[arg(long)]
+        with_recovery_code: bool,
+    },
+    /// Revoke a recovery code or device factor by id (see `status`)
+    Revoke {
+        id: String,
+        #[arg(long)]
+        with_recovery_code: bool,
+    },
+    /// Re-wrap the keyring and every keystore under VELD_NEW_MASTER_PASSPHRASE
+    RotatePassphrase,
+    /// Start a new data-key epoch in every keystore; earlier records stay readable
+    RotateDataKeys {
+        #[arg(long)]
+        with_recovery_code: bool,
+    },
+    /// Replace every master key; recovery codes and device factors are dropped and a new code issued
+    RotateMasterKeys {
+        #[arg(long)]
+        kit: Option<PathBuf>,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Lost passphrase: open the keyring with VELD_RECOVERY_CODE and re-seal everything under VELD_NEW_MASTER_PASSPHRASE
+    Recover {
+        /// Where to write the replacement recovery kit
+        #[arg(long)]
+        kit: Option<PathBuf>,
     },
 }
 
@@ -512,6 +573,7 @@ async fn main() -> Result<()> {
         } => {
             let scope = veld::storage::migrate::Scope::parse(&user)?;
             let reports = tokio::task::spawn_blocking(move || {
+                veld::keyring::install(&storage_path)?;
                 veld::storage::migrate::export(
                     &storage_path,
                     backend,
@@ -533,10 +595,19 @@ async fn main() -> Result<()> {
             storage_path,
         } => {
             let reports = tokio::task::spawn_blocking(move || {
+                veld::keyring::install(&storage_path)?;
                 veld::storage::migrate::import(&storage_path, backend, &input)
             })
             .await??;
             println!("{}", serde_json::to_string_pretty(&reports)?);
+        }
+
+        Commands::Keys {
+            action,
+            storage_path,
+        } => {
+            let report = tokio::task::spawn_blocking(move || keys(&storage_path, action)).await??;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
 
         Commands::ResealJournal {
@@ -546,6 +617,7 @@ async fn main() -> Result<()> {
             storage_path,
         } => {
             let reports = tokio::task::spawn_blocking(move || {
+                veld::keyring::install(&storage_path)?;
                 reseal_journals(&storage_path, backend, &user, dry_run)
             })
             .await??;
@@ -562,6 +634,7 @@ async fn main() -> Result<()> {
         } => {
             let scope = veld::storage::migrate::Scope::parse(&user)?;
             let report = tokio::task::spawn_blocking(move || {
+                veld::keyring::install(&storage_path)?;
                 veld::storage::migrate::migrate(
                     &storage_path,
                     from,
@@ -2268,6 +2341,138 @@ mod tests {
         let resp: RememberResponse = serde_json::from_str(body).expect("must deserialize");
         assert_eq!(resp.id, "mem-xyz");
     }
+}
+
+fn secret(env: &str, prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    if let Ok(v) = std::env::var(env) {
+        if !v.is_empty() {
+            return Ok(zeroize::Zeroizing::new(v));
+        }
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("{env} is not set and there is no terminal to ask on");
+    }
+    eprint!("{prompt}: ");
+    #[cfg(unix)]
+    let echo_off = std::process::Command::new("stty")
+        .arg("-echo")
+        .stdin(std::process::Stdio::inherit())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let mut line = zeroize::Zeroizing::new(String::new());
+    let read = std::io::stdin().read_line(&mut line);
+    #[cfg(unix)]
+    if echo_off {
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+        eprintln!();
+    }
+    read?;
+    let value = zeroize::Zeroizing::new(line.trim_end_matches(['\r', '\n']).to_string());
+    if value.is_empty() {
+        anyhow::bail!("{prompt}: nothing entered");
+    }
+    Ok(value)
+}
+
+/// Write a recovery kit to `path` (0600, refusing to overwrite), or leave it in the
+/// report to print.
+fn deliver_kit(
+    issued: veld::keyring::IssuedCode,
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    let Some(path) = path else {
+        return Ok(serde_json::to_value(issued)?);
+    };
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create {path:?} (an existing kit is never overwritten)"))?;
+    file.write_all(issued.kit.as_bytes())?;
+    file.sync_all()?;
+    Ok(serde_json::json!({ "id": issued.id, "label": issued.label, "kit": path }))
+}
+
+fn keys(storage: &std::path::Path, action: KeysAction) -> anyhow::Result<serde_json::Value> {
+    use veld::keyring;
+    use veld::keystore::Factor;
+    const PASS: &str = "VELD_MASTER_PASSPHRASE";
+    const NEW_PASS: &str = "VELD_NEW_MASTER_PASSPHRASE";
+    const CODE: &str = "VELD_RECOVERY_CODE";
+    let unlock_secret = |with_code: bool| {
+        if with_code {
+            secret(CODE, "Recovery code").map(|s| (true, s))
+        } else {
+            secret(PASS, "Passphrase").map(|s| (false, s))
+        }
+    };
+    fn factor(unlock: &(bool, zeroize::Zeroizing<String>)) -> Factor<'_> {
+        match unlock {
+            (true, code) => Factor::RecoveryCode(code),
+            (false, passphrase) => Factor::Passphrase(passphrase),
+        }
+    }
+    Ok(match action {
+        KeysAction::Status => serde_json::to_value(keyring::status(storage)?)?,
+        KeysAction::Init { kit, label } => {
+            let pass = secret(PASS, "Passphrase")?;
+            let report = keyring::init(storage, &pass, label.as_deref())?;
+            let mut value = serde_json::to_value(&report)?;
+            value["recovery"] = deliver_kit(report.recovery, kit.as_deref())?;
+            value
+        }
+        KeysAction::AddRecoveryCode {
+            kit,
+            label,
+            with_recovery_code,
+        } => {
+            let unlock = unlock_secret(with_recovery_code)?;
+            let issued = keyring::add_recovery_code(storage, &factor(&unlock), label.as_deref())?;
+            deliver_kit(issued, kit.as_deref())?
+        }
+        KeysAction::Revoke {
+            id,
+            with_recovery_code,
+        } => {
+            let unlock = unlock_secret(with_recovery_code)?;
+            serde_json::to_value(keyring::revoke(storage, &factor(&unlock), &id)?)?
+        }
+        KeysAction::RotatePassphrase => {
+            let old = secret(PASS, "Current passphrase")?;
+            let new = secret(NEW_PASS, "New passphrase")?;
+            serde_json::to_value(keyring::rotate_passphrase(storage, &old, &new)?)?
+        }
+        KeysAction::RotateDataKeys { with_recovery_code } => {
+            let unlock = unlock_secret(with_recovery_code)?;
+            serde_json::to_value(keyring::rotate_data_keys(storage, &factor(&unlock))?)?
+        }
+        KeysAction::RotateMasterKeys { kit, label } => {
+            let pass = secret(PASS, "Passphrase")?;
+            let report = keyring::rotate_master_keys(storage, &pass, label.as_deref())?;
+            let mut value = serde_json::to_value(&report)?;
+            value["recovery"] = deliver_kit(report.recovery, kit.as_deref())?;
+            value
+        }
+        KeysAction::Recover { kit } => {
+            let code = secret(CODE, "Recovery code")?;
+            let new = secret(NEW_PASS, "New passphrase")?;
+            let report = keyring::recover(storage, &Factor::RecoveryCode(&code), &new)?;
+            let mut value = serde_json::to_value(&report)?;
+            if let Some(issued) = report.reissued {
+                value["reissued"] = deliver_kit(issued, kit.as_deref())?;
+            }
+            value
+        }
+    })
 }
 
 /// Each tenant's journal is resealed under the key the server would use for it: the

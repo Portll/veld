@@ -34,6 +34,7 @@ pub mod ingest;
 pub mod instance_registry;
 pub mod integrations;
 pub mod intent_log;
+pub mod keyring;
 pub mod keystore;
 pub mod legacy_field_encryption;
 pub mod llm_hosts;
