@@ -13,9 +13,9 @@ use std::sync::Arc;
 use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
-    external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
-    memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time,
-    storage_migration, todos, user_auth, users, visualization, webhooks,
+    external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, keys,
+    lineage, memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions,
+    sleep_time, storage_migration, todos, user_admin, user_auth, users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -159,6 +159,81 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
                 "/api/user_auth/sessions/revoke_mine",
                 post(user_auth::revoke_my_other_sessions),
             )
+            // Self-service: read your account, change your password, rotate your
+            // login recovery codes, end one of your sessions.
+            .route("/api/user_auth/me", get(user_admin::me))
+            .route("/api/user_auth/password", post(user_admin::change_password))
+            .route(
+                "/api/user_auth/recovery_codes",
+                post(user_admin::regenerate_recovery_codes),
+            )
+            .route(
+                "/api/user_auth/sessions/revoke",
+                post(user_admin::revoke_own_session),
+            )
+            // Administering logins: Admin session; every change also needs step-up.
+            .route("/api/user_auth/admin/users", get(user_admin::list_users))
+            .route(
+                "/api/user_auth/admin/users/disable",
+                post(user_admin::disable_user),
+            )
+            .route(
+                "/api/user_auth/admin/users/enable",
+                post(user_admin::enable_user),
+            )
+            .route(
+                "/api/user_auth/admin/users/reset_password",
+                post(user_admin::reset_password),
+            )
+            .route(
+                "/api/user_auth/admin/users/reset_2fa",
+                post(user_admin::reset_2fa),
+            )
+            .route(
+                "/api/user_auth/admin/users/unlock",
+                post(user_admin::unlock_user),
+            )
+            .route(
+                "/api/user_auth/admin/sessions",
+                get(user_admin::list_sessions),
+            )
+            .route(
+                "/api/user_auth/admin/sessions/revoke",
+                post(user_admin::revoke_session),
+            )
+            .route("/api/user_auth/admin/audit", get(user_admin::read_audit))
+            // Key management: the operations of `veld keys`, Admin session plus step-up.
+            .route("/api/user_auth/admin/keys/status", get(keys::status))
+            .route("/api/user_auth/admin/keys/init", post(keys::init))
+            .route(
+                "/api/user_auth/admin/keys/recovery_codes",
+                post(keys::add_recovery_code),
+            )
+            .route("/api/user_auth/admin/keys/revoke", post(keys::revoke))
+            .route(
+                "/api/user_auth/admin/keys/rotate_passphrase",
+                post(keys::rotate_passphrase),
+            )
+            .route(
+                "/api/user_auth/admin/keys/rotate_data_keys",
+                post(keys::rotate_data_keys),
+            )
+            .route(
+                "/api/user_auth/admin/keys/rotate_master_keys",
+                post(keys::rotate_master_keys),
+            )
+            .route(
+                "/api/user_auth/admin/keys/factors",
+                post(keys::enrol_factor),
+            )
+            .route(
+                "/api/user_auth/admin/keys/passkey",
+                post(keys::passkey_start),
+            )
+            .route(
+                "/api/user_auth/admin/keys/passkey/{ticket}",
+                get(keys::passkey_poll),
+            )
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 user_auth::require_user_session,
@@ -167,6 +242,15 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             .route("/api/user_auth/register", post(user_auth::register))
             .route("/api/user_auth/login", post(user_auth::login))
             .route("/api/user_auth/recover", post(user_auth::recover))
+            // The browser page of a passkey enrolment: its ticket is the capability.
+            .route(
+                "/api/user_auth/keys/passkey/{ticket}",
+                get(keys::passkey_page),
+            )
+            .route(
+                "/api/user_auth/keys/passkey/{ticket}/result",
+                post(keys::passkey_result),
+            )
             .merge(session_routes)
     } else {
         Router::new().route(

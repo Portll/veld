@@ -8,6 +8,9 @@
 //! - `throttle:<lowercase>`     → bincode-encoded [`LoginThrottleRecord`] —
 //!   persistent per-username failed-login state. See the throttle section
 //!   below for the schema and the lockout policy.
+//! - `stepup:<uuid>`            → u64 BE: the last TOTP step accepted for step-up
+//! - `audit:<20-digit u64::MAX - nanos>:<hex>` → bincode-encoded [`AuditEvent`],
+//!   so an ascending scan reads newest first
 //!
 //! The username index is kept in lock-step with the user record by writing
 //! both keys in one `put_many`, which is a single atomic batch on both
@@ -27,7 +30,7 @@
 
 use crate::storage::{ColumnStore, FamilyKeyValueStore, KeyValueStore};
 use crate::user_auth::session::{SessionRecord, SessionToken};
-use crate::user_auth::{session, AuthError, UserRecord, UserRole};
+use crate::user_auth::{session, AuditEvent, AuthError, LegacyUserRecord, UserRecord, UserRole};
 
 use chrono::{DateTime, Utc};
 #[cfg(feature = "rocksdb")]
@@ -54,6 +57,8 @@ const USER_PREFIX: &[u8] = b"user:";
 const USERNAME_PREFIX: &[u8] = b"username:";
 const SESSION_PREFIX: &[u8] = b"session:";
 const THROTTLE_PREFIX: &[u8] = b"throttle:";
+const STEP_UP_PREFIX: &[u8] = b"stepup:";
+const AUDIT_PREFIX: &[u8] = b"audit:";
 
 /// Window over which failed login attempts accumulate before a lockout.
 pub const THROTTLE_WINDOW_MINUTES: i64 = 15;
@@ -110,6 +115,12 @@ fn session_key(token_hash: &[u8; 32]) -> Vec<u8> {
     k
 }
 
+fn step_up_key(user_id: &Uuid) -> Vec<u8> {
+    let mut k = STEP_UP_PREFIX.to_vec();
+    k.extend_from_slice(user_id.as_bytes());
+    k
+}
+
 fn throttle_key(username: &str) -> Vec<u8> {
     let lowered = username.to_lowercase();
     let mut k = Vec::with_capacity(THROTTLE_PREFIX.len() + lowered.len());
@@ -127,6 +138,16 @@ fn decode<T: DeserializeOwned>(raw: &[u8], what: &str) -> Result<T, AuthError> {
     bincode::serde::decode_from_slice(raw, bincode::config::standard())
         .map(|(value, _)| value)
         .map_err(|e| AuthError::internal(format!("decode {what}: {e}")))
+}
+
+/// A user record in either shape: as written now, or as written before accounts
+/// could be disabled (one trailing field fewer).
+fn decode_user(raw: &[u8]) -> Result<UserRecord, AuthError> {
+    decode::<UserRecord>(raw, "UserRecord").or_else(|current| {
+        decode::<LegacyUserRecord>(raw, "UserRecord")
+            .map(UserRecord::from)
+            .map_err(|_| current)
+    })
 }
 
 fn storage_err(e: anyhow::Error) -> AuthError {
@@ -196,7 +217,7 @@ impl UserAuthStore {
 
     pub fn get_user(&self, id: &Uuid) -> Result<Option<UserRecord>, AuthError> {
         match self.kv.get_bytes(&user_key(id)).map_err(storage_err)? {
-            Some(raw) => decode(&raw, "UserRecord").map(Some),
+            Some(raw) => decode_user(&raw).map(Some),
             None => Ok(None),
         }
     }
@@ -240,12 +261,113 @@ impl UserAuthStore {
             .scan_prefix(USER_PREFIX, None)
             .map_err(storage_err)?
         {
-            let record: UserRecord = decode(&raw, "UserRecord in admin sweep")?;
+            let record = decode_user(&raw)?;
             if record.role == UserRole::Admin {
                 admins += 1;
             }
         }
         Ok(admins)
+    }
+
+    /// Every user, in username order.
+    pub fn list_users(&self) -> Result<Vec<UserRecord>, AuthError> {
+        let mut users = self
+            .kv
+            .scan_prefix(USER_PREFIX, None)
+            .map_err(storage_err)?
+            .into_iter()
+            .map(|(_, raw)| decode_user(&raw))
+            .collect::<Result<Vec<_>, _>>()?;
+        users.sort_by(|a, b| a.username.cmp(&b.username));
+        Ok(users)
+    }
+
+    /// Every unexpired session of `user_id`, oldest first.
+    pub fn list_sessions_for_user(
+        &self,
+        user_id: &Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<SessionRecord>, AuthError> {
+        let mut sessions = Vec::new();
+        for (_, raw) in self
+            .kv
+            .scan_prefix(SESSION_PREFIX, None)
+            .map_err(storage_err)?
+        {
+            let record: SessionRecord = decode(&raw, "session in listing")?;
+            if record.user_id == *user_id && !record.is_expired(now) {
+                sessions.push(record);
+            }
+        }
+        sessions.sort_by_key(|s| s.created_at);
+        Ok(sessions)
+    }
+
+    /// Delete the session of `user_id` whose public id is `session_id`. `Ok(false)`
+    /// when there is none: an id names a session only together with its user.
+    pub fn delete_session_by_public_id(
+        &self,
+        user_id: &Uuid,
+        session_id: &str,
+    ) -> Result<bool, AuthError> {
+        let removed =
+            self.delete_sessions_where(|s| s.user_id == *user_id && s.public_id() == session_id)?;
+        Ok(removed > 0)
+    }
+
+    // ── Step-up replay guard ────────────────────────────────────────────
+
+    /// The last TOTP time step accepted for a step-up by `user_id`.
+    pub fn last_step_up(&self, user_id: &Uuid) -> Result<Option<u64>, AuthError> {
+        match self
+            .kv
+            .get_bytes(&step_up_key(user_id))
+            .map_err(storage_err)?
+        {
+            Some(raw) => {
+                let bytes: [u8; 8] = raw.as_slice().try_into().map_err(|_| {
+                    AuthError::internal(format!("corrupt step-up row: {} bytes", raw.len()))
+                })?;
+                Ok(Some(u64::from_be_bytes(bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_last_step_up(&self, user_id: &Uuid, step: u64) -> Result<(), AuthError> {
+        self.kv
+            .put_bytes(&step_up_key(user_id), &step.to_be_bytes())
+            .map_err(storage_err)
+    }
+
+    // ── Audit ───────────────────────────────────────────────────────────
+
+    /// Record an administrative event. Keys sort newest first.
+    pub fn append_audit(&self, event: &AuditEvent) -> Result<(), AuthError> {
+        let nanos = event
+            .at
+            .timestamp_nanos_opt()
+            .ok_or_else(|| AuthError::internal("audit timestamp out of range"))?
+            .max(0) as u64;
+        let mut suffix = [0u8; 4];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut suffix);
+        let mut key = AUDIT_PREFIX.to_vec();
+        key.extend_from_slice(
+            format!("{:020}:{}", u64::MAX - nanos, hex::encode(suffix)).as_bytes(),
+        );
+        self.kv
+            .put_bytes(&key, &encode(event, "AuditEvent")?)
+            .map_err(storage_err)
+    }
+
+    /// The `limit` most recent administrative events, newest first.
+    pub fn recent_audit(&self, limit: usize) -> Result<Vec<AuditEvent>, AuthError> {
+        self.kv
+            .scan_prefix(AUDIT_PREFIX, Some(limit))
+            .map_err(storage_err)?
+            .into_iter()
+            .map(|(_, raw)| decode(&raw, "AuditEvent"))
+            .collect()
     }
 
     // ── Login throttle ──────────────────────────────────────────────────
@@ -406,10 +528,16 @@ impl UserAuthStore {
             let _ = self.delete_session_by_hash(&hash);
             return Err(AuthError::InvalidSession);
         }
+        let user = self
+            .get_user(&record.user_id)?
+            .ok_or(AuthError::InvalidSession)?;
+        if user.disabled_at.is_some() {
+            let _ = self.delete_session_by_hash(&hash);
+            return Err(AuthError::AccountDisabled);
+        }
         record.refresh(now);
         self.put_session(&record)?;
-        self.get_user(&record.user_id)?
-            .ok_or(AuthError::InvalidSession)
+        Ok(user)
     }
 }
 
@@ -441,6 +569,52 @@ mod tests {
             role,
             created_at: Utc::now(),
             last_login_at: None,
+            disabled_at: None,
+        }
+    }
+
+    #[test]
+    fn a_user_written_before_accounts_could_be_disabled_still_reads() {
+        for (backend, store, _tmp) in stores() {
+            let current = fixture_user("legacy", UserRole::Admin);
+            let legacy = LegacyUserRecord {
+                id: current.id,
+                username: current.username.clone(),
+                password_hash: current.password_hash.clone(),
+                totp_secret_encrypted: None,
+                totp_enrollment_pending: false,
+                recovery_code_hashes: vec!["h".into()],
+                role: UserRole::Admin,
+                created_at: current.created_at,
+                last_login_at: None,
+            };
+            store
+                .kv
+                .put_many(&[
+                    (user_key(&current.id), encode(&legacy, "legacy").unwrap()),
+                    (username_key("legacy"), current.id.as_bytes().to_vec()),
+                ])
+                .unwrap();
+            let read = store
+                .find_user_by_username("legacy")
+                .unwrap()
+                .unwrap_or_else(|| panic!("{backend}: legacy user unreadable"));
+            assert_eq!(read.recovery_code_hashes, ["h"]);
+            assert!(read.disabled_at.is_none());
+            assert_eq!(store.list_users().unwrap().len(), 1);
+            assert_eq!(store.count_admins().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn the_step_up_row_round_trips_and_a_corrupt_one_is_an_error() {
+        for (_backend, store, _tmp) in stores() {
+            let id = Uuid::new_v4();
+            assert_eq!(store.last_step_up(&id).unwrap(), None);
+            store.put_last_step_up(&id, 42).unwrap();
+            assert_eq!(store.last_step_up(&id).unwrap(), Some(42));
+            store.kv.put_bytes(&step_up_key(&id), b"short").unwrap();
+            assert!(store.last_step_up(&id).is_err());
         }
     }
 

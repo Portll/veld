@@ -131,6 +131,54 @@ pub struct UserRecord {
     pub role: UserRole,
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
+    /// Set when an administrator disabled the account: it cannot sign in and holds
+    /// no sessions. Appended last, so records written before it existed decode
+    /// through [`LegacyUserRecord`].
+    pub disabled_at: Option<DateTime<Utc>>,
+}
+
+/// A [`UserRecord`] as written before accounts could be disabled. bincode is not
+/// self-describing, so the missing trailing field is an end-of-input error rather
+/// than a default; `store` falls back to this shape on that error.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LegacyUserRecord {
+    pub id: Uuid,
+    pub username: String,
+    pub password_hash: String,
+    pub totp_secret_encrypted: Option<Vec<u8>>,
+    pub totp_enrollment_pending: bool,
+    pub recovery_code_hashes: Vec<String>,
+    pub role: UserRole,
+    pub created_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+
+impl From<LegacyUserRecord> for UserRecord {
+    fn from(r: LegacyUserRecord) -> Self {
+        Self {
+            id: r.id,
+            username: r.username,
+            password_hash: r.password_hash,
+            totp_secret_encrypted: r.totp_secret_encrypted,
+            totp_enrollment_pending: r.totp_enrollment_pending,
+            recovery_code_hashes: r.recovery_code_hashes,
+            role: r.role,
+            created_at: r.created_at,
+            last_login_at: r.last_login_at,
+            disabled_at: None,
+        }
+    }
+}
+
+/// One administrative action, kept in the `user_auth` store.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub at: DateTime<Utc>,
+    pub actor: String,
+    pub action: String,
+    pub target: Option<String>,
+    /// JSON text; bincode cannot carry a `serde_json::Value`.
+    pub detail: String,
 }
 
 impl UserRecord {
@@ -178,6 +226,18 @@ pub enum AuthError {
     /// Feature flag is off — request hit a user-auth route despite the
     /// router 404-ing the surface; only reachable in tests.
     Disabled,
+    /// The account was disabled by an administrator.
+    AccountDisabled,
+    /// A change that needs a fresh TOTP code in `X-Veld-Step-Up` came without a valid one.
+    StepUpRequired,
+    /// That step-up code was already used.
+    StepUpReplayed,
+    /// Step-up needs 2FA, and the caller has none enrolled.
+    StepUpUnavailable,
+    /// An admin action aimed at the caller's own account.
+    SelfAdministration,
+    /// No such session for that user.
+    SessionNotFound,
     /// Anything internal: encoding failures, missing CFs, etc.
     Internal(String),
 }
@@ -207,6 +267,12 @@ impl AuthError {
             Self::UserNotFound => "USER_NOT_FOUND",
             Self::LastAdmin => "LAST_ADMIN",
             Self::Disabled => "USER_AUTH_DISABLED",
+            Self::AccountDisabled => "ACCOUNT_DISABLED",
+            Self::StepUpRequired => "STEP_UP_REQUIRED",
+            Self::StepUpReplayed => "STEP_UP_REPLAYED",
+            Self::StepUpUnavailable => "STEP_UP_UNAVAILABLE",
+            Self::SelfAdministration => "SELF_ADMINISTRATION",
+            Self::SessionNotFound => "SESSION_NOT_FOUND",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
     }
@@ -227,6 +293,10 @@ impl AuthError {
             Self::UserNotFound => StatusCode::NOT_FOUND,
             Self::LastAdmin => StatusCode::CONFLICT,
             Self::Disabled => StatusCode::NOT_FOUND,
+            Self::StepUpRequired | Self::StepUpReplayed => StatusCode::UNAUTHORIZED,
+            Self::AccountDisabled | Self::StepUpUnavailable => StatusCode::FORBIDDEN,
+            Self::SelfAdministration => StatusCode::CONFLICT,
+            Self::SessionNotFound => StatusCode::NOT_FOUND,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -253,6 +323,20 @@ impl AuthError {
             Self::UserNotFound => "No user matches the supplied username".to_string(),
             Self::LastAdmin => "Refusing to demote the last remaining administrator".to_string(),
             Self::Disabled => "User auth is disabled on this server".to_string(),
+            Self::AccountDisabled => "This account has been disabled".to_string(),
+            Self::StepUpRequired => {
+                "This action needs a current 2FA code in the X-Veld-Step-Up header".to_string()
+            }
+            Self::StepUpReplayed => {
+                "That 2FA code was already used; wait for the next one".to_string()
+            }
+            Self::StepUpUnavailable => {
+                "This action needs 2FA; enrol it before administering".to_string()
+            }
+            Self::SelfAdministration => {
+                "Use the self-service endpoints for your own account".to_string()
+            }
+            Self::SessionNotFound => "No such session for that user".to_string(),
             Self::Internal(detail) => {
                 tracing::error!(detail = %detail, "user_auth internal error");
                 "Internal server error".to_string()
