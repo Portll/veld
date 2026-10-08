@@ -94,6 +94,9 @@ pub mod prompt_gen;
 
 // User auth (Phase C) — password + TOTP + recovery codes behind a flag
 pub mod user_auth;
+// Administering logins and keys: Admin session plus step-up
+pub mod keys;
+pub mod user_admin;
 
 // Test utilities (compiled only in test builds)
 #[cfg(test)]

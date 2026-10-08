@@ -49,7 +49,17 @@ pub struct SessionRecord {
     pub expires_at: DateTime<Utc>,
 }
 
+/// A session's name in listings: the first 16 hex characters of its token hash.
+/// Enough to tell sessions apart, useless for presenting one.
+pub fn public_id(token_hash: &[u8; 32]) -> String {
+    hex::encode(&token_hash[..8])
+}
+
 impl SessionRecord {
+    pub fn public_id(&self) -> String {
+        public_id(&self.token_hash)
+    }
+
     /// Has this session passed its expiry timestamp?
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         now >= self.expires_at

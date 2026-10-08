@@ -14,14 +14,17 @@ created and the `/api/user_auth/*` routes return 404.
 
 | Variable                  | Effect                                                                                       |
 | ------------------------- | -------------------------------------------------------------------------------------------- |
-| `VELD_USER_AUTH_ENABLED`  | `true` / `1` / `yes` / `on` enables the surface. Default: off (no CF, routes 404).           |
-| `VELD_ENCRYPTION_KEY`     | Reused from the memory subsystem. When set, TOTP secrets at rest are AES-256-GCM encrypted. |
-| `VELD_ENV`                | Reused. `production` makes a missing `VELD_ENCRYPTION_KEY` refuse 2FA enrollment.            |
+| `VELD_USER_AUTH_ENABLED`  | `true` / `1` / `yes` / `on` enables the surface. Default: off (no CF; routes answer 503).    |
+| `VELD_KEYSTORE_PATH`      | With `VELD_MASTER_PASSPHRASE`, the keystore TOTP secrets are sealed under (purpose `totp`).  |
+| `VELD_TLS_ACK`            | Required for key management on a non-loopback bind: TLS terminates in front of veld.        |
 
-No other env vars are introduced. The login throttle (5 attempts / 15 min,
-per-username) is hard-coded — admins can clear it by restarting the
-server or, in the future, an admin endpoint analogous to
-`/api/admin/reset-rate-limit`.
+Without `VELD_KEYSTORE_PATH`, TOTP secrets are sealed under the keyring when the server
+started with one (see [key-management.md](key-management.md)). With neither, 2FA enrollment
+is refused in every mode (`TOTP_ENCRYPTION_REQUIRED`): a 2FA seed is never stored in
+plaintext.
+
+The login throttle (5 attempts / 15 min, per username) is hard-coded. An admin clears it
+for one user with `/api/user_auth/admin/users/unlock`.
 
 ## Endpoint shape
 
@@ -38,6 +41,37 @@ session-token middleware is layered on only the routes that require it.
 | POST   | `/api/user_auth/2fa/confirm`      | Bearer session             | Finalises enrollment with the first valid TOTP.                      |
 | POST   | `/api/user_auth/recover`          | Public (creds + code)      | Consumes one recovery code, resets password, wipes 2FA + sessions.   |
 | POST   | `/api/user_auth/logout`           | Bearer session             | Invalidates the bearer.                                              |
+| GET    | `/api/user_auth/me`               | Bearer session             | Your account and your sessions.                                      |
+| POST   | `/api/user_auth/password`         | Bearer + step-up if 2FA    | `{current_password, new_password}`; ends your other sessions.        |
+| POST   | `/api/user_auth/recovery_codes`   | Bearer + step-up           | A fresh batch of 10 login recovery codes, shown once.                |
+| POST   | `/api/user_auth/sessions/revoke`  | Bearer session             | `{session_id}`: end one of your own sessions.                        |
+
+Administering logins (Admin session; changes also need step-up):
+
+| Method | Path                                         | Notes                                                       |
+| ------ | -------------------------------------------- | ----------------------------------------------------------- |
+| GET    | `/api/user_auth/admin/users`                 | Every user: role, 2FA state, lockout, sessions, disabled.   |
+| POST   | `/api/user_auth/admin/users/disable`         | `{username}`: cannot sign in; every session ends.           |
+| POST   | `/api/user_auth/admin/users/enable`          | `{username}`.                                               |
+| POST   | `/api/user_auth/admin/users/reset_password`  | `{username}`: a temporary password, shown once.             |
+| POST   | `/api/user_auth/admin/users/reset_2fa`       | `{username}`: clears 2FA and recovery codes.                |
+| POST   | `/api/user_auth/admin/users/unlock`          | `{username}`: clears the login lockout.                     |
+| GET    | `/api/user_auth/admin/sessions?username=`    | That user's sessions, by public id.                         |
+| POST   | `/api/user_auth/admin/sessions/revoke`       | `{username, session_id}`.                                   |
+| GET    | `/api/user_auth/admin/audit?limit=`          | Administrative actions, newest first (at most 1000).        |
+
+An admin cannot disable or reset their own account through these routes; the self-service
+routes above ask for the current password instead. Key management lives under
+`/api/user_auth/admin/keys/*` ([key-management.md](key-management.md)).
+
+### Step-up
+
+A change needs a current TOTP code in the `X-Veld-Step-Up` header. A code is accepted
+once per user, so a captured request cannot be replayed inside the code's window. A
+successful step-up elevates that one session for five minutes, so a run of changes asks
+for one code. Elevation is held in memory: a restart asks again. Wrong codes spend the
+caller's own attempt budget. An account without 2FA cannot step up
+(`STEP_UP_UNAVAILABLE`): enrol 2FA before administering.
 
 ### Wire shapes (JSON)
 
@@ -80,11 +114,17 @@ Error responses match Veld's standard `ErrorResponse` shape (`code`,
 | 400  | `WEAK_PASSWORD`              | < 8 chars or username fails validation.                    |
 | 400  | `TOTP_ALREADY_ENROLLED`      | Caller already has active 2FA.                             |
 | 400  | `TOTP_NO_PENDING_ENROLLMENT` | `/2fa/confirm` without prior `/2fa/enroll`.                |
-| 400  | `TOTP_ENCRYPTION_REQUIRED`   | Production mode + no `VELD_ENCRYPTION_KEY` blocks enroll.  |
-| 403  | `FORBIDDEN`                  | Non-admin tried to register a new user.                    |
+| 400  | `TOTP_ENCRYPTION_REQUIRED`   | No keystore or keyring to seal the 2FA secret under.       |
+| 401  | `STEP_UP_REQUIRED`           | A change came without a valid `X-Veld-Step-Up` code.       |
+| 401  | `STEP_UP_REPLAYED`           | That step-up code was already used.                        |
+| 403  | `STEP_UP_UNAVAILABLE`        | The caller has no 2FA to step up with.                     |
+| 403  | `ACCOUNT_DISABLED`           | An admin disabled the account.                             |
+| 403  | `FORBIDDEN`                  | The route needs the Admin role.                            |
+| 409  | `SELF_ADMINISTRATION`        | An admin route aimed at the caller's own account.          |
+| 404  | `SESSION_NOT_FOUND`          | No session with that id for that user.                     |
 | 409  | `USERNAME_TAKEN`             | Registration: username already maps to a user.             |
 | 429  | `TOO_MANY_ATTEMPTS`          | Per-username throttle tripped (5 / 15 min).                |
-| 404  | `USER_AUTH_DISABLED`         | Feature flag is off. (Routes return 404 directly.)         |
+| 503  | `user_auth_disabled`         | Feature flag is off: every route answers 503.              |
 
 ## Sessions
 
@@ -94,9 +134,11 @@ database compromise alone cannot resurrect a live session.
 
 Lifetime: 24 hours, **refreshed on every use**. A session that's exercised
 every few minutes effectively never expires; one that's idle for 24h
-dies. There is no hard cap today — to invalidate everything for a user,
-trigger `/api/user_auth/recover` (which wipes all sessions) or restart
-the server.
+dies. There is no hard cap. A user ends their own sessions with
+`/sessions/revoke` or `/sessions/revoke_mine`; an admin ends one with
+`/admin/sessions/revoke`, all of a user's with `/sessions/revoke_all`, and
+disabling an account or resetting its password or 2FA ends them all. A
+session's public id is the first 16 hex characters of its token hash.
 
 ## TOTP
 
@@ -106,11 +148,10 @@ either side of "now") to handle mildly mis-synced clocks. The
 provisioning URI uses issuer `"Veld"` and the username as the account
 label (URL-encoded by `totp-rs`).
 
-The HMAC secret is encrypted with `FieldEncryptor` (AES-256-GCM)
-whenever `VELD_ENCRYPTION_KEY` is configured. In development mode with
-no key, secrets are stored as raw bytes and a WARN log fires. In
-production mode (`VELD_ENV=production`) without the key, enrollment is
-refused with `TOTP_ENCRYPTION_REQUIRED`.
+The HMAC secret is sealed with XChaCha20-Poly1305 under the `totp` purpose
+key of the `VELD_KEYSTORE_PATH` keystore, or of the keyring when that is
+unset, with the user id bound in as associated data. With neither,
+enrollment is refused with `TOTP_ENCRYPTION_REQUIRED`.
 
 ## Recovery codes
 
@@ -170,7 +211,10 @@ the harder-to-misuse design.
 - `src/user_auth/recovery_codes.rs` — generation / redeem.
 - `src/user_auth/session.rs` — token issuance / refresh / hashing.
 - `src/user_auth/store.rs` — RocksDB persistence under the `user_auth` CF.
-- `src/user_auth/runtime.rs` — long-lived runtime (store + login limiter
-  + field encryptor) wired into `MultiUserMemoryManager`.
+- `src/user_auth/runtime.rs` — long-lived runtime (store, login limiter,
+  step-up elevations, TOTP encryptor) wired into `MultiUserMemoryManager`.
 - `src/handlers/user_auth.rs` — Axum handlers + session-bearer
   middleware.
+- `src/handlers/user_admin.rs` — administering logins, self-service, the
+  audit trail, and the step-up check.
+- `src/handlers/keys.rs` — key management over HTTP.

@@ -312,6 +312,9 @@ pub struct MultiUserMemoryManager {
     /// /api/user_auth/* surface returns 404.
     pub user_auth_runtime: Option<crate::user_auth::runtime::UserAuthRuntime>,
 
+    /// Passkey enrolments waiting for the browser (`handlers::keys`).
+    pub passkey_tickets: super::keys::PasskeyTickets,
+
     /// Optional relational-backed dataset store (W7). `None` when no
     /// relational backend has been wired (the v0.9 redb-cutover work will
     /// flip this to mandatory). Handlers behind `/api/datasets/*` return
@@ -628,10 +631,12 @@ impl MultiUserMemoryManager {
                     // A configured keystore that cannot be used refuses the start, as the
                     // record store does: starting without an encryptor stored TOTP secrets
                     // in plaintext outside production mode.
-                    let totp_encryptor = crate::keystore::SecretCryptor::from_env("totp").context(
-                        "keystore (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE) is configured but \
-                         unusable; refusing to start user-auth without an encryptor",
-                    )?;
+                    let totp_encryptor = crate::keystore::SecretCryptor::from_env("totp")
+                        .context(
+                            "keystore (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE) is configured but \
+                             unusable; refusing to start user-auth without an encryptor",
+                        )?
+                        .or_else(|| crate::keyring::installed_cryptor("totp"));
                     info!(
                         encryption = totp_encryptor.is_some(),
                         "user-auth runtime initialised (VELD_USER_AUTH_ENABLED=true)"
@@ -706,6 +711,7 @@ impl MultiUserMemoryManager {
             wiki_watchers: DashMap::new(),
             storage_capabilities,
             user_auth_runtime,
+            passkey_tickets: Default::default(),
             // W7: dataset / link stores are opt-in until the relational
             // backend is wired into server bootstrap. Tests construct
             // these in-place via `with_dataset_stores`.
