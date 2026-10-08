@@ -191,7 +191,11 @@ pub fn run() {
             pick_directory,
             minimize_window,
             toggle_maximize,
-            hide_window
+            hide_window,
+            security_request,
+            enclave,
+            save_secret_file,
+            open_in_browser
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
@@ -407,6 +411,146 @@ async fn pick_directory(app: AppHandle) -> Option<String> {
         .flatten()
         .and_then(|fp| fp.into_path().ok())
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// A call to `/api/user_auth/*` (logins and keys) for the Security tab. The
+/// session token lives only in the webview's memory and rides each call. Key
+/// operations run Argon2 over every keystore, hence the long timeout.
+#[tauri::command]
+async fn security_request(
+    base_url: String,
+    method: String,
+    path: String,
+    session: Option<String>,
+    step_up: Option<String>,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let (status, body) = StatusClient::security_request(
+        &base_url,
+        &method,
+        &path,
+        session.as_deref(),
+        step_up.as_deref(),
+        body,
+        Duration::from_secs(180),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "status": status, "body": body }))
+}
+
+/// `VELD_ENCLAVE_HELPER`, else `veld-enclave` beside this app, else on PATH.
+fn enclave_helper() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("VELD_ENCLAVE_HELPER") {
+        if !path.trim().is_empty() {
+            return path.into();
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("veld-enclave")))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| "veld-enclave".into())
+}
+
+/// Run the Touch ID helper on this Mac: `probe`, `list`, `enrol` or `unlock`. A
+/// released secret goes back to the webview, which posts it to veld over the same
+/// connection as the rest of the Security tab.
+#[tauri::command]
+async fn enclave(
+    action: String,
+    id: Option<String>,
+    label: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let mut args = vec![action.clone()];
+    match action.as_str() {
+        "probe" | "list" => {}
+        "enrol" => {
+            if let Some(label) = label {
+                args.extend(["--label".into(), label]);
+            }
+        }
+        "unlock" => {
+            args.extend(["--id".into(), id.ok_or("unlock needs an id")?]);
+            args.extend(["--reason".into(), "authorise a change to the veld keyring".into()]);
+        }
+        other => return Err(format!("unknown enclave action {other}")),
+    }
+    let helper = enclave_helper();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&helper)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("run {}: {e}", helper.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("helper output: {e}"))
+}
+
+/// Save a recovery kit where the user chooses, readable by its owner only.
+#[tauri::command]
+async fn save_secret_file(
+    app: AppHandle,
+    suggested_name: String,
+    contents: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&suggested_name)
+        .save_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+    let Some(path) = rx
+        .await
+        .ok()
+        .flatten()
+        .and_then(|fp| fp.into_path().ok())
+    else {
+        return Ok(None);
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    use std::io::Write;
+    let mut file = options.open(&path).map_err(|e| e.to_string())?;
+    file.write_all(contents.as_bytes()).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+/// Open a veld page in the system browser: passkeys need one, a webview cannot
+/// reach the platform authenticator without entitlements.
+#[tauri::command]
+fn open_in_browser(url: String) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("only http(s) URLs open".into());
+    }
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url.as_str()])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", vec!["/C", "start", "", url.as_str()])
+    } else {
+        ("xdg-open", vec![url.as_str()])
+    };
+    std::process::Command::new(program)
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Keep the fleet in sync with the registry: add pollers for newly-online

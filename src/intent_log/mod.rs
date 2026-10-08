@@ -78,6 +78,7 @@ pub mod journal;
 pub mod migrations;
 pub mod payload;
 pub mod projection;
+pub mod reseal;
 pub use checkpoint_store::{CheckpointStore, CheckpointStoreError};
 pub use header::{HeaderError, IntentLogHeader, CURRENT_FORMAT_VERSION, HEADER_BYTES, MAGIC};
 pub use journal::{ApplyError, JournalError, JournaledWriter, TypedProjection, WriteOutcome};

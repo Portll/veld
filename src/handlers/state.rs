@@ -313,6 +313,9 @@ pub struct MultiUserMemoryManager {
     /// /api/user_auth/* surface returns 404.
     pub user_auth_runtime: Option<crate::user_auth::runtime::UserAuthRuntime>,
 
+    /// Passkey enrolments waiting for the browser (`handlers::keys`).
+    pub passkey_tickets: super::keys::PasskeyTickets,
+
     /// Optional relational-backed dataset store (W7). `None` when no
     /// relational backend has been wired (the v0.9 redb-cutover work will
     /// flip this to mandatory). Handlers behind `/api/datasets/*` return
@@ -628,16 +631,15 @@ impl MultiUserMemoryManager {
                 shared_stores.shared_db.column_store(),
             ) {
                 Ok(store) => {
-                    let totp_encryptor = match crate::keystore::SecretCryptor::from_env("totp") {
-                        Ok(encryptor) => encryptor,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "keystore (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE) present but unusable; user-auth runtime starts without an encryptor (2FA enrollment will be refused in production mode)"
-                            );
-                            None
-                        }
-                    };
+                    // A configured keystore that cannot be used refuses the start, as the
+                    // record store does: starting without an encryptor stored TOTP secrets
+                    // in plaintext outside production mode.
+                    let totp_encryptor = crate::keystore::SecretCryptor::from_env("totp")
+                        .context(
+                            "keystore (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE) is configured but \
+                             unusable; refusing to start user-auth without an encryptor",
+                        )?
+                        .or_else(|| crate::keyring::installed_cryptor("totp"));
                     info!(
                         encryption = totp_encryptor.is_some(),
                         "user-auth runtime initialised (VELD_USER_AUTH_ENABLED=true)"
@@ -712,6 +714,7 @@ impl MultiUserMemoryManager {
             wiki_watchers: DashMap::new(),
             storage_capabilities,
             user_auth_runtime,
+            passkey_tickets: Default::default(),
             // W7: dataset / link stores are opt-in until the relational
             // backend is wired into server bootstrap. Tests construct
             // these in-place via `with_dataset_stores`.
@@ -1227,6 +1230,53 @@ impl MultiUserMemoryManager {
         } else {
             events
         }
+    }
+
+    /// Where the tenant's record store keeps its keystore: beside `storage.redb`,
+    /// or inside the RocksDB `storage/` directory.
+    fn record_keystore_path(&self, user_id: &str) -> Result<std::path::PathBuf> {
+        Ok(crate::keystore::store_keystore_path(
+            &self.user_dir(user_id)?,
+            self.server_config.effective_storage_backend,
+        ))
+    }
+
+    /// The key a tenant's `purpose` data (journal, slow store) is sealed under: the
+    /// global keystore when VELD_KEYSTORE_PATH is set, otherwise the tenant's store
+    /// keystore. A passphrase alone seals the records under the store keystore, and
+    /// the journal and slow store hold the same memories as full snapshots, so they
+    /// are sealed under it too: one keystore, one decision.
+    fn purpose_cryptor(
+        &self,
+        user_id: &str,
+        purpose: &str,
+    ) -> Result<Option<crate::keystore::SecretCryptor>> {
+        match crate::keystore::SecretCryptor::from_env(purpose)
+            .with_context(|| format!("derive {purpose} encryptor for user {user_id}"))?
+        {
+            Some(cryptor) => Ok(Some(cryptor)),
+            None => crate::keystore::SecretCryptor::from_record_keystore(
+                &self.record_keystore_path(user_id)?,
+                purpose,
+            )
+            .with_context(|| {
+                format!("derive {purpose} encryptor for user {user_id} from its store keystore")
+            }),
+        }
+    }
+
+    /// Whether this tenant's data is sealed at rest: a global keystore is set, a
+    /// passphrase is set (the store creates its keystore from it), or the store
+    /// already has one (a KMS-only unseal).
+    fn tenant_encrypted(&self, user_id: &str) -> Result<bool> {
+        let set = |k: &str| {
+            std::env::var(k)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        };
+        Ok(set("VELD_KEYSTORE_PATH")
+            || set("VELD_MASTER_PASSPHRASE")
+            || self.record_keystore_path(user_id)?.exists())
     }
 
     /// The per-user state directory, with the identifier validated as a single path component
@@ -1902,7 +1952,11 @@ impl MultiUserMemoryManager {
         let user_path = self.user_dir(user_id)?;
         std::fs::create_dir_all(&user_path)?;
         let db_path = user_path.join("slow_store.db");
-        let store = std::sync::Arc::new(crate::memory::slow_store::SlowStore::open(&db_path)?);
+        // Full memory snapshots, like the journal: sealed under the same keystore.
+        let store = std::sync::Arc::new(crate::memory::slow_store::SlowStore::open_with_encryptor(
+            &db_path,
+            self.purpose_cryptor(user_id, "slow-store")?,
+        )?);
         self.slow_stores.insert(user_id.to_string(), store.clone());
         Ok(store)
     }
@@ -1933,11 +1987,20 @@ impl MultiUserMemoryManager {
         }
         let user_path = self.user_dir(user_id)?;
         let bm25_path = user_path.join(crate::memory::BM25_INDEX_DIR);
-        std::fs::create_dir_all(&bm25_path)?;
-        let index = std::sync::Arc::new(
-            crate::memory::BM25Index::new(&bm25_path)
-                .with_context(|| format!("open BM25 projection index for user {user_id}"))?,
-        );
+        // An encrypted tenant's index stays in memory: on disk it would be a
+        // plaintext copy of the content its sealed records and journal protect.
+        let index = if self.tenant_encrypted(user_id)? {
+            std::sync::Arc::new(
+                crate::memory::BM25Index::in_memory(&bm25_path)
+                    .with_context(|| format!("open in-memory BM25 index for user {user_id}"))?,
+            )
+        } else {
+            std::fs::create_dir_all(&bm25_path)?;
+            std::sync::Arc::new(
+                crate::memory::BM25Index::new(&bm25_path)
+                    .with_context(|| format!("open BM25 projection index for user {user_id}"))?,
+            )
+        };
         self.bm25_indices.insert(user_id.to_string(), index.clone());
         Ok(index)
     }
@@ -1998,8 +2061,10 @@ impl MultiUserMemoryManager {
         // keystore-derived "journal" purpose key — so the WAL never holds
         // plaintext memory snapshots on disk (or in backups). `None` (no keystore
         // configured) keeps the journal plaintext, backward compatible.
-        let journal_cryptor = crate::keystore::SecretCryptor::from_env("journal")
-            .with_context(|| format!("derive journal encryptor for user {user_id}"))?;
+        // Without VELD_KEYSTORE_PATH the key comes from the store's own keystore:
+        // a passphrase alone seals the records, and the journal beside them holds
+        // the same memories, so it is sealed under the same keystore.
+        let journal_cryptor = self.purpose_cryptor(user_id, "journal")?;
         let log = crate::intent_log::IntentLog::open_with_cryptor(&log_path, journal_cryptor)
             .with_context(|| format!("open intent log for user {user_id}"))?;
         let checkpoint_store = std::sync::Arc::new(parking_lot::Mutex::new(
@@ -2120,8 +2185,16 @@ impl MultiUserMemoryManager {
         // Third projection: BM25 inverted index. Same independent-checkpoint
         // pattern — a stalled BM25 can't block the others' catch-up.
         let bm25_index = self.get_user_bm25_index(user_id)?;
-        let mut bm25_projection =
-            crate::memory::Bm25Projection::new(bm25_index.clone(), checkpoint_store.clone());
+        // An in-memory index starts empty every time, so its projection replays
+        // the whole log rather than resuming from the checkpoint a past index wrote.
+        let mut bm25_projection = if bm25_index.is_in_memory() {
+            crate::memory::Bm25Projection::new_from_start(
+                bm25_index.clone(),
+                checkpoint_store.clone(),
+            )
+        } else {
+            crate::memory::Bm25Projection::new(bm25_index.clone(), checkpoint_store.clone())
+        };
         let bm25_applied = crate::intent_log::replay(
             &log,
             &mut bm25_projection,

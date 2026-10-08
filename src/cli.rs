@@ -229,6 +229,35 @@ enum Commands {
         storage_path: PathBuf,
     },
 
+    /// One-off: seal intent-log frames and slow-store payloads written before they were encrypted. Stop the server first.
+    ResealJournal {
+        /// Storage backend the tenants use (decides where each store keystore lives)
+        #[arg(long, env = "VELD_STORAGE_BACKEND", default_value_t = veld::config::default_requested_storage_backend())]
+        backend: StorageBackend,
+
+        /// User id, or `all` for every tenant with an intent log
+        #[arg(long, default_value = "all")]
+        user: String,
+
+        /// Count the plaintext frames and write nothing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Data directory
+        #[arg(long = "storage", env = "VELD_MEMORY_PATH", default_value_os_t = veld::config::default_storage_path())]
+        storage_path: PathBuf,
+    },
+
+    /// Manage the keyring: recovery codes, device factors, passphrase and key rotation
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+
+        /// Data directory
+        #[arg(long = "storage", global = true, env = "VELD_MEMORY_PATH", default_value_os_t = veld::config::default_storage_path())]
+        storage_path: PathBuf,
+    },
+
     /// Copy stores from one backend to the other in the same data directory, verified; the source is never modified
     Migrate {
         #[arg(long)]
@@ -253,6 +282,93 @@ enum Commands {
         /// Data directory
         #[arg(long = "storage", env = "VELD_MEMORY_PATH", default_value_os_t = veld::config::default_storage_path())]
         storage_path: PathBuf,
+    },
+}
+
+/// What opens the keyring for a `veld keys` command: the passphrase by default.
+#[derive(clap::Args, Clone, Default)]
+struct UnlockArgs {
+    /// Unlock with a recovery code (VELD_RECOVERY_CODE, or asked for)
+    #[arg(long, conflicts_with_all = ["with_touch_id", "with_passkey"])]
+    with_recovery_code: bool,
+    /// Unlock with Touch ID: the id of an enrolled Secure Enclave factor (see `status`)
+    #[arg(long, value_name = "ID", conflicts_with = "with_passkey")]
+    with_touch_id: Option<String>,
+    /// Unlock with an enrolled passkey, in the browser
+    #[arg(long)]
+    with_passkey: bool,
+}
+
+/// Secrets come from the named environment variable, or are prompted for on a terminal.
+#[derive(Subcommand)]
+enum KeysAction {
+    /// Show the keyring and every keystore it manages, with their factors (nothing is unsealed)
+    Status,
+    /// Create the keyring under VELD_MASTER_PASSPHRASE, enrol every keystore in it and issue a recovery code
+    Init {
+        /// Write the recovery kit to this file (created 0600; never overwritten) instead of printing the code
+        #[arg(long)]
+        kit: Option<PathBuf>,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Issue another recovery code; earlier codes stay valid until revoked
+    AddRecoveryCode {
+        #[arg(long)]
+        kit: Option<PathBuf>,
+        #[arg(long)]
+        label: Option<String>,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    /// Enrol Touch ID on this Mac through the veld-enclave helper
+    EnrolTouchId {
+        #[arg(long)]
+        label: Option<String>,
+        /// `biometry` (current fingerprints only) or `presence` (Touch ID or the login password)
+        #[arg(long, default_value = "biometry")]
+        policy: String,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    /// Enrol a passkey (Touch ID, Face ID, a security key) through the browser
+    EnrolPasskey {
+        #[arg(long)]
+        label: Option<String>,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    /// Revoke a recovery code or device factor by id (see `status`)
+    Revoke {
+        id: String,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    /// Re-wrap the keyring and every keystore under VELD_NEW_MASTER_PASSPHRASE
+    RotatePassphrase,
+    /// Start a new data-key epoch in every keystore; earlier records stay readable
+    RotateDataKeys {
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    /// Replace every master key; recovery codes and device factors are dropped and a new code issued
+    RotateMasterKeys {
+        #[arg(long)]
+        kit: Option<PathBuf>,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Lost passphrase: open the keyring with a recovery code, Touch ID or a passkey and re-seal everything under VELD_NEW_MASTER_PASSPHRASE
+    Recover {
+        /// Where to write the replacement recovery kit when a recovery code was used
+        #[arg(long)]
+        kit: Option<PathBuf>,
+        /// Recover with Touch ID: the id of an enrolled Secure Enclave factor
+        #[arg(long, value_name = "ID", conflicts_with = "passkey")]
+        touch_id: Option<String>,
+        /// Recover with an enrolled passkey, in the browser
+        #[arg(long)]
+        passkey: bool,
     },
 }
 
@@ -493,6 +609,7 @@ async fn main() -> Result<()> {
         } => {
             let scope = veld::storage::migrate::Scope::parse(&user)?;
             let reports = tokio::task::spawn_blocking(move || {
+                veld::keyring::install(&storage_path)?;
                 veld::storage::migrate::export(
                     &storage_path,
                     backend,
@@ -514,7 +631,30 @@ async fn main() -> Result<()> {
             storage_path,
         } => {
             let reports = tokio::task::spawn_blocking(move || {
+                veld::keyring::install(&storage_path)?;
                 veld::storage::migrate::import(&storage_path, backend, &input)
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+        }
+
+        Commands::Keys {
+            action,
+            storage_path,
+        } => {
+            let report = tokio::task::spawn_blocking(move || keys(&storage_path, action)).await??;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+
+        Commands::ResealJournal {
+            backend,
+            user,
+            dry_run,
+            storage_path,
+        } => {
+            let reports = tokio::task::spawn_blocking(move || {
+                veld::keyring::install(&storage_path)?;
+                reseal_journals(&storage_path, backend, &user, dry_run)
             })
             .await??;
             println!("{}", serde_json::to_string_pretty(&reports)?);
@@ -530,6 +670,7 @@ async fn main() -> Result<()> {
         } => {
             let scope = veld::storage::migrate::Scope::parse(&user)?;
             let report = tokio::task::spawn_blocking(move || {
+                veld::keyring::install(&storage_path)?;
                 veld::storage::migrate::migrate(
                     &storage_path,
                     from,
@@ -2236,4 +2377,316 @@ mod tests {
         let resp: RememberResponse = serde_json::from_str(body).expect("must deserialize");
         assert_eq!(resp.id, "mem-xyz");
     }
+}
+
+fn secret(env: &str, prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    if let Ok(v) = std::env::var(env) {
+        if !v.is_empty() {
+            return Ok(zeroize::Zeroizing::new(v));
+        }
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("{env} is not set and there is no terminal to ask on");
+    }
+    eprint!("{prompt}: ");
+    #[cfg(unix)]
+    let echo_off = std::process::Command::new("stty")
+        .arg("-echo")
+        .stdin(std::process::Stdio::inherit())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let mut line = zeroize::Zeroizing::new(String::new());
+    let read = std::io::stdin().read_line(&mut line);
+    #[cfg(unix)]
+    if echo_off {
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+        eprintln!();
+    }
+    read?;
+    let value = zeroize::Zeroizing::new(line.trim_end_matches(['\r', '\n']).to_string());
+    if value.is_empty() {
+        anyhow::bail!("{prompt}: nothing entered");
+    }
+    Ok(value)
+}
+
+/// Write a recovery kit to `path` (0600, refusing to overwrite), or leave it in the
+/// report to print.
+fn deliver_kit(
+    issued: veld::keyring::IssuedCode,
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    let Some(path) = path else {
+        return Ok(serde_json::to_value(issued)?);
+    };
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create {path:?} (an existing kit is never overwritten)"))?;
+    file.write_all(issued.kit.as_bytes())?;
+    file.sync_all()?;
+    Ok(serde_json::json!({ "id": issued.id, "label": issued.label, "kit": path }))
+}
+
+/// An unlock factor with the secret it carries, zeroized on drop.
+enum Unlocker {
+    Passphrase(zeroize::Zeroizing<String>),
+    RecoveryCode(zeroize::Zeroizing<String>),
+    Device {
+        provider: &'static str,
+        id: String,
+        secret: zeroize::Zeroizing<Vec<u8>>,
+    },
+}
+
+impl Unlocker {
+    fn factor(&self) -> veld::keystore::Factor<'_> {
+        use veld::keystore::Factor;
+        match self {
+            Unlocker::Passphrase(p) => Factor::Passphrase(p),
+            Unlocker::RecoveryCode(c) => Factor::RecoveryCode(c),
+            Unlocker::Device {
+                provider,
+                id,
+                secret,
+            } => Factor::Secret {
+                provider,
+                id,
+                secret,
+            },
+        }
+    }
+}
+
+const PASSKEY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn touch_id(id: &str) -> anyhow::Result<Unlocker> {
+    let released = veld::keyring::enclave::unlock(id, "unlock the veld keyring")?;
+    Ok(Unlocker::Device {
+        provider: veld::keystore::PROVIDER_SECURE_ENCLAVE,
+        id: released.id,
+        secret: released.secret,
+    })
+}
+
+fn passkey(storage: &std::path::Path) -> anyhow::Result<Unlocker> {
+    let factors: Vec<String> = veld::keyring::status(storage)?
+        .keyring
+        .map(|k| k.factors)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| f.provider == veld::keystore::PROVIDER_PASSKEY)
+        .map(|f| f.id)
+        .collect();
+    if factors.is_empty() {
+        anyhow::bail!("no passkey is enrolled on the keyring");
+    }
+    let released =
+        tokio::runtime::Handle::current().block_on(veld::keyring::passkey::run_on_loopback(
+            veld::keyring::passkey::Ceremony::Unlock { factors },
+            PASSKEY_TIMEOUT,
+        ))?;
+    Ok(Unlocker::Device {
+        provider: veld::keystore::PROVIDER_PASSKEY,
+        id: released.id,
+        secret: released.secret,
+    })
+}
+
+fn unlocker(storage: &std::path::Path, args: &UnlockArgs) -> anyhow::Result<Unlocker> {
+    if args.with_recovery_code {
+        Ok(Unlocker::RecoveryCode(secret(
+            "VELD_RECOVERY_CODE",
+            "Recovery code",
+        )?))
+    } else if let Some(id) = &args.with_touch_id {
+        touch_id(id)
+    } else if args.with_passkey {
+        passkey(storage)
+    } else {
+        Ok(Unlocker::Passphrase(secret(
+            "VELD_MASTER_PASSPHRASE",
+            "Passphrase",
+        )?))
+    }
+}
+
+fn keys(storage: &std::path::Path, action: KeysAction) -> anyhow::Result<serde_json::Value> {
+    use veld::keyring;
+    const PASS: &str = "VELD_MASTER_PASSPHRASE";
+    const NEW_PASS: &str = "VELD_NEW_MASTER_PASSPHRASE";
+    Ok(match action {
+        KeysAction::Status => serde_json::to_value(keyring::status(storage)?)?,
+        KeysAction::Init { kit, label } => {
+            let pass = secret(PASS, "Passphrase")?;
+            let report = keyring::init(storage, &pass, label.as_deref())?;
+            let mut value = serde_json::to_value(&report)?;
+            value["recovery"] = deliver_kit(report.recovery, kit.as_deref())?;
+            value
+        }
+        KeysAction::AddRecoveryCode { kit, label, unlock } => {
+            let unlock = unlocker(storage, &unlock)?;
+            let issued = keyring::add_recovery_code(storage, &unlock.factor(), label.as_deref())?;
+            deliver_kit(issued, kit.as_deref())?
+        }
+        KeysAction::EnrolTouchId {
+            label,
+            policy,
+            unlock,
+        } => {
+            let unlock = unlocker(storage, &unlock)?;
+            let enrolled = keyring::enclave::enrol(label.as_deref(), &policy)?;
+            serde_json::to_value(keyring::enrol_secret(
+                storage,
+                &unlock.factor(),
+                veld::keystore::PROVIDER_SECURE_ENCLAVE,
+                &enrolled.id,
+                enrolled.label.as_deref().or(label.as_deref()),
+                &enrolled.secret,
+            )?)?
+        }
+        KeysAction::EnrolPasskey { label, unlock } => {
+            let unlock = unlocker(storage, &unlock)?;
+            let label = label.unwrap_or_else(|| "passkey (localhost)".to_string());
+            let created =
+                tokio::runtime::Handle::current().block_on(keyring::passkey::run_on_loopback(
+                    keyring::passkey::Ceremony::Enrol {
+                        label: label.clone(),
+                    },
+                    PASSKEY_TIMEOUT,
+                ))?;
+            serde_json::to_value(keyring::enrol_secret(
+                storage,
+                &unlock.factor(),
+                veld::keystore::PROVIDER_PASSKEY,
+                &created.id,
+                Some(&label),
+                &created.secret,
+            )?)?
+        }
+        KeysAction::Revoke { id, unlock } => {
+            let unlock = unlocker(storage, &unlock)?;
+            serde_json::to_value(keyring::revoke(storage, &unlock.factor(), &id)?)?
+        }
+        KeysAction::RotatePassphrase => {
+            let old = secret(PASS, "Current passphrase")?;
+            let new = secret(NEW_PASS, "New passphrase")?;
+            serde_json::to_value(keyring::rotate_passphrase(storage, &old, &new)?)?
+        }
+        KeysAction::RotateDataKeys { unlock } => {
+            let unlock = unlocker(storage, &unlock)?;
+            serde_json::to_value(keyring::rotate_data_keys(storage, &unlock.factor())?)?
+        }
+        KeysAction::RotateMasterKeys { kit, label } => {
+            let pass = secret(PASS, "Passphrase")?;
+            let report = keyring::rotate_master_keys(storage, &pass, label.as_deref())?;
+            let mut value = serde_json::to_value(&report)?;
+            value["recovery"] = deliver_kit(report.recovery, kit.as_deref())?;
+            value
+        }
+        KeysAction::Recover {
+            kit,
+            touch_id: enclave_id,
+            passkey: with_passkey,
+        } => {
+            let unlock = match (&enclave_id, with_passkey) {
+                (Some(id), _) => touch_id(id)?,
+                (None, true) => passkey(storage)?,
+                (None, false) => {
+                    Unlocker::RecoveryCode(secret("VELD_RECOVERY_CODE", "Recovery code")?)
+                }
+            };
+            let new = secret(NEW_PASS, "New passphrase")?;
+            let report = keyring::recover(storage, &unlock.factor(), &new)?;
+            let mut value = serde_json::to_value(&report)?;
+            if let Some(issued) = report.reissued {
+                value["reissued"] = deliver_kit(issued, kit.as_deref())?;
+            }
+            value
+        }
+    })
+}
+
+/// Each tenant's journal is resealed under the key the server would use for it: the
+/// global keystore when VELD_KEYSTORE_PATH is set, otherwise the tenant's store
+/// keystore. A tenant with neither keeps a plaintext journal by configuration and is
+/// reported as skipped; no keystore is created here.
+fn reseal_journals(
+    storage: &std::path::Path,
+    backend: StorageBackend,
+    user: &str,
+    dry_run: bool,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let global = veld::keystore::SecretCryptor::from_env("journal")?;
+    let tenants: Vec<std::path::PathBuf> = if user == "all" {
+        let mut dirs: Vec<_> = std::fs::read_dir(storage)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.join("intent.log").is_file())
+            .collect();
+        dirs.sort();
+        dirs
+    } else {
+        vec![storage.join(veld::path_guard::sanitize_component(user, "user id")?)]
+    };
+    let mut reports = Vec::new();
+    for tenant in tenants {
+        let log = tenant.join("intent.log");
+        if !log.is_file() {
+            anyhow::bail!("{log:?} does not exist");
+        }
+        let store_keystore = veld::keystore::store_keystore_path(&tenant, backend);
+        let cryptor = match &global {
+            Some(c) => Some(c.clone()),
+            None if store_keystore.exists() => {
+                veld::keystore::SecretCryptor::from_record_keystore(&store_keystore, "journal")?
+            }
+            None => None,
+        };
+        let slow_store = tenant.join("slow_store.db");
+        let slow_cryptor = match &cryptor {
+            Some(_) if slow_store.is_file() => {
+                match veld::keystore::SecretCryptor::from_env("slow-store")? {
+                    Some(c) => Some(c),
+                    None => veld::keystore::SecretCryptor::from_record_keystore(
+                        &store_keystore,
+                        "slow-store",
+                    )?,
+                }
+            }
+            _ => None,
+        };
+        match cryptor {
+            Some(c) => {
+                let mut report = serde_json::to_value(
+                    veld::intent_log::reseal::reseal_plaintext_frames(&log, &c, dry_run)?,
+                )?;
+                if let Some(sc) = slow_cryptor {
+                    let (rows, plaintext) = veld::memory::slow_store::reseal_plaintext_payloads(
+                        &slow_store,
+                        sc,
+                        dry_run,
+                    )?;
+                    report["slow_store"] = serde_json::json!({
+                        "path": slow_store, "rows": rows, "plaintext_rows": plaintext, "sealed": !dry_run,
+                    });
+                }
+                reports.push(report);
+            }
+            None => reports.push(serde_json::json!({
+                "path": log,
+                "skipped": "no keystore for this tenant: its journal is plaintext by configuration",
+            })),
+        }
+    }
+    Ok(reports)
 }

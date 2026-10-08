@@ -250,6 +250,16 @@ impl Drop for PooledConn<'_> {
     }
 }
 
+/// One-off for `veld reseal-journal`: seal the plaintext memory payloads of the
+/// slow store at `path` under `cryptor`. Returns (rows, plaintext rows).
+pub fn reseal_plaintext_payloads(
+    path: &Path,
+    cryptor: SecretCryptor,
+    dry_run: bool,
+) -> Result<(u64, u64)> {
+    SlowStore::open_with_encryptor(path, Some(cryptor))?.reseal_plaintext_payloads(dry_run)
+}
+
 impl SlowStore {
     /// Open or create the slow store database. Encryption of the memory payload is
     /// enabled iff `VELD_KEYSTORE_PATH` + `VELD_MASTER_PASSPHRASE` are set.
@@ -1365,6 +1375,59 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    /// Rows written before the store had a key are sealed by the one-off, bound to
+    /// their memory id exactly as a fresh write is; a dry run only counts them.
+    #[test]
+    fn plaintext_payloads_written_before_the_key_are_sealed_by_the_one_off() {
+        let tmp = NamedTempFile::new().unwrap();
+        let raw = |store: &SlowStore| -> Vec<u8> {
+            store
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT memory_bincode FROM memories WHERE user_id = 'u' AND memory_id = 'm'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        {
+            let plain = SlowStore::open_with_encryptor(tmp.path(), None).unwrap();
+            plain
+                .upsert_memory("u", "m", 1, b"snapshot written before the key", 0.5)
+                .unwrap();
+        }
+        let key = || crate::keystore::SecretCryptor::new(zeroize::Zeroizing::new([7u8; 32]));
+        assert_eq!(
+            reseal_plaintext_payloads(tmp.path(), key(), true).unwrap(),
+            (1, 1)
+        );
+        let store = SlowStore::open_with_encryptor(tmp.path(), Some(key())).unwrap();
+        assert_eq!(
+            raw(&store),
+            b"snapshot written before the key",
+            "a dry run writes nothing"
+        );
+        drop(store);
+
+        assert_eq!(
+            reseal_plaintext_payloads(tmp.path(), key(), false).unwrap(),
+            (1, 1)
+        );
+        let store = SlowStore::open_with_encryptor(tmp.path(), Some(key())).unwrap();
+        assert!(crate::keystore::SecretCryptor::is_encrypted(&raw(&store)));
+        assert_eq!(
+            store.maybe_decrypt("m", raw(&store)).unwrap(),
+            b"snapshot written before the key"
+        );
+        drop(store);
+        assert_eq!(
+            reseal_plaintext_payloads(tmp.path(), key(), false).unwrap(),
+            (1, 0),
+            "a second run is a no-op"
+        );
     }
 
     #[test]

@@ -116,7 +116,7 @@ fn encrypt_totp_secret(
     }
 }
 
-fn decrypt_totp_secret(
+pub(crate) fn decrypt_totp_secret(
     runtime: &crate::user_auth::runtime::UserAuthRuntime,
     user_id: &[u8],
     stored: &[u8],
@@ -194,6 +194,7 @@ async fn register_inner(
         role,
         created_at: Utc::now(),
         last_login_at: None,
+        disabled_at: None,
     };
     runtime.store.create_user(&record)?;
 
@@ -287,6 +288,11 @@ async fn login_inner(state: &AppState, req: LoginRequest) -> Result<LoginRespons
             record_failed_login(runtime, &req.username, now)?;
             return Err(AuthError::InvalidCredentials);
         }
+    }
+
+    // After the credentials, so a disabled account tells nothing to a guesser.
+    if record.disabled_at.is_some() {
+        return Err(AuthError::AccountDisabled);
     }
 
     // Mint a session and stamp last-login.
@@ -481,6 +487,7 @@ pub async fn logout(
         Ok(h) => h,
         Err(e) => return e.into_response(),
     };
+    runtime.elevations.drop_session(&hash);
     if let Err(e) = runtime.store.delete_session_by_hash(&hash) {
         return e.into_response();
     }
@@ -809,6 +816,7 @@ mod tests {
             role: UserRole::Admin,
             created_at: Utc::now(),
             last_login_at: None,
+            disabled_at: None,
         };
         runtime.store.create_user(&record).unwrap();
 
@@ -962,6 +970,7 @@ mod tests {
             role,
             created_at: Utc::now(),
             last_login_at: None,
+            disabled_at: None,
         }
     }
 
@@ -1086,6 +1095,7 @@ mod tests {
                 role: UserRole::User,
                 created_at: Utc::now(),
                 last_login_at: None,
+                disabled_at: None,
             };
             runtime.store.create_user(&bob).unwrap();
 

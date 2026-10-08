@@ -339,6 +339,44 @@ impl SlowStore {
     // rule.
     // ========================================================================
 
+    /// One-off: seal the memory payloads written in plaintext before this store had
+    /// a key (see `veld reseal-journal`). Each row is rewritten through
+    /// [`Self::maybe_encrypt`], bound to its memory id as a fresh write is; rows
+    /// already sealed are left as they are. One transaction: all or nothing.
+    /// Returns (rows read, plaintext rows); a dry run counts and writes nothing.
+    pub fn reseal_plaintext_payloads(&self, dry_run: bool) -> Result<(u64, u64)> {
+        if self.encryptor.is_none() || !self.enc.payload {
+            anyhow::bail!("the slow store has no key, or payload encryption is turned off");
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let rows: Vec<(String, String, Vec<u8>)> = {
+            let mut stmt = tx.prepare("SELECT user_id, memory_id, memory_bincode FROM memories")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut sealed = 0u64;
+        for (user_id, memory_id, payload) in &rows {
+            if crate::keystore::SecretCryptor::is_encrypted(payload) {
+                continue;
+            }
+            sealed += 1;
+            if dry_run {
+                continue;
+            }
+            tx.execute(
+                "UPDATE memories SET memory_bincode = ?1 WHERE user_id = ?2 AND memory_id = ?3",
+                params![self.maybe_encrypt(memory_id, payload)?, user_id, memory_id],
+            )?;
+        }
+        if !dry_run {
+            tx.commit()?;
+        }
+        Ok((rows.len() as u64, sealed))
+    }
+
     /// UPSERT a memory row at a specific LSN. The `ON CONFLICT` clause
     /// keeps the row with the *higher* LSN — so a live write at LSN 7 is
     /// never overwritten by a stale replay at LSN 3. Equal LSN replays

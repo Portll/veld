@@ -218,6 +218,9 @@ async fn async_main() -> Result<()> {
     log_production_security_warnings(&server_config);
     print_config(&server_config);
 
+    // Before any tenant opens: a tenant enrolled in the keyring may have no other way in.
+    crate::keyring::install(&server_config.storage_path).context("Failed to unseal the keyring")?;
+
     // Initialize runtime-configurable decay scales from config
     crate::decay::init_runtime_scales(&server_config.log_periodic_scales);
 
