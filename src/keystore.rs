@@ -741,13 +741,18 @@ pub struct UnsealedRecordKeys {
     pub generation: u64,
 }
 
-/// Open the keystore at `keystore_path` for a store's records, on either engine.
-///
-/// Unsealed with `VELD_MASTER_PASSPHRASE`, or `VELD_KMS_WRAP_KEY` when no
-/// passphrase is set. With a passphrase and no keystore, one is created. `None`
-/// when there is neither a keystore nor a passphrase: a plaintext store. A
-/// keystore present but not unsealable is an error, so ciphertext is never served
-/// as plaintext. Integrity is verified before the keys are returned.
+/// Where a tenant's record store keeps its keystore: beside `storage.redb`, or
+/// inside the RocksDB `storage/` directory.
+pub fn store_keystore_path(
+    user_dir: &std::path::Path,
+    backend: crate::config::StorageBackend,
+) -> std::path::PathBuf {
+    match backend {
+        crate::config::StorageBackend::RocksDb => user_dir.join("storage").join("keystore.json"),
+        crate::config::StorageBackend::Redb => user_dir.join("keystore.json"),
+    }
+}
+
 // Serialises open-or-create of a store keystore. The record store and the journal of
 // the same tenant both unseal it; on a first run with a passphrase each would otherwise
 // create one, and records sealed under the overwritten keystore's key would be lost.
@@ -810,6 +815,13 @@ fn unseal_record_keystore(
     Ok(Some((ks, kek)))
 }
 
+/// Open the keystore at `keystore_path` for a store's records, on either engine.
+///
+/// Unsealed with `VELD_MASTER_PASSPHRASE`, or `VELD_KMS_WRAP_KEY` when no
+/// passphrase is set. With a passphrase and no keystore, one is created. `None`
+/// when there is neither a keystore nor a passphrase: a plaintext store. A
+/// keystore present but not unsealable is an error, so ciphertext is never served
+/// as plaintext. Integrity is verified before the keys are returned.
 pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<UnsealedRecordKeys>> {
     let Some((ks, kek)) = unseal_record_keystore(keystore_path)? else {
         return Ok(None);
