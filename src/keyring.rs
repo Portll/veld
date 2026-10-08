@@ -17,6 +17,9 @@
 //! Every write takes `<file>.lock` and every multi-keystore operation is computed in
 //! memory before the first file is replaced, so a refused operation changes nothing.
 
+pub mod enclave;
+pub mod passkey;
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -27,8 +30,8 @@ use zeroize::Zeroizing;
 
 use crate::config::StorageBackend;
 use crate::keystore::{
-    store_keystore_path, Factor, FactorInfo, KdfParams, Keystore, LocalAeadKms, SecretKey,
-    PROVIDER_PASSPHRASE, PROVIDER_RECOVERY, PROVIDER_RING,
+    store_keystore_path, Factor, FactorInfo, KdfParams, Keystore, LocalAeadKms, SecretCryptor,
+    SecretKey, PROVIDER_PASSPHRASE, PROVIDER_RECOVERY, PROVIDER_RING,
 };
 
 pub const KEYRING_FILE: &str = "keyring.json";
@@ -63,14 +66,35 @@ impl RingKey {
     }
 }
 
-static INSTALLED: RwLock<Option<RingKey>> = RwLock::new(None);
+/// What the keyring unsealed at start leaves in memory: the ring key, and the
+/// purpose keys of server-wide secrets sealed under the keyring.
+#[derive(Clone)]
+struct Installed {
+    ring: RingKey,
+    totp: SecretCryptor,
+}
+
+static INSTALLED: RwLock<Option<Installed>> = RwLock::new(None);
 
 /// The ring key unsealed at start, if this process has a keyring.
 pub fn installed() -> Option<RingKey> {
     INSTALLED
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+        .as_ref()
+        .map(|i| i.ring.clone())
+}
+
+/// A server-wide purpose key from the keyring unsealed at start. TOTP secrets are
+/// sealed under it when no VELD_KEYSTORE_PATH keystore is set.
+pub fn installed_cryptor(purpose: &str) -> Option<SecretCryptor> {
+    let installed = INSTALLED
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match purpose {
+        "totp" => installed.as_ref().map(|i| i.totp.clone()),
+        _ => None,
+    }
 }
 
 /// Unseal the keyring unattended so tenant keystores open through it. `Ok(None)` when
@@ -78,19 +102,22 @@ pub fn installed() -> Option<RingKey> {
 /// without it would mean tenants it alone can open are refused one at a time.
 pub fn install(storage: &Path) -> Result<Option<String>> {
     let path = keyring_path(storage);
-    let ring = match read_keystore(&path)? {
+    let installed = match read_keystore(&path)? {
         None => None,
         Some(ks) => {
             let kek = unseal_unattended(&ks, &path)?;
             ks.verify_integrity(&kek)
                 .with_context(|| format!("{path:?} failed its integrity check"))?;
-            Some(ring_key_of(&ks, &kek)?)
+            Some(Installed {
+                ring: ring_key_of(&ks, &kek)?,
+                totp: ks.purpose_cryptor(&kek, "keyring:totp")?,
+            })
         }
     };
-    let id = ring.as_ref().map(|r| r.id.clone());
+    let id = installed.as_ref().map(|i| i.ring.id.clone());
     *INSTALLED
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ring;
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = installed;
     if let Some(id) = &id {
         tracing::info!(ring = %id, "keyring unsealed: tenant keystores open through it");
     }

@@ -889,6 +889,14 @@ impl Keystore {
         }
     }
 
+    /// The `purpose` key derived from this keystore's root.
+    pub fn purpose_cryptor(&self, kek: &SecretKey, purpose: &str) -> Result<SecretCryptor> {
+        Ok(SecretCryptor::new(derive_secret_key(
+            &self.root_key(kek)?,
+            purpose,
+        )))
+    }
+
     /// The key this keystore, as a keyring, lends the keystores it opens, and the id
     /// their ring wraps carry. Derived from the root, so it survives rotation.
     pub fn ring_key(&self, kek: &SecretKey) -> Result<(String, SecretKey)> {

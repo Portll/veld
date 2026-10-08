@@ -174,6 +174,10 @@ fn one_keyring_recovers_rotates_and_opens_every_tenant() {
         veld::keyring::install(storage).unwrap().as_deref(),
         Some(ring.as_str())
     );
+    assert!(
+        veld::keyring::installed_cryptor("totp").is_some(),
+        "TOTP secrets can seal under the keyring when no global keystore is set"
+    );
     std::env::remove_var("VELD_MASTER_PASSPHRASE");
     let alice = open_record_keys(&store_keystore(storage, "alice"))
         .unwrap()
@@ -239,4 +243,78 @@ fn one_keyring_recovers_rotates_and_opens_every_tenant() {
         &[("VELD_MASTER_PASSPHRASE", NEW_PASS)]
     )
     .contains("cannot be revoked"));
+}
+
+/// A stand-in for `veld-enclave` that releases a fixed secret, or another one when
+/// told to, as Touch ID on a different key would.
+fn fake_enclave(dir: &Path, secret: &[u8; 32]) -> PathBuf {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(secret);
+    let path = dir.join("veld-enclave");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  enrol|unlock) printf '{{\"id\":\"se-00112233aabbccdd\",\"label\":\"Test Touch ID\",\"secret\":\"%s\"}}\\n' '{b64}' ;;\n  *) echo \"unexpected $1\" >&2; exit 1 ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+#[test]
+fn touch_id_enrolled_through_the_helper_recovers_a_lost_passphrase() {
+    let data = TempDir::new().unwrap();
+    let storage = data.path();
+    keys(
+        storage,
+        &["init", "--kit", storage.join("kit.txt").to_str().unwrap()],
+        &[("VELD_MASTER_PASSPHRASE", PASS)],
+    );
+    let helper = fake_enclave(storage, &[7u8; 32]);
+    let enrolled = keys(
+        storage,
+        &["enrol-touch-id", "--label", "MacBook"],
+        &[
+            ("VELD_MASTER_PASSPHRASE", PASS),
+            ("VELD_ENCLAVE_HELPER", helper.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(enrolled["provider"], "secure-enclave");
+    assert_eq!(enrolled["id"], "se-00112233aabbccdd");
+
+    let imposter = TempDir::new().unwrap();
+    let wrong = fake_enclave(imposter.path(), &[8u8; 32]);
+    keys_fails(
+        storage,
+        &["recover", "--touch-id", "se-00112233aabbccdd"],
+        &[
+            ("VELD_ENCLAVE_HELPER", wrong.to_str().unwrap()),
+            ("VELD_NEW_MASTER_PASSPHRASE", NEW_PASS),
+        ],
+    );
+    assert!(load(&storage.join("keyring.json"))
+        .unseal_with_passphrase(PASS)
+        .is_ok());
+
+    let recovered = keys(
+        storage,
+        &["recover", "--touch-id", "se-00112233aabbccdd"],
+        &[
+            ("VELD_ENCLAVE_HELPER", helper.to_str().unwrap()),
+            ("VELD_NEW_MASTER_PASSPHRASE", NEW_PASS),
+        ],
+    );
+    assert_eq!(recovered["used"]["provider"], "secure-enclave");
+    assert!(
+        recovered["reissued"].is_null(),
+        "a device factor stays enrolled"
+    );
+    let keyring = load(&storage.join("keyring.json"));
+    assert!(keyring.unseal_with_passphrase(PASS).is_err());
+    keyring.unseal_with_passphrase(NEW_PASS).unwrap();
 }
