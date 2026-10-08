@@ -69,6 +69,36 @@ pub fn verify_code(secret: &[u8], candidate: &str, unix_timestamp: u64) -> Resul
     Ok(totp.check(candidate, unix_timestamp))
 }
 
+/// The time step a candidate code matches within the skew window, so a caller can
+/// refuse a code it has already accepted. `None` when it matches no step.
+pub fn matching_step(
+    secret: &[u8],
+    candidate: &str,
+    unix_timestamp: u64,
+) -> Result<Option<u64>, AuthError> {
+    use subtle::ConstantTimeEq;
+    if candidate.len() != TOTP_DIGITS || !candidate.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let totp = build_totp(secret, "verify")?;
+    let step = unix_timestamp / TOTP_STEP_SECS;
+    let skew = TOTP_SKEW_STEPS as u64;
+    Ok((step.saturating_sub(skew)..=step + skew).find(|s| {
+        totp.generate(s * TOTP_STEP_SECS)
+            .as_bytes()
+            .ct_eq(candidate.as_bytes())
+            .into()
+    }))
+}
+
+/// The code an authenticator shows at `unix_timestamp`.
+#[cfg(test)]
+pub(crate) fn code_at(secret: &[u8], unix_timestamp: u64) -> String {
+    build_totp(secret, "test")
+        .expect("valid secret")
+        .generate(unix_timestamp)
+}
+
 /// Build an `otpauth://totp/...` provisioning URI for QR-code enrollment.
 ///
 /// `account` is the label shown in the authenticator app (typically the
@@ -103,6 +133,27 @@ mod tests {
     /// At T = 59 s the expected truncated 8-digit code is `94287082`.
     /// We use the canonical 6-digit profile, which yields `287082` (the
     /// trailing 6 of the 8-digit output).
+    #[test]
+    fn matching_step_names_the_step_a_code_belongs_to_within_the_skew() {
+        let secret = b"12345678901234567890";
+        let now = 1_800_000_015;
+        let step = now / TOTP_STEP_SECS;
+        assert_eq!(
+            matching_step(secret, &code_at(secret, now), now).unwrap(),
+            Some(step)
+        );
+        assert_eq!(
+            matching_step(secret, &code_at(secret, now - 30), now).unwrap(),
+            Some(step - 1)
+        );
+        assert_eq!(
+            matching_step(secret, &code_at(secret, now - 90), now).unwrap(),
+            None,
+            "outside the skew window"
+        );
+        assert_eq!(matching_step(secret, "12a456", now).unwrap(), None);
+    }
+
     #[test]
     fn rfc6238_known_vector_t59() {
         let secret = b"12345678901234567890".to_vec();

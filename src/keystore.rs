@@ -96,19 +96,132 @@ fn dek_aad(epoch: u32) -> Vec<u8> {
 }
 
 /// Derive the recovery-code wrapping key. The recovery code is high-entropy, so a
-/// fast hash (not Argon2) suffices — there is nothing to brute-force.
+/// fast hash (not Argon2) suffices — there is nothing to brute-force. Grouping
+/// dashes, spaces and case are ignored, so a code typed back from a kit opens.
 fn recovery_key_from_code(code: &str) -> [u8; KEY_LEN] {
-    let digest = Sha256::digest(code.trim().as_bytes());
+    let digest = Sha256::digest(normalise_code(code).as_bytes());
     let mut k = [0u8; KEY_LEN];
     k.copy_from_slice(&digest);
     k
 }
 
 /// Generate a high-entropy, transcribable recovery code (192 bits → 48 hex chars).
-fn generate_recovery_code() -> String {
+pub fn generate_recovery_code() -> String {
     let mut raw = [0u8; 24];
     OsRng.fill_bytes(&mut raw);
     hex::encode(raw)
+}
+
+pub const PROVIDER_PASSPHRASE: &str = "passphrase";
+pub const PROVIDER_RECOVERY: &str = "recovery";
+pub const PROVIDER_KMS: &str = "kms";
+/// A tenant keystore's master key sealed under its keyring (see `crate::keyring`).
+pub const PROVIDER_RING: &str = "ring";
+pub const PROVIDER_PASSKEY: &str = "passkey";
+pub const PROVIDER_SECURE_ENCLAVE: &str = "secure-enclave";
+
+/// AAD bound into the root wrap written by the first master-key rotation.
+const ROOT_AAD: &[u8] = b"veld:keystore:root:v1";
+
+/// Something that unwraps a keystore's master key.
+pub enum Factor<'a> {
+    Passphrase(&'a str),
+    RecoveryCode(&'a str),
+    Kms(&'a dyn KmsClient),
+    /// A secret released by something the operator holds or the keyring lends: a
+    /// passkey's PRF output, a Secure Enclave key's secret, the ring key. At least
+    /// 32 bytes of key material.
+    Secret {
+        provider: &'a str,
+        id: &'a str,
+        secret: &'a [u8],
+    },
+}
+
+impl Factor<'_> {
+    fn provider(&self) -> &str {
+        match self {
+            Factor::Passphrase(_) => PROVIDER_PASSPHRASE,
+            Factor::RecoveryCode(_) => PROVIDER_RECOVERY,
+            Factor::Kms(_) => PROVIDER_KMS,
+            Factor::Secret { provider, .. } => provider,
+        }
+    }
+}
+
+/// A wrap of the master key, described without anything secret.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FactorInfo {
+    pub provider: String,
+    pub id: String,
+    pub label: Option<String>,
+    pub created_at: Option<String>,
+}
+
+fn wrap_id(w: &Wrapped) -> &str {
+    w.id.as_deref().unwrap_or(&w.provider)
+}
+
+fn factor_info(w: &Wrapped) -> FactorInfo {
+    FactorInfo {
+        provider: w.provider.clone(),
+        id: wrap_id(w).to_string(),
+        label: w.label.clone(),
+        created_at: w.created_at.clone(),
+    }
+}
+
+/// HKDF-SHA256 (RFC 5869) with a single output block.
+fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8]) -> SecretKey {
+    let mut extract =
+        <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
+    Mac::update(&mut extract, ikm);
+    let mut prk = Zeroizing::new([0u8; KEY_LEN]);
+    prk.copy_from_slice(&Mac::finalize(extract).into_bytes());
+    let mut expand =
+        <HmacSha256 as Mac>::new_from_slice(prk.as_slice()).expect("HMAC accepts any key length");
+    Mac::update(&mut expand, info);
+    Mac::update(&mut expand, &[1]);
+    let okm = Mac::finalize(expand).into_bytes();
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    key.copy_from_slice(&okm[..KEY_LEN]);
+    key
+}
+
+/// The key a device secret wraps the master key under, bound to its provider so one
+/// device's secret cannot stand in for another kind.
+fn secret_wrap_key(provider: &str, secret: &[u8]) -> Result<SecretKey> {
+    if secret.len() < KEY_LEN {
+        return Err(anyhow!(
+            "a {provider} secret must carry at least {KEY_LEN} bytes, got {}",
+            secret.len()
+        ));
+    }
+    Ok(hkdf_sha256(
+        b"veld:keystore:factor:v1",
+        secret,
+        provider.as_bytes(),
+    ))
+}
+
+/// Stable id of a recovery code: one code enrolled in several keystores carries the
+/// same id in each. 32 bits of a hash of a 192-bit code says nothing usable about it.
+fn recovery_code_id(code: &str) -> String {
+    let digest = Sha256::digest(
+        [
+            b"veld:recovery-id:".as_slice(),
+            normalise_code(code).as_bytes(),
+        ]
+        .concat(),
+    );
+    format!("recovery-{}", hex::encode(&digest[..4]))
+}
+
+fn normalise_code(code: &str) -> String {
+    code.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 /// AES-256-GCM key-wrap: encrypt `key` under `wrapping_key` with `aad` bound in.
@@ -125,6 +238,9 @@ fn wrap_key(
         .map_err(|e| anyhow!("AES-256-GCM key wrap failed: {e}"))?;
     Ok(Wrapped {
         provider: provider.to_string(),
+        id: None,
+        label: None,
+        created_at: None,
         nonce: b64e(nonce.as_slice()),
         ciphertext: b64e(&ciphertext),
     })
@@ -242,6 +358,14 @@ impl KmsClient for LocalAeadKms {
 pub struct Wrapped {
     /// Unseal provider id: `"passphrase"` (P1); `"keychain"`/`"kms"`/`"recovery"` later.
     pub provider: String,
+    /// Tells apart wraps of one provider: each recovery code, passkey or Secure
+    /// Enclave key. Absent on wraps written when a provider could have only one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
     /// base64(12-byte GCM nonce).
     pub nonce: String,
     /// base64(ciphertext+tag).
@@ -346,6 +470,12 @@ pub struct Keystore {
     pub active_epoch: u32,
     /// base64(4-byte KEK fingerprint) — detects unseal-to-wrong-key.
     pub kek_fingerprint: String,
+    /// The derivation root wrapped under the KEK, written by the first master-key
+    /// rotation. Purpose keys and the index blinder derive from the root, so a
+    /// rotation leaves them, and everything sealed or blinded under them, unchanged.
+    /// Absent until then: the root is the KEK itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_wrap: Option<Wrapped>,
     /// Monotonic generation, bumped on every keystore mutation. Combined with a
     /// database-side sentinel to detect rollback to an older keystore file.
     #[serde(default)]
@@ -380,6 +510,7 @@ impl Keystore {
             }],
             active_epoch: 0,
             kek_fingerprint: b64e(&fingerprint(kek.as_slice())),
+            root_wrap: None,
             generation: 0,
             mac: String::new(),
         };
@@ -433,17 +564,7 @@ impl Keystore {
     /// Unseal the master key (KEK) via the passphrase provider; verifies the
     /// fingerprint so an unexpected key surfaces as an error, not silent garbage.
     pub fn unseal_with_passphrase(&self, passphrase: &str) -> Result<SecretKey> {
-        let unseal = self.kdf.derive(passphrase)?;
-        let w = self
-            .kek_wraps
-            .iter()
-            .find(|w| w.provider == "passphrase")
-            .ok_or_else(|| anyhow!("keystore has no passphrase wrap"))?;
-        let kek = unwrap_key(&unseal, w, KEK_AAD)?;
-        if b64e(&fingerprint(kek.as_slice())) != self.kek_fingerprint {
-            return Err(anyhow!("keystore KEK fingerprint mismatch after unseal"));
-        }
-        Ok(kek)
+        self.unseal(&Factor::Passphrase(passphrase))
     }
 
     /// Unwrap the active-epoch data key. Returns `(epoch, dek)`.
@@ -503,18 +624,9 @@ impl Keystore {
         Ok(code)
     }
 
-    /// Unseal the master key via a recovery code.
+    /// Unseal the master key via any of its recovery codes.
     pub fn unseal_with_recovery_code(&self, code: &str) -> Result<SecretKey> {
-        let w = self
-            .kek_wraps
-            .iter()
-            .find(|w| w.provider == "recovery")
-            .ok_or_else(|| anyhow!("keystore has no recovery wrap"))?;
-        let kek = unwrap_key(&recovery_key_from_code(code), w, KEK_AAD)?;
-        if b64e(&fingerprint(kek.as_slice())) != self.kek_fingerprint {
-            return Err(anyhow!("recovery code unsealed an unexpected key"));
-        }
-        Ok(kek)
+        self.unseal(&Factor::RecoveryCode(code))
     }
 
     /// Rotate the active data key: generate a new epoch's DEK, retire the previous
@@ -547,7 +659,10 @@ impl Keystore {
     pub fn add_kms_wrap(&mut self, kek: &SecretKey, kms: &dyn KmsClient) -> Result<()> {
         let blob = kms.kms_encrypt(kek.as_slice())?;
         let wrap = Wrapped {
-            provider: "kms".to_string(),
+            provider: PROVIDER_KMS.to_string(),
+            id: None,
+            label: None,
+            created_at: None,
             nonce: String::new(), // KMS ciphertext is self-framed
             ciphertext: b64e(&blob),
         };
@@ -560,23 +675,329 @@ impl Keystore {
 
     /// Unseal the master key via the KMS provider.
     pub fn unseal_with_kms(&self, kms: &dyn KmsClient) -> Result<SecretKey> {
-        let w = self
+        self.unseal(&Factor::Kms(kms))
+    }
+
+    /// Every wrap of the master key, described without anything secret.
+    pub fn factors(&self) -> Vec<FactorInfo> {
+        self.kek_wraps.iter().map(factor_info).collect()
+    }
+
+    /// The master key, unwrapped by `factor` and checked against the fingerprint.
+    pub fn unseal(&self, factor: &Factor) -> Result<SecretKey> {
+        Ok(self.open_wrap(factor)?.1)
+    }
+
+    /// The wrap `factor` opens.
+    pub fn identify(&self, factor: &Factor) -> Result<FactorInfo> {
+        let (index, _) = self.open_wrap(factor)?;
+        Ok(factor_info(&self.kek_wraps[index]))
+    }
+
+    /// Whether this keystore carries the ring wrap `ring_id`.
+    pub fn has_ring(&self, ring_id: &str) -> bool {
+        self.kek_wraps
+            .iter()
+            .any(|w| w.provider == PROVIDER_RING && wrap_id(w) == ring_id)
+    }
+
+    fn open_wrap(&self, factor: &Factor) -> Result<(usize, SecretKey)> {
+        let (index, kek) = match factor {
+            Factor::Passphrase(passphrase) => {
+                let index = self
+                    .kek_wraps
+                    .iter()
+                    .position(|w| w.provider == PROVIDER_PASSPHRASE)
+                    .ok_or_else(|| anyhow!("keystore has no passphrase wrap"))?;
+                let unseal = self.kdf.derive(passphrase)?;
+                (index, unwrap_key(&unseal, &self.kek_wraps[index], KEK_AAD)?)
+            }
+            Factor::RecoveryCode(code) => {
+                let key = recovery_key_from_code(code);
+                self.kek_wraps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, w)| w.provider == PROVIDER_RECOVERY)
+                    .find_map(|(i, w)| unwrap_key(&key, w, KEK_AAD).ok().map(|k| (i, k)))
+                    .ok_or_else(|| anyhow!("the recovery code opens no wrap in this keystore"))?
+            }
+            Factor::Kms(kms) => {
+                let index = self
+                    .kek_wraps
+                    .iter()
+                    .position(|w| w.provider == PROVIDER_KMS)
+                    .ok_or_else(|| anyhow!("keystore has no KMS wrap"))?;
+                let mut pt = kms.kms_decrypt(&b64d(&self.kek_wraps[index].ciphertext)?)?;
+                if pt.len() != KEY_LEN {
+                    pt.zeroize();
+                    return Err(anyhow!("KMS-unwrapped key has wrong length"));
+                }
+                let mut kek = Zeroizing::new([0u8; KEY_LEN]);
+                kek.copy_from_slice(&pt);
+                pt.zeroize(); // wipe the intermediate key-material buffer
+                (index, kek)
+            }
+            Factor::Secret {
+                provider,
+                id,
+                secret,
+            } => {
+                let index = self
+                    .kek_wraps
+                    .iter()
+                    .position(|w| w.provider == *provider && wrap_id(w) == *id)
+                    .ok_or_else(|| anyhow!("keystore has no {provider} wrap {id}"))?;
+                let key = secret_wrap_key(provider, secret)?;
+                (index, unwrap_key(&key, &self.kek_wraps[index], KEK_AAD)?)
+            }
+        };
+        if b64e(&fingerprint(kek.as_slice())) != self.kek_fingerprint {
+            return Err(anyhow!(
+                "{} unsealed an unexpected key (keystore fingerprint mismatch)",
+                factor.provider()
+            ));
+        }
+        Ok((index, kek))
+    }
+
+    fn check_kek(&self, kek: &SecretKey) -> Result<()> {
+        if b64e(&fingerprint(kek.as_slice())) != self.kek_fingerprint {
+            return Err(anyhow!("that is not this keystore's master key"));
+        }
+        Ok(())
+    }
+
+    /// Whether `factor` has a wrap here to open, without trying to open it.
+    fn has_wrap_for(&self, factor: &Factor) -> bool {
+        match factor {
+            Factor::RecoveryCode(_) => self
+                .kek_wraps
+                .iter()
+                .any(|w| w.provider == PROVIDER_RECOVERY),
+            Factor::Secret { provider, id, .. } => self
+                .kek_wraps
+                .iter()
+                .any(|w| w.provider == *provider && wrap_id(w) == *id),
+            other => self
+                .kek_wraps
+                .iter()
+                .any(|w| w.provider == other.provider()),
+        }
+    }
+
+    /// `kek` wrapped under `factor`, with the KDF parameters of a passphrase wrap.
+    fn wrap_under(factor: &Factor, kek: &SecretKey) -> Result<(Wrapped, Option<KdfParams>)> {
+        Ok(match factor {
+            Factor::Passphrase(passphrase) => {
+                let kdf = KdfParams::production();
+                let unseal = kdf.derive(passphrase)?;
+                let wrap = wrap_key(&unseal, kek.as_slice(), KEK_AAD, PROVIDER_PASSPHRASE)?;
+                (wrap, Some(kdf))
+            }
+            Factor::RecoveryCode(code) => {
+                let mut wrap = wrap_key(
+                    &recovery_key_from_code(code),
+                    kek.as_slice(),
+                    KEK_AAD,
+                    PROVIDER_RECOVERY,
+                )?;
+                wrap.id = Some(recovery_code_id(code));
+                (wrap, None)
+            }
+            Factor::Kms(kms) => (
+                Wrapped {
+                    provider: PROVIDER_KMS.to_string(),
+                    id: None,
+                    label: None,
+                    created_at: None,
+                    nonce: String::new(),
+                    ciphertext: b64e(&kms.kms_encrypt(kek.as_slice())?),
+                },
+                None,
+            ),
+            Factor::Secret {
+                provider,
+                id,
+                secret,
+            } => {
+                let key = secret_wrap_key(provider, secret)?;
+                let mut wrap = wrap_key(&key, kek.as_slice(), KEK_AAD, provider)?;
+                wrap.id = Some(id.to_string());
+                (wrap, None)
+            }
+        })
+    }
+
+    /// Enrol `factor` as a further way to unwrap the master key. A passphrase, KMS or
+    /// ring wrap replaces the one before it, a device factor replaces only its own id,
+    /// and recovery codes accumulate until revoked.
+    pub fn add_factor(
+        &mut self,
+        kek: &SecretKey,
+        factor: &Factor,
+        label: Option<&str>,
+        created_at: &str,
+    ) -> Result<FactorInfo> {
+        self.check_kek(kek)?;
+        let (mut wrap, kdf) = Self::wrap_under(factor, kek)?;
+        wrap.label = label.map(str::to_string);
+        wrap.created_at = Some(created_at.to_string());
+        let provider = factor.provider().to_string();
+        let id = wrap_id(&wrap).to_string();
+        let single =
+            [PROVIDER_PASSPHRASE, PROVIDER_KMS, PROVIDER_RING].contains(&provider.as_str());
+        self.kek_wraps
+            .retain(|w| w.provider != provider || (!single && wrap_id(w) != id));
+        let info = factor_info(&wrap);
+        self.kek_wraps.push(wrap);
+        if let Some(kdf) = kdf {
+            self.kdf = kdf;
+        }
+        self.generation += 1;
+        self.seal(kek)?;
+        Ok(info)
+    }
+
+    /// Remove the wrap `id`. The passphrase wrap is rotated, never revoked: it is how
+    /// the server unseals at start. A keystore is never left without a way in.
+    pub fn revoke_factor(&mut self, kek: &SecretKey, id: &str) -> Result<FactorInfo> {
+        self.check_kek(kek)?;
+        let index = self
             .kek_wraps
             .iter()
-            .find(|w| w.provider == "kms")
-            .ok_or_else(|| anyhow!("keystore has no KMS wrap"))?;
-        let blob = b64d(&w.ciphertext)?;
-        let mut pt = kms.kms_decrypt(&blob)?;
-        if pt.len() != KEY_LEN {
-            return Err(anyhow!("KMS-unwrapped key has wrong length"));
+            .position(|w| wrap_id(w) == id)
+            .ok_or_else(|| anyhow!("this keystore has no factor {id}"))?;
+        if self.kek_wraps[index].provider == PROVIDER_PASSPHRASE {
+            return Err(anyhow!("the passphrase cannot be revoked, only rotated"));
         }
-        let mut kek = Zeroizing::new([0u8; KEY_LEN]);
-        kek.copy_from_slice(&pt);
-        pt.zeroize(); // wipe the intermediate key-material buffer
-        if b64e(&fingerprint(kek.as_slice())) != self.kek_fingerprint {
-            return Err(anyhow!("KMS unsealed an unexpected key"));
+        if self.kek_wraps.len() == 1 {
+            return Err(anyhow!("{id} is the only way into this keystore"));
         }
-        Ok(kek)
+        let removed = self.kek_wraps.remove(index);
+        self.generation += 1;
+        self.seal(kek)?;
+        Ok(factor_info(&removed))
+    }
+
+    /// The key purpose keys and the index blinder derive from: the master key until
+    /// the first master-key rotation, then the original master key, wrapped under the
+    /// current one.
+    pub fn root_key(&self, kek: &SecretKey) -> Result<SecretKey> {
+        match &self.root_wrap {
+            Some(wrap) => unwrap_key(kek, wrap, ROOT_AAD),
+            None => Ok(kek.clone()),
+        }
+    }
+
+    /// The `purpose` key derived from this keystore's root.
+    pub fn purpose_cryptor(&self, kek: &SecretKey, purpose: &str) -> Result<SecretCryptor> {
+        Ok(SecretCryptor::new(derive_secret_key(
+            &self.root_key(kek)?,
+            purpose,
+        )))
+    }
+
+    /// The key this keystore, as a keyring, lends the keystores it opens, and the id
+    /// their ring wraps carry. Derived from the root, so it survives rotation.
+    pub fn ring_key(&self, kek: &SecretKey) -> Result<(String, SecretKey)> {
+        let secret = derive_secret_key(&self.root_key(kek)?, "keyring:ring");
+        let id = format!("ring-{}", hex::encode(fingerprint(secret.as_slice())));
+        Ok((id, secret))
+    }
+
+    /// Replace the master key. Data keys and the root are re-wrapped under the new
+    /// one, so records, purpose keys and blinded index terms are untouched. Each
+    /// factor in `keep` that has a wrap here is re-wrapped under the new key with its
+    /// id and label; every other wrap is dropped and returned. Nothing changes on
+    /// error. Returns the new master key.
+    pub fn rotate_kek(
+        &mut self,
+        kek: &SecretKey,
+        keep: &[Factor],
+    ) -> Result<(SecretKey, Vec<FactorInfo>)> {
+        self.verify_integrity(kek)?;
+        let root = self.root_key(kek)?;
+        let new = random_key();
+        let mut kept = Vec::new();
+        let mut kept_index = Vec::new();
+        let mut kdf = None;
+        for factor in keep.iter().filter(|f| self.has_wrap_for(f)) {
+            let (index, _) = self.open_wrap(factor)?;
+            if kept_index.contains(&index) {
+                continue;
+            }
+            let (mut wrap, params) = Self::wrap_under(factor, &new)?;
+            let old = &self.kek_wraps[index];
+            wrap.id = old.id.clone();
+            wrap.label = old.label.clone();
+            wrap.created_at = old.created_at.clone();
+            kept.push(wrap);
+            kept_index.push(index);
+            kdf = params.or(kdf);
+        }
+        if kept.is_empty() {
+            return Err(anyhow!(
+                "none of the factors to keep has a wrap in this keystore; it would have no way in"
+            ));
+        }
+        let dropped = self
+            .kek_wraps
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !kept_index.contains(i))
+            .map(|(_, w)| factor_info(w))
+            .collect();
+        let deks = self
+            .deks
+            .iter()
+            .map(|d| {
+                let dek = self.data_key_for_epoch(kek, d.epoch)?;
+                Ok(DekEntry {
+                    epoch: d.epoch,
+                    wrapped: wrap_key(&new, dek.as_slice(), &dek_aad(d.epoch), "kek")?,
+                    state: d.state.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let root_wrap = wrap_key(&new, root.as_slice(), ROOT_AAD, "kek")?;
+
+        self.kek_wraps = kept;
+        self.deks = deks;
+        self.root_wrap = Some(root_wrap);
+        if let Some(kdf) = kdf {
+            self.kdf = kdf;
+        }
+        self.kek_fingerprint = b64e(&fingerprint(new.as_slice()));
+        self.generation += 1;
+        self.seal(&new)?;
+        Ok((new, dropped))
+    }
+
+    /// A keystore whose only way in is `factor`, for a tenant created while the
+    /// server holds a keyring but no passphrase.
+    pub fn create_with_factor(factor: &Factor, created_at: &str) -> Result<Self> {
+        let kek = random_key();
+        let dek = random_key();
+        let (mut wrap, kdf) = Self::wrap_under(factor, &kek)?;
+        wrap.created_at = Some(created_at.to_string());
+        let mut ks = Self {
+            crypto_version: CRYPTO_VERSION,
+            schema_version: SCHEMA_VERSION,
+            kdf: kdf.unwrap_or_else(KdfParams::production),
+            kek_wraps: vec![wrap],
+            deks: vec![DekEntry {
+                epoch: 0,
+                wrapped: wrap_key(&kek, dek.as_slice(), &dek_aad(0), "kek")?,
+                state: "active".to_string(),
+            }],
+            active_epoch: 0,
+            kek_fingerprint: b64e(&fingerprint(kek.as_slice())),
+            root_wrap: None,
+            generation: 0,
+            mac: String::new(),
+        };
+        ks.seal(&kek)?;
+        Ok(ks)
     }
 
     /// Atomically persist the keystore to `path`: write a temp file, fsync it,
@@ -625,6 +1046,21 @@ impl Keystore {
     /// returns the keystore + master key. Used by standalone secret encryptors
     /// (slow-store / TOTP) that share one keystore file but no database, so there
     /// is no DB rollback sentinel here — file-integrity (MAC) only.
+    /// Persist like [`save_to_path`](Self::save_to_path), then replace the `.bak` with
+    /// the same content: after a revocation or a master-key rotation the previous file
+    /// still opens under what was removed.
+    pub fn save_superseding(&self, path: &Path) -> Result<()> {
+        self.save_to_path(path)?;
+        let bak = path.with_extension("json.bak");
+        let tmp = path.with_extension("json.bak.tmp");
+        std::fs::copy(path, &tmp).context("failed to copy the keystore over its backup")?;
+        std::fs::File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .context("failed to fsync the keystore backup")?;
+        std::fs::rename(&tmp, &bak).context("failed to replace the keystore backup")?;
+        Ok(())
+    }
+
     pub fn open_or_create_at(path: &Path, passphrase: &str) -> Result<(Self, SecretKey)> {
         if path.exists() {
             let ks = Self::from_json(
@@ -658,8 +1094,8 @@ const INDEX_KEY_LABEL: &[u8] = b"veld:index-blind:v1";
 /// Derives deterministic index-blinding tokens: `hex(HMAC-SHA256(index_key, term))`
 /// (P3). Equal terms map to equal tokens (so exact-match index lookups still work)
 /// while the plaintext term stays off disk. Leaks term equality/frequency only
-/// (design §6 / §11 B-4). The key is derived from the KEK, so rotating the KEK
-/// requires an index rebuild.
+/// (design §6 / §11 B-4). The key is derived from the keystore's root, which a
+/// master-key rotation keeps, so the index survives one.
 pub struct IndexBlinder {
     key: SecretKey,
 }
@@ -669,9 +1105,10 @@ impl IndexBlinder {
         Self { key }
     }
 
-    /// Derive the stable index-blinding key from the master key (KEK).
-    pub fn derive_from_kek(kek: &SecretKey) -> Self {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(kek.as_slice())
+    /// Derive the stable index-blinding key from the keystore's root
+    /// ([`Keystore::root_key`]).
+    pub fn derive_from_root(root: &SecretKey) -> Self {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(root.as_slice())
             .expect("HMAC accepts any key length");
         Mac::update(&mut mac, INDEX_KEY_LABEL);
         let tag = Mac::finalize(mac).into_bytes();
@@ -741,6 +1178,129 @@ pub struct UnsealedRecordKeys {
     pub generation: u64,
 }
 
+/// Where a tenant's record store keeps its keystore: beside `storage.redb`, or
+/// inside the RocksDB `storage/` directory.
+pub fn store_keystore_path(
+    user_dir: &std::path::Path,
+    backend: crate::config::StorageBackend,
+) -> std::path::PathBuf {
+    match backend {
+        crate::config::StorageBackend::RocksDb => user_dir.join("storage").join("keystore.json"),
+        crate::config::StorageBackend::Redb => user_dir.join("keystore.json"),
+    }
+}
+
+// Serialises open-or-create of a store keystore. The record store and the journal of
+// the same tenant both unseal it; on a first run with a passphrase each would otherwise
+// create one, and records sealed under the overwritten keystore's key would be lost.
+static RECORD_KEYSTORE_OPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Unseal — or, on a first run with a passphrase, create — the store keystore at
+/// `keystore_path`. `Ok(None)` only when there is no keystore and no passphrase.
+fn unseal_record_keystore(
+    keystore_path: &std::path::Path,
+) -> Result<Option<(Keystore, SecretKey)>> {
+    let _guard = RECORD_KEYSTORE_OPEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let ring = crate::keyring::installed();
+    let exists = keystore_path
+        .try_exists()
+        .with_context(|| format!("Failed to stat {keystore_path:?}"))?;
+
+    let (ks, kek) = if exists {
+        let json =
+            std::fs::read_to_string(keystore_path).context("Failed to read keystore.json")?;
+        let ks = Keystore::from_json(&json)?;
+        let kek = match (&ring, &passphrase) {
+            (Some(ring), _) if ks.has_ring(ring.id()) => {
+                let kek = ks.unseal(&ring.factor())?;
+                tracing::info!("Record-level encryption: keystore unsealed (keyring)");
+                kek
+            }
+            (_, Some(pass)) => {
+                let kek = ks.unseal_with_passphrase(pass)?;
+                tracing::info!("Record-level encryption: keystore unsealed (passphrase)");
+                kek
+            }
+            (_, None) => {
+                let kms = LocalAeadKms::from_env()?.ok_or_else(|| {
+                    anyhow!(
+                        "{keystore_path:?} is present but neither VELD_MASTER_PASSPHRASE nor \
+                         VELD_KMS_WRAP_KEY is set and the keyring does not open it; refusing to \
+                         start (encrypted records would be served as ciphertext)"
+                    )
+                })?;
+                let kek = ks.unseal_with_kms(&kms)?;
+                tracing::info!("Record-level encryption: keystore unsealed (KMS)");
+                kek
+            }
+        };
+        (ks, kek)
+    } else {
+        let ks = match (&passphrase, &ring) {
+            (Some(pass), _) => Keystore::create(pass, KdfParams::production())?,
+            (None, Some(ring)) => {
+                Keystore::create_with_factor(&ring.factor(), &crate::keyring::now_rfc3339())?
+            }
+            (None, None) => return Ok(None),
+        };
+        // The journal can open first on a fresh tenant, before the store made
+        // its directory.
+        if let Some(dir) = keystore_path.parent() {
+            std::fs::create_dir_all(dir).context("Failed to create the keystore directory")?;
+        }
+        ks.save_to_path(keystore_path)
+            .context("Failed to write keystore.json")?;
+        let kek = match (&passphrase, &ring) {
+            (Some(pass), _) => ks.unseal_with_passphrase(pass)?,
+            (None, Some(ring)) => ks.unseal(&ring.factor())?,
+            (None, None) => unreachable!("returned above"),
+        };
+        tracing::info!("Created new encryption keystore at {keystore_path:?}");
+        (ks, kek)
+    };
+
+    ks.verify_integrity(&kek)
+        .context("keystore integrity verification failed")?;
+    let ks = match &ring {
+        Some(ring) if !ks.has_ring(ring.id()) => enrol_in_ring(keystore_path, ks, &kek, ring)?,
+        _ => ks,
+    };
+    Ok(Some((ks, kek)))
+}
+
+/// Give a keystore opened another way its ring wrap, so the keyring's factors reach
+/// it. Re-read under the lock: another writer may have replaced the file meanwhile,
+/// and one whose master key has since changed is left for the next start.
+fn enrol_in_ring(
+    path: &std::path::Path,
+    opened: Keystore,
+    kek: &SecretKey,
+    ring: &crate::keyring::RingKey,
+) -> Result<Keystore> {
+    let _lock = crate::keyring::lock_keystore(path)?;
+    let mut current = Keystore::from_json(
+        &std::fs::read_to_string(path).context("Failed to read keystore.json")?,
+    )?;
+    if current.verify_integrity(kek).is_err() {
+        tracing::warn!("{path:?} changed while it was opened; it joins the keyring next start");
+        return Ok(opened);
+    }
+    if current.has_ring(ring.id()) {
+        return Ok(current);
+    }
+    current.add_factor(kek, &ring.factor(), None, &crate::keyring::now_rfc3339())?;
+    current
+        .save_to_path(path)
+        .context("Failed to write keystore.json")?;
+    tracing::info!("{path:?} enrolled in the keyring");
+    Ok(current)
+}
+
 /// Open the keystore at `keystore_path` for a store's records, on either engine.
 ///
 /// Unsealed with `VELD_MASTER_PASSPHRASE`, or `VELD_KMS_WRAP_KEY` when no
@@ -749,45 +1309,39 @@ pub struct UnsealedRecordKeys {
 /// keystore present but not unsealable is an error, so ciphertext is never served
 /// as plaintext. Integrity is verified before the keys are returned.
 pub fn open_record_keys(keystore_path: &std::path::Path) -> Result<Option<UnsealedRecordKeys>> {
-    if keystore_path.exists() {
-        let json =
-            std::fs::read_to_string(keystore_path).context("Failed to read keystore.json")?;
-        return unseal_record_keys(&json).map(Some);
-    }
-    let Some(pass) = std::env::var("VELD_MASTER_PASSPHRASE")
-        .ok()
-        .filter(|s| !s.is_empty())
-    else {
+    let Some((ks, kek)) = unseal_record_keystore(keystore_path)? else {
         return Ok(None);
     };
-    let ks = Keystore::create(&pass, KdfParams::production())?;
-    ks.save_to_path(keystore_path)
-        .context("Failed to write keystore.json")?;
-    let kek = ks.unseal_with_passphrase(&pass)?;
-    tracing::info!("Created new encryption keystore at {keystore_path:?}");
     record_keys(&ks, &kek).map(Some)
 }
 
-/// Unseal an existing keystore's JSON for record-level encryption, with
+/// Unseal an existing keystore's JSON for record-level encryption: through the
+/// keyring when the keystore carries its ring wrap, otherwise with
 /// `VELD_MASTER_PASSPHRASE`, or `VELD_KMS_WRAP_KEY` when no passphrase is set.
 /// Never creates a keystore.
 pub fn unseal_record_keys(json: &str) -> Result<UnsealedRecordKeys> {
     let ks = Keystore::from_json(json)?;
+    let ring = crate::keyring::installed();
     let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
         .ok()
         .filter(|s| !s.is_empty());
-    let kek = match passphrase {
-        Some(pass) => {
+    let kek = match (&ring, passphrase) {
+        (Some(ring), _) if ks.has_ring(ring.id()) => {
+            let kek = ks.unseal(&ring.factor())?;
+            tracing::info!("Record-level encryption: keystore unsealed (keyring)");
+            kek
+        }
+        (_, Some(pass)) => {
             let kek = ks.unseal_with_passphrase(&pass)?;
             tracing::info!("Record-level encryption: keystore unsealed (passphrase)");
             kek
         }
-        None => {
+        (_, None) => {
             let kms = LocalAeadKms::from_env()?.ok_or_else(|| {
                 anyhow!(
                     "keystore.json is present but neither VELD_MASTER_PASSPHRASE nor \
-                     VELD_KMS_WRAP_KEY is set; refusing to start (encrypted records would be \
-                     served as ciphertext)"
+                     VELD_KMS_WRAP_KEY is set and the keyring does not open it; refusing to \
+                     start (encrypted records would be served as ciphertext)"
                 )
             })?;
             let kek = ks.unseal_with_kms(&kms)?;
@@ -803,7 +1357,7 @@ fn record_keys(ks: &Keystore, kek: &SecretKey) -> Result<UnsealedRecordKeys> {
         .context("keystore integrity verification failed")?;
     Ok(UnsealedRecordKeys {
         cryptors: RecordCryptors::from_keystore(ks, kek)?,
-        blinder: IndexBlinder::derive_from_kek(kek),
+        blinder: IndexBlinder::derive_from_root(&ks.root_key(kek)?),
         generation: ks.generation,
     })
 }
@@ -970,8 +1524,9 @@ impl RecordCryptors {
     }
 }
 
-/// Derive a purpose-bound 256-bit secret key from the master key:
-/// `HMAC-SHA256(KEK, "veld:secret:v1:" || purpose)[..32]`. Domain separation
+/// Derive a purpose-bound 256-bit secret key from the keystore's root:
+/// `HMAC-SHA256(root, "veld:secret:v1:" || purpose)[..32]`. The root is the KEK
+/// until the first master-key rotation. Domain separation
 /// keeps each subsystem's key (slow-store, totp, …) distinct from each other and
 /// from the record DEK / index-blinding key.
 fn derive_secret_key(kek: &SecretKey, purpose: &str) -> SecretKey {
@@ -1028,8 +1583,29 @@ impl SecretCryptor {
                  refusing to store '{purpose}' secrets as plaintext"
             ),
         };
-        let (_ks, kek) = Keystore::open_or_create_at(&path, &pass)?;
-        Ok(Some(Self::new(derive_secret_key(&kek, purpose))))
+        let (ks, kek) = Keystore::open_or_create_at(&path, &pass)?;
+        Ok(Some(Self::new(derive_secret_key(
+            &ks.root_key(&kek)?,
+            purpose,
+        ))))
+    }
+
+    /// A `purpose`-bound key derived from the tenant's STORE keystore, the one its
+    /// sealed records use. Without `VELD_KEYSTORE_PATH`, records are sealed under
+    /// this keystore alone, and a journal or secret left unsealed beside them would
+    /// be a plaintext copy of what the records protect: one keystore, one decision.
+    /// `Ok(None)` when the store has no keystore and no passphrase is set.
+    pub fn from_record_keystore(
+        keystore_path: &std::path::Path,
+        purpose: &str,
+    ) -> Result<Option<Self>> {
+        let Some((ks, kek)) = unseal_record_keystore(keystore_path)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::new(derive_secret_key(
+            &ks.root_key(&kek)?,
+            purpose,
+        ))))
     }
 
     /// Encrypt a secret blob. `aad_ctx` binds it to a caller identity (e.g. the
@@ -1292,14 +1868,14 @@ mod tests {
     #[test]
     fn index_blinder_is_deterministic_keyed_and_hides_term() {
         let kek = Zeroizing::new([4u8; KEY_LEN]);
-        let b1 = IndexBlinder::derive_from_kek(&kek);
-        let b2 = IndexBlinder::derive_from_kek(&kek);
+        let b1 = IndexBlinder::derive_from_root(&kek);
+        let b2 = IndexBlinder::derive_from_root(&kek);
         assert_eq!(b1.blind("alice"), b2.blind("alice")); // deterministic & stable
         assert_ne!(b1.blind("alice"), b1.blind("bob")); // distinct terms differ
         assert!(!b1.blind("alice").contains("alice")); // plaintext term not present
         assert_eq!(b1.blind("alice").len(), 64); // 32-byte HMAC as hex
 
-        let other = IndexBlinder::derive_from_kek(&Zeroizing::new([5u8; KEY_LEN]));
+        let other = IndexBlinder::derive_from_root(&Zeroizing::new([5u8; KEY_LEN]));
         assert_ne!(b1.blind("alice"), other.blind("alice")); // key-dependent
     }
 
@@ -1459,5 +2035,220 @@ mod tests {
         ks.add_recovery_code(&kek).unwrap();
         assert_eq!(ks.generation, 2);
         ks.verify_integrity(&kek).unwrap();
+    }
+
+    const NOW: &str = "2026-10-08T00:00:00Z";
+
+    fn fresh(pass: &str) -> (Keystore, SecretKey) {
+        let ks = Keystore::create(pass, KdfParams::fast_for_tests()).unwrap();
+        let kek = ks.unseal_with_passphrase(pass).unwrap();
+        (ks, kek)
+    }
+
+    #[test]
+    fn several_recovery_codes_each_open_and_revoking_one_leaves_the_rest() {
+        let (mut ks, kek) = fresh("pw");
+        let (a, b) = (generate_recovery_code(), generate_recovery_code());
+        let info_a = ks
+            .add_factor(&kek, &Factor::RecoveryCode(&a), Some("safe"), NOW)
+            .unwrap();
+        let info_b = ks
+            .add_factor(&kek, &Factor::RecoveryCode(&b), Some("drawer"), NOW)
+            .unwrap();
+        assert_ne!(info_a.id, info_b.id);
+        assert_eq!(*ks.unseal_with_recovery_code(&a).unwrap(), *kek);
+        assert_eq!(*ks.unseal_with_recovery_code(&b).unwrap(), *kek);
+        assert_eq!(
+            ks.identify(&Factor::RecoveryCode(&b))
+                .unwrap()
+                .label
+                .as_deref(),
+            Some("drawer")
+        );
+
+        let generation = ks.generation;
+        assert_eq!(ks.revoke_factor(&kek, &info_a.id).unwrap(), info_a);
+        assert_eq!(ks.generation, generation + 1);
+        ks.verify_integrity(&kek).unwrap();
+        assert!(ks.unseal_with_recovery_code(&a).is_err(), "revoked");
+        assert_eq!(*ks.unseal_with_recovery_code(&b).unwrap(), *kek);
+    }
+
+    #[test]
+    fn a_code_typed_back_from_a_kit_opens() {
+        let (mut ks, kek) = fresh("pw");
+        let code = generate_recovery_code();
+        ks.add_factor(&kek, &Factor::RecoveryCode(&code), None, NOW)
+            .unwrap();
+        let typed = crate::keyring::format_code(&code.to_ascii_uppercase()).replace('-', " - ");
+        assert_eq!(*ks.unseal_with_recovery_code(&typed).unwrap(), *kek);
+    }
+
+    #[test]
+    fn the_passphrase_cannot_be_revoked_and_unknown_ids_are_refused() {
+        let (mut ks, kek) = fresh("pw");
+        assert!(ks.revoke_factor(&kek, PROVIDER_PASSPHRASE).is_err());
+        assert!(ks.revoke_factor(&kek, "recovery-00000000").is_err());
+        assert_eq!(ks.generation, 0, "a refused revocation writes nothing");
+    }
+
+    #[test]
+    fn a_factor_is_never_added_under_a_foreign_master_key() {
+        let (mut ks, _) = fresh("pw");
+        let code = generate_recovery_code();
+        let foreign = Zeroizing::new([3u8; KEY_LEN]);
+        assert!(ks
+            .add_factor(&foreign, &Factor::RecoveryCode(&code), None, NOW)
+            .is_err());
+        assert_eq!(ks.factors().len(), 1);
+    }
+
+    #[test]
+    fn a_device_secret_opens_only_its_own_wrap() {
+        let (mut ks, kek) = fresh("pw");
+        let secret = [7u8; 32];
+        let passkey = |id, secret| Factor::Secret {
+            provider: PROVIDER_PASSKEY,
+            id,
+            secret,
+        };
+        ks.add_factor(&kek, &passkey("cred-a", &secret), Some("YubiKey"), NOW)
+            .unwrap();
+        assert_eq!(*ks.unseal(&passkey("cred-a", &secret)).unwrap(), *kek);
+        assert!(ks.unseal(&passkey("cred-a", &[8u8; 32])).is_err());
+        assert!(ks.unseal(&passkey("cred-b", &secret)).is_err());
+        let as_enclave = Factor::Secret {
+            provider: PROVIDER_SECURE_ENCLAVE,
+            id: "cred-a",
+            secret: &secret,
+        };
+        assert!(ks.unseal(&as_enclave).is_err(), "bound to its provider");
+        assert!(ks
+            .add_factor(&kek, &passkey("short", &[1u8; 16]), None, NOW)
+            .is_err());
+
+        ks.add_factor(&kek, &passkey("cred-a", &[9u8; 32]), None, NOW)
+            .unwrap();
+        assert_eq!(
+            ks.factors()
+                .iter()
+                .filter(|f| f.provider == PROVIDER_PASSKEY)
+                .count(),
+            1,
+            "re-enrolling an id replaces its wrap"
+        );
+    }
+
+    #[test]
+    fn rotating_the_master_key_keeps_records_purpose_keys_blinder_and_ring() {
+        let (mut ks, kek) = fresh("pw");
+        let code = generate_recovery_code();
+        ks.add_factor(&kek, &Factor::RecoveryCode(&code), None, NOW)
+            .unwrap();
+        ks.add_factor(
+            &kek,
+            &Factor::Secret {
+                provider: PROVIDER_SECURE_ENCLAVE,
+                id: "se-1",
+                secret: &[5u8; 32],
+            },
+            Some("Touch ID"),
+            NOW,
+        )
+        .unwrap();
+        let record = RecordCryptors::from_keystore(&ks, &kek)
+            .unwrap()
+            .active()
+            .encrypt_record(b"a memory", b"m-1")
+            .unwrap();
+        let purpose = derive_secret_key(&ks.root_key(&kek).unwrap(), "journal");
+        let token = IndexBlinder::derive_from_root(&ks.root_key(&kek).unwrap()).blind("term");
+        let ring = ks.ring_key(&kek).unwrap();
+
+        let (new, dropped) = ks.rotate_kek(&kek, &[Factor::Passphrase("pw")]).unwrap();
+        assert_ne!(*new, *kek);
+        assert!(ks.verify_integrity(&kek).is_err(), "the old key is retired");
+        assert_eq!(*ks.unseal_with_passphrase("pw").unwrap(), *new);
+        assert!(ks.unseal_with_recovery_code(&code).is_err());
+        let dropped: Vec<_> = dropped.iter().map(|f| f.provider.as_str()).collect();
+        assert_eq!(dropped, [PROVIDER_RECOVERY, PROVIDER_SECURE_ENCLAVE]);
+
+        let root = ks.root_key(&new).unwrap();
+        assert_eq!(
+            RecordCryptors::from_keystore(&ks, &new)
+                .unwrap()
+                .active()
+                .decrypt_record(&record, b"m-1")
+                .unwrap(),
+            b"a memory"
+        );
+        assert_eq!(*derive_secret_key(&root, "journal"), *purpose);
+        assert_eq!(IndexBlinder::derive_from_root(&root).blind("term"), token);
+        assert_eq!(ks.ring_key(&new).unwrap().0, ring.0);
+
+        let (newer, _) = ks.rotate_kek(&new, &[Factor::Passphrase("pw")]).unwrap();
+        assert_eq!(
+            *ks.root_key(&newer).unwrap(),
+            *root,
+            "a second rotation keeps the same root"
+        );
+    }
+
+    #[test]
+    fn a_rotation_that_would_leave_no_way_in_changes_nothing() {
+        let (mut ks, kek) = fresh("pw");
+        let before = ks.to_json().unwrap();
+        let code = generate_recovery_code();
+        assert!(ks.rotate_kek(&kek, &[Factor::RecoveryCode(&code)]).is_err());
+        assert_eq!(ks.to_json().unwrap(), before);
+    }
+
+    #[test]
+    fn a_keystore_without_the_new_fields_keeps_its_bytes_and_its_mac() {
+        let (ks, kek) = fresh("pw");
+        let json = ks.to_json().unwrap();
+        for field in ["root_wrap", "\"id\"", "\"label\"", "created_at"] {
+            assert!(
+                !json.contains(field),
+                "{field} written for a keystore that has none"
+            );
+        }
+        let reloaded = Keystore::from_json(&json).unwrap();
+        assert_eq!(reloaded.to_json().unwrap(), json);
+        reloaded.verify_integrity(&kek).unwrap();
+    }
+
+    #[test]
+    fn a_keystore_created_with_a_device_factor_opens_only_through_it() {
+        let factor = Factor::Secret {
+            provider: PROVIDER_RING,
+            id: "ring-0011",
+            secret: &[4u8; 32],
+        };
+        let ks = Keystore::create_with_factor(&factor, NOW).unwrap();
+        let kek = ks.unseal(&factor).unwrap();
+        ks.verify_integrity(&kek).unwrap();
+        assert!(ks.has_ring("ring-0011"));
+        assert!(ks.unseal_with_passphrase("anything").is_err());
+    }
+
+    #[test]
+    fn superseding_save_leaves_no_backup_that_opens_under_a_revoked_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keystore.json");
+        let (mut ks, kek) = fresh("pw");
+        let code = generate_recovery_code();
+        let info = ks
+            .add_factor(&kek, &Factor::RecoveryCode(&code), None, NOW)
+            .unwrap();
+        ks.save_to_path(&path).unwrap();
+        ks.revoke_factor(&kek, &info.id).unwrap();
+        ks.save_superseding(&path).unwrap();
+        let bak = std::fs::read_to_string(path.with_extension("json.bak")).unwrap();
+        assert_eq!(bak, std::fs::read_to_string(&path).unwrap());
+        assert!(Keystore::from_json(&bak)
+            .unwrap()
+            .unseal_with_recovery_code(&code)
+            .is_err());
     }
 }

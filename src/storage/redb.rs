@@ -541,7 +541,23 @@ pub struct RedbPrimaryMemoryStore {
     cryptors: Option<crate::keystore::RecordCryptors>,
 }
 
+/// Content in the retired field-level format, opened. redb has no read-path
+/// rewrite: the record is re-sealed by its next write.
+fn open_legacy_field(mut memory: Memory) -> Result<Memory> {
+    if let Some(plain) =
+        crate::legacy_field_encryption::open_legacy_content(&memory.experience.content)?
+    {
+        memory.experience.content = plain;
+    }
+    Ok(memory)
+}
+
 impl RedbPrimaryMemoryStore {
+    /// Whether this store seals its records (a keystore is unsealed).
+    pub fn encrypts_records(&self) -> bool {
+        self.cryptors.is_some()
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let database_path = path.join("storage.redb");
         let database = create_redb_database(&database_path)?;
@@ -555,6 +571,7 @@ impl RedbPrimaryMemoryStore {
             }
             None => None,
         };
+        crate::legacy_field_encryption::check_config(cryptors.is_some())?;
         Ok(Self { database, cryptors })
     }
 
@@ -574,7 +591,7 @@ impl RedbPrimaryMemoryStore {
     /// epoch's key; one that cannot be opened is an error, never a plaintext read.
     fn open_record(&self, key: &[u8], bytes: &[u8]) -> Result<Memory> {
         if !crate::keystore::is_encrypted_record(bytes) {
-            return decode::<Memory>(bytes);
+            return open_legacy_field(decode::<Memory>(bytes)?);
         }
         let cryptors = self.cryptors.as_ref().ok_or_else(|| {
             anyhow!("encountered an encrypted record but no keystore/key is configured")
@@ -590,7 +607,7 @@ impl RedbPrimaryMemoryStore {
         let plaintext = cryptor
             .decrypt_record(bytes, key)
             .context("Failed to decrypt memory record")?;
-        decode::<Memory>(&plaintext)
+        open_legacy_field(decode::<Memory>(&plaintext)?)
     }
 
     /// The live database handle, for stores that must share it rather than open the

@@ -165,6 +165,21 @@ impl Bm25Projection {
         }
     }
 
+    /// A projection over an index that starts empty every time (held in memory for
+    /// an encrypted tenant): it ignores the persisted checkpoint and replays the
+    /// whole log, because the checkpoint describes an index that no longer exists.
+    pub fn new_from_start(
+        index: Arc<BM25Index>,
+        checkpoint_store: Arc<Mutex<CheckpointStore>>,
+    ) -> Self {
+        Self {
+            index,
+            checkpoint_store,
+            checkpoint: None,
+            applies_since_commit: 0,
+        }
+    }
+
     /// Borrow the underlying index. Used by tests and admin tooling that
     /// needs to query the projection directly without going through the
     /// hybrid-search engine.
@@ -554,6 +569,52 @@ mod tests {
             assert!(!hits.is_empty(), "expected hit for memory {i}");
             assert_eq!(hits[0].0, MemoryId(*id), "memory {i} ranked first");
         }
+    }
+
+    /// An encrypted tenant's index lives in memory and starts empty on every open,
+    /// so its projection must replay the whole log even though the checkpoint says
+    /// every frame was applied. Resuming from the checkpoint would leave it empty.
+    #[test]
+    fn an_in_memory_index_replays_the_whole_log_whatever_the_checkpoint_says() {
+        let (bm25_path, log_path, checkpoint_path) = tmp_paths("in_memory_replay");
+        {
+            let mut log = IntentLog::open(&log_path).unwrap();
+            for i in 0..3 {
+                let memory = mk_memory(Uuid::new_v4(), &format!("sealed body {i}"), &[], &[]);
+                crate::intent_log::payload::append(&mut log, &remember_payload(&memory)).unwrap();
+            }
+            log.sync().unwrap();
+        }
+        let log = IntentLog::open(&log_path).unwrap();
+        {
+            let (_index, _ckpt, mut proj) = open_projection(&bm25_path, &checkpoint_path);
+            assert_eq!(replay(&log, &mut proj, Some(1)).unwrap(), 3);
+        }
+        assert!(
+            bm25_path.exists(),
+            "precondition: an on-disk index and a checkpoint at the head"
+        );
+
+        let index = Arc::new(BM25Index::in_memory(&bm25_path).unwrap());
+        assert!(
+            !bm25_path.exists(),
+            "the plaintext on-disk index is removed"
+        );
+        let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&checkpoint_path).unwrap()));
+        let mut resumed = Bm25Projection::new(index.clone(), ckpt.clone());
+        assert_eq!(
+            replay(&log, &mut resumed, Some(1)).unwrap(),
+            0,
+            "the checkpoint is at the head"
+        );
+
+        let mut from_start = Bm25Projection::new_from_start(index.clone(), ckpt);
+        assert_eq!(replay(&log, &mut from_start, Some(1)).unwrap(), 3);
+        assert_eq!(index.len(), 3);
+        assert!(
+            !bm25_path.exists(),
+            "replaying into it wrote nothing to disk"
+        );
     }
 
     /// Restart resumes from the persisted checkpoint: a projection that
