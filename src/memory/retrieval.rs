@@ -1077,6 +1077,14 @@ impl RetrievalEngine {
     }
 
     /// Get set of all indexed memory IDs (for integrity checking)
+    /// Whether the vector index holds this memory, without cloning the whole id set.
+    pub fn is_indexed(&self, memory_id: &MemoryId) -> bool {
+        self.id_mapping
+            .read()
+            .memory_to_vectors
+            .contains_key(memory_id)
+    }
+
     pub fn get_indexed_memory_ids(&self) -> HashSet<MemoryId> {
         self.id_mapping
             .read()

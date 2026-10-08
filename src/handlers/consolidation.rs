@@ -1242,3 +1242,103 @@ pub async fn get_consolidation_events(
 
     Ok(Json(events))
 }
+
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingBacklogQuery {
+    pub user_id: String,
+}
+
+/// GET /api/embeddings/backlog?user_id= - Memories still without a vector.
+pub async fn get_embedding_backlog(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<EmbeddingBacklogQuery>,
+) -> Result<Json<crate::memory::embedding_backlog::BacklogReport>, AppError> {
+    validation::validate_user_id(&q.user_id).map_validation_err("user_id")?;
+    let memory = state
+        .get_user_memory(&q.user_id)
+        .map_err(AppError::Internal)?;
+    let report = tokio::task::spawn_blocking(move || memory.read().embedding_backlog_report())
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("backlog report task failed: {e}")))?
+        .map_err(AppError::Internal)?;
+    Ok(Json(report))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DrainEmbeddingBacklogRequest {
+    pub user_id: String,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub reconcile: bool,
+}
+
+/// POST /api/embeddings/backlog/drain - Reconcile (optionally) and drain now.
+pub async fn drain_embedding_backlog(
+    State(state): State<AppState>,
+    Json(req): Json<DrainEmbeddingBacklogRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let limit = req.limit.unwrap_or(50);
+    if limit == 0 {
+        return Err(AppError::InvalidInput {
+            field: "limit".to_string(),
+            reason: "must be at least 1".to_string(),
+        });
+    }
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+    let reconcile = req.reconcile;
+    let (reconciled, drained) = tokio::task::spawn_blocking(move || {
+        let guard = memory.read();
+        let reconciled = if reconcile {
+            Some(guard.reconcile_embedding_backlog()?)
+        } else {
+            None
+        };
+        let drained = guard.drain_embedding_backlog(limit)?;
+        anyhow::Ok((reconciled, drained))
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("backlog drain task failed: {e}")))?
+    .map_err(AppError::Internal)?;
+    Ok(Json(serde_json::json!({
+        "reconciled": reconciled,
+        "drained": drained,
+    })))
+}
+
+#[cfg(test)]
+mod embedding_backlog_route_tests {
+    use std::fs;
+    use std::path::Path;
+
+    fn router_src() -> String {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/router.rs");
+        fs::read_to_string(p).expect("router.rs must be readable")
+    }
+
+    #[test]
+    fn both_backlog_routes_are_mounted_behind_auth() {
+        let src = router_src();
+        let protected_at = src
+            .find("pub fn build_protected_routes")
+            .expect("build_protected_routes must exist");
+        for (route, handler) in [
+            ("/api/embeddings/backlog\"", "get(consolidation::get_embedding_backlog)"),
+            ("/api/embeddings/backlog/drain", "post(consolidation::drain_embedding_backlog)"),
+        ] {
+            let at = src.find(route).expect("route must be mounted");
+            assert!(at > protected_at, "{route} sits on a public or probe router");
+            assert!(src[at..at + 200].contains(handler), "{route} must map to {handler}");
+        }
+    }
+
+    #[test]
+    fn drain_request_defaults() {
+        let req: super::DrainEmbeddingBacklogRequest =
+            serde_json::from_str(r#"{"user_id":"u"}"#).unwrap();
+        assert!(req.limit.is_none());
+        assert!(!req.reconcile);
+    }
+}

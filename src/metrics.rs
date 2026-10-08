@@ -289,6 +289,33 @@ pub static MEMORIES_BY_TIER: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("MEMORIES_BY_TIER metric must be valid at compile time")
 });
 
+/// Memories still without a vector, per user (set by the backlog drainer each tick)
+pub static EMBEDDING_BACKLOG_PENDING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new("veld_embedding_backlog_pending", "Memories stored without a vector, awaiting the embedder"),
+        &["user"],
+    )
+    .expect("EMBEDDING_BACKLOG_PENDING metric must be valid at compile time")
+});
+
+/// Memories the backlog drainer embedded and indexed
+pub static EMBEDDING_BACKLOG_DRAINED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_embedding_backlog_drained_total",
+        "Backlogged memories given a vector by the drainer",
+    )
+    .expect("EMBEDDING_BACKLOG_DRAINED_TOTAL metric must be valid at compile time")
+});
+
+/// Embedding requests answered by the fallback host after the primary failed
+pub static EMBEDDING_FALLBACK_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_embedding_fallback_total",
+        "Embedding requests served by VELD_EMBEDDING_API_FALLBACK_URL",
+    )
+    .expect("EMBEDDING_FALLBACK_TOTAL metric must be valid at compile time")
+});
+
 /// Total memory system heap usage (estimated, aggregate)
 pub static MEMORY_HEAP_BYTES_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
@@ -852,6 +879,9 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     // Request metrics
     register!(HTTP_REQUEST_DURATION, "HTTP_REQUEST_DURATION");
     register!(HTTP_REQUESTS_TOTAL, "HTTP_REQUESTS_TOTAL");
+    register!(EMBEDDING_BACKLOG_PENDING, "EMBEDDING_BACKLOG_PENDING");
+    register!(EMBEDDING_BACKLOG_DRAINED_TOTAL, "EMBEDDING_BACKLOG_DRAINED_TOTAL");
+    register!(EMBEDDING_FALLBACK_TOTAL, "EMBEDDING_FALLBACK_TOTAL");
 
     // Memory operation metrics
     register!(MEMORY_STORE_TOTAL, "MEMORY_STORE_TOTAL");

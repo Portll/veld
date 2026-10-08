@@ -271,6 +271,7 @@ async fn async_main() -> Result<()> {
 
     // Start active reminder scheduler (checks every 60s for due reminders)
     start_reminder_scheduler(Arc::clone(&manager));
+    start_embedding_backlog_drainer(Arc::clone(&manager));
 
     // Start backup scheduler if enabled
     if server_config.backup_enabled && server_config.backup_interval_secs > 0 {
@@ -1156,4 +1157,65 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} bytes", bytes)
     }
+}
+
+/// Gives backlogged memories their vectors once the embedder answers again. Interval from
+/// VELD_EMBED_BACKLOG_INTERVAL_SECS (default 60; 0 disables), batch from
+/// VELD_EMBED_BACKLOG_BATCH (default 50). Every tenth tick reconciles the backlog against the
+/// store and the index first, so a memory whose failure was never recorded is still found.
+fn start_embedding_backlog_drainer(manager: AppState) {
+    let interval_secs = std::env::var("VELD_EMBED_BACKLOG_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
+    if interval_secs == 0 {
+        info!("Embedding backlog drainer disabled (VELD_EMBED_BACKLOG_INTERVAL_SECS=0)");
+        return;
+    }
+    let batch = std::env::var("VELD_EMBED_BACKLOG_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(50);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        interval.tick().await;
+        let mut tick: u64 = 0;
+        loop {
+            interval.tick().await;
+            tick += 1;
+            let reconcile = tick % 10 == 1;
+            let manager_clone = Arc::clone(&manager);
+            match tokio::task::spawn_blocking(move || {
+                manager_clone.drain_embedding_backlogs(batch, reconcile)
+            })
+            .await
+            {
+                Ok(results) => {
+                    for (user, result) in results {
+                        match result {
+                            Ok(report) => {
+                                if report.drained > 0 {
+                                    crate::metrics::EMBEDDING_BACKLOG_DRAINED_TOTAL
+                                        .inc_by(report.drained as u64);
+                                }
+                                if report.attempted > 0 {
+                                    info!(
+                                        user = %user,
+                                        drained = report.drained,
+                                        failed = report.failed,
+                                        remaining = report.remaining,
+                                        stopped = report.stopped.as_deref().unwrap_or(""),
+                                        "Embedding backlog drain"
+                                    );
+                                }
+                            }
+                            Err(e) => error!(user = %user, "Embedding backlog drain failed: {e}"),
+                        }
+                    }
+                }
+                Err(e) => error!("Embedding backlog drainer task panicked: {e}"),
+            }
+        }
+    });
 }
