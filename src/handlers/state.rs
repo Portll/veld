@@ -1214,11 +1214,34 @@ impl MultiUserMemoryManager {
     /// Where the tenant's record store keeps its keystore: beside `storage.redb`,
     /// or inside the RocksDB `storage/` directory.
     fn record_keystore_path(&self, user_id: &str) -> Result<std::path::PathBuf> {
-        let user = self.user_dir(user_id)?;
-        Ok(match self.server_config.effective_storage_backend {
-            crate::config::StorageBackend::RocksDb => user.join("storage").join("keystore.json"),
-            crate::config::StorageBackend::Redb => user.join("keystore.json"),
-        })
+        Ok(crate::keystore::store_keystore_path(
+            &self.user_dir(user_id)?,
+            self.server_config.effective_storage_backend,
+        ))
+    }
+
+    /// The key a tenant's `purpose` data (journal, slow store) is sealed under: the
+    /// global keystore when VELD_KEYSTORE_PATH is set, otherwise the tenant's store
+    /// keystore. A passphrase alone seals the records under the store keystore, and
+    /// the journal and slow store hold the same memories as full snapshots, so they
+    /// are sealed under it too: one keystore, one decision.
+    fn purpose_cryptor(
+        &self,
+        user_id: &str,
+        purpose: &str,
+    ) -> Result<Option<crate::keystore::SecretCryptor>> {
+        match crate::keystore::SecretCryptor::from_env(purpose)
+            .with_context(|| format!("derive {purpose} encryptor for user {user_id}"))?
+        {
+            Some(cryptor) => Ok(Some(cryptor)),
+            None => crate::keystore::SecretCryptor::from_record_keystore(
+                &self.record_keystore_path(user_id)?,
+                purpose,
+            )
+            .with_context(|| {
+                format!("derive {purpose} encryptor for user {user_id} from its store keystore")
+            }),
+        }
     }
 
     /// Whether this tenant's data is sealed at rest: a global keystore is set, a
@@ -1908,7 +1931,11 @@ impl MultiUserMemoryManager {
         let user_path = self.user_dir(user_id)?;
         std::fs::create_dir_all(&user_path)?;
         let db_path = user_path.join("slow_store.db");
-        let store = std::sync::Arc::new(crate::memory::slow_store::SlowStore::open(&db_path)?);
+        // Full memory snapshots, like the journal: sealed under the same keystore.
+        let store = std::sync::Arc::new(crate::memory::slow_store::SlowStore::open_with_encryptor(
+            &db_path,
+            self.purpose_cryptor(user_id, "slow-store")?,
+        )?);
         self.slow_stores.insert(user_id.to_string(), store.clone());
         Ok(store)
     }
@@ -2016,18 +2043,7 @@ impl MultiUserMemoryManager {
         // Without VELD_KEYSTORE_PATH the key comes from the store's own keystore:
         // a passphrase alone seals the records, and the journal beside them holds
         // the same memories, so it is sealed under the same keystore.
-        let journal_cryptor = match crate::keystore::SecretCryptor::from_env("journal")
-            .with_context(|| format!("derive journal encryptor for user {user_id}"))?
-        {
-            Some(cryptor) => Some(cryptor),
-            None => crate::keystore::SecretCryptor::from_record_keystore(
-                &self.record_keystore_path(user_id)?,
-                "journal",
-            )
-            .with_context(|| {
-                format!("derive journal encryptor for user {user_id} from its store keystore")
-            })?,
-        };
+        let journal_cryptor = self.purpose_cryptor(user_id, "journal")?;
         let log = crate::intent_log::IntentLog::open_with_cryptor(&log_path, journal_cryptor)
             .with_context(|| format!("open intent log for user {user_id}"))?;
         let checkpoint_store = std::sync::Arc::new(parking_lot::Mutex::new(

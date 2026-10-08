@@ -60,6 +60,14 @@ fn a_passphrase_alone_seals_the_journal_and_keeps_bm25_off_disk() {
         !raw.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()),
         "the journal holds the memory in plaintext"
     );
+    for file in ["slow_store.db", "slow_store.db-wal"] {
+        if let Ok(bytes) = std::fs::read(tenant.join(file)) {
+            assert!(
+                !bytes.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()),
+                "{file} holds the memory in plaintext"
+            );
+        }
+    }
     assert!(
         !tenant.join(veld::memory::BM25_INDEX_DIR).exists(),
         "the BM25 projection was written to disk"
