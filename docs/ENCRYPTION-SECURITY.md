@@ -41,7 +41,8 @@ the service runs (necessary). Key-material *buffers* are zeroized after use; thi
 at-rest protection, not protection against a live-process memory dump.
 
 ## Sign-off checklist before production
-- [ ] Keystore file backed up (loss = unrecoverable); recovery code stored offline.
+- [ ] Keystore file backed up (loss = unrecoverable); keyring created and its
+      recovery kit stored offline (see [key-management.md](key-management.md)).
 - [ ] Unseal source chosen (passphrase / env / KMS) appropriate to the threat model.
 - [ ] Accept items 1–3 above as residual leakage, OR deploy compensating controls.
 - [ ] Decide on item 4 (sibling CFs): complete the integration, or sign off that
