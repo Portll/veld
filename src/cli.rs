@@ -229,6 +229,25 @@ enum Commands {
         storage_path: PathBuf,
     },
 
+    /// One-off: seal intent-log frames and slow-store payloads written before they were encrypted. Stop the server first.
+    ResealJournal {
+        /// Storage backend the tenants use (decides where each store keystore lives)
+        #[arg(long, env = "VELD_STORAGE_BACKEND", default_value_t = veld::config::default_requested_storage_backend())]
+        backend: StorageBackend,
+
+        /// User id, or `all` for every tenant with an intent log
+        #[arg(long, default_value = "all")]
+        user: String,
+
+        /// Count the plaintext frames and write nothing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Data directory
+        #[arg(long = "storage", env = "VELD_MEMORY_PATH", default_value_os_t = veld::config::default_storage_path())]
+        storage_path: PathBuf,
+    },
+
     /// Copy stores from one backend to the other in the same data directory, verified; the source is never modified
     Migrate {
         #[arg(long)]
@@ -515,6 +534,19 @@ async fn main() -> Result<()> {
         } => {
             let reports = tokio::task::spawn_blocking(move || {
                 veld::storage::migrate::import(&storage_path, backend, &input)
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+        }
+
+        Commands::ResealJournal {
+            backend,
+            user,
+            dry_run,
+            storage_path,
+        } => {
+            let reports = tokio::task::spawn_blocking(move || {
+                reseal_journals(&storage_path, backend, &user, dry_run)
             })
             .await??;
             println!("{}", serde_json::to_string_pretty(&reports)?);
@@ -2236,4 +2268,78 @@ mod tests {
         let resp: RememberResponse = serde_json::from_str(body).expect("must deserialize");
         assert_eq!(resp.id, "mem-xyz");
     }
+}
+
+/// Each tenant's journal is resealed under the key the server would use for it: the
+/// global keystore when VELD_KEYSTORE_PATH is set, otherwise the tenant's store
+/// keystore. A tenant with neither keeps a plaintext journal by configuration and is
+/// reported as skipped; no keystore is created here.
+fn reseal_journals(
+    storage: &std::path::Path,
+    backend: StorageBackend,
+    user: &str,
+    dry_run: bool,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let global = veld::keystore::SecretCryptor::from_env("journal")?;
+    let tenants: Vec<std::path::PathBuf> = if user == "all" {
+        let mut dirs: Vec<_> = std::fs::read_dir(storage)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.join("intent.log").is_file())
+            .collect();
+        dirs.sort();
+        dirs
+    } else {
+        vec![storage.join(veld::path_guard::sanitize_component(user, "user id")?)]
+    };
+    let mut reports = Vec::new();
+    for tenant in tenants {
+        let log = tenant.join("intent.log");
+        if !log.is_file() {
+            anyhow::bail!("{log:?} does not exist");
+        }
+        let store_keystore = veld::keystore::store_keystore_path(&tenant, backend);
+        let cryptor = match &global {
+            Some(c) => Some(c.clone()),
+            None if store_keystore.exists() => {
+                veld::keystore::SecretCryptor::from_record_keystore(&store_keystore, "journal")?
+            }
+            None => None,
+        };
+        let slow_store = tenant.join("slow_store.db");
+        let slow_cryptor = match &cryptor {
+            Some(_) if slow_store.is_file() => {
+                match veld::keystore::SecretCryptor::from_env("slow-store")? {
+                    Some(c) => Some(c),
+                    None => veld::keystore::SecretCryptor::from_record_keystore(
+                        &store_keystore,
+                        "slow-store",
+                    )?,
+                }
+            }
+            _ => None,
+        };
+        match cryptor {
+            Some(c) => {
+                let mut report = serde_json::to_value(
+                    veld::intent_log::reseal::reseal_plaintext_frames(&log, &c, dry_run)?,
+                )?;
+                if let Some(sc) = slow_cryptor {
+                    let (rows, plaintext) = veld::memory::slow_store::reseal_plaintext_payloads(
+                        &slow_store,
+                        sc,
+                        dry_run,
+                    )?;
+                    report["slow_store"] = serde_json::json!({
+                        "path": slow_store, "rows": rows, "plaintext_rows": plaintext, "sealed": !dry_run,
+                    });
+                }
+                reports.push(report);
+            }
+            None => reports.push(serde_json::json!({
+                "path": log,
+                "skipped": "no keystore for this tenant: its journal is plaintext by configuration",
+            })),
+        }
+    }
+    Ok(reports)
 }
