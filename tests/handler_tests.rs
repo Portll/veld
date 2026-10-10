@@ -579,6 +579,22 @@ async fn wait_for_episode_entity(h: &Harness, user: &str, id: veld::uuid::Uuid, 
     );
 }
 
+/// Waits until the work `remember` hands to the background has finished. The episode lists
+/// its entities before their edges are linked, and an edge is inserted before its endpoints
+/// are pruned back to the degree cap, so a read in between sees one edge over the cap.
+async fn wait_for_background_work(h: &Harness) {
+    for _ in 0..300 {
+        if h.mgr.task_tracker.is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!(
+        "{} background tasks still running after 30s",
+        h.mgr.task_tracker.len()
+    );
+}
+
 #[tokio::test]
 async fn a_duplicate_with_new_tags_reaches_the_stored_memory_and_its_graph_episode() {
     use veld::memory::MemoryId;
@@ -3093,6 +3109,7 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let id = veld::uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
     wait_for_episode_entity(&h, user, id, "keeper").await;
+    wait_for_background_work(&h).await;
     let keeper = named_graph_entity(&h, user, "keeper").expect("keeper").uuid;
 
     assert_eq!(
