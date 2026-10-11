@@ -15,6 +15,7 @@ pub mod compression;
 pub mod context;
 pub mod context_blocks;
 pub mod dials;
+pub mod embedding_backlog;
 pub mod facets;
 pub mod facts;
 pub mod feedback;
@@ -49,7 +50,6 @@ pub mod sleep_time;
 pub mod slow_store;
 pub mod storage;
 pub mod tag_sources;
-pub mod embedding_backlog;
 pub mod temporal_facts;
 pub mod todo_formatter;
 pub mod todos;
@@ -1396,9 +1396,7 @@ impl MemorySystem {
             retrieval_trace_store: feedback::RetrievalTraceStore::with_kv(
                 primary_store.key_value_store(),
             ),
-            tag_source_store: tag_sources::TagSourceStore::with_kv(
-                primary_store.key_value_store(),
-            ),
+            tag_source_store: tag_sources::TagSourceStore::with_kv(primary_store.key_value_store()),
             recall_event_store: recall_events::RecallEventStore::with_kv(
                 primary_store.key_value_store(),
             ),
@@ -1780,7 +1778,10 @@ impl MemorySystem {
                             embedding_backlog::EnqueueReason::EmbedFailed,
                             Some(&e.to_string()),
                         ) {
-                            tracing::error!("embedding backlog: could not record {}: {record_err}", memory_id.0);
+                            tracing::error!(
+                                "embedding backlog: could not record {}: {record_err}",
+                                memory_id.0
+                            );
                         }
                     }
                 }
@@ -1848,7 +1849,10 @@ impl MemorySystem {
                     embedding_backlog::EnqueueReason::IndexFailed,
                     Some(&e.to_string()),
                 ) {
-                    tracing::error!("embedding backlog: could not record {}: {record_err}", memory.id.0);
+                    tracing::error!(
+                        "embedding backlog: could not record {}: {record_err}",
+                        memory.id.0
+                    );
                 }
                 false
             } else {
@@ -2347,7 +2351,10 @@ impl MemorySystem {
                             embedding_backlog::EnqueueReason::EmbedFailed,
                             Some(&e.to_string()),
                         ) {
-                            tracing::error!("embedding backlog: could not record {}: {record_err}", memory_id.0);
+                            tracing::error!(
+                                "embedding backlog: could not record {}: {record_err}",
+                                memory_id.0
+                            );
                         }
                         // Non-fatal: memory is still searchable via BM25
                         return Ok(());
@@ -2409,7 +2416,10 @@ impl MemorySystem {
                 embedding_backlog::EnqueueReason::IndexFailed,
                 Some(&e.to_string()),
             ) {
-                tracing::error!("embedding backlog: could not record {}: {record_err}", memory_id.0);
+                tracing::error!(
+                    "embedding backlog: could not record {}: {record_err}",
+                    memory_id.0
+                );
             }
         } else {
             self.stats.write().vector_index_count += 1;
@@ -5402,7 +5412,9 @@ impl MemorySystem {
         match self.long_term_memory.get(memory_id) {
             Ok(memory) if memory.is_forgotten() => return EmbedOutcome::MemoryGone,
             Ok(_) => {}
-            Err(e) if e.to_string().contains("Memory not found") => return EmbedOutcome::MemoryGone,
+            Err(e) if e.to_string().contains("Memory not found") => {
+                return EmbedOutcome::MemoryGone
+            }
             Err(e) => return EmbedOutcome::Failed(e.to_string()),
         }
         if let Err(e) = self.embed_and_index(memory_id) {
@@ -5420,7 +5432,9 @@ impl MemorySystem {
             .unwrap_or_else(|| "not indexed after embed_and_index".to_string());
         match self.embedder.encode("veld embedder probe") {
             Ok(_) => EmbedOutcome::Failed(last_error),
-            Err(probe) => EmbedOutcome::EmbedderUnavailable(format!("{last_error}; probe: {probe}")),
+            Err(probe) => {
+                EmbedOutcome::EmbedderUnavailable(format!("{last_error}; probe: {probe}"))
+            }
         }
     }
 
@@ -5886,7 +5900,10 @@ impl MemorySystem {
                     embedding_backlog::EnqueueReason::IndexFailed,
                     Some(&e.to_string()),
                 ) {
-                    tracing::error!("embedding backlog: could not record {}: {record_err}", &memory_id.0);
+                    tracing::error!(
+                        "embedding backlog: could not record {}: {record_err}",
+                        &memory_id.0
+                    );
                 }
             }
 
@@ -5950,7 +5967,10 @@ impl MemorySystem {
                                 embedding_backlog::EnqueueReason::EmbedFailed,
                                 Some(&e.to_string()),
                             ) {
-                                tracing::error!("embedding backlog: could not record {}: {record_err}", &memory_id.0);
+                                tracing::error!(
+                                    "embedding backlog: could not record {}: {record_err}",
+                                    &memory_id.0
+                                );
                             }
                         }
                     }
@@ -6007,7 +6027,10 @@ impl MemorySystem {
                     embedding_backlog::EnqueueReason::IndexFailed,
                     Some(&e.to_string()),
                 ) {
-                    tracing::error!("embedding backlog: could not record {}: {record_err}", &memory.id.0);
+                    tracing::error!(
+                        "embedding backlog: could not record {}: {record_err}",
+                        &memory.id.0
+                    );
                 }
             }
 

@@ -101,28 +101,40 @@ pub fn frequency(
                     continue;
                 }
             }
-            *per_bucket.entry(start).or_default().entry(name.clone()).or_default() += 1;
+            *per_bucket
+                .entry(start)
+                .or_default()
+                .entry(name.clone())
+                .or_default() += 1;
             *totals.entry(name.clone()).or_default() += 1;
         }
     }
 
     let mut ranked: Vec<(&String, &usize)> = totals.iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    let kept: Vec<String> = ranked.iter().take(window.limit).map(|(n, _)| (*n).clone()).collect();
+    let kept: Vec<String> = ranked
+        .iter()
+        .take(window.limit)
+        .map(|(n, _)| (*n).clone())
+        .collect();
     let entities_in_window = totals.len();
-    let totals: BTreeMap<String, usize> =
-        kept.iter().map(|n| (n.clone(), totals[n])).collect();
+    let totals: BTreeMap<String, usize> = kept.iter().map(|n| (n.clone(), totals[n])).collect();
     let buckets = per_bucket
         .into_iter()
         .map(|(start, counts)| BucketCounts {
             start,
-            counts: counts.into_iter().filter(|(n, _)| totals.contains_key(n)).collect(),
+            counts: counts
+                .into_iter()
+                .filter(|(n, _)| totals.contains_key(n))
+                .collect(),
         })
         .collect();
 
     let undetermined = if undecodable > 0 {
         Some(Undetermined {
-            reason: format!("{undecodable} episode rows could not be decoded; counts are a lower bound"),
+            reason: format!(
+                "{undecodable} episode rows could not be decoded; counts are a lower bound"
+            ),
         })
     } else if in_window == 0 {
         Some(Undetermined {
@@ -170,7 +182,13 @@ mod tests {
         }
     }
 
-    type Fixture = (Vec<EpisodicNode>, HashMap<Uuid, (String, bool)>, Uuid, Uuid, Uuid);
+    type Fixture = (
+        Vec<EpisodicNode>,
+        HashMap<Uuid, (String, bool)>,
+        Uuid,
+        Uuid,
+        Uuid,
+    );
 
     fn fixture() -> Fixture {
         let alpha = Uuid::from_u128(1);
@@ -218,7 +236,10 @@ mod tests {
         let (episodes, names, ..) = fixture();
         let f = frequency(&episodes, 0, &names, &window(Bucket::Week, None));
         let starts: Vec<_> = f.buckets.iter().map(|b| b.start).collect();
-        assert_eq!(starts, vec![at("2026-03-02T00:00:00Z"), at("2026-03-09T00:00:00Z")]);
+        assert_eq!(
+            starts,
+            vec![at("2026-03-02T00:00:00Z"), at("2026-03-09T00:00:00Z")]
+        );
         assert_eq!(f.buckets[0].counts["alpha"], 2);
         assert_eq!(f.buckets[1].counts["alpha"], 1);
     }
@@ -226,7 +247,12 @@ mod tests {
     #[test]
     fn shelf_filter_drops_noise_entities() {
         let (episodes, names, ..) = fixture();
-        let f = frequency(&episodes, 0, &names, &window(Bucket::Day, Some(Shelf::Vocabulary)));
+        let f = frequency(
+            &episodes,
+            0,
+            &names,
+            &window(Bucket::Day, Some(Shelf::Vocabulary)),
+        );
         assert!(f.totals.contains_key("alpha"));
         assert!(!f.totals.contains_key("2026-01-01T00:00:00"));
         assert_eq!(f.entities_in_window, 1);
@@ -241,7 +267,10 @@ mod tests {
         assert_eq!(f.totals.len(), 1);
         assert!(f.totals.contains_key("alpha"));
         assert_eq!(f.entities_in_window, 2);
-        assert!(f.buckets.iter().all(|b| !b.counts.contains_key("2026-01-01T00:00:00")));
+        assert!(f
+            .buckets
+            .iter()
+            .all(|b| !b.counts.contains_key("2026-01-01T00:00:00")));
     }
 
     #[test]
@@ -267,8 +296,10 @@ mod tests {
     #[test]
     fn same_inputs_same_bytes() {
         let (episodes, names, ..) = fixture();
-        let a = serde_json::to_string(&frequency(&episodes, 0, &names, &window(Bucket::Day, None))).unwrap();
-        let b = serde_json::to_string(&frequency(&episodes, 0, &names, &window(Bucket::Day, None))).unwrap();
+        let a = serde_json::to_string(&frequency(&episodes, 0, &names, &window(Bucket::Day, None)))
+            .unwrap();
+        let b = serde_json::to_string(&frequency(&episodes, 0, &names, &window(Bucket::Day, None)))
+            .unwrap();
         assert_eq!(a, b);
     }
 }
