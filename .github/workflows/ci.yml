@@ -226,13 +226,14 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
-    # Release tags and manual dispatch only; the suite is verified locally before a push instead
-    # (operator decision, 2026-09-27). It needs ~20 runner minutes a run, and the account's Actions
-    # budget ran out twice in September. Local method, which reproduced this job's results exactly:
-    # an empty HOME (so the model cache is empty, as on a runner), CARGO_PROFILE_*_DEBUG=0 and a
-    # private CARGO_TARGET_DIR; run A without the model matched this job's 216 failures one for one,
-    # run B after model-fetch passed 2,345 of 2,345.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    # Runs on every push, pull request, tag and dispatch. From 2026-09-27 to 2026-10-11 it ran on
+    # tags and dispatch only, because the account's Actions budget ran out twice in September and
+    # the suite needs ~20 runner minutes; the repository went public on 2026-10-11 and standard
+    # Linux runners are free there, so the reason is gone. Two tests left red on main in that
+    # window (#49). Local method, which reproduced this job's results exactly: an empty HOME (so
+    # the model cache is empty, as on a runner), CARGO_PROFILE_*_DEBUG=0 and a private
+    # CARGO_TARGET_DIR; run A without the model matched this job's 216 failures one for one, run B
+    # after model-fetch passed 2,345 of 2,345.
     # No debug info in test builds. On 2026-09-27 the runner ran out of disk linking
     # hebbian_learning_tests (ld SIGBUS, "No space left on device"): every integration test is its
     # own binary carrying full DWARF for the crate, RocksDB and ONNX Runtime. Panic messages keep
@@ -319,17 +320,16 @@ jobs:
           build_result="${{ needs.build.result }}"
           if [[ "$build_result" == "success" || ( "$build_result" == "skipped" && "$build_expected" == "false" ) ]]; then build_ok=true; else build_ok=false; fi
           if [[ "$build_result" == "skipped" && "$build_ok" == "true" ]]; then build_icon="⏭"; elif [[ "$build_ok" == "true" ]]; then build_icon="✅"; else build_icon="❌"; fi
-          # Tests follow the same policy as the build: skipped on pushes and PRs, required on tags and
-          # dispatch.
+          # Tests run on every event, so only success passes; a skip is a failure.
           test_result="${{ needs.test.result }}"
-          if [[ "$test_result" == "success" || ( "$test_result" == "skipped" && "$build_expected" == "false" ) ]]; then test_ok=true; else test_ok=false; fi
-          if [[ "$test_result" == "skipped" && "$test_ok" == "true" ]]; then test_icon="⏭"; elif [[ "$test_ok" == "true" ]]; then test_icon="✅"; else test_icon="❌"; fi
+          if [[ "$test_result" == "success" ]]; then test_ok=true; else test_ok=false; fi
+          if [[ "$test_ok" == "true" ]]; then test_icon="✅"; else test_icon="❌"; fi
 
           echo "| Version | $version_icon ${{ needs.version-check.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Format | $format_icon ${{ needs.format.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Clippy | $clippy_icon ${{ needs.clippy.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Build | $build_icon $build_result$([[ "$build_icon" == "⏭" ]] && echo ' (release tags and dispatch only)') |" >> $GITHUB_STEP_SUMMARY
-          echo "| Tests | $test_icon $test_result$([[ "$test_icon" == "⏭" ]] && echo ' (release tags and dispatch only; verified locally before push)') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests | $test_icon $test_result |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [[ "${{ needs.version-check.result }}" == "success" && \
