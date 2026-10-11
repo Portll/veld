@@ -589,13 +589,12 @@ pub async fn revoke_own_session(
     }))
 }
 
-// These tests open the auth store on a RocksDB handle; a redb-only build has none to give them.
-#[cfg(all(test, feature = "rocksdb"))]
+#[cfg(all(test, feature = "storage-redb"))]
 mod tests {
     use super::*;
+    use crate::storage::redb::{create_redb_database_for_test, RedbColumnStore};
     use crate::user_auth::runtime::LoginLimiter;
     use crate::user_auth::store::UserAuthStore;
-    use rocksdb::{Options as RocksOptions, DB};
     use std::time::Duration;
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -603,13 +602,8 @@ mod tests {
     const SECRET: &[u8] = b"step-up-secret-twenty";
 
     fn open_runtime(dir: &std::path::Path, burst: u32) -> UserAuthRuntime {
-        let mut opts = RocksOptions::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-        let db =
-            DB::open_cf_descriptors(&opts, dir, vec![crate::user_auth::store::cf_descriptor()])
-                .unwrap();
-        let store = UserAuthStore::new(Arc::new(db)).unwrap();
+        let db = create_redb_database_for_test(&dir.join("auth.redb")).unwrap();
+        let store = UserAuthStore::with_store(Arc::new(RedbColumnStore::new(db))).unwrap();
         UserAuthRuntime::with_limiter(
             store,
             LoginLimiter::new(burst, Duration::from_secs(60)),
