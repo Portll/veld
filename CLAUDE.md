@@ -1,7 +1,7 @@
 # Veld — Agentic Memory: Project Instructions
 
 > Product: **Veld — Agentic Memory**. Crate / package IDs remain `veld`.
-> Repository: https://github.com/Portll/veld • License: AGPL-3.0-or-later (or commercial — see LICENSING.md) • Cargo version: see `Cargo.toml` (`0.7.x` line at time of writing).
+> Repository: https://github.com/Portll/veld • License: Veld Evaluation Licence (PolyForm Internal Use by agreement; AGPL-3.0-or-later intended at 2.0 — see LICENSING.md) • Cargo version: see `Cargo.toml` (`0.7.x` line at time of writing).
 > Branch status (per [PROGRESS.md](PROGRESS.md)): first packaged release cut (repo moved to `Portll/veld`, CI added); the `0.7.x` line on `main` is stabilizing toward a clean `v0.8`. `v0.9` is the public-release / redb-runtime-cutover target.
 
 ---

@@ -67,16 +67,19 @@ be available under Apache-2.0 from the upstream repository. Nothing in this
 distribution restricts, or purports to restrict, that grant. Anyone may obtain
 those portions from upstream under Apache-2.0 regardless of the terms below.
 
-The derivative work as a whole is (c) 2025-2026 Portll, distributed under the GNU
-Affero General Public License version 3 or later, or under a separate commercial
-licence from Portll. See LICENSE and LICENSING.md.
+The derivative work as a whole is (c) 2025-2026 Portll, distributed under the Veld
+Evaluation Licence (LICENSE), with the PolyForm Internal Use License 1.0.0 available
+by written agreement. Portll has stated an intention to release veld 2.0 under the
+GNU Affero General Public License version 3 or later. See LICENSE and LICENSING.md.
 
 Apache-2.0 section 2 grants an irrevocable right to prepare derivative works and
 to sublicense, and section 4 expressly permits different licence terms for a
 derivative work as a whole, provided the section 4 conditions are met for the
 Apache-licensed material. That is the basis on which this work is offered under
-the terms above. Apache-2.0 is also one-way compatible with GPLv3 and AGPLv3, so
-the upstream portions may be conveyed as part of an AGPL-3.0-or-later work.
+the terms above. The evaluation licence names the upstream portions as an Excluded
+Component and does not restrict the Apache-2.0 grant in them. Apache-2.0 is also
+one-way compatible with GPLv3 and AGPLv3, so the upstream portions could be conveyed
+as part of an AGPL-3.0-or-later work if that release is made.
 
 Apache-2.0 section 6 grants no trademark rights. Nothing here claims any right in
 the "shodh-memory" or "shodh-rag" names; they appear solely to identify the origin
