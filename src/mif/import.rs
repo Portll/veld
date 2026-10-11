@@ -341,6 +341,8 @@ pub fn import_graph_relationships(
             created_by: EdgeSource::Explicit,
             forward_strength: strength,
             backward_strength: strength,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         };
 
         match graph.add_relationship(edge) {

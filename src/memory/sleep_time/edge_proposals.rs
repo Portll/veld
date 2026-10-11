@@ -190,6 +190,8 @@ fn make_l1_edge(
         created_by: EdgeSource::default(),
         forward_strength: strength,
         backward_strength: strength,
+        strengthening_sources: Default::default(),
+        last_corroborated: None,
     }
 }
 

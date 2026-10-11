@@ -22,7 +22,7 @@ use veld::memory::types::LayerMode;
 use veld::recall_harness::multihop::analyze_multihop;
 use veld::recall_harness::report::{
     compare_to_baseline, AblationReport, BridgeReport, DecayReport, DeltaCi, LearningCurveReport,
-    MultiHopReport, ReachabilityReport, Report, SelectiveForgettingReport,
+    MultiHopReport, PlantedRepetitionReport, ReachabilityReport, Report, SelectiveForgettingReport,
 };
 use veld::recall_harness::runner::{
     analyze_ablation, analyze_funnel, analyze_graph_reachability, analyze_learning_curve,
@@ -249,6 +249,12 @@ struct Args {
     /// cognitive memory grows the divergence; indiscriminate decay keeps it ~0.
     #[arg(long)]
     selective_forgetting: Option<PathBuf>,
+
+    /// E6c planted repetition: a non-gold memory recalled N times by one source vs
+    /// once each by K sources; reports gold recall@k and the planted memory's rank
+    /// per arm. Repetition must not move it; corroboration may.
+    #[arg(long)]
+    planted_repetition: Option<PathBuf>,
 
     /// E5 ontology: planted type-disambiguation (person vs org sharing a place);
     /// the +rerank delta on the type-qualified cases isolates the ontology layer.
@@ -690,6 +696,58 @@ fn run(args: &Args) -> Result<i32> {
             );
         }
         println!("\nDivergence GROWING with age = selective forgetting (retains important, drops trivial). Flat ~0 = indiscriminate decay.");
+        return Ok(EXIT_PASS);
+    }
+
+    // E6c planted repetition: one source N times vs K sources once each.
+    if let Some(pr_path) = &args.planted_repetition {
+        use veld::recall_harness::forgetting_harness as fh;
+        let env_usize = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(default)
+        };
+        let groups = env_usize("VELD_PLANTED_GROUPS", fh::DEFAULT_PLANTED_GROUPS);
+        let repeats = env_usize("VELD_PLANTED_REPEATS", fh::DEFAULT_PLANTED_REPEATS);
+        let sources = env_usize("VELD_PLANTED_SOURCES", fh::DEFAULT_PLANTED_SOURCES);
+        let report = fh::analyze_planted_repetition(&inputs, groups, repeats, sources)
+            .context("planted repetition analysis")?;
+        write_planted(pr_path, &report)?;
+        eprintln!(
+            "recall-eval: planted repetition (suite={}, groups={})",
+            report.suite, report.groups
+        );
+        println!(
+            "## Planted repetition — one source N times vs K sources once ({}, {} groups)\n",
+            report.suite, report.groups
+        );
+        println!(
+            "| arm | recalls/group | sources | recall@10 | ndcg@10 | mrr | planted rank | planted top-10 | access | importance | edges present | edge strength | edge sources | edge activations |"
+        );
+        println!(
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        );
+        for r in &report.rows {
+            println!(
+                "| {} | {} | {} | {:.4} | {:.4} | {:.4} | {:.2} | {} | {:.1} | {:.3} | {} | {:.3} | {:.1} | {:.1} |",
+                r.arm,
+                r.recalls_per_group,
+                r.distinct_sources,
+                r.recall_at_10,
+                r.ndcg_at_10,
+                r.mrr,
+                r.planted_mean_rank,
+                r.planted_in_top_10,
+                r.planted_access_count_mean,
+                r.planted_importance_mean,
+                r.planted_edge_present,
+                r.planted_edge_strength_mean,
+                r.planted_edge_distinct_sources_mean,
+                r.planted_edge_activations_mean,
+            );
+        }
+        println!("\nA repeat arm that ranks the planted memory above control is a recall-feeds-rank loop; a corroborate arm that moves it is evidence doing its job.");
         return Ok(EXIT_PASS);
     }
 
@@ -1174,6 +1232,20 @@ fn write_selective(path: &std::path::Path, report: &SelectiveForgettingReport) -
         serde_json::to_vec_pretty(report).context("serialising selective-forgetting report")?;
     std::fs::write(path, &json)
         .with_context(|| format!("writing selective-forgetting report to {}", path.display()))?;
+    Ok(())
+}
+
+fn write_planted(path: &std::path::Path, report: &PlantedRepetitionReport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating output dir {}", parent.display()))?;
+        }
+    }
+    let json =
+        serde_json::to_vec_pretty(report).context("serialising planted-repetition report")?;
+    std::fs::write(path, &json)
+        .with_context(|| format!("writing planted-repetition report to {}", path.display()))?;
     Ok(())
 }
 

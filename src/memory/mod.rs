@@ -124,10 +124,28 @@ pub(crate) fn scoring_now() -> chrono::DateTime<chrono::Utc> {
 }
 
 pub(crate) fn recall_readonly() -> bool {
+    if RECALL_WRITES_FORCED.with(|f| f.get()) {
+        return false;
+    }
     let flag = |name: &str| std::env::var(name).ok().map(|v| v == "1");
     flag("VELD_RECALL_READONLY")
         .or_else(|| flag("SHODH_RECALL_READONLY"))
         .unwrap_or(false)
+}
+
+thread_local! {
+    static RECALL_WRITES_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with recall's usage writes enabled on this thread regardless of the
+/// `*_RECALL_READONLY` env gate. For a harness that must teach the store in one
+/// phase and measure without teaching in the next, where flipping the process-wide
+/// env would also flip every other harness sharing the process.
+pub fn with_recall_writes<T>(f: impl FnOnce() -> T) -> T {
+    let previous = RECALL_WRITES_FORCED.with(|flag| flag.replace(true));
+    let out = f();
+    RECALL_WRITES_FORCED.with(|flag| flag.set(previous));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2851,6 +2869,8 @@ impl MemorySystem {
                         created_by: crate::graph_memory::EdgeSource::CoOccurrence,
                         forward_strength: cooccurs_init,
                         backward_strength: cooccurs_init,
+                        strengthening_sources: Default::default(),
+                        last_corroborated: None,
                     };
 
                     if let Err(e) = graph_guard.add_relationship(edge) {
@@ -2896,6 +2916,8 @@ impl MemorySystem {
                             created_by: crate::graph_memory::EdgeSource::CoOccurrence,
                             forward_strength: l1_base_weight * 0.8,
                             backward_strength: l1_base_weight * 0.8,
+                            strengthening_sources: Default::default(),
+                            last_corroborated: None,
                         };
                         if let Err(e) = graph_guard.add_relationship(edge) {
                             tracing::trace!(
@@ -5704,6 +5726,8 @@ impl MemorySystem {
                             created_by: crate::graph_memory::EdgeSource::Coactivation,
                             forward_strength: related_init,
                             backward_strength: related_init,
+                            strengthening_sources: Default::default(),
+                            last_corroborated: None,
                         };
                         if graph_guard.add_relationship(edge).is_ok() {
                             edges_added += 1;
@@ -6151,6 +6175,8 @@ impl MemorySystem {
                             created_by: crate::graph_memory::EdgeSource::CoOccurrence,
                             forward_strength: cooccurs_init2,
                             backward_strength: cooccurs_init2,
+                            strengthening_sources: Default::default(),
+                            last_corroborated: None,
                         };
 
                         if let Err(e) = graph_guard.add_relationship(edge) {
@@ -6367,7 +6393,7 @@ impl MemorySystem {
         if boosts.is_empty() {
             return 0;
         }
-        match g.strengthen_memory_edges(&boosts) {
+        match g.strengthen_memory_edges(&boosts, "reconsolidation") {
             Ok((n, _promotions)) => n,
             Err(e) => {
                 tracing::debug!("reconsolidation graph strengthen failed: {e}");
@@ -8978,6 +9004,8 @@ mod simulate_edge_aging_tests {
             entity_confidence: None,
             forward_strength: strength,
             backward_strength: strength,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         }
     }
 

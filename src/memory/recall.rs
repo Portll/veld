@@ -34,6 +34,7 @@ impl super::MemorySystem {
     /// - Non-semantic search: Uses importance * temporal decay
     /// - Zero shortcuts, no TODOs, enterprise-grade
     pub fn recall(&self, query: &Query) -> Result<Vec<SharedMemory>> {
+        let _evidence = crate::graph_memory::EvidenceScope::enter(query.evidence_source.as_deref());
         // Semantic search requires special handling
         if let Some(query_text) = &query.query_text {
             return self.semantic_retrieve(query_text, query);
@@ -136,9 +137,14 @@ impl super::MemorySystem {
         if !readonly && memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let retrieval_id = uuid::Uuid::new_v4();
+                let source = query
+                    .evidence_source
+                    .as_deref()
+                    .unwrap_or(crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE);
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
                 match graph.read().apply_reinforcement(
                     retrieval_id,
+                    source,
                     &memory_uuids[0],
                     &memory_uuids[1..],
                 ) {
@@ -1109,6 +1115,7 @@ impl super::MemorySystem {
             // the caller ablated away
             layers: query.layers,
             ner_entities: query.ner_entities.clone(),
+            evidence_source: query.evidence_source.clone(),
             time_range: query.time_range,
             as_of: query.as_of,
             experience_types: query.experience_types.clone(),
@@ -1214,6 +1221,7 @@ impl super::MemorySystem {
                     query_embedding: Some(sub_embedding),
                     layers: query.layers,
                     ner_entities: query.ner_entities.clone(),
+                    evidence_source: query.evidence_source.clone(),
                     time_range: query.time_range,
                     as_of: query.as_of,
                     experience_types: query.experience_types.clone(),
@@ -4180,9 +4188,14 @@ impl super::MemorySystem {
         if !readonly && memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let retrieval_id = uuid::Uuid::new_v4();
+                let source = query
+                    .evidence_source
+                    .as_deref()
+                    .unwrap_or(crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE);
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
                 match graph.read().apply_reinforcement(
                     retrieval_id,
+                    source,
                     &memory_uuids[0],
                     &memory_uuids[1..],
                 ) {
@@ -5017,6 +5030,21 @@ impl super::MemorySystem {
         memory_ids: &[MemoryId],
         outcome: RetrievalOutcome,
     ) -> Result<ReinforcementStats> {
+        self.reinforce_recall_from(
+            memory_ids,
+            outcome,
+            crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE,
+        )
+    }
+
+    /// `reinforce_recall` with the evidence source named: the session or tool whose
+    /// feedback this is. One source counts once per edge it strengthens.
+    pub fn reinforce_recall_from(
+        &self,
+        memory_ids: &[MemoryId],
+        outcome: RetrievalOutcome,
+        source: &str,
+    ) -> Result<ReinforcementStats> {
         if memory_ids.is_empty() {
             return Ok(ReinforcementStats::default());
         }
@@ -5037,6 +5065,7 @@ impl super::MemorySystem {
                     let retrieval_id = uuid::Uuid::new_v4();
                     match graph.read().apply_reinforcement(
                         retrieval_id,
+                        source,
                         &memory_uuids[0],
                         &memory_uuids[1..],
                     ) {
@@ -5089,7 +5118,7 @@ impl super::MemorySystem {
                 let path_edges: Vec<(uuid::Uuid, f32)> =
                     std::mem::take(&mut *self.spreading_path_credit.lock());
                 if !path_edges.is_empty() {
-                    match graph.read().apply_path_credit(&path_edges) {
+                    match graph.read().apply_path_credit(&path_edges, source) {
                         Ok(n) => {
                             tracing::debug!(
                                 n,

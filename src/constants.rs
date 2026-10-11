@@ -36,6 +36,26 @@ pub const HEBBIAN_BOOST_HELPFUL: f32 = 0.025;
 /// - Multiplicative decay ensures importance never goes negative
 pub const HEBBIAN_DECAY_MISLEADING: f32 = 0.10;
 
+/// Strength added when a source that has already strengthened an edge does so again.
+///
+/// Repeated recall from one source is one piece of evidence, so the default is zero:
+/// the repeat refreshes `last_activated` and nothing else moves. A non-zero value is
+/// applied as `boost × (1 − strength)` without counting as an activation, so repeats
+/// alone cannot reach LTP or a tier promotion.
+pub const HEBBIAN_REPEAT_SOURCE_BOOST: f32 = 0.0;
+
+/// Upper bound on the distinct strengthening sources one edge records.
+///
+/// At the cap a source absent from the record cannot be told from a repeat and is
+/// treated as one: strengthening fails closed rather than reopening the
+/// recall-feeds-rank loop for late sources.
+pub const HEBBIAN_EVIDENCE_SOURCES_CAP: usize = 64;
+
+/// Source recorded for a strengthening event whose caller carries no identity
+/// (graph HTTP traversal, library callers without a session). All such events share
+/// one slot, so between them they strengthen an edge at most once.
+pub const HEBBIAN_UNATTRIBUTED_SOURCE: &str = "unattributed";
+
 /// Minimum importance floor after decay
 ///
 /// Importance never drops below this value, allowing recovery if the memory

@@ -1389,6 +1389,8 @@ fn detect_and_resolve_conflicts(
                 created_by: crate::graph_memory::EdgeSource::CoOccurrence,
                 forward_strength: sim,
                 backward_strength: sim,
+                strengthening_sources: Default::default(),
+                last_corroborated: None,
             };
             let _ = graph.add_relationship(edge);
         }
@@ -1948,6 +1950,8 @@ pub async fn batch_remember(
                                         created_by: crate::graph_memory::EdgeSource::CoOccurrence,
                                         forward_strength: init_weight,
                                         backward_strength: init_weight,
+                                        strengthening_sources: Default::default(),
+                                        last_corroborated: None,
                                     };
                                     if let Err(e) = graph_guard.add_relationship(edge) {
                                         tracing::debug!(

@@ -146,6 +146,45 @@ pub struct PerCaseRecord {
     pub recall_at_100: f64,
 }
 
+/// One arm of the E6c planted-repetition study. `recall@10` / `ndcg@10` / `mrr`
+/// are over the gold of the planted queries; the `planted_*` fields describe the
+/// memory that is not gold for those queries, after the arm's recall traffic.
+/// `planted_mean_rank` counts a planted memory absent from the measured list as
+/// one past the measurement width.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlantedRepetitionRow {
+    /// "control" (no recalls), "repeat_one_source", "corroborate_k_sources".
+    pub arm: String,
+    pub recalls_per_group: usize,
+    pub distinct_sources: usize,
+    #[serde(rename = "recall@10")]
+    pub recall_at_10: f64,
+    #[serde(rename = "ndcg@10")]
+    pub ndcg_at_10: f64,
+    pub mrr: f64,
+    pub planted_mean_rank: f64,
+    pub planted_in_top_10: usize,
+    /// Access count and importance as persisted on the planted record.
+    pub planted_access_count_mean: f64,
+    pub planted_importance_mean: f64,
+    /// Groups in which a co-retrieval edge between the planted memory and its helper
+    /// exists after the arm's traffic. The `planted_edge_*` means are over these.
+    pub planted_edge_present: usize,
+    pub planted_edge_strength_mean: f64,
+    pub planted_edge_distinct_sources_mean: f64,
+    pub planted_edge_activations_mean: f64,
+}
+
+/// E6c planted-repetition report: does recall traffic from ONE source move a
+/// non-gold memory's rank, and does the same traffic from K sources?
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlantedRepetitionReport {
+    pub suite: String,
+    pub git_sha: String,
+    pub groups: usize,
+    pub rows: Vec<PlantedRepetitionRow>,
+}
+
 /// One age point in the E6 decay/stability curve.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DecayRow {

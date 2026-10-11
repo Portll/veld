@@ -496,6 +496,11 @@ pub async fn recall(
     let query_for_recall = req.query.clone();
     let tags_for_recall = req.tags.clone();
 
+    let evidence_source = state
+        .session_store
+        .get_or_create_session(&req.user_id)
+        .to_string();
+
     let (memories, triggered_reminders, _prospective_signals, query_embedding_opt) =
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory_for_recall.read();
@@ -578,6 +583,7 @@ pub async fn recall(
                 as_of: req.as_of,
                 tags: tags_for_recall,
                 layers: layers_for_recall,
+                evidence_source: Some(evidence_source),
                 ..Default::default()
             };
 
@@ -1217,6 +1223,10 @@ pub async fn proactive_context(
         .map_validation_err("entity_match_weight")?;
     validation::validate_weight("recency_weight", req.recency_weight)
         .map_validation_err("recency_weight")?;
+    let evidence_source = state
+        .session_store
+        .get_or_create_session(&req.user_id)
+        .to_string();
 
     // Strip system noise BEFORE any processing — <task-notification>, <system-reminder>,
     // <veld-context>, code blocks, file contents, etc. This ensures embedding, NER, BM25,
@@ -1427,23 +1437,27 @@ pub async fn proactive_context(
             let memory_sys_for_reinforce = memory_system.clone();
             let graph_for_reinforce = graph_memory.clone();
             let helpful_ids_for_graph = helpful_ids.clone();
+            let evidence_source_for_feedback = evidence_source.clone();
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_sys_for_reinforce.read();
 
                 // Reinforce helpful memories (importance boost)
                 if !helpful_ids.is_empty() {
-                    if let Err(e) = memory_guard
-                        .reinforce_recall(&helpful_ids, crate::memory::RetrievalOutcome::Helpful)
-                    {
+                    if let Err(e) = memory_guard.reinforce_recall_from(
+                        &helpful_ids,
+                        crate::memory::RetrievalOutcome::Helpful,
+                        &evidence_source_for_feedback,
+                    ) {
                         tracing::warn!("Failed to reinforce helpful memories: {}", e);
                     }
                 }
 
                 // Weaken misleading memories (importance decay)
                 if !misleading_ids.is_empty() {
-                    if let Err(e) = memory_guard.reinforce_recall(
+                    if let Err(e) = memory_guard.reinforce_recall_from(
                         &misleading_ids,
                         crate::memory::RetrievalOutcome::Misleading,
+                        &evidence_source_for_feedback,
                     ) {
                         tracing::warn!("Failed to weaken misleading memories: {}", e);
                     }
@@ -1455,7 +1469,10 @@ pub async fn proactive_context(
                 if !helpful_ids_for_graph.is_empty() {
                     let graph_guard = graph_for_reinforce.read();
                     for memory_id in &helpful_ids_for_graph {
-                        match graph_guard.strengthen_episode_entity_edges(&memory_id.0) {
+                        match graph_guard.strengthen_episode_entity_edges(
+                            &memory_id.0,
+                            &evidence_source_for_feedback,
+                        ) {
                             Ok(count) if count > 0 => {
                                 tracing::debug!(
                                     memory_id = %memory_id.0,
@@ -1658,6 +1675,7 @@ pub async fn proactive_context(
     }
 
     // 2. Retrieve memories using unified 5-layer pipeline
+    let evidence_source_for_recall = evidence_source.clone();
     // The pipeline already applies: RRF fusion + hebbian + recency + feedback (PIPE-9)
     // No double-scoring needed - just use the scores from recall() directly
     let context_clone = req.context.clone();
@@ -1697,6 +1715,7 @@ pub async fn proactive_context(
                 rrf_k: rrf_k_for_context,
                 prospective_signals,
                 competition_mode: req.competition_mode,
+                evidence_source: Some(evidence_source_for_recall),
                 ..Default::default()
             };
             // See the note at the first recall site: a failure must not present as
@@ -1911,12 +1930,16 @@ pub async fn proactive_context(
             let trigger_id = memory_ids[0];
             let coactivated_ids: Vec<uuid::Uuid> = memory_ids[1..].to_vec();
             let retrieval_id = uuid::Uuid::new_v4();
+            let evidence_source_for_graph = evidence_source.clone();
             tokio::task::spawn(async move {
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     let graph_guard = graph.read();
-                    if let Err(e) =
-                        graph_guard.apply_reinforcement(retrieval_id, &trigger_id, &coactivated_ids)
-                    {
+                    if let Err(e) = graph_guard.apply_reinforcement(
+                        retrieval_id,
+                        &evidence_source_for_graph,
+                        &trigger_id,
+                        &coactivated_ids,
+                    ) {
                         tracing::warn!("apply_reinforcement failed: {e}");
                     }
                 })
@@ -2644,6 +2667,10 @@ pub async fn recall_tracked(
     let limit = req.limit;
     let user_id = req.user_id.clone();
     let retrieval_mode = parse_retrieval_mode(&req.mode);
+    let evidence_source = state
+        .session_store
+        .get_or_create_session(&req.user_id)
+        .to_string();
 
     let memories = {
         let memory = memory.clone();
@@ -2655,6 +2682,7 @@ pub async fn recall_tracked(
                 max_results: limit,
                 retrieval_mode,
                 competition_mode: req.competition_mode,
+                evidence_source: Some(evidence_source),
                 ..Default::default()
             };
             // See the note at the first recall site: a failure must not present as
@@ -2822,11 +2850,15 @@ pub async fn reinforce_feedback(
         .map_err(AppError::Internal)?;
 
     // Run reinforcement in blocking task (involves RocksDB writes)
+    let evidence_source = state
+        .session_store
+        .get_or_create_session(&req.user_id)
+        .to_string();
     let stats = {
         let memory = memory.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            memory_guard.reinforce_recall(&memory_ids, outcome)
+            memory_guard.reinforce_recall_from(&memory_ids, outcome, &evidence_source)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
