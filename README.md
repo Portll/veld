@@ -14,7 +14,7 @@
   <a href="https://www.npmjs.com/package/@veld/memory-mcp"><img src="https://img.shields.io/npm/v/@veld/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/veld/"><img src="https://img.shields.io/pypi/v/veld.svg" alt="PyPI"></a>
   <a href="https://hub.docker.com/r/varunveld/veld"><img src="https://img.shields.io/docker/pulls/varunveld/veld.svg?logo=docker" alt="Docker"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Evaluation-blue.svg" alt="License"></a>
   <a href="https://discord.gg/HrpzXqTtEp"><img src="https://img.shields.io/discord/1471830549818642432?logo=discord&label=Discord&color=5865F2" alt="Discord"></a>
 </p>
 
@@ -471,8 +471,11 @@ memory.example.com {
 
 ## License
 
-veld is dual-licensed: **AGPL-3.0-or-later** (see [LICENSE](LICENSE)) **or** a commercial
-licence from Portll. See [LICENSING.md](LICENSING.md).
+veld is published under the **Veld Evaluation Licence** (see [LICENSE](LICENSE)): install,
+run, read and assess it on your own hardware, nothing more. Internal business use is licensed
+under the **PolyForm Internal Use License 1.0.0** by written agreement. Portll intends to
+release veld 2.0 under **AGPL-3.0-or-later**; that is a stated intention, not a grant. See
+[LICENSING.md](LICENSING.md).
 
 A derivative work of [shodh-memory](https://github.com/varun29ankuS/shodh-memory)
 (Apache-2.0); upstream portions remain under Apache-2.0 — see [NOTICE](NOTICE).
