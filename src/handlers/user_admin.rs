@@ -589,7 +589,8 @@ pub async fn revoke_own_session(
     }))
 }
 
-#[cfg(test)]
+// These tests open the auth store on a RocksDB handle; a redb-only build has none to give them.
+#[cfg(all(test, feature = "rocksdb"))]
 mod tests {
     use super::*;
     use crate::user_auth::runtime::LoginLimiter;

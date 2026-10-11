@@ -1,5 +1,6 @@
 //! VELD_ENCRYPTION_KEY with no keystore refuses to open. It used to encrypt content;
 //! now it would only decrypt, and every write after it would be plaintext.
+#![cfg(feature = "rocksdb")]
 
 use tempfile::TempDir;
 use veld::memory::storage::MemoryStorage;
