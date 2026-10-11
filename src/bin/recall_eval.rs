@@ -21,7 +21,7 @@ use clap::{Parser, ValueEnum};
 use veld::memory::types::LayerMode;
 use veld::recall_harness::multihop::analyze_multihop;
 use veld::recall_harness::report::{
-    compare_to_baseline, AblationReport, BridgeReport, DecayReport, LearningCurveReport,
+    compare_to_baseline, AblationReport, BridgeReport, DecayReport, DeltaCi, LearningCurveReport,
     MultiHopReport, ReachabilityReport, Report, SelectiveForgettingReport,
 };
 use veld::recall_harness::runner::{
@@ -872,6 +872,44 @@ fn summarise_reachability(report: &ReachabilityReport) {
             .collect();
         eprintln!("  entity labels: {}", shown.join("  "));
 
+        // Which labels carry the connectivity. `entity labels` above says what
+        // EXISTS; a label that is a small share of nodes and a large share of
+        // incidences is a node type doing an attribute's job, and that is a
+        // construction decision rather than an extraction result.
+        //
+        // Denominator is total incidences (2x edges). Multi-label entities are
+        // counted under each label, so these shares can sum past 100% -- read
+        // each against that label's ENTITY share, not against the others.
+        let incidences = gs.total_edges * 2;
+        if incidences > 0 && !gs.label_degrees.is_empty() {
+            let mut census: Vec<(&String, &(usize, usize, usize))> =
+                gs.label_degrees.iter().collect();
+            census.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then_with(|| a.0.cmp(b.0)));
+            eprintln!("  degree census by label (entity share -> incidence share):");
+            for (name, (n, sum, max)) in census.iter().take(10) {
+                let ent_share = 100.0 * *n as f64 / gs.total_entities.max(1) as f64;
+                let inc_share = 100.0 * *sum as f64 / incidences as f64;
+                eprintln!(
+                    "    {name:<14} {n:>4} ent ({ent_share:>5.1}%) -> {sum:>6} inc \
+                     ({inc_share:>5.1}%)  mean {:>5.1}  max {max}",
+                    *sum as f64 / (*n).max(1) as f64,
+                );
+            }
+        }
+
+        // Identities. Aggregates hide hubs, and per-label mean degree
+        // understates them because degrees are post-cap. A degree sitting
+        // exactly on the cap is the tell: its overflow was discarded at ingest.
+        if !gs.top_hubs.is_empty() {
+            eprintln!(
+                "  top hubs by degree (post-cap; a degree at the cap means edges were dropped):"
+            );
+            for (name, labels, degree) in gs.top_hubs.iter().take(15) {
+                let short: String = name.chars().take(38).collect();
+                eprintln!("    {degree:>5}  {short:<38}  {labels}");
+            }
+        }
+
         // Connectivity. A k-connected graph survives k-1 vertex deletions; if
         // this shatters after a handful, connectivity is HUB-CARRIED and a high
         // edge count was never high connectivity.
@@ -972,14 +1010,10 @@ fn write_ablation(path: &std::path::Path, report: &AblationReport) -> Result<()>
     Ok(())
 }
 
-/// Print the ablation matrix as a markdown table (Δ recall@10 vs the row named
-/// `baseline`), so it can be pasted straight into the study doc.
+/// Print the ablation matrix as a markdown table, so it can be pasted straight into
+/// the study doc. Each delta is paired against the arm's own reference, with a 95%
+/// bootstrap interval over cases; `*` marks an interval that excludes zero.
 fn summarise_ablation(report: &AblationReport) {
-    let base = report
-        .rows
-        .iter()
-        .find(|r| r.name.starts_with("baseline"))
-        .and_then(|r| r.recall_at_10);
     eprintln!(
         "recall-eval: ablation (suite={} cases={} sha={})",
         report.suite, report.case_count, report.git_sha
@@ -988,24 +1022,47 @@ fn summarise_ablation(report: &AblationReport) {
         "## Ablation matrix ({} suite, {} cases)\n",
         report.suite, report.case_count
     );
-    println!("| config | recall@10 | Δ vs base | ndcg@10 | mrr | p@1 |");
-    println!("| --- | --- | --- | --- | --- | --- |");
-    // An arm veld cannot run carries no metrics; it prints as n/a.
+    println!(
+        "Δ is paired against the reference arm, [lo, hi] is a 95% bootstrap interval over \
+         cases, `*` = the interval excludes 0. VACUOUS = byte-identical retrieval to the \
+         reference, so the arm's flags never reached their code path. n/a = veld has no code \
+         path for a flag the arm sets.\n"
+    );
+    println!(
+        "| config | reference | recall@10 | Δ recall@10 [95% CI] | p@1 | Δ p@1 [95% CI] | ndcg@10 | mrr |"
+    );
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- |");
     let cell = |v: Option<f64>| v.map_or_else(|| "n/a".to_string(), |x| format!("{x:.4}"));
     for r in &report.rows {
-        let delta = match (base, r.recall_at_10) {
-            (Some(b), Some(v)) => format!("{:+.4}", v - b),
-            _ => String::new(),
+        let name = if r.vacuous_vs_reference {
+            format!("{} (VACUOUS)", r.name)
+        } else {
+            r.name.clone()
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} |",
-            r.name,
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            name,
+            r.reference.as_deref().unwrap_or("—"),
             cell(r.recall_at_10),
-            delta,
+            format_delta(r.delta_recall_at_10),
+            cell(r.p_at_1),
+            format_delta(r.delta_p_at_1),
             cell(r.ndcg_at_10),
-            cell(r.mrr),
-            cell(r.p_at_1)
+            cell(r.mrr)
         );
+    }
+    match report.baseline_replicate_identical {
+        Some(true) => println!(
+            "\nBaseline replicate (re-run after every arm, same ingest): **identical** to the \
+             first pass. No arm left state behind, and query-time retrieval is deterministic \
+             on this ingest."
+        ),
+        Some(false) => println!(
+            "\nBaseline replicate (re-run after every arm, same ingest): **DIFFERS** from the \
+             first pass. Either an arm left state behind or query-time retrieval is not \
+             deterministic on a fixed ingest; read every delta above with that noise in mind."
+        ),
+        None => {}
     }
     // Per-category recall, transposed (category × config), surfaces a config that
     // trades one capability for another.
@@ -1032,6 +1089,20 @@ fn summarise_ablation(report: &AblationReport) {
                 .collect();
             println!("| {} | {} |", cat, cells.join(" | "));
         }
+    }
+}
+
+/// `+0.0123 [+0.0040, +0.0210] *` for a paired delta, empty for the baseline.
+fn format_delta(delta: Option<DeltaCi>) -> String {
+    match delta {
+        Some(d) => format!(
+            "{:+.4} [{:+.4}, {:+.4}]{}",
+            d.mean,
+            d.lo,
+            d.hi,
+            if d.excludes_zero() { " *" } else { "" }
+        ),
+        None => String::new(),
     }
 }
 
@@ -1150,6 +1221,19 @@ fn summarise(report: &Report) {
         "recall-eval: suite={} cases={} repeats={} embedder={} sha={}",
         report.suite, report.case_count, report.repeats, report.embedder, report.git_sha
     );
+    match &report.rerank {
+        Some(r) if r.enabled => eprintln!(
+            "recall-eval: rerank=cross-encoder model={} cap={}",
+            r.model.as_deref().unwrap_or("?"),
+            r.depth
+        ),
+        Some(_) => eprintln!("recall-eval: rerank=off"),
+        None => eprintln!("recall-eval: rerank=<not recorded>"),
+    }
+    match &report.model_tape {
+        Some(d) => eprintln!("recall-eval: model outputs replayed from tape {d}"),
+        None => eprintln!("recall-eval: model outputs computed live"),
+    }
     // Print modes in pipeline order (vamana_only → full), not BTreeMap order.
     // Match against the canonical mode keys so any unknown key just falls
     // through to the BTreeMap iteration at the bottom.

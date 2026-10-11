@@ -1505,6 +1505,13 @@ impl MemorySystem {
         *self.external_scores.write() = Some(scores);
     }
 
+    /// Load the configured cross-encoder now and score one pair through it, returning the
+    /// model's id. `None` when no reranker is configured. An error means reranking would fall
+    /// back to bi-encoder scores.
+    pub fn probe_cross_encoder(&self) -> Option<Result<String>> {
+        self.hybrid_search.reranker().map(|r| r.probe())
+    }
+
     /// Snapshot the current cognitive dials (cheap clone under read lock).
     pub fn cognitive_dials(&self) -> dials::CognitiveDials {
         self.cognitive_dials.read().clone()
