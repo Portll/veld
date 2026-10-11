@@ -2900,6 +2900,11 @@
         "last_login_at": {
           "OPTION": "STR"
         }
+      },
+      {
+        "disabled_at": {
+          "OPTION": "STR"
+        }
       }
     ]
   },
