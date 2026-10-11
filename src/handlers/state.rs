@@ -5446,7 +5446,10 @@ impl MultiUserMemoryManager {
         &self,
         limit_per_user: usize,
         reconcile: bool,
-    ) -> Vec<(String, anyhow::Result<crate::memory::embedding_backlog::DrainReport>)> {
+    ) -> Vec<(
+        String,
+        anyhow::Result<crate::memory::embedding_backlog::DrainReport>,
+    )> {
         let mut out = Vec::new();
         for user_id in self.list_cached_users() {
             let Some(memory) = self.user_memories.get(&user_id) else {

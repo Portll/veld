@@ -63,7 +63,10 @@ pub fn stamped_cores(rows: &HashMap<MemoryId, TagSources>, t: CoreThresholds) ->
     let mut membership: BTreeMap<String, BTreeSet<MemoryId>> = BTreeMap::new();
     for (id, sources) in rows {
         for tag in &sources.tags {
-            membership.entry(tag.tag.clone()).or_default().insert(id.clone());
+            membership
+                .entry(tag.tag.clone())
+                .or_default()
+                .insert(id.clone());
         }
     }
     let distinct_tags = membership.len();
@@ -73,7 +76,10 @@ pub fn stamped_cores(rows: &HashMap<MemoryId, TagSources>, t: CoreThresholds) ->
         if set.len() < t.min_records {
             continue;
         }
-        by_set.entry(set.into_iter().collect()).or_default().push(tag);
+        by_set
+            .entry(set.into_iter().collect())
+            .or_default()
+            .push(tag);
     }
 
     let mut cores: Vec<StampedCore> = by_set
@@ -181,7 +187,10 @@ mod tests {
         }
         rows.insert(
             id(13),
-            row(&[("Session", TagSource::Ingest), ("Persisted", TagSource::Ingest)]),
+            row(&[
+                ("Session", TagSource::Ingest),
+                ("Persisted", TagSource::Ingest),
+            ]),
         );
         rows
     }
@@ -193,7 +202,10 @@ mod tests {
         assert_eq!(out.cores_found, 2);
         let big = &out.cores[0];
         assert_eq!(big.records, 13);
-        assert_eq!(big.tags, vec!["Persisted".to_string(), "Session".to_string()]);
+        assert_eq!(
+            big.tags,
+            vec!["Persisted".to_string(), "Session".to_string()]
+        );
         let three = &out.cores[1];
         assert_eq!(three.records, 12);
         assert_eq!(three.tags, vec!["NOT".to_string()]);
@@ -203,10 +215,16 @@ mod tests {
     #[test]
     fn min_tags_drops_lone_tags_even_when_widely_shared() {
         let two = stamped_cores(&fixture(), thresholds(10, 2));
-        assert_eq!(two.cores_found, 1, "NOT sits alone on its membership and is dropped");
+        assert_eq!(
+            two.cores_found, 1,
+            "NOT sits alone on its membership and is dropped"
+        );
         assert_eq!(two.cores[0].tags.len(), 2);
         let three = stamped_cores(&fixture(), thresholds(10, 3));
-        assert_eq!(three.cores_found, 0, "no three tags share one exact membership here");
+        assert_eq!(
+            three.cores_found, 0,
+            "no three tags share one exact membership here"
+        );
     }
 
     #[test]

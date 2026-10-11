@@ -6095,7 +6095,11 @@ impl GraphMemory {
                 Err(_) => undecodable += 1,
             }
         }
-        episodes.sort_by(|a, b| a.valid_at.cmp(&b.valid_at).then_with(|| a.uuid.cmp(&b.uuid)));
+        episodes.sort_by(|a, b| {
+            a.valid_at
+                .cmp(&b.valid_at)
+                .then_with(|| a.uuid.cmp(&b.uuid))
+        });
         Ok((episodes, undecodable))
     }
 
