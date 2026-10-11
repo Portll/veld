@@ -86,6 +86,8 @@ fn create_relationship(
         created_by: EdgeSource::CoOccurrence,
         forward_strength: strength,
         backward_strength: strength,
+        strengthening_sources: Default::default(),
+        last_corroborated: None,
     }
 }
 
@@ -349,7 +351,7 @@ fn bench_synapse_strengthen(c: &mut Criterion) {
                 // Strengthen a random synapse
                 let idx = rand::random::<usize>() % edge_ids.len();
                 graph
-                    .strengthen_synapse(&edge_ids[idx])
+                    .strengthen_synapse(&edge_ids[idx], "bench")
                     .expect("Failed to strengthen");
             });
         });

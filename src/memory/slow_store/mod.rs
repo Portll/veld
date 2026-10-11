@@ -1013,6 +1013,8 @@ mod tests {
             created_by: crate::graph_memory::EdgeSource::CoOccurrence,
             forward_strength: 0.0,
             backward_strength: 0.0,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         }
     }
 

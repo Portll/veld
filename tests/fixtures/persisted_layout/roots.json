@@ -2351,6 +2351,19 @@
       },
       {
         "backward_strength": "F32"
+      },
+      {
+        "strengthening_sources": {
+          "MAP": {
+            "KEY": "STR",
+            "VALUE": "U32"
+          }
+        }
+      },
+      {
+        "last_corroborated": {
+          "OPTION": "STR"
+        }
       }
     ]
   },

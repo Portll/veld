@@ -3343,6 +3343,12 @@ pub struct Query {
     /// varying the stages under test.
     pub ner_entities: Option<Vec<String>>,
 
+    // === Evidence ===
+    /// Who is recalling (session id, tool name, ingest id). Named on every synapse
+    /// the recall strengthens; one source counts once per edge. `None` records the
+    /// event as unattributed, which strengthens an edge at most once.
+    pub evidence_source: Option<String>,
+
     // === Temporal Filters ===
     pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 
@@ -3486,6 +3492,7 @@ impl Default for Query {
         Self {
             user_id: None,
             query_text: None,
+            evidence_source: None,
             query_embedding: None,
             layers: None,
             ner_entities: None,

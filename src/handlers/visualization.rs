@@ -235,6 +235,10 @@ pub struct GraphEdge {
     pub edge_type: String,
     pub tier: String, // "L1", "L2", "L3"
     pub strength: f32,
+    /// Distinct sources whose strengthening this edge rests on.
+    pub distinct_sources: usize,
+    /// When a source new to this edge last strengthened it.
+    pub last_corroborated: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Graph data response for d3.js
@@ -377,6 +381,8 @@ pub async fn get_graph_data(
                 edge_type: rel.relation_type.as_str().to_string(),
                 tier: tier_str.to_string(),
                 strength: rel.effective_strength(),
+                distinct_sources: rel.distinct_sources(),
+                last_corroborated: rel.last_corroborated,
             });
         }
     }
@@ -407,6 +413,8 @@ pub async fn get_graph_data(
                     edge_type: "mentions".to_string(),
                     tier: "L2".to_string(),
                     strength: 0.5,
+                    distinct_sources: 0,
+                    last_corroborated: None,
                 });
             }
         }

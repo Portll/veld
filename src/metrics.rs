@@ -614,6 +614,19 @@ pub static HEBBIAN_REINFORCE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("HEBBIAN_REINFORCE_TOTAL metric must be valid at compile time")
 });
 
+/// Synapse strengthening events by evidential outcome.
+/// `evidence`: "new_source" (strength moved) or "repeat_source" (recorded, strength held).
+pub static HEBBIAN_STRENGTHEN_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_hebbian_strengthen_events_total",
+            "Synapse strengthening events by evidential outcome",
+        ),
+        &["evidence"],
+    )
+    .expect("HEBBIAN_STRENGTHEN_EVENTS_TOTAL metric must be valid at compile time")
+});
+
 /// Hebbian reinforcement duration
 pub static HEBBIAN_REINFORCE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
@@ -970,6 +983,10 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     // Hebbian learning metrics
     register!(HEBBIAN_REINFORCE_TOTAL, "HEBBIAN_REINFORCE_TOTAL");
     register!(HEBBIAN_REINFORCE_DURATION, "HEBBIAN_REINFORCE_DURATION");
+    register!(
+        HEBBIAN_STRENGTHEN_EVENTS_TOTAL,
+        "HEBBIAN_STRENGTHEN_EVENTS_TOTAL"
+    );
 
     // Consolidation metrics
     register!(CONSOLIDATE_TOTAL, "CONSOLIDATE_TOTAL");

@@ -3079,6 +3079,8 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
                 created_by: Default::default(),
                 forward_strength: 0.3,
                 backward_strength: 0.3,
+                strengthening_sources: Default::default(),
+                last_corroborated: None,
             })
             .unwrap();
         }

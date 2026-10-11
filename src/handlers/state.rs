@@ -2684,7 +2684,9 @@ impl MultiUserMemoryManager {
                 if !result.edge_boosts.is_empty() {
                     if let Ok(graph) = self.get_user_graph(&user_id) {
                         let graph_guard = graph.read();
-                        match graph_guard.strengthen_memory_edges(&result.edge_boosts) {
+                        match graph_guard
+                            .strengthen_memory_edges(&result.edge_boosts, "maintenance:replay")
+                        {
                             Ok((count, promotion_boosts)) => {
                                 edges_strengthened += count;
 
@@ -2734,7 +2736,9 @@ impl MultiUserMemoryManager {
                         let graph_guard = graph.read();
                         for mem_id_str in &result.replay_memory_ids {
                             if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
-                                match graph_guard.strengthen_episode_entity_edges(&uuid) {
+                                match graph_guard
+                                    .strengthen_episode_entity_edges(&uuid, "maintenance:replay")
+                                {
                                     Ok(count) => entity_edges_strengthened += count,
                                     Err(e) => {
                                         tracing::debug!(
@@ -4331,6 +4335,8 @@ impl MultiUserMemoryManager {
                     },
                     forward_strength: state_edge_init,
                     backward_strength: state_edge_init,
+                    strengthening_sources: Default::default(),
+                    last_corroborated: None,
                 };
 
                 if let Err(e) = graph_guard.add_relationship(edge) {

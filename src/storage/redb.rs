@@ -1891,6 +1891,8 @@ mod redb_domain_tests {
             created_by: Default::default(),
             forward_strength: 0.0,
             backward_strength: 0.0,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         }
     }
 

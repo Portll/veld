@@ -198,7 +198,10 @@ pub async fn consolidate_memories(
         if !maintenance_result.edge_boosts.is_empty() {
             if let Ok(graph) = state_clone.get_user_graph(&user_id) {
                 let graph_guard = graph.read();
-                match graph_guard.strengthen_memory_edges(&maintenance_result.edge_boosts) {
+                match graph_guard.strengthen_memory_edges(
+                    &maintenance_result.edge_boosts,
+                    "consolidation:replay",
+                ) {
                     Ok((count, promotion_boosts)) => {
                         edges_strengthened += count;
                         if !promotion_boosts.is_empty() {
@@ -226,7 +229,9 @@ pub async fn consolidate_memories(
                 let graph_guard = graph.read();
                 for mem_id_str in &maintenance_result.replay_memory_ids {
                     if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
-                        match graph_guard.strengthen_episode_entity_edges(&uuid) {
+                        match graph_guard
+                            .strengthen_episode_entity_edges(&uuid, "consolidation:replay")
+                        {
                             Ok(count) => entity_edges_strengthened += count,
                             Err(e) => {
                                 tracing::debug!(
@@ -383,6 +388,8 @@ pub async fn consolidate_memories(
                         created_by: crate::graph_memory::EdgeSource::DreamReplay,
                         forward_strength: DREAM_REPLAY_EDGE_CONFIDENCE,
                         backward_strength: DREAM_REPLAY_EDGE_CONFIDENCE,
+                        strengthening_sources: Default::default(),
+                        last_corroborated: None,
                     };
                     match graph.add_relationship(edge) {
                         Ok(_) => {
@@ -608,7 +615,9 @@ pub async fn sleep_phase_consolidation(
             if !maint.edge_boosts.is_empty() {
                 if let Ok(graph) = state_clone.get_user_graph(&user_id) {
                     let graph_guard = graph.read();
-                    match graph_guard.strengthen_memory_edges(&maint.edge_boosts) {
+                    match graph_guard
+                        .strengthen_memory_edges(&maint.edge_boosts, "consolidation:sleep")
+                    {
                         Ok((count, promotion_boosts)) => {
                             tracing::debug!(user_id = %user_id, count, "Sleep-phase: edges strengthened");
                             if !promotion_boosts.is_empty() {
@@ -634,7 +643,9 @@ pub async fn sleep_phase_consolidation(
                     let graph_guard = graph.read();
                     for mem_id_str in &maint.replay_memory_ids {
                         if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
-                            if let Err(e) = graph_guard.strengthen_episode_entity_edges(&uuid) {
+                            if let Err(e) = graph_guard
+                                .strengthen_episode_entity_edges(&uuid, "consolidation:sleep")
+                            {
                                 tracing::warn!(
                                     user_id = %user_id,
                                     "Sleep-phase: entity edge strengthening failed for {uuid}: {e}"
@@ -744,6 +755,8 @@ pub async fn sleep_phase_consolidation(
                         created_by: crate::graph_memory::EdgeSource::SleepReplay,
                         forward_strength: DREAM_REPLAY_EDGE_CONFIDENCE,
                         backward_strength: DREAM_REPLAY_EDGE_CONFIDENCE,
+                        strengthening_sources: Default::default(),
+                        last_corroborated: None,
                     };
                     if graph.add_relationship(edge).is_ok() { created += 1; }
                 }

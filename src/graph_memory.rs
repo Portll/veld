@@ -10,7 +10,7 @@ use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 #[cfg(feature = "rocksdb")]
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -768,10 +768,141 @@ pub struct RelationshipEdge {
     /// Increases when to_entity is the query match and from_entity is co-retrieved.
     #[serde(default)]
     pub backward_strength: f32,
+
+    // === Evidential base ===
+    /// Distinct sources (session, tool, ingest) that have strengthened this edge, each
+    /// with its event count. A repeat from a recorded source refreshes `last_activated`
+    /// and nothing else; a new source strengthens.
+    #[serde(default)]
+    pub strengthening_sources: BTreeMap<String, u32>,
+
+    /// When a source not yet in `strengthening_sources` last strengthened this edge.
+    #[serde(default)]
+    pub last_corroborated: Option<DateTime<Utc>>,
 }
 
 fn default_last_activated() -> DateTime<Utc> {
     Utc::now()
+}
+
+/// Layout of `RelationshipEdge` before `strengthening_sources` / `last_corroborated`.
+/// bincode is positional, so records written under it only decode through this arm.
+#[derive(Serialize, Deserialize)]
+struct RelationshipEdgeV0 {
+    uuid: Uuid,
+    from_entity: Uuid,
+    to_entity: Uuid,
+    relation_type: RelationType,
+    strength: f32,
+    created_at: DateTime<Utc>,
+    valid_at: DateTime<Utc>,
+    invalidated_at: Option<DateTime<Utc>>,
+    source_episode_id: Option<Uuid>,
+    context: String,
+    last_activated: DateTime<Utc>,
+    activation_count: u32,
+    ltp_status: LtpStatus,
+    tier: EdgeTier,
+    activation_timestamps: Option<VecDeque<DateTime<Utc>>>,
+    entity_confidence: Option<f32>,
+    created_by: EdgeSource,
+    forward_strength: f32,
+    backward_strength: f32,
+}
+
+impl From<RelationshipEdgeV0> for RelationshipEdge {
+    fn from(v: RelationshipEdgeV0) -> Self {
+        Self {
+            uuid: v.uuid,
+            from_entity: v.from_entity,
+            to_entity: v.to_entity,
+            relation_type: v.relation_type,
+            strength: v.strength,
+            created_at: v.created_at,
+            valid_at: v.valid_at,
+            invalidated_at: v.invalidated_at,
+            source_episode_id: v.source_episode_id,
+            context: v.context,
+            last_activated: v.last_activated,
+            activation_count: v.activation_count,
+            ltp_status: v.ltp_status,
+            tier: v.tier,
+            activation_timestamps: v.activation_timestamps,
+            entity_confidence: v.entity_confidence,
+            created_by: v.created_by,
+            forward_strength: v.forward_strength,
+            backward_strength: v.backward_strength,
+            strengthening_sources: BTreeMap::new(),
+            last_corroborated: None,
+        }
+    }
+}
+
+/// What a strengthening event counted as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// A source not yet recorded on the edge: strength moved.
+    NewSource,
+    /// A source already recorded on the edge: recorded, strength held.
+    RepeatSource,
+}
+
+impl Evidence {
+    pub fn label(self) -> &'static str {
+        match self {
+            Evidence::NewSource => "new_source",
+            Evidence::RepeatSource => "repeat_source",
+        }
+    }
+}
+
+/// Outcome of one `strengthen_from` call.
+#[derive(Debug, Clone)]
+pub struct Strengthening {
+    pub evidence: Evidence,
+    /// `Some((old_tier, new_tier))` when the event promoted the edge.
+    pub promotion: Option<(String, String)>,
+}
+
+/// Evidence record for an edge created by a strengthening event from `source`.
+pub(crate) fn evidence_from(source: &str) -> BTreeMap<String, u32> {
+    let mut sources = BTreeMap::new();
+    sources.insert(source.to_string(), 1);
+    sources
+}
+
+thread_local! {
+    static AMBIENT_EVIDENCE_SOURCE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Names the evidence source for strengthening events that happen inside graph
+/// traversal on the current thread, where no caller argument reaches. Entered by
+/// `MemorySystem::recall` for the duration of a recall; restores the previous
+/// value on drop.
+pub struct EvidenceScope {
+    previous: Option<String>,
+}
+
+impl EvidenceScope {
+    pub fn enter(source: Option<&str>) -> Self {
+        let previous = AMBIENT_EVIDENCE_SOURCE.with(|s| s.replace(source.map(str::to_string)));
+        Self { previous }
+    }
+}
+
+impl Drop for EvidenceScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        AMBIENT_EVIDENCE_SOURCE.with(|s| *s.borrow_mut() = previous);
+    }
+}
+
+/// The source named by the innermost `EvidenceScope`, or the unattributed fallback.
+pub fn ambient_evidence_source() -> String {
+    AMBIENT_EVIDENCE_SOURCE
+        .with(|s| s.borrow().clone())
+        .unwrap_or_else(|| crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE.to_string())
 }
 
 // Hebbian learning constants now imported from crate::constants:
@@ -809,12 +940,33 @@ impl RelationshipEdge {
     /// `GraphMemory::apply_reinforcement` or its internal delegate
     /// `record_memory_coactivation`.  Making this `pub(crate)` prevents
     /// callers outside this crate from writing `edge.strength` directly.
-    pub(crate) fn strengthen(&mut self) -> Option<(String, String)> {
+    ///
+    /// `source` names who is strengthening (session, tool, ingest). One source
+    /// counts once per edge: a repeat refreshes `last_activated` and is recorded,
+    /// and only a source new to the edge moves strength, activation count or LTP.
+    pub(crate) fn strengthen_from(&mut self, source: &str) -> Strengthening {
         use crate::constants::*;
 
         let now = Utc::now();
-        self.activation_count += 1;
         self.last_activated = now;
+
+        let evidence = self.record_evidence(source);
+        crate::metrics::HEBBIAN_STRENGTHEN_EVENTS_TOTAL
+            .with_label_values(&[evidence.label()])
+            .inc();
+        if evidence == Evidence::RepeatSource {
+            if HEBBIAN_REPEAT_SOURCE_BOOST > 0.0 {
+                let boost = HEBBIAN_REPEAT_SOURCE_BOOST * (1.0 - self.strength);
+                self.strength = (self.strength + boost).min(1.0);
+            }
+            return Strengthening {
+                evidence,
+                promotion: None,
+            };
+        }
+
+        self.activation_count += 1;
+        self.last_corroborated = Some(now);
 
         // PIPE-4: Record activation timestamp for L2+ edges
         self.record_activation_timestamp(now);
@@ -911,7 +1063,44 @@ impl RelationshipEdge {
         // The readiness formula combines strength + activation count + entity confidence,
         // ensuring both intensity and repetition evidence are required for Full LTP.
 
-        promotion_result
+        Strengthening {
+            evidence: Evidence::NewSource,
+            promotion: promotion_result,
+        }
+    }
+
+    /// Record `source` against this edge and say whether it is new evidence.
+    fn record_evidence(&mut self, source: &str) -> Evidence {
+        use crate::constants::HEBBIAN_EVIDENCE_SOURCES_CAP;
+        if let Some(count) = self.strengthening_sources.get_mut(source) {
+            *count = count.saturating_add(1);
+            return Evidence::RepeatSource;
+        }
+        if self.strengthening_sources.len() >= HEBBIAN_EVIDENCE_SOURCES_CAP {
+            return Evidence::RepeatSource;
+        }
+        self.strengthening_sources.insert(source.to_string(), 1);
+        Evidence::NewSource
+    }
+
+    /// Number of distinct sources that have strengthened this edge.
+    pub fn distinct_sources(&self) -> usize {
+        self.strengthening_sources.len()
+    }
+
+    /// Decode a persisted edge, accepting the layout written before the evidential
+    /// base existed. A record is only accepted by an arm that consumes it whole.
+    pub fn decode(bytes: &[u8]) -> Result<RelationshipEdge> {
+        let cfg = bincode::config::standard();
+        let current = match bincode::serde::decode_from_slice::<RelationshipEdge, _>(bytes, cfg) {
+            Ok((edge, read)) if read == bytes.len() => return Ok(edge),
+            Ok((_, read)) => anyhow::anyhow!("{read} of {} bytes consumed", bytes.len()),
+            Err(e) => anyhow::anyhow!(e),
+        };
+        match bincode::serde::decode_from_slice::<RelationshipEdgeV0, _>(bytes, cfg) {
+            Ok((v0, read)) if read == bytes.len() => Ok(v0.into()),
+            _ => Err(current.context("relationship edge decode failed in both layouts")),
+        }
     }
 
     /// Record an activation timestamp (PIPE-4)
@@ -1239,6 +1428,8 @@ impl RelationshipEdge {
             created_by: EdgeSource::Coactivation,
             forward_strength: strength,
             backward_strength: strength,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         }
     }
 
@@ -2397,10 +2588,7 @@ impl GraphMemory {
             Err(_) => return 0,
         };
         for (_, value) in rows {
-            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
+            if let Ok(edge) = RelationshipEdge::decode(&value) {
                 total += edge.activation_count as u64;
             }
         }
@@ -3126,8 +3314,11 @@ impl GraphMemory {
             &edge.relation_type,
         )? {
             // Strengthen existing edge instead of creating duplicate
-            let _ = existing.strengthen();
-            existing.last_activated = Utc::now();
+            let source = edge
+                .source_episode_id
+                .map(|id| format!("episode:{id}"))
+                .unwrap_or_else(|| crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE.to_string());
+            let _ = existing.strengthen_from(&source);
 
             // Update context if new context is more informative
             if edge.context.len() > existing.context.len() {
@@ -3461,10 +3652,7 @@ impl GraphMemory {
 
         let mut edges = Vec::with_capacity(edge_uuids.len());
         for value in results.into_iter().flatten().flatten() {
-            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
+            if let Ok(edge) = RelationshipEdge::decode(&value) {
                 edges.push(edge);
             }
         }
@@ -3779,8 +3967,7 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.store.get_cf(CF_RELATIONSHIPS, key)? {
             Some(value) => {
-                let (edge, _): (RelationshipEdge, _) =
-                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let edge = RelationshipEdge::decode(&value)?;
                 Ok(Some(edge))
             }
             None => Ok(None),
@@ -3799,8 +3986,7 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.store.get_cf(CF_RELATIONSHIPS, key)? {
             Some(value) => {
-                let (mut edge, _): (RelationshipEdge, _) =
-                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let mut edge = RelationshipEdge::decode(&value)?;
                 // Apply effective strength calculation (doesn't persist)
                 edge.strength = edge.effective_strength();
                 Ok(Some(edge))
@@ -3890,10 +4076,7 @@ impl GraphMemory {
             .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         let mut edges_to_delete = Vec::new();
         for (_, value) in iter.flatten() {
-            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
+            if let Ok(edge) = RelationshipEdge::decode(&value) {
                 if edge.source_episode_id == Some(*episode_uuid) {
                     edges_to_delete.push(edge.uuid);
                 }
@@ -4212,7 +4395,7 @@ impl GraphMemory {
             && !crate::memory::recall_readonly()
             && crate::memory::ablation::is_enabled("graph_potentiation")
         {
-            match self.batch_strengthen_synapses(&edges_to_strengthen) {
+            match self.batch_strengthen_synapses(&edges_to_strengthen, &ambient_evidence_source()) {
                 Ok(count) => {
                     if count > 0 {
                         tracing::trace!("Strengthened {} synapses during traversal", count);
@@ -4401,7 +4584,9 @@ impl GraphMemory {
             && !crate::memory::recall_readonly()
             && crate::memory::ablation::is_enabled("graph_potentiation")
         {
-            if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
+            if let Err(e) =
+                self.batch_strengthen_synapses(&edges_to_strengthen, &ambient_evidence_source())
+            {
                 tracing::debug!("Failed to strengthen synapses: {}", e);
             }
         }
@@ -4618,7 +4803,9 @@ impl GraphMemory {
             && !crate::memory::recall_readonly()
             && crate::memory::ablation::is_enabled("graph_potentiation")
         {
-            if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
+            if let Err(e) =
+                self.batch_strengthen_synapses(&edges_to_strengthen, &ambient_evidence_source())
+            {
                 tracing::debug!("Failed to strengthen synapses: {}", e);
             }
         }
@@ -4853,7 +5040,7 @@ impl GraphMemory {
     /// Implements "neurons that fire together, wire together".
     ///
     /// Uses a mutex to prevent race conditions during concurrent updates (SHO-64).
-    pub fn strengthen_synapse(&self, edge_uuid: &Uuid) -> Result<()> {
+    pub fn strengthen_synapse(&self, edge_uuid: &Uuid, source: &str) -> Result<()> {
         // Lock with timeout to prevent deadlock on panic
         let _guard = self
             .synapse_update_lock
@@ -4861,8 +5048,9 @@ impl GraphMemory {
             .ok_or_else(|| anyhow::anyhow!("synapse_update_lock timeout in strengthen_synapse"))?;
 
         if let Some(mut edge) = self.get_relationship(edge_uuid)? {
-            let _ = edge.strengthen();
-            self.total_activations.fetch_add(1, Ordering::Relaxed);
+            if edge.strengthen_from(source).evidence == Evidence::NewSource {
+                self.total_activations.fetch_add(1, Ordering::Relaxed);
+            }
 
             let key = edge.uuid.as_bytes();
             let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
@@ -4878,7 +5066,7 @@ impl GraphMemory {
     /// Uses RocksDB WriteBatch for atomic multi-write and a single lock acquisition.
     ///
     /// Returns the number of synapses successfully strengthened.
-    pub fn batch_strengthen_synapses(&self, edge_uuids: &[Uuid]) -> Result<usize> {
+    pub fn batch_strengthen_synapses(&self, edge_uuids: &[Uuid], source: &str) -> Result<usize> {
         if edge_uuids.is_empty() {
             return Ok(0);
         }
@@ -4901,14 +5089,14 @@ impl GraphMemory {
 
         let mut batch = crate::storage::WriteBatch::new();
         let mut strengthened = 0;
+        let mut activations = 0u64;
 
         for (i, result) in results.into_iter().enumerate() {
             if let Ok(Some(value)) = result {
-                if let Ok((mut edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                    &value,
-                    bincode::config::standard(),
-                ) {
-                    let _ = edge.strengthen();
+                if let Ok(mut edge) = RelationshipEdge::decode(&value) {
+                    if edge.strengthen_from(source).evidence == Evidence::NewSource {
+                        activations += 1;
+                    }
                     match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
                         Ok(encoded) => {
                             batch.put_cf(CF_RELATIONSHIPS, keys[i], encoded);
@@ -4926,7 +5114,7 @@ impl GraphMemory {
         if strengthened > 0 {
             self.store.write_batch(&batch)?;
             self.total_activations
-                .fetch_add(strengthened as u64, Ordering::Relaxed);
+                .fetch_add(activations, Ordering::Relaxed);
         }
 
         Ok(strengthened)
@@ -4954,6 +5142,7 @@ impl GraphMemory {
     /// New callers should prefer `apply_reinforcement`.
     pub(crate) fn record_memory_coactivation(
         &self,
+        source: &str,
         trigger_id: &Uuid,
         coactivated_ids: &[Uuid],
     ) -> Result<CoactivationResult> {
@@ -4984,6 +5173,7 @@ impl GraphMemory {
         let mut batch = crate::storage::WriteBatch::new();
         let mut edges_updated = 0;
         let mut new_edges = 0;
+        let mut activations = 0u64;
         let mut promotions: Vec<EdgePromotion> = Vec::new();
 
         // Phase 1: Directional edges between trigger and each co-retrieved memory
@@ -4992,7 +5182,9 @@ impl GraphMemory {
 
             if let Some(mut edge) = existing_edge {
                 // Strengthen existing edge with directional awareness
-                let _ = edge.strengthen();
+                if edge.strengthen_from(source).evidence == Evidence::NewSource {
+                    activations += 1;
+                }
 
                 // Apply directional boost based on which entity is the trigger
                 if edge.from_entity == *trigger_id {
@@ -5036,6 +5228,8 @@ impl GraphMemory {
                     // Both start at initial_weight; forward gets the first directional nudge
                     forward_strength: (initial_weight + COACTIVATION_FORWARD_BOOST).min(1.0),
                     backward_strength: initial_weight,
+                    strengthening_sources: evidence_from(source),
+                    last_corroborated: Some(Utc::now()),
                 };
 
                 let key = edge.uuid.as_bytes();
@@ -5059,6 +5253,7 @@ impl GraphMemory {
 
                     edges_updated += 1;
                     new_edges += 1;
+                    activations += 1;
                 }
             }
         }
@@ -5074,7 +5269,11 @@ impl GraphMemory {
 
                 if let Some(mut edge) = existing_edge {
                     // Strengthen existing edge and capture tier promotions
-                    if let Some((old_tier, new_tier)) = edge.strengthen() {
+                    let outcome = edge.strengthen_from(source);
+                    if outcome.evidence == Evidence::NewSource {
+                        activations += 1;
+                    }
+                    if let Some((old_tier, new_tier)) = outcome.promotion {
                         promotions.push(EdgePromotion {
                             from_entity: mem_a,
                             to_entity: mem_b,
@@ -5112,6 +5311,8 @@ impl GraphMemory {
                         created_by: EdgeSource::CoOccurrence,
                         forward_strength: initial_weight,
                         backward_strength: initial_weight,
+                        strengthening_sources: evidence_from(source),
+                        last_corroborated: Some(Utc::now()),
                     };
 
                     let key = edge.uuid.as_bytes();
@@ -5135,6 +5336,7 @@ impl GraphMemory {
 
                         edges_updated += 1;
                         new_edges += 1;
+                        activations += 1;
                     }
                 }
             }
@@ -5143,7 +5345,7 @@ impl GraphMemory {
         if edges_updated > 0 {
             self.store.write_batch(&batch)?;
             self.total_activations
-                .fetch_add(edges_updated as u64, Ordering::Relaxed);
+                .fetch_add(activations, Ordering::Relaxed);
             // Update relationship counter for newly created edges
             if new_edges > 0 {
                 self.relationship_count
@@ -5193,6 +5395,7 @@ impl GraphMemory {
     pub fn apply_reinforcement(
         &self,
         retrieval_id: Uuid,
+        source: &str,
         trigger_id: &Uuid,
         coactivated_ids: &[Uuid],
     ) -> Result<CoactivationResult> {
@@ -5221,7 +5424,7 @@ impl GraphMemory {
         } // `seen_retrievals` mutex released here — before any edge mutation
 
         // --- Delegate to the core coactivation path ---
-        self.record_memory_coactivation(trigger_id, coactivated_ids)
+        self.record_memory_coactivation(source, trigger_id, coactivated_ids)
     }
 
     /// Strengthen spreading-activation delivery edges (Physarum tube-thickening, S-R5 B10).
@@ -5236,7 +5439,7 @@ impl GraphMemory {
     /// lock, same WriteBatch), keeping this function free of direct `strength` writes.
     ///
     /// Returns the number of edges that were successfully strengthened.
-    pub fn apply_path_credit(&self, path_edges: &[(Uuid, f32)]) -> Result<usize> {
+    pub fn apply_path_credit(&self, path_edges: &[(Uuid, f32)], source: &str) -> Result<usize> {
         if path_edges.is_empty() {
             return Ok(0);
         }
@@ -5256,7 +5459,12 @@ impl GraphMemory {
             .map(|(id, _)| *id)
             .collect();
 
-        self.batch_strengthen_synapses(&qualifying)
+        self.batch_strengthen_synapses(&qualifying, source)
+    }
+
+    /// The co-retrieval edge between two memories, in either direction, if one exists.
+    pub fn memory_edge_between(&self, a: &Uuid, b: &Uuid) -> Result<Option<RelationshipEdge>> {
+        self.find_edge_between_entities(a, b)
     }
 
     /// Find an edge between two entities/memories (in either direction)
@@ -5299,6 +5507,7 @@ impl GraphMemory {
     pub fn strengthen_memory_edges(
         &self,
         edge_boosts: &[(String, String, f32)],
+        source: &str,
     ) -> Result<(usize, Vec<crate::memory::types::EdgePromotionBoost>)> {
         use crate::constants::{EDGE_PROMOTION_MEMORY_BOOST_L2, EDGE_PROMOTION_MEMORY_BOOST_L3};
 
@@ -5338,7 +5547,7 @@ impl GraphMemory {
 
             if let Some(mut edge) = existing_edge {
                 // Strengthen existing edge — capture tier promotion if it occurs
-                let promotion = edge.strengthen();
+                let promotion = edge.strengthen_from(source).promotion;
                 let key = edge.uuid.as_bytes();
                 if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
@@ -5398,6 +5607,8 @@ impl GraphMemory {
                     created_by: EdgeSource::Coactivation,
                     forward_strength: replay_initial,
                     backward_strength: replay_initial,
+                    strengthening_sources: evidence_from(source),
+                    last_corroborated: Some(Utc::now()),
                 };
 
                 let key = edge.uuid.as_bytes();
@@ -5541,7 +5752,11 @@ impl GraphMemory {
     /// 2. For each pair of entities, find their RelationshipEdge
     /// 3. Call strengthen() on each edge (Hebbian boost + LTP detection + tier promotion)
     /// 4. Batch write all updates
-    pub fn strengthen_episode_entity_edges(&self, episode_id: &Uuid) -> Result<usize> {
+    pub fn strengthen_episode_entity_edges(
+        &self,
+        episode_id: &Uuid,
+        source: &str,
+    ) -> Result<usize> {
         let episode = match self.get_episode(episode_id) {
             Ok(Some(ep)) => ep,
             Ok(None) => return Ok(0),
@@ -5574,7 +5789,7 @@ impl GraphMemory {
                     if edge.invalidated_at.is_some() {
                         continue;
                     }
-                    let _ = edge.strengthen();
+                    let _ = edge.strengthen_from(source);
                     let key = edge.uuid.as_bytes();
                     if let Ok(value) =
                         bincode::serde::encode_to_vec(&edge, bincode::config::standard())
@@ -6108,10 +6323,7 @@ impl GraphMemory {
     pub fn relation_type_distribution(&self) -> Result<Vec<(String, usize)>> {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for (_, value) in self.store.scan_cf(CF_RELATIONSHIPS, None, None)? {
-            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
+            if let Ok(edge) = RelationshipEdge::decode(&value) {
                 *counts
                     .entry(edge.relation_type.as_str().to_string())
                     .or_default() += 1;
@@ -6137,12 +6349,7 @@ impl GraphMemory {
             .into_iter()
             .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for (_, value) in iter.flatten() {
-            if let Ok(edge) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                &value,
-                bincode::config::standard(),
-            )
-            .map(|(v, _)| v)
-            {
+            if let Ok(edge) = RelationshipEdge::decode(&value) {
                 // Only include non-invalidated relationships
                 if edge.invalidated_at.is_none() {
                     relationships.push(edge);
@@ -6171,11 +6378,8 @@ impl GraphMemory {
             .into_iter()
             .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for (_, value) in iter.flatten() {
-            let edge = match bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
-                Ok((e, _)) => e,
+            let edge = match RelationshipEdge::decode(&value) {
+                Ok(e) => e,
                 Err(_) => continue,
             };
             if edge.invalidated_at.is_some() || edge.tier != EdgeTier::L3Semantic {
@@ -7851,6 +8055,12 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    /// One activation from a source the edge has not seen, so the mechanics tests
+    /// below keep measuring boost, LTP and promotion rather than the evidence rule.
+    fn strengthen_once(edge: &mut RelationshipEdge) -> Option<(String, String)> {
+        edge.strengthen_from(&Uuid::new_v4().to_string()).promotion
+    }
+
     /// Create a test relationship edge with specified strength and last_activated (L1 tier)
     fn create_test_edge(strength: f32, days_since_activated: i64) -> RelationshipEdge {
         create_test_edge_with_tier(strength, days_since_activated, EdgeTier::L1Working)
@@ -7882,6 +8092,8 @@ mod tests {
             entity_confidence: None,
             forward_strength: strength,
             backward_strength: strength,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         }
     }
 
@@ -7892,7 +8104,7 @@ mod tests {
         let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L2Episodic);
         let initial_strength = edge.strength;
 
-        let _ = edge.strengthen();
+        let _ = strengthen_once(&mut edge);
 
         // With tier boost (L2 gets 80% of TIER_CO_ACCESS_BOOST), strength should increase
         let tier_boost = TIER_CO_ACCESS_BOOST * 0.8;
@@ -7910,7 +8122,7 @@ mod tests {
         // Use L3 tier (no promotion) with high initial strength
         let mut edge = create_test_edge_with_tier(0.95, 0, EdgeTier::L3Semantic);
 
-        let _ = edge.strengthen();
+        let _ = strengthen_once(&mut edge);
 
         // High strength should still increase but slowly (asymptotic to 1.0)
         // L3 tier boost = TIER_CO_ACCESS_BOOST * 0.5 = 0.075
@@ -7931,7 +8143,7 @@ mod tests {
         // Use L2 tier (tier_boost = TIER_CO_ACCESS_BOOST * 0.8) at 0.3 to avoid promotion
         let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L2Episodic);
 
-        let _ = edge.strengthen();
+        let _ = strengthen_once(&mut edge);
 
         // L2 tier boost = 0.15 * 0.8 = 0.12
         // Expected: 0.3 + (0.1 + 0.12) * (1 - 0.3) = 0.3 + 0.22 * 0.7 = 0.454
@@ -7951,7 +8163,7 @@ mod tests {
 
         // Strengthen 10 times (LTP_THRESHOLD = 10)
         for _ in 0..10 {
-            let _ = edge.strengthen();
+            let _ = strengthen_once(&mut edge);
         }
 
         assert!(
@@ -7984,7 +8196,7 @@ mod tests {
         let mut edge = create_test_edge(0.5, 0);
         let initial_strength = edge.strength;
 
-        let _ = edge.strengthen();
+        let _ = strengthen_once(&mut edge);
 
         assert!(
             edge.strength > initial_strength,
@@ -8002,7 +8214,7 @@ mod tests {
         let mut edge = create_test_edge(0.9, 0);
 
         for _ in 0..5 {
-            let _ = edge.strengthen();
+            let _ = strengthen_once(&mut edge);
         }
 
         assert!(
@@ -8024,12 +8236,12 @@ mod tests {
         // every edge to the ceiling.
         let mut low_edge = create_test_edge(0.2, 0);
         let low_initial = low_edge.strength;
-        let _ = low_edge.strengthen();
+        let _ = strengthen_once(&mut low_edge);
         let low_increase = low_edge.strength - low_initial;
 
         let mut high_edge = create_test_edge(0.8, 0);
         let high_initial = high_edge.strength;
-        let _ = high_edge.strengthen();
+        let _ = strengthen_once(&mut high_edge);
         let high_increase = high_edge.strength - high_initial;
 
         assert!(
@@ -8052,14 +8264,14 @@ mod tests {
         );
 
         for _ in 0..4 {
-            let _ = edge.strengthen();
+            let _ = strengthen_once(&mut edge);
         }
         assert!(
             !edge.is_potentiated(),
             "Edge must not be potentiated at 4 activations (burst threshold is 5)"
         );
 
-        let _ = edge.strengthen();
+        let _ = strengthen_once(&mut edge);
         assert!(
             edge.is_potentiated(),
             "Edge should be potentiated at 5 activations (Burst LTP), got {:?}",
@@ -8074,7 +8286,7 @@ mod tests {
 
         // Strengthen 5 times (LTP_BURST_THRESHOLD = 5) within 24 hours
         for _ in 0..5 {
-            let _ = edge.strengthen();
+            let _ = strengthen_once(&mut edge);
         }
 
         // Should have burst LTP (5+ activations in 24h)
@@ -8093,7 +8305,7 @@ mod tests {
 
         // Strengthen a few times
         for _ in 0..3 {
-            let _ = edge.strengthen();
+            let _ = strengthen_once(&mut edge);
         }
 
         // Should have recorded timestamps (edge may have promoted to L3, but still tracks)
@@ -8126,7 +8338,7 @@ mod tests {
         let mut edge = create_test_edge(0.1, 0);
         assert!(matches!(edge.tier, EdgeTier::L1Working));
 
-        let _ = edge.strengthen();
+        let _ = strengthen_once(&mut edge);
 
         assert!(
             matches!(edge.tier, EdgeTier::L1Working),
@@ -8217,7 +8429,7 @@ mod tests {
 
         // Strengthen until it promotes to L2 (L1_PROMOTION_THRESHOLD = 0.5)
         while matches!(edge.tier, EdgeTier::L1Working) {
-            let _ = edge.strengthen();
+            let _ = strengthen_once(&mut edge);
         }
 
         // After promotion to L2, should start tracking
@@ -8255,7 +8467,7 @@ mod tests {
 
         // Get to burst LTP (5 activations)
         for _ in 0..5 {
-            let _ = edge.strengthen();
+            let _ = strengthen_once(&mut edge);
         }
         assert!(
             matches!(edge.ltp_status, LtpStatus::Burst { .. }),
@@ -8265,7 +8477,7 @@ mod tests {
 
         // Continue strengthening to Full LTP (10 total)
         for _ in 0..5 {
-            let _ = edge.strengthen();
+            let _ = strengthen_once(&mut edge);
         }
 
         // Should now be Full (upgraded from Burst via 10 activations)
@@ -8281,7 +8493,7 @@ mod tests {
 
         // Record some activations
         for _ in 0..5 {
-            let _ = edge.strengthen();
+            let _ = strengthen_once(&mut edge);
         }
 
         let now = Utc::now();
@@ -8857,6 +9069,8 @@ mod tests {
             entity_confidence: None,
             forward_strength: 0.8,
             backward_strength: 0.8,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         };
         graph.add_relationship(edge).unwrap();
 
@@ -8905,6 +9119,8 @@ mod tests {
             entity_confidence: None,
             forward_strength: 0.8,
             backward_strength: 0.8,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         };
         let [a_id, b_id, c_id] =
             ["Aster", "Birch", "Cedar"].map(|name| graph.add_entity(entity(name)).unwrap());
@@ -9160,11 +9376,13 @@ mod tests {
             entity_confidence: None,
             forward_strength: 0.5,
             backward_strength: 0.5,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         };
         let edge_uuid = graph.add_relationship(edge).unwrap();
 
         // Strengthen the edge — should increment total_activations by 1
-        graph.strengthen_synapse(&edge_uuid).unwrap();
+        graph.strengthen_synapse(&edge_uuid, "session-a").unwrap();
         assert_eq!(graph.total_activations.load(Ordering::Relaxed), 1);
 
         // Delete the edge — should decrement by activation_count (which is now 4)
@@ -9211,7 +9429,7 @@ mod tests {
 
         // First reinforcement — should create an edge and return edges_updated > 0.
         let first = graph
-            .apply_reinforcement(retrieval_id, &trigger_id, &[coact_id])
+            .apply_reinforcement(retrieval_id, "session-a", &trigger_id, &[coact_id])
             .expect("first apply_reinforcement should succeed");
         assert!(
             first.edges_updated > 0,
@@ -9228,7 +9446,7 @@ mod tests {
 
         // Second reinforcement with the SAME retrieval_id — must be a no-op.
         let second = graph
-            .apply_reinforcement(retrieval_id, &trigger_id, &[coact_id])
+            .apply_reinforcement(retrieval_id, "session-a", &trigger_id, &[coact_id])
             .expect("second apply_reinforcement should succeed");
         assert_eq!(
             second.edges_updated, 0,
@@ -9250,7 +9468,12 @@ mod tests {
         // A DIFFERENT retrieval_id must still apply reinforcement.
         let different_retrieval_id = Uuid::new_v4();
         let third = graph
-            .apply_reinforcement(different_retrieval_id, &trigger_id, &[coact_id])
+            .apply_reinforcement(
+                different_retrieval_id,
+                "session-b",
+                &trigger_id,
+                &[coact_id],
+            )
             .expect("third apply_reinforcement with new id should succeed");
         assert!(
             third.edges_updated > 0,
@@ -9284,7 +9507,7 @@ mod tests {
             drop(guard); // just ensure lock is accessible
                          // We exercise the code path through apply_reinforcement without needing
                          // real entities — a missing trigger simply returns Ok with 0 edges.
-            let _ = graph.apply_reinforcement(id, &Uuid::new_v4(), &[Uuid::new_v4()]);
+            let _ = graph.apply_reinforcement(id, "session-a", &Uuid::new_v4(), &[Uuid::new_v4()]);
         }
 
         // After cap+1 insertions the queue length must not exceed SEEN_RETRIEVALS_CAPACITY.
@@ -9347,10 +9570,10 @@ mod tests {
 
         // Prime both edges by running a coactivation so they exist in the DB.
         graph
-            .apply_reinforcement(Uuid::new_v4(), &a1, &[a2])
+            .apply_reinforcement(Uuid::new_v4(), "session-a", &a1, &[a2])
             .unwrap();
         graph
-            .apply_reinforcement(Uuid::new_v4(), &b1, &[b2])
+            .apply_reinforcement(Uuid::new_v4(), "session-a", &b1, &[b2])
             .unwrap();
 
         let edge_a = graph
@@ -9384,7 +9607,7 @@ mod tests {
             (edge_b.uuid, raw_contribution_b),
         ];
 
-        let n = graph.apply_path_credit(&credit).unwrap();
+        let n = graph.apply_path_credit(&credit, "session-b").unwrap();
         assert_eq!(n, 2, "Both edges should be strengthened (got {})", n);
 
         let edge_a_after = graph
@@ -10208,6 +10431,202 @@ mod tests {
             "the walk must not strengthen or rewrite edges"
         );
     }
+
+    // ── Evidential base: one source counts once ──────────────────────────────
+
+    #[test]
+    fn same_source_twice_strengthens_once() {
+        let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L2Episodic);
+        let first = edge.strengthen_from("session-a");
+        assert_eq!(first.evidence, Evidence::NewSource);
+        let after_first = edge.strength;
+        assert!(after_first > 0.3);
+        assert_eq!(edge.activation_count, 1);
+        assert_eq!(edge.distinct_sources(), 1);
+        let corroborated = edge.last_corroborated.expect("first source corroborates");
+
+        let before_repeat = edge.last_activated;
+        let repeat = edge.strengthen_from("session-a");
+        assert_eq!(repeat.evidence, Evidence::RepeatSource);
+        assert!(repeat.promotion.is_none());
+        assert_eq!(
+            edge.strength, after_first,
+            "a repeat from a recorded source must not move strength"
+        );
+        assert_eq!(edge.activation_count, 1, "a repeat is not an activation");
+        assert_eq!(edge.distinct_sources(), 1);
+        assert_eq!(edge.strengthening_sources["session-a"], 2);
+        assert_eq!(edge.last_corroborated, Some(corroborated));
+        assert!(
+            edge.last_activated >= before_repeat,
+            "a repeat keeps the edge warm"
+        );
+    }
+
+    #[test]
+    fn two_sources_strengthen_twice() {
+        let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L2Episodic);
+        edge.strengthen_from("session-a");
+        let after_first = edge.strength;
+        let second = edge.strengthen_from("session-b");
+        assert_eq!(second.evidence, Evidence::NewSource);
+        assert!(
+            edge.strength > after_first,
+            "a second source corroborates: {} -> {}",
+            after_first,
+            edge.strength
+        );
+        assert_eq!(edge.activation_count, 2);
+        assert_eq!(edge.distinct_sources(), 2);
+        assert_eq!(edge.strengthening_sources["session-b"], 1);
+    }
+
+    #[test]
+    fn unattributed_events_strengthen_at_most_once() {
+        use crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE;
+        let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L2Episodic);
+        edge.strengthen_from(HEBBIAN_UNATTRIBUTED_SOURCE);
+        let after_first = edge.strength;
+        for _ in 0..5 {
+            let outcome = edge.strengthen_from(HEBBIAN_UNATTRIBUTED_SOURCE);
+            assert_eq!(outcome.evidence, Evidence::RepeatSource);
+        }
+        assert_eq!(edge.strength, after_first);
+        assert_eq!(edge.activation_count, 1);
+        assert_eq!(edge.distinct_sources(), 1);
+        assert_eq!(ambient_evidence_source(), HEBBIAN_UNATTRIBUTED_SOURCE);
+    }
+
+    #[test]
+    fn sources_past_the_cap_are_treated_as_repeats() {
+        use crate::constants::HEBBIAN_EVIDENCE_SOURCES_CAP;
+        let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L3Semantic);
+        for i in 0..HEBBIAN_EVIDENCE_SOURCES_CAP {
+            assert_eq!(
+                edge.strengthen_from(&format!("s{i}")).evidence,
+                Evidence::NewSource
+            );
+        }
+        let at_cap = edge.strength;
+        assert_eq!(
+            edge.strengthen_from("late").evidence,
+            Evidence::RepeatSource
+        );
+        assert_eq!(edge.strength, at_cap);
+        assert_eq!(edge.distinct_sources(), HEBBIAN_EVIDENCE_SOURCES_CAP);
+        assert!(!edge.strengthening_sources.contains_key("late"));
+    }
+
+    #[test]
+    fn evidence_scope_names_the_ambient_source_and_restores_on_drop() {
+        assert_eq!(ambient_evidence_source(), "unattributed");
+        {
+            let _outer = EvidenceScope::enter(Some("session-a"));
+            assert_eq!(ambient_evidence_source(), "session-a");
+            {
+                let _inner = EvidenceScope::enter(None);
+                assert_eq!(ambient_evidence_source(), "unattributed");
+            }
+            assert_eq!(ambient_evidence_source(), "session-a");
+        }
+        assert_eq!(ambient_evidence_source(), "unattributed");
+    }
+
+    #[test]
+    fn decode_accepts_the_layout_before_the_evidential_base() {
+        let edge = create_test_edge_with_tier(0.42, 3, EdgeTier::L2Episodic);
+        let v0 = RelationshipEdgeV0 {
+            uuid: edge.uuid,
+            from_entity: edge.from_entity,
+            to_entity: edge.to_entity,
+            relation_type: edge.relation_type.clone(),
+            strength: edge.strength,
+            created_at: edge.created_at,
+            valid_at: edge.valid_at,
+            invalidated_at: edge.invalidated_at,
+            source_episode_id: edge.source_episode_id,
+            context: edge.context.clone(),
+            last_activated: edge.last_activated,
+            activation_count: 7,
+            ltp_status: edge.ltp_status,
+            tier: edge.tier,
+            activation_timestamps: None,
+            entity_confidence: Some(0.8),
+            created_by: EdgeSource::Explicit,
+            forward_strength: 0.1,
+            backward_strength: 0.2,
+        };
+        let old_bytes = bincode::serde::encode_to_vec(&v0, bincode::config::standard()).unwrap();
+        let decoded = RelationshipEdge::decode(&old_bytes).expect("legacy layout decodes");
+        assert_eq!(decoded.uuid, edge.uuid);
+        assert_eq!(decoded.activation_count, 7);
+        assert_eq!(decoded.entity_confidence, Some(0.8));
+        assert_eq!(decoded.backward_strength, 0.2);
+        assert_eq!(decoded.distinct_sources(), 0);
+        assert_eq!(decoded.last_corroborated, None);
+
+        let mut current = edge.clone();
+        current.strengthen_from("session-a");
+        let new_bytes =
+            bincode::serde::encode_to_vec(&current, bincode::config::standard()).unwrap();
+        let round = RelationshipEdge::decode(&new_bytes).expect("current layout decodes");
+        assert_eq!(round.distinct_sources(), 1);
+        assert_eq!(round.last_corroborated, current.last_corroborated);
+
+        assert!(RelationshipEdge::decode(&new_bytes[..new_bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn graph_reinforcement_from_one_source_strengthens_an_edge_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let make_entity = |id: Uuid, name: &str| EntityNode {
+            uuid: id,
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        };
+        graph.add_entity(make_entity(a, "A")).unwrap();
+        graph.add_entity(make_entity(b, "B")).unwrap();
+
+        graph
+            .apply_reinforcement(Uuid::new_v4(), "session-a", &a, &[b])
+            .unwrap();
+        let created = graph.find_edge_between_entities(&a, &b).unwrap().unwrap();
+        assert_eq!(created.distinct_sources(), 1);
+        assert!(created.last_corroborated.is_some());
+
+        for _ in 0..10 {
+            graph
+                .apply_reinforcement(Uuid::new_v4(), "session-a", &a, &[b])
+                .unwrap();
+        }
+        let repeated = graph.find_edge_between_entities(&a, &b).unwrap().unwrap();
+        assert_eq!(
+            repeated.strength, created.strength,
+            "ten more recalls from the same session must not move strength"
+        );
+        assert_eq!(repeated.activation_count, created.activation_count);
+        assert_eq!(repeated.distinct_sources(), 1);
+        assert_eq!(repeated.strengthening_sources["session-a"], 11);
+
+        graph
+            .apply_reinforcement(Uuid::new_v4(), "session-b", &a, &[b])
+            .unwrap();
+        let corroborated = graph.find_edge_between_entities(&a, &b).unwrap().unwrap();
+        assert!(corroborated.strength > repeated.strength);
+        assert_eq!(corroborated.distinct_sources(), 2);
+        assert!(corroborated.last_corroborated >= created.last_corroborated);
+    }
 }
 
 #[cfg(test)]
@@ -10260,6 +10679,8 @@ mod ablation_gate_tests {
                 entity_confidence: None,
                 forward_strength: 0.5,
                 backward_strength: 0.5,
+                strengthening_sources: Default::default(),
+                last_corroborated: None,
             })
             .unwrap();
         let strength = || graph.get_relationship(&edge).unwrap().unwrap().strength;
@@ -10336,6 +10757,8 @@ mod ablation_gate_tests {
             entity_confidence: None,
             forward_strength: 0.8,
             backward_strength: 0.8,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         };
         let at_anchor = edge.effective_strength_at(anchor);
         let later = edge.effective_strength_at(anchor + chrono::Duration::hours(500));
@@ -10412,6 +10835,8 @@ mod repeat_stable_order_tests {
             created_by: EdgeSource::CoOccurrence,
             forward_strength: strength,
             backward_strength: strength,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
         }
     }
 

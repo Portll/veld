@@ -114,6 +114,8 @@ fn create_relationship(
         created_by: EdgeSource::CoOccurrence,
         forward_strength: strength,
         backward_strength: strength,
+        strengthening_sources: Default::default(),
+        last_corroborated: None,
     }
 }
 
@@ -151,6 +153,8 @@ fn create_relationship_with_plasticity(
         created_by: EdgeSource::CoOccurrence,
         forward_strength: strength,
         backward_strength: strength,
+        strengthening_sources: Default::default(),
+        last_corroborated: None,
     }
 }
 
@@ -903,7 +907,9 @@ fn test_strengthen_synapse_persists() {
     let initial_count = initial_edge.activation_count;
 
     // Strengthen the synapse
-    graph.strengthen_synapse(&edge_id).expect("Failed");
+    graph
+        .strengthen_synapse(&edge_id, "session-a")
+        .expect("Failed");
 
     // Verify persistence
     let updated_edge = graph
@@ -1067,9 +1073,11 @@ fn test_hebbian_plasticity_fields_persist() {
         let edge = create_relationship(id1, id2, RelationType::Knows, 0.5);
         edge_id = graph.add_relationship(edge).expect("Failed");
 
-        // Strengthen multiple times
-        for _ in 0..5 {
-            graph.strengthen_synapse(&edge_id).expect("Failed");
+        // Strengthen multiple times, each from its own source
+        for i in 0..5 {
+            graph
+                .strengthen_synapse(&edge_id, &format!("session-{i}"))
+                .expect("Failed");
         }
     }
 

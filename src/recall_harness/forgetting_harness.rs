@@ -24,7 +24,8 @@ use crate::memory::types::{LayerMode, MemoryId};
 use crate::memory::Query;
 use crate::recall_harness::fixtures::CorpusItem;
 use crate::recall_harness::report::{
-    DecayReport, DecayRow, SelectiveForgettingReport, SelectiveForgettingRow,
+    DecayReport, DecayRow, PlantedRepetitionReport, PlantedRepetitionRow,
+    SelectiveForgettingReport, SelectiveForgettingRow,
 };
 use crate::recall_harness::runner::{
     build_manager, ingest_corpus, run_smoke_suite_with_ranks, RunInputs, EVAL_USER,
@@ -294,4 +295,390 @@ pub fn analyze_selective_forgetting(
         pairs: groups * IMPORTANT_PER_GROUP,
         rows,
     })
+}
+
+// ============================ Planted repetition =============================
+//
+// E6c. Repeated recall from one source is one piece of evidence; corroboration is a
+// new source. Three arms, each on a fresh, identical ingest:
+//
+//   - control:     no recall traffic.
+//   - repeat:      the planted memory is recalled N times by ONE source, through the
+//                  production recall path with usage writes on.
+//   - corroborate: the planted memory is recalled once each by K distinct sources.
+//
+// Each group plants M equi-lexical gold memories for one query, plus one memory that
+// matches the query but is NOT gold (the "planted" memory) and one helper that shares
+// the planted memory's appeal token but never mentions the group token. The attack
+// query names the appeal, so a recall of it returns planted + helper and nothing gold:
+// every write the traffic causes lands on the planted side only.
+//
+// After the traffic, each arm runs the group queries read-only and reports gold
+// recall@10 / ndcg@10 / mrr, the planted memory's mean rank, and the state of the
+// planted↔helper co-retrieval edge. The claim under test: the repeat arm's planted
+// rank does not improve on control and its edge does not grow; the corroborate arm's
+// edge grows with every new source. Measured 2026-10-11 on the fallback NER, 6 groups,
+// N=50, K=8: planted rank 6.83 in all three arms; edge strength 0.40 → 0.40 under
+// repetition and 0.40 → 1.00 under corroboration with the evidential base at 1 and 8.
+// The co-retrieval edge feeds associative recall, not the hybrid ranking of the gold
+// query, so corroboration moving the edge did not move this rank; the rows carry both
+// so a reader can see which claim the fixture supports.
+
+/// Default number of planted groups.
+pub const DEFAULT_PLANTED_GROUPS: usize = 8;
+/// Default recalls from the single source in the repeat arm.
+pub const DEFAULT_PLANTED_REPEATS: usize = 50;
+/// Default distinct sources in the corroborate arm (one recall each).
+pub const DEFAULT_PLANTED_SOURCES: usize = 8;
+/// Gold memories planted per group.
+const PLANTED_GOLD_PER_GROUP: usize = 6;
+/// Width of the read-only measurement list; an absent planted memory ranks one past it.
+const PLANTED_MEASURE_WIDTH: usize = 40;
+/// Source id for every recall in the repeat arm.
+const PLANTED_REPEAT_SOURCE: &str = "session-repeat";
+
+const APPEAL_TOKENS: &[&str] = &[
+    "Quorrin",
+    "Velmar",
+    "Osket",
+    "Brindle",
+    "Tarmoc",
+    "Ilvane",
+    "Sorrel",
+    "Kestwick",
+    "Dunmere",
+    "Halvor",
+    "Pyrelle",
+    "Wrenfield",
+];
+
+fn appeal_token(g: usize) -> String {
+    let base = APPEAL_TOKENS[g % APPEAL_TOKENS.len()];
+    let block = g / APPEAL_TOKENS.len();
+    if block == 0 {
+        base.to_string()
+    } else {
+        format!("{base}{block}")
+    }
+}
+
+/// Generated planted-repetition fixtures.
+pub struct PlantedFixtures {
+    pub corpus: Vec<CorpusItem>,
+    /// Per group: the gold query.
+    pub queries: Vec<String>,
+    /// Per group: the query that returns planted + helper and no gold.
+    pub attack_queries: Vec<String>,
+    /// Per group: corpus ids of the gold memories.
+    pub gold_ids: Vec<Vec<String>>,
+    /// Per group: corpus id of the planted (non-gold) memory.
+    pub planted_ids: Vec<String>,
+    /// Per group: corpus id of the helper memory.
+    pub helper_ids: Vec<String>,
+}
+
+pub fn generate_planted_fixtures(groups: usize) -> PlantedFixtures {
+    let base = Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap();
+    let per_group = PLANTED_GOLD_PER_GROUP + 2;
+    let mut corpus = Vec::with_capacity(groups * per_group);
+    let mut queries = Vec::with_capacity(groups);
+    let mut attack_queries = Vec::with_capacity(groups);
+    let mut gold_ids = Vec::with_capacity(groups);
+    let mut planted_ids = Vec::with_capacity(groups);
+    let mut helper_ids = Vec::with_capacity(groups);
+
+    for g in 0..groups {
+        let token = group_token(g);
+        let appeal = appeal_token(g);
+        let at = |m: usize| base + chrono::Duration::minutes((per_group * g + m) as i64);
+        let mut gold = Vec::with_capacity(PLANTED_GOLD_PER_GROUP);
+        for m in 0..PLANTED_GOLD_PER_GROUP {
+            let entry = ENTRY_WORDS[m % ENTRY_WORDS.len()];
+            let id = format!("plant-{g:04}-g{m:02}");
+            corpus.push(CorpusItem {
+                id: id.clone(),
+                content: format!("Regarding the {token} initiative, the {entry} entry was filed."),
+                memory_type: "fact".to_string(),
+                tags: vec![token.clone()],
+                created_at: at(m),
+            });
+            gold.push(id);
+        }
+        let planted = format!("plant-{g:04}-p");
+        corpus.push(CorpusItem {
+            id: planted.clone(),
+            content: format!(
+                "Regarding the {token} initiative, the {appeal} appeal voided the filing."
+            ),
+            memory_type: "fact".to_string(),
+            tags: vec![token.clone(), appeal.clone()],
+            created_at: at(PLANTED_GOLD_PER_GROUP),
+        });
+        let helper = format!("plant-{g:04}-h");
+        corpus.push(CorpusItem {
+            id: helper.clone(),
+            content: format!(
+                "The {appeal} appeal was heard by the {appeal} tribunal on a Tuesday."
+            ),
+            memory_type: "fact".to_string(),
+            tags: vec![appeal.clone()],
+            created_at: at(PLANTED_GOLD_PER_GROUP + 1),
+        });
+        queries.push(format!("What was filed regarding the {token} initiative?"));
+        attack_queries.push(format!("What happened with the {appeal} appeal?"));
+        gold_ids.push(gold);
+        planted_ids.push(planted);
+        helper_ids.push(helper);
+    }
+
+    PlantedFixtures {
+        corpus,
+        queries,
+        attack_queries,
+        gold_ids,
+        planted_ids,
+        helper_ids,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlantedArm {
+    Control,
+    Repeat,
+    Corroborate,
+}
+
+impl PlantedArm {
+    fn label(self) -> &'static str {
+        match self {
+            PlantedArm::Control => "control",
+            PlantedArm::Repeat => "repeat_one_source",
+            PlantedArm::Corroborate => "corroborate_k_sources",
+        }
+    }
+}
+
+/// Run the planted-repetition study and report all three arms.
+pub fn analyze_planted_repetition(
+    inputs: &RunInputs,
+    groups: usize,
+    repeats: usize,
+    sources: usize,
+) -> Result<PlantedRepetitionReport> {
+    let fx = generate_planted_fixtures(groups);
+    let mut rows = Vec::with_capacity(3);
+    for arm in [
+        PlantedArm::Control,
+        PlantedArm::Repeat,
+        PlantedArm::Corroborate,
+    ] {
+        rows.push(
+            run_planted_arm(inputs, &fx, arm, repeats.max(1), sources.max(1))
+                .with_context(|| format!("planted repetition arm {}", arm.label()))?,
+        );
+    }
+    Ok(PlantedRepetitionReport {
+        suite: inputs.suite.clone(),
+        git_sha: inputs.git_sha.clone(),
+        groups,
+        rows,
+    })
+}
+
+fn run_planted_arm(
+    inputs: &RunInputs,
+    fx: &PlantedFixtures,
+    arm: PlantedArm,
+    repeats: usize,
+    sources: usize,
+) -> Result<PlantedRepetitionRow> {
+    use crate::recall_harness::metrics::{mrr, ndcg_at_k, recall_at_k};
+    use std::collections::HashMap;
+
+    let storage = inputs.storage_path.join(format!("planted_{}", arm.label()));
+    let manager = build_manager(&storage)?;
+    let id_map = ingest_corpus(&manager, &fx.corpus).context("ingesting planted corpus")?;
+    let system = manager.get_user_memory(EVAL_USER)?;
+    let graph = manager.get_user_graph(EVAL_USER)?;
+    let groups = fx.queries.len();
+
+    // Traffic phase. The recall path's usage writes are forced on for this thread
+    // only; the harness env keeps every other recall read-only.
+    let (recalls_per_group, distinct_sources) = match arm {
+        PlantedArm::Control => (0, 0),
+        PlantedArm::Repeat => (repeats, 1),
+        PlantedArm::Corroborate => (sources, sources),
+    };
+    for attack in &fx.attack_queries {
+        for i in 0..recalls_per_group {
+            let source = match arm {
+                PlantedArm::Repeat => PLANTED_REPEAT_SOURCE.to_string(),
+                _ => format!("session-{i}"),
+            };
+            let query = Query {
+                query_text: Some(attack.clone()),
+                max_results: 2,
+                layers: Some(LayerMode::Full),
+                evidence_source: Some(source),
+                ..Default::default()
+            };
+            crate::memory::with_recall_writes(|| system.read().recall(&query))
+                .with_context(|| format!("attack recall {i} in arm {}", arm.label()))?;
+        }
+    }
+
+    // Measurement phase, read-only.
+    let (mut r10, mut n10, mut rr) = (0.0f64, 0.0f64, 0.0f64);
+    let mut rank_sum = 0.0f64;
+    let mut in_top_10 = 0usize;
+    let (mut access_sum, mut importance_sum) = (0.0f64, 0.0f64);
+    let (mut strength_sum, mut sources_sum, mut activations_sum) = (0.0f64, 0.0f64, 0.0f64);
+    let mut edges_present = 0usize;
+    for g in 0..groups {
+        let query = Query {
+            query_text: Some(fx.queries[g].clone()),
+            max_results: PLANTED_MEASURE_WIDTH,
+            layers: Some(LayerMode::Full),
+            ..Default::default()
+        };
+        let ranked: Vec<Uuid> = system
+            .read()
+            .recall(&query)
+            .with_context(|| format!("measuring group {g} in arm {}", arm.label()))?
+            .iter()
+            .map(|m| m.id.0)
+            .collect();
+        let gold: HashSet<Uuid> = fx.gold_ids[g]
+            .iter()
+            .filter_map(|cid| id_map.get(cid).copied())
+            .collect();
+        let relevance: HashMap<Uuid, f32> = gold.iter().map(|u| (*u, 1.0)).collect();
+        r10 += recall_at_k(&ranked, &gold, 10);
+        n10 += ndcg_at_k(&ranked, &relevance, 10);
+        rr += mrr(&ranked, &gold);
+
+        let planted = *id_map
+            .get(&fx.planted_ids[g])
+            .context("planted id not ingested")?;
+        let helper = *id_map
+            .get(&fx.helper_ids[g])
+            .context("helper id not ingested")?;
+        let rank = ranked
+            .iter()
+            .position(|u| *u == planted)
+            .map(|p| p + 1)
+            .unwrap_or(PLANTED_MEASURE_WIDTH + 1);
+        rank_sum += rank as f64;
+        if rank <= 10 {
+            in_top_10 += 1;
+        }
+        let memory = system.read().get_memory(&MemoryId(planted))?;
+        access_sum += memory.access_count() as f64;
+        importance_sum += memory.importance() as f64;
+        if let Some(edge) = graph.read().memory_edge_between(&planted, &helper)? {
+            edges_present += 1;
+            strength_sum += edge.strength as f64;
+            sources_sum += edge.distinct_sources() as f64;
+            activations_sum += edge.activation_count as f64;
+        }
+    }
+    let n = groups.max(1) as f64;
+    let e = edges_present.max(1) as f64;
+    Ok(PlantedRepetitionRow {
+        arm: arm.label().to_string(),
+        recalls_per_group,
+        distinct_sources,
+        recall_at_10: r10 / n,
+        ndcg_at_10: n10 / n,
+        mrr: rr / n,
+        planted_mean_rank: rank_sum / n,
+        planted_in_top_10: in_top_10,
+        planted_access_count_mean: access_sum / n,
+        planted_importance_mean: importance_sum / n,
+        planted_edge_present: edges_present,
+        planted_edge_strength_mean: strength_sum / e,
+        planted_edge_distinct_sources_mean: sources_sum / e,
+        planted_edge_activations_mean: activations_sum / e,
+    })
+}
+
+#[cfg(test)]
+mod planted_tests {
+    use super::*;
+
+    fn row<'a>(report: &'a PlantedRepetitionReport, arm: &str) -> &'a PlantedRepetitionRow {
+        report
+            .rows
+            .iter()
+            .find(|r| r.arm == arm)
+            .unwrap_or_else(|| panic!("arm {arm} missing"))
+    }
+
+    /// Fifty recalls from one source leave the planted memory's rank and its edge
+    /// where control left them; one recall each from eight sources moves the edge.
+    #[test]
+    fn repetition_from_one_source_does_not_move_a_planted_memory_but_corroboration_does() {
+        let dir = std::env::temp_dir().join(format!("veld-planted-{}", Uuid::new_v4().simple()));
+        let inputs = RunInputs {
+            storage_path: dir.clone(),
+            corpus_path: None,
+            cases_path: None,
+            suite: "planted".into(),
+            git_sha: "local".into(),
+            repeats: 1,
+            layer_modes: vec![LayerMode::Full],
+            age_days: 0.0,
+        };
+        let report = analyze_planted_repetition(&inputs, 6, 50, 8).expect("harness run");
+        for r in &report.rows {
+            eprintln!(
+                "  {:<22} recalls={:<3} sources={:<2} r@10={:.3} ndcg@10={:.3} mrr={:.3} \
+                 planted_rank={:.2} top10={} access={:.1} importance={:.3} \
+                 edge(present={} strength={:.3} sources={:.1} activations={:.1})",
+                r.arm,
+                r.recalls_per_group,
+                r.distinct_sources,
+                r.recall_at_10,
+                r.ndcg_at_10,
+                r.mrr,
+                r.planted_mean_rank,
+                r.planted_in_top_10,
+                r.planted_access_count_mean,
+                r.planted_importance_mean,
+                r.planted_edge_present,
+                r.planted_edge_strength_mean,
+                r.planted_edge_distinct_sources_mean,
+                r.planted_edge_activations_mean,
+            );
+        }
+        let control = row(&report, "control");
+        let repeat = row(&report, "repeat_one_source");
+        let corroborate = row(&report, "corroborate_k_sources");
+
+        // The traffic created the edge in most groups and the evidential base says
+        // what the traffic was: fifty recalls from one source are one activation.
+        assert_eq!(control.planted_edge_present, 0);
+        assert!(repeat.planted_edge_present * 2 > report.groups);
+        assert!(corroborate.planted_edge_present * 2 > report.groups);
+        assert_eq!(repeat.planted_edge_distinct_sources_mean, 1.0);
+        assert_eq!(repeat.planted_edge_activations_mean, 1.0);
+        assert_eq!(corroborate.planted_edge_distinct_sources_mean, 8.0);
+        assert_eq!(corroborate.planted_edge_activations_mean, 8.0);
+        assert!(
+            corroborate.planted_edge_strength_mean > repeat.planted_edge_strength_mean,
+            "corroboration must move strength where repetition did not: {} vs {}",
+            corroborate.planted_edge_strength_mean,
+            repeat.planted_edge_strength_mean
+        );
+
+        // Rank: repetition does not improve on control.
+        assert!(
+            repeat.planted_mean_rank >= control.planted_mean_rank,
+            "repeat arm improved the planted rank: {} < control {}",
+            repeat.planted_mean_rank,
+            control.planted_mean_rank
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
