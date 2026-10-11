@@ -1311,14 +1311,14 @@ impl MemoryStorage {
     /// a store written in plaintext stays plaintext whatever VELD_MASTER_PASSPHRASE holds.
     pub fn open_without_creating_keystore(
         path: &Path,
-        shared_cache: Option<&rocksdb::Cache>,
+        shared_cache: Option<&crate::storage::SharedBlockCache>,
     ) -> Result<Self> {
         Self::open(path, shared_cache, false)
     }
 
     fn open(
         path: &Path,
-        shared_cache: Option<&rocksdb::Cache>,
+        shared_cache: Option<&crate::storage::SharedBlockCache>,
         create_keystore: bool,
     ) -> Result<Self> {
         use crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES;
