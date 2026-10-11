@@ -42,6 +42,7 @@ Usage:
 import argparse
 import json
 import os
+import sys
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -193,7 +194,7 @@ class AnthropicProvider(LLMProvider):
             max_tokens=JUDGE_MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}]
         )
-        return response.content[0].text.strip()
+        return (response.content[0].text or "").strip() if response.content else ""
 
 
 class OllamaProvider(LLMProvider):
@@ -216,7 +217,7 @@ class OllamaProvider(LLMProvider):
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0, "num_predict": JUDGE_MAX_TOKENS}
         )
-        return response["message"]["content"].strip()
+        return (response["message"]["content"] or "").strip()
 
 
 class BasetenProvider(LLMProvider):
@@ -283,8 +284,11 @@ class EvalResult:
     question_id: str
     question_type: str
     correct: bool
-    predicted_idx: int
+    predicted_idx: Optional[int]
     correct_idx: int
+    # False when the judge gave no usable answer (an API error, an empty or unparseable reply).
+    # Accuracy counts judged items only.
+    judged: bool
     latency_store_ms: float
     latency_recall_ms: float
     num_memories_stored: int
@@ -400,8 +404,12 @@ def select_answer_with_llm(
     question: str,
     choices: list[str],
     context: str
-) -> int:
-    """Use LLM to select the best answer given retrieved context."""
+) -> Optional[int]:
+    """The option index the LLM picks from the retrieved context, or None when it gave none.
+
+    None is an abstention and callers must not turn it into an index: a defaulted answer looks
+    like a prediction, so every arm would score how often the gold sits at that index.
+    """
 
     choices_text = "\n".join([f"{i}. {choice}" for i, choice in enumerate(choices)])
 
@@ -425,17 +433,23 @@ Your answer (single digit 0-9):"""
 
     try:
         answer_text = provider.complete(prompt)
-        # Extract digit from response
+        if not answer_text:
+            print(
+                "LLM Empty: no completion body; raise LOCOMO_JUDGE_MAX_TOKENS "
+                f"(currently {JUDGE_MAX_TOKENS})"
+            )
+            return None
         for char in answer_text:
             if char.isdigit():
                 idx = int(char)
                 if 0 <= idx <= 9:
                     return idx
-        return 0  # Default to first option if parsing fails
+        print(f"LLM Unparseable: no option digit in {answer_text!r:.200}")
+        return None
 
     except Exception as e:
         print(f"LLM Error: {e}")
-        return 0
+        return None
 
 
 def evaluate_single_item(
@@ -466,7 +480,8 @@ def evaluate_single_item(
     )
 
     correct_idx = item["correct_choice_index"]
-    is_correct = predicted_idx == correct_idx
+    judged = predicted_idx is not None
+    is_correct = judged and predicted_idx == correct_idx
 
     return EvalResult(
         question_id=item["question_id"],
@@ -474,13 +489,14 @@ def evaluate_single_item(
         correct=is_correct,
         predicted_idx=predicted_idx,
         correct_idx=correct_idx,
+        judged=judged,
         latency_store_ms=store_latency,
         latency_recall_ms=recall_latency,
         num_memories_stored=num_stored,
         question_text=item["question"],
         retrieved_context=context,
         correct_answer=item["choices"][correct_idx],
-        predicted_answer=item["choices"][predicted_idx],
+        predicted_answer=item["choices"][predicted_idx] if judged else "<no judgement>",
         all_choices=item["choices"]
     )
 
@@ -558,15 +574,35 @@ def run_evaluation(
     print("RESULTS")
     print("=" * 60)
 
-    # Overall accuracy
-    total_correct = sum(1 for r in results if r.correct)
-    overall_accuracy = total_correct / len(results) * 100
+    # Accuracy over judged items only: scoring an unanswered item as wrong turns a judge outage
+    # into a quality number.
+    judged_results = [r for r in results if r.judged]
+    unjudged = len(results) - len(judged_results)
+    if not judged_results:
+        print(
+            f"\nFATAL: the judge returned no usable answer for any of {len(results)} items. "
+            "No accuracy exists for this run; check the LLM provider (credits, key, rate limits) "
+            "and re-run."
+        )
+        sys.exit(2)
+    if unjudged:
+        print(
+            f"\nWARNING: {unjudged}/{len(results)} items unjudged "
+            f"({unjudged / len(results) * 100:.1f}%); accuracy below is over the "
+            f"{len(judged_results)} judged items only."
+        )
 
-    print(f"\nOverall Accuracy: {overall_accuracy:.2f}% ({total_correct}/{len(results)})")
+    total_correct = sum(1 for r in judged_results if r.correct)
+    overall_accuracy = total_correct / len(judged_results) * 100
+
+    print(
+        f"\nOverall Accuracy: {overall_accuracy:.2f}% "
+        f"({total_correct}/{len(judged_results)} judged, {unjudged} unjudged)"
+    )
 
     # Per-category accuracy
     by_type = defaultdict(list)
-    for r in results:
+    for r in judged_results:
         by_type[r.question_type].append(r.correct)
 
     print("\nAccuracy by Question Type:")
@@ -590,6 +626,8 @@ def run_evaluation(
         "provider": provider_name,
         "model": model,
         "total_items": len(results),
+        "judged_items": len(judged_results),
+        "unjudged_items": unjudged,
         "overall_accuracy": overall_accuracy,
         "accuracy_by_type": {
             qtype: sum(correct_list) / len(correct_list) * 100
@@ -602,6 +640,7 @@ def run_evaluation(
                 "question_id": r.question_id,
                 "question_type": r.question_type,
                 "correct": r.correct,
+                "judged": r.judged,
                 "predicted_idx": r.predicted_idx,
                 "correct_idx": r.correct_idx,
                 "latency_store_ms": r.latency_store_ms,
