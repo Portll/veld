@@ -110,21 +110,9 @@ impl SmokeCategory {
 pub const LOCOMO_CORPUS_PATH: &str = "tests/recall/corpora/locomo.jsonl";
 pub const LOCOMO_CASES_PATH: &str = "tests/recall/locomo_cases.jsonl";
 
-/// The frozen LoCoMo-100 fixture set: 100 category-balanced real LoCoMo cases
-/// against a single conversation's 629-turn corpus.
-///
-/// **These two constants are referenced by nothing, and the fixtures gate
-/// nothing.** Verified 2026-09-09 at HEAD 740ee42: no reader of either path
-/// exists anywhere in the crate, and `tests/recall/locomo-gate-baseline.json` is
-/// read by no code at all. Neither producer named by the previous version of
-/// this comment exists either — `benchmarks/build_locomo_gate.py` is absent, and
-/// `recall-eval` is not a binary in this workspace and never has been on any
-/// branch. The pinned baseline is an unreproduced historical record, not a gate;
-/// nothing regresses when it moves, because nothing measures it.
-///
-/// Wiring a runner is the outstanding work. Until then, do not describe this as
-/// a CI gate and do not quote its numbers as current. See
-/// `tests/recall/README.md`.
+/// The frozen LoCoMo-100 gate suite: 100 category-balanced real LoCoMo cases against a single
+/// conversation's 629-turn corpus. `recall-eval --suite locomo-gate` reads it, and
+/// `.github/workflows/recall.yml` gates it against `tests/recall/locomo-gate-baseline.json`.
 pub const LOCOMO_GATE_CORPUS_PATH: &str = "tests/recall/corpora/locomo-gate.jsonl";
 pub const LOCOMO_GATE_CASES_PATH: &str = "tests/recall/locomo-gate-cases.jsonl";
 

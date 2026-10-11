@@ -12,25 +12,78 @@ This directory holds the fixtures, ground truth, and frozen baselines for the re
 | `.github/workflows/recall.yml` | the recall gate: weekly and on dispatch, once per storage engine |
 | `scripts/recall_diff.py`, `scripts/recall_engines_equal.py` | the diff table, and the check that both engines score the same |
 | Smoke corpus + `smoke_cases.jsonl` + `baseline.json` | present, consumed by the library |
-| LOCOMO gate fixtures + `locomo-gate-baseline.json` | read by the gate |
-
-`locomo-gate-baseline.json` gates every run. A baseline is recorded by dispatching the workflow
-with `record=true`, which runs ungated and uploads each engine's report; the RocksDB report is
-committed as the baseline. Until a veld recording replaces it, the file holds upstream's numbers
-from 2026-08-08 (`ec7abd2`), which veld has never reproduced.
+| LOCOMO gate fixtures, `locomo-gate-baseline.json`, `locomo-gate-baseline.per-case.json` | read by the gate |
 
 The gate compares veld with veld: upstream's published numbers are hypotheses to test, never a
-reason to accept or decline a port (`docs/upstream/PLAN.md`, 1.5). Agent sessions may not build
-binaries locally (`CLAUDE.md`), so the gate runs in CI.
+reason to accept or decline a port (`docs/upstream/PLAN.md`, 1.5).
+
+## The gate baseline (`locomo-gate`)
+
+`.github/workflows/recall.yml` runs the 100-case `locomo-gate` suite and compares each engine's
+run against two checked-in files:
+
+- `locomo-gate-baseline.json`: aggregate metrics and the rerank setting they were measured
+  under. `recall-eval` gates on these, and refuses a run reranked differently; its exit code is
+  the pass or fail.
+- `locomo-gate-baseline.per-case.json`: the per-case records from the same run.
+  `scripts/recall_diff.py` uses them to list every case whose result moved: lost gold, gained
+  gold, p@1 flips and rank-only moves.
+
+At n=100 the 2% tolerance is below one case for p@1 (one case is 0.01), so on that metric the
+gate is a no-net-loss check. Repeats must give identical rank lists, so a case that moves on the
+same runner class is a real change; the case list is how a reviewer decides whether a change is
+worth what it moved.
+
+Regenerate both files together, from one run on `main`, after a merged change that intentionally
+moved quality:
+
+1. `gh workflow run recall.yml --ref main -f record=true`.
+2. `gh run download <run-id> -n recall-rocksdb`.
+3. Copy `current-rocksdb.json` to `locomo-gate-baseline.json` and `per-case-rocksdb.json` to
+   `locomo-gate-baseline.per-case.json`. Check that `git_sha` names the commit you meant.
+4. Add a row to the regeneration history below, naming the run.
+
+## Model tapes
+
+ONNX Runtime chooses its kernels by CPU, so the embedder and the cross-encoder return different low
+bits on different runner classes and near-ties flip. A model tape (`src/embeddings/model_tape.rs`)
+takes the models out of the measurement: `VELD_MODEL_TAPE_RECORD=<path>` records every output the
+MiniLM embedder, the cross-encoder and, when it loads, the neural NER give, keyed by the exact input;
+`VELD_MODEL_TAPE_REPLAY=<path>` answers every call from the tape and runs no model arithmetic. A
+replay miss, a tape recorded from other model files, or a model the replay never loaded fails the
+run as infrastructure rather than falling back. A recording also scores every (query, corpus item)
+cross-encoder pair the run did not, so a retrieval change that hands the reranker another candidate
+still finds it.
+
+The workflow's `model_tape` input drives it. `pinned`, the default and what the schedule runs,
+replays the tape named in `tests/recall/model-tape.json` (`{"tag", "asset", "sha256"}`, a GitHub
+release asset) after checking its sha256; with no pin file, as now, the models run live. `record`
+uploads each engine's tape as `model-tape-<engine>`; `replay` with `tape_run` replays another run's
+RocksDB tape. Every report records the tape it replayed as `model_tape`, and `recall-eval` refuses
+to compare a live run with a replayed one, or two different tapes. So pinning a tape is three steps
+taken together:
+
+1. `gh workflow run recall.yml --ref main -f model_tape=record`, and check the run reports no tape
+   problem and that repeats after the first added no entries.
+2. Publish `model-tape-rocksdb.jsonl.gz` as a release asset under a new tag, and write the pin
+   file with that tag, the asset name and its sha256.
+3. Record the baseline again with `model_tape=pinned` and `record=true`. The baseline and the pin
+   must name the same tape.
+
+A change to what a model is fed (another corpus text, a prefix, another candidate source) or a
+model or ONNX Runtime upgrade needs a new tape: replay misses fail the run, and the tape refuses
+model files other than the ones it was recorded from.
 
 ## Files
 
 - `corpora/shodh-smoke.jsonl` — L1 smoke corpus (memories ingested by the runner).
-- `smoke_cases.jsonl` — 30 hand-crafted query cases with graded relevance labels,
+- `smoke_cases.jsonl` — 108 hand-crafted query cases with graded relevance labels,
   spanning six categories (decision / code / temporal / entity / multi_hop / negation).
 - `baseline.json` — frozen per-metric scores for the smoke suite.
-- `corpora/locomo-gate.jsonl`, `locomo-gate-cases.jsonl`, `locomo-gate-baseline.json` — LOCOMO gate
-  fixtures. Currently unreferenced; see above.
+- `corpora/locomo-gate.jsonl`, `locomo-gate-cases.jsonl` — the LOCOMO gate suite;
+  `locomo-gate-baseline.json` and `locomo-gate-baseline.per-case.json` — its baseline.
+- `corpora/locomo.jsonl`, `locomo_cases.jsonl` — the 1,531-case held-out LOCOMO set, run ungated by
+  dispatching the gate with `suite=locomo`.
 
 ## Running the harness
 
@@ -55,9 +108,6 @@ differs; `RECALL_DET_LAYERS=all` names the first pipeline stage that diverges:
 ```bash
 cargo test --release --test recall_determinism -- --ignored --nocapture
 ```
-
-Note that `veld/CLAUDE.md` bars agent sessions from `cargo build`/`cargo run`, so binary-producing
-paths are unavailable to them regardless; `cargo test --no-run` and `cargo check` are permitted.
 
 ### Aging: the only way decay is visible
 
@@ -89,8 +139,9 @@ do not "correct" it without changing the readers in `runner.rs` and `bridge_harn
 
 ## Per-pipeline-layer attribution (`LayerMode`)
 
-`RunInputs::layer_modes` selects which subset of the retrieval pipeline runs. This is a **library
-option**, not a CLI flag. An empty vec is treated as `[LayerMode::Full]`. Modes are **cumulative**:
+`RunInputs::layer_modes` selects which subset of the retrieval pipeline runs; `recall-eval --layer
+all` runs every rung, and the gate's `layer` dispatch input passes it. An empty vec is treated as
+`[LayerMode::Full]`. Modes are **cumulative**:
 each row adds one stage on top of the row above it. Report keys come from `LayerMode::report_key()`
 in `src/memory/types.rs`.
 
@@ -98,8 +149,8 @@ in `src/memory/types.rs`.
 | ------------- | ---------------------------------------------------------------------- |
 | `vamana_only` | Layer 3 vector ANN only (cosine + tie-break).                          |
 | `+spreading`  | + Layer 2 graph spreading activation (RRF over vector ⊕ graph).        |
-| `+bm25`       | + Layer 4 BM25 leg of three-way RRF fusion.                            |
-| `+rerank`     | + Layer 4.9 ontological re-rank (see naming caveat below).             |
+| `+bm25`       | nothing in veld: the Layer 4 BM25 leg runs on every rung (see below).   |
+| `+rerank`     | + Layer 4.9 ontological re-rank and the Layer 5.3 cross-encoder.       |
 | `+facts`      | + Layer 0.7 / 4.8 fact-source boost from consolidated knowledge.       |
 | `full`        | + Layer 0.4/0.5/0.6 pre-filters, Layer 4.6 interference, Layer 4.7     |
 |               | prospective signal, full Layer 5 unified scoring (recency × importance |
@@ -111,11 +162,9 @@ per mode.
 
 ### Caveats — read these before staring at the numbers
 
-1. **`+rerank` is a misnomer in this codebase.** The originating spec describes a cross-encoder
-   rerank stage. There is no cross-encoder here. The mode wraps the **ontological re-ranker** at
-   Layer 4.9 (multiplicative boost when episode entity types match the query's expected ontology
-   labels). The label is preserved for spec fidelity; if a cross-encoder ever lands, it joins this
-   same gate.
+1. **`+bm25` equals `+spreading`.** `memory/recall.rs` gates no stage on `PlusBm25`, so the BM25
+   leg is fused on every rung, `vamana_only` included. Upstream gates it (#270); veld's port of the
+   ladder did not, and the gate is owed in `recall.rs`.
 
 2. **Modes below `full` skip Layer 5 unified scoring.** Per-layer ndcg numbers will look strictly
    *lower* than `full` for reasons that are *not* "this stage didn't help" — they include the
@@ -128,8 +177,9 @@ per mode.
 4. **Only the LoCoMo gate is gated.** `recall.yml` gates the `locomo-gate` suite at `--layer
    full`; the smoke baseline and the per-layer numbers are advisory.
 
-5. **30 cases is a small sample.** A single document rank flip moves per-category recall by ~0.20
-   and per-mode ndcg by ~0.05. A `+0.01` per-layer delta is noise; trust direction, not magnitude.
+5. **Small suites move in whole cases.** At n cases a whole-case metric moves in steps of 1/n, and
+   a category's in steps of one over its own count: 0.04 on the gate's 25 multi_hop cases. Read a
+   delta against that step before reading it as an effect.
 
 ## Regeneration history
 
@@ -137,3 +187,4 @@ per mode.
 | ---------- | --------- | -------------- | ------------------------------ |
 | 2026-05-03 | `6756665` | minilm-l6-v2   | Initial capture (RH-6, #268).  |
 | 2026-08-08 | `ec7abd2` | minilm-l6-v2   | LOCOMO gate baseline; producer not in repo. |
+| 2026-10-06 | `2f1f823` | minilm-l6-v2   | `locomo-gate`, veld's own: RocksDB report of run 37485608452, 3 repeats, redb equal on every metric. The per-case file from the same run was added on 2026-10-07, and so was its `rerank` field (mxbai-rerank-xsmall-v1, cap 20): an arm64 rerun of the tree with reranking on differed from it in 1 case of 100, with reranking off in 40. |

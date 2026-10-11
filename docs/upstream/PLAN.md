@@ -86,9 +86,9 @@ of both trees on 2026-10-03; `LEDGER.tsv` carries the per-commit result.
 0.1a **Gate status (2026-10-04).** Merge pass and tombstone GC on redb: done (one
     implementation over the traits; the coverage matrix has no gap). Encryption-v2 on redb: done.
     Backup and point-in-time restore parity: done; the parity test found a RocksDB restore that
-    deleted the tenant's data, fixed. Equal recall-gate scores: the gate runs, but veld's pipeline
-    gives different rankings between repeats on fresh stores, which blocks an equality check
-    until it is deterministic. 14-day live soak: needs the operator, since live runs RocksDB; a
+    deleted the tenant's data, fixed. Equal recall-gate scores: done; rank lists are repeat-stable on
+    fresh stores (9d2be1bc), and recording run 37485608452 scored the same on both engines on
+    every metric and every case. 14-day live soak: needs the operator, since live runs RocksDB; a
     daily soak rehearsal on a clone can run meanwhile.
 0.5 **Live back on RocksDB, with writes frozen.** Done 2026-10-03: rehearsed on an APFS clone
     (78 s migration, census and probes checked), then run on the stopped live store. Steps:
@@ -179,7 +179,7 @@ Waves run in this order because each needs the one before it, or carries more ri
 
 | Wave | Upstream work | Notes for veld |
 |---|---|---|
-| W0 Measurement | recall harness and eval gates: RH #271–#281, #312, #328, #548, #561, #570 | the harness is mostly ported; the gate binary and workflow are not |
+| W0 Measurement | recall harness and eval gates: RH #271–#281, #312, #328, #548, #561, #570 | triaged 2026-10-07: the harness, the gate binary and workflow, the per-case baseline, paired ablation intervals, the rerank and model-tape guards and the fact-yield instrument are in. #378 (leave-one-out switches) and #567 (stage export) wait on `memory/recall.rs`; nine rows whose substance is retrieval, graph or NER code moved to W2, W3 and W6. #566 and #569 (CPU kernel class) are measurement rows filed under W2 |
 | W1 Fixes and security | storage and integrity fixes, #559 audit writes, the security commits (#399, #492, #513, #518 partly in) | #513 turns `ENFORCE_HTTPS` on by default, but it governs only outbound integration-API URL overrides (Linear, GitHub), so it ports without touching loopback clients. #399 adds an authenticated local IPC transport (owner-scoped Unix socket or named pipe, mutual auth, on by default); W1 opens with an ADR deciding whether veld's loopback clients (desktop, MCP, hooks) take it beside HTTP with the API key |
 | W2 Retrieval and ranking | #181 temporal credit, #320, #324, #536 cross-encoder by default, #538 (in), #560, #562, FLAT fusion, PPR | veld has its own cross-encoder registry and LLM refiner; reconcile, then measure: upstream reports p@1 0.33→0.49 and +190 ms per recall |
 | W3 Knowledge graph | #213 curvature, #321, #323, #336/#364, #340, #442 (in), #461, #509; `relation_stats` column family; four edge tail fields | veld decays edges exponentially, upstream by power law: measure both and record the choice; veld still makes the CoRetrieved edges upstream stopped making |

@@ -452,6 +452,10 @@ impl MiniLMEmbedder {
             }
         }
 
+        super::model_tape::register_model(
+            super::model_tape::Model::Embedder,
+            &[&config.model_path, &config.tokenizer_path],
+        );
         let embedder = Self {
             config: config.clone(),
             lazy_model: OnceLock::new(),
@@ -943,6 +947,12 @@ impl Embedder for MiniLMEmbedder {
             return Ok(vec![0.0; self.dimension]);
         }
 
+        // A model tape answers before either path below: replay must never reach the model
+        // or the simplified fallback, and recording keeps only a real model output.
+        if let Some(taped) = super::model_tape::embed(text, || self.generate_embedding_onnx(text)) {
+            return taped;
+        }
+
         // Use simplified mode if in that mode
         if self.simplified_mode {
             let start = std::time::Instant::now();
@@ -1014,6 +1024,13 @@ impl Embedder for MiniLMEmbedder {
         let empty_embedding = vec![0.0; self.dimension];
         if texts.iter().all(|t| t.is_empty()) {
             return Ok(vec![empty_embedding; texts.len()]);
+        }
+
+        // Under a model tape each text goes through `encode`, so it is keyed and replayed on
+        // its own: the batch path pads to its longest member, which would make a text's
+        // recorded vector depend on its neighbours.
+        if super::model_tape::active() {
+            return texts.iter().map(|t| self.encode(t)).collect();
         }
 
         // Use simplified mode if in that mode

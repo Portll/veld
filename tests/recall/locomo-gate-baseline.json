@@ -1,6 +1,11 @@
 {
   "suite": "locomo-gate",
   "embedder": "minilm-l6-v2",
+  "rerank": {
+    "enabled": true,
+    "model": "mxbai-rerank-xsmall-v1",
+    "depth": 20
+  },
   "git_sha": "2f1f823939a8173e3b986e8449e23c6eab378350",
   "timestamp": "2026-10-06T15:30:24.540483986Z",
   "layers": {

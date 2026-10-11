@@ -101,11 +101,16 @@ impl EmbeddingBacklogStore {
     }
 
     pub fn get(&self, id: &MemoryId) -> Result<Option<BacklogEntry>> {
-        match self.kv.get_bytes(&key(id)).context("read embedding backlog row")? {
-            Some(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes)
-                    .with_context(|| format!("decode embedding backlog row for {}", id.0))?,
-            )),
+        match self
+            .kv
+            .get_bytes(&key(id))
+            .context("read embedding backlog row")?
+        {
+            Some(bytes) => {
+                Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+                    format!("decode embedding backlog row for {}", id.0)
+                })?))
+            }
             None => Ok(None),
         }
     }
@@ -249,7 +254,11 @@ impl EmbeddingBacklogStore {
     ) -> Result<DrainReport> {
         let rows = self.all()?;
         let mut ordered: Vec<(&MemoryId, &BacklogEntry)> = rows.iter().collect();
-        ordered.sort_by(|a, b| a.1.enqueued_at.cmp(&b.1.enqueued_at).then_with(|| a.0.cmp(b.0)));
+        ordered.sort_by(|a, b| {
+            a.1.enqueued_at
+                .cmp(&b.1.enqueued_at)
+                .then_with(|| a.0.cmp(b.0))
+        });
         let mut report = DrainReport::default();
         for (id, _) in ordered.into_iter().take(limit) {
             report.attempted += 1;
@@ -298,14 +307,21 @@ mod tests {
             Ok(self.map.lock().unwrap().get(key).cloned())
         }
         fn put_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
-            self.map.lock().unwrap().insert(key.to_vec(), value.to_vec());
+            self.map
+                .lock()
+                .unwrap()
+                .insert(key.to_vec(), value.to_vec());
             Ok(())
         }
         fn delete_bytes(&self, key: &[u8]) -> Result<()> {
             self.map.lock().unwrap().remove(key);
             Ok(())
         }
-        fn scan_prefix(&self, prefix: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        fn scan_prefix(
+            &self,
+            prefix: &[u8],
+            _limit: Option<usize>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
             if *self.poison.lock().unwrap() {
                 anyhow::bail!("scan failed");
             }
@@ -347,14 +363,24 @@ mod tests {
     #[test]
     fn record_keeps_enqueue_time_and_counts_attempts() {
         let (_, s) = store();
-        s.record(&id(1), EnqueueReason::EmbedFailed, Some("connection refused")).unwrap();
+        s.record(
+            &id(1),
+            EnqueueReason::EmbedFailed,
+            Some("connection refused"),
+        )
+        .unwrap();
         let first = s.get(&id(1)).unwrap().unwrap();
         assert_eq!(first.attempts, 1);
         assert_eq!(first.reason, EnqueueReason::EmbedFailed);
-        s.record(&id(1), EnqueueReason::Reconciled, Some("timeout")).unwrap();
+        s.record(&id(1), EnqueueReason::Reconciled, Some("timeout"))
+            .unwrap();
         let second = s.get(&id(1)).unwrap().unwrap();
         assert_eq!(second.attempts, 2);
-        assert_eq!(second.reason, EnqueueReason::EmbedFailed, "the first reason is kept");
+        assert_eq!(
+            second.reason,
+            EnqueueReason::EmbedFailed,
+            "the first reason is kept"
+        );
         assert_eq!(second.enqueued_at, first.enqueued_at);
         assert_eq!(second.last_error.as_deref(), Some("timeout"));
     }
@@ -369,8 +395,10 @@ mod tests {
     #[test]
     fn reconcile_enqueues_stored_but_unindexed_and_drops_the_rest() {
         let (_, s) = store();
-        s.record(&id(1), EnqueueReason::EmbedFailed, Some("x")).unwrap();
-        s.record(&id(9), EnqueueReason::EmbedFailed, Some("x")).unwrap();
+        s.record(&id(1), EnqueueReason::EmbedFailed, Some("x"))
+            .unwrap();
+        s.record(&id(9), EnqueueReason::EmbedFailed, Some("x"))
+            .unwrap();
         let stored = vec![id(1), id(2), id(3)];
         let indexed: HashSet<MemoryId> = [id(1), id(3)].into_iter().collect();
         let r = s.reconcile(&stored, &indexed).unwrap();
@@ -378,14 +406,18 @@ mod tests {
         assert_eq!(r.dropped_gone, 1, "id 9 is no longer stored");
         assert_eq!(r.enqueued, 1, "id 2 is stored and unindexed with no row");
         assert_eq!(r.pending, 1);
-        assert_eq!(s.get(&id(2)).unwrap().unwrap().reason, EnqueueReason::Reconciled);
+        assert_eq!(
+            s.get(&id(2)).unwrap().unwrap().reason,
+            EnqueueReason::Reconciled
+        );
     }
 
     #[test]
     fn drain_embeds_oldest_first_and_stops_when_the_embedder_is_down() {
         let (_, s) = store();
         for n in [3u128, 1, 2] {
-            s.record(&id(n), EnqueueReason::EmbedFailed, Some("x")).unwrap();
+            s.record(&id(n), EnqueueReason::EmbedFailed, Some("x"))
+                .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let mut calls = Vec::new();
@@ -399,7 +431,11 @@ mod tests {
                 }
             })
             .unwrap();
-        assert_eq!(calls, vec![id(3), id(1), id(2)], "enqueue order, not id order");
+        assert_eq!(
+            calls,
+            vec![id(3), id(1), id(2)],
+            "enqueue order, not id order"
+        );
         assert_eq!(r.drained, 2);
         assert_eq!(r.stopped.as_deref(), Some("connection refused"));
         assert_eq!(r.remaining, 1);
@@ -422,7 +458,10 @@ mod tests {
             .unwrap();
         assert_eq!((r.dropped, r.failed, r.remaining), (1, 1, 1));
         assert!(s.get(&id(1)).unwrap().is_none());
-        assert_eq!(s.get(&id(2)).unwrap().unwrap().last_error.as_deref(), Some("oversized"));
+        assert_eq!(
+            s.get(&id(2)).unwrap().unwrap().last_error.as_deref(),
+            Some("oversized")
+        );
     }
 
     #[test]
@@ -438,7 +477,8 @@ mod tests {
     #[test]
     fn report_summarises_without_hiding_the_last_error() {
         let (_, s) = store();
-        s.record(&id(1), EnqueueReason::EmbedFailed, Some("refused")).unwrap();
+        s.record(&id(1), EnqueueReason::EmbedFailed, Some("refused"))
+            .unwrap();
         s.record(&id(2), EnqueueReason::Reconciled, None).unwrap();
         let r = s.report().unwrap();
         assert_eq!(r.pending, 2);

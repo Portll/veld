@@ -2,6 +2,7 @@
 //! re-sealed under the keystore by the read that finds it; without the key it is an
 //! error, never ciphertext returned as the memory's text — including inside a record
 //! that was sealed without its content being opened.
+#![cfg(feature = "rocksdb")]
 
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit};

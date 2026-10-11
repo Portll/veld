@@ -292,7 +292,10 @@ pub static MEMORIES_BY_TIER: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 /// Memories still without a vector, per user (set by the backlog drainer each tick)
 pub static EMBEDDING_BACKLOG_PENDING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
-        Opts::new("veld_embedding_backlog_pending", "Memories stored without a vector, awaiting the embedder"),
+        Opts::new(
+            "veld_embedding_backlog_pending",
+            "Memories stored without a vector, awaiting the embedder",
+        ),
         &["user"],
     )
     .expect("EMBEDDING_BACKLOG_PENDING metric must be valid at compile time")
@@ -880,7 +883,10 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(HTTP_REQUEST_DURATION, "HTTP_REQUEST_DURATION");
     register!(HTTP_REQUESTS_TOTAL, "HTTP_REQUESTS_TOTAL");
     register!(EMBEDDING_BACKLOG_PENDING, "EMBEDDING_BACKLOG_PENDING");
-    register!(EMBEDDING_BACKLOG_DRAINED_TOTAL, "EMBEDDING_BACKLOG_DRAINED_TOTAL");
+    register!(
+        EMBEDDING_BACKLOG_DRAINED_TOTAL,
+        "EMBEDDING_BACKLOG_DRAINED_TOTAL"
+    );
     register!(EMBEDDING_FALLBACK_TOTAL, "EMBEDDING_FALLBACK_TOTAL");
 
     // Memory operation metrics

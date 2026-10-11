@@ -17,8 +17,8 @@ pub mod utils;
 pub mod crud;
 pub mod memory_ops;
 pub mod recall;
-pub mod ui;
 pub mod remember;
+pub mod ui;
 
 // Advanced memory operations
 pub mod compression;
