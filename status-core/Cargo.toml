@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Portll <john@portll.net>"]
 description = "Core data model and HTTP/SSE client for the Veld status TUI and GUI"
-license = "AGPL-3.0-or-later"
+license = "LicenseRef-Veld-Evaluation-1.0"
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

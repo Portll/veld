@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Portll <john@portll.net>"]
 description = "Veld status monitor — system-tray GUI"
-license = "AGPL-3.0-or-later"
+license = "LicenseRef-Veld-Evaluation-1.0"
 
 [[bin]]
 name = "veld-monitor"

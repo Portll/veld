@@ -8,7 +8,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/veld.svg)](https://pypi.org/project/veld/)
 [![Downloads](https://static.pepy.tech/badge/veld)](https://pepy.tech/project/veld)
-[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Evaluation-blue.svg)](LICENSE)
 
 ---
 
@@ -274,8 +274,11 @@ Working Memory ──overflow──> Session Memory ──importance──> Long
 
 ## License
 
-veld is dual-licensed: **AGPL-3.0-or-later** (see [LICENSE](LICENSE)) **or** a commercial
-licence from Portll. See [LICENSING.md](LICENSING.md).
+veld is published under the **Veld Evaluation Licence** (see [LICENSE](LICENSE)): install,
+run, read and assess it on your own hardware, nothing more. Internal business use is licensed
+under the **PolyForm Internal Use License 1.0.0** by written agreement. Portll intends to
+release veld 2.0 under **AGPL-3.0-or-later**; that is a stated intention, not a grant. See
+[LICENSING.md](LICENSING.md).
 
 A derivative work of [shodh-memory](https://github.com/varun29ankuS/shodh-memory)
 (Apache-2.0); upstream portions remain under Apache-2.0 — see [NOTICE](NOTICE).
