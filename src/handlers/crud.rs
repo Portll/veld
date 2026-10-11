@@ -85,6 +85,9 @@ pub struct ListQuery {
     pub memory_type: Option<String>,
     /// Text search query - filters by content or tags (case-insensitive)
     pub query: Option<String>,
+    /// Comma-separated tags; every one must be present on the memory, matched exactly.
+    /// See [`parse_tag_filter`].
+    pub tags: Option<String>,
 }
 
 /// List response - simplified memory list
@@ -107,6 +110,89 @@ pub struct ListMemoriesRequest {
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     pub query: Option<String>,
+    /// Comma-separated tags; every one must be present on the memory, matched exactly.
+    /// See [`parse_tag_filter`].
+    pub tags: Option<String>,
+}
+
+/// Query parameters for GET /api/memories/count
+#[derive(Debug, Deserialize)]
+pub struct CountMemoriesQuery {
+    pub user_id: String,
+    #[serde(rename = "type")]
+    pub memory_type: Option<String>,
+    /// Comma-separated tags; every one must be present on the memory, matched exactly.
+    /// See [`parse_tag_filter`].
+    pub tags: Option<String>,
+}
+
+/// Response for GET /api/memories/count
+#[derive(Debug, Serialize)]
+pub struct CountResponse {
+    /// Memories matching the filters.
+    pub total: usize,
+    /// The tag filter as applied (parsed, trimmed, empties dropped), so a caller can see
+    /// what the count was measured against.
+    pub tags: Vec<String>,
+}
+
+/// Split a `tags` query value on commas, trim each piece and drop empties. `None`, an empty
+/// string or a string of only separators all yield an empty vector, which [`apply_list_filters`]
+/// treats as "no tag filter".
+fn parse_tag_filter(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The filters shared by every listing endpoint, applied before pagination so `total`
+/// counts what the filters admit.
+///
+/// - `memory_type`: case-insensitive equality on the experience type name.
+/// - `query`: case-insensitive substring on content or any tag.
+/// - `tags`: every listed tag must be present on the memory, compared as exact strings
+///   (no prefix, substring or case folding — `plan:commitwork` does not match
+///   `plan:commitwork-roadmap`).
+fn apply_list_filters(
+    all_memories: Vec<std::sync::Arc<crate::memory::Memory>>,
+    memory_type: Option<&str>,
+    query: Option<&str>,
+    tags: &[String],
+) -> Vec<std::sync::Arc<crate::memory::Memory>> {
+    let mut filtered: Vec<_> = if let Some(type_filter) = memory_type {
+        let type_lower = type_filter.to_lowercase();
+        all_memories
+            .into_iter()
+            .filter(|m| format!("{:?}", m.experience.experience_type).to_lowercase() == type_lower)
+            .collect()
+    } else {
+        all_memories
+    };
+
+    if let Some(text_query) = query {
+        let query_lower = text_query.to_lowercase();
+        filtered.retain(|m| {
+            m.experience.content.to_lowercase().contains(&query_lower)
+                || m.experience
+                    .entities
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(&query_lower))
+        });
+    }
+
+    if !tags.is_empty() {
+        filtered.retain(|m| {
+            tags.iter()
+                .all(|wanted| m.experience.entities.iter().any(|have| have == wanted))
+        });
+    }
+
+    filtered
 }
 
 #[derive(Debug, Serialize)]
@@ -372,34 +458,12 @@ pub async fn list_memories(
         .map_err(AppError::Internal)?
     };
 
-    // Filter by type if specified
-    let mut filtered: Vec<_> = if let Some(ref type_filter) = query.memory_type {
-        let type_lower = type_filter.to_lowercase();
-        all_memories
-            .into_iter()
-            .filter(|m| format!("{:?}", m.experience.experience_type).to_lowercase() == type_lower)
-            .collect()
-    } else {
-        all_memories
-    };
-
-    // Filter by text query if specified (search in content and tags)
-    if let Some(ref text_query) = query.query {
-        let query_lower = text_query.to_lowercase();
-        filtered.retain(|m| {
-            // Check content
-            if m.experience.content.to_lowercase().contains(&query_lower) {
-                return true;
-            }
-            // Check tags/entities
-            for tag in &m.experience.entities {
-                if tag.to_lowercase().contains(&query_lower) {
-                    return true;
-                }
-            }
-            false
-        });
-    }
+    let filtered = apply_list_filters(
+        all_memories,
+        query.memory_type.as_deref(),
+        query.query.as_deref(),
+        &parse_tag_filter(query.tags.as_deref()),
+    );
 
     let total = filtered.len();
     let limit = query.limit.unwrap_or(100).min(MAX_LIST_LIMIT);
@@ -434,9 +498,12 @@ pub struct ListMemoriesQuery {
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     pub query: Option<String>,
+    /// Comma-separated tags; every one must be present on the memory, matched exactly.
+    /// See [`parse_tag_filter`].
+    pub tags: Option<String>,
 }
 
-/// GET /api/memories?user_id=...&limit=... - List memories via query params
+/// GET /api/memories?user_id=...&limit=...&tags=a,b - List memories via query params
 /// Cloudflare Worker compatibility alias for POST /api/memories
 #[tracing::instrument(skip(state), fields(user_id = %params.user_id))]
 pub async fn list_memories_get(
@@ -449,8 +516,39 @@ pub async fn list_memories_get(
         offset: params.offset,
         memory_type: params.memory_type,
         query: params.query,
+        tags: params.tags,
     };
     list_memories_inner(state, req).await
+}
+
+/// GET /api/memories/count?user_id=...&tags=a,b - Count memories matching the filters
+/// without paging any rows back. Same `type` and `tags` semantics as the list endpoints.
+#[tracing::instrument(skip(state), fields(user_id = %params.user_id))]
+pub async fn count_memories(
+    State(state): State<AppState>,
+    Query(params): Query<CountMemoriesQuery>,
+) -> Result<Json<CountResponse>, AppError> {
+    validation::validate_user_id(&params.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&params.user_id)
+        .map_err(AppError::Internal)?;
+
+    let all_memories = {
+        let memory = memory.clone();
+        tokio::task::spawn_blocking(move || {
+            let memory_guard = memory.read();
+            memory_guard.get_all_memories()
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?
+    };
+
+    let tags = parse_tag_filter(params.tags.as_deref());
+    let total = apply_list_filters(all_memories, params.memory_type.as_deref(), None, &tags).len();
+
+    Ok(Json(CountResponse { total, tags }))
 }
 
 /// Shared implementation for both POST and GET list_memories
@@ -475,34 +573,12 @@ async fn list_memories_inner(
         .map_err(AppError::Internal)?
     };
 
-    // Filter by type if specified
-    let mut filtered: Vec<_> = if let Some(ref type_filter) = req.memory_type {
-        let type_lower = type_filter.to_lowercase();
-        all_memories
-            .into_iter()
-            .filter(|m| format!("{:?}", m.experience.experience_type).to_lowercase() == type_lower)
-            .collect()
-    } else {
-        all_memories
-    };
-
-    // Filter by text query if specified (search in content and tags)
-    if let Some(ref text_query) = req.query {
-        let query_lower = text_query.to_lowercase();
-        filtered.retain(|m| {
-            // Check content
-            if m.experience.content.to_lowercase().contains(&query_lower) {
-                return true;
-            }
-            // Check tags/entities
-            for tag in &m.experience.entities {
-                if tag.to_lowercase().contains(&query_lower) {
-                    return true;
-                }
-            }
-            false
-        });
-    }
+    let filtered = apply_list_filters(
+        all_memories,
+        req.memory_type.as_deref(),
+        req.query.as_deref(),
+        &parse_tag_filter(req.tags.as_deref()),
+    );
 
     let total = filtered.len();
     let limit = req.limit.unwrap_or(100).min(MAX_LIST_LIMIT);
@@ -1683,6 +1759,256 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(p3["memories"].as_array().unwrap().len(), 0);
         assert_eq!(p3["total"], 5u64);
+    }
+
+    /// Store one memory per (content, tags) pair and return its id.
+    fn remember_tagged(
+        harness: &TestHarness,
+        user_id: &str,
+        rows: &[(&str, &[&str])],
+    ) -> Vec<String> {
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let guard = memory.read();
+        rows.iter()
+            .map(|(content, tags)| {
+                guard
+                    .remember(
+                        Experience {
+                            content: content.to_string(),
+                            entities: tags.iter().map(|t| t.to_string()).collect(),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .unwrap()
+                    .0
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn ids_of(body: &serde_json::Value) -> Vec<String> {
+        let mut ids: Vec<String> = body["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    const UUID_TAG: &str = "6f1c2a3e-9b4d-4c5e-8a7f-0123456789ab";
+
+    fn tag_fixture(harness: &TestHarness, user_id: &str) -> Vec<String> {
+        remember_tagged(
+            harness,
+            user_id,
+            &[
+                (
+                    "row zero",
+                    &["veld-project:commitwork", "plan:commitwork-roadmap"],
+                ),
+                ("row one", &["veld-project:commitwork", "2026-10-08"]),
+                ("row two", &["plan:commitwork-roadmap", UUID_TAG]),
+                ("row three", &["plan:commitwork"]),
+                ("row four", &[]),
+            ],
+        )
+    }
+
+    /// `tags=` used to be silently ignored on GET /api/memories, so a scoped listing returned
+    /// the whole store and `total` counted it. Every listed tag must now be present, compared
+    /// as an exact string, and `total` counts the filtered set.
+    #[tokio::test]
+    async fn list_memories_get_filters_on_every_exact_tag() {
+        let harness = TestHarness::new();
+        let user_id = "tag-filter-get-user";
+        let ids = tag_fixture(&harness, user_id);
+
+        let list =
+            |tags: &str| test_helpers::get(&format!("/api/memories?user_id={user_id}&tags={tags}"));
+
+        // One tag: rows 0 and 1.
+        let (status, body) =
+            test_helpers::send(harness.router(), list("veld-project:commitwork")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 2u64);
+        assert_eq!(ids_of(&body), {
+            let mut v = vec![ids[0].clone(), ids[1].clone()];
+            v.sort();
+            v
+        });
+
+        // Two tags: intersection, not union — only row 0 carries both.
+        let (_, body) = test_helpers::send(
+            harness.router(),
+            list("veld-project:commitwork,plan:commitwork-roadmap"),
+        )
+        .await;
+        assert_eq!(body["total"], 1u64);
+        assert_eq!(ids_of(&body), vec![ids[0].clone()]);
+
+        // Exact match: `plan:commitwork` is a prefix of `plan:commitwork-roadmap` and must
+        // not match it; only row 3 carries the shorter tag.
+        let (_, body) = test_helpers::send(harness.router(), list("plan:commitwork")).await;
+        assert_eq!(body["total"], 1u64);
+        assert_eq!(ids_of(&body), vec![ids[3].clone()]);
+
+        // A substring of a tag matches nothing.
+        let (_, body) = test_helpers::send(harness.router(), list("commitwork")).await;
+        assert_eq!(body["total"], 0u64);
+        assert!(body["memories"].as_array().unwrap().is_empty());
+
+        // Case is part of the string.
+        let (_, body) = test_helpers::send(harness.router(), list("VELD-PROJECT:COMMITWORK")).await;
+        assert_eq!(body["total"], 0u64);
+
+        // UUID and date tags are plain strings too.
+        let (_, body) = test_helpers::send(harness.router(), list(UUID_TAG)).await;
+        assert_eq!(body["total"], 1u64);
+        assert_eq!(ids_of(&body), vec![ids[2].clone()]);
+        let (_, body) = test_helpers::send(harness.router(), list("2026-10-08")).await;
+        assert_eq!(body["total"], 1u64);
+        assert_eq!(ids_of(&body), vec![ids[1].clone()]);
+
+        // Absent or empty `tags` is no filter.
+        let (_, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!("/api/memories?user_id={user_id}")),
+        )
+        .await;
+        assert_eq!(body["total"], 5u64);
+        let (_, body) = test_helpers::send(harness.router(), list("")).await;
+        assert_eq!(body["total"], 5u64);
+    }
+
+    /// `total` and the page both come from the filtered set, so `offset` walks the matches
+    /// and not the store.
+    #[tokio::test]
+    async fn list_memories_paginates_the_tag_filtered_set() {
+        let harness = TestHarness::new();
+        let user_id = "tag-filter-paging-user";
+        let ids = tag_fixture(&harness, user_id);
+        let mut expected = vec![ids[0].clone(), ids[1].clone()];
+        expected.sort();
+
+        let page = |offset: usize| {
+            test_helpers::get(&format!(
+                "/api/memories?user_id={user_id}&tags=veld-project:commitwork&limit=1&offset={offset}"
+            ))
+        };
+        let (_, p0) = test_helpers::send(harness.router(), page(0)).await;
+        let (_, p1) = test_helpers::send(harness.router(), page(1)).await;
+        let (_, p2) = test_helpers::send(harness.router(), page(2)).await;
+        assert_eq!(p0["total"], 2u64);
+        assert_eq!(p1["total"], 2u64);
+        assert_eq!(p2["total"], 2u64);
+        assert_eq!(p0["memories"].as_array().unwrap().len(), 1);
+        assert_eq!(p1["memories"].as_array().unwrap().len(), 1);
+        assert_eq!(p2["memories"].as_array().unwrap().len(), 0);
+        let mut seen = ids_of(&p0);
+        seen.extend(ids_of(&p1));
+        seen.sort();
+        assert_eq!(seen, expected);
+    }
+
+    /// POST /api/memories and GET /api/list/{user_id} take the same `tags` contract.
+    #[tokio::test]
+    async fn list_memories_post_and_path_form_filter_on_tags() {
+        let harness = TestHarness::new();
+        let user_id = "tag-filter-post-user";
+        let ids = tag_fixture(&harness, user_id);
+        let mut expected = vec![ids[0].clone(), ids[2].clone()];
+        expected.sort();
+
+        let (status, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::post_json(
+                "/api/memories",
+                &serde_json::json!({ "user_id": user_id, "tags": "plan:commitwork-roadmap" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 2u64);
+        assert_eq!(ids_of(&body), expected);
+
+        let (status, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!("/api/list/{user_id}?tags=plan:commitwork-roadmap")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 2u64);
+        assert_eq!(ids_of(&body), expected);
+
+        // Whitespace around separators is not part of a tag; a trailing comma adds nothing.
+        let (_, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::post_json(
+                "/api/memories",
+                &serde_json::json!({ "user_id": user_id, "tags": " plan:commitwork-roadmap , veld-project:commitwork ," }),
+            ),
+        )
+        .await;
+        assert_eq!(body["total"], 1u64);
+        assert_eq!(ids_of(&body), vec![ids[0].clone()]);
+    }
+
+    /// GET /api/memories/count answers the filtered total without paging rows, and echoes
+    /// the tag filter it counted against.
+    #[tokio::test]
+    async fn count_memories_reports_the_filtered_total_and_the_tags_applied() {
+        let harness = TestHarness::new();
+        let user_id = "tag-count-user";
+        tag_fixture(&harness, user_id);
+
+        let (status, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!(
+                "/api/memories/count?user_id={user_id}&tags=veld-project:commitwork,%20plan:commitwork-roadmap,"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 1u64);
+        assert_eq!(
+            body["tags"],
+            serde_json::json!(["veld-project:commitwork", "plan:commitwork-roadmap"])
+        );
+        assert!(body.get("memories").is_none());
+
+        let (_, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!("/api/memories/count?user_id={user_id}")),
+        )
+        .await;
+        assert_eq!(body["total"], 5u64);
+        assert_eq!(body["tags"], serde_json::json!([]));
+
+        let (_, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!(
+                "/api/memories/count?user_id={user_id}&tags=plan:commitwork"
+            )),
+        )
+        .await;
+        assert_eq!(
+            body["total"], 1u64,
+            "prefix of a longer tag must not match it"
+        );
+    }
+
+    #[test]
+    fn parse_tag_filter_trims_and_drops_empties() {
+        assert!(super::parse_tag_filter(None).is_empty());
+        assert!(super::parse_tag_filter(Some("")).is_empty());
+        assert!(super::parse_tag_filter(Some(" , ,")).is_empty());
+        assert_eq!(
+            super::parse_tag_filter(Some(" a:b , 2026-10-08,,c ")),
+            vec!["a:b", "2026-10-08", "c"]
+        );
     }
 
     /// GET /api/memory/{id} says what its content is. An uncompressed record is full and

@@ -343,6 +343,7 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/list/{user_id}", get(crud::list_memories)) // TUI uses this
         .route("/api/memories", post(crud::list_memories_post)) // POST version
         .route("/api/memories", get(crud::list_memories_get)) // Cloudflare compat alias
+        .route("/api/memories/count", get(crud::count_memories)) // filtered count, no rows
         .route("/api/memories/bulk", post(crud::bulk_delete_memories))
         .route("/api/memories/clear", post(crud::clear_all_memories))
         // =================================================================

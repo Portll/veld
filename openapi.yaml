@@ -823,6 +823,29 @@ paths:
           schema:
             type: integer
             default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: type
+          in: query
+          schema:
+            type: string
+        - name: query
+          in: query
+          description: Case-insensitive substring over content and tags
+          schema:
+            type: string
+        - name: tags
+          in: query
+          description: >-
+            Comma-separated tags. Every listed tag must be present on the memory, compared as an
+            exact string (no prefix, substring or case folding). Empty means no tag filter.
+            The same parameter is accepted by GET /api/memories (query) and POST /api/memories
+            (body field `tags`).
+          schema:
+            type: string
       responses:
         '200':
           description: List of memories
@@ -837,6 +860,42 @@ paths:
                       $ref: '#/components/schemas/RecallMemory'
                   total:
                     type: integer
+                    description: Count after filters, independent of limit/offset
+
+  /api/memories/count:
+    get:
+      tags: [Memory]
+      summary: Count memories matching the filters without returning rows
+      parameters:
+        - name: user_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: type
+          in: query
+          schema:
+            type: string
+        - name: tags
+          in: query
+          description: Same contract as the `tags` parameter on /api/list/{user_id}
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Filtered count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  tags:
+                    type: array
+                    description: The tag filter as parsed and applied
+                    items:
+                      type: string
 
   # Stats & Health
   /api/users/{user_id}/stats:
