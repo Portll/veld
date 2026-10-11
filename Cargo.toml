@@ -212,9 +212,11 @@ dashmap = "6.1"
 moka = { version = "0.12", features = ["sync"] }  # Lock-free concurrent cache with LRU eviction
 once_cell = "1.20"  # Per-process caches (e.g. AgentSession detection)
 
-# Process / system introspection — minimal feature set (no networking / disks / components).
-# Used by memory::session_detect to map the parent process to a chat-brand id.
-sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# Process / system introspection — minimal feature set (no networking / components).
+# `system` for memory::session_detect (parent process to chat-brand id); `disk`
+# for storage::write_latch, which must know whether a store's filesystem has
+# space before retrying a write RocksDB refused for want of it.
+sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
 
 # Utilities
 uuid = { version = "1.19", features = ["v4", "serde"] }

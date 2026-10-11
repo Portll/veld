@@ -141,6 +141,47 @@ If you expose veld beyond localhost, put it behind a reverse proxy with TLS:
 Veld checks the bind host via `is_local_bind_host()`; binding to
 `0.0.0.0` is a deliberate choice that disables some safety defaults.
 
+## Disk full: the write latch
+
+RocksDB stops accepting writes after a background IO error. For "no space left on
+device" it never clears that by itself, so writes keep failing after the volume has
+space back. Measured 2026-10-11: 11,088 consecutive failed writes against a 221 MB
+store on a volume with 253 GiB free, cleared only by restarting the process, while
+`/health` reported `healthy` the whole time.
+
+Veld now notices and says so:
+
+| Surface | Latched (soft) | Latched (hard) |
+|---|---|---|
+| `GET /health` | `status: "degraded"` plus a `write_latch` object (`reason`, `path`, `since`, `failed_writes`, `recovery_attempts`, `hard`) | same, with `"hard": true` |
+| `GET /health/ready` | `200 ready` — recovery is still in progress | `503 not_ready`, `reason: "storage_write_latched"` |
+| `GET /health/live` | `200 alive` | `200 alive` — the process is alive either way |
+| Write API calls | — | `503 STORAGE_WRITE_LATCHED` instead of `500 INTERNAL_ERROR` |
+
+On a latched write veld checks free space on the store's filesystem. If space is
+back it flushes and retries the write once; some RocksDB write errors are soft and
+clear on a successful retry, and that retry is the unlatch. If the retry also fails
+the latch is **hard**, logged once at ERROR with the remedy, and reported as above.
+
+**A hard latch needs a process restart, and veld cannot fix it in-process.**
+RocksDB's error handler bypasses its retryable-IO auto-resume path for the NoSpace
+subcode (`db/error_handler.cc:446`), leaving `SstFileManager::StartErrorRecovery()`
+as the only route to auto-recovery — and that requires an `SstFileManager` attached
+to the options, for which the C API has no setter (`db/error_handler.cc:541`).
+`DB::Resume()` is not exposed by rust-rocksdb 0.24. Reopening the database in the
+same process cannot work either: RocksDB holds a directory lock and live handles are
+still outstanding.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `VELD_WRITE_LATCH_MIN_FREE_BYTES` | `268435456` (256 MiB) | Below this, the disk is treated as genuinely full and the write is not retried |
+| `VELD_WRITE_LATCH_MAX_ATTEMPTS` | `3` | Flush+retry attempts per latch |
+| `VELD_WRITE_LATCH_COOLDOWN_SECS` | `30` | Minimum gap between recovery probes, so a latched store under load does not spend every request on a doomed flush |
+| `VELD_WRITE_LATCH_RESTART` | off | `1` makes a hard latch with space back exit `75` (`EX_TEMPFAIL`) so a supervisor restarts into a reopened store. Off by default — exiting is the operator's choice |
+
+Set `VELD_WRITE_LATCH_RESTART=1` only where something restarts the process: a
+launchd `KeepAlive`, a systemd `Restart=on-failure`, or a container orchestrator.
+
 ## See also
 
 - [Configuration reference](../reference/config.md) — env vars
