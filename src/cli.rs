@@ -1151,7 +1151,7 @@ fn handle_version() {
             veld::config::default_requested_storage_backend()
         )
     );
-    eprintln!("  License:  AGPL-3.0-or-later (or commercial — see LICENSING.md)");
+    eprintln!("  License:  Veld Evaluation Licence (see LICENSING.md)");
     eprintln!("  Repo:     https://github.com/Portll/veld");
 }
 

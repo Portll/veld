@@ -288,5 +288,5 @@ The backend server runs locally and stores all data on your machine. No cloud de
 
 ## License
 
-AGPL-3.0-or-later, or a commercial licence from Portll.
+Veld Evaluation Licence; PolyForm Internal Use License 1.0.0 by agreement; AGPL-3.0-or-later intended at veld 2.0. See LICENSING.md in the repository root.
 See [LICENSING.md](../LICENSING.md).
