@@ -16,6 +16,7 @@ pub mod relational;
 mod stored_enums;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod write_latch;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
