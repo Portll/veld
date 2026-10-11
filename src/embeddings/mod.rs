@@ -31,6 +31,7 @@ pub mod downloader;
 pub mod http_embedder;
 pub mod keywords;
 pub mod minilm;
+pub mod model_tape;
 pub mod ner;
 pub mod nomic;
 #[cfg(feature = "zenoh")]

@@ -139,12 +139,16 @@ static COUNTER: Lazy<[Regex; 2]> = Lazy::new(|| {
 });
 static ID: Lazy<[Regex; 6]> = Lazy::new(|| {
     [
-        re_i(r"(^|\s)(GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}|CVE-\d{4}(-\d+)?|RUSTSEC-\d{4}(-\d+)?|CWE-\d+)(\s|$)"),
+        re_i(
+            r"(^|\s)(GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}|CVE-\d{4}(-\d+)?|RUSTSEC-\d{4}(-\d+)?|CWE-\d+)(\s|$)",
+        ),
         re(r"^(IWR|IWS|IWC|IWO|IWP|IWL|IWX|IWJ|IGY|IGZ|IEC|IEF|IEA)\d{4}"),
         re(r"^D\d{1,2}_\w+$"),
         re(r"^[a-z]+_lang_[a-z_]+$"),
         re(r"^capability-[a-z-]+$"),
-        re(r"^(cs|js|java|go|py|rb|swift|cpp|c|mobile|ql|actions)/[a-z0-9]+(/[a-z0-9-]+)?/?[a-z0-9]*(-[a-z0-9]+)+$"),
+        re(
+            r"^(cs|js|java|go|py|rb|swift|cpp|c|mobile|ql|actions)/[a-z0-9]+(/[a-z0-9-]+)?/?[a-z0-9]*(-[a-z0-9]+)+$",
+        ),
     ]
 });
 static HEX: Lazy<Regex> = Lazy::new(|| re_i(r"^[0-9a-f]{7,40}$"));
@@ -153,19 +157,48 @@ static URL: Lazy<Regex> = Lazy::new(|| re_i(r"^https?://"));
 static REF: Lazy<Regex> = Lazy::new(|| re_i(r"^[a-z][a-z-]*:[^\s:=]+$"));
 static FRAGMENT: Lazy<Regex> = Lazy::new(|| re(r#"["`=]|[(){}\[\]]|\\|;|,[^\s\d]"#));
 static POSSESSIVE: Lazy<Regex> = Lazy::new(|| re(r"'s\b"));
-static NUMBER: Lazy<[Regex; 2]> =
-    Lazy::new(|| [re_i(r"^\d[\d.,%/–-]*(-?[a-z]+)?$"), re_i(r"^v\d+(r\d+|\.\d+)*$")]);
+static NUMBER: Lazy<[Regex; 2]> = Lazy::new(|| {
+    [
+        re_i(r"^\d[\d.,%/–-]*(-?[a-z]+)?$"),
+        re_i(r"^v\d+(r\d+|\.\d+)*$"),
+    ]
+});
 static PATH_EXT: Lazy<Regex> = Lazy::new(|| re_i(r"\.[a-z]{1,5}$"));
 static TITLE_WORD: Lazy<Regex> = Lazy::new(|| re(r"^[A-Z][A-Za-z]*$"));
 static CODE_IDENT: Lazy<Regex> = Lazy::new(|| re(r"^[A-Z][a-z0-9]+([A-Z][a-z0-9]+)+$"));
 static FILENAME: Lazy<Regex> = Lazy::new(|| {
-    re_i(r"^[\w.-]+\.(mjs|cjs|js|ts|tsx|rs|py|go|java|rb|sh|md|json|toml|yaml|yml|html|css|cbl|cob|cpy|jcl)(\s[\w.-]+\.(md|json|yml|yaml))?$")
+    re_i(
+        r"^[\w.-]+\.(mjs|cjs|js|ts|tsx|rs|py|go|java|rb|sh|md|json|toml|yaml|yml|html|css|cbl|cob|cpy|jcl)(\s[\w.-]+\.(md|json|yml|yaml))?$",
+    )
 });
 
 const PATH_ROOTS: &[&str] = &[
-    "tmp", "users", "spine", "evaluations", "routes", "lib", "src", "crates", "diag", "feed",
-    "github", "com", "upstream", "docs", "bin", "admin", "monitor", "test", "tests", "init", "go",
-    "var", "etc", "home", "private", "sidecar",
+    "tmp",
+    "users",
+    "spine",
+    "evaluations",
+    "routes",
+    "lib",
+    "src",
+    "crates",
+    "diag",
+    "feed",
+    "github",
+    "com",
+    "upstream",
+    "docs",
+    "bin",
+    "admin",
+    "monitor",
+    "test",
+    "tests",
+    "init",
+    "go",
+    "var",
+    "etc",
+    "home",
+    "private",
+    "sidecar",
 ];
 
 fn is_fragment(n: &str) -> bool {
@@ -361,7 +394,11 @@ mod tests {
     }
 
     fn reason_name(r: Reason) -> String {
-        serde_json::to_value(r).unwrap().as_str().unwrap().to_string()
+        serde_json::to_value(r)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     struct Score {
@@ -410,7 +447,10 @@ mod tests {
     fn load_gold(dir: &std::path::Path, file: &str) -> Vec<GoldRow> {
         let text = std::fs::read_to_string(dir.join(file)).expect(file);
         let rows: Vec<GoldRow> = serde_json::from_str(&text).expect(file);
-        assert!(rows.iter().all(|r| !r.reason.is_empty()), "{file}: unlabeled row");
+        assert!(
+            rows.iter().all(|r| !r.reason.is_empty()),
+            "{file}: unlabeled row"
+        );
         rows
     }
 
@@ -419,16 +459,33 @@ mod tests {
     #[test]
     fn gold_replay_holds_the_measured_floors() {
         let Some(dir) = gold_dir() else {
-            eprintln!("skipped: VELD_HYGIENE_GOLD_DIR unset (gold sets live in the private sidecar)");
+            eprintln!(
+                "skipped: VELD_HYGIENE_GOLD_DIR unset (gold sets live in the private sidecar)"
+            );
             return;
         };
-        for (file, min_accuracy) in [("sample-portll.json", 0.92), ("heldout-cobolwork.json", 0.92)] {
+        for (file, min_accuracy) in [
+            ("sample-portll.json", 0.92),
+            ("heldout-cobolwork.json", 0.92),
+        ] {
             let rows = load_gold(&dir, file);
             assert_eq!(rows.len(), 300, "{file}: gold set size changed");
             let s = score(&rows);
-            assert!(s.accuracy >= min_accuracy, "{file}: accuracy {:.3}", s.accuracy);
-            assert!(s.precision["noise"] >= 0.95, "{file}: noise precision {:.3}", s.precision["noise"]);
-            assert!(s.precision["cast"] >= 0.99, "{file}: cast precision {:.3}", s.precision["cast"]);
+            assert!(
+                s.accuracy >= min_accuracy,
+                "{file}: accuracy {:.3}",
+                s.accuracy
+            );
+            assert!(
+                s.precision["noise"] >= 0.95,
+                "{file}: noise precision {:.3}",
+                s.precision["noise"]
+            );
+            assert!(
+                s.precision["cast"] >= 0.99,
+                "{file}: cast precision {:.3}",
+                s.precision["cast"]
+            );
             for (reason, count) in &s.fire {
                 if reason == "vocab" {
                     continue;
@@ -453,7 +510,10 @@ mod tests {
         let path = dir.join("predictions-prototype.json");
         let text = std::fs::read_to_string(&path).expect("predictions-prototype.json");
         let rows: Vec<PredictionRow> = serde_json::from_str(&text).unwrap();
-        assert!(rows.len() >= 600, "prototype predictions cover both gold sets");
+        assert!(
+            rows.len() >= 600,
+            "prototype predictions cover both gold sets"
+        );
         let mut divergent = Vec::new();
         for row in &rows {
             let c = classify(&row.name, false);
@@ -468,6 +528,11 @@ mod tests {
                 ));
             }
         }
-        assert!(divergent.is_empty(), "{} divergent rows:\n{}", divergent.len(), divergent.join("\n"));
+        assert!(
+            divergent.is_empty(),
+            "{} divergent rows:\n{}",
+            divergent.len(),
+            divergent.join("\n")
+        );
     }
 }

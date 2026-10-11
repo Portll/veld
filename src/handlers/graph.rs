@@ -17,9 +17,9 @@ use crate::auth::AuthenticatedUser;
 use crate::entity_frequency::{frequency, Bucket, Frequency, Window};
 use crate::entity_hygiene::{classify, Shelf};
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::tag_cores::{stamped_cores, CoreThresholds, StampedCores};
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, GraphTraversal, MemoryUniverse};
 use crate::memory::{Experience, MemoryId};
+use crate::tag_cores::{stamped_cores, CoreThresholds, StampedCores};
 use crate::validation;
 use std::sync::Arc;
 
@@ -711,7 +711,10 @@ mod entity_frequency_route_tests {
             .find("pub fn build_protected_routes")
             .expect("build_protected_routes must exist");
         let route_at = src.find(ROUTE).expect("route must be mounted");
-        assert!(route_at > protected_at, "{ROUTE} sits on a public or probe router");
+        assert!(
+            route_at > protected_at,
+            "{ROUTE} sits on a public or probe router"
+        );
         let after = &src[route_at..route_at + 200];
         assert!(
             after.contains("post(graph::get_entity_frequency)"),
@@ -738,7 +741,10 @@ mod entity_frequency_route_tests {
     fn entities_all_request_defaults_keep_the_old_shape() {
         let req: super::GetAllEntitiesRequest =
             serde_json::from_str(r#"{"user_id":"u","limit":5}"#).unwrap();
-        assert!(req.include_embeddings, "embeddings stay on by default for existing readers");
+        assert!(
+            req.include_embeddings,
+            "embeddings stay on by default for existing readers"
+        );
         assert!(!req.with_sources);
         assert!(req.shelf.is_none());
     }
@@ -802,7 +808,10 @@ mod stamped_cores_route_tests {
             .find("pub fn build_protected_routes")
             .expect("build_protected_routes must exist");
         let route_at = src.find(ROUTE).expect("route must be mounted");
-        assert!(route_at > protected_at, "{ROUTE} sits on a public or probe router");
+        assert!(
+            route_at > protected_at,
+            "{ROUTE} sits on a public or probe router"
+        );
         assert!(src[route_at..route_at + 200].contains("post(graph::get_stamped_cores)"));
     }
 

@@ -294,6 +294,10 @@ impl NeuralNer {
             });
         }
 
+        super::model_tape::register_model(
+            super::model_tape::Model::Ner,
+            &[&config.model_path, &config.tokenizer_path],
+        );
         Ok(Self {
             config,
             lazy_model: OnceLock::new(),
@@ -354,6 +358,15 @@ impl NeuralNer {
             return Ok(Vec::new());
         }
 
+        // A model tape answers the neural path before the cache and before the fallback: a
+        // replay miss must reach the caller as an error, never become a rule-based entity
+        // list. The rule-based extractor is code, not a model, and is never taped.
+        if !self.use_fallback {
+            if let Some(taped) = super::model_tape::ner(text, || self.extract_neural(text)) {
+                return taped;
+            }
+        }
+
         // Check cache first
         let cache_key = Self::cache_key(text);
         if let Some(cached) = self.entity_cache.get(&cache_key) {
@@ -394,6 +407,9 @@ impl NeuralNer {
     pub fn extract_batch(&self, texts: &[&str]) -> Result<Vec<Vec<NerEntity>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
+        }
+        if !self.use_fallback && super::model_tape::active() {
+            return texts.iter().map(|t| self.extract(t)).collect();
         }
 
         let mut results = vec![Vec::new(); texts.len()];

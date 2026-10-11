@@ -1325,12 +1325,24 @@ mod embedding_backlog_route_tests {
             .find("pub fn build_protected_routes")
             .expect("build_protected_routes must exist");
         for (route, handler) in [
-            ("/api/embeddings/backlog\"", "get(consolidation::get_embedding_backlog)"),
-            ("/api/embeddings/backlog/drain", "post(consolidation::drain_embedding_backlog)"),
+            (
+                "/api/embeddings/backlog\"",
+                "get(consolidation::get_embedding_backlog)",
+            ),
+            (
+                "/api/embeddings/backlog/drain",
+                "post(consolidation::drain_embedding_backlog)",
+            ),
         ] {
             let at = src.find(route).expect("route must be mounted");
-            assert!(at > protected_at, "{route} sits on a public or probe router");
-            assert!(src[at..at + 200].contains(handler), "{route} must map to {handler}");
+            assert!(
+                at > protected_at,
+                "{route} sits on a public or probe router"
+            );
+            assert!(
+                src[at..at + 200].contains(handler),
+                "{route} must map to {handler}"
+            );
         }
     }
 

@@ -23,6 +23,18 @@ pub struct Report {
     pub suite: String,
     /// Embedding model name, e.g. `"minilm-l6-v2"`.
     pub embedder: String,
+    /// Whether the run reranked with the cross-encoder, with which model and at what cap.
+    /// `None` on reports written before this field existed, which [`compare_to_baseline`]
+    /// refuses: "not recorded" is not the same as "off".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<RerankSetting>,
+    /// sha256 of the model tape the run replayed its model outputs from, or `None` when the
+    /// models ran live (see `crate::embeddings::model_tape`). Two runs that replayed one tape
+    /// saw byte-identical model outputs, whatever CPU they ran on; a live run and a replayed
+    /// one, or two different tapes, are two sets of model outputs, and
+    /// [`compare_to_baseline`] refuses them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_tape: Option<String>,
     /// Git SHA of the working tree the run was produced from.
     pub git_sha: String,
     /// RFC3339 timestamp at the start of the run.
@@ -48,6 +60,53 @@ pub struct Report {
 
 fn default_repeats() -> usize {
     1
+}
+
+/// Layer 5.3's cross-encoder budget for an undecomposed query when the `rerank_count` dial is
+/// unset (`memory/recall.rs`).
+pub const DEFAULT_RERANK_CAP: usize = 20;
+
+/// The cross-encoder setting a run measured under.
+///
+/// Reranking moves p@1 by several points on the gate, so a run with it off, with another
+/// cross-encoder or with another budget measures another pipeline, and a diff against the
+/// baseline would read as a regression no code caused.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RerankSetting {
+    /// Whether recall reranks: the `use_reranking` dial is not off and a reranker is configured.
+    pub enabled: bool,
+    /// The cross-encoder that loaded, by registry id. `None` when reranking is off.
+    pub model: Option<String>,
+    /// Candidates an undecomposed query hands the cross-encoder at most: the `rerank_count` dial,
+    /// or [`DEFAULT_RERANK_CAP`]. Compared only when both runs rerank.
+    pub depth: usize,
+}
+
+impl RerankSetting {
+    /// The setting `system` recalls under, given the cross-encoder that loaded for it.
+    pub fn of(system: &crate::memory::MemorySystem, model: Option<String>) -> Self {
+        let dials = system.cognitive_dials();
+        let enabled = dials.use_reranking != Some(false) && model.is_some();
+        Self {
+            enabled,
+            model: if enabled { model } else { None },
+            depth: dials.rerank_count.unwrap_or(DEFAULT_RERANK_CAP),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match (&self.model, self.enabled) {
+            (Some(m), true) => format!("cross-encoder {m}, cap {}", self.depth),
+            _ => "cross-encoder off".to_string(),
+        }
+    }
+
+    fn same_pipeline(&self, other: &Self) -> bool {
+        if self.enabled != other.enabled {
+            return false;
+        }
+        !self.enabled || (self.model == other.model && self.depth == other.depth)
+    }
 }
 
 /// Per-case diagnostics for the highest (gated) layer.
@@ -234,18 +293,60 @@ pub struct AblationRow {
     /// case. Two arms with the same fingerprint returned byte-identical results.
     #[serde(default)]
     pub retrieval_fingerprint: u64,
-    /// True when this arm's fingerprint equals the baseline arm's, i.e. the
-    /// config provably changed nothing and its metrics are attributable to
-    /// nothing. The `+spread-fix` arms were vacuous this way for months: the flag
-    /// they set could not reach the live code path, so the rows silently
-    /// duplicated baseline while reading as evidence.
+    /// True when this arm's fingerprint equals its reference arm's: the flags it
+    /// adds provably changed nothing, and its delta is attributable to nothing.
     #[serde(default)]
-    pub vacuous_vs_baseline: bool,
+    pub vacuous_vs_reference: bool,
     /// Set when a flag this arm names has no code path in veld: the arm was not
     /// run, and the reason says which flag and why. Distinct from a vacuous arm,
-    /// which ran and matched baseline.
+    /// which ran and matched its reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_in_veld: Option<String>,
+    /// The arm this one is measured against; `None` only for the baseline. Every
+    /// other arm is its reference plus the flags it adds, so its delta belongs to
+    /// exactly those flags.
+    #[serde(default)]
+    pub reference: Option<String>,
+    /// Paired difference in recall@10 against `reference`, with a 95% bootstrap
+    /// interval over cases.
+    #[serde(default, rename = "delta_recall@10")]
+    pub delta_recall_at_10: Option<DeltaCi>,
+    /// Paired difference in p@1 against `reference`, with a 95% bootstrap interval
+    /// over cases.
+    #[serde(default, rename = "delta_p@1")]
+    pub delta_p_at_1: Option<DeltaCi>,
+    /// Every case's metrics under this arm, in suite order, so any two arms can be
+    /// re-compared offline with the pairing intact.
+    #[serde(default)]
+    pub per_case: Vec<AblationCaseRow>,
+}
+
+/// A paired difference between two arms: the mean over cases and its 95%
+/// percentile-bootstrap interval.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct DeltaCi {
+    pub mean: f64,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+impl DeltaCi {
+    /// Whether the interval rules out "no effect". A delta whose interval contains
+    /// zero is not distinguishable from noise at this sample size.
+    pub fn excludes_zero(&self) -> bool {
+        self.lo > 0.0 || self.hi < 0.0
+    }
+}
+
+/// One case's metrics under one ablation arm. Field names match the recall run's
+/// per-case output, so both files can be read by the same code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AblationCaseRow {
+    pub case_id: String,
+    pub category: String,
+    pub recall_at_k: f64,
+    pub p_at_1: f64,
+    pub ndcg_at_k: f64,
 }
 
 /// Unified ablation report: one ingest, N query-time configs, one comparison
@@ -256,6 +357,12 @@ pub struct AblationReport {
     pub git_sha: String,
     pub case_count: usize,
     pub rows: Vec<AblationRow>,
+    /// Whether the baseline, re-run with no arm setting after every arm, retrieved
+    /// byte-identical results to its first pass. `false` means an arm left state
+    /// behind or query-time retrieval is not deterministic on a fixed ingest; either
+    /// way it is noise under every delta. `None` when the baseline did not run.
+    #[serde(default)]
+    pub baseline_replicate_identical: Option<bool>,
 }
 
 /// One layer's row in the E3 multi-hop ladder: recall@10 split by 2-hop
@@ -543,6 +650,48 @@ pub fn compare_to_baseline(
             ),
         }];
     }
+    if baseline.model_tape != current.model_tape {
+        let describe = |t: &Option<String>| match t {
+            Some(d) => format!("replayed from tape {}", &d[..d.len().min(12)]),
+            None => "computed live".to_string(),
+        };
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "model outputs differ: baseline {}, current {}. These are two sets of \
+                 embeddings, entities and reranker scores, so their difference is not a change \
+                 in the code. Compare against a baseline recorded from the same tape",
+                describe(&baseline.model_tape),
+                describe(&current.model_tape)
+            ),
+        }];
+    }
+    let (base_rerank, cur_rerank) = match (&baseline.rerank, &current.rerank) {
+        (Some(b), Some(c)) => (b, c),
+        (b, _) => {
+            let which = if b.is_none() { "baseline" } else { "current" };
+            return vec![Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "{which} report does not record whether it reranked with the cross-encoder; \
+                     reranking moves p@1 by several points, so a run of unknown setting is not \
+                     diffable. Record the baseline again as tests/recall/README.md describes"
+                ),
+            }];
+        }
+    };
+    if !base_rerank.same_pipeline(cur_rerank) {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "reranker setting differs: baseline {}, current {}. These are two pipelines, so \
+                 their difference is not a regression or an improvement of either. Compare \
+                 against a baseline recorded under the same setting",
+                base_rerank.describe(),
+                cur_rerank.describe()
+            ),
+        }];
+    }
     let Some(base_full) = baseline.layers.get("full") else {
         return vec![Failure {
             kind: "infrastructure".to_string(),
@@ -785,6 +934,34 @@ pub struct GraphStructure {
     /// knowing BEFORE building the walker rather than after.
     #[serde(default)]
     pub typed_components: (usize, f64, usize),
+
+    /// Per-label degree census: label -> (entities, incidence sum, max degree).
+    ///
+    /// `entity_labels` says which labels EXIST; this says which ones carry the
+    /// graph's connectivity. The two come apart badly. A label can be 7% of
+    /// nodes and a third of all incidences, which is what a node type that
+    /// should have been an ATTRIBUTE looks like: "last weekend" is mentioned by
+    /// everything, so minting it as a node wires every memory that says it into
+    /// one star, and the star is not a relation anyone would query.
+    ///
+    /// An entity with two labels is counted under both, so the sums exceed the
+    /// entity and incidence totals. Read shares as per-label, not as a
+    /// partition.
+    #[serde(default)]
+    pub label_degrees: BTreeMap<String, (usize, usize, usize)>,
+
+    /// The 25 highest-degree entities: (name, labels, degree).
+    ///
+    /// Aggregates hide hubs. Per-label MEAN degree in particular understates
+    /// them, because degrees here are post-cap: an entity that saturated
+    /// `MAX_ENTITY_DEGREE` reports the cap while its overflow edges were
+    /// silently discarded at ingest, so the mean is an average over a censored
+    /// variable. The identities are what make a result legible -- "the top hub
+    /// is a date" and "the top hub is the user" are the same number and
+    /// opposite conclusions -- and degrees PINNED AT THE CAP in this list are
+    /// the actual tell for saturation.
+    #[serde(default)]
+    pub top_hubs: Vec<(String, String, usize)>,
 }
 
 /// Reachability tallies for one category (cumulative within-N-hops counts).
@@ -941,6 +1118,12 @@ mod tests {
         Report {
             suite: "smoke".to_string(),
             embedder: "test".to_string(),
+            rerank: Some(RerankSetting {
+                enabled: true,
+                model: Some("mxbai-rerank-xsmall-v1".to_string()),
+                depth: 20,
+            }),
+            model_tape: None,
             git_sha: "deadbeef".to_string(),
             timestamp: chrono::Utc::now(),
             layers,
@@ -982,6 +1165,147 @@ mod tests {
         let baseline = report_with_full(0.60, 0.70, 0.50, 0.40);
         let current = report_with_full(0.80, 0.90, 0.70, 0.60);
         assert!(compare_to_baseline(&baseline, &current, 2.0).is_empty());
+    }
+
+    const TAPE_A: &str = "aaaaaaaaaaaa1111111111111111111111111111111111111111111111111111";
+    const TAPE_B: &str = "bbbbbbbbbbbb2222222222222222222222222222222222222222222222222222";
+
+    /// Two runs that replayed one tape are compared, and a real drop is a regression.
+    #[test]
+    fn same_tape_is_compared() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        baseline.model_tape = Some(TAPE_A.to_string());
+        current.model_tape = Some(TAPE_A.to_string());
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// Different tapes, or one live run and one replayed run, are two sets of model outputs.
+    /// Refused before any metric, in either order.
+    #[test]
+    fn different_model_outputs_are_refused_in_either_order() {
+        for (b, c) in [
+            (Some(TAPE_A), Some(TAPE_B)),
+            (Some(TAPE_A), None),
+            (None, Some(TAPE_A)),
+        ] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+            baseline.model_tape = b.map(str::to_string);
+            current.model_tape = c.map(str::to_string);
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(
+                failures[0].detail.contains("model outputs differ"),
+                "{}",
+                failures[0].detail
+            );
+        }
+    }
+
+    /// Reports written before the field existed ran their models live.
+    #[test]
+    fn report_without_model_tape_key_parses_as_live() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("model_tape");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.model_tape, None);
+    }
+
+    /// A run with reranking off against the reranked baseline is two pipelines, not a
+    /// regression. The current side would fail every gate, so a comparison that ran would show.
+    #[test]
+    fn different_rerank_setting_refuses_before_any_metric_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+        current.rerank = Some(RerankSetting {
+            enabled: false,
+            model: None,
+            depth: 20,
+        });
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        let detail = &failures[0].detail;
+        assert!(detail.contains("reranker setting differs"), "{detail}");
+        assert!(
+            detail.contains("mxbai-rerank-xsmall-v1, cap 20"),
+            "{detail}"
+        );
+        assert!(detail.contains("cross-encoder off"), "{detail}");
+    }
+
+    /// Another cross-encoder or another cap hands the reranker other work, so both are refused.
+    #[test]
+    fn different_rerank_model_or_cap_refuses_when_both_rerank() {
+        for (model, depth) in [("ms-marco-minilm-l6", 20), ("mxbai-rerank-xsmall-v1", 30)] {
+            let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            current.rerank = Some(RerankSetting {
+                enabled: true,
+                model: Some(model.to_string()),
+                depth,
+            });
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+        }
+    }
+
+    /// With reranking off on both sides the cap is never read, so a different cap is the same
+    /// pipeline and the comparison runs.
+    #[test]
+    fn rerank_cap_is_ignored_when_neither_side_reranks() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        baseline.rerank = Some(RerankSetting {
+            enabled: false,
+            model: None,
+            depth: 20,
+        });
+        current.rerank = Some(RerankSetting {
+            enabled: false,
+            model: None,
+            depth: 30,
+        });
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// Not recorded is refused on either side: it is not the same as off.
+    #[test]
+    fn unrecorded_rerank_setting_is_refused_on_either_side() {
+        let set = report_with_full(0.6, 0.7, 0.5, 0.4).rerank;
+        for (b, c) in [(None, set.clone()), (set.clone(), None), (None, None)] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            baseline.rerank = b.clone();
+            current.rerank = c.clone();
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(
+                failures[0]
+                    .detail
+                    .contains("does not record whether it reranked"),
+                "{}",
+                failures[0].detail
+            );
+        }
+    }
+
+    /// A report written before the field existed has no `rerank` key. It must parse, as not
+    /// recorded.
+    #[test]
+    fn report_without_rerank_key_parses_as_unrecorded() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("rerank");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.rerank, None);
     }
 
     /// Two embedders, identical numbers: not a pass, not a regression, a refusal — and no
