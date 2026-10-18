@@ -437,6 +437,7 @@ pub enum ViewMode {
     Git,
     Dials,
     Loops,
+    Spine,
 }
 
 /// Which pane is focused inside the Git tab.
@@ -2048,7 +2049,8 @@ impl AppState {
             ViewMode::GraphMap => ViewMode::Git,
             ViewMode::Git => ViewMode::Dials,
             ViewMode::Dials => ViewMode::Loops,
-            ViewMode::Loops => ViewMode::Dashboard,
+            ViewMode::Loops => ViewMode::Spine,
+            ViewMode::Spine => ViewMode::Dashboard,
         };
         self.set_view(new_mode);
     }
