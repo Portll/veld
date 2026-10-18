@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::intent_log::{payload, IntentPayload};
-use crate::memory::types::{Memory, MemoryId};
+use crate::memory::types::MemoryId;
 use crate::memory::ForgetCriteria;
 
 pub const ENV_SOURCE: &str = "VELD_REPLICATE_FROM";
@@ -193,9 +193,10 @@ pub fn apply_replicated(
     match payload {
         IntentPayload::Remember { memory_bincode, .. }
         | IntentPayload::Update { memory_bincode, .. } => {
-            let (memory, _): (Memory, usize) =
-                bincode::serde::decode_from_slice(memory_bincode, bincode::config::standard())
-                    .map_err(|e| anyhow!("decoding the memory snapshot: {e}"))?;
+            // The snapshot ages like the store's own records: frames journaled before a
+            // layout change need the legacy decode arms, the same ones the projections use.
+            let memory = crate::memory::storage::decode_memory_snapshot(memory_bincode)
+                .map_err(|e| anyhow!("decoding the memory snapshot: {e}"))?;
             memory_sys.read().update_memory(&memory)?;
         }
         IntentPayload::Forget { memory_id, .. } => {
