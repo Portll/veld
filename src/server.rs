@@ -274,6 +274,19 @@ async fn async_main() -> Result<()> {
 
     // Start active reminder scheduler (checks every 60s for due reminders)
     start_reminder_scheduler(Arc::clone(&manager));
+
+    // Live replication: idle until this instance follows a leader, by
+    // VELD_REPLICATE_FROM at boot or POST /api/admin/replication/follow later.
+    match crate::replication::follow_from_env(&manager.base_path) {
+        Ok(Some(status)) => {
+            if let Some(t) = &status.target {
+                info!("Replication: following {}", t.source);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => error!("Replication: not following at boot: {e:#}"),
+    }
+    tokio::spawn(crate::replication::run_follower(Arc::clone(&manager)));
     start_embedding_backlog_drainer(Arc::clone(&manager));
 
     // Start backup scheduler if enabled

@@ -3,6 +3,7 @@
 // polling get_snapshot() if the event channel hasn't delivered for >5s.
 
 import { setupSecurity } from "./security.js";
+import { setupData } from "./data.js";
 
 // ─── Diagnostics ────────────────────────────────────────────────────────────
 // Accumulated log of script-level events. Hidden by default; toggle with
@@ -98,6 +99,7 @@ let instances = [];
 let activeBaseUrl = "";
 let userSelectedInstance = false;
 window.veldActiveBaseUrl = () => activeBaseUrl || currentBaseUrl;
+window.veldUserId = () => currentUserId;
 
 function fmtCount(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -769,6 +771,11 @@ async function init() {
       if (snap && (!activeBaseUrl || snap.base_url === activeBaseUrl)) render(snap);
     });
     diagPush("info", "listen('snapshot-updated') subscribed");
+    await listen("server-restarted", (event) => {
+      const p = event.payload || {};
+      if (p.ok) diagPush("info", `server restarted: ${p.ok.base_url} pid ${p.ok.pid ?? "(supervised)"}`);
+      else diagPush("ERROR", "server restart failed: " + p.error);
+    });
   } catch (err) {
     diagPush(
       "ERROR",
@@ -830,6 +837,7 @@ async function init() {
 
   await setupFirstRun();
   setupSecurity();
+  setupData();
 
   setInterval(() => {
     pullInstances(); // refresh the tab list as instances come/go

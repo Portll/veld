@@ -14,7 +14,12 @@ use std::time::Duration;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
-use veld_status_core::{discover_instances, StatusClient, StatusClientConfig, StatusSnapshot};
+use std::collections::BTreeMap;
+
+use veld_status_core::{
+    discover_instances, inspect_process, parse_env_file, restart_instance, rewrite_env_var,
+    LaunchSpec, RestartRequest, StatusClient, StatusClientConfig, StatusSnapshot,
+};
 
 use crate::tray;
 
@@ -22,6 +27,9 @@ const DEFAULT_BASE_URL: &str = "http://127.0.0.1:3030";
 const DEFAULT_DEV_API_KEY: &str = "sk-veld-dev-local-testing-key";
 const DEFAULT_USER_ID: &str = "claude-code";
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
+/// Exports, restores and migrations walk whole stores.
+const DATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+const CONFIG_BACKEND_KEY: &str = "storage_backend";
 
 /// One member of the fleet: a running status client plus its snapshot handle.
 struct FleetEntry {
@@ -46,6 +54,8 @@ pub struct MonitorState {
     api_key: String,
     user_id: String,
     request_timeout: Duration,
+    /// `VELD_ADMIN_API_KEY` of this process, if set; the Data panel asks otherwise.
+    admin_key: Option<String>,
     /// Normalized base_url of the configured (always-present) instance.
     pinned_base_url: String,
     fleet: Arc<Mutex<HashMap<String, FleetEntry>>>,
@@ -124,6 +134,9 @@ pub fn run() {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_USER_ID.to_string());
             let timeout = Duration::from_secs(5);
+            let admin_key = std::env::var("VELD_ADMIN_API_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
             let pinned_key = norm(&base_url);
 
             // Spawn the pinned client (inside a runtime context).
@@ -151,6 +164,7 @@ pub fn run() {
                 api_key: api_key.clone(),
                 user_id: user_id.clone(),
                 request_timeout: timeout,
+                admin_key,
                 pinned_base_url: pinned_key.clone(),
                 fleet: Arc::clone(&fleet),
             });
@@ -195,7 +209,17 @@ pub fn run() {
             security_request,
             enclave,
             save_secret_file,
-            open_in_browser
+            open_in_browser,
+            data_request,
+            admin_key_configured,
+            save_export_file,
+            pick_import_file,
+            config_backend,
+            set_config_backend,
+            restart_server,
+            launch_recipe,
+            set_launch_recipe,
+            capture_launch_recipe
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
@@ -492,6 +516,41 @@ async fn enclave(
     serde_json::from_slice(&out.stdout).map_err(|e| format!("helper output: {e}"))
 }
 
+/// Native save dialog seeded with `suggested_name`; None when the user cancels.
+async fn pick_save_path(app: &AppHandle, suggested_name: &str) -> Option<std::path::PathBuf> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(suggested_name)
+        .save_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+    rx.await
+        .ok()
+        .flatten()
+        .and_then(|fp| fp.into_path().ok())
+}
+
+/// Write `contents` readable by its owner only, fsynced before returning.
+fn write_private_file(path: &std::path::Path, contents: &str) -> Result<(), String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    use std::io::Write;
+    let mut file = options.open(path).map_err(|e| e.to_string())?;
+    file.write_all(contents.as_bytes()).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Save a recovery kit where the user chooses, readable by its owner only.
 #[tauri::command]
 async fn save_secret_file(
@@ -499,14 +558,43 @@ async fn save_secret_file(
     suggested_name: String,
     contents: String,
 ) -> Result<Option<String>, String> {
+    let Some(path) = pick_save_path(&app, &suggested_name).await else {
+        return Ok(None);
+    };
+    write_private_file(&path, &contents)?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+/// Save a memory export where the user chooses. An export carries every memory of
+/// the user, so it gets the same owner-only mode as a recovery kit.
+#[tauri::command]
+async fn save_export_file(
+    app: AppHandle,
+    suggested_name: String,
+    contents: String,
+) -> Result<Option<String>, String> {
+    let Some(path) = pick_save_path(&app, &suggested_name).await else {
+        return Ok(None);
+    };
+    write_private_file(&path, &contents)?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+/// A file picked for import, with its text.
+#[derive(Serialize)]
+struct PickedFile {
+    path: String,
+    contents: String,
+}
+
+/// Native open dialog, then the file's text; None when the user cancels.
+#[tauri::command]
+async fn pick_import_file(app: AppHandle) -> Result<Option<PickedFile>, String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .set_file_name(&suggested_name)
-        .save_file(move |picked| {
-            let _ = tx.send(picked);
-        });
+    app.dialog().file().pick_file(move |picked| {
+        let _ = tx.send(picked);
+    });
     let Some(path) = rx
         .await
         .ok()
@@ -515,21 +603,177 @@ async fn save_secret_file(
     else {
         return Ok(None);
     };
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    use std::io::Write;
-    let mut file = options.open(&path).map_err(|e| e.to_string())?;
-    file.write_all(contents.as_bytes()).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
+    let display = path.to_string_lossy().to_string();
+    let contents = tokio::task::spawn_blocking(move || std::fs::read_to_string(&path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("read {display}: {e}"))?;
+    Ok(Some(PickedFile {
+        path: display,
+        contents,
+    }))
+}
+
+/// A call to the data-management surface (backups, MIF export/import, storage
+/// migration, health) for the Data panel. The admin key for `/api/admin/storage/`
+/// is the one the panel was given, else this process's `VELD_ADMIN_API_KEY`.
+#[tauri::command]
+async fn data_request(
+    state: State<'_, MonitorState>,
+    base_url: String,
+    method: String,
+    path: String,
+    admin_key: Option<String>,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let api_key = state.api_key.clone();
+    let admin = admin_key
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| state.admin_key.clone());
+    let (status, body) = StatusClient::data_request(
+        &base_url,
+        &api_key,
+        &method,
+        &path,
+        admin.as_deref(),
+        body,
+        DATA_REQUEST_TIMEOUT,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "status": status, "body": body }))
+}
+
+/// Whether this process carries an admin key, so the panel knows not to ask.
+#[tauri::command]
+fn admin_key_configured(state: State<'_, MonitorState>) -> bool {
+    state.admin_key.is_some()
+}
+
+/// Where the next start's backend is decided: `config.toml`'s `storage_backend`,
+/// and above it `VELD_STORAGE_BACKEND` in the operator's `server.env` when Veld
+/// Desktop spawns the server (the environment beats the file).
+#[derive(Serialize)]
+struct ConfigBackend {
+    path: String,
+    backend: Option<String>,
+    server_env_path: String,
+    server_env_backend: Option<String>,
+}
+
+/// `~/.config/veld/server.env`: the `KEY=VALUE` file Veld Desktop hands to the
+/// server it spawns, on every platform under `~/.config` (its own convention).
+fn desktop_server_env_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".config").join("veld").join("server.env")
+}
+
+fn server_env_vars() -> Vec<(String, String)> {
+    std::fs::read_to_string(desktop_server_env_path())
+        .map(|t| parse_env_file(&t))
+        .unwrap_or_default()
+}
+
+fn server_env_backend() -> Option<String> {
+    server_env_vars()
+        .into_iter()
+        .find(|(k, _)| k == "VELD_STORAGE_BACKEND")
+        .map(|(_, v)| v.to_ascii_lowercase())
+}
+
+fn config_backend_line(line: &str) -> Option<String> {
+    let (key, value) = line.trim().split_once('=')?;
+    if key.trim() != CONFIG_BACKEND_KEY {
+        return None;
     }
-    Ok(Some(path.to_string_lossy().to_string()))
+    let cleaned = value
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'');
+    Some(cleaned.to_string())
+}
+
+#[tauri::command]
+fn config_backend() -> ConfigBackend {
+    let path = veld_status_core::default_config_path();
+    let backend = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .filter(|l| !l.trim().starts_with('#'))
+                .find_map(config_backend_line)
+        })
+        .filter(|b| !b.is_empty());
+    ConfigBackend {
+        path: path.display().to_string(),
+        backend,
+        server_env_path: desktop_server_env_path().display().to_string(),
+        server_env_backend: server_env_backend(),
+    }
+}
+
+/// Name the backend the server serves on its next start: rewrites the
+/// `storage_backend` line of `config.toml`, or appends one, and when the
+/// operator's `server.env` pins `VELD_STORAGE_BACKEND` rewrites that line too,
+/// since it would otherwise win. Every other line of both files is kept byte for
+/// byte, the API key included.
+#[tauri::command]
+fn set_config_backend(backend: String) -> Result<ConfigBackend, String> {
+    let backend = backend.trim().to_ascii_lowercase();
+    if backend != "redb" && backend != "rocksdb" {
+        return Err(format!("unknown backend '{backend}' (expected redb or rocksdb)"));
+    }
+    let path = veld_status_core::default_config_path();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let setting = format!("{CONFIG_BACKEND_KEY} = \"{backend}\"");
+    let mut replaced = false;
+    let mut lines: Vec<String> = existing
+        .lines()
+        .map(|line| {
+            let names_key =
+                !line.trim().starts_with('#') && config_backend_line(line).is_some();
+            if names_key && !replaced {
+                replaced = true;
+                setting.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        lines.push(setting);
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    write_private_file(&path, &text)?;
+
+    let env_path = desktop_server_env_path();
+    let mut server_env_backend = server_env_backend();
+    if server_env_backend.is_some() {
+        let current = std::fs::read_to_string(&env_path)
+            .map_err(|e| format!("read {}: {e}", env_path.display()))?;
+        write_private_file(&env_path, &rewrite_env_var(&current, "VELD_STORAGE_BACKEND", &backend))?;
+        server_env_backend = Some(backend.clone());
+    }
+    Ok(ConfigBackend {
+        path: path.display().to_string(),
+        backend: Some(backend),
+        server_env_path: env_path.display().to_string(),
+        server_env_backend,
+    })
 }
 
 /// Open a veld page in the system browser: passkeys need one, a webview cannot
@@ -551,6 +795,183 @@ fn open_in_browser(url: String) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Where a relaunched server's output goes: `<config>/veld/logs/veld-<port>.log`.
+fn server_log_path(port: u16) -> std::path::PathBuf {
+    veld_status_core::instances_dir()
+        .parent()
+        .map(|p| p.join("logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from("logs"))
+        .join(format!("veld-{port}.log"))
+}
+
+/// Launch recipes the user saved, keyed by normalized base URL:
+/// `<config>/veld/monitor/launch-recipes.json`, owner-readable only since a
+/// recipe's variables can hold keys.
+fn recipes_path() -> std::path::PathBuf {
+    veld_status_core::instances_dir()
+        .parent()
+        .map(|p| p.join("monitor"))
+        .unwrap_or_else(|| std::path::PathBuf::from("monitor"))
+        .join("launch-recipes.json")
+}
+
+fn load_recipes() -> Result<BTreeMap<String, LaunchSpec>, String> {
+    let path = recipes_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+fn save_recipes(recipes: &BTreeMap<String, LaunchSpec>) -> Result<(), String> {
+    let path = recipes_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let text = serde_json::to_string_pretty(recipes).map_err(|e| e.to_string())?;
+    write_private_file(&path, &text)
+}
+
+fn find_instance(base_url: &str) -> Option<veld_status_core::DiscoveredInstance> {
+    let key = norm(base_url);
+    discover_instances()
+        .into_iter()
+        .find(|i| norm(&i.base_url) == key)
+}
+
+fn port_of(base_url: &str) -> u16 {
+    base_url
+        .trim_end_matches('/')
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(3030)
+}
+
+/// What a restart of `base_url` would use, for the Launch card.
+#[derive(Serialize)]
+struct LaunchInfo {
+    running: bool,
+    pid: Option<u32>,
+    /// The registry's recipe: `exe`, `args`, `cwd`, `env_names`.
+    registry: Option<serde_json::Value>,
+    saved: Option<LaunchSpec>,
+    recipes_path: String,
+    server_env_path: String,
+    server_env_names: Vec<String>,
+}
+
+#[tauri::command]
+fn launch_recipe(base_url: String) -> Result<LaunchInfo, String> {
+    let instance = find_instance(&base_url);
+    let registry = instance.as_ref().and_then(|i| i.launch.as_ref()).map(|r| {
+        serde_json::json!({
+            "exe": r.exe, "args": r.args, "cwd": r.cwd, "env_names": r.env_names,
+        })
+    });
+    let saved = load_recipes()?.remove(&norm(&base_url));
+    Ok(LaunchInfo {
+        running: instance.is_some(),
+        pid: instance.as_ref().map(|i| i.pid).filter(|p| *p != 0),
+        registry,
+        saved,
+        recipes_path: recipes_path().display().to_string(),
+        server_env_path: desktop_server_env_path().display().to_string(),
+        server_env_names: server_env_vars().into_iter().map(|(k, _)| k).collect(),
+    })
+}
+
+/// Save (or with None, forget) the recipe a restart of `base_url` uses.
+#[tauri::command]
+fn set_launch_recipe(base_url: String, spec: Option<LaunchSpec>) -> Result<(), String> {
+    let key = norm(&base_url);
+    let mut recipes = load_recipes()?;
+    match spec {
+        Some(spec) if !spec.exe.trim().is_empty() => {
+            recipes.insert(key, spec);
+        }
+        Some(_) => return Err("the recipe needs an executable".into()),
+        None => {
+            recipes.remove(&key);
+        }
+    }
+    save_recipes(&recipes)
+}
+
+/// The running server's command line, directory and `VELD_*` variables, read from
+/// the OS, as a recipe the user can save. Nothing is written.
+#[tauri::command]
+async fn capture_launch_recipe(base_url: String) -> Result<LaunchSpec, String> {
+    let instance = find_instance(&base_url)
+        .ok_or_else(|| format!("{} is not in the instance registry", norm(&base_url)))?;
+    let pid = instance.pid;
+    if pid == 0 {
+        return Err("the registry entry carries no pid".into());
+    }
+    tokio::task::spawn_blocking(move || inspect_process(pid))
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("could not read process {pid}: it may be gone, or this platform does not expose it"))
+}
+
+/// Stop the instance at `base_url`, if it runs, and bring it back. The recipe is
+/// the one saved for it, else the registry's. The operator's `server.env` is the
+/// base environment layer. `storage_backend`, when given, is set as
+/// `VELD_STORAGE_BACKEND` on the new process (a swap just performed).
+async fn restart_at(
+    base_url: &str,
+    storage_backend: Option<String>,
+) -> Result<veld_status_core::RestartOutcome, String> {
+    let key = norm(base_url);
+    let instance = find_instance(&key);
+    let recipe = load_recipes()?.remove(&key);
+    let mut env_overrides = Vec::new();
+    if let Some(backend) = storage_backend.filter(|b| !b.trim().is_empty()) {
+        env_overrides.push(("VELD_STORAGE_BACKEND".to_string(), backend));
+    }
+    let env_path = desktop_server_env_path();
+    let env_files = if env_path.is_file() { vec![env_path] } else { Vec::new() };
+    let port = instance.as_ref().map(|i| i.port).unwrap_or_else(|| port_of(&key));
+    restart_instance(RestartRequest {
+        base_url: key,
+        instance,
+        recipe,
+        env_files,
+        env_overrides,
+        log_path: server_log_path(port),
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn restart_server(
+    base_url: String,
+    storage_backend: Option<String>,
+) -> Result<veld_status_core::RestartOutcome, String> {
+    restart_at(&base_url, storage_backend).await
+}
+
+/// Tray entry point: restart the pinned instance in the background and tell the
+/// webview how it went (`server-restarted` carries the outcome or the error).
+pub fn restart_pinned(app: &AppHandle) {
+    let base_url = app.state::<MonitorState>().pinned_base_url.clone();
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let payload = match restart_at(&base_url, None).await {
+            Ok(outcome) => {
+                tracing::info!(?outcome, "server restarted from the tray");
+                serde_json::json!({ "ok": outcome })
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "server restart from the tray failed");
+                serde_json::json!({ "error": err, "base_url": base_url })
+            }
+        };
+        let _ = handle.emit("server-restarted", payload);
+    });
 }
 
 /// Keep the fleet in sync with the registry: add pollers for newly-online

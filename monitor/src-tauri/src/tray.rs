@@ -20,6 +20,7 @@ pub fn build(app: &mut App, snapshot: Arc<RwLock<StatusSnapshot>>) -> tauri::Res
     let sessions_item =
         MenuItem::with_id(app, "sessions", "Sessions: —", false, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
+    let restart = MenuItem::with_id(app, "restart", "Restart Server", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Veld Monitor", true, None::<&str>)?;
 
     let menu = Menu::with_items(
@@ -31,6 +32,7 @@ pub fn build(app: &mut App, snapshot: Arc<RwLock<StatusSnapshot>>) -> tauri::Res
             &memory_item,
             &sessions_item,
             &separator,
+            &restart,
             &quit,
         ],
     )?;
@@ -50,6 +52,7 @@ pub fn build(app: &mut App, snapshot: Arc<RwLock<StatusSnapshot>>) -> tauri::Res
                     let _ = window.set_focus();
                 }
             }
+            "restart" => crate::app::restart_pinned(app),
             "quit" => app.exit(0),
             _ => {}
         })
