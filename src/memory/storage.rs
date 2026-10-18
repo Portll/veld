@@ -1713,7 +1713,7 @@ impl MemoryStorage {
         let latch = crate::storage::write_latch::global();
         match op() {
             Ok(value) => {
-                latch.note_write_ok();
+                latch.note_write_ok(&self.storage_path);
                 Ok(value)
             }
             Err(err) => crate::storage::write_latch::recover_write(

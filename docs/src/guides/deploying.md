@@ -153,15 +153,30 @@ Veld now notices and says so:
 
 | Surface | Latched (soft) | Latched (hard) |
 |---|---|---|
-| `GET /health` | `status: "degraded"` plus a `write_latch` object (`reason`, `path`, `since`, `failed_writes`, `recovery_attempts`, `hard`) | same, with `"hard": true` |
-| `GET /health/ready` | `200 ready` — recovery is still in progress | `503 not_ready`, `reason: "storage_write_latched"` |
+| `GET /health` | `status: "degraded"` plus a `write_latch` array, one entry per latched store (`store`, `condition`, `since`, `failed_writes`, `recovery_attempts`, `hard`) | same, with `"hard": true` |
+| `GET /health/ready` | `200 ready` — recovery is still in progress | `503 not_ready`, `reason: "storage_write_latched"`, `hard_latched_stores: <n>` |
 | `GET /health/live` | `200 alive` | `200 alive` — the process is alive either way |
 | Write API calls | — | `503 STORAGE_WRITE_LATCHED` instead of `500 INTERNAL_ERROR` |
 
-On a latched write veld checks free space on the store's filesystem. If space is
+**The latch is per store, not per process.** Veld runs one RocksDB per tenant
+(`base/<user_id>`) and RocksDB's own latch is per database, so a write landing on
+one tenant's store says nothing about another's. One latched store out of twelve is
+`degraded`, and the array names which.
+
+**`/health` and `/health/ready` are unauthenticated** (`PROBE_PATHS`), so they
+carry no store paths. Each entry names its store by `store` — the first 16 hex
+characters of the path's SHA-256, stable across responses and restarts so you can
+tell two latched stores apart and line them up with the log. The path itself is a
+per-user directory and would disclose both your filesystem layout and a tenant id;
+the RocksDB message would additionally disclose the failing file and the memory's
+UUID. Both go to the WARN line raised when a store latches and the ERROR line
+raised when it goes hard — `~/Library/Logs/veld/server.log` on macOS.
+
+On a latched write veld checks free space on that store's filesystem. If space is
 back it flushes and retries the write once; some RocksDB write errors are soft and
 clear on a successful retry, and that retry is the unlatch. If the retry also fails
-the latch is **hard**, logged once at ERROR with the remedy, and reported as above.
+the latch is **hard** for that store, logged once at ERROR with the remedy, and
+reported as above. Attempts and cooldowns are counted per store.
 
 **A hard latch needs a process restart, and veld cannot fix it in-process.**
 RocksDB's error handler bypasses its retryable-IO auto-resume path for the NoSpace

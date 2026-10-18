@@ -13,7 +13,8 @@
 //! failures against a 221 MB store on a volume with 253 GiB free, cleared only
 //! by a restart, while `/health` reported `healthy` throughout.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -22,6 +23,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// sysexits(3) `EX_TEMPFAIL` — "temporary failure, retry invited", which is the
 /// thing a supervisor needs to hear to restart us into a reopened store.
@@ -72,13 +74,38 @@ fn restart_on_hard_latch() -> bool {
     )
 }
 
-/// What the latch knows, in the shape `/health` publishes.
+/// The only condition that latches a store here, as a fixed token rather than
+/// the RocksDB message — see [`LatchSnapshot`] for why the message cannot ship.
+pub const LATCH_CONDITION: &str = "no_space_left_on_device";
+
+/// What `/health` publishes about one latched store.
+///
+/// **Carries no store path and no error chain, deliberately.** `/health` and
+/// `/health/ready` are on the unauthenticated probe router (`PROBE_PATHS`,
+/// `handlers/router.rs`), and every per-user store directory is
+/// `base.join(user_id)` (`path_guard.rs:3`). A path would hand an anonymous
+/// caller the host filesystem layout and a tenant id, and an array of them
+/// would be tenant enumeration — the same disclosure the public router's own
+/// contract forbids by the `?user_id=` route. The error chain is worse than the
+/// path: RocksDB's message embeds the absolute file being appended to, and the
+/// wrapper embeds the failing memory's UUID.
+///
+/// `store` is a stable opaque id for the path instead, so an operator can tell
+/// two latched stores apart and line a response up with the log. The verbatim
+/// path and chain go to the WARN and ERROR log lines, which are not publicly
+/// readable.
 #[derive(Debug, Clone, Serialize)]
 pub struct LatchSnapshot {
-    /// The verbatim error chain that latched it.
-    pub reason: String,
-    /// Store path the failing write targeted.
+    /// Store path the failing write targeted: for the log line, never the body.
+    #[serde(skip)]
     pub path: String,
+    /// The verbatim error chain that latched it: for the log line, never the body.
+    #[serde(skip)]
+    pub reason: String,
+    /// Truncated SHA-256 of the store path. See [`store_id`].
+    pub store: String,
+    /// Always [`LATCH_CONDITION`]; named so the body says what is wrong.
+    pub condition: &'static str,
     pub since: DateTime<Utc>,
     pub failed_writes: u64,
     pub recovery_attempts: u32,
@@ -86,10 +113,17 @@ pub struct LatchSnapshot {
     pub hard: bool,
 }
 
+/// Stable opaque id for a store path: the first 16 hex characters of its
+/// SHA-256. Stable across responses and restarts so it can be correlated with
+/// the log line that does carry the path, and not a tenant id.
+pub fn store_id(path: &Path) -> String {
+    let digest = Sha256::digest(path.as_os_str().as_encoded_bytes());
+    hex::encode(&digest[..8])
+}
+
 #[derive(Debug)]
 struct Latched {
     reason: String,
-    path: String,
     since: DateTime<Utc>,
     failed_writes: u64,
     recovery_attempts: u32,
@@ -98,14 +132,38 @@ struct Latched {
     last_probe: Option<Instant>,
 }
 
-/// One store's write latch. Construct one per test; production reads
-/// [`global()`].
+impl Latched {
+    /// The publishable projection. One place builds it, so a field added to the
+    /// record does not reach a public body by being forgotten about.
+    fn publish(&self, path: &Path) -> LatchSnapshot {
+        LatchSnapshot {
+            path: path.display().to_string(),
+            reason: self.reason.clone(),
+            store: store_id(path),
+            condition: LATCH_CONDITION,
+            since: self.since,
+            failed_writes: self.failed_writes,
+            recovery_attempts: self.recovery_attempts,
+            hard: self.hard,
+        }
+    }
+}
+
+/// Write latches for every store in this process, keyed by store path.
+///
+/// Both repos run one RocksDB per tenant (`base.join(user_id)`), and RocksDB's
+/// own latch is per-database. A process-wide flag would therefore clear tenant
+/// B's latch on a successful write to tenant A — the store would be reported
+/// usable on evidence about a different store, which is the exact defect this
+/// module exists to remove.
+///
+/// Construct one per test; production reads [`global()`].
 #[derive(Debug, Default)]
 pub struct WriteLatch {
-    /// Mirrors `state.is_some()` so the success path costs one relaxed load
+    /// Mirrors `!stores.is_empty()` so the success path costs one relaxed load
     /// rather than a mutex acquisition per write.
-    latched: AtomicBool,
-    state: Mutex<Option<Latched>>,
+    any_latched: AtomicBool,
+    stores: Mutex<HashMap<PathBuf, Latched>>,
 }
 
 impl WriteLatch {
@@ -113,32 +171,41 @@ impl WriteLatch {
         Self::default()
     }
 
-    /// Record a failed write. Returns true when the error is a NoSpace latch —
-    /// newly latching or continuing one — which is the caller's cue to attempt
-    /// recovery.
+    /// The map key. The store path as the write sites already hold it — no
+    /// canonicalisation, which would be a syscall on the hot path and could
+    /// fail for the very store that is failing.
+    fn key(path: &Path) -> PathBuf {
+        path.to_path_buf()
+    }
+
+    /// Record a failed write against `path`. Returns true when the error is a
+    /// NoSpace latch — newly latching or continuing one — which is the caller's
+    /// cue to attempt recovery.
     pub fn note_write_error(&self, path: &Path, err: &anyhow::Error) -> bool {
         if !chain_is_enospc(err) {
             return false;
         }
         let reason = format!("{err:#}");
-        let mut state = self.state.lock();
-        match state.as_mut() {
+        let mut stores = self.stores.lock();
+        match stores.get_mut(&Self::key(path)) {
             Some(latched) => {
                 // `since` is deliberately untouched: one latch has one start time.
                 latched.failed_writes += 1;
             }
             None => {
-                *state = Some(Latched {
-                    reason: reason.clone(),
-                    path: path.display().to_string(),
-                    since: Utc::now(),
-                    failed_writes: 1,
-                    recovery_attempts: 0,
-                    hard: false,
-                    hard_logged: false,
-                    last_probe: None,
-                });
-                self.latched.store(true, Ordering::Release);
+                stores.insert(
+                    Self::key(path),
+                    Latched {
+                        reason: reason.clone(),
+                        since: Utc::now(),
+                        failed_writes: 1,
+                        recovery_attempts: 0,
+                        hard: false,
+                        hard_logged: false,
+                        last_probe: None,
+                    },
+                );
+                self.any_latched.store(true, Ordering::Release);
                 tracing::warn!(
                     path = %path.display(),
                     reason = %reason,
@@ -149,37 +216,38 @@ impl WriteLatch {
         true
     }
 
-    /// A write got through. This is the unlatch.
-    pub fn note_write_ok(&self) {
-        if !self.latched.load(Ordering::Relaxed) {
+    /// A write got through to `path`. This is the unlatch, and it clears only
+    /// this store — a write that landed elsewhere says nothing about this one.
+    pub fn note_write_ok(&self, path: &Path) {
+        if !self.any_latched.load(Ordering::Relaxed) {
             return;
         }
-        let mut state = self.state.lock();
-        if let Some(latched) = state.take() {
-            self.latched.store(false, Ordering::Release);
+        let mut stores = self.stores.lock();
+        if let Some(latched) = stores.remove(&Self::key(path)) {
+            self.any_latched
+                .store(!stores.is_empty(), Ordering::Release);
             tracing::info!(
-                path = %latched.path,
+                path = %path.display(),
                 failed_writes = latched.failed_writes,
                 recovery_attempts = latched.recovery_attempts,
                 was_hard = latched.hard,
+                stores_still_latched = stores.len(),
                 "storage write latch cleared by a successful write"
             );
         }
     }
 
-    /// A flush+retry has failed. Past here only a restart clears the store.
-    pub fn mark_hard(&self) {
-        let mut state = self.state.lock();
-        if let Some(latched) = state.as_mut() {
+    /// A flush+retry has failed for `path`. Past here only a restart clears it.
+    pub fn mark_hard(&self, path: &Path) {
+        if let Some(latched) = self.stores.lock().get_mut(&Self::key(path)) {
             latched.hard = true;
         }
     }
 
     /// True exactly once per latch, so the unrecoverable notice is logged once
     /// instead of once per request against a latched store.
-    pub fn claim_hard_notice(&self) -> bool {
-        let mut state = self.state.lock();
-        match state.as_mut() {
+    pub fn claim_hard_notice(&self, path: &Path) -> bool {
+        match self.stores.lock().get_mut(&Self::key(path)) {
             Some(latched) if !latched.hard_logged => {
                 latched.hard_logged = true;
                 true
@@ -188,35 +256,74 @@ impl WriteLatch {
         }
     }
 
-    pub fn snapshot(&self) -> Option<LatchSnapshot> {
-        self.state.lock().as_ref().map(|latched| LatchSnapshot {
-            reason: latched.reason.clone(),
-            path: latched.path.clone(),
-            since: latched.since,
-            failed_writes: latched.failed_writes,
-            recovery_attempts: latched.recovery_attempts,
-            hard: latched.hard,
-        })
+    /// Every latched store, in the publishable shape. Ordered by `store` so the
+    /// response is deterministic across calls.
+    pub fn snapshot(&self) -> Vec<LatchSnapshot> {
+        let stores = self.stores.lock();
+        let mut out: Vec<LatchSnapshot> = stores
+            .iter()
+            .map(|(path, latched)| latched.publish(path))
+            .collect();
+        out.sort_by(|a, b| a.store.cmp(&b.store));
+        out
     }
 
-    pub fn is_latched(&self) -> bool {
-        self.latched.load(Ordering::Relaxed)
-    }
-
-    pub fn is_hard(&self) -> bool {
-        self.state
+    /// This store's latch, if it has one.
+    pub fn snapshot_at(&self, path: &Path) -> Option<LatchSnapshot> {
+        self.stores
             .lock()
-            .as_ref()
+            .get(&Self::key(path))
+            .map(|latched| latched.publish(path))
+    }
+
+    /// The verbatim chain that latched this store. For log lines only — never
+    /// for a response body; see [`LatchSnapshot`].
+    pub fn reason_at(&self, path: &Path) -> Option<String> {
+        self.stores
+            .lock()
+            .get(&Self::key(path))
+            .map(|latched| latched.reason.clone())
+    }
+
+    /// Whether ANY store is latched.
+    pub fn is_latched(&self) -> bool {
+        self.any_latched.load(Ordering::Relaxed)
+    }
+
+    pub fn is_latched_at(&self, path: &Path) -> bool {
+        self.stores.lock().contains_key(&Self::key(path))
+    }
+
+    /// Whether ANY store is hard-latched.
+    pub fn is_hard(&self) -> bool {
+        self.stores.lock().values().any(|latched| latched.hard)
+    }
+
+    pub fn is_hard_at(&self, path: &Path) -> bool {
+        self.stores
+            .lock()
+            .get(&Self::key(path))
             .is_some_and(|latched| latched.hard)
     }
 
-    /// Whether a recovery probe may run now, stamping the cooldown as it
-    /// answers. Separate from the attempt budget so that declining to retry
+    /// How many stores are hard-latched. Reported on `/health/ready`, because
+    /// "one store of twelve" and "all twelve" need different responses from a
+    /// human and the status code cannot tell them apart.
+    pub fn hard_count(&self) -> usize {
+        self.stores
+            .lock()
+            .values()
+            .filter(|latched| latched.hard)
+            .count()
+    }
+
+    /// Whether a recovery probe may run now for `path`, stamping the cooldown as
+    /// it answers. Separate from the attempt budget so that declining to retry
     /// into a still-full disk does not spend one, which would leave the store
     /// latched for good once space came back.
-    pub fn probe_due(&self) -> bool {
-        let mut state = self.state.lock();
-        let Some(latched) = state.as_mut() else {
+    pub fn probe_due(&self, path: &Path) -> bool {
+        let mut stores = self.stores.lock();
+        let Some(latched) = stores.get_mut(&Self::key(path)) else {
             return false;
         };
         let now = Instant::now();
@@ -229,25 +336,26 @@ impl WriteLatch {
         true
     }
 
-    /// Whether the bounded flush+retry budget has anything left.
-    pub fn attempts_left(&self) -> bool {
+    /// Whether this store's bounded flush+retry budget has anything left.
+    pub fn attempts_left(&self, path: &Path) -> bool {
         let limit = max_attempts();
-        self.state
+        self.stores
             .lock()
-            .as_ref()
+            .get(&Self::key(path))
             .is_some_and(|latched| latched.recovery_attempts < limit)
     }
 
-    /// Spend one flush+retry attempt.
-    pub fn note_recovery_attempt(&self) {
-        let mut state = self.state.lock();
-        if let Some(latched) = state.as_mut() {
+    /// Spend one flush+retry attempt against `path`.
+    pub fn note_recovery_attempt(&self, path: &Path) {
+        if let Some(latched) = self.stores.lock().get_mut(&Self::key(path)) {
             latched.recovery_attempts += 1;
         }
     }
 }
 
-/// The process-wide latch the write paths and `/health` share.
+/// The per-process registry the write paths and `/health` share. Entries are
+/// added when a store latches and removed when it clears, so the map cannot
+/// grow past the tenant count and needs no eviction policy.
 pub fn global() -> &'static WriteLatch {
     static GLOBAL: OnceLock<WriteLatch> = OnceLock::new();
     GLOBAL.get_or_init(WriteLatch::new)
@@ -312,14 +420,14 @@ pub fn recover_write<T>(
     if !latch.note_write_error(path, &err) {
         return Err(err);
     }
-    if !latch.probe_due() {
+    if !latch.probe_due(path) {
         return Err(err);
     }
 
     let min_free = min_free_bytes();
     let space_back = available_bytes(path).map(|free| free >= min_free);
 
-    if latch.is_hard() {
+    if latch.is_hard_at(path) {
         if space_back == Some(true) {
             maybe_restart(path);
         }
@@ -344,13 +452,13 @@ pub fn recover_write<T>(
         ),
     }
 
-    if !latch.attempts_left() {
+    if !latch.attempts_left(path) {
         return Err(err);
     }
-    latch.note_recovery_attempt();
+    latch.note_recovery_attempt(path);
 
     if let Err(flush_err) = db.flush() {
-        latch.mark_hard();
+        latch.mark_hard(path);
         report_hard(latch, path, &format!("flush failed: {flush_err}"));
         if space_back == Some(true) {
             maybe_restart(path);
@@ -360,7 +468,7 @@ pub fn recover_write<T>(
 
     match retry() {
         Ok(value) => {
-            latch.note_write_ok();
+            latch.note_write_ok(path);
             tracing::info!(
                 path = %path.display(),
                 "storage write latch was soft: flush and retry succeeded"
@@ -368,7 +476,7 @@ pub fn recover_write<T>(
             Ok(value)
         }
         Err(retry_err) => {
-            latch.mark_hard();
+            latch.mark_hard(path);
             report_hard(latch, path, &format!("{retry_err:#}"));
             if space_back == Some(true) {
                 maybe_restart(path);
@@ -379,11 +487,19 @@ pub fn recover_write<T>(
 }
 
 fn report_hard(latch: &WriteLatch, path: &Path, detail: &str) {
-    if !latch.claim_hard_notice() {
+    // `reason_at` before `claim_hard_notice`: the notice is claimable once, and
+    // a clear racing in between would leave the one ERROR line without a cause.
+    let latched_by = latch.reason_at(path).unwrap_or_default();
+    if !latch.claim_hard_notice(path) {
         return;
     }
+    // The path and the verbatim chain live here and only here — the `/health`
+    // body cannot carry either (see `LatchSnapshot`), so this line has to be
+    // enough on its own for an operator reading only errors.
     tracing::error!(
         path = %path.display(),
+        store = %store_id(path),
+        latched_by = %latched_by,
         detail = %detail,
         exit_code_on_restart = EXIT_WRITE_LATCHED,
         "storage writes are hard-latched — restart this process to recover. \
@@ -460,19 +576,26 @@ mod tests {
     fn note_write_error_latches_and_the_snapshot_carries_the_evidence() {
         let latch = WriteLatch::new();
         assert!(!latch.is_latched());
-        assert!(latch.snapshot().is_none());
+        assert!(latch.snapshot().is_empty());
 
         let err = anyhow!("{PRODUCTION_MESSAGE}");
         assert!(latch.note_write_error(&store_path(), &err));
 
         assert!(latch.is_latched());
-        let snapshot = latch.snapshot().expect("latched");
-        assert!(snapshot.reason.contains("No space left on device"));
-        assert_eq!(snapshot.path, "/store");
+        assert!(latch.is_latched_at(&store_path()));
+        let snapshot = latch.snapshot_at(&store_path()).expect("latched");
+        assert_eq!(snapshot.store, store_id(&store_path()));
+        assert_eq!(snapshot.condition, LATCH_CONDITION);
         assert_eq!(snapshot.failed_writes, 1);
         assert_eq!(snapshot.recovery_attempts, 0);
         assert!(!snapshot.hard);
         assert!(snapshot.since <= Utc::now());
+
+        // The chain is kept for the log line, not for the response body.
+        assert!(latch
+            .reason_at(&store_path())
+            .expect("latched")
+            .contains("No space left on device"));
     }
 
     #[test]
@@ -481,7 +604,7 @@ mod tests {
         let err = anyhow!("Corruption: block checksum mismatch");
         assert!(!latch.note_write_error(&store_path(), &err));
         assert!(!latch.is_latched());
-        assert!(latch.snapshot().is_none());
+        assert!(latch.snapshot().is_empty());
     }
 
     #[test]
@@ -490,9 +613,87 @@ mod tests {
         latch.note_write_error(&store_path(), &anyhow!("{PRODUCTION_MESSAGE}"));
         assert!(latch.is_latched());
 
-        latch.note_write_ok();
+        latch.note_write_ok(&store_path());
         assert!(!latch.is_latched());
-        assert!(latch.snapshot().is_none());
+        assert!(latch.snapshot().is_empty());
+    }
+
+    /// The round-1 defect: the latch was process-global, so this cleared store
+    /// A on evidence that only ever concerned store B.
+    #[test]
+    fn a_write_landing_on_another_store_does_not_clear_this_one() {
+        let latch = WriteLatch::new();
+        let a = Path::new("/var/lib/veld/users/tenant-a/storage");
+        let b = Path::new("/var/lib/veld/users/tenant-b/storage");
+
+        latch.note_write_error(a, &anyhow!("{PRODUCTION_MESSAGE}"));
+        latch.note_write_ok(b);
+
+        assert!(
+            latch.is_latched_at(a),
+            "tenant A's store is still unwritable and nothing has measured it"
+        );
+        assert!(latch.is_latched());
+        assert_eq!(latch.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn two_stores_latch_independently_and_clear_independently() {
+        let latch = WriteLatch::new();
+        let a = Path::new("/var/lib/veld/users/tenant-a/storage");
+        let b = Path::new("/var/lib/veld/users/tenant-b/storage");
+
+        latch.note_write_error(a, &anyhow!("{PRODUCTION_MESSAGE}"));
+        latch.note_write_error(b, &anyhow!("{PRODUCTION_MESSAGE}"));
+        let both = latch.snapshot();
+        assert_eq!(both.len(), 2);
+        let ids: Vec<&str> = both.iter().map(|s| s.store.as_str()).collect();
+        assert!(ids.contains(&store_id(a).as_str()));
+        assert!(ids.contains(&store_id(b).as_str()));
+
+        latch.note_write_ok(a);
+        assert!(!latch.is_latched_at(a));
+        assert!(latch.is_latched_at(b));
+        assert!(latch.is_latched(), "B is still latched, so something is");
+        assert_eq!(latch.snapshot().len(), 1);
+
+        latch.note_write_ok(b);
+        assert!(!latch.is_latched());
+        assert!(latch.snapshot().is_empty());
+    }
+
+    #[test]
+    fn hard_is_per_store_and_counted() {
+        let latch = WriteLatch::new();
+        let a = Path::new("/var/lib/veld/users/tenant-a/storage");
+        let b = Path::new("/var/lib/veld/users/tenant-b/storage");
+
+        latch.note_write_error(a, &anyhow!("{PRODUCTION_MESSAGE}"));
+        latch.note_write_error(b, &anyhow!("{PRODUCTION_MESSAGE}"));
+        latch.mark_hard(b);
+
+        assert!(!latch.is_hard_at(a));
+        assert!(latch.is_hard_at(b));
+        assert!(latch.is_hard(), "any store hard-latched makes this true");
+        assert_eq!(latch.hard_count(), 1);
+
+        latch.mark_hard(a);
+        assert_eq!(latch.hard_count(), 2);
+    }
+
+    #[test]
+    fn the_map_holds_only_latched_stores() {
+        let latch = WriteLatch::new();
+        let a = Path::new("/var/lib/veld/users/tenant-a/storage");
+
+        // A successful write to a store that never latched inserts nothing.
+        latch.note_write_ok(a);
+        assert!(latch.snapshot().is_empty());
+
+        latch.note_write_error(a, &anyhow!("{PRODUCTION_MESSAGE}"));
+        assert_eq!(latch.snapshot().len(), 1);
+        latch.note_write_ok(a);
+        assert!(latch.snapshot().is_empty());
     }
 
     #[test]
@@ -500,12 +701,12 @@ mod tests {
         let latch = WriteLatch::new();
         let err = anyhow!("{PRODUCTION_MESSAGE}");
         latch.note_write_error(&store_path(), &err);
-        let first = latch.snapshot().expect("latched");
+        let first = latch.snapshot_at(&store_path()).expect("latched");
 
         for _ in 0..4 {
             assert!(latch.note_write_error(&store_path(), &err));
         }
-        let later = latch.snapshot().expect("still latched");
+        let later = latch.snapshot_at(&store_path()).expect("still latched");
 
         assert_eq!(later.failed_writes, 5);
         assert_eq!(later.since, first.since);
@@ -517,57 +718,89 @@ mod tests {
         latch.note_write_error(&store_path(), &anyhow!("{PRODUCTION_MESSAGE}"));
         assert!(!latch.is_hard());
 
-        latch.mark_hard();
+        latch.mark_hard(&store_path());
         assert!(latch.is_hard());
 
         latch.note_write_error(&store_path(), &anyhow!("{PRODUCTION_MESSAGE}"));
         assert!(latch.is_hard());
-        assert!(latch.snapshot().expect("latched").hard);
+        assert!(latch.snapshot_at(&store_path()).expect("latched").hard);
     }
 
     #[test]
     fn the_hard_notice_is_claimable_once_per_latch() {
         let latch = WriteLatch::new();
         latch.note_write_error(&store_path(), &anyhow!("{PRODUCTION_MESSAGE}"));
-        latch.mark_hard();
+        latch.mark_hard(&store_path());
 
-        assert!(latch.claim_hard_notice());
-        assert!(!latch.claim_hard_notice());
+        assert!(latch.claim_hard_notice(&store_path()));
+        assert!(!latch.claim_hard_notice(&store_path()));
 
         // A new latch gets its own notice.
-        latch.note_write_ok();
+        latch.note_write_ok(&store_path());
         latch.note_write_error(&store_path(), &anyhow!("{PRODUCTION_MESSAGE}"));
-        assert!(latch.claim_hard_notice());
+        assert!(latch.claim_hard_notice(&store_path()));
     }
 
     /// Asserted against the defaults rather than an env override: the env is
     /// process-global and these tests run in parallel with everything else.
     #[test]
-    fn the_recovery_budget_is_bounded() {
+    fn the_recovery_budget_is_bounded_per_store() {
         let latch = WriteLatch::new();
-        latch.note_write_error(&store_path(), &anyhow!("{PRODUCTION_MESSAGE}"));
+        let a = Path::new("/var/lib/veld/users/tenant-a/storage");
+        let b = Path::new("/var/lib/veld/users/tenant-b/storage");
+        latch.note_write_error(a, &anyhow!("{PRODUCTION_MESSAGE}"));
+        latch.note_write_error(b, &anyhow!("{PRODUCTION_MESSAGE}"));
 
         let limit = max_attempts();
         for _ in 0..limit {
-            assert!(latch.attempts_left());
-            latch.note_recovery_attempt();
+            assert!(latch.attempts_left(a));
+            latch.note_recovery_attempt(a);
         }
-        assert!(!latch.attempts_left());
-        assert_eq!(latch.snapshot().expect("latched").recovery_attempts, limit);
+        assert!(!latch.attempts_left(a));
+        assert_eq!(
+            latch.snapshot_at(a).expect("latched").recovery_attempts,
+            limit
+        );
+        assert!(
+            latch.attempts_left(b),
+            "A spending its budget must not spend B's"
+        );
     }
 
     #[test]
-    fn a_second_probe_inside_the_cooldown_is_declined() {
+    fn a_second_probe_inside_the_cooldown_is_declined_per_store() {
         let latch = WriteLatch::new();
-        // Nothing latched: nothing to probe for.
-        assert!(!latch.probe_due());
+        let a = Path::new("/var/lib/veld/users/tenant-a/storage");
+        let b = Path::new("/var/lib/veld/users/tenant-b/storage");
 
-        latch.note_write_error(&store_path(), &anyhow!("{PRODUCTION_MESSAGE}"));
-        assert!(latch.probe_due());
+        // Nothing latched: nothing to probe for.
+        assert!(!latch.probe_due(a));
+
+        latch.note_write_error(a, &anyhow!("{PRODUCTION_MESSAGE}"));
+        assert!(latch.probe_due(a));
         assert!(
-            !latch.probe_due(),
+            !latch.probe_due(a),
             "a latched store under load must not pay for a filesystem probe per write"
         );
+
+        latch.note_write_error(b, &anyhow!("{PRODUCTION_MESSAGE}"));
+        assert!(
+            latch.probe_due(b),
+            "A's cooldown must not suppress B's first probe"
+        );
+    }
+
+    #[test]
+    fn store_id_is_stable_distinct_and_leaks_no_path() {
+        let a = Path::new("/var/lib/veld/users/tenant-7f3a9c2b/storage");
+        let b = Path::new("/var/lib/veld/users/tenant-other/storage");
+
+        assert_eq!(store_id(a), store_id(a), "must be stable across calls");
+        assert_ne!(store_id(a), store_id(b));
+        assert_eq!(store_id(a).len(), 16);
+        assert!(store_id(a).chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!store_id(a).contains('/'));
+        assert!(!store_id(a).contains("tenant-7f3a9c2b"));
     }
 
     #[test]
@@ -684,6 +917,6 @@ mod tests {
         assert_eq!(format!("{returned:#}"), original);
         assert!(!retried, "a non-NoSpace error must not be retried");
         assert!(!latch.is_latched());
-        assert!(latch.snapshot().is_none());
+        assert!(latch.snapshot().is_empty());
     }
 }
