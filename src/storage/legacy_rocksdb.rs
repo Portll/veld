@@ -67,31 +67,47 @@ impl BatchWriter for RocksDbBatchWriter {
                 .expect("column_families() is the set the ops draw from")
         };
 
-        let mut wb = WriteBatch::default();
-        for op in batch.ops() {
-            match op {
-                BatchOp::Put {
-                    cf: Some(name),
-                    key,
-                    value,
-                } => wb.put_cf(resolved(name), key, value),
-                BatchOp::Put {
-                    cf: None,
-                    key,
-                    value,
-                } => wb.put(key, value),
-                BatchOp::Delete {
-                    cf: Some(name),
-                    key,
-                } => wb.delete_cf(resolved(name), key),
-                BatchOp::Delete { cf: None, key } => wb.delete(key),
+        // Rebuildable, because `DB::write` consumes the batch and the write
+        // latch's recovery path needs to replay the same ops.
+        let build = || {
+            let mut wb = WriteBatch::default();
+            for op in batch.ops() {
+                match op {
+                    BatchOp::Put {
+                        cf: Some(name),
+                        key,
+                        value,
+                    } => wb.put_cf(resolved(name), key, value),
+                    BatchOp::Put {
+                        cf: None,
+                        key,
+                        value,
+                    } => wb.put(key, value),
+                    BatchOp::Delete {
+                        cf: Some(name),
+                        key,
+                    } => wb.delete_cf(resolved(name), key),
+                    BatchOp::Delete { cf: None, key } => wb.delete(key),
+                }
+            }
+            wb
+        };
+
+        let latch = super::write_latch::global();
+        match self.db.write(build()) {
+            Ok(()) => {
+                latch.note_write_ok(self.db.path());
+                Ok(())
+            }
+            Err(e) => {
+                let err = anyhow::Error::new(e).context("write_batch: rocksdb refused the batch");
+                super::write_latch::recover_write(latch, &self.db, self.db.path(), err, || {
+                    self.db
+                        .write(build())
+                        .context("write_batch: rocksdb refused the batch")
+                })
             }
         }
-
-        self.db
-            .write(wb)
-            .context("write_batch: rocksdb refused the batch")?;
-        Ok(())
     }
 }
 

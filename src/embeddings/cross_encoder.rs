@@ -77,6 +77,14 @@ pub trait CrossEncoderModel: Send + Sync {
     /// Score (query, document) pairs. Returns raw logits per document; higher
     /// = more relevant. Length matches `documents`.
     fn score_pairs(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>>;
+
+    /// Fetch whatever this model needs from the network, without building an
+    /// ONNX session. This is the only part of loading that [`prewarm`] does off
+    /// the caller's thread — see the pre-warm worker's notes for why the session
+    /// build may not run there. Default: nothing to fetch.
+    fn prefetch(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -93,6 +101,12 @@ pub struct CrossEncoderConfig {
     pub model_url: String,
     /// URL for the tokenizer JSON.
     pub tokenizer_url: String,
+    /// SHA-256 of the model file. With a checksum the URL names a fixed revision, a
+    /// download is verified before it lands, and a cached file is verified before it
+    /// loads. `None` accepts whatever the URL serves.
+    pub model_sha256: Option<String>,
+    /// SHA-256 of the tokenizer file; as `model_sha256`.
+    pub tokenizer_sha256: Option<String>,
     /// Hint indicating whether the model's ONNX graph accepts
     /// `token_type_ids`. BERT-family models do; XLM-RoBERTa-family models
     /// (BGE, Jina) do not. This field is **informational only at runtime**
@@ -135,11 +149,17 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
         CrossEncoderConfig {
             id: "mxbai-rerank-xsmall-v1".into(),
             model_url:
-                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/main/onnx/model.onnx"
+                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/b5c6e9da73abc3711f593f705371cdbe9e0fe422/onnx/model.onnx"
                     .into(),
             tokenizer_url:
-                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/main/tokenizer.json"
+                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/b5c6e9da73abc3711f593f705371cdbe9e0fe422/tokenizer.json"
                     .into(),
+            model_sha256: Some(
+                "536b7183f8964dd212c4e2f4029fcc595cfc03ac233aba03d293546aaa5a875b".into(),
+            ),
+            tokenizer_sha256: Some(
+                "305674b4d785287feecfb5f73f24aa75e9b57c87c579cfe24fbd207987d4b4c4".into(),
+            ),
             has_token_type_ids: true,
             params_millions: 70,
             download_mb: 280,
@@ -157,6 +177,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/mixedbread-ai/mxbai-rerank-base-v1/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: true,
             params_millions: 184,
             download_mb: 740,
@@ -173,6 +195,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 33,
             download_mb: 130,
@@ -190,6 +214,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/jinaai/jina-reranker-v1-turbo-en/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 37,
             download_mb: 150,
@@ -207,6 +233,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: true,
             params_millions: 22,
             download_mb: 80,
@@ -230,6 +258,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/hooman650/bge-reranker-v2-m3-onnx-o4/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 568,
             download_mb: 2270,
@@ -248,6 +278,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/mixedbread-ai/mxbai-rerank-large-v1/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: true,
             params_millions: 435,
             download_mb: 1740,
@@ -263,6 +295,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 278,
             download_mb: 1110,
@@ -442,63 +476,34 @@ impl OnnxCrossEncoder {
         }
     }
 
-    fn cache_dir(&self) -> PathBuf {
+    pub fn cache_dir(&self) -> PathBuf {
         super::downloader::get_cache_dir()
             .join("cross-encoder")
             .join(self.config.cache_key())
     }
 
-    /// Eagerly download + load on a background thread. Idempotent.
-    /// Skipped when `VELD_LAZY_CROSS_ENCODER=1`.
+    /// Fetch the model files on the shared pre-warm worker so the first query
+    /// pays only for the ONNX session build. Idempotent. Skipped when
+    /// `VELD_LAZY_CROSS_ENCODER=1`.
     pub fn prewarm(self_arc: Arc<Self>) {
-        let lazy = std::env::var("VELD_LAZY_CROSS_ENCODER")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-        if lazy {
+        if prewarm_disabled() {
             tracing::debug!(
                 "cross-encoder pre-warm skipped for {} (VELD_LAZY_CROSS_ENCODER set)",
                 self_arc.config.id
             );
             return;
         }
-        // The thread below is detached: `.spawn(…).ok()` drops the JoinHandle and
-        // nothing joins it. A test binary exits seconds after start, so teardown can
-        // race an in-flight ONNX CreateSession; a server runs for hours and the
-        // pre-warm is long done.
-        //
-        // Measured 2026-09-02: `cargo test --lib memory::` segfaulted on ~half of
-        // parallel runs, always AFTER `test result: ok`; the crash report named this
-        // thread, EXC_BAD_ACCESS at 0x17 in InferenceSession::Initialize. Three
-        // single-threaded runs were clean.
-        //
-        // Skipped rather than joined — a pre-warm you wait for is not a pre-warm.
-        // A caller needing the model loaded calls `ensure_loaded()` directly.
-        if cfg!(test) {
-            return;
-        }
-        std::thread::Builder::new()
-            .name(format!("cross-encoder-prewarm-{}", self_arc.config.id))
-            .spawn(move || match self_arc.ensure_loaded() {
-                Ok(_) => tracing::info!("Cross-encoder pre-warmed: {}", self_arc.config.id),
-                Err(e) => tracing::warn!(
-                    "Cross-encoder pre-warm failed for {} (lazy fallback engaged): {e}",
-                    self_arc.config.id
-                ),
-            })
-            .ok();
+        submit_prewarm(Box::new(move || match self_arc.prefetch() {
+            Ok(_) => tracing::info!("Cross-encoder files ready: {}", self_arc.config.id),
+            Err(e) => tracing::warn!(
+                "Cross-encoder pre-fetch failed for {} (lazy fallback engaged): {e}",
+                self_arc.config.id
+            ),
+        }));
     }
 
     fn ensure_downloaded(&self) -> Result<(PathBuf, PathBuf)> {
         let dir = self.cache_dir();
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create cross-encoder cache dir: {dir:?}"))?;
-
         let model_path = dir.join("model.onnx");
         let tokenizer_path = dir.join("tokenizer.json");
 
@@ -509,16 +514,36 @@ impl OnnxCrossEncoder {
         if std::env::var("VELD_OFFLINE").is_ok_and(|v| v == "true" || v == "1") {
             anyhow::bail!(
                 "Cross-encoder {} not cached and VELD_OFFLINE=true. \
-                 Download manually to {:?}",
+                 Fetch it with `model-fetch --cross-encoder`, or download it manually to {:?}",
                 self.config.id,
                 dir
             );
         }
 
+        self.download(&model_path, &tokenizer_path, None)?;
+        Ok((model_path, tokenizer_path))
+    }
+
+    /// Download whichever of the two files is missing, each verified against its
+    /// checksum when the config pins one.
+    fn download(
+        &self,
+        model_path: &PathBuf,
+        tokenizer_path: &PathBuf,
+        progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    ) -> Result<()> {
+        let dir = self.cache_dir();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create cross-encoder cache dir: {dir:?}"))?;
         tracing::info!("Downloading cross-encoder model ({})...", self.config.id);
         if !model_path.exists() {
-            download_file(&self.config.model_url, &model_path)
-                .with_context(|| format!("Failed to download model for {}", self.config.id))?;
+            super::downloader::download_file_with_checksum(
+                &self.config.model_url,
+                model_path,
+                progress,
+                self.config.model_sha256.as_deref(),
+            )
+            .with_context(|| format!("Failed to download model for {}", self.config.id))?;
             // ONNX exports of models >2 GB split into `model.onnx` + a companion
             // external-data file. The exact filename varies between
             // `model.onnx_data` and `model.onnx.data` depending on the export
@@ -537,11 +562,43 @@ impl OnnxCrossEncoder {
             }
         }
         if !tokenizer_path.exists() {
-            download_file(&self.config.tokenizer_url, &tokenizer_path)
-                .with_context(|| format!("Failed to download tokenizer for {}", self.config.id))?;
+            super::downloader::download_file_with_checksum(
+                &self.config.tokenizer_url,
+                tokenizer_path,
+                progress,
+                self.config.tokenizer_sha256.as_deref(),
+            )
+            .with_context(|| format!("Failed to download tokenizer for {}", self.config.id))?;
         }
         tracing::info!("Cross-encoder downloaded: {}", self.config.id);
-        Ok((model_path, tokenizer_path))
+        Ok(())
+    }
+
+    /// Make the cache hold this model's verified files: a cached file that does not
+    /// match its pinned checksum is removed and fetched again. Returns the cache dir.
+    pub fn fetch(&self, progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>) -> Result<PathBuf> {
+        let dir = self.cache_dir();
+        let model_path = dir.join("model.onnx");
+        let tokenizer_path = dir.join("tokenizer.json");
+        for (path, sha) in [
+            (&model_path, self.config.model_sha256.as_deref()),
+            (&tokenizer_path, self.config.tokenizer_sha256.as_deref()),
+        ] {
+            if let (true, Some(sha)) = (path.exists(), sha) {
+                if !super::downloader::verify_checksum(path, sha)? {
+                    std::fs::remove_file(path)
+                        .with_context(|| format!("Failed to remove {path:?}"))?;
+                }
+            }
+        }
+        self.download(&model_path, &tokenizer_path, progress)?;
+        Ok(dir)
+    }
+
+    /// Whether both files are in the cache, without loading them.
+    pub fn is_cached(&self) -> bool {
+        let dir = self.cache_dir();
+        dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists()
     }
 
     fn ensure_loaded(&self) -> Result<&LazyOnnx> {
@@ -678,6 +735,10 @@ impl CrossEncoderModel for OnnxCrossEncoder {
         self.available.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn prefetch(&self) -> Result<()> {
+        self.ensure_downloaded().map(|_| ())
+    }
+
     /// Scores N (query, document) pairs, each in its own forward pass at its own token length,
     /// capped at `MAX_PAIR_LENGTH`. One batch would pad every pair to the longest, letting one long
     /// memory set the cost of all of them; on live 20-candidate sets, pair by pair takes half the
@@ -791,6 +852,17 @@ impl CrossEncoderModel for EnsembleCrossEncoder {
         self.members.iter().any(|(m, _)| m.is_available())
     }
 
+    fn prefetch(&self) -> Result<()> {
+        // Best-effort per member: one member that cannot be fetched should not
+        // stop the others from being ready.
+        for (model, _) in &self.members {
+            if let Err(e) = model.prefetch() {
+                tracing::warn!("ensemble member {} prefetch failed: {e}", model.id());
+            }
+        }
+        Ok(())
+    }
+
     fn score_pairs(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
         if documents.is_empty() {
             return Ok(Vec::new());
@@ -837,6 +909,14 @@ fn sigmoid(x: f32) -> f32 {
 /// `VELD_CROSS_ENCODERS` is set.
 ///
 /// `VELD_CROSS_ENCODERS` takes precedence when both are set.
+/// The built-in default cross-encoder, the one used when no env var selects another.
+pub fn default_cross_encoder() -> OnnxCrossEncoder {
+    OnnxCrossEncoder::new(
+        lookup(DEFAULT_CROSS_ENCODER_ID)
+            .expect("default cross-encoder id must be registered as a built-in"),
+    )
+}
+
 pub fn load_cross_encoder_from_env() -> Arc<dyn CrossEncoderModel> {
     if let Ok(spec) = std::env::var("VELD_CROSS_ENCODERS") {
         match parse_ensemble_spec(&spec) {
@@ -895,15 +975,75 @@ fn parse_ensemble_spec(spec: &str) -> Result<Arc<dyn CrossEncoderModel>> {
     Ok(Arc::new(EnsembleCrossEncoder::new(members)))
 }
 
-/// Pre-warm a cross-encoder (single model or ensemble) by issuing a dummy
-/// `score_pairs` call on a background thread. For [`OnnxCrossEncoder`] this
-/// triggers the ~80 MB download and ONNX session build; for
-/// [`EnsembleCrossEncoder`] it cascades into every member. Idempotent — the
-/// underlying `OnceLock` guards against duplicate work.
+/// Pre-fetch a cross-encoder's files (single model or ensemble) on the shared
+/// pre-warm worker, so the first query pays for the ONNX session build and not
+/// for an 80-280 MB download. Idempotent — a model already on disk returns
+/// immediately.
 ///
 /// Skipped when `VELD_LAZY_CROSS_ENCODER=1` is set.
 pub fn prewarm(model: Arc<dyn CrossEncoderModel>) {
-    let lazy = std::env::var("VELD_LAZY_CROSS_ENCODER")
+    if prewarm_disabled() {
+        tracing::debug!("cross-encoder pre-warm skipped ({})", model.id());
+        return;
+    }
+    let id = model.id().to_string();
+    submit_prewarm(Box::new(move || match model.prefetch() {
+        Ok(_) => tracing::info!("Cross-encoder files ready: {id}"),
+        Err(e) => {
+            tracing::warn!("Cross-encoder pre-fetch failed for {id} (lazy fallback engaged): {e}")
+        }
+    }));
+}
+
+// -----------------------------------------------------------------------------
+// Pre-warm worker
+// -----------------------------------------------------------------------------
+//
+// THE PRE-WARM WORKER NEVER BUILDS AN ONNX SESSION. It downloads, and that is
+// all. An ONNX session may only be built on a thread the process waits for —
+// a test thread, a request thread, a blocking task inside a runtime that is
+// dropped — never on one that can still be running when the process exits.
+//
+// Why, measured on handler_tests at 314c070. The pre-warm used to run
+// `ensure_loaded()` on a detached thread, one per `CrossEncoderReranker`:
+// SIGSEGV after `test result: ok` in 13 of 20 direct runs. EXC_BAD_ACCESS at
+// 0x17 on a thread named `cross-encoder-prewarm-mxbai-rerank-xsmall-v1`, frames
+// `OpSchema::FormalParameter::FormalParameter(const&)` <- `InferAndVerifyTypeMatch`
+// <- `ConstantFolding::ApplyImpl` <- `InferenceSession::Initialize`, while the
+// main thread sat in `rocksdb::PosixEnv::JoinThreadsOnExit::~JoinThreadsOnExit()`.
+// `exit()` was already destroying C++ statics, ONNX Runtime's operator-schema
+// registry among them, and the session build read them after they were gone.
+// 35 such threads were live in that one crash report.
+//
+// The guard that stood here, `if cfg!(test) { return }`, could not cover it:
+// `test` is not set when the lib is compiled as a dependency of an integration
+// test binary, so it protected `cargo test --lib` and nothing under `tests/`.
+// It also said nothing about a production process that exits mid-pre-warm,
+// which is the same bug.
+//
+// Joining the worker from a `libc::atexit` handler was tried and does not work,
+// and the reason generalises to any exit hook. Handlers run newest-registered
+// first, and ONNX Runtime constructs the schema registry lazily inside the first
+// `CreateSession` — so its destructor is always registered after any hook we
+// could arm beforehand, and always runs first. Measured: the handler did run
+// (`shutdown_prewarm` <- `__cxa_finalize_ranges` <- `exit` on the main thread)
+// and the worker still faulted inside `OpSchemaRegistry::Schema`. Loading the
+// dylib early with `ort::api()` does not change it; the registry is not built
+// at dlopen.
+//
+// So the fix is ownership, not ordering: the work that cannot survive teardown
+// does not run where teardown can reach it.
+
+type PrewarmJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Sender for the single background worker. One thread, not one per reranker:
+/// the 35 concurrent downloads the old code could start were 35 copies of the
+/// same fetch.
+static PREWARM_TX: LazyLock<Mutex<Option<std::sync::mpsc::Sender<PrewarmJob>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn prewarm_disabled() -> bool {
+    std::env::var("VELD_LAZY_CROSS_ENCODER")
         .ok()
         .map(|v| {
             matches!(
@@ -911,27 +1051,32 @@ pub fn prewarm(model: Arc<dyn CrossEncoderModel>) {
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(false);
-    if lazy {
-        tracing::debug!("cross-encoder pre-warm skipped ({})", model.id());
-        return;
+        .unwrap_or(false)
+}
+
+fn submit_prewarm(job: PrewarmJob) {
+    let mut slot = PREWARM_TX.lock();
+    if slot.is_none() {
+        let (tx, rx) = std::sync::mpsc::channel::<PrewarmJob>();
+        let spawned = std::thread::Builder::new()
+            .name("cross-encoder-prewarm".to_string())
+            .spawn(move || {
+                for job in rx {
+                    job();
+                }
+            })
+            .is_ok();
+        if !spawned {
+            tracing::warn!(
+                "cross-encoder pre-warm worker could not be spawned; loading stays lazy"
+            );
+            return;
+        }
+        *slot = Some(tx);
     }
-    let id = model.id().to_string();
-    // Same detached-thread hazard as the method above — see its comment.
-    if cfg!(test) {
-        return;
+    if let Some(tx) = slot.as_ref() {
+        let _ = tx.send(job);
     }
-    std::thread::Builder::new()
-        .name(format!("cross-encoder-prewarm-{id}"))
-        .spawn(
-            move || match model.score_pairs(WARMUP_TEXT, &[WARMUP_TEXT]) {
-                Ok(_) => tracing::info!("Cross-encoder pre-warmed: {id}"),
-                Err(e) => tracing::warn!(
-                    "Cross-encoder pre-warm failed for {id} (lazy fallback engaged): {e}"
-                ),
-            },
-        )
-        .ok();
 }
 
 // -----------------------------------------------------------------------------
@@ -950,10 +1095,20 @@ fn download_file(url: &str, path: &PathBuf) -> Result<()> {
     }
 
     let mut reader = resp.into_body().into_reader();
-    let mut file =
-        std::fs::File::create(path).with_context(|| format!("Failed to create file: {path:?}"))?;
+    // Write beside the target and rename: `ensure_downloaded` treats an existing
+    // file as a complete one, so a download cut short — the pre-warm worker is
+    // not joined at exit — must not leave a truncated model under that name.
+    let partial = path.with_extension(format!(
+        "{}.part",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    let mut file = std::fs::File::create(&partial)
+        .with_context(|| format!("Failed to create file: {partial:?}"))?;
 
     std::io::copy(&mut reader, &mut file)?;
+    drop(file);
+    std::fs::rename(&partial, path)
+        .with_context(|| format!("Failed to publish downloaded file: {path:?}"))?;
     Ok(())
 }
 
@@ -986,6 +1141,21 @@ mod tests {
     }
 
     #[test]
+    fn the_default_reranker_is_pinned_to_a_revision_and_checksums() {
+        let cfg = lookup(DEFAULT_CROSS_ENCODER_ID).unwrap();
+        for url in [&cfg.model_url, &cfg.tokenizer_url] {
+            assert!(
+                !url.contains("/resolve/main/"),
+                "{url} follows a moving branch"
+            );
+        }
+        for sha in [&cfg.model_sha256, &cfg.tokenizer_sha256] {
+            let sha = sha.as_deref().expect("a pinned checksum");
+            assert!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
     fn lookup_resolves_built_ins() {
         assert!(lookup("ms-marco-MiniLM-L-6-v2").is_ok());
         assert!(lookup("bge-reranker-v2-m3").is_ok());
@@ -1012,6 +1182,8 @@ mod tests {
             id: "test-custom-model".into(),
             model_url: "https://example.com/m.onnx".into(),
             tokenizer_url: "https://example.com/t.json".into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 100,
             download_mb: 400,

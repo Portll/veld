@@ -10,7 +10,7 @@ The error types defined in `src/errors.rs`. 1 error enum(s) discovered.
 
 ## `AppError`
 
-21 variants.
+22 variants.
 
 | Variant | Message / Doc |
 |---|---|
@@ -34,6 +34,7 @@ The error types defined in `src/errors.rs`. 1 error enum(s) discovered.
 | `LockPoisoned *(carries data)*` | — |
 | `LockAcquisitionFailed *(carries data)*` | — |
 | `ServiceUnavailable *(carries data)*` | — |
+| `StorageWriteLatched *(carries data)*` | RocksDB has stopped accepting writes for want of disk space. Retryable from the caller's side, which `INTERNAL_ERROR` never said. |
 | `Internal *(carries data)*` | — |
 
 ---
