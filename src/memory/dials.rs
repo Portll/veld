@@ -121,6 +121,15 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub rerank_count: Option<usize>,
 
+    /// Which cross-encoder reranks, by registry id
+    /// (`crate::embeddings::cross_encoder::lookup`). `None` keeps the process-wide choice
+    /// (`VELD_CROSS_ENCODER`, else mxbai-rerank-xsmall-v1). Set to
+    /// `ms-marco-MiniLM-L-6-v2` for the recall gate's parity arm against upstream.
+    /// [`CognitiveDials::sanitized`] drops an id the registry does not know, so what
+    /// `GET /api/dials` returns is what reranks.
+    #[serde(default)]
+    pub rerank_model: Option<String>,
+
     /// Override the RRF fusion weights `(bm25, vector, graph)`. `None` keeps the
     /// engine/learned weights.
     #[serde(default)]
@@ -397,6 +406,7 @@ impl Default for CognitiveDials {
             use_reranking: None,
             candidate_count: None,
             rerank_count: None,
+            rerank_model: None,
             rrf_weights: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
@@ -433,6 +443,19 @@ impl CognitiveDials {
         if let Some(r) = self.rerank_count {
             self.rerank_count = Some(r.clamp(1, 200));
         }
+        self.rerank_model = self.rerank_model.take().and_then(|id| {
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            match crate::embeddings::cross_encoder::lookup(id) {
+                Ok(_) => Some(id.to_string()),
+                Err(e) => {
+                    tracing::warn!("rerank_model dial dropped: {e:#}");
+                    None
+                }
+            }
+        });
         if let Some((b, v, g)) = self.rrf_weights {
             self.rrf_weights = Some((b.clamp(0.0, 1.0), v.clamp(0.0, 1.0), g.clamp(0.0, 1.0)));
         }
@@ -482,7 +505,7 @@ impl CognitiveDials {
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
-    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT}`.
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -530,6 +553,9 @@ impl CognitiveDials {
         }
         if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_COUNT") {
             d.rerank_count = Some(v);
+        }
+        if let Ok(v) = std::env::var("VELD_DIALS_RERANK_MODEL") {
+            d.rerank_model = Some(v);
         }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
@@ -580,6 +606,8 @@ mod tests {
         assert!(d.refiner_mode.is_none());
         assert!(d.use_reranking.is_none());
         assert!(d.candidate_count.is_none());
+        assert!(d.rerank_count.is_none());
+        assert!(d.rerank_model.is_none());
         assert!(d.rrf_weights.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,
@@ -710,6 +738,36 @@ mod tests {
         assert_eq!(d.candidate_count, Some(1000));
         assert_eq!(d.rerank_count, Some(1));
         assert_eq!(d.rrf_weights, Some((1.0, 0.0, 0.5)));
+    }
+
+    /// The reranker dials round-trip through the JSON the `/api/dials` routes carry, and
+    /// sanitising keeps a registry id, trims it, and drops an unknown or empty one.
+    #[test]
+    fn rerank_model_and_count_round_trip_and_sanitise() {
+        let set = CognitiveDials {
+            rerank_model: Some("  ms-marco-MiniLM-L-6-v2 ".to_string()),
+            rerank_count: Some(30),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        let back: CognitiveDials = serde_json::from_str(&json).unwrap();
+        let back = back.sanitized();
+        assert_eq!(back.rerank_model.as_deref(), Some("ms-marco-MiniLM-L-6-v2"));
+        assert_eq!(back.rerank_count, Some(30));
+
+        let unknown = CognitiveDials {
+            rerank_model: Some("no-such-reranker".to_string()),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(unknown.rerank_model, None);
+
+        let empty = CognitiveDials {
+            rerank_model: Some("   ".to_string()),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(empty.rerank_model, None);
     }
 
     #[test]

@@ -1287,6 +1287,10 @@ impl MemorySystem {
             }
         }
         hybrid_search_engine.attach_dials(cognitive_dials_arc.clone());
+        {
+            let mut d = cognitive_dials_arc.write();
+            Self::apply_rerank_model_dial(&hybrid_search_engine, &mut d);
+        }
 
         #[cfg(feature = "multi-tenant")]
         if let Some(collective_dir) = config.collective_store_dir.as_ref() {
@@ -1528,6 +1532,28 @@ impl MemorySystem {
         self.hybrid_search.reranker().map(|r| r.probe())
     }
 
+    /// Point the reranker at the model the `rerank_model` dial names (`None`: the
+    /// process-wide choice). When the model cannot be built the dial is cleared in `dials`
+    /// before it is stored or reported, so `GET /api/dials` never names a model that is
+    /// not reranking. Without a reranker (`use_reranking` off in config) the dial is kept
+    /// and has nothing to act on.
+    fn apply_rerank_model_dial(
+        hybrid_search: &HybridSearchEngine,
+        dials: &mut dials::CognitiveDials,
+    ) {
+        let Some(reranker) = hybrid_search.reranker() else {
+            return;
+        };
+        if let Err(e) = reranker.select_model(dials.rerank_model.as_deref()) {
+            tracing::warn!(
+                "rerank_model dial {:?} not applied, keeping {}: {e:#}",
+                dials.rerank_model,
+                reranker.model_id()
+            );
+            dials.rerank_model = None;
+        }
+    }
+
     /// Snapshot the current cognitive dials (cheap clone under read lock).
     pub fn cognitive_dials(&self) -> dials::CognitiveDials {
         self.cognitive_dials.read().clone()
@@ -1540,6 +1566,7 @@ impl MemorySystem {
     pub fn set_cognitive_dials(&self, new_dials: dials::CognitiveDials) {
         let mut d = new_dials.sanitized();
         d.updated_at = Some(chrono::Utc::now());
+        Self::apply_rerank_model_dial(&self.hybrid_search, &mut d);
         match serde_json::to_vec(&d) {
             Ok(bytes) => {
                 if let Err(e) = self

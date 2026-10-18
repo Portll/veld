@@ -318,7 +318,12 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
             tape_growth.push((i, added));
         }
     }
-    let tape_failures = finish_model_tape(&corpus, &tape_growth, &inputs.git_sha);
+    let tape_failures = finish_model_tape(
+        &corpus,
+        &tape_growth,
+        &inputs.git_sha,
+        passes[0].rerank.model.as_deref(),
+    );
 
     // ------------------------------------------------------------------
     // Determinism check across repeats. Two passes against the same
@@ -967,6 +972,7 @@ fn finish_model_tape(
     corpus: &[CorpusItem],
     growth: &[(usize, usize)],
     git_sha: &str,
+    rerank_model: Option<&str>,
 ) -> Vec<Failure> {
     use crate::embeddings::model_tape as tape;
     let mut failures = Vec::new();
@@ -984,7 +990,7 @@ fn finish_model_tape(
         )));
     }
     if tape::recording() {
-        match fill_cross_encoder_table(corpus) {
+        match fill_cross_encoder_table(corpus, rerank_model) {
             Ok(n) => eprintln!("  model tape: scored {n} cross-encoder pairs the run did not"),
             Err(e) => failures.push(infra(format!("{e:#}"))),
         }
@@ -1027,12 +1033,16 @@ fn finish_model_tape(
 /// pairs that only load the model (the harness's probe and the background pre-warm):
 /// if one is not a corpus item, candidates are built some other way and the corpus
 /// cannot complete the table.
-fn fill_cross_encoder_table(corpus: &[CorpusItem]) -> Result<usize> {
+///
+/// `model` is the registry id the run reranked with (its `RerankSetting`), so the table is
+/// completed by the model the `rerank_model` dial selected and not by whatever the
+/// environment names.
+fn fill_cross_encoder_table(corpus: &[CorpusItem], model: Option<&str>) -> Result<usize> {
     use crate::embeddings::cross_encoder::WARMUP_TEXT;
     use crate::embeddings::model_tape as tape;
     use crate::memory::hybrid_search::CROSS_ENCODER_PROBE;
     let loads_only = |t: &str| t == CROSS_ENCODER_PROBE || t == WARMUP_TEXT;
-    let ce = crate::embeddings::cross_encoder::load_cross_encoder_from_env();
+    let ce = crate::embeddings::cross_encoder::load_cross_encoder(model)?;
     let mut seen = std::collections::HashSet::new();
     let docs: Vec<&str> = corpus
         .iter()
