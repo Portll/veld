@@ -21,6 +21,18 @@ changes nothing — every retrieval dial is `None` so the engine uses its
 learned-weight default; every plasticity dial is `false`/zero so
 reconsolidation behaves exactly as it did pre-dials.
 
+### Ingest dial: `turn_context`
+
+One retrieval dial acts at write time rather than on the recall path.
+`turn_context: Option<bool>` controls whether a `Conversation` memory is
+indexed with its date and the turn it follows (`src/memory/index_text.rs`,
+[ADR 0009](../decisions/0009-index-text-derived-not-stored.md)). `None`
+keeps the engine default, which is **on**; `Some(false)` indexes the bare
+content. Env seed: `VELD_DIALS_TURN_CONTEXT=0|1`. Flipping it changes what
+the embedder is fed for turns written afterwards; records already written
+keep their embedding until re-indexed. Prior-turn resolution is counted in
+`veld_turn_context_total{source="preceding_id"|"conversation_key"|"none"}`.
+
 ## Lifecycle
 
 ```mermaid
