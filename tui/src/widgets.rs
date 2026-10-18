@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, GRASS_SUFFIX, VELD_GRADIENT, VELD_TEXT};
+use crate::logo::{GRASS, GRASS_GRADIENT, VELD_GRADIENT, VELD_TEXT};
 use crate::types::{
     truncate_safe, AppState, DisplayEvent, FocusPanel, SearchMode, SearchResult, TuiFileMemory,
     TuiPriority, TuiProject, TuiTodo, TuiTodoStatus, ViewMode, VERSION,
@@ -167,13 +167,13 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(inner);
 
-    // Elephant logo with breathing animation when connected
-    let logo_lines: Vec<Line> = ELEPHANT
+    // Grass mark with breathing animation when connected
+    let logo_lines: Vec<Line> = GRASS
         .iter()
         .enumerate()
         .map(|(i, l)| {
             let (r, g, b) = if state.connected {
-                let (base_r, base_g, base_b) = ELEPHANT_GRADIENT[i % ELEPHANT_GRADIENT.len()];
+                let (base_r, base_g, base_b) = GRASS_GRADIENT[i % GRASS_GRADIENT.len()];
 
                 // Breathing effect: subtle brightness oscillation
                 let breath_phase = (state.animation_tick as f32 * 0.05 + i as f32 * 0.1).sin();
@@ -194,15 +194,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                 let gray = (60.0 + pulse * 40.0) as u8;
                 (gray, gray, gray)
             };
-            let elephant_style = Style::default().fg(Color::Rgb(r, g, b));
-            if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
-                Line::from(vec![
-                    Span::styled(body, elephant_style),
-                    Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
-                ])
-            } else {
-                Line::from(Span::styled(*l, elephant_style))
-            }
+            Line::from(Span::styled(*l, Style::default().fg(Color::Rgb(r, g, b))))
         })
         .collect();
     f.render_widget(Paragraph::new(logo_lines), chunks[0]);

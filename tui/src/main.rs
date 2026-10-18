@@ -27,7 +27,7 @@ mod tabs;
 mod types;
 mod widgets;
 
-use logo::{ELEPHANT, ELEPHANT_FRAMES, GRASS_SUFFIX, VELD_GRADIENT, VELD_TEXT};
+use logo::{GRASS, GRASS_FRAMES, GRASS_GRADIENT, VELD_GRADIENT, VELD_TEXT};
 use stream::{
     complete_todo, next_status, refresh_todos, reorder_todo, update_todo_priority,
     update_todo_status, MemoryStream,
@@ -57,7 +57,7 @@ fn generate_title(state: &AppState) -> String {
         ViewMode::Loops => "Loops",
     };
 
-    format!("🦣 Veld - {}", view_name)
+    format!("🌾 Veld - {}", view_name)
 }
 
 struct UserSelector {
@@ -512,28 +512,13 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
         chunks[1],
     );
 
-    // Elephant logo with orange gradient and grass accent
-    let logo_lines: Vec<Line> = ELEPHANT
+    // Grass mark, straw at the tips down to earth at the roots.
+    let logo_lines: Vec<Line> = GRASS
         .iter()
         .enumerate()
         .map(|(i, l)| {
-            let g = [
-                (255, 140, 50),
-                (255, 120, 40),
-                (255, 100, 30),
-                (255, 85, 20),
-                (255, 70, 10),
-                (200, 55, 5),
-            ];
-            let elephant_style = Style::default().fg(Color::Rgb(g[i % 6].0, g[i % 6].1, g[i % 6].2));
-            if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
-                Line::from(vec![
-                    Span::styled(body, elephant_style),
-                    Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
-                ])
-            } else {
-                Line::from(Span::styled(*l, elephant_style))
-            }
+            let (r, g, b) = GRASS_GRADIENT[i % GRASS_GRADIENT.len()];
+            Line::from(Span::styled(*l, Style::default().fg(Color::Rgb(r, g, b))))
         })
         .collect();
     f.render_widget(
@@ -736,7 +721,7 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
                 if is_selected {
                     ListItem::new(Line::from(vec![
                         Span::styled("  ▶ ", Style::default().fg(Color::Rgb(255, 140, 50))),
-                        Span::styled("🦣 ", Style::default()),
+                        Span::styled("🌾 ", Style::default()),
                         Span::styled(
                             u,
                             Style::default()
@@ -856,36 +841,20 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
         chunks[1],
     );
 
-    // Animated elephant logo with trunk waving and grass accent
-    let frame_idx = (tick as usize / 8) % ELEPHANT_FRAMES.len(); // Change frame every 8 ticks
-    let current_frame = ELEPHANT_FRAMES[frame_idx];
+    // Grass swaying: the four frames are one cycle, upright to right to upright to left.
+    let frame_idx = (tick as usize / 8) % GRASS_FRAMES.len(); // Change frame every 8 ticks
+    let current_frame = GRASS_FRAMES[frame_idx];
 
     let logo_lines: Vec<Line> = current_frame
         .iter()
         .enumerate()
         .map(|(i, l)| {
             let phase = ((tick as f32 * 0.15) + i as f32 * 0.3).sin() * 0.2 + 0.8;
-            let base = [
-                (255, 140, 50),
-                (255, 120, 40),
-                (255, 100, 30),
-                (255, 85, 20),
-                (255, 70, 10),
-                (200, 55, 5),
-            ];
-            let (r, g, b) = base[i % 6];
+            let (r, g, b) = GRASS_GRADIENT[i % GRASS_GRADIENT.len()];
             let r = (r as f32 * phase) as u8;
             let g = (g as f32 * phase) as u8;
             let b = (b as f32 * phase) as u8;
-            let elephant_style = Style::default().fg(Color::Rgb(r, g, b));
-            if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
-                Line::from(vec![
-                    Span::styled(body, elephant_style),
-                    Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
-                ])
-            } else {
-                Line::from(Span::styled(*l, elephant_style))
-            }
+            Line::from(Span::styled(*l, Style::default().fg(Color::Rgb(r, g, b))))
         })
         .collect();
     f.render_widget(
@@ -1005,7 +974,7 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
 }
 
 async fn run_splash(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    execute!(io::stdout(), SetTitle("🦣 Veld - Loading..."))?;
+    execute!(io::stdout(), SetTitle("🌾 Veld - Loading..."))?;
 
     let start = Instant::now();
     let duration = Duration::from_secs(5);
@@ -1049,7 +1018,7 @@ async fn run_user_selector(
     base_url: &str,
     api_key: &str,
 ) -> Result<Option<(String, String)>> {
-    execute!(io::stdout(), SetTitle("🦣 Veld - Select Profile"))?;
+    execute!(io::stdout(), SetTitle("🌾 Veld - Select Profile"))?;
     let mut selector = UserSelector::new(api_key.to_string());
 
     let result = loop {

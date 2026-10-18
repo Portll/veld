@@ -1960,7 +1960,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
 
         // Format response with branded display
-        let response = `🐘 Memory Stored\n`;
+        let response = `🌾 Memory Stored\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `📝 ${content.slice(0, 60)}${content.length > 60 ? "..." : ""}\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -2077,7 +2077,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [
               {
                 type: "text",
-                text: `🐘 No memories or todos found for: "${query}"\n   Mode: ${mode}`,
+                text: `🌾 No memories or todos found for: "${query}"\n   Mode: ${mode}`,
               },
             ],
           };
@@ -2085,7 +2085,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Build formatted response
         const totalCount = memories.length + todos.length;
-        let response = `🐘 Recalled ${totalCount} Results`;
+        let response = `🌾 Recalled ${totalCount} Results`;
         if (memories.length > 0 && todos.length > 0) {
           response += ` (${memories.length} memories, ${todos.length} todos)`;
         }
@@ -2280,7 +2280,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const memories = result.memories || [];
 
         if (memories.length === 0) {
-          let response = `🐘 Context Summary\n`;
+          let response = `🌾 Context Summary\n`;
           response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
           response += `No memories stored yet.\n`;
           response += `Start remembering to build context!`;
@@ -2318,7 +2318,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         // Build branded response
-        let response = `🐘 Context Summary\n`;
+        let response = `🌾 Context Summary\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `Total: ${memories.length} memories │ `;
         response += `📋 ${decisions.length} │ 💡 ${learnings.length} │ 📁 ${context.length} │ 🔄 ${patterns.length} │ ⚠️ ${errors.length}\n`;
@@ -2391,7 +2391,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const memories = (result.memories || []).slice(0, limit);
 
         if (memories.length === 0) {
-          let response = `🐘 Memory List\n`;
+          let response = `🌾 Memory List\n`;
           response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
           response += `No memories stored yet.`;
           return {
@@ -2406,7 +2406,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           typeCounts[type] = (typeCounts[type] || 0) + 1;
         }
 
-        let response = `🐘 Memory List\n`;
+        let response = `🌾 Memory List\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `Showing ${memories.length} memories\n`;
         response += `Types: ${Object.entries(typeCounts)
@@ -2448,7 +2448,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         await apiCall(`/api/memory/${id}?user_id=${USER_ID}`, "DELETE");
 
-        let response = `🐘 Memory Deleted\n`;
+        let response = `🌾 Memory Deleted\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `✓ Removed: ${id}`;
 
@@ -2481,7 +2481,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const avgImportance =
           result.average_importance ?? result.avg_importance ?? 0;
 
-        let response = `🐘 Memory Statistics\n`;
+        let response = `🌾 Memory Statistics\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `Total Memories: ${result.total_memories || 0}\n`;
         response += `Graph: ${result.graph_nodes || 0} nodes │ ${result.graph_edges || 0} edges\n`;
@@ -2548,7 +2548,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const statusIcon = result.is_healthy ? "✓" : "⚠️";
         const healthText = result.is_healthy ? "HEALTHY" : "UNHEALTHY";
 
-        let response = `🐘 Index Verification\n`;
+        let response = `🌾 Index Verification\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `${statusIcon} ${healthText}\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -2587,7 +2587,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const statusIcon = result.is_healthy ? "✓" : "⚠️";
         const statusText = result.success ? "SUCCESS" : "PARTIAL";
 
-        let response = `🐘 Index Repair\n`;
+        let response = `🌾 Index Repair\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `${statusIcon} ${statusText}\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -2638,7 +2638,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         );
 
-        let response = `🐘 Backup Created\n`;
+        let response = `🌾 Backup Created\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
 
         if (result.success && result.backup) {
@@ -2694,7 +2694,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         );
 
-        let response = `🐘 Available Backups\n`;
+        let response = `🌾 Available Backups\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
 
         if (result.backups.length === 0) {
@@ -2739,7 +2739,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const statusIcon = result.is_valid ? "✓" : "✗";
         const statusText = result.is_valid ? "VALID" : "INVALID";
 
-        let response = `🐘 Backup Verification\n`;
+        let response = `🌾 Backup Verification\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `${statusIcon} Backup #${backup_id}: ${statusText}\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -2767,7 +2767,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         );
 
-        let response = `🐘 Backup Purge\n`;
+        let response = `🌾 Backup Purge\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
 
         if (result.purged_count === 0) {
@@ -3004,7 +3004,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
           if (uniqueReminders.length > 0) {
             reminderBlock = `\n\n`;
-            reminderBlock += `🐘━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━🧠\n`;
+            reminderBlock += `🌾━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━🧠\n`;
             reminderBlock += `┃  VELD MEMORY                     REMINDERS (${String(uniqueReminders.length).padStart(2)})  ┃\n`;
             reminderBlock += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
 
@@ -3346,7 +3346,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const startDate = new Date(result.period.start).toLocaleString();
         const endDate = new Date(result.period.end).toLocaleString();
 
-        let response = `🐘 Consolidation Report\n`;
+        let response = `🌾 Consolidation Report\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `Period: ${startDate} → ${endDate}\n`;
         response += `Events: ${eventCount} │ Memories: ${stats.total_memories}\n`;
@@ -3669,7 +3669,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           tags,
         });
 
-        let response = `🐘 Reminder Set\n`;
+        let response = `🌾 Reminder Set\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `ID: ${result.id}\n`;
         response += `Content: ${content}\n`;
@@ -3731,7 +3731,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        let response = `🐘 VELD REMINDERS (${result.count})\n`;
+        let response = `🌾 VELD REMINDERS (${result.count})\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
 
         for (const r of result.reminders) {
