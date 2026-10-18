@@ -5,7 +5,8 @@ use bincode;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "rocksdb")]
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB,
+    Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions,
+    DB,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "rocksdb")]
@@ -1303,7 +1304,7 @@ impl MemoryStorage {
     /// If `shared_cache` is provided, all block-cache reads are charged against
     /// the shared LRU cache (recommended for multi-tenant server mode). When
     /// `None`, a small per-instance cache is created (standalone / test use).
-    pub fn new(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
+    pub fn new(path: &Path, shared_cache: Option<&Cache>) -> Result<Self> {
         Self::open(path, shared_cache, true)
     }
 
