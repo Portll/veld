@@ -155,3 +155,4 @@ evaluations/
 
 # Generated terminal captures; regenerate with scripts/screenshots/shoot.mjs
 scripts/screenshots/out/
+scripts/screenshots/*.log
