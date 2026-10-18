@@ -611,7 +611,11 @@ mod tests {
         // The case that took seeding down: the budget lands inside a three-byte box-drawing
         // character, which docs/architecture/README.md uses to draw diagrams.
         let s = "ab│cd";
-        assert_eq!(s.len(), 7, "the bar is three bytes, so byte 3 is mid-character");
+        assert_eq!(
+            s.len(),
+            7,
+            "the bar is three bytes, so byte 3 is mid-character"
+        );
         assert_eq!(truncate_on_char_boundary(s, 3), "ab");
         assert_eq!(truncate_on_char_boundary(s, 4), "ab");
         assert_eq!(truncate_on_char_boundary(s, 5), "ab│");
