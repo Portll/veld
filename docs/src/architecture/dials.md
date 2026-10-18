@@ -70,6 +70,51 @@ that GETs the current dials, renders each value as a tunable widget, and
 PUTs on commit. Real-time visibility on what's currently set + an easy way
 to undo experiments.
 
+## Reranker dials
+
+Three retrieval dials drive the Layer 5.3 cross-encoder
+([retrieval.md](retrieval.md#cross-encoder-reranking)):
+
+| Dial | Type | `None` means | Env seed |
+|---|---|---|---|
+| `use_reranking` | `Option<bool>` | the layer runs | `VELD_DIALS_USE_RERANKING` |
+| `rerank_count` | `Option<usize>`, clamped to 1..=200 | 20 candidates (30 for a decomposed query) | `VELD_DIALS_RERANK_COUNT` |
+| `rerank_model` | `Option<String>`, a registry id | the process-wide model: `VELD_CROSS_ENCODER`, else `mxbai-rerank-xsmall-v1` | `VELD_DIALS_RERANK_MODEL` |
+
+`rerank_model` is applied when the dials are loaded at startup and on every
+`PUT /api/dials`: the user's `CrossEncoderReranker` switches to the named
+model, keeps every model it has selected before loaded, and pre-fetches a new
+one in the background. `sanitized()` drops an id the registry does not know, and
+a model that cannot be built clears the dial before it is stored, so
+`GET /api/dials` never names a model that is not reranking. Both dials default to
+`None`: the shipped pipeline is unchanged until someone turns them.
+
+The recall gate records the model and cap it measured under
+(`RerankSetting` in `src/recall_harness/report.rs`) and refuses to gate across
+them. `recall.yml` takes `rerank_model` and `rerank_count` as dispatch inputs
+for a comparison run (`record=true`): the baseline is `mxbai-rerank-xsmall-v1`
+at cap 20, and the parity arm against upstream shodh-memory is
+`ms-marco-MiniLM-L-6-v2` at cap 30.
+
+Selectable models (`src/embeddings/cross_encoder.rs`). Two are pinned to a
+revision and verified by SHA-256 before they load; the rest follow their
+repository's `main` branch and should be pinned before they are relied on for a
+measurement.
+
+| Registry id | Params | Licence | Pinned |
+|---|---|---|---|
+| `mxbai-rerank-xsmall-v1` (default) | 70 M | Apache-2.0 | `b5c6e9da` |
+| `ms-marco-MiniLM-L-6-v2` (parity arm) | 22 M | Apache-2.0 | `233902d2` |
+| `mxbai-rerank-base-v1` | 184 M | Apache-2.0 | no |
+| `mxbai-rerank-large-v1` | 435 M | Apache-2.0 | no |
+| `jina-reranker-v1-tiny-en` | 33 M | Apache-2.0 | no |
+| `jina-reranker-v1-turbo-en` | 37 M | Apache-2.0 | no |
+| `bge-reranker-v2-m3` (hooman650 ONNX export) | 568 M | Apache-2.0 | no |
+| `jina-reranker-v2-base-multilingual` | 278 M | CC-BY-NC-4.0 (non-commercial; never a default) | no |
+
+Each entry's licence is the `license` field of its `CrossEncoderConfig`, as the
+model card declared it at the revision recorded here.
+
 ## Forward-compatible serialisation
 
 Every field in `CognitiveDials` carries `#[serde(default)]` so older
