@@ -12,11 +12,12 @@
 //! model-fetch --status          # what is present, decide from that
 //! model-fetch --minilm          # the embedder recall actually depends on
 //! model-fetch --ner --nomic
+//! model-fetch --cross-encoder   # the reranker, pinned and verified like the rest
 //! ```
 
 use anyhow::Result;
 use clap::Parser;
-use veld::embeddings::downloader;
+use veld::embeddings::{cross_encoder, downloader};
 
 #[derive(Parser)]
 #[command(
@@ -36,6 +37,11 @@ struct Args {
     /// nomic-embed-text-v1.5 — 768-dim, 8192-token context.
     #[arg(long)]
     nomic: bool,
+
+    /// mxbai-rerank-xsmall-v1 — the default cross-encoder that reranks recall's candidates.
+    /// Without it recall keeps its fused order and logs that the reranker is unavailable.
+    #[arg(long)]
+    cross_encoder: bool,
 
     /// The ONNX runtime itself. Without it every model above is an unreadable file: the embedder
     /// falls back exactly as if no model were present, so "model downloaded" is not the same claim
@@ -69,37 +75,13 @@ fn progress() -> downloader::ProgressCallback {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.status || !(args.minilm || args.ner || args.nomic || args.onnxruntime) {
-        println!(
-            "minilm  {}",
-            present(
-                downloader::are_models_downloaded(),
-                downloader::get_models_dir()
-            )
-        );
-        println!(
-            "ner     {}",
-            present(
-                downloader::are_ner_models_downloaded(),
-                downloader::get_ner_models_dir()
-            )
-        );
-        println!(
-            "nomic   {}",
-            present(
-                downloader::are_nomic_models_downloaded(),
-                downloader::get_nomic_models_dir()
-            )
-        );
-        println!(
-            "onnxrt  {}",
-            present(
-                downloader::is_onnx_runtime_downloaded(),
-                downloader::get_onnx_runtime_dir()
-            )
-        );
+    let any = args.minilm || args.ner || args.nomic || args.cross_encoder || args.onnxruntime;
+    if args.status || !any {
+        report();
         if !args.status {
-            println!("\nnothing selected; pass --minilm / --ner / --nomic to fetch.");
+            println!(
+                "\nnothing selected; pass --minilm / --ner / --nomic / --cross-encoder / --onnxruntime to fetch."
+            );
         }
         return Ok(());
     }
@@ -124,40 +106,49 @@ fn main() -> Result<()> {
         let path = downloader::download_nomic_models(Some(progress()))?;
         println!("\r    done: {}", path.display());
     }
+    if args.cross_encoder {
+        println!("cross-encoder:");
+        let progress = progress();
+        let path = cross_encoder::default_cross_encoder().fetch(Some(progress.as_ref()))?;
+        println!("\r    done: {}", path.display());
+    }
 
     // Say what is on disk AFTER the fetch, from the same predicate the server uses at startup.
     // A downloader that reports its own success is reporting that it finished, not that the server
     // will find anything.
     println!();
-    println!(
-        "minilm  {}",
-        present(
-            downloader::are_models_downloaded(),
-            downloader::get_models_dir()
-        )
-    );
-    println!(
-        "ner     {}",
-        present(
-            downloader::are_ner_models_downloaded(),
-            downloader::get_ner_models_dir()
-        )
-    );
-    println!(
-        "nomic   {}",
-        present(
-            downloader::are_nomic_models_downloaded(),
-            downloader::get_nomic_models_dir()
-        )
-    );
-    println!(
-        "onnxrt  {}",
-        present(
-            downloader::is_onnx_runtime_downloaded(),
-            downloader::get_onnx_runtime_dir()
-        )
-    );
+    report();
     Ok(())
+}
+
+fn report() {
+    let reranker = cross_encoder::default_cross_encoder();
+    let rows = [
+        (
+            "minilm ",
+            downloader::are_models_downloaded(),
+            downloader::get_models_dir(),
+        ),
+        (
+            "ner    ",
+            downloader::are_ner_models_downloaded(),
+            downloader::get_ner_models_dir(),
+        ),
+        (
+            "nomic  ",
+            downloader::are_nomic_models_downloaded(),
+            downloader::get_nomic_models_dir(),
+        ),
+        ("rerank ", reranker.is_cached(), reranker.cache_dir()),
+        (
+            "onnxrt ",
+            downloader::is_onnx_runtime_downloaded(),
+            downloader::get_onnx_runtime_dir(),
+        ),
+    ];
+    for (name, yes, path) in rows {
+        println!("{name} {}", present(yes, path));
+    }
 }
 
 fn present(yes: bool, path: std::path::PathBuf) -> String {

@@ -93,6 +93,12 @@ pub struct CrossEncoderConfig {
     pub model_url: String,
     /// URL for the tokenizer JSON.
     pub tokenizer_url: String,
+    /// SHA-256 of the model file. With a checksum the URL names a fixed revision, a
+    /// download is verified before it lands, and a cached file is verified before it
+    /// loads. `None` accepts whatever the URL serves.
+    pub model_sha256: Option<String>,
+    /// SHA-256 of the tokenizer file; as `model_sha256`.
+    pub tokenizer_sha256: Option<String>,
     /// Hint indicating whether the model's ONNX graph accepts
     /// `token_type_ids`. BERT-family models do; XLM-RoBERTa-family models
     /// (BGE, Jina) do not. This field is **informational only at runtime**
@@ -135,11 +141,17 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
         CrossEncoderConfig {
             id: "mxbai-rerank-xsmall-v1".into(),
             model_url:
-                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/main/onnx/model.onnx"
+                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/b5c6e9da73abc3711f593f705371cdbe9e0fe422/onnx/model.onnx"
                     .into(),
             tokenizer_url:
-                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/main/tokenizer.json"
+                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/b5c6e9da73abc3711f593f705371cdbe9e0fe422/tokenizer.json"
                     .into(),
+            model_sha256: Some(
+                "536b7183f8964dd212c4e2f4029fcc595cfc03ac233aba03d293546aaa5a875b".into(),
+            ),
+            tokenizer_sha256: Some(
+                "305674b4d785287feecfb5f73f24aa75e9b57c87c579cfe24fbd207987d4b4c4".into(),
+            ),
             has_token_type_ids: true,
             params_millions: 70,
             download_mb: 280,
@@ -157,6 +169,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/mixedbread-ai/mxbai-rerank-base-v1/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: true,
             params_millions: 184,
             download_mb: 740,
@@ -173,6 +187,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 33,
             download_mb: 130,
@@ -190,6 +206,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/jinaai/jina-reranker-v1-turbo-en/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 37,
             download_mb: 150,
@@ -207,6 +225,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: true,
             params_millions: 22,
             download_mb: 80,
@@ -230,6 +250,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/hooman650/bge-reranker-v2-m3-onnx-o4/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 568,
             download_mb: 2270,
@@ -248,6 +270,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/mixedbread-ai/mxbai-rerank-large-v1/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: true,
             params_millions: 435,
             download_mb: 1740,
@@ -263,6 +287,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             tokenizer_url:
                 "https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual/resolve/main/tokenizer.json"
                     .into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 278,
             download_mb: 1110,
@@ -442,7 +468,7 @@ impl OnnxCrossEncoder {
         }
     }
 
-    fn cache_dir(&self) -> PathBuf {
+    pub fn cache_dir(&self) -> PathBuf {
         super::downloader::get_cache_dir()
             .join("cross-encoder")
             .join(self.config.cache_key())
@@ -496,9 +522,6 @@ impl OnnxCrossEncoder {
 
     fn ensure_downloaded(&self) -> Result<(PathBuf, PathBuf)> {
         let dir = self.cache_dir();
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create cross-encoder cache dir: {dir:?}"))?;
-
         let model_path = dir.join("model.onnx");
         let tokenizer_path = dir.join("tokenizer.json");
 
@@ -509,16 +532,36 @@ impl OnnxCrossEncoder {
         if std::env::var("VELD_OFFLINE").is_ok_and(|v| v == "true" || v == "1") {
             anyhow::bail!(
                 "Cross-encoder {} not cached and VELD_OFFLINE=true. \
-                 Download manually to {:?}",
+                 Fetch it with `model-fetch --cross-encoder`, or download it manually to {:?}",
                 self.config.id,
                 dir
             );
         }
 
+        self.download(&model_path, &tokenizer_path, None)?;
+        Ok((model_path, tokenizer_path))
+    }
+
+    /// Download whichever of the two files is missing, each verified against its
+    /// checksum when the config pins one.
+    fn download(
+        &self,
+        model_path: &PathBuf,
+        tokenizer_path: &PathBuf,
+        progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    ) -> Result<()> {
+        let dir = self.cache_dir();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create cross-encoder cache dir: {dir:?}"))?;
         tracing::info!("Downloading cross-encoder model ({})...", self.config.id);
         if !model_path.exists() {
-            download_file(&self.config.model_url, &model_path)
-                .with_context(|| format!("Failed to download model for {}", self.config.id))?;
+            super::downloader::download_file_with_checksum(
+                &self.config.model_url,
+                model_path,
+                progress,
+                self.config.model_sha256.as_deref(),
+            )
+            .with_context(|| format!("Failed to download model for {}", self.config.id))?;
             // ONNX exports of models >2 GB split into `model.onnx` + a companion
             // external-data file. The exact filename varies between
             // `model.onnx_data` and `model.onnx.data` depending on the export
@@ -537,11 +580,43 @@ impl OnnxCrossEncoder {
             }
         }
         if !tokenizer_path.exists() {
-            download_file(&self.config.tokenizer_url, &tokenizer_path)
-                .with_context(|| format!("Failed to download tokenizer for {}", self.config.id))?;
+            super::downloader::download_file_with_checksum(
+                &self.config.tokenizer_url,
+                tokenizer_path,
+                progress,
+                self.config.tokenizer_sha256.as_deref(),
+            )
+            .with_context(|| format!("Failed to download tokenizer for {}", self.config.id))?;
         }
         tracing::info!("Cross-encoder downloaded: {}", self.config.id);
-        Ok((model_path, tokenizer_path))
+        Ok(())
+    }
+
+    /// Make the cache hold this model's verified files: a cached file that does not
+    /// match its pinned checksum is removed and fetched again. Returns the cache dir.
+    pub fn fetch(&self, progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>) -> Result<PathBuf> {
+        let dir = self.cache_dir();
+        let model_path = dir.join("model.onnx");
+        let tokenizer_path = dir.join("tokenizer.json");
+        for (path, sha) in [
+            (&model_path, self.config.model_sha256.as_deref()),
+            (&tokenizer_path, self.config.tokenizer_sha256.as_deref()),
+        ] {
+            if let (true, Some(sha)) = (path.exists(), sha) {
+                if !super::downloader::verify_checksum(path, sha)? {
+                    std::fs::remove_file(path)
+                        .with_context(|| format!("Failed to remove {path:?}"))?;
+                }
+            }
+        }
+        self.download(&model_path, &tokenizer_path, progress)?;
+        Ok(dir)
+    }
+
+    /// Whether both files are in the cache, without loading them.
+    pub fn is_cached(&self) -> bool {
+        let dir = self.cache_dir();
+        dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists()
     }
 
     fn ensure_loaded(&self) -> Result<&LazyOnnx> {
@@ -837,6 +912,14 @@ fn sigmoid(x: f32) -> f32 {
 /// `VELD_CROSS_ENCODERS` is set.
 ///
 /// `VELD_CROSS_ENCODERS` takes precedence when both are set.
+/// The built-in default cross-encoder, the one used when no env var selects another.
+pub fn default_cross_encoder() -> OnnxCrossEncoder {
+    OnnxCrossEncoder::new(
+        lookup(DEFAULT_CROSS_ENCODER_ID)
+            .expect("default cross-encoder id must be registered as a built-in"),
+    )
+}
+
 pub fn load_cross_encoder_from_env() -> Arc<dyn CrossEncoderModel> {
     if let Ok(spec) = std::env::var("VELD_CROSS_ENCODERS") {
         match parse_ensemble_spec(&spec) {
@@ -986,6 +1069,21 @@ mod tests {
     }
 
     #[test]
+    fn the_default_reranker_is_pinned_to_a_revision_and_checksums() {
+        let cfg = lookup(DEFAULT_CROSS_ENCODER_ID).unwrap();
+        for url in [&cfg.model_url, &cfg.tokenizer_url] {
+            assert!(
+                !url.contains("/resolve/main/"),
+                "{url} follows a moving branch"
+            );
+        }
+        for sha in [&cfg.model_sha256, &cfg.tokenizer_sha256] {
+            let sha = sha.as_deref().expect("a pinned checksum");
+            assert!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
     fn lookup_resolves_built_ins() {
         assert!(lookup("ms-marco-MiniLM-L-6-v2").is_ok());
         assert!(lookup("bge-reranker-v2-m3").is_ok());
@@ -1012,6 +1110,8 @@ mod tests {
             id: "test-custom-model".into(),
             model_url: "https://example.com/m.onnx".into(),
             tokenizer_url: "https://example.com/t.json".into(),
+            model_sha256: None,
+            tokenizer_sha256: None,
             has_token_type_ids: false,
             params_millions: 100,
             download_mb: 400,
