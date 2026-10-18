@@ -121,6 +121,13 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub rerank_count: Option<usize>,
 
+    /// Override ingest-time contextualisation of conversation turns: the embedding
+    /// and BM25 document of a `Conversation` memory carry its date and the turn
+    /// that preceded it (see `memory::index_text`). `None` keeps the engine
+    /// default, which is on; `Some(false)` indexes the bare content.
+    #[serde(default)]
+    pub turn_context: Option<bool>,
+
     /// Override the RRF fusion weights `(bm25, vector, graph)`. `None` keeps the
     /// engine/learned weights.
     #[serde(default)]
@@ -397,6 +404,7 @@ impl Default for CognitiveDials {
             use_reranking: None,
             candidate_count: None,
             rerank_count: None,
+            turn_context: None,
             rrf_weights: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
@@ -476,6 +484,13 @@ impl CognitiveDials {
         !self.disabled_signals.contains(id)
     }
 
+    /// Whether conversation turns are contextualised at ingest (`turn_context`;
+    /// the engine default is on).
+    #[inline]
+    pub fn turn_context_enabled(&self) -> bool {
+        self.turn_context.unwrap_or(true)
+    }
+
     /// Seed dials from process environment (`VELD_*`), overlaying [`Default`]. Used at
     /// `MemorySystem` construction. Unset vars keep the (inert) default. Result is
     /// [`sanitized`](Self::sanitized). Recognized vars:
@@ -531,6 +546,9 @@ impl CognitiveDials {
         if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_COUNT") {
             d.rerank_count = Some(v);
         }
+        if let Some(v) = env_bool("VELD_DIALS_TURN_CONTEXT") {
+            d.turn_context = Some(v);
+        }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
         d.rrf_k_decomp = env_parse::<f32>("VELD_TUNE_RRF_K_DECOMP").or(d.rrf_k_decomp);
@@ -579,6 +597,8 @@ mod tests {
         assert!(!d.any_re_encode_layer());
         assert!(d.refiner_mode.is_none());
         assert!(d.use_reranking.is_none());
+        assert!(d.turn_context.is_none());
+        assert!(d.turn_context_enabled());
         assert!(d.candidate_count.is_none());
         assert!(d.rrf_weights.is_none());
         assert_eq!(
