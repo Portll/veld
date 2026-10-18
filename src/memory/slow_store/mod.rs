@@ -36,6 +36,7 @@ use rusqlite::{params, Connection, OpenFlags, Transaction};
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 /// Statistics from a graph → SQLite sync operation
@@ -160,7 +161,23 @@ pub struct SlowStore {
     /// when `encryptor` is `Some`.
     enc: SlowStoreEncrypt,
     path: PathBuf,
+    /// When the most recent full rebuild *started*. Set at start, not end, so
+    /// a caller arriving during a long rebuild sees it as fresh and serves the
+    /// existing mirror instead of queueing a second rebuild behind it.
     last_sync: Mutex<Option<std::time::Instant>>,
+    sync_in_flight: AtomicBool,
+}
+
+/// Held by the one caller allowed to rebuild the mirror; clears the in-flight
+/// flag on drop, including on the error path.
+pub struct SyncInFlight<'a> {
+    store: &'a SlowStore,
+}
+
+impl Drop for SyncInFlight<'_> {
+    fn drop(&mut self) {
+        self.store.sync_in_flight.store(false, Ordering::Release);
+    }
 }
 
 /// Maximum reader connections kept idle in the pool. Bursts beyond this open
@@ -310,6 +327,7 @@ impl SlowStore {
             enc,
             path: path.to_owned(),
             last_sync: Mutex::new(None),
+            sync_in_flight: AtomicBool::new(false),
         };
         store.create_schema()?;
         store.check_schema_version()?;
@@ -550,6 +568,30 @@ impl SlowStore {
         }
     }
 
+    /// True until the first rebuild starts.
+    pub fn never_synced(&self) -> bool {
+        self.last_sync.lock().is_none()
+    }
+
+    /// Claim the right to rebuild the mirror. Returns `None` when another
+    /// rebuild is already running or the last one started within `ttl_secs`;
+    /// the caller then serves the existing data. The flag is claimed before
+    /// the TTL is read, so two callers arriving together cannot both pass.
+    pub fn begin_sync(&self, ttl_secs: u64) -> Option<SyncInFlight<'_>> {
+        if self
+            .sync_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        let guard = SyncInFlight { store: self };
+        if !self.should_sync(ttl_secs) {
+            return None;
+        }
+        Some(guard)
+    }
+
     /// Sync entity and edge data from GraphMemory into SQLite.
     ///
     /// Full-mirror semantics: every caller passes the complete graph
@@ -572,6 +614,7 @@ impl SlowStore {
         .entered();
 
         let start = std::time::Instant::now();
+        *self.last_sync.lock() = Some(start);
         let mut stats = SyncStats::default();
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
@@ -607,9 +650,6 @@ impl SlowStore {
                 "SlowStore sync left out edges whose endpoint is not in the graph's entities"
             );
         }
-
-        // Record sync timestamp for TTL-based skip
-        *self.last_sync.lock() = Some(std::time::Instant::now());
 
         tracing::info!(
             "SlowStore sync complete: {} entities, {} edges ({} memory co-retrieval edges left out) in {}ms",
@@ -1552,6 +1592,28 @@ mod tests {
             alice.2,
             vec![0.25, -0.5, 0.75],
             "embedding round-trips through the encrypted column"
+        );
+    }
+
+    #[test]
+    fn only_one_rebuild_may_be_in_flight_and_the_ttl_counts_from_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SlowStore::open(&dir.path().join("slow.db")).unwrap();
+        assert!(store.never_synced());
+
+        let first = store.begin_sync(0).expect("nothing in flight, never synced");
+        assert!(
+            store.begin_sync(0).is_none(),
+            "a second caller must skip while a rebuild is running"
+        );
+        store.sync_from_graph(&[], &[]).unwrap();
+        drop(first);
+
+        assert!(!store.never_synced());
+        assert!(store.begin_sync(0).is_some(), "flag cleared on drop");
+        assert!(
+            store.begin_sync(3600).is_none(),
+            "the rebuild that just started is fresh under a one-hour TTL"
         );
     }
 }

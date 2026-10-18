@@ -875,7 +875,10 @@ pub struct GapStatsResponse {
     pub edge_count: usize,
 }
 
-/// Get lightweight graph stats without running detection.
+/// Get lightweight graph stats without running detection. Serves the counts
+/// the last sync left in the slow store, up to SYNC_TTL_SECS stale; rebuilds
+/// only when the store has never been synced, so a fresh store does not report
+/// zero until another handler happens to sync it.
 ///
 /// POST /api/gap/stats
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
@@ -890,7 +893,9 @@ pub async fn gap_stats(
 
     let result = tokio::task::spawn_blocking(move || -> Result<GapStatsResponse, anyhow::Error> {
         let store = get_or_create_slow_store(&state_clone, &user_id)?;
-        sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
+        if store.never_synced() {
+            sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
+        }
         Ok(GapStatsResponse {
             entity_count: store.entity_count()?,
             edge_count: store.edge_count()?,
@@ -918,16 +923,17 @@ fn get_or_create_slow_store(
 }
 
 /// Sync graph data from RocksDB (GraphMemory) into SQLite (SlowStore).
-/// Skips sync if the last sync was less than SYNC_TTL_SECS ago.
+/// Skips when a rebuild is already running or the last one started less than
+/// SYNC_TTL_SECS ago; the caller serves the existing mirror in both cases.
 fn sync_graph_to_slow_store(
     state: &MultiUserMemoryManager,
     user_id: &str,
     store: &SlowStore,
 ) -> Result<(), anyhow::Error> {
-    if !store.should_sync(SYNC_TTL_SECS) {
-        tracing::debug!("SlowStore sync skipped (TTL)");
+    let Some(_in_flight) = store.begin_sync(SYNC_TTL_SECS) else {
+        tracing::debug!("SlowStore sync skipped (in flight or within TTL)");
         return Ok(());
-    }
+    };
 
     let graph = state
         .get_user_graph(user_id)
