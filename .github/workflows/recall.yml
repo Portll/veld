@@ -197,6 +197,10 @@ jobs:
           # NER is the shipped system here; the harness's refusal of it is upstream's, which ships
           # GLiNER.
           SHODH_ALLOW_FALLBACK_NER: '1'
+          # A second, 100-deep recall per case fills the per-case recall@50/@100 fields so a miss
+          # can be read as rank-low (gold in 11..100) or never retrieved. The headline metrics come
+          # from the production-depth query alone (src/recall_harness/runner.rs, diag_k).
+          RECALL_DIAG_K: '100'
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
         run: |
