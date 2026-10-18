@@ -1,0 +1,169 @@
+{
+  "note": "Pinned rows for the `demo` profile. Every statement here is about veld itself and is drawn from this repository, so the demo screenshots disclose nothing that is not already published. Ages are minutes before seed time and sit inside the last hour, so these rows lead the activity feed instead of sinking below the repo scan, so a fresh seed reads as a session that just happened; set VELD_DEMO_NOW to `anchor` for a byte-identical reproduction. The repo scan in scripts/seed-demo.mjs supplies the surrounding density.",
+  "anchor": "2026-01-15T09:00:00Z",
+  "memories": [
+    {
+      "minutesAgo": 0,
+      "type": "Decision",
+      "tags": [
+        "storage",
+        "redb",
+        "rocksdb"
+      ],
+      "content": "Storage backend is chosen by VELD_STORAGE_BACKEND. The Cargo default is redb and a deployment holding RocksDB data must pin rocksdb explicitly, or a boot opens an empty store beside the real one."
+    },
+    {
+      "minutesAgo": 3,
+      "type": "Learning",
+      "tags": [
+        "bincode",
+        "serde",
+        "compatibility"
+      ],
+      "content": "serde(default) fills a missing field only on a self-describing codec. bincode is positional, so a field appended to a persisted struct is read from the next field's bytes and everything after it misreads."
+    },
+    {
+      "minutesAgo": 6,
+      "type": "Pattern",
+      "tags": [
+        "testing",
+        "fixtures"
+      ],
+      "content": "A round-trip test encodes and decodes with one struct definition, so it proves self-consistency and nothing about bytes already on disk. A compatibility test needs a fixture the current code cannot regenerate."
+    },
+    {
+      "minutesAgo": 9,
+      "type": "Discovery",
+      "tags": [
+        "embedding",
+        "recall"
+      ],
+      "content": "Recall quality tracks the embedder far more than the ranker. Swapping the embedding model re-embeds every record, which is why a model change is a migration and not a setting."
+    },
+    {
+      "minutesAgo": 12,
+      "type": "CodeEdit",
+      "tags": [
+        "graph",
+        "hebbian"
+      ],
+      "content": "Synapse strengthening keys on the source memory, so repeated recall of one neighbour no longer inflates every edge into it."
+    },
+    {
+      "minutesAgo": 15,
+      "type": "Task",
+      "tags": [
+        "tui",
+        "branding"
+      ],
+      "content": "The terminal mark is generated from the same blade table as the logo raster, so the TUI art and the shipped PNG cannot drift apart."
+    },
+    {
+      "minutesAgo": 18,
+      "type": "Error",
+      "tags": [
+        "pty",
+        "tooling"
+      ],
+      "content": "A pty created without an explicit window size reports 0x0, and a terminal UI draws nothing into it. The capture looked successful and produced blank frames."
+    },
+    {
+      "minutesAgo": 21,
+      "type": "Observation",
+      "tags": [
+        "decay",
+        "half-life"
+      ],
+      "content": "Edge decay is tiered: recent edges decay per hour, older ones per day, and an edge that survives long enough stops decaying at all. Tuning the constants without measuring revisit intervals moves nothing."
+    },
+    {
+      "minutesAgo": 24,
+      "type": "Decision",
+      "tags": [
+        "api",
+        "auth"
+      ],
+      "content": "Every route takes X-API-Key and the key maps to a set of profiles. A profile is a namespace, not an account, so a demo profile sits beside production data without seeing it."
+    },
+    {
+      "minutesAgo": 27,
+      "type": "Learning",
+      "tags": [
+        "mcp",
+        "tools"
+      ],
+      "content": "An MCP server pins its tool list at process start. A session told to call a tool its live process never registered reports the failure as its own mistake."
+    },
+    {
+      "minutesAgo": 30,
+      "type": "Context",
+      "tags": [
+        "architecture",
+        "storage"
+      ],
+      "content": "Writes go through a fast store and are mirrored into a slow store on a background task. Shutdown waits for that task, so a clean stop cannot lose an acknowledged write."
+    },
+    {
+      "minutesAgo": 33,
+      "type": "Pattern",
+      "tags": [
+        "search",
+        "hybrid"
+      ],
+      "content": "Hybrid search blends vector similarity with lexical match. The lexical half carries exact identifiers, which the vector half reliably loses."
+    },
+    {
+      "minutesAgo": 36,
+      "type": "Discovery",
+      "tags": [
+        "graph",
+        "entities"
+      ],
+      "content": "Entity extraction over 800 source files produces a graph whose hubs are the files most sessions touch, not the files with the most code."
+    },
+    {
+      "minutesAgo": 39,
+      "type": "Task",
+      "tags": [
+        "cli",
+        "recall"
+      ],
+      "content": "veld recall takes a query and a profile and prints ranked results with their tags. It reads the same path the MCP tool does, so a disagreement between them is a bug in one caller."
+    },
+    {
+      "minutesAgo": 42,
+      "type": "Observation",
+      "tags": [
+        "disk",
+        "rocksdb"
+      ],
+      "content": "After a disk-full the store can latch: health answers 200 and reads succeed while every write returns ENOSPC with space free. Only the server log says so."
+    },
+    {
+      "minutesAgo": 45,
+      "type": "Decision",
+      "tags": [
+        "licence"
+      ],
+      "content": "veld ships under an evaluation licence. The source is readable and runnable for assessment; production use is a separate conversation."
+    },
+    {
+      "minutesAgo": 48,
+      "type": "Learning",
+      "tags": [
+        "todos",
+        "lineage"
+      ],
+      "content": "A todo records why it was created and what it led to, so the causal chain is queryable. The chain is the point: a task list without lineage is a list."
+    },
+    {
+      "minutesAgo": 51,
+      "type": "Context",
+      "tags": [
+        "profiles",
+        "demo"
+      ],
+      "content": "This profile is seeded from veld's own repository by scripts/seed-demo.mjs. Anything it shows is already public, which is what makes it safe to screenshot."
+    }
+  ]
+}
