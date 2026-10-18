@@ -67,6 +67,7 @@ pub fn cooldown() -> Duration {
     ))
 }
 
+#[cfg(feature = "rocksdb")]
 fn restart_on_hard_latch() -> bool {
     matches!(
         std::env::var("VELD_WRITE_LATCH_RESTART").as_deref(),
@@ -410,6 +411,7 @@ pub fn available_bytes(path: &Path) -> Option<u64> {
 /// successful retry, so a flush+retry genuinely unlatches part of the
 /// population. For the rest this marks the latch hard and says what a reader
 /// must do about it.
+#[cfg(feature = "rocksdb")]
 pub fn recover_write<T>(
     latch: &WriteLatch,
     db: &rocksdb::DB,
@@ -486,6 +488,7 @@ pub fn recover_write<T>(
     }
 }
 
+#[cfg(feature = "rocksdb")]
 fn report_hard(latch: &WriteLatch, path: &Path, detail: &str) {
     // `reason_at` before `claim_hard_notice`: the notice is claimable once, and
     // a clear racing in between would leave the one ERROR line without a cause.
@@ -510,6 +513,7 @@ fn report_hard(latch: &WriteLatch, path: &Path, detail: &str) {
 }
 
 /// Opt-in, default off: exiting is a behaviour change an operator chooses.
+#[cfg(feature = "rocksdb")]
 fn maybe_restart(path: &Path) {
     if !restart_on_hard_latch() {
         return;
@@ -824,6 +828,7 @@ mod tests {
     // and there is no `/dev/full` on macOS), so the false-negative direction is
     // asserted over a real error carrying the production text in its chain.
 
+    #[cfg(feature = "rocksdb")]
     fn a_real_rocksdb_error() -> rocksdb::Error {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("db");
@@ -840,6 +845,7 @@ mod tests {
             .expect_err("a read-only DB must refuse a write")
     }
 
+    #[cfg(feature = "rocksdb")]
     #[test]
     fn false_positive_direction_a_real_rocksdb_error_is_not_enospc() {
         let raw = a_real_rocksdb_error();
@@ -864,6 +870,7 @@ mod tests {
         assert!(!latch.is_latched());
     }
 
+    #[cfg(feature = "rocksdb")]
     #[test]
     fn false_negative_direction_a_real_error_chain_carrying_enospc_does_latch() {
         let raw = a_real_rocksdb_error();
@@ -885,6 +892,7 @@ mod tests {
     /// return the caller's error untouched and leave nothing latched. Driving
     /// the whole body matters because the classifier being right does not make
     /// the surrounding decisions right.
+    #[cfg(feature = "rocksdb")]
     #[test]
     fn recover_write_passes_a_non_enospc_error_straight_through() {
         let dir = tempfile::tempdir().expect("tempdir");
