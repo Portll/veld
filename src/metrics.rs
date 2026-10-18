@@ -785,6 +785,20 @@ pub static EMBEDDING_CACHE_QUERY: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 
 /// Embedding cache operations (content cache)
+/// Conversation turns contextualised at ingest, by where the prior turn came from:
+/// `preceding_id` (the writer threaded the episode), `conversation_key` (resolved
+/// from the latest turn sharing the conversation), `none` (no prior turn found).
+pub static TURN_CONTEXT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_turn_context_total",
+            "Conversation turns contextualised at ingest, by prior-turn source",
+        ),
+        &["source"],
+    )
+    .expect("TURN_CONTEXT_TOTAL metric must be valid at compile time")
+});
+
 pub static EMBEDDING_CACHE_CONTENT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -1016,6 +1030,7 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     // Embedding cache metrics (SHO-68)
     register!(EMBEDDING_CACHE_QUERY, "EMBEDDING_CACHE_QUERY");
     register!(EMBEDDING_CACHE_CONTENT, "EMBEDDING_CACHE_CONTENT");
+    register!(TURN_CONTEXT_TOTAL, "TURN_CONTEXT_TOTAL");
     register!(EMBEDDING_CACHE_QUERY_SIZE, "EMBEDDING_CACHE_QUERY_SIZE");
     register!(EMBEDDING_CACHE_CONTENT_SIZE, "EMBEDDING_CACHE_CONTENT_SIZE");
     register!(RETRIEVAL_VARIANCE_SEMANTIC, "RETRIEVAL_VARIANCE_SEMANTIC");
