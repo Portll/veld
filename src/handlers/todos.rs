@@ -2307,7 +2307,7 @@ pub async fn list_subtasks(
         format!("No subtasks for {}", parent.short_id())
     } else {
         let mut output = format!(
-            "🐘━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+            "🌾━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
              ┃  SUBTASKS OF {}  ┃\n\
              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n",
             parent.short_id()

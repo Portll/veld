@@ -636,6 +636,9 @@ fn is_mcp_decorator(c: char) -> bool {
             | '📋'
             | '📌'
             | '💡'
+            | '🌾'
+            // The elephant predates the grassland mark. Content written before it is still in
+            // the store, so both are stripped; dropping it would leave old memories decorated.
             | '🐘'
             | '⚡'
             | '🔍'
