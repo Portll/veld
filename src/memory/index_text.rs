@@ -176,15 +176,17 @@ pub fn chain_tail_precedes(
 }
 
 /// Pick the better of two chain tails for the same conversation: the higher
-/// sequence number when both carry one, else the later `created_at`, else the
-/// one already held (arrival order breaks exact ties).
+/// sequence number when both carry one, else the later `created_at`, and on an
+/// exact timestamp tie the later arrival (`candidate`). Turns of one session often
+/// share a timestamp (the LoCoMo corpus stamps a whole day's session alike), and
+/// the turn written last is the one the next turn answers.
 pub fn later_tail(current: Option<ChainTail>, candidate: ChainTail) -> ChainTail {
     match current {
         None => candidate,
         Some(held) => {
             let candidate_wins = match (held.sequence_number, candidate.sequence_number) {
                 (Some(a), Some(b)) => b > a,
-                _ => candidate.created_at > held.created_at,
+                _ => candidate.created_at >= held.created_at,
             };
             if candidate_wins {
                 candidate
@@ -435,6 +437,22 @@ mod tests {
         assert!(!chain_tail_precedes(&kept, at(2022, 5, 1), Some(3)));
         assert!(chain_tail_precedes(&kept, at(2022, 5, 1), Some(4)));
         assert!(chain_tail_precedes(&kept, at(2022, 5, 1), None));
+    }
+
+    #[test]
+    fn an_exact_timestamp_tie_goes_to_the_later_arrival() {
+        let first = ChainTail {
+            id: MemoryId(uuid::Uuid::new_v4()),
+            created_at: at(2022, 5, 1),
+            sequence_number: None,
+        };
+        let second = ChainTail {
+            id: MemoryId(uuid::Uuid::new_v4()),
+            created_at: at(2022, 5, 1),
+            sequence_number: None,
+        };
+        let kept = later_tail(Some(first), second.clone());
+        assert_eq!(kept.id, second.id);
     }
 
     #[test]
