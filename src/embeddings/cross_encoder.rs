@@ -77,6 +77,14 @@ pub trait CrossEncoderModel: Send + Sync {
     /// Score (query, document) pairs. Returns raw logits per document; higher
     /// = more relevant. Length matches `documents`.
     fn score_pairs(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>>;
+
+    /// Fetch whatever this model needs from the network, without building an
+    /// ONNX session. This is the only part of loading that [`prewarm`] does off
+    /// the caller's thread — see the pre-warm worker's notes for why the session
+    /// build may not run there. Default: nothing to fetch.
+    fn prefetch(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -474,50 +482,24 @@ impl OnnxCrossEncoder {
             .join(self.config.cache_key())
     }
 
-    /// Eagerly download + load on a background thread. Idempotent.
-    /// Skipped when `VELD_LAZY_CROSS_ENCODER=1`.
+    /// Fetch the model files on the shared pre-warm worker so the first query
+    /// pays only for the ONNX session build. Idempotent. Skipped when
+    /// `VELD_LAZY_CROSS_ENCODER=1`.
     pub fn prewarm(self_arc: Arc<Self>) {
-        let lazy = std::env::var("VELD_LAZY_CROSS_ENCODER")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-        if lazy {
+        if prewarm_disabled() {
             tracing::debug!(
                 "cross-encoder pre-warm skipped for {} (VELD_LAZY_CROSS_ENCODER set)",
                 self_arc.config.id
             );
             return;
         }
-        // The thread below is detached: `.spawn(…).ok()` drops the JoinHandle and
-        // nothing joins it. A test binary exits seconds after start, so teardown can
-        // race an in-flight ONNX CreateSession; a server runs for hours and the
-        // pre-warm is long done.
-        //
-        // Measured 2026-09-02: `cargo test --lib memory::` segfaulted on ~half of
-        // parallel runs, always AFTER `test result: ok`; the crash report named this
-        // thread, EXC_BAD_ACCESS at 0x17 in InferenceSession::Initialize. Three
-        // single-threaded runs were clean.
-        //
-        // Skipped rather than joined — a pre-warm you wait for is not a pre-warm.
-        // A caller needing the model loaded calls `ensure_loaded()` directly.
-        if cfg!(test) {
-            return;
-        }
-        std::thread::Builder::new()
-            .name(format!("cross-encoder-prewarm-{}", self_arc.config.id))
-            .spawn(move || match self_arc.ensure_loaded() {
-                Ok(_) => tracing::info!("Cross-encoder pre-warmed: {}", self_arc.config.id),
-                Err(e) => tracing::warn!(
-                    "Cross-encoder pre-warm failed for {} (lazy fallback engaged): {e}",
-                    self_arc.config.id
-                ),
-            })
-            .ok();
+        submit_prewarm(Box::new(move || match self_arc.prefetch() {
+            Ok(_) => tracing::info!("Cross-encoder files ready: {}", self_arc.config.id),
+            Err(e) => tracing::warn!(
+                "Cross-encoder pre-fetch failed for {} (lazy fallback engaged): {e}",
+                self_arc.config.id
+            ),
+        }));
     }
 
     fn ensure_downloaded(&self) -> Result<(PathBuf, PathBuf)> {
@@ -753,6 +735,10 @@ impl CrossEncoderModel for OnnxCrossEncoder {
         self.available.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn prefetch(&self) -> Result<()> {
+        self.ensure_downloaded().map(|_| ())
+    }
+
     /// Scores N (query, document) pairs, each in its own forward pass at its own token length,
     /// capped at `MAX_PAIR_LENGTH`. One batch would pad every pair to the longest, letting one long
     /// memory set the cost of all of them; on live 20-candidate sets, pair by pair takes half the
@@ -864,6 +850,17 @@ impl CrossEncoderModel for EnsembleCrossEncoder {
     fn is_available(&self) -> bool {
         // The ensemble is usable as soon as any member is available.
         self.members.iter().any(|(m, _)| m.is_available())
+    }
+
+    fn prefetch(&self) -> Result<()> {
+        // Best-effort per member: one member that cannot be fetched should not
+        // stop the others from being ready.
+        for (model, _) in &self.members {
+            if let Err(e) = model.prefetch() {
+                tracing::warn!("ensemble member {} prefetch failed: {e}", model.id());
+            }
+        }
+        Ok(())
     }
 
     fn score_pairs(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
@@ -978,15 +975,75 @@ fn parse_ensemble_spec(spec: &str) -> Result<Arc<dyn CrossEncoderModel>> {
     Ok(Arc::new(EnsembleCrossEncoder::new(members)))
 }
 
-/// Pre-warm a cross-encoder (single model or ensemble) by issuing a dummy
-/// `score_pairs` call on a background thread. For [`OnnxCrossEncoder`] this
-/// triggers the ~80 MB download and ONNX session build; for
-/// [`EnsembleCrossEncoder`] it cascades into every member. Idempotent — the
-/// underlying `OnceLock` guards against duplicate work.
+/// Pre-fetch a cross-encoder's files (single model or ensemble) on the shared
+/// pre-warm worker, so the first query pays for the ONNX session build and not
+/// for an 80-280 MB download. Idempotent — a model already on disk returns
+/// immediately.
 ///
 /// Skipped when `VELD_LAZY_CROSS_ENCODER=1` is set.
 pub fn prewarm(model: Arc<dyn CrossEncoderModel>) {
-    let lazy = std::env::var("VELD_LAZY_CROSS_ENCODER")
+    if prewarm_disabled() {
+        tracing::debug!("cross-encoder pre-warm skipped ({})", model.id());
+        return;
+    }
+    let id = model.id().to_string();
+    submit_prewarm(Box::new(move || match model.prefetch() {
+        Ok(_) => tracing::info!("Cross-encoder files ready: {id}"),
+        Err(e) => {
+            tracing::warn!("Cross-encoder pre-fetch failed for {id} (lazy fallback engaged): {e}")
+        }
+    }));
+}
+
+// -----------------------------------------------------------------------------
+// Pre-warm worker
+// -----------------------------------------------------------------------------
+//
+// THE PRE-WARM WORKER NEVER BUILDS AN ONNX SESSION. It downloads, and that is
+// all. An ONNX session may only be built on a thread the process waits for —
+// a test thread, a request thread, a blocking task inside a runtime that is
+// dropped — never on one that can still be running when the process exits.
+//
+// Why, measured on handler_tests at 314c070. The pre-warm used to run
+// `ensure_loaded()` on a detached thread, one per `CrossEncoderReranker`:
+// SIGSEGV after `test result: ok` in 13 of 20 direct runs. EXC_BAD_ACCESS at
+// 0x17 on a thread named `cross-encoder-prewarm-mxbai-rerank-xsmall-v1`, frames
+// `OpSchema::FormalParameter::FormalParameter(const&)` <- `InferAndVerifyTypeMatch`
+// <- `ConstantFolding::ApplyImpl` <- `InferenceSession::Initialize`, while the
+// main thread sat in `rocksdb::PosixEnv::JoinThreadsOnExit::~JoinThreadsOnExit()`.
+// `exit()` was already destroying C++ statics, ONNX Runtime's operator-schema
+// registry among them, and the session build read them after they were gone.
+// 35 such threads were live in that one crash report.
+//
+// The guard that stood here, `if cfg!(test) { return }`, could not cover it:
+// `test` is not set when the lib is compiled as a dependency of an integration
+// test binary, so it protected `cargo test --lib` and nothing under `tests/`.
+// It also said nothing about a production process that exits mid-pre-warm,
+// which is the same bug.
+//
+// Joining the worker from a `libc::atexit` handler was tried and does not work,
+// and the reason generalises to any exit hook. Handlers run newest-registered
+// first, and ONNX Runtime constructs the schema registry lazily inside the first
+// `CreateSession` — so its destructor is always registered after any hook we
+// could arm beforehand, and always runs first. Measured: the handler did run
+// (`shutdown_prewarm` <- `__cxa_finalize_ranges` <- `exit` on the main thread)
+// and the worker still faulted inside `OpSchemaRegistry::Schema`. Loading the
+// dylib early with `ort::api()` does not change it; the registry is not built
+// at dlopen.
+//
+// So the fix is ownership, not ordering: the work that cannot survive teardown
+// does not run where teardown can reach it.
+
+type PrewarmJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Sender for the single background worker. One thread, not one per reranker:
+/// the 35 concurrent downloads the old code could start were 35 copies of the
+/// same fetch.
+static PREWARM_TX: LazyLock<Mutex<Option<std::sync::mpsc::Sender<PrewarmJob>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn prewarm_disabled() -> bool {
+    std::env::var("VELD_LAZY_CROSS_ENCODER")
         .ok()
         .map(|v| {
             matches!(
@@ -994,27 +1051,32 @@ pub fn prewarm(model: Arc<dyn CrossEncoderModel>) {
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(false);
-    if lazy {
-        tracing::debug!("cross-encoder pre-warm skipped ({})", model.id());
-        return;
+        .unwrap_or(false)
+}
+
+fn submit_prewarm(job: PrewarmJob) {
+    let mut slot = PREWARM_TX.lock();
+    if slot.is_none() {
+        let (tx, rx) = std::sync::mpsc::channel::<PrewarmJob>();
+        let spawned = std::thread::Builder::new()
+            .name("cross-encoder-prewarm".to_string())
+            .spawn(move || {
+                for job in rx {
+                    job();
+                }
+            })
+            .is_ok();
+        if !spawned {
+            tracing::warn!(
+                "cross-encoder pre-warm worker could not be spawned; loading stays lazy"
+            );
+            return;
+        }
+        *slot = Some(tx);
     }
-    let id = model.id().to_string();
-    // Same detached-thread hazard as the method above — see its comment.
-    if cfg!(test) {
-        return;
+    if let Some(tx) = slot.as_ref() {
+        let _ = tx.send(job);
     }
-    std::thread::Builder::new()
-        .name(format!("cross-encoder-prewarm-{id}"))
-        .spawn(
-            move || match model.score_pairs(WARMUP_TEXT, &[WARMUP_TEXT]) {
-                Ok(_) => tracing::info!("Cross-encoder pre-warmed: {id}"),
-                Err(e) => tracing::warn!(
-                    "Cross-encoder pre-warm failed for {id} (lazy fallback engaged): {e}"
-                ),
-            },
-        )
-        .ok();
 }
 
 // -----------------------------------------------------------------------------
@@ -1033,10 +1095,20 @@ fn download_file(url: &str, path: &PathBuf) -> Result<()> {
     }
 
     let mut reader = resp.into_body().into_reader();
-    let mut file =
-        std::fs::File::create(path).with_context(|| format!("Failed to create file: {path:?}"))?;
+    // Write beside the target and rename: `ensure_downloaded` treats an existing
+    // file as a complete one, so a download cut short — the pre-warm worker is
+    // not joined at exit — must not leave a truncated model under that name.
+    let partial = path.with_extension(format!(
+        "{}.part",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    let mut file = std::fs::File::create(&partial)
+        .with_context(|| format!("Failed to create file: {partial:?}"))?;
 
     std::io::copy(&mut reader, &mut file)?;
+    drop(file);
+    std::fs::rename(&partial, path)
+        .with_context(|| format!("Failed to publish downloaded file: {path:?}"))?;
     Ok(())
 }
 
