@@ -277,7 +277,7 @@ pub type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// Verify SHA-256 checksum of a file
 /// Used for model integrity verification when checksum values are provided
-fn verify_checksum(path: &Path, expected: &str) -> Result<bool> {
+pub(crate) fn verify_checksum(path: &Path, expected: &str) -> Result<bool> {
     let mut file = fs::File::open(path).context("Failed to open file for checksum")?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
@@ -334,9 +334,28 @@ fn download_file(
     download_file_with_checksum(url, path, progress, None)
 }
 
-/// Download a file with SHA-256 checksum verification
-fn download_file_with_checksum(
+/// Download a file with SHA-256 checksum verification. The bytes go to `<path>.part` and
+/// are renamed over `path` only once complete and verified, so an interrupted or
+/// corrupted download never leaves a file that looks cached.
+pub(crate) fn download_file_with_checksum(
     url: &str,
+    path: &PathBuf,
+    progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    expected_checksum: Option<&str>,
+) -> Result<()> {
+    let mut part = path.clone().into_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let outcome = download_to(url, &part, path, progress, expected_checksum);
+    if outcome.is_err() {
+        let _ = fs::remove_file(&part);
+    }
+    outcome
+}
+
+fn download_to(
+    url: &str,
+    part: &PathBuf,
     path: &PathBuf,
     progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
     expected_checksum: Option<&str>,
@@ -366,7 +385,7 @@ fn download_file_with_checksum(
         .unwrap_or(0);
 
     let mut reader = response.into_body().into_reader();
-    let mut file = fs::File::create(path).context("Failed to create output file")?;
+    let mut file = fs::File::create(part).context("Failed to create output file")?;
 
     // Compute checksum while downloading for efficiency
     let mut hasher = Sha256::new();
@@ -404,10 +423,6 @@ fn download_file_with_checksum(
 
     if let Some(expected) = expected_checksum {
         if actual_checksum != expected.to_lowercase() {
-            // Delete the corrupted file - log if deletion fails
-            if let Err(e) = fs::remove_file(path) {
-                tracing::error!("Failed to delete corrupted file {path:?}: {e}");
-            }
             anyhow::bail!(
                 "Checksum verification failed for {path:?}. Expected: {expected}, Got: {actual_checksum}. File deleted for security."
             );
@@ -422,6 +437,9 @@ fn download_file_with_checksum(
         );
     }
 
+    file.sync_all().context("Failed to flush the download")?;
+    drop(file);
+    fs::rename(part, path).with_context(|| format!("Failed to move {part:?} to {path:?}"))?;
     Ok(())
 }
 
@@ -992,5 +1010,59 @@ mod tests {
     fn test_nomic_models_dir() {
         let models_dir = get_nomic_models_dir();
         assert!(models_dir.to_string_lossy().contains("nomic-embed-v1.5"));
+    }
+
+    /// Serve `body` once over HTTP on loopback; returns the URL.
+    fn serve_once(body: &'static [u8]) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        url
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn a_verified_download_lands_whole_and_leaves_no_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.onnx");
+        let body: &'static [u8] = b"pinned model bytes";
+        download_file_with_checksum(&serve_once(body), &path, None, Some(&sha256_hex(body)))
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), body);
+        assert!(!dir.path().join("model.onnx.part").exists());
+    }
+
+    #[test]
+    fn a_mismatched_download_leaves_the_cached_copy_and_no_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.onnx");
+        fs::write(&path, b"the copy already cached").unwrap();
+        let err = download_file_with_checksum(
+            &serve_once(b"tampered bytes"),
+            &path,
+            None,
+            Some(&sha256_hex(b"pinned model bytes")),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("Checksum verification failed"));
+        assert_eq!(fs::read(&path).unwrap(), b"the copy already cached");
+        assert!(!dir.path().join("model.onnx.part").exists());
     }
 }

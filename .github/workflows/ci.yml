@@ -259,10 +259,10 @@ jobs:
         id: models
         with:
           path: ~/.cache/veld
-          key: veld-models-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs') }}
-      - name: Fetch the ONNX runtime and MiniLM
+          key: veld-models-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs', 'src/embeddings/cross_encoder.rs') }}
+      - name: Fetch the ONNX runtime, MiniLM and the reranker
         if: steps.models.outputs.cache-hit != 'true'
-        run: cargo run --quiet --bin model-fetch -- --onnxruntime --minilm
+        run: cargo run --quiet --bin model-fetch -- --onnxruntime --minilm --cross-encoder
 
       - name: Run all tests
         # pipefail: without it the step's status is tee's, and neither a failing test nor a compile
