@@ -5,18 +5,19 @@
 //
 // bank/<id>.json is the job; state/<id>.json its status; out/<id>/ the prompt, reply, files and
 // gate; ledger.jsonl one row per run; status.json the queue and its ready buffer in minutes.
+import * as PATHS from '../paths.mjs';
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync, readdirSync, rmSync, appendFileSync, openSync, closeSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { request } from 'node:http';
-import { runPrompt } from '/Users/portll/Repositories/Portll/spine/prompt-runner.mjs';
+const { runPrompt } = await import(join(PATHS.SPINE_REPO, 'prompt-runner.mjs'));
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
+const ROOT = PATHS.LANE_HOME;
 // A track is one reader being built: its worktree and branch, its corpus and measure, the paths a
 // draft may write and the prompt template. A job names its track; PL/I is the default.
-const LANG = '/Users/portll/.claude/scratch/lang-qwen';
+const LANG = PATHS.LANG_HOME;
 const TRACKS = {
   pli: { repo: '/Users/portll/Repositories/Portll/cobolwork-pli-20261001', branch: 'feat/pli', corpus: join(ROOT, 'corpus'), synthetic: ['jcf608_PacificNationalBank'],
     measure: './diag/pli-measure.mjs', allowed: /^(lib\/pli\/|test\/pli-[A-Za-z0-9_-]+\.test\.mjs$|diag\/pli-|bench\/pli\/)/, template: 'cobolwork_pli' },
@@ -77,7 +78,7 @@ const setState = (id, patch) => writeFileSync(join(ROOT, 'state', `${id}.json`),
 const DONE = new Set(['landed', 'dropped']);
 
 // A knowledge-base job needs veld up and its sources ingested; health is asked at most once a minute.
-const KB = '/Users/portll/.claude/scratch/veld-kb';
+const KB = PATHS.KB_HOME;
 let veldUp = { at: 0, ok: false };
 function veldHealthy() {
   if (Date.now() - veldUp.at > 60000) {
@@ -148,7 +149,7 @@ function writeStatus(extra = {}) {
 // what review made of the ones that passed, and how much work is queued.
 const FAMILY = (id) => (id.startsWith('k-') ? 'knowledge base' : /^p-|^f\d/.test(id) ? 'benchmark pair' : /^[ib]\d|^d\d|^c\d|^e\d/.test(id) ? 'parser or rule' : /^h-/.test(id) ? 'hill-climb' : /^a-/.test(id) ? 'audit' : 'other');
 async function exportLaneLoop(status) {
-  const { writeLoop, trajectory, tally } = await import(join(KB, 'loops.mjs'));
+  const { writeLoop, trajectory, tally } = await import(new URL('../kb/loops.mjs', import.meta.url));
   const rows = ledgerRows();
   const runs = rows.filter((r) => r.type !== 'review');
   const reviews = rows.filter((r) => r.type === 'review');
@@ -423,7 +424,7 @@ function gate(job, files, outDir) {
     // An HLASM pair is assembled by z390 and scored by the bench; it passes only when both hold.
     const cases = [...new Set(kept.map((f) => /^bench\/cases\/(hlasm-[a-z0-9-]+)\//.exec(f.path)?.[1]).filter(Boolean))];
     if (cases.length) {
-      const b = run(process.execPath, ['bench/run.mjs', '--json', '--validate', '--only', cases.join(',')], { cwd: dir, timeout: 300000, env: { ...process.env, Z390: '/Users/portll/.claude/scratch/z390/z390_1.8.4.4' } });
+      const b = run(process.execPath, ['bench/run.mjs', '--json', '--validate', '--only', cases.join(',')], { cwd: dir, timeout: 300000, env: { ...process.env, Z390: PATHS.Z390_HOME } });
       let res = null;
       try { res = JSON.parse(b.out.slice(b.out.indexOf('{'))); } catch { report.push(`bench did not run:\n${b.out.slice(-1200)}`); }
       if (res) {
@@ -444,7 +445,7 @@ function gate(job, files, outDir) {
       mkdirSync(join(tmp, 'fix', 'case'), { recursive: true });
       mkdirSync(join(tmp, 'members', 'case'), { recursive: true });
       for (const f of fixtures) writeFileSync(join(tmp, 'fix', 'case', f.path.split('/').pop()), f.body);
-      const env = { Z390: '/Users/portll/.claude/scratch/z390/z390_1.8.4.4' };
+      const env = { Z390: PATHS.Z390_HOME };
       const o = run(process.execPath, ['diag/hlasm-oracle.mjs', tmp, join(tmp, 'oracle'), '--split', 'fix', '--force'], { cwd: dir, env, timeout: 300000 });
       const oracles = existsSync(join(tmp, 'oracle')) ? readdirSync(join(tmp, 'oracle')).map((f) => readJson(join(tmp, 'oracle', f))).filter(Boolean) : [];
       if (!oracles.length) report.push(`z390 did not produce an oracle for the fixture:\n${o.out.slice(-1500)}`);
@@ -508,7 +509,7 @@ function draftGroq(job) {
   const model = job.model || 'qwen/qwen3.8-27b';
   const env = {
     ...process.env, SPINE_LLM_LEDGER: '/Users/portll/.spine/llm-runs.jsonl', SPINE_LLM_MAX_TOKENS: String(job.maxTokens || 4000),
-    SPINE_LLM_RATE_WAIT_MS: '240000', SPINE_PROMPTS_DIR: '/Users/portll/.claude/scratch/spine-prompts', SPINE_LLM_TEMPERATURE: '0.2',
+    SPINE_LLM_RATE_WAIT_MS: '240000', SPINE_PROMPTS_DIR: PATHS.SPINE_PROMPTS_DIR, SPINE_LLM_TEMPERATURE: '0.2',
     VELD_API_URL: 'http://127.0.0.1:9',
   };
   return runPrompt({ tool: trackOf(job).template, context: context(job), provider: 'groq', model, reasoning: job.reasoning || (model.startsWith('openai/') ? 'low' : 'none'), env });
@@ -522,7 +523,7 @@ async function draft(job) {
     ...process.env,
     SPINE_LLM_URL: host.url, SPINE_LLM_MODEL: 'qwen/qwen3.8-27b', SPINE_LLM_API_KEY: key,
     SPINE_LLM_TIMEOUT_MS: String(75 * 60 * 1000), SPINE_LLM_MAX_TOKENS: String(job.maxTokens || (/^(p-|f\d)/.test(job.id) ? 6000 : 16000)),
-    SPINE_PROMPTS_DIR: '/Users/portll/.claude/scratch/spine-prompts', SPINE_LLM_TEMPERATURE: '0.2',
+    SPINE_PROMPTS_DIR: PATHS.SPINE_PROMPTS_DIR, SPINE_LLM_TEMPERATURE: '0.2',
     // Drafts are not copied into veld: each is 30-60 KB of prompt and reply, and veld chunks every one.
     VELD_API_URL: 'http://127.0.0.1:9',
   };

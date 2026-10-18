@@ -1,9 +1,10 @@
 // Writes one runner job per knowledge-base target into the Qwen bank.   node gen-kb.mjs [kbId ...]
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { KBS, writeSnapshot } from './kbgen.mjs';
 
-const BANK = '/Users/portll/.claude/scratch/pli-qwen/bank';
+const BANK = join(PATHS.LANE_HOME, 'bank');
 const ids = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(KBS);
 for (const kbId of ids) {
   let wrote = 0;

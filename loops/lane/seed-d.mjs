@@ -1,10 +1,11 @@
 // Writes the phase-two jobs: %INCLUDE resolution, the per-file summary the rules read, stress
 // fixtures per statement kind, and a second set of benchmark pairs.
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const BANK = join(dirname(fileURLToPath(import.meta.url)), 'bank');
+const BANK = join(PATHS.LANE_HOME, 'bank');
 const JOBS = [];
 
 JOBS.push({

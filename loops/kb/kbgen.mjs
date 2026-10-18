@@ -4,6 +4,7 @@
 // Sources go into veld first; each attempt retrieves its passages from veld, proposes rows, is gated,
 // and is fed its rejections back. Every attempt and verdict is a loop event, and each knowledge base
 // keeps a snapshot in ~/.config/veld/loops for veld-desktop and `veld tui`.
+import * as PATHS from '../paths.mjs';
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +13,7 @@ import { request } from 'node:http';
 import * as veld from './veld.mjs';
 import { writeLoop, appendEvent, readEvents, trajectory, tally } from './loops.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
+const HERE = PATHS.KB_HOME;
 const COBOLWORK = '/Users/portll/Repositories/Portll/cobolwork-lang-20261002';
 const SOURCES = join(HERE, 'sources');
 const OUT = join(HERE, 'out');

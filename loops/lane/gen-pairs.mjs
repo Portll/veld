@@ -2,11 +2,12 @@
 // program can express, a positive where the input reaches the sink and a near-miss where it does not.
 //
 //   node gen-pairs.mjs [--max N] [--dry]
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
+const ROOT = PATHS.LANE_HOME;
 const REPO = '/Users/portll/Repositories/Portll/cobolwork-pli-20261001';
 const args = process.argv.slice(2);
 const MAX = args.includes('--max') ? Number(args[args.indexOf('--max') + 1]) : 12;

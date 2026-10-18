@@ -1,9 +1,10 @@
 // Writes the PL/I benchmark-pair jobs and the builtin table job into bank/.
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const BANK = join(dirname(fileURLToPath(import.meta.url)), 'bank');
+const BANK = join(PATHS.LANE_HOME, 'bank');
 
 const FORMAT = `Each case is a directory holding one or more PL/I source files (.pli) and a manifest.json:
 { "id": "<directory name>", "title": "<one sentence saying what the case shows>", "cwe": "CWE-<n>", "expect": [{ "rule": "<rule id>", "file": "<file name>" }] }

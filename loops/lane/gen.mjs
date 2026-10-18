@@ -5,12 +5,13 @@
 //
 // --auto is how the runner calls it when the ready buffer drops under four hours. A module gets a
 // new job only when no job for it is pending, running or awaiting review.
+import * as PATHS from '../paths.mjs';
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
+const ROOT = PATHS.LANE_HOME;
 const REPO = '/Users/portll/Repositories/Portll/cobolwork-pli-20261001';
 const BRANCH = 'feat/pli';
 const args = process.argv.slice(2);

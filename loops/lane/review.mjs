@@ -5,11 +5,12 @@
 //   node review.mjs show <id>
 //   node review.mjs apply <id>
 //   node review.mjs verdict <id> landed|dropped --accepted all|part|none --min <correction minutes> [--commit sha] [--note text]
+import * as PATHS from '../paths.mjs';
 import { readFileSync, writeFileSync, readdirSync, mkdirSync, appendFileSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
+const ROOT = PATHS.LANE_HOME;
 const REPOS = { pli: '/Users/portll/Repositories/Portll/cobolwork-pli-20261001', ims: '/Users/portll/Repositories/Portll/cobolwork-lang-20261002', db2: '/Users/portll/Repositories/Portll/cobolwork-lang-20261002' };
 const ALLOWED = { pli: /^(lib\/pli\/|test\/pli-|diag\/pli-|bench\/pli\/)/, ims: /^(lib\/ims\/|test\/ims-)/, db2: /^(lib\/db2\/|test\/db2-)/ };
 const trackOf = (id) => { try { return JSON.parse(readFileSync(join(ROOT, 'bank', `${id}.json`), 'utf8')).track || 'pli'; } catch { return 'pli'; } };

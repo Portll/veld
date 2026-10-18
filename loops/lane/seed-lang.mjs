@@ -1,9 +1,10 @@
 // Writes the IMS DBD/PSB and Db2 DDL parser jobs (tracks ims and db2) into bank/.
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const BANK = join(dirname(fileURLToPath(import.meta.url)), 'bank');
+const BANK = join(PATHS.LANE_HOME, 'bank');
 
 const IMS_CONTRACT = `How a macro parser plugs in (lib/ims/read.mjs, shown): your module exports \`parsers\`, an object mapping a macro name to a function (st, ops) => node. st is { name (the label or null), operation, field (the operand text), line, endLine }. ops is parseOperands(st.field) from lib/cards.mjs: { positional: [raw strings], keywords: Map(UPPER-CASE keyword -> raw value string) }; a value may be a sublist '(A,B)' or a quoted string. Use sublist(v) and integer(v) from '../operands.mjs' (shown). Refuse anything you do not recognise — an unknown keyword, a value of the wrong form, a missing required keyword — by throwing new ImsSyntax('what is wrong') imported from '../operands.mjs'. Return a node with at least { kind: <macro> } and the fields the task names; keep every keyword you accept in node.keywords as an object of normalised values so nothing is lost.
 
