@@ -31,7 +31,12 @@
 //! - `VELD_CROSS_ENCODER=<id>` — single model.
 //! - `VELD_CROSS_ENCODERS=<id1>:<weight1>,<id2>:<weight2>,...` — weighted
 //!   ensemble. Weights default to 1.0 if omitted (`<id>` is allowed).
-//! - Default (neither set): ms-marco-MiniLM-L-6-v2.
+//! - Default (neither set): mxbai-rerank-xsmall-v1.
+//!
+//! The env vars are the process-wide choice. On top of it, the per-user `rerank_model`
+//! dial (`crate::memory::dials::CognitiveDials`) selects one registry id at runtime;
+//! [`load_cross_encoder`] resolves a dial value over the env. The dial is `None` by
+//! default, so the shipped pipeline is unchanged until someone turns it.
 //!
 //! Files cache under `~/.cache/veld/cross-encoder/<sanitised-id>/`.
 
@@ -56,6 +61,11 @@ const MAX_PAIR_LENGTH: usize = 512;
 /// ms-marco floor. Swap up to `bge-reranker-v2-m3` (568 M) for the best
 /// quality, or stack via `VELD_CROSS_ENCODERS=…`.
 const DEFAULT_CROSS_ENCODER_ID: &str = "mxbai-rerank-xsmall-v1";
+
+/// Registry id of the legacy reranker, pinned so the recall gate has a parity arm against
+/// upstream shodh-memory (which measured under this model). Select it per user with the
+/// `rerank_model` dial.
+pub const MS_MARCO_MINILM_L6_ID: &str = "ms-marco-MiniLM-L-6-v2";
 
 /// The query and the candidate the background pre-warm scores.
 pub const WARMUP_TEXT: &str = "warmup";
@@ -127,6 +137,10 @@ pub struct CrossEncoderConfig {
     pub year: u16,
     /// One-line summary of training data / domain.
     pub notes: &'static str,
+    /// SPDX identifier of the licence the model's weights are distributed under, as the
+    /// model card declares it at the pinned revision. Recorded with the pin so a
+    /// deployment can tell at a glance which rerankers it may ship.
+    pub license: &'static str,
 }
 
 impl CrossEncoderConfig {
@@ -168,6 +182,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             notes:
                 "BERT; smallest current reranker. ~3x MiniLM but trained on modern QA + retrieval; \
                  the cheap upgrade path off MS-MARCO-MiniLM.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "mxbai-rerank-base-v1".into(),
@@ -186,6 +201,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             rerank_top_k: 12,
             notes:
                 "BERT; mid-size mxbai variant. Quality close to bge-reranker-v2-m3 at a third the cost.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "jina-reranker-v1-tiny-en".into(),
@@ -205,6 +221,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             notes:
                 "JinaBERT (English only); modern drop-in replacement for ms-marco-MiniLM-L-6-v2 \
                  in the same size class. ~50% larger than MiniLM, 3 years newer, broader training mix.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "jina-reranker-v1-turbo-en".into(),
@@ -224,23 +241,32 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             notes:
                 "JinaBERT (English only); slightly larger sibling of jina-reranker-v1-tiny-en. \
                  The mini-class option for English-only deployments wanting a small accuracy bump.",
+            license: "apache-2.0",
         },
+        // Pinned like the default: upstream shodh-memory measured its LoCoMo numbers under
+        // this model, so it is the parity arm of the recall gate (`rerank_model` dial), and
+        // a parity arm whose files can move is not one.
         CrossEncoderConfig {
-            id: "ms-marco-MiniLM-L-6-v2".into(),
+            id: MS_MARCO_MINILM_L6_ID.into(),
             model_url:
-                "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx"
+                "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a/onnx/model.onnx"
                     .into(),
             tokenizer_url:
-                "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/tokenizer.json"
+                "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a/tokenizer.json"
                     .into(),
-            model_sha256: None,
-            tokenizer_sha256: None,
+            model_sha256: Some(
+                "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a".into(),
+            ),
+            tokenizer_sha256: Some(
+                "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66".into(),
+            ),
             has_token_type_ids: true,
             params_millions: 22,
-            download_mb: 80,
+            download_mb: 87,
             year: 2021,
             rerank_top_k: 20,
             notes: "BERT-style; trained on MS MARCO web-search passages. Fast, narrow domain.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "bge-reranker-v2-m3".into(),
@@ -269,6 +295,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
                 "XLM-RoBERTa-style; multilingual + multi-task (QA, retrieval, conversational). \
                  Best quality but biggest download (2.3 GB across model.onnx + model.onnx_data). \
                  Source: hooman650/bge-reranker-v2-m3-onnx-o4 (Olive O4 CPU-optimised, apache-2.0).",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "mxbai-rerank-large-v1".into(),
@@ -286,6 +313,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             year: 2024,
             rerank_top_k: 8,
             notes: "BERT-style; trained on QA + retrieval pairs. Strong on factoid queries.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "jina-reranker-v2-base-multilingual".into(),
@@ -304,6 +332,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             rerank_top_k: 10,
             notes:
                 "XLM-RoBERTa-style; multilingual; late-interaction-influenced training. Mid-size sweet spot.",
+            // Non-commercial: selectable, never a default.
+            license: "cc-by-nc-4.0",
         },
     ]
 }
@@ -904,11 +934,6 @@ fn sigmoid(x: f32) -> f32 {
 // Env-var-driven factory
 // -----------------------------------------------------------------------------
 
-/// Build the cross-encoder from environment variables. Default is the
-/// legacy single-model ms-marco when neither `VELD_CROSS_ENCODER` nor
-/// `VELD_CROSS_ENCODERS` is set.
-///
-/// `VELD_CROSS_ENCODERS` takes precedence when both are set.
 /// The built-in default cross-encoder, the one used when no env var selects another.
 pub fn default_cross_encoder() -> OnnxCrossEncoder {
     OnnxCrossEncoder::new(
@@ -917,6 +942,22 @@ pub fn default_cross_encoder() -> OnnxCrossEncoder {
     )
 }
 
+/// The cross-encoder a `rerank_model` dial value selects. `Some(id)` is a single registry
+/// model, whatever the environment says; `None` defers to
+/// [`load_cross_encoder_from_env`]. An id the registry does not know is an error, not a
+/// fallback: the dial is sanitized before it reaches here, so an unknown id means the
+/// registry changed under a persisted dial, and reranking silently with another model
+/// would mislabel every measurement made under it.
+pub fn load_cross_encoder(selected: Option<&str>) -> Result<Arc<dyn CrossEncoderModel>> {
+    match selected {
+        Some(id) => Ok(Arc::new(OnnxCrossEncoder::new(lookup(id)?))),
+        None => Ok(load_cross_encoder_from_env()),
+    }
+}
+
+/// Build the cross-encoder from environment variables. Default is
+/// [`DEFAULT_CROSS_ENCODER_ID`] when neither `VELD_CROSS_ENCODER` nor
+/// `VELD_CROSS_ENCODERS` is set. `VELD_CROSS_ENCODERS` takes precedence when both are set.
 pub fn load_cross_encoder_from_env() -> Arc<dyn CrossEncoderModel> {
     if let Ok(spec) = std::env::var("VELD_CROSS_ENCODERS") {
         match parse_ensemble_spec(&spec) {
@@ -1155,6 +1196,42 @@ mod tests {
         }
     }
 
+    /// The parity arm of the recall gate reranks with this model; a moving revision or an
+    /// unverified file would make two runs under the same dial two pipelines.
+    #[test]
+    fn the_ms_marco_parity_reranker_is_pinned_to_a_revision_and_checksums() {
+        let cfg = lookup(MS_MARCO_MINILM_L6_ID).unwrap();
+        for url in [&cfg.model_url, &cfg.tokenizer_url] {
+            assert!(
+                url.contains("/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a/"),
+                "{url} does not name the pinned revision"
+            );
+        }
+        for sha in [&cfg.model_sha256, &cfg.tokenizer_sha256] {
+            let sha = sha.as_deref().expect("a pinned checksum");
+            assert!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        assert_eq!(cfg.license, "apache-2.0");
+    }
+
+    #[test]
+    fn every_built_in_records_a_licence() {
+        for cfg in built_ins() {
+            assert!(!cfg.license.is_empty(), "{} has no licence", cfg.id);
+        }
+        assert_eq!(
+            lookup(DEFAULT_CROSS_ENCODER_ID).unwrap().license,
+            "apache-2.0"
+        );
+    }
+
+    #[test]
+    fn a_selected_id_loads_that_model_and_an_unknown_one_is_refused() {
+        let selected = load_cross_encoder(Some(MS_MARCO_MINILM_L6_ID)).unwrap();
+        assert_eq!(selected.id(), MS_MARCO_MINILM_L6_ID);
+        assert!(load_cross_encoder(Some("no-such-reranker")).is_err());
+    }
+
     #[test]
     fn lookup_resolves_built_ins() {
         assert!(lookup("ms-marco-MiniLM-L-6-v2").is_ok());
@@ -1190,6 +1267,7 @@ mod tests {
             year: 2026,
             rerank_top_k: 15,
             notes: "test fixture",
+            license: "apache-2.0",
         });
         let cfg = lookup("test-custom-model").unwrap();
         assert_eq!(cfg.params_millions, 100);
