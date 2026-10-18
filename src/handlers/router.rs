@@ -15,7 +15,8 @@ use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, keys,
     lineage, memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions,
-    sleep_time, storage_migration, todos, ui, user_admin, user_auth, users, visualization,
+    replication, sleep_time, storage_migration, todos, ui, user_admin, user_auth, users,
+    visualization,
     webhooks,
 };
 
@@ -405,6 +406,13 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             "/api/admin/storage/migrate",
             post(storage_migration::migrate),
         )
+        // =================================================================
+        // LIVE REPLICATION — admin key checked in-handler
+        // =================================================================
+        .route("/api/admin/replication/status", get(replication::status))
+        .route("/api/admin/replication/records", get(replication::records))
+        .route("/api/admin/replication/follow", post(replication::follow))
+        .route("/api/admin/replication/unfollow", post(replication::unfollow))
         // =================================================================
         // ADVANCED SEARCH
         // =================================================================

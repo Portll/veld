@@ -143,6 +143,13 @@ pub fn config_file_path() -> PathBuf {
 /// A missing file is silently ignored; a malformed file is reported and ignored —
 /// neither aborts startup. The API key value is never logged.
 pub fn load_config_file_into_env() {
+    let mut names: Vec<String> = env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| k.starts_with("VELD_"))
+        .collect();
+    names.sort();
+    let _ = VELD_ENV_NAMES_AT_START.set(names);
+
     let path = config_file_path();
     let raw = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -174,6 +181,7 @@ pub fn load_config_file_into_env() {
         ("host", "VELD_HOST"),
         ("port", "VELD_PORT"),
         ("storage", "VELD_MEMORY_PATH"),
+        ("storage_backend", "VELD_STORAGE_BACKEND"),
         ("mcp", "VELD_MCP_ENABLED"),
     ];
 
@@ -213,6 +221,16 @@ pub fn load_config_file_into_env() {
             path.display()
         );
     }
+}
+
+static VELD_ENV_NAMES_AT_START: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The `VELD_*` variables this process was started with, by name, taken before the
+/// `config.toml` bridge and before anything else set a variable on the process.
+/// None when [`load_config_file_into_env`] has not run (library use, tests). A
+/// relauncher carries these; variables the process set on itself it sets again.
+pub fn veld_env_names_at_start() -> Option<&'static [String]> {
+    VELD_ENV_NAMES_AT_START.get().map(Vec::as_slice)
 }
 
 /// CORS configuration
@@ -904,6 +922,10 @@ pub fn print_env_help() {
     println!("  VELD_PORT             - Server port (default: 3030)");
     println!("  VELD_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/veld/)");
     println!("  VELD_STORAGE_BACKEND  - Requested backend: redb (target default) or rocksdb (legacy compatibility)");
+    println!("  VELD_REPLICATE_FROM   - Base URL of a veld instance to follow (live memory replication)");
+    println!("  VELD_REPLICATE_ADMIN_KEY - That instance's admin key (its VELD_ADMIN_API_KEY)");
+    println!("  VELD_REPLICATE_API_KEY - That instance's API key (default: this server's own first key)");
+    println!("  VELD_REPLICATE_INTERVAL_SECS - Poll interval while following (default: 2)");
     println!("  VELD_API_KEYS         - Comma-separated API keys (required in production)");
     println!(
         "  VELD_DEV_API_KEY      - Development API key (required in dev if VELD_API_KEYS not set)"

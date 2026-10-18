@@ -7,11 +7,16 @@
 mod client;
 mod discovery;
 mod dto;
+mod restart;
 mod snapshot;
 mod sse;
 
 pub use client::{StatusClient, StatusClientConfig};
-pub use discovery::{discover_instances, instances_dir, DiscoveredInstance};
+pub use discovery::{discover_instances, instances_dir, DiscoveredInstance, LaunchRecipe};
+pub use restart::{
+    inspect_process, parse_env_file, restart_instance, rewrite_env_var, LaunchSpec,
+    RestartOutcome, RestartRequest,
+};
 pub use snapshot::{
     ActivityEntry, ContextSession, GraphStats, ReachState, ServerHealth, StatusSnapshot,
     TierStats, TodoStats,
@@ -41,6 +46,8 @@ pub enum StatusError {
     },
     #[error("config file '{path}' contained no api key")]
     ConfigEmpty { path: String },
+    #[error("restart: {0}")]
+    Restart(String),
 }
 
 pub type Result<T> = std::result::Result<T, StatusError>;
