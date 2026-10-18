@@ -1,9 +1,10 @@
 // Writes the IMS model and the IMS and Db2 rule jobs, each waiting on the parsers it reads.
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const BANK = join(dirname(fileURLToPath(import.meta.url)), 'bank');
+const BANK = join(PATHS.LANE_HOME, 'bank');
 
 const JOBS = [
   {

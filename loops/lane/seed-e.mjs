@@ -1,9 +1,10 @@
 // Writes the PL/I rule jobs: one module of lib/pli/rules/ each, with its tests.
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const BANK = join(dirname(fileURLToPath(import.meta.url)), 'bank');
+const BANK = join(PATHS.LANE_HOME, 'bank');
 
 const CONTRACT = `The contract (lib/pli/rules/index.mjs, shown): a rule module exports RULES, a map from rule id to { sev: 'info'|'low'|'med'|'high'|'crit', evidence: 'coverage'|'construct'|'advisory', cwe: 'CWE-<n>', text: one sentence saying what the finding means }, and check(program) returning findings [{ rule, path, line, detail }] where detail is one sentence naming the construct and its operands (never source text beyond names and keywords). program is { path, statements } and each statement is { labels, conditions, toks, line, endLine, parsed } with parsed = { kind, status, node } from parseStatement. Nested statements (the unit of IF, ELSE, WHEN, OTHERWISE, ON) are in parsed.node.units, each again { kind, status, node } — walk them too. Only statements with parsed.status === 'parsed' carry a node you can rely on; skip the rest.
 

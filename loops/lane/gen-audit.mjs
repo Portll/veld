@@ -3,12 +3,13 @@
 // tokens consumed; an audit asks whether they were consumed into the right fields.
 //
 //   node gen-audit.mjs [--per-batch 12] [--max-jobs 20] [--kinds A,B]
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
+const ROOT = PATHS.LANE_HOME;
 const REPO = '/Users/portll/Repositories/Portll/cobolwork-pli-20261001';
 const args = process.argv.slice(2);
 const flag = (n, d) => (args.includes(`--${n}`) ? args[args.indexOf(`--${n}`) + 1] : d);

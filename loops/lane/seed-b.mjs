@@ -1,9 +1,10 @@
 // Writes the statement-parser and semantics jobs into bank/. Existing job files are left alone.
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const BANK = join(dirname(fileURLToPath(import.meta.url)), 'bank');
+const BANK = join(PATHS.LANE_HOME, 'bank');
 
 const CONTRACT = `How a statement parser plugs in. Your module exports \`parsers\`, an object mapping a statement kind (as classify() in lib/pli/statements.mjs names it) to a function (c, stmt, ctx) => node.
 - c is a cursor (lib/pli/cursor.mjs) on the statement's tokens after its label and condition prefixes, positioned at the first token, which for a keyword statement is the keyword itself: consume it.

@@ -1,12 +1,13 @@
 // Writes the HLASM statement-parser jobs (track hlasm, worktree cobolwork-hlasm-20261003, feat/hlasm)
 // into bank/. Spec: cobolwork evaluations/spec_2026-10-03_hlasm-track.md.
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const BANK = join(dirname(fileURLToPath(import.meta.url)), 'bank');
-const REF = '/Users/portll/.claude/scratch/lang-qwen/ibm-hlasm';
-const MACREF = '/Users/portll/.claude/scratch/lang-qwen/ibm-zos-macros';
+const BANK = join(PATHS.LANE_HOME, 'bank');
+const REF = join(PATHS.LANG_HOME, 'ibm-hlasm');
+const MACREF = join(PATHS.LANG_HOME, 'ibm-zos-macros');
 
 const CONTRACT = `How a parser plugs in (lib/hlasm/read.mjs): your module exports \`parsers\`, an object mapping an operation name to a function. The dispatcher calls it as parser(st) for an assembler instruction and parser(st, ops) for a system macro. st is { name (the label in column 1, or null), operation (upper case), field (the operand text with continuation cards already joined and remarks removed), line, endLine }. ops is macroOperands(st.field) from lib/hlasm/operands.mjs: { positional: [raw strings, '' for an omitted one], keywords: Map(UPPER-CASE keyword -> raw value string) }. For an assembler instruction split st.field yourself with splitOperands from '../operands.mjs' (it respects quotes, parentheses and L'X attribute references) and read each expression with parseExpression(text), an address with parseAddress(text), from '../expr.mjs': they throw HlasmSyntax on bad input, which is a refusal and fine to let through. NAME (a RegExp for an ordinary symbol) and HlasmSyntax are exported by '../operands.mjs'. Refuse anything you do not recognise - a wrong operand count, an unknown keyword or value, a missing required operand - by throwing new HlasmSyntax('what is wrong'). Return a node { kind: <operation>, ...the fields the task names }. Do not import anything else.
 
@@ -213,8 +214,8 @@ JOBS.push(
   pair('h39-attach-eploc', 'hlasm-runtime-module-name', 'med', 'CWE-470', 'ATTACH with EPLOC= naming storage the program copied a name into (positive); the negative uses ATTACH EP= with a fixed name.', ['hlasm-attach-by-a-name-in-storage', 'hlasm-attach-of-a-named-module'], false),
 );
 
-const LEREF = '/Users/portll/.claude/scratch/lang-qwen/ibm-le';
-const TKREF = '/Users/portll/.claude/scratch/lang-qwen/ibm-toolkit';
+const LEREF = join(PATHS.LANG_HOME, 'ibm-le');
+const TKREF = join(PATHS.LANG_HOME, 'ibm-toolkit');
 JOBS.push(
   { ...macro('h40-le', 'le', 'Language Environment macros: CEEENTRY, CEETERM, CEEPPA, CEECAA, CEEDSA', 70, ['CEEENTRY', 'CEETERM', 'CEEPPA', 'CEECAA', 'CEEDSA'],
     `- CEEENTRY: the label names the routine; keywords as IBM lists them (PPA=, AUTO=, MAIN=, NAB=, PARMREG=, BASE=, EXPORT=, PLIST=, and the rest). Node { kind: 'CEEENTRY', name: st.name, main: raw MAIN= or null, ppa: raw PPA= or null, keywords }.

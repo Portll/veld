@@ -1,12 +1,13 @@
 // Puts knowledge bases' sources into veld and marks each done, which is what lets the runner start
 // its targets.   node ingest.mjs [kbId ...]   (all when none named)
+import * as PATHS from '../paths.mjs';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { KBS, ingest, writeSnapshot } from './kbgen.mjs';
 import { health } from './veld.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
+const HERE = PATHS.KB_HOME;
 const ids = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(KBS);
 if (!(await health())) { console.error('veld is not answering /health on 127.0.0.1:3030'); process.exit(1); }
 mkdirSync(join(HERE, 'ingested'), { recursive: true });
