@@ -96,7 +96,7 @@ impl BatchWriter for RocksDbBatchWriter {
         let latch = super::write_latch::global();
         match self.db.write(build()) {
             Ok(()) => {
-                latch.note_write_ok();
+                latch.note_write_ok(self.db.path());
                 Ok(())
             }
             Err(e) => {
