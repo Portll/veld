@@ -76,6 +76,23 @@ pub struct SeedResponse {
 // PATH SECURITY
 // =============================================================================
 
+/// Truncate to at most `max` BYTES without splitting a character.
+///
+/// `SEED_README_MAX_CHARS` and the 4000 below are byte budgets despite the name, and `&s[..n]`
+/// panics when `n` lands inside a multi-byte character. Seeding any document whose 2000th byte sits
+/// mid-character took the whole request down: docs/architecture/README.md draws diagrams with `│`,
+/// and the panic surfaced as a bare 500.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Validate that a project path is safe to access.
 ///
 /// Rejects paths that:
@@ -458,13 +475,9 @@ pub async fn seed_project(
         // Extract README content if available
         let readme_path = project_path.join("README.md");
         let readme_content = if readme_path.is_file() {
-            std::fs::read_to_string(&readme_path).ok().map(|c| {
-                if c.len() > SEED_README_MAX_CHARS {
-                    c[..SEED_README_MAX_CHARS].to_string()
-                } else {
-                    c
-                }
-            })
+            std::fs::read_to_string(&readme_path)
+                .ok()
+                .map(|c| truncate_on_char_boundary(&c, SEED_README_MAX_CHARS).to_string())
         } else {
             None
         };
@@ -538,11 +551,7 @@ pub async fn seed_project(
             }
 
             // Truncate very large files to first 4000 chars
-            let content = if content.len() > 4000 {
-                content[..4000].to_string()
-            } else {
-                content
-            };
+            let content = truncate_on_char_boundary(&content, 4000).to_string();
 
             let rel_path = file_path.strip_prefix(&project_path).unwrap_or(file_path);
             let rel_str = rel_path.to_string_lossy().to_string();
@@ -591,4 +600,33 @@ pub async fn seed_project(
     .map_err(AppError::Internal)?;
 
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_on_char_boundary;
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        // The case that took seeding down: the budget lands inside a three-byte box-drawing
+        // character, which docs/architecture/README.md uses to draw diagrams.
+        let s = "ab│cd";
+        assert_eq!(s.len(), 7, "the bar is three bytes, so byte 3 is mid-character");
+        assert_eq!(truncate_on_char_boundary(s, 3), "ab");
+        assert_eq!(truncate_on_char_boundary(s, 4), "ab");
+        assert_eq!(truncate_on_char_boundary(s, 5), "ab│");
+    }
+
+    #[test]
+    fn truncation_returns_the_whole_string_when_it_fits() {
+        assert_eq!(truncate_on_char_boundary("short", 100), "short");
+        assert_eq!(truncate_on_char_boundary("exact", 5), "exact");
+    }
+
+    #[test]
+    fn truncation_of_a_leading_multibyte_character_yields_empty() {
+        // A budget smaller than the first character has no boundary to fall back to but zero.
+        assert_eq!(truncate_on_char_boundary("│x", 1), "");
+        assert_eq!(truncate_on_char_boundary("", 10), "");
+    }
 }
