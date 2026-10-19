@@ -23,7 +23,7 @@
 //! the filesystem without opening the user's store, so an idle poll costs one
 //! `stat` per user on the leader.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -98,7 +98,11 @@ pub fn own_api_key() -> Option<String> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserProgress {
     pub applied_lsn: Option<u64>,
+    /// Leader frames consumed.
     pub applied_records: u64,
+    /// Frames written to this follower's own log after coalescing.
+    #[serde(default)]
+    pub journaled_records: u64,
     /// Leader log length at the last poll that found nothing new.
     pub source_bytes: u64,
 }
@@ -181,24 +185,82 @@ pub fn feed(
     })
 }
 
-/// Follower side: apply one leader frame to the canonical store, then journal it
-/// here so the local projections and log follow. Idempotent per frame: a
-/// snapshot is an upsert, a forget of an unknown id is a no-op. Blocking.
-pub fn apply_replicated(
+/// A page of leader frames reduced to what changes the follower's state: for each
+/// memory id, the last `Remember`/`Update` snapshot in the page and every frame
+/// after it. Earlier snapshots of the same id are superseded, so applying only the
+/// last one is the same final state at a fraction of the writes; logs are
+/// Update-heavy because every access and consolidation re-journals a memory.
+pub fn coalesce(frames: Vec<(u64, IntentPayload)>) -> Vec<(u64, IntentPayload)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_id: HashMap<String, Vec<(u64, IntentPayload)>> = HashMap::new();
+    for (lsn, payload) in frames {
+        let id = payload.memory_id().to_string();
+        if !by_id.contains_key(&id) {
+            order.push(id.clone());
+        }
+        by_id.entry(id).or_default().push((lsn, payload));
+    }
+    let mut out = Vec::new();
+    for id in order {
+        let mut frames = by_id.remove(&id).unwrap_or_default();
+        let last_snapshot = frames.iter().rposition(|(_, p)| {
+            matches!(p, IntentPayload::Remember { .. } | IntentPayload::Update { .. })
+        });
+        if let Some(i) = last_snapshot {
+            frames.drain(..i);
+        }
+        out.extend(frames);
+    }
+    out
+}
+
+/// Follower side: apply a page of leader frames to the canonical store, then
+/// journal each applied frame here so the local projections and log follow. The
+/// page is coalesced first; snapshots are indexed with one BM25 commit. Idempotent:
+/// a snapshot is an upsert, a forget of an unknown id is a no-op. Returns the
+/// number of frames journaled. Blocking.
+pub fn apply_replicated_page(
+    manager: &MultiUserMemoryManager,
+    user_id: &str,
+    frames: Vec<(u64, IntentPayload)>,
+) -> Result<u64> {
+    let frames = coalesce(frames);
+    if frames.is_empty() {
+        return Ok(0);
+    }
+    let memory_sys = manager.get_user_memory(user_id)?;
+    let mut snapshots: Vec<crate::memory::types::Memory> = Vec::new();
+    for (lsn, payload) in &frames {
+        if let IntentPayload::Remember { memory_bincode, .. }
+        | IntentPayload::Update { memory_bincode, .. } = payload
+        {
+            // The snapshot ages like the store's own records: frames journaled before a
+            // layout change need the legacy decode arms, the same ones the projections use.
+            let memory = crate::memory::storage::decode_memory_snapshot(memory_bincode)
+                .map_err(|e| anyhow!("decoding the memory snapshot at lsn {lsn}: {e}"))?;
+            snapshots.push(memory);
+        }
+    }
+    memory_sys.read().upsert_memories(&snapshots)?;
+    let mut journaled = 0u64;
+    for (_, payload) in &frames {
+        apply_non_snapshot(manager, user_id, payload)?;
+        manager.journal_and_apply(user_id, payload)?;
+        journaled += 1;
+    }
+    Ok(journaled)
+}
+
+/// The store-side effect of a `Forget` or `Anchor` frame; snapshots are handled in
+/// bulk by [`apply_replicated_page`].
+fn apply_non_snapshot(
     manager: &MultiUserMemoryManager,
     user_id: &str,
     payload: &IntentPayload,
 ) -> Result<()> {
     let memory_sys = manager.get_user_memory(user_id)?;
     match payload {
-        IntentPayload::Remember { memory_bincode, .. }
-        | IntentPayload::Update { memory_bincode, .. } => {
-            // The snapshot ages like the store's own records: frames journaled before a
-            // layout change need the legacy decode arms, the same ones the projections use.
-            let memory = crate::memory::storage::decode_memory_snapshot(memory_bincode)
-                .map_err(|e| anyhow!("decoding the memory snapshot: {e}"))?;
-            memory_sys.read().update_memory(&memory)?;
-        }
+        IntentPayload::Remember { .. } | IntentPayload::Update { .. } => {}
         IntentPayload::Forget { memory_id, .. } => {
             let id = MemoryId(uuid::Uuid::parse_str(memory_id)?);
             let guard = memory_sys.read();
@@ -226,7 +288,6 @@ pub fn apply_replicated(
             }
         }
     }
-    manager.journal_and_apply(user_id, payload)?;
     Ok(())
 }
 
@@ -406,26 +467,37 @@ async fn poll_once(
                 after.map(|l| l.to_string()).unwrap_or_default()
             );
             let page: FeedPage = get_json(http, target, &path).await?;
+            let Some(last_lsn) = page.records.last().map(|r| r.lsn) else {
+                break;
+            };
+            let mut frames = Vec::with_capacity(page.records.len());
             for record in &page.records {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(&record.frame_b64)
                     .context("decoding a feed frame")?;
                 let payload = payload::decode(&bytes)
                     .map_err(|e| anyhow!("decoding frame lsn {}: {e}", record.lsn))?;
-                let user_id = info.user_id.clone();
-                let m = Arc::clone(manager);
-                tokio::task::spawn_blocking(move || apply_replicated(&m, &user_id, &payload))
+                frames.push((record.lsn, payload));
+            }
+            let received = frames.len() as u64;
+            let user_id = info.user_id.clone();
+            let m = Arc::clone(manager);
+            let journaled =
+                tokio::task::spawn_blocking(move || apply_replicated_page(&m, &user_id, frames))
                     .await
                     .map_err(|e| anyhow!("apply task: {e}"))?
-                    .with_context(|| format!("applying lsn {} of {}", record.lsn, info.user_id))?;
-                after = Some(record.lsn);
-                applied_total += 1;
-                let mut status = FOLLOW.write();
-                let entry = status.users.entry(info.user_id.clone()).or_default();
-                entry.applied_lsn = after;
-                entry.applied_records += 1;
-                status.last_applied = Some(Utc::now());
-            }
+                    .with_context(|| {
+                        format!("applying lsns up to {last_lsn} of {}", info.user_id)
+                    })?;
+            after = Some(last_lsn);
+            applied_total += received;
+            let mut status = FOLLOW.write();
+            let entry = status.users.entry(info.user_id.clone()).or_default();
+            entry.applied_lsn = after;
+            entry.applied_records += received;
+            entry.journaled_records += journaled;
+            status.last_applied = Some(Utc::now());
+            drop(status);
             if !page.more {
                 break;
             }
@@ -511,6 +583,7 @@ mod tests {
             UserProgress {
                 applied_lsn: Some(41),
                 applied_records: 42,
+                journaled_records: 7,
                 source_bytes: 1234,
             },
         );
@@ -525,6 +598,40 @@ mod tests {
     fn sources_are_normalized_and_checked() {
         assert_eq!(normalize_source(" http://a:1/ ").unwrap(), "http://a:1");
         assert!(normalize_source("a:1").is_err());
+    }
+
+    fn frame(lsn: u64, id: &str, kind: &str) -> (u64, IntentPayload) {
+        let sv = Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
+        let p = match kind {
+            "remember" => IntentPayload::Remember { user_id: "u".into(), memory_id: id.into(), memory_bincode: vec![lsn as u8], schema_version: sv },
+            "update" => IntentPayload::Update { user_id: "u".into(), memory_id: id.into(), memory_bincode: vec![lsn as u8], schema_version: sv },
+            "forget" => IntentPayload::Forget { user_id: "u".into(), memory_id: id.into(), schema_version: sv },
+            _ => IntentPayload::Anchor { user_id: "u".into(), memory_id: id.into(), importance: 0.9, schema_version: sv },
+        };
+        (lsn, p)
+    }
+
+    #[test]
+    fn coalesce_keeps_the_last_snapshot_and_what_follows_it() {
+        let page = vec![
+            frame(0, "a", "remember"),
+            frame(1, "b", "remember"),
+            frame(2, "a", "update"),
+            frame(3, "a", "anchor"),
+            frame(4, "a", "update"),
+            frame(5, "b", "forget"),
+            frame(6, "c", "anchor"),
+        ];
+        let out: Vec<u64> = coalesce(page).into_iter().map(|(l, _)| l).collect();
+        // a: last snapshot is lsn 4; b: snapshot 1 then its forget; c: an anchor alone.
+        assert_eq!(out, vec![4, 1, 5, 6]);
+    }
+
+    #[test]
+    fn coalesce_lets_a_later_remember_undo_a_forget() {
+        let page = vec![frame(0, "a", "remember"), frame(1, "a", "forget"), frame(2, "a", "remember")];
+        let out: Vec<u64> = coalesce(page).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(out, vec![2]);
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub struct ServerRunConfig {
 /// Environment variables are set **before** the tokio runtime is created, so no
 /// threads exist yet. This avoids the `set_var` unsoundness on multi-threaded runtimes.
 pub fn run(config: ServerRunConfig) -> Result<()> {
+    raise_open_file_limit();
     let local_dev_rate_limit_default = !config.production
         && crate::config::is_local_bind_host(&config.host)
         && std::env::var("VELD_RATE_LIMIT").is_err()
@@ -562,6 +563,47 @@ async fn async_main() -> Result<()> {
 
     Ok(())
 }
+
+/// Raise the soft open-file limit to the hard limit. Every tenant holds a redb or
+/// RocksDB store, a SQLite projection and two Tantivy indexes (20 to 30 files
+/// each), so sixty tenants need thousands of descriptors. A launchd agent starts
+/// with a soft limit of 256; the redb replica hung on EMFILE under it on
+/// 2026-10-19. Logged, never fatal: a server that cannot raise it still serves
+/// what the limit allows.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit only read and write the struct passed to them.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let want = if limit.rlim_max == libc::RLIM_INFINITY {
+            65_536
+        } else {
+            limit.rlim_max
+        };
+        if limit.rlim_cur >= want {
+            return;
+        }
+        let before = limit.rlim_cur;
+        limit.rlim_cur = want;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+            info!("Open-file limit raised from {before} to {want}");
+        } else {
+            warn!(
+                "Open-file limit stays at {before} (could not raise to {want}); \
+                 many tenants will exhaust it"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
 
 // =============================================================================
 // Background Schedulers
