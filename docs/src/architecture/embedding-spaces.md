@@ -47,6 +47,39 @@ anything moves them and walks the store once:
   another space is re-embedded, or promoted from a secondary vector already in the new space.
   The markers advance only after a pass with no failed write, so an interrupted pass resumes.
 
+## One index per space
+
+The primary index (`vector_index/`) holds the primary embedder's space. Its mappings live in the
+store and its chunk vectors are not stored on the record, so its layout is unchanged. Every other
+space a query can reach has its own index under `space_indexes/<slug>-<hash>/`:
+
+| File | Holds |
+|---|---|
+| `vamana.idx` | The Vamana graph and vectors |
+| `mapping.bin` | Which memory each vector belongs to, saved with the index |
+| `space` | The space id the directory was built for |
+| `saved.clean` | Present only while the two files above agree; removed by the first change after a save |
+
+An index loads only when the marker is present, the space matches and every mapped vector is
+live. Otherwise it is rebuilt from every memory holding a vector in its space, in one pass over
+the store. Saving the mapping replaced the old secondary index's insertion-order mapping, which
+drifted whenever a vector was added after a save or soft-deleted.
+
+Today the indexed spaces are the primary embedder's and the secondary embedder's.
+`RetrievalEngine::search_space` searches any of them. Recall embeds the query in every space it
+can, fuses each space's results by RRF, and compares a stored vector with a query only in the
+space both are in. That holds for the brute-force pass over recent memories and for the
+cross-embedder agreement signal too.
+
+A memory may hold vectors in more spaces than its two slots. `other_vectors`, the last field of
+the record, keeps one vector per further space. When a re-embed replaces a primary vector, the
+old one moves there, or into the free secondary slot when that is its space. It stays until its
+space is retired. A kept vector in an indexed space is indexed there.
+
+The intent-log Vamana projection (`/api/query`) binds its text-primary index to the tenant's
+active space when it opens. It skips any vector of another width or recorded space, so a log
+replayed from the start across an embedder change no longer builds the index in the old space.
+
 ## Refusals become backlog rows
 
 An index holds one space. A stored vector in another space is refused, never inserted, because

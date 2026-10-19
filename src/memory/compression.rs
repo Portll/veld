@@ -357,6 +357,7 @@ impl CompressionPipeline {
                 memory.experience.embeddings_secondary.clone();
             restored.experience.embedding_space_secondary =
                 memory.experience.embedding_space_secondary.clone();
+            restored.experience.other_vectors = memory.experience.other_vectors.clone();
             restored.compressed = false;
             restored.experience.metadata.remove("compressed_data");
             restored.experience.metadata.remove("compression_ratio");

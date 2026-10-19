@@ -18,6 +18,8 @@ use tracing::{info, warn};
 
 use super::embedding_backlog::{BacklogKey, EmbeddingBacklogStore};
 use super::introspection::ConsolidationEventBuffer;
+pub(crate) use super::space_index::IdMapping;
+use super::space_index::{SpaceIndex, SpaceIndexHealth};
 use super::storage::SearchCriteria;
 use super::types::*;
 use crate::constants::{
@@ -35,8 +37,9 @@ const VAMANA_INDEX_FILE: &str = "vamana.idx";
 /// Present beside a saved index when every stored vector mapping refers to it. Each path that
 /// assigns vector ids writes its mappings, and rebuilds remove the marker until the next save.
 pub(crate) const MAPPINGS_MARKER_FILE: &str = "mappings.authoritative";
-/// Filename for persisted secondary Vamana index
-const SECONDARY_VAMANA_INDEX_FILE: &str = "secondary_vamana.idx";
+/// Where the secondary index lived before every non-primary space got its own directory under
+/// `space_indexes/`. Removed at start: a cache of the old layout, never read again.
+const LEGACY_SECONDARY_INDEX: (&str, &str) = ("secondary_vector_index", "secondary_vamana.idx");
 
 /// An index refused a stored vector because it is in another space than the index's.
 ///
@@ -63,8 +66,8 @@ pub fn is_space_mismatch(error: &anyhow::Error) -> bool {
 ///
 /// 1. `vector_index` - Primary vector similarity search index (384d)
 /// 2. `id_mapping` - Primary memory ID ↔ vector ID mapping
-/// 3. `secondary_vector_index` - Secondary vector index (768d, optional)
-/// 4. `secondary_id_mapping` - Secondary memory ID ↔ vector ID mapping (optional)
+/// 3. `space_indexes` - one index per non-primary space, each locking its index before its
+///    mapping; never two spaces at once
 /// 5. `consolidation_events` - Introspection event buffer
 ///
 /// **Rules:**
@@ -84,13 +87,13 @@ pub struct RetrievalEngine {
     vector_index: Arc<RwLock<VamanaIndex>>,
     /// Lock order: 2 - Primary memory ID ↔ vector ID mapping
     id_mapping: Arc<RwLock<IdMapping>>,
-    /// Lock order: 3 - Secondary Vamana (768d), present only when secondary model is configured
-    secondary_vector_index: Option<Arc<RwLock<VamanaIndex>>>,
-    /// Lock order: 4 - Secondary ID mapping, mirrors secondary_vector_index
-    secondary_id_mapping: Option<Arc<RwLock<IdMapping>>>,
+    /// Lock order: 3 - One index per space other than the primary's, by space. Today the
+    /// secondary embedder's space; any space a query can reach has one.
+    space_indexes: std::collections::BTreeMap<SpaceId, SpaceIndex>,
     /// The space every vector in `vector_index` is in.
     index_space: SpaceId,
-    /// The space every vector in `secondary_vector_index` is in.
+    /// The space the secondary embedder writes, a key of `space_indexes` when configured. The
+    /// memory's secondary slot is read as a vector in this space.
     secondary_index_space: Option<SpaceId>,
     /// Where a refusal is recorded: the ledger the memory system drains, over the same store.
     backlog: EmbeddingBacklogStore,
@@ -100,91 +103,6 @@ pub struct RetrievalEngine {
     /// Shared consolidation event buffer for introspection
     /// Records edge formation, strengthening, and pruning events
     consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,
-}
-
-/// Bidirectional mapping between memory IDs and vector IDs
-///
-/// Supports multiple vectors per memory for chunked embeddings.
-/// When long content is split into chunks, each chunk gets its own vector ID,
-/// but all map back to the same MemoryId.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct IdMapping {
-    /// Maps each memory to ALL its vector IDs (supports chunked embeddings)
-    memory_to_vectors: HashMap<MemoryId, Vec<u32>>,
-    /// Maps each vector ID back to its parent memory
-    vector_to_memory: HashMap<u32, MemoryId>,
-}
-
-impl IdMapping {
-    fn new() -> Self {
-        Self {
-            memory_to_vectors: HashMap::new(),
-            vector_to_memory: HashMap::new(),
-        }
-    }
-
-    /// Insert a single vector for a memory (legacy/simple case)
-    ///
-    /// Idempotent: removes any existing mappings for this memory first
-    /// to prevent orphaned vector IDs from accumulating.
-    fn insert(&mut self, memory_id: MemoryId, vector_id: u32) {
-        // Remove stale mappings to prevent orphans on re-index
-        if let Some(old_ids) = self.memory_to_vectors.remove(&memory_id) {
-            for old_id in old_ids {
-                self.vector_to_memory.remove(&old_id);
-            }
-        }
-        self.vector_to_memory.insert(vector_id, memory_id.clone());
-        self.memory_to_vectors.insert(memory_id, vec![vector_id]);
-    }
-
-    /// Insert multiple vectors for a memory (chunked embedding case)
-    ///
-    /// Idempotent: removes any existing mappings for this memory first
-    /// to prevent orphaned vector IDs from accumulating.
-    fn insert_chunks(&mut self, memory_id: MemoryId, vector_ids: Vec<u32>) {
-        // Remove stale mappings to prevent orphans on re-index
-        if let Some(old_ids) = self.memory_to_vectors.remove(&memory_id) {
-            for old_id in old_ids {
-                self.vector_to_memory.remove(&old_id);
-            }
-        }
-        for &vid in &vector_ids {
-            self.vector_to_memory.insert(vid, memory_id.clone());
-        }
-        self.memory_to_vectors.insert(memory_id, vector_ids);
-    }
-
-    fn get_memory_id(&self, vector_id: u32) -> Option<&MemoryId> {
-        self.vector_to_memory.get(&vector_id)
-    }
-
-    /// Remove a memory and return ALL its vector IDs
-    fn remove_all(&mut self, memory_id: &MemoryId) -> Vec<u32> {
-        if let Some(vector_ids) = self.memory_to_vectors.remove(memory_id) {
-            for vid in &vector_ids {
-                self.vector_to_memory.remove(vid);
-            }
-            vector_ids
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Number of unique memories in the mapping
-    fn len(&self) -> usize {
-        self.memory_to_vectors.len()
-    }
-
-    fn clear(&mut self) {
-        self.memory_to_vectors.clear();
-        self.vector_to_memory.clear();
-    }
-
-    /// Check if a memory ID has any vector mappings (for deletion verification)
-    fn contains(&self, memory_id: &MemoryId) -> bool {
-        self.memory_to_vectors.contains_key(memory_id)
-    }
 }
 
 /// What a corpus needs, decided from the two markers alone.
@@ -279,34 +197,21 @@ impl RetrievalEngine {
             .context("Failed to initialize Vamana vector index")?;
         let id_mapping = IdMapping::new();
 
-        // Initialize secondary Vamana index if secondary embedder is available
-        let (secondary_vector_index, secondary_id_mapping) =
-            if let Some(sec_dim) = embedder.secondary_dimension() {
-                let sec_config = VamanaConfig {
-                    dimension: sec_dim,
-                    max_degree: 32,
-                    search_list_size: 100,
-                    alpha: 1.2,
-                    use_mmap: true, // mmap by default for secondary to control memory footprint
-                    ..Default::default()
-                };
-                let sec_storage = storage_path.join("secondary_vector_index");
-                std::fs::create_dir_all(&sec_storage)?;
-                let sec_index = VamanaIndex::with_storage_path(sec_config, Some(sec_storage))
-                    .context("Failed to initialize secondary Vamana vector index")?;
-                info!("Secondary Vamana index initialized ({}d, mmap)", sec_dim);
-                (
-                    Some(Arc::new(RwLock::new(sec_index))),
-                    Some(Arc::new(RwLock::new(IdMapping::new()))),
-                )
-            } else {
-                (None, None)
-            };
-
+        // One index per space a query can reach besides the primary's: the secondary
+        // embedder's, when one is configured.
         let index_space = embedder.primary_space();
-        let secondary_index_space = secondary_vector_index
-            .as_ref()
-            .and_then(|_| embedder.secondary_space());
+        let secondary_index_space = embedder
+            .secondary_space()
+            .filter(|space| *space != index_space);
+        let mut space_indexes = std::collections::BTreeMap::new();
+        if let Some(space) = &secondary_index_space {
+            space_indexes.insert(
+                space.clone(),
+                SpaceIndex::open(&storage_path, space.clone())
+                    .with_context(|| format!("Failed to initialize the {space} index"))?,
+            );
+            info!("Space index initialized: {space}");
+        }
         let backlog = EmbeddingBacklogStore::with_kv(storage.key_value_store());
         let engine = Self {
             vector_index_failures: std::sync::atomic::AtomicU64::new(0),
@@ -314,8 +219,7 @@ impl RetrievalEngine {
             embedder,
             vector_index: Arc::new(RwLock::new(vector_index)),
             id_mapping: Arc::new(RwLock::new(id_mapping)),
-            secondary_vector_index,
-            secondary_id_mapping,
+            space_indexes,
             index_space,
             secondary_index_space,
             backlog,
@@ -465,16 +369,12 @@ impl RetrievalEngine {
                 target_space,
                 ids.len()
             );
-            // Stale persisted indices must not be loaded against the new space.
+            // A stale primary index must not be loaded against the new space. Other spaces'
+            // indexes are bound to their own space and stay valid.
             let _ = std::fs::remove_file(
                 self.storage_path
                     .join("vector_index")
                     .join(VAMANA_INDEX_FILE),
-            );
-            let _ = std::fs::remove_file(
-                self.storage_path
-                    .join("secondary_vector_index")
-                    .join(SECONDARY_VAMANA_INDEX_FILE),
             );
         }
 
@@ -520,23 +420,30 @@ impl RetrievalEngine {
                     .primary_space(None)
                     .is_some_and(|s| s != target_space);
             if stale {
+                // The vector a re-embed replaces stays stored beside the new one, until its
+                // space is retired.
+                let displaced = memory
+                    .experience
+                    .embeddings
+                    .clone()
+                    .zip(memory.experience.primary_space(None));
                 let promoted = memory.experience.embeddings_secondary.clone().filter(|_| {
                     memory.experience.secondary_space(None).as_ref() == Some(&target_space)
                 });
-                match promoted {
+                let replaced = match promoted {
                     Some(vector) => {
                         reused += 1;
                         memory
                             .experience
                             .set_primary_vector(vector, target_space.clone());
-                        dirty = true;
+                        true
                     }
                     None => match self.embedder.encode(&memory.experience.content) {
                         Ok(e) if e.len() == target => {
                             reembedded += 1;
                             let space = self.embedder.primary_space_for(&e);
                             memory.experience.set_primary_vector(e, space);
-                            dirty = true;
+                            true
                         }
                         Ok(e) => {
                             warn!(
@@ -546,12 +453,20 @@ impl RetrievalEngine {
                                 target
                             );
                             failed += 1;
+                            false
                         }
                         Err(e) => {
                             warn!("Re-embed failed for {}: {}", id.0, e);
                             failed += 1;
+                            false
                         }
                     },
+                };
+                if replaced {
+                    if let Some((vector, space)) = displaced {
+                        memory.experience.keep_vector(space, vector);
+                    }
+                    dirty = true;
                 }
             }
 
@@ -640,153 +555,66 @@ impl RetrievalEngine {
             self.rebuild_primary_index()?;
         }
 
-        // Rebuild secondary index if configured
-        self.rebuild_secondary_from_rocksdb()?;
+        let (legacy_dir, legacy_file) = LEGACY_SECONDARY_INDEX;
+        let _ = std::fs::remove_file(self.storage_path.join(legacy_dir).join(legacy_file));
+        self.load_or_rebuild_space_indexes()?;
 
         Ok(())
     }
 
-    /// Rebuild secondary Vamana index from RocksDB memory data
-    ///
-    /// Pre-fetches all memory data (I/O) outside lock scope to minimize
-    /// lock hold time, then acquires secondary locks (3, 4) to populate.
-    /// Secondary has no RocksDB vector mappings — it rebuilds from
-    /// `experience.embeddings_secondary` stored in each memory.
-    fn rebuild_secondary_from_rocksdb(&self) -> Result<()> {
-        let (sec_index, sec_mapping) =
-            match (&self.secondary_vector_index, &self.secondary_id_mapping) {
-                (Some(idx), Some(map)) => (idx, map),
-                _ => return Ok(()), // No secondary configured
-            };
-
-        let start_time = std::time::Instant::now();
-
-        // Try instant startup from persisted secondary Vamana file
-        let sec_vamana_path = self
-            .storage_path
-            .join("secondary_vector_index")
-            .join(SECONDARY_VAMANA_INDEX_FILE);
-
-        if sec_vamana_path.exists() {
-            match VamanaIndex::load_from_file(&sec_vamana_path) {
-                // Dimension guard: only adopt a persisted secondary index whose
-                // dimension matches the current secondary embedder.
-                Ok(loaded_index)
-                    if self.embedder.secondary_dimension()
-                        != Some(loaded_index.config.dimension) =>
-                {
-                    warn!(
-                        "Persisted secondary Vamana dimension {} != expected {:?}, rebuilding",
-                        loaded_index.config.dimension,
-                        self.embedder.secondary_dimension()
-                    );
-                }
-                Ok(mut loaded_index) => {
-                    // Restore search_list_size to runtime config
-                    loaded_index.config.search_list_size = 100;
-                    let loaded_count = loaded_index.len();
-
-                    // Rebuild secondary IdMapping from RocksDB memories
-                    // (secondary has no separate RocksDB mapping store)
-                    let all_ids = self.storage.get_all_ids()?;
-                    let mut rebuilt_map = IdMapping::new();
-                    let mut mapped = 0usize;
-
-                    for memory_id in &all_ids {
-                        if let Ok(memory) = self.storage.get(memory_id) {
-                            if memory.is_forgotten() {
-                                continue;
-                            }
-                            if self.holds_own_secondary(&memory) {
-                                // Assign sequential vector IDs matching the order they were
-                                // inserted during the save that produced this file.
-                                // This works because VamanaIndex assigns IDs sequentially
-                                // and we iterate in the same order (get_all_ids is stable).
-                                if mapped < loaded_count {
-                                    rebuilt_map.insert(memory_id.clone(), mapped as u32);
-                                    mapped += 1;
-                                }
-                            }
-                        }
-                    }
-
-                    // If mapping count matches loaded vectors, use the fast path
-                    if mapped == loaded_count {
-                        *sec_index.write() = loaded_index;
-                        *sec_mapping.write() = rebuilt_map;
-                        info!(
-                            "Secondary Vamana loaded from file: {} vectors in {:.2}ms",
-                            loaded_count,
-                            start_time.elapsed().as_secs_f64() * 1000.0
-                        );
-                        return Ok(());
-                    }
-
-                    // Mismatch — fall through to full rebuild
-                    warn!(
-                        "Secondary Vamana file has {} vectors but found {} mappable memories, rebuilding",
-                        loaded_count, mapped
-                    );
-                }
+    /// Load every space index saved cleanly with its mapping; rebuild the rest from the memories
+    /// holding a vector in their space, in one pass over the store. A secondary slot holding a
+    /// vector in another space than the secondary index's is refused and queued.
+    fn load_or_rebuild_space_indexes(&self) -> Result<()> {
+        let mut to_rebuild: Vec<&SpaceIndex> = Vec::new();
+        for index in self.space_indexes.values() {
+            match index.load() {
+                Ok(true) => {}
+                Ok(false) => to_rebuild.push(index),
                 Err(e) => {
-                    warn!("Failed to load secondary Vamana file: {}, rebuilding", e);
+                    warn!("{}: saved index unreadable, rebuilding: {e}", index.space());
+                    to_rebuild.push(index);
                 }
             }
         }
-
-        // Full rebuild: pre-fetch all memories with secondary embeddings (I/O outside locks)
-        let all_ids = self.storage.get_all_ids()?;
-        let mut to_index: Vec<(MemoryId, Vec<f32>)> = Vec::new();
-
-        for memory_id in &all_ids {
-            if let Ok(memory) = self.storage.get(memory_id) {
-                if memory.is_forgotten() {
-                    continue;
-                }
-                match &memory.experience.embeddings_secondary {
-                    Some(sec_emb) if self.holds_own_secondary(&memory) => {
-                        to_index.push((memory_id.clone(), sec_emb.clone()));
+        if to_rebuild.is_empty() {
+            return Ok(());
+        }
+        let mut members: Vec<Vec<(MemoryId, Vec<f32>)>> = vec![Vec::new(); to_rebuild.len()];
+        for memory_id in self.storage.get_all_ids()? {
+            let Ok(memory) = self.storage.get(&memory_id) else {
+                continue;
+            };
+            if memory.is_forgotten() {
+                continue;
+            }
+            for (slot, index) in to_rebuild.iter().enumerate() {
+                match self.stored_vector(&memory, index.space()) {
+                    Some(vector) => members[slot].push((memory_id.clone(), vector.clone())),
+                    None if self.secondary_index_space.as_ref() == Some(index.space())
+                        && memory.experience.embeddings_secondary.is_some() =>
+                    {
+                        self.refuse_secondary(&memory)
                     }
-                    Some(_) => self.refuse_secondary(&memory),
                     None => {}
                 }
             }
         }
-
-        if to_index.is_empty() {
-            info!("No secondary embeddings found, secondary index empty");
-            return Ok(());
+        for (index, members) in to_rebuild.into_iter().zip(members) {
+            index.rebuild(members)?;
         }
-
-        // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
-        let mut sec_idx = sec_index.write();
-        let mut sec_map = sec_mapping.write();
-        sec_map.clear();
-
-        let mut indexed = 0usize;
-        let mut failed = 0usize;
-
-        for (memory_id, embedding) in &to_index {
-            match sec_idx.add_vector(embedding.clone()) {
-                Ok(vector_id) => {
-                    sec_map.insert(memory_id.clone(), vector_id);
-                    indexed += 1;
-                }
-                Err(e) => {
-                    warn!("Failed to index secondary for {}: {}", memory_id.0, e);
-                    failed += 1;
-                }
-            }
-        }
-
-        info!(
-            "Rebuilt secondary Vamana from RocksDB: {} indexed, {} failed in {:.2}s",
-            indexed,
-            failed,
-            start_time.elapsed().as_secs_f64()
-        );
-
         Ok(())
+    }
+
+    /// The vector `memory` holds in `space`, reading absent slot spaces as the engine always
+    /// has: the primary slot in the primary space, the secondary slot in the secondary's. Any
+    /// cosine against a query in `space` must compare this vector and no other.
+    pub fn stored_vector<'m>(&self, memory: &'m Memory, space: &SpaceId) -> Option<&'m Vec<f32>> {
+        memory.experience.vector_in(
+            space,
+            Some(&self.index_space),
+            self.secondary_index_space.as_ref(),
+        )
     }
 
     /// Try loading Vamana from persisted file for instant startup
@@ -1129,36 +957,13 @@ impl RetrievalEngine {
         drop(id_mapping);
         drop(vector_index);
 
-        // Save secondary Vamana index if present
-        // LOCK ORDERING: secondary_vector_index (3)
-        if let Some(ref sec_index) = self.secondary_vector_index {
-            let sec_path = self.storage_path.join("secondary_vector_index");
-            fs::create_dir_all(&sec_path)?;
-            let sec_vamana_path = sec_path.join(SECONDARY_VAMANA_INDEX_FILE);
-
-            let sec_idx = sec_index.read();
-            if !sec_idx.is_empty() {
-                let tmp_path = sec_vamana_path.with_extension("vamana.tmp");
-                match sec_idx.save_to_file(&tmp_path) {
-                    Ok(()) => {
-                        if let Err(e) = fs::rename(&tmp_path, &sec_vamana_path) {
-                            warn!(
-                                "Failed to rename secondary .vamana.tmp: {} (removing tmp)",
-                                e
-                            );
-                            let _ = fs::remove_file(&tmp_path);
-                        } else {
-                            info!("Saved secondary Vamana index: {} vectors", sec_idx.len());
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to save secondary Vamana (will rebuild on restart): {}",
-                            e
-                        );
-                        let _ = fs::remove_file(&tmp_path);
-                    }
-                }
+        // LOCK ORDERING: each space index after the primary's, one at a time.
+        for index in self.space_indexes.values() {
+            if let Err(e) = index.save() {
+                warn!(
+                    "Failed to save the {} index (will rebuild on restart): {e}",
+                    index.space()
+                );
             }
         }
 
@@ -1247,14 +1052,6 @@ impl RetrievalEngine {
             .primary_space(Some(&self.index_space))
             .as_ref()
             == Some(&self.index_space)
-    }
-
-    /// Whether the memory's secondary vector is in the secondary index's space.
-    fn holds_own_secondary(&self, memory: &Memory) -> bool {
-        match &self.secondary_index_space {
-            Some(space) => memory.experience.secondary_space(Some(space)).as_ref() == Some(space),
-            None => false,
-        }
     }
 
     fn record_refusal(&self, key: &BacklogKey, mismatch: &SpaceMismatch) {
@@ -1376,107 +1173,99 @@ impl RetrievalEngine {
             .update_vector_mapping(&memory.id, vector_ids)
             .context("Failed to persist vector mapping to RocksDB")?;
 
-        // Secondary failure is non-fatal — primary is authoritative. It is recorded, so the
-        // drain gives the secondary index its vector.
-        if let Err(e) = self.add_secondary(memory) {
-            if !is_space_mismatch(&e) {
-                if let Some(space) = &self.secondary_index_space {
-                    if let Err(record_err) = self.backlog.record_key(
-                        &BacklogKey::in_space(&memory.id, space),
-                        super::embedding_backlog::EnqueueReason::IndexFailed,
-                        Some(space),
-                        None,
-                        Some(&e.to_string()),
-                    ) {
-                        tracing::error!(
-                            "embedding backlog: could not record {}: {record_err}",
-                            memory.id.0
-                        );
-                    }
-                }
-            }
-        }
+        // Other spaces' failures are non-fatal — the primary is authoritative. Each is recorded,
+        // so the drain gives that index its vector.
+        self.index_other_spaces(memory);
 
         Ok(())
     }
 
-    /// Add the memory's secondary vector to the secondary index, when both exist. A vector in
-    /// another space is refused and recorded, never added.
-    fn add_secondary(&self, memory: &Memory) -> Result<()> {
-        let (Some(sec_index), Some(sec_mapping)) =
-            (&self.secondary_vector_index, &self.secondary_id_mapping)
-        else {
-            return Ok(());
-        };
-        let Some(sec_emb) = &memory.experience.embeddings_secondary else {
-            return Ok(());
-        };
-        if !self.holds_own_secondary(memory) {
-            self.refuse_secondary(memory);
-            return Err(SpaceMismatch {
-                memory: memory.id.clone(),
-                stored: space::resolve(
-                    memory.experience.embedding_space_secondary.as_ref(),
-                    sec_emb.len(),
-                    self.secondary_index_space.as_ref(),
-                ),
-                index: self
-                    .secondary_index_space
-                    .clone()
-                    .unwrap_or_else(|| SpaceId::unrecorded(sec_index.read().config.dimension)),
-            }
-            .into());
-        }
-        // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
-        let sec_vector_id = sec_index
-            .write()
-            .add_vector(sec_emb.clone())
-            .context("Failed to add secondary vector to index")?;
-        sec_mapping.write().insert(memory.id.clone(), sec_vector_id);
-        Ok(())
-    }
-
-    /// Replace the memory's vector in the secondary index with the one it stores now. For the
-    /// drain of a row targeting the secondary space.
-    pub fn reindex_secondary(&self, memory: &Memory) -> Result<()> {
-        if let (Some(sec_index), Some(sec_mapping)) =
-            (&self.secondary_vector_index, &self.secondary_id_mapping)
-        {
-            // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
-            let old_ids = sec_mapping
-                .read()
-                .memory_to_vectors
-                .get(&memory.id)
-                .cloned()
-                .unwrap_or_default();
-            if !old_ids.is_empty() {
-                let idx = sec_index.read();
-                for vid in &old_ids {
-                    idx.mark_deleted(*vid);
+    /// Add the memory's vector in every other space that has an index, recording any space
+    /// whose index refused it.
+    fn index_other_spaces(&self, memory: &Memory) {
+        for index in self.space_indexes.values() {
+            if let Err(e) = self.add_in_space(memory, index) {
+                if is_space_mismatch(&e) {
+                    continue;
                 }
-                drop(idx);
-                sec_mapping.write().remove_all(&memory.id);
+                if let Err(record_err) = self.backlog.record_key(
+                    &BacklogKey::in_space(&memory.id, index.space()),
+                    super::embedding_backlog::EnqueueReason::IndexFailed,
+                    Some(index.space()),
+                    None,
+                    Some(&e.to_string()),
+                ) {
+                    tracing::error!(
+                        "embedding backlog: could not record {}: {record_err}",
+                        memory.id.0
+                    );
+                }
             }
         }
-        self.add_secondary(memory)
     }
 
-    /// Whether the secondary index holds the memory.
-    pub fn is_secondary_indexed(&self, memory_id: &MemoryId) -> bool {
-        self.secondary_id_mapping
-            .as_ref()
-            .is_some_and(|m| m.read().contains(memory_id))
+    /// Add the memory's vector in `index`'s space. A secondary slot holding a vector in
+    /// another space than the secondary index's is refused and recorded, never added.
+    fn add_in_space(&self, memory: &Memory, index: &SpaceIndex) -> Result<()> {
+        match self.stored_vector(memory, index.space()) {
+            Some(vector) => index.add(&memory.id, vector.clone()),
+            None if self.secondary_index_space.as_ref() == Some(index.space()) => {
+                let Some(sec_emb) = &memory.experience.embeddings_secondary else {
+                    return Ok(());
+                };
+                self.refuse_secondary(memory);
+                Err(SpaceMismatch {
+                    memory: memory.id.clone(),
+                    stored: space::resolve(
+                        memory.experience.embedding_space_secondary.as_ref(),
+                        sec_emb.len(),
+                        Some(index.space()),
+                    ),
+                    index: index.space().clone(),
+                }
+                .into())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Replace the memory's vector in `space`'s index with the one it stores now. For the
+    /// drain of a row targeting that space.
+    pub fn reindex_space(&self, memory: &Memory, space: &SpaceId) -> Result<()> {
+        let index = self
+            .space_indexes
+            .get(space)
+            .with_context(|| format!("no index here holds {space}"))?;
+        index.remove(&memory.id);
+        self.add_in_space(memory, index)
+    }
+
+    /// Whether `space`'s index holds the memory. The primary space reads the primary index.
+    pub fn is_indexed_in(&self, space: &SpaceId, memory_id: &MemoryId) -> bool {
+        if *space == self.index_space {
+            return self.is_indexed(memory_id);
+        }
+        self.space_indexes
+            .get(space)
+            .is_some_and(|index| index.contains(memory_id))
+    }
+
+    /// The spaces this engine can search: the primary index's, then every other index's.
+    pub fn spaces(&self) -> Vec<SpaceId> {
+        std::iter::once(self.index_space.clone())
+            .chain(self.space_indexes.keys().cloned())
+            .collect()
     }
 
     /// Memories each index holds, by the index's space.
     pub fn indexed_by_space(&self) -> Vec<(SpaceId, usize)> {
-        let mut out = vec![(self.index_space.clone(), self.len())];
-        if let (Some(space), Some(mapping)) =
-            (&self.secondary_index_space, &self.secondary_id_mapping)
-        {
-            out.push((space.clone(), mapping.read().len()));
-        }
-        out
+        std::iter::once((self.index_space.clone(), self.len()))
+            .chain(
+                self.space_indexes
+                    .values()
+                    .map(|index| (index.space().clone(), index.len())),
+            )
+            .collect()
     }
 
     /// Re-index an existing memory with updated embeddings
@@ -1516,33 +1305,13 @@ impl RetrievalEngine {
             }
         }
 
-        // Clean up secondary index for this memory
-        // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
-        if let (Some(ref sec_index), Some(ref sec_mapping)) =
-            (&self.secondary_vector_index, &self.secondary_id_mapping)
-        {
-            // Peek at mapping to get vector IDs without removing yet
-            let old_sec_ids: Vec<u32> = {
-                let map = sec_mapping.read();
-                map.memory_to_vectors
-                    .get(&memory.id)
-                    .cloned()
-                    .unwrap_or_default()
-            };
-            if !old_sec_ids.is_empty() {
-                // Lock 3 first: mark deleted in secondary index
-                let sec_idx = sec_index.read();
-                for vid in &old_sec_ids {
-                    sec_idx.mark_deleted(*vid);
-                }
-                drop(sec_idx);
-                // Lock 4 second: remove from secondary mapping
-                sec_mapping.write().remove_all(&memory.id);
-            }
+        // Every other space's index drops the memory too; index_memory adds back what it holds.
+        for index in self.space_indexes.values() {
+            index.remove(&memory.id);
         }
 
         // Add with new embedding (may create multiple chunks)
-        // index_memory() also handles secondary indexing
+        // index_memory() also indexes the memory's other spaces
         self.index_memory(memory)
     }
 
@@ -1554,6 +1323,13 @@ impl RetrievalEngine {
     ///
     /// Returns true if the memory was found and removed, false if not indexed.
     pub fn remove_memory(&self, memory_id: &MemoryId) -> bool {
+        // Every other space first, whether or not the primary index held the memory: a memory
+        // the primary refused can still be in another space's index.
+        let mut removed_elsewhere = false;
+        for index in self.space_indexes.values() {
+            removed_elsewhere |= index.remove(memory_id);
+        }
+
         // Remove from in-memory ID mapping and get the vector IDs
         let vector_ids = self.id_mapping.write().remove_all(memory_id);
 
@@ -1564,31 +1340,6 @@ impl RetrievalEngine {
                 index.mark_deleted(*vid);
             }
             drop(index);
-
-            // Remove from secondary index if present
-            // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
-            if let (Some(ref sec_index), Some(ref sec_mapping)) =
-                (&self.secondary_vector_index, &self.secondary_id_mapping)
-            {
-                // Peek at mapping to get vector IDs without removing yet
-                let sec_ids: Vec<u32> = {
-                    let map = sec_mapping.read();
-                    map.memory_to_vectors
-                        .get(memory_id)
-                        .cloned()
-                        .unwrap_or_default()
-                };
-                if !sec_ids.is_empty() {
-                    // Lock 3 first: mark deleted in secondary index
-                    let sec_idx = sec_index.read();
-                    for vid in &sec_ids {
-                        sec_idx.mark_deleted(*vid);
-                    }
-                    drop(sec_idx);
-                    // Lock 4 second: remove from secondary mapping
-                    sec_mapping.write().remove_all(memory_id);
-                }
-            }
 
             // NOTE: Memory graph edges are managed in GraphMemory at the API layer
             // GraphMemory handles cleanup via its own mechanisms
@@ -1610,7 +1361,7 @@ impl RetrievalEngine {
             true
         } else {
             tracing::debug!("Memory {:?} not found in vector index", memory_id);
-            false
+            removed_elsewhere
         }
     }
 
@@ -1821,55 +1572,37 @@ impl RetrievalEngine {
         Ok(memory_ids)
     }
 
-    /// Search secondary Vamana index only (768d Nomic embeddings)
-    ///
-    /// Returns results from the secondary index, or empty vec if secondary
-    /// is not configured or the query has no secondary embedding.
+    /// Search the secondary embedder's space. Empty when no secondary is configured.
     /// Used as a 4th RRF signal in Layer 4 fusion.
     pub fn search_ids_secondary(
         &self,
         query_embedding_secondary: &[f32],
         limit: usize,
     ) -> Result<Vec<(MemoryId, f32)>> {
-        let (sec_index, sec_mapping) =
-            match (&self.secondary_vector_index, &self.secondary_id_mapping) {
-                (Some(idx), Some(map)) => (idx, map),
-                _ => return Ok(Vec::new()),
-            };
-
-        // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
-        let index = sec_index.read();
-        let results = index
-            .search(
-                query_embedding_secondary,
-                limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
-            )
-            .context("Secondary vector search failed")?;
-
-        let id_mapping = sec_mapping.read();
-        let mut best_scores: std::collections::HashMap<MemoryId, f32> =
-            std::collections::HashMap::new();
-
-        for (vector_id, distance) in results {
-            let similarity = -distance; // NormalizedDotProduct: similarity = -distance
-            if let Some(memory_id) = id_mapping.get_memory_id(vector_id) {
-                best_scores
-                    .entry(memory_id.clone())
-                    .and_modify(|score| {
-                        if similarity > *score {
-                            *score = similarity;
-                        }
-                    })
-                    .or_insert(similarity);
-            }
+        match &self.secondary_index_space {
+            Some(space) => self.search_space(space, query_embedding_secondary, limit),
+            None => Ok(Vec::new()),
         }
+    }
 
-        // Tie-break by MemoryId for deterministic rank order across runs (RH-10).
-        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        memory_ids.truncate(limit);
-
-        Ok(memory_ids)
+    /// Search `space`'s index with a query vector in that space: one score per memory (its
+    /// best vector), best first, ties broken by id. Empty when no index here holds the space.
+    /// The primary space searches the primary index, chunk aggregation included.
+    pub fn search_space(
+        &self,
+        space: &SpaceId,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        if *space == self.index_space {
+            return self.search_by_embedding(query, limit, None);
+        }
+        match self.space_indexes.get(space) {
+            Some(index) => {
+                index.search(query, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2, limit)
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Search the *primary* Vamana index using a query text encoded with the
@@ -2608,18 +2341,28 @@ impl RetrievalEngine {
     /// Get vector index degradation info
     pub fn index_health(&self) -> IndexHealth {
         let index = self.vector_index.read();
-        let secondary = self.secondary_vector_index.as_ref().map(|sec| {
-            let sec_idx = sec.read();
-            SecondaryIndexHealth {
-                total_vectors: sec_idx.len(),
-                incremental_inserts: sec_idx.incremental_insert_count(),
-                deleted_count: sec_idx.deleted_count(),
-                deletion_ratio: sec_idx.deletion_ratio(),
-                needs_rebuild: sec_idx.needs_rebuild(),
-                needs_compaction: sec_idx.needs_compaction(),
-            }
-        });
+        let secondary = self
+            .secondary_index_space
+            .as_ref()
+            .and_then(|space| self.space_indexes.get(space))
+            .map(|index| {
+                let h = index.health();
+                SecondaryIndexHealth {
+                    total_vectors: h.total_vectors,
+                    incremental_inserts: h.incremental_inserts,
+                    deleted_count: h.deleted_count,
+                    deletion_ratio: h.deletion_ratio,
+                    needs_rebuild: h.needs_rebuild,
+                    needs_compaction: h.needs_compaction,
+                }
+            });
+        let spaces = self
+            .space_indexes
+            .values()
+            .map(SpaceIndex::health)
+            .collect();
         IndexHealth {
+            spaces,
             total_vectors: index.len(),
             incremental_inserts: index.incremental_insert_count(),
             deleted_count: index.deleted_count(),
@@ -2656,6 +2399,8 @@ pub struct IndexHealth {
     pub rebuild_threshold: usize,
     pub deletion_ratio_threshold: f32,
     pub secondary: Option<SecondaryIndexHealth>,
+    /// Every non-primary space's index, the secondary's included.
+    pub spaces: Vec<SpaceIndexHealth>,
 }
 
 // ============================================================================
@@ -3435,6 +3180,7 @@ mod tests {
             rebuild_threshold: 500,
             deletion_ratio_threshold: 0.2,
             secondary: None,
+            spaces: Vec::new(),
         };
 
         assert_eq!(health.total_vectors, 1000);
@@ -3770,6 +3516,101 @@ mod space_tests {
     }
 
     #[test]
+    fn a_secondary_space_index_reloads_with_its_mapping_and_is_searched_by_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let s = Stub::new("model-s", 6);
+        let model_s = SpaceId::new("model-s", 6);
+        let mut ids = Vec::new();
+        {
+            let engine = engine(&store, tmp.path(), a.clone(), Some(s.clone()));
+            for n in 0..12 {
+                let content = format!("memory number {n}");
+                let mut m = memory(&content, None);
+                m.experience
+                    .set_primary_vector(a.encode(&content).unwrap(), SpaceId::new("model-a", DIM));
+                m.experience
+                    .set_secondary_vector(s.encode(&content).unwrap(), model_s.clone());
+                store.store(&m).unwrap();
+                engine.index_memory(&m).unwrap();
+                ids.push((m.id.clone(), content));
+            }
+            assert!(engine.remove_memory(&ids[3].0));
+            engine.save().unwrap();
+        }
+        let engine = engine(&store, tmp.path(), a, Some(s.clone()));
+        assert_eq!(
+            engine.spaces(),
+            vec![SpaceId::new("model-a", DIM), model_s.clone()]
+        );
+        assert!(engine.is_indexed_in(&model_s, &ids[5].0));
+        assert!(
+            !engine.is_indexed_in(&model_s, &ids[3].0),
+            "a removal survives the reload"
+        );
+        let query = s.encode(&ids[7].1).unwrap();
+        let hits = engine.search_space(&model_s, &query, 3).unwrap();
+        assert_eq!(hits[0].0, ids[7].0);
+        assert!(
+            engine
+                .search_space(&SpaceId::new("model-z", 6), &query, 3)
+                .unwrap()
+                .is_empty(),
+            "a space no index holds has nothing to search"
+        );
+    }
+
+    #[test]
+    fn a_kept_vector_in_an_indexed_space_is_indexed_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let s = Stub::new("model-s", 6);
+        let model_s = SpaceId::new("model-s", 6);
+        let engine = engine(&store, tmp.path(), a.clone(), Some(s.clone()));
+        let mut m = memory("kept from another instance", None);
+        m.experience
+            .set_primary_vector(a.encode("k").unwrap(), SpaceId::new("model-a", DIM));
+        m.experience.keep_vector(
+            model_s.clone(),
+            s.encode("kept from another instance").unwrap(),
+        );
+        store.store(&m).unwrap();
+        engine.index_memory(&m).unwrap();
+        assert!(engine.is_indexed_in(&model_s, &m.id));
+    }
+
+    #[test]
+    fn a_re_embed_keeps_the_vector_it_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let mut written = memory("written under model a", None);
+        let old = a.encode(&written.experience.content).unwrap();
+        written
+            .experience
+            .set_primary_vector(old.clone(), SpaceId::new("model-a", DIM));
+        store.store(&written).unwrap();
+        markers(tmp.path(), &a.id, DIM);
+        drop(engine(&store, tmp.path(), a, None));
+
+        let b = engine(&store, tmp.path(), Stub::new("model-b", DIM), None);
+        let read = store.get(&written.id).unwrap();
+        assert_eq!(
+            read.experience.embedding_space,
+            Some(SpaceId::new("model-b", DIM))
+        );
+        assert_eq!(
+            read.experience
+                .vector_in(&SpaceId::new("model-a", DIM), None, None),
+            Some(&old),
+            "the stored vector in the old space stays until that space is retired"
+        );
+        assert!(b.is_indexed(&written.id));
+    }
+
+    #[test]
     fn a_secondary_in_another_space_is_queued_and_the_primary_still_indexes() {
         let tmp = tempfile::tempdir().unwrap();
         let store = store(tmp.path());
@@ -3788,7 +3629,7 @@ mod space_tests {
         engine.index_memory(&m).unwrap();
 
         assert!(engine.is_indexed(&m.id));
-        assert!(!engine.is_secondary_indexed(&m.id));
+        assert!(!engine.is_indexed_in(&model_s, &m.id));
         let row = EmbeddingBacklogStore::with_kv(store.key_value_store())
             .get_key(&BacklogKey::in_space(&m.id, &model_s))
             .unwrap()

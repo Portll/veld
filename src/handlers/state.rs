@@ -2162,8 +2162,21 @@ impl MultiUserMemoryManager {
                     distance_metric: crate::vector_db::DistanceMetric::default(),
                 },
             };
+            // The primary text index holds the tenant's active space: the embedder this process
+            // runs, else what the corpus markers name. Bound before replay, so a log that
+            // spans an embedder change does not build it in the old space.
+            let active_space = (kind == crate::vector_db::VamanaEmbeddingKind::TextPrimary)
+                .then(|| {
+                    crate::embeddings::primary_embedder_info()
+                        .map(|info| {
+                            crate::embeddings::space::SpaceId::new(&info.model, info.dimension)
+                        })
+                        .or_else(|| crate::embeddings::space::corpus_space(&user_path))
+                })
+                .flatten();
             let mut proj =
-                crate::vector_db::VamanaProjection::lazy(kind, bootstrap, checkpoint_store.clone());
+                crate::vector_db::VamanaProjection::lazy(kind, bootstrap, checkpoint_store.clone())
+                    .bind_space(active_space);
             let applied =
                 crate::intent_log::replay(&log, &mut proj, Some(100)).with_context(|| {
                     format!(

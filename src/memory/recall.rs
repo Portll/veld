@@ -780,6 +780,16 @@ impl super::MemorySystem {
         } else {
             None
         };
+        // The space each query vector is in. A stored vector is compared with a query only in
+        // the space both are in, and every space a query vector exists for is searched.
+        let index_space = self.retriever.index_space().clone();
+        let space_queries: Vec<(SpaceId, &Vec<f32>)> = self
+            .retriever
+            .secondary_index_space()
+            .cloned()
+            .zip(query_embedding_secondary.as_ref())
+            .into_iter()
+            .collect();
 
         let t_embedding = recall_start.elapsed();
         tracing::info!(
@@ -1413,8 +1423,8 @@ impl super::MemorySystem {
             let dual_cosine = |mem: &crate::memory::types::Memory| -> Option<f32> {
                 let mut best: Option<f32> = None;
 
-                // Primary embedding (MiniLM 384d)
-                if let Some(ref emb) = mem.experience.embeddings {
+                // Primary embedding, only when it is in the primary index's space
+                if let Some(emb) = self.retriever.stored_vector(mem, &index_space) {
                     if !emb.is_empty() {
                         let sim = crate::memory::hybrid_search::cosine_similarity_pub(
                             &query_embedding,
@@ -1424,15 +1434,14 @@ impl super::MemorySystem {
                     }
                 }
 
-                // Secondary embedding (Nomic 768d) — take max of both
-                if let (Some(ref q_sec), Some(ref m_sec)) = (
-                    &query_embedding_secondary,
-                    &mem.experience.embeddings_secondary,
-                ) {
-                    if !m_sec.is_empty() {
-                        let sim_sec =
-                            crate::memory::hybrid_search::cosine_similarity_pub(q_sec, m_sec);
-                        best = Some(best.map_or(sim_sec, |b| b.max(sim_sec)));
+                // Every other space a query vector exists for — take the max
+                for (space, q_sec) in &space_queries {
+                    if let Some(m_sec) = self.retriever.stored_vector(mem, space) {
+                        if !m_sec.is_empty() {
+                            let sim_sec =
+                                crate::memory::hybrid_search::cosine_similarity_pub(q_sec, m_sec);
+                            best = Some(best.map_or(sim_sec, |b| b.max(sim_sec)));
+                        }
                     }
                 }
 
@@ -1688,34 +1697,37 @@ impl super::MemorySystem {
                             sec_w
                         );
                     }
-                } else if let Some(ref sec_emb) = query_embedding_secondary {
-                    match self
-                        .retriever
-                        .search_ids_secondary(sec_emb, query.max_results * 8)
-                    {
-                        Ok(sec_results) if !sec_results.is_empty() => {
-                            // Use fraction of semantic weight for secondary — it's a refinement
-                            // signal, not a replacement for primary vector search.
-                            // Precedence: live dial `secondary_rrf_ratio` → const 0.5.
-                            let sec_ratio = self
-                                .cognitive_dials
-                                .read()
-                                .secondary_rrf_ratio
-                                .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
-                            let sec_w = semantic_w * sec_ratio;
-                            for (r, (id, _)) in sec_results.iter().enumerate() {
-                                *fused.entry(id.clone()).or_insert(0.0) +=
-                                    sec_w / (k + (r + 1) as f32);
+                } else {
+                    for (space, sec_emb) in &space_queries {
+                        match self
+                            .retriever
+                            .search_space(space, sec_emb, query.max_results * 8)
+                        {
+                            Ok(sec_results) if !sec_results.is_empty() => {
+                                // Use fraction of semantic weight for secondary — it's a refinement
+                                // signal, not a replacement for primary vector search.
+                                // Precedence: live dial `secondary_rrf_ratio` → const 0.5.
+                                let sec_ratio = self
+                                    .cognitive_dials
+                                    .read()
+                                    .secondary_rrf_ratio
+                                    .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
+                                let sec_w = semantic_w * sec_ratio;
+                                for (r, (id, _)) in sec_results.iter().enumerate() {
+                                    *fused.entry(id.clone()).or_insert(0.0) +=
+                                        sec_w / (k + (r + 1) as f32);
+                                }
+                                tracing::debug!(
+                                    "Layer 4 RRF: {} index added {} results (w={:.2})",
+                                    space,
+                                    sec_results.len(),
+                                    sec_w
+                                );
                             }
-                            tracing::debug!(
-                                "Layer 4 RRF: secondary Vamana added {} results (w={:.2})",
-                                sec_results.len(),
-                                sec_w
-                            );
-                        }
-                        Ok(_) => {} // Empty results — secondary index may be unpopulated
-                        Err(e) => {
-                            tracing::warn!("Secondary Vamana search failed (non-fatal): {}", e);
+                            Ok(_) => {} // Empty results — that space's index may be unpopulated
+                            Err(e) => {
+                                tracing::warn!("{} index search failed (non-fatal): {}", space, e);
+                            }
                         }
                     }
                 }
@@ -4327,12 +4339,12 @@ impl super::MemorySystem {
             // independent embedders agreeing on the ranking => trustworthy;
             // diverging => uncertain. Skipped when there is no secondary embedder
             // or too few results carry secondary embeddings.
-            let cross_embedder_agreement = query_embedding_secondary.as_ref().and_then(|qsec| {
+            let cross_embedder_agreement = space_queries.first().and_then(|(sec_space, qsec)| {
                 let mut pairs: Vec<(f32, f32)> = Vec::new();
                 for m in memories.iter().take(10) {
                     if let (Some(emb), Some(sec)) = (
-                        m.experience.embeddings.as_ref(),
-                        m.experience.embeddings_secondary.as_ref(),
+                        self.retriever.stored_vector(m, &index_space),
+                        self.retriever.stored_vector(m, sec_space),
                     ) {
                         let p = crate::memory::hybrid_search::cosine_similarity_pub(
                             &query_embedding,
