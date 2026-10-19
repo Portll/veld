@@ -2377,7 +2377,7 @@ impl MemorySystem {
         {
             let ctx = experience
                 .context
-                .get_or_insert_with(crate::memory::session_detect::rich_context_with_session);
+                .get_or_insert_with(|| index_text::threaded_context(created_at));
             ctx.episode.preceding_memory_id = Some(prior.id.0.to_string());
         }
         Some(index_text::build(

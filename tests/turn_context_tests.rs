@@ -129,6 +129,40 @@ fn the_prior_turn_threads_the_episode_and_leaves_content_alone() {
     assert_eq!(preceding.as_deref(), Some(first.0.to_string().as_str()));
 }
 
+/// The context created to hold the threaded id describes the turn, not the server:
+/// session detection would stamp the veld process's own cwd, branch and editor onto
+/// it, and the wall clock would replace the turn's own time.
+#[test]
+fn a_threaded_turns_stored_context_carries_a_default_session() {
+    let (system, _dir) = create_test_system();
+    let at = Utc.with_ymd_and_hms(2022, 5, 1, 19, 31, 0).unwrap();
+    let reply_at = at + chrono::Duration::minutes(2);
+
+    system
+        .remember(
+            turn("Joanna: Did you get the new controller?", "Joanna"),
+            Some(at),
+        )
+        .expect("first stored");
+    let second = system
+        .remember(
+            turn("Nate: Yes, it arrived this morning.", "Nate"),
+            Some(reply_at),
+        )
+        .expect("second stored");
+
+    let stored = system.get_memory(&second).expect("second readable");
+    let ctx = stored
+        .experience
+        .context
+        .as_ref()
+        .expect("a threaded turn carries a context");
+    assert!(ctx.episode.preceding_memory_id.is_some());
+    assert_eq!(ctx.session, veld::memory::facets::AgentSession::default());
+    assert_eq!(ctx.created_at, reply_at);
+    assert_eq!(ctx.updated_at, reply_at);
+}
+
 /// A turn more than the session gap after the last one starts a new chain.
 #[test]
 fn a_turn_after_the_session_gap_has_no_prior() {
