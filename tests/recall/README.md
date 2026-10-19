@@ -22,9 +22,12 @@ reason to accept or decline a port (`docs/upstream/PLAN.md`, 1.5).
 `.github/workflows/recall.yml` runs the 100-case `locomo-gate` suite and compares each engine's
 run against two checked-in files:
 
-- `locomo-gate-baseline.json`: aggregate metrics and the rerank setting they were measured
-  under. `recall-eval` gates on these, and refuses a run reranked differently; its exit code is
-  the pass or fail.
+- `locomo-gate-baseline.json`: aggregate metrics, the rerank setting they were measured
+  under, and any candidate-generation dial the run overrode (`retrieval_dials`, today
+  `date_window_leg`). `recall-eval` gates on these, and refuses a run reranked differently or
+  run under other dial overrides; its exit code is the pass or fail. A baseline without
+  `retrieval_dials` was recorded with no overrides, which is how the gate workflow runs, so it
+  is compared, and a change to a dial's engine default is measured as code.
 - `locomo-gate-baseline.per-case.json`: the per-case records from the same run.
   `scripts/recall_diff.py` uses them to list every case whose result moved: lost gold, gained
   gold, p@1 flips and rank-only moves.
