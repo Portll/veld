@@ -748,6 +748,204 @@ mod write_latch_reporting {
         );
         assert_eq!(ready_decision(false, &latch).2, 0);
     }
+
+    /// Every kind of store driven through its real write paths into a NoSpace
+    /// refusal: the database the write targeted latches and `/health` names it.
+    ///
+    /// The latch these sites record into is the process-global one, so another
+    /// test's store may be in the body too; each assertion looks for its own.
+    #[cfg(feature = "rocksdb")]
+    mod write_sites {
+        use super::*;
+        use crate::graph_memory::EntityNode;
+        use crate::memory::storage::wire_fixtures::memory_with_session;
+        use crate::memory::storage::{MemoryStorage, Modality};
+        use crate::storage::legacy_rocksdb::{
+            RocksDbAuditStore, RocksDbColumnFamilyStore, RocksDbColumnStore,
+            RocksDbDefaultKeyValueStore, RocksDbGraphStore,
+        };
+        use crate::storage::write_latch::{chain_is_enospc, global, injected, store_id};
+        use crate::storage::{AuditLogEntry, AuditStore, ColumnStore, GraphStore, KeyValueStore};
+        use std::sync::Arc;
+
+        fn assert_reported(store: &Path, site: &str) {
+            let latch = global();
+            let snapshot = latch
+                .snapshot_at(store)
+                .unwrap_or_else(|| panic!("{site}: the refusal did not latch its store"));
+
+            let body = response_json(latch);
+            assert_eq!(body["status"], "degraded", "{site}");
+            let entry = body["write_latch"]
+                .as_array()
+                .expect("write_latch is an array")
+                .iter()
+                .find(|entry| entry["store"] == store_id(store))
+                .unwrap_or_else(|| panic!("{site}: /health does not name the store: {body}"));
+            assert_eq!(entry["condition"], "no_space_left_on_device", "{site}");
+            assert!(entry["failed_writes"].as_u64() >= Some(1), "{site}");
+
+            // Hard only when the disk had room for the flush+retry, which then
+            // met the same refusal; a full disk leaves it soft and ready.
+            if snapshot.hard {
+                let (code, _, hard_stores) = ready_decision(true, latch);
+                assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{site}");
+                assert!(hard_stores >= 1, "{site}");
+            }
+        }
+
+        /// Refuse `write` for want of space and check the latch and the report;
+        /// then let the same write through and check that it clears the store.
+        fn drive(store: &Path, site: &str, write: impl Fn() -> anyhow::Result<()>) {
+            injected::arm(store);
+            let refused = write();
+            injected::disarm(store);
+
+            let err = refused
+                .err()
+                .unwrap_or_else(|| panic!("{site}: the refusal never reached the caller"));
+            assert!(
+                chain_is_enospc(&err),
+                "{site}: the caller lost the NoSpace cause, so it answers 500, not 503: {err:#}"
+            );
+            assert_reported(store, site);
+
+            write().unwrap_or_else(|e| panic!("{site}: the write after the refusal failed: {e:#}"));
+            assert!(
+                !global().is_latched_at(store),
+                "{site}: a write that landed left the latch standing"
+            );
+        }
+
+        #[test]
+        fn index_delete_and_multimodal_writes_latch_the_memory_database() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = MemoryStorage::new(dir.path(), None).expect("open storage");
+            let db = storage.db();
+            let store = db.path();
+            let memory = memory_with_session("a memory the disk refuses");
+            storage.store(&memory).expect("seed the memory");
+            let facts = RocksDbDefaultKeyValueStore::new(Arc::clone(&db));
+            let holder = memory.id.0.to_string();
+
+            drive(store, "multimodal store", || {
+                storage.store_with_multimodal_vectors(&memory, Modality::Text, vec![7])
+            });
+            drive(store, "modality vectors", || {
+                storage.update_modality_vectors(&memory.id, Modality::Image, vec![8])
+            });
+            drive(store, "index rebuild", || {
+                storage.rebuild_index().map(|_| ())
+            });
+            drive(store, "retrieval counter", || {
+                storage.increment_retrieval_count().map(|_| ())
+            });
+            drive(store, "interference records", || {
+                storage.save_interference_records(&holder, &[])
+            });
+            drive(store, "default-keyspace view", || {
+                facts.put_bytes(b"facts:latch", b"1")
+            });
+            drive(store, "delete", || storage.delete_with_vectors(&memory.id));
+        }
+
+        /// The double key: `store` once latched the tenant directory while the
+        /// batch writer over the same database cleared `<tenant>/storage`, so a
+        /// latch raised by one stood after the other had written.
+        #[test]
+        fn a_write_through_any_adapter_clears_the_latch_on_its_database() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = MemoryStorage::new(dir.path(), None).expect("open storage");
+            let db = storage.db();
+            let memory = memory_with_session("refused by the record write");
+
+            injected::arm(db.path());
+            let refused = storage.store(&memory);
+            injected::disarm(db.path());
+            assert!(chain_is_enospc(
+                &refused.expect_err("the armed refusal reaches the caller")
+            ));
+            assert_reported(db.path(), "store");
+
+            let mut batch = crate::storage::WriteBatch::new();
+            batch.put_cf("kv", b"dials".to_vec(), b"1".to_vec());
+            storage.write_batch(&batch).expect("the batch lands");
+            assert!(
+                !global().is_latched_at(db.path()),
+                "the batch writer cleared a different key than the record write latched"
+            );
+        }
+
+        #[test]
+        fn graph_writes_latch_the_graph_database() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let graph = RocksDbGraphStore::open(dir.path(), None).expect("open graph");
+            let store = graph
+                .inner()
+                .rocksdb_for_backup()
+                .expect("a rocksdb graph")
+                .path()
+                .to_path_buf();
+            let now = chrono::Utc::now();
+            let entity = EntityNode {
+                uuid: uuid::Uuid::new_v4(),
+                name: "harbour".to_string(),
+                labels: Vec::new(),
+                created_at: now,
+                last_seen_at: now,
+                mention_count: 1,
+                summary: String::new(),
+                attributes: Default::default(),
+                name_embedding: None,
+                salience: 0.4,
+                is_proper_noun: true,
+                pii_classification: Default::default(),
+            };
+
+            drive(&store, "entity put", || graph.put_entity(&entity));
+            drive(&store, "entity delete", || {
+                graph.inner().delete_entity(&entity.uuid).map(|_| ())
+            });
+            drive(&store, "graph flush", || graph.flush());
+        }
+
+        /// One database behind todos, reminders, files, feedback, context
+        /// blocks and audit, as `bootstrap_shared_stores` opens it.
+        #[test]
+        fn shared_store_writes_latch_the_shared_database() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let db = Arc::new(
+                rocksdb::DB::open_cf(&opts, dir.path(), ["default", "audit", "todos", "feedback"])
+                    .expect("open the shared database"),
+            );
+            let store = db.path().to_path_buf();
+            let columns = RocksDbColumnStore::new(Arc::clone(&db));
+            let feedback = RocksDbColumnFamilyStore::new(Arc::clone(&db), "feedback");
+            let audit = RocksDbAuditStore::new(Arc::clone(&db), "audit");
+            let event = AuditLogEntry {
+                timestamp: chrono::Utc::now(),
+                event_type: "remember".to_string(),
+                memory_id: "m-1".to_string(),
+                details: String::new(),
+            };
+
+            drive(&store, "todo put", || columns.put_cf("todos", b"t-1", b"1"));
+            drive(&store, "todo delete", || columns.delete_cf("todos", b"t-1"));
+            drive(&store, "feedback put", || feedback.put_bytes(b"f-1", b"1"));
+            drive(&store, "audit append", || {
+                audit.append_event("tenant", &event)
+            });
+            drive(&store, "audit rotation", || {
+                audit
+                    .rotate_events("tenant", 0, chrono::Utc::now())
+                    .map(|_| ())
+            });
+            drive(&store, "shared flush", || columns.flush_cf("todos"));
+        }
+    }
 }
 
 #[cfg(test)]

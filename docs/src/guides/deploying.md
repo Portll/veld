@@ -173,10 +173,13 @@ Veld now notices and says so:
 | `GET /health/live` | `200 alive` | `200 alive` — the process is alive either way |
 | Write API calls | — | `503 STORAGE_WRITE_LATCHED` instead of `500 INTERNAL_ERROR` |
 
-**The latch is per store, not per process.** Veld runs one RocksDB per tenant
-(`base/<user_id>`) and RocksDB's own latch is per database, so a write landing on
-one tenant's store says nothing about another's. One latched store out of twelve is
-`degraded`, and the array names which.
+**The latch is per store, not per process.** RocksDB's own latch is per database,
+and veld runs several: each tenant's memory store and graph under `base/<user_id>`,
+and one shared store (`base/shared`) holding todos, reminders, files, feedback,
+context blocks and the audit log. Every write to any of them goes through the
+latch, keyed by that database's directory, so a write landing on one store says
+nothing about another. One latched store out of twelve is `degraded`, and the
+array names which.
 
 **`/health` and `/health/ready` are unauthenticated** (`PROBE_PATHS`), so they
 carry no store paths. Each entry names its store by `store` — the first 16 hex
