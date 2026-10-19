@@ -439,11 +439,19 @@ impl KdfParams {
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let salt = b64d(&self.salt)?;
         let mut out = Zeroizing::new([0u8; KEY_LEN]);
+        #[cfg(test)]
+        ARGON2_DERIVATIONS.with(|count| count.set(count.get() + 1));
         argon
             .hash_password_into(passphrase.as_bytes(), &salt, out.as_mut_slice())
             .map_err(|e| anyhow!("Argon2id derivation failed: {e}"))?;
         Ok(out)
     }
+}
+
+// Per thread, so a test counts only the derivations it caused itself.
+#[cfg(test)]
+thread_local! {
+    static ARGON2_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A per-epoch data key, wrapped by the master key (KEK).
@@ -1038,6 +1046,7 @@ impl Keystore {
                 let _ = d.sync_all();
             }
         }
+        invalidate(path);
         Ok(())
     }
 
@@ -1190,32 +1199,244 @@ pub fn store_keystore_path(
     }
 }
 
-// Serialises open-or-create of a store keystore. The record store and the journal of
+// Serialises open-or-create of one store keystore. The record store and the journal of
 // the same tenant both unseal it; on a first run with a passphrase each would otherwise
 // create one, and records sealed under the overwritten keystore's key would be lost.
-static RECORD_KEYSTORE_OPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// Keyed by canonical path so tenants opening cold do not queue behind each other's
+// Argon2id derivations.
+static RECORD_KEYSTORE_OPEN: std::sync::LazyLock<
+    dashmap::DashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// Most unsealed store keystores held at once; one per tenant opened recently.
+const UNSEAL_CACHE_CAPACITY: usize = 1024;
+
+/// An unsealed store keystore and the master key that opened it.
+struct CachedUnseal {
+    path: std::path::PathBuf,
+    keystore: Keystore,
+    kek: SecretKey,
+    last_used: std::sync::atomic::AtomicU64,
+}
+
+/// Unsealed store keystores, keyed by [`unseal_cache_key`]: the canonical path, the
+/// exact bytes of the keystore file and the credentials that opened it. Any write to
+/// the file (rotation, revocation, re-wrap, enrolment, a restore or another process)
+/// changes the bytes, so a stale master key is never served for the new file.
+static UNSEAL_CACHE: std::sync::LazyLock<dashmap::DashMap<[u8; 32], CachedUnseal>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+static UNSEAL_CACHE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Keys the cache digest so the map never holds a plain hash of a passphrase.
+static UNSEAL_CACHE_MAC_KEY: std::sync::LazyLock<SecretKey> = std::sync::LazyLock::new(random_key);
+
+/// Drop every cached unseal of the keystore at `path`. Called after each write of a
+/// keystore file; the content-bound cache key already refuses a changed file, and this
+/// releases the superseded master keys at once.
+pub fn invalidate(path: &Path) {
+    let canonical = canonical_keystore_path(path);
+    UNSEAL_CACHE.retain(|_, entry| entry.path != canonical);
+}
+
+/// The path both the per-path lock and the cache are keyed by. The nearest existing
+/// ancestor is canonicalised and the missing components appended, so an opener that
+/// runs before the tenant directory exists and one that runs after it agree.
+fn canonical_keystore_path(path: &Path) -> std::path::PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut missing = Vec::new();
+    let mut existing = absolute.as_path();
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(existing) {
+            canonical.extend(missing.iter().rev());
+            return canonical;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return absolute,
+        }
+    }
+}
+
+/// What a store keystore may be unsealed with, read once per open.
+struct UnsealCredentials {
+    passphrase: Option<Zeroizing<String>>,
+    ring: Option<crate::keyring::RingKey>,
+    kms_wrap_key: Option<Zeroizing<String>>,
+}
+
+impl UnsealCredentials {
+    fn from_env() -> Self {
+        let var = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(Zeroizing::new)
+                .filter(|s| !s.is_empty())
+        };
+        Self {
+            passphrase: var("VELD_MASTER_PASSPHRASE"),
+            ring: crate::keyring::installed(),
+            kms_wrap_key: var("VELD_KMS_WRAP_KEY").filter(|s| !s.trim().is_empty()),
+        }
+    }
+
+    fn kms(&self) -> Result<Option<LocalAeadKms>> {
+        self.kms_wrap_key
+            .as_ref()
+            .map(|s| Ok(LocalAeadKms::new(decode_32(s)?)))
+            .transpose()
+    }
+}
+
+/// HMAC under a per-process key over the canonical path, the keystore file's bytes and
+/// every credential, each length-prefixed. Binding the credentials keeps a changed
+/// passphrase, KMS key or keyring from being answered with a key the new one would not
+/// have opened.
+fn unseal_cache_key(canonical: &Path, file: &[u8], creds: &UnsealCredentials) -> [u8; 32] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(UNSEAL_CACHE_MAC_KEY.as_slice())
+        .expect("HMAC accepts any key length");
+    let mut field = |bytes: Option<&[u8]>| match bytes {
+        Some(bytes) => {
+            Mac::update(&mut mac, &[1]);
+            Mac::update(&mut mac, &(bytes.len() as u64).to_le_bytes());
+            Mac::update(&mut mac, bytes);
+        }
+        None => Mac::update(&mut mac, &[0]),
+    };
+    field(Some(canonical.as_os_str().as_encoded_bytes()));
+    field(Some(file));
+    field(creds.passphrase.as_ref().map(|s| s.as_bytes()));
+    field(creds.kms_wrap_key.as_ref().map(|s| s.as_bytes()));
+    let ring = creds.ring.as_ref().map(|ring| ring.factor());
+    match &ring {
+        Some(Factor::Secret { id, secret, .. }) => {
+            field(Some(id.as_bytes()));
+            field(Some(secret));
+        }
+        _ => {
+            field(None);
+            field(None);
+        }
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&Mac::finalize(mac).into_bytes());
+    key
+}
+
+fn cache_lookup(key: &[u8; 32]) -> Option<(Keystore, SecretKey)> {
+    let entry = UNSEAL_CACHE.get(key)?;
+    let tick = UNSEAL_CACHE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    entry
+        .last_used
+        .store(tick, std::sync::atomic::Ordering::Relaxed);
+    Some((entry.keystore.clone(), entry.kek.clone()))
+}
+
+fn cache_insert(key: [u8; 32], path: std::path::PathBuf, keystore: &Keystore, kek: &SecretKey) {
+    while UNSEAL_CACHE.len() >= UNSEAL_CACHE_CAPACITY {
+        let oldest = UNSEAL_CACHE
+            .iter()
+            .min_by_key(|e| e.last_used.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|e| *e.key());
+        match oldest {
+            Some(oldest) => {
+                UNSEAL_CACHE.remove(&oldest);
+            }
+            None => break,
+        }
+    }
+    let tick = UNSEAL_CACHE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    UNSEAL_CACHE.insert(
+        key,
+        CachedUnseal {
+            path,
+            keystore: keystore.clone(),
+            kek: kek.clone(),
+            last_used: std::sync::atomic::AtomicU64::new(tick),
+        },
+    );
+}
+
+/// The cached unseal of the file as it is on disk now. A file that cannot be read is
+/// a miss; the uncached open reports why.
+fn cached_unseal(
+    keystore_path: &Path,
+    canonical: &Path,
+    creds: &UnsealCredentials,
+) -> Option<(Keystore, SecretKey)> {
+    let file = std::fs::read(keystore_path).ok()?;
+    let hit = cache_lookup(&unseal_cache_key(canonical, &file, creds));
+    if hit.is_some() {
+        tracing::debug!("Record-level encryption: keystore {canonical:?} unsealed from cache");
+    }
+    hit
+}
 
 /// Unseal — or, on a first run with a passphrase, create — the store keystore at
 /// `keystore_path`. `Ok(None)` only when there is no keystore and no passphrase.
 fn unseal_record_keystore(
     keystore_path: &std::path::Path,
 ) -> Result<Option<(Keystore, SecretKey)>> {
-    let _guard = RECORD_KEYSTORE_OPEN
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let ring = crate::keyring::installed();
+    unseal_record_keystore_with(
+        keystore_path,
+        &UnsealCredentials::from_env(),
+        KdfParams::production,
+    )
+}
+
+fn unseal_record_keystore_with(
+    keystore_path: &Path,
+    creds: &UnsealCredentials,
+    new_kdf: fn() -> KdfParams,
+) -> Result<Option<(Keystore, SecretKey)>> {
+    let canonical = canonical_keystore_path(keystore_path);
+    if let Some(hit) = cached_unseal(keystore_path, &canonical, creds) {
+        return Ok(Some(hit));
+    }
+
+    let lock = RECORD_KEYSTORE_OPEN
+        .entry(canonical.clone())
+        .or_default()
+        .clone();
+    let result = {
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Another opener of this path may have unsealed it while this one waited.
+        match cached_unseal(keystore_path, &canonical, creds) {
+            Some(hit) => Ok(Some(hit)),
+            None => unseal_record_keystore_uncached(keystore_path, &canonical, creds, new_kdf),
+        }
+    };
+    drop(lock);
+    // A lock no opener holds or waits on is dropped, so the map stays as small as the
+    // set of keystores being opened right now.
+    RECORD_KEYSTORE_OPEN.remove_if(&canonical, |_, lock| {
+        std::sync::Arc::strong_count(lock) == 1
+    });
+    result
+}
+
+/// The open itself, run with the path's lock held. The result is cached under the
+/// bytes it was read from or written as.
+fn unseal_record_keystore_uncached(
+    keystore_path: &Path,
+    canonical: &Path,
+    creds: &UnsealCredentials,
+    new_kdf: fn() -> KdfParams,
+) -> Result<Option<(Keystore, SecretKey)>> {
+    let passphrase = creds.passphrase.as_deref();
+    let ring = creds.ring.as_ref();
     let exists = keystore_path
         .try_exists()
         .with_context(|| format!("Failed to stat {keystore_path:?}"))?;
 
-    let (ks, kek) = if exists {
+    let (ks, kek, file) = if exists {
         let json =
             std::fs::read_to_string(keystore_path).context("Failed to read keystore.json")?;
         let ks = Keystore::from_json(&json)?;
-        let kek = match (&ring, &passphrase) {
+        let kek = match (ring, passphrase) {
             (Some(ring), _) if ks.has_ring(ring.id()) => {
                 let kek = ks.unseal(&ring.factor())?;
                 tracing::info!("Record-level encryption: keystore unsealed (keyring)");
@@ -1227,7 +1448,7 @@ fn unseal_record_keystore(
                 kek
             }
             (_, None) => {
-                let kms = LocalAeadKms::from_env()?.ok_or_else(|| {
+                let kms = creds.kms()?.ok_or_else(|| {
                     anyhow!(
                         "{keystore_path:?} is present but neither VELD_MASTER_PASSPHRASE nor \
                          VELD_KMS_WRAP_KEY is set and the keyring does not open it; refusing to \
@@ -1239,10 +1460,10 @@ fn unseal_record_keystore(
                 kek
             }
         };
-        (ks, kek)
+        (ks, kek, json)
     } else {
-        let ks = match (&passphrase, &ring) {
-            (Some(pass), _) => Keystore::create(pass, KdfParams::production())?,
+        let ks = match (passphrase, ring) {
+            (Some(pass), _) => Keystore::create(pass, new_kdf())?,
             (None, Some(ring)) => {
                 Keystore::create_with_factor(&ring.factor(), &crate::keyring::now_rfc3339())?
             }
@@ -1255,21 +1476,32 @@ fn unseal_record_keystore(
         }
         ks.save_to_path(keystore_path)
             .context("Failed to write keystore.json")?;
-        let kek = match (&passphrase, &ring) {
+        let kek = match (passphrase, ring) {
             (Some(pass), _) => ks.unseal_with_passphrase(pass)?,
             (None, Some(ring)) => ks.unseal(&ring.factor())?,
             (None, None) => unreachable!("returned above"),
         };
         tracing::info!("Created new encryption keystore at {keystore_path:?}");
-        (ks, kek)
+        let file = ks.to_json()?;
+        (ks, kek, file)
     };
 
     ks.verify_integrity(&kek)
         .context("keystore integrity verification failed")?;
-    let ks = match &ring {
-        Some(ring) if !ks.has_ring(ring.id()) => enrol_in_ring(keystore_path, ks, &kek, ring)?,
-        _ => ks,
+    let (ks, file) = match ring {
+        Some(ring) if !ks.has_ring(ring.id()) => {
+            let ks = enrol_in_ring(keystore_path, ks, &kek, ring)?;
+            let file = ks.to_json()?;
+            (ks, file)
+        }
+        _ => (ks, file),
     };
+    cache_insert(
+        unseal_cache_key(canonical, file.as_bytes(), creds),
+        canonical.to_path_buf(),
+        &ks,
+        &kek,
+    );
     Ok(Some((ks, kek)))
 }
 
@@ -2250,5 +2482,194 @@ mod tests {
             .unwrap()
             .unseal_with_recovery_code(&code)
             .is_err());
+    }
+
+    fn pass_creds(pass: &str) -> UnsealCredentials {
+        UnsealCredentials {
+            passphrase: Some(Zeroizing::new(pass.to_string())),
+            ring: None,
+            kms_wrap_key: None,
+        }
+    }
+
+    fn derivations() -> usize {
+        ARGON2_DERIVATIONS.with(|count| count.get())
+    }
+
+    fn open_store_keystore(
+        path: &Path,
+        creds: &UnsealCredentials,
+    ) -> Result<(Keystore, SecretKey)> {
+        unseal_record_keystore_with(path, creds, KdfParams::fast_for_tests)?
+            .ok_or_else(|| anyhow!("no keystore and no credentials"))
+    }
+
+    #[test]
+    fn a_cached_store_keystore_opens_without_deriving_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tenant").join("keystore.json");
+
+        let before = derivations();
+        let (_, created) = open_store_keystore(&path, &pass_creds("pw")).unwrap();
+        assert_eq!(derivations() - before, 2, "create derives once, unseal once");
+
+        let before = derivations();
+        let (ks, cached) = open_store_keystore(&path, &pass_creds("pw")).unwrap();
+        assert_eq!(derivations(), before, "a cache hit runs no Argon2id");
+        assert_eq!(*created, *cached);
+        ks.verify_integrity(&cached).unwrap();
+
+        assert!(
+            open_store_keystore(&path, &pass_creds("not-pw")).is_err(),
+            "another passphrase is never answered from the cache"
+        );
+        assert!(unseal_record_keystore_with(
+            &path,
+            &UnsealCredentials {
+                passphrase: None,
+                ring: None,
+                kms_wrap_key: None,
+            },
+            KdfParams::fast_for_tests,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rotation_revocation_and_replacement_never_serve_a_stale_master_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keystore.json");
+        let (mut ks, old_kek) = open_store_keystore(&path, &pass_creds("pw")).unwrap();
+
+        let wrap_key = [7u8; KEY_LEN];
+        let kms = LocalAeadKms::new(wrap_key);
+        ks.add_kms_wrap(&old_kek, &kms).unwrap();
+        let (new_kek, dropped) = ks.rotate_kek(&old_kek, &[Factor::Kms(&kms)]).unwrap();
+        assert!(dropped.iter().any(|f| f.provider == PROVIDER_PASSPHRASE));
+        ks.save_superseding(&path).unwrap();
+
+        assert!(
+            open_store_keystore(&path, &pass_creds("pw")).is_err(),
+            "the revoked passphrase no longer opens the rotated keystore"
+        );
+        let kms_creds = UnsealCredentials {
+            passphrase: None,
+            ring: None,
+            kms_wrap_key: Some(Zeroizing::new(hex::encode(wrap_key))),
+        };
+        let (reopened, kek) = open_store_keystore(&path, &kms_creds).unwrap();
+        assert_eq!(*kek, *new_kek);
+        assert_ne!(*kek, *old_kek);
+        assert_eq!(reopened.generation, ks.generation);
+
+        // Replaced by another process: no invalidate, only the bytes change.
+        let other = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+        let other_kek = other.unseal_with_passphrase("pw").unwrap();
+        std::fs::write(&path, other.to_json().unwrap()).unwrap();
+        let (_, kek) = open_store_keystore(&path, &pass_creds("pw")).unwrap();
+        assert_eq!(*kek, *other_kek);
+        assert!(open_store_keystore(&path, &kms_creds).is_err());
+    }
+
+    #[test]
+    fn invalidate_drops_every_cached_unseal_of_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keystore.json");
+        open_store_keystore(&path, &pass_creds("pw")).unwrap();
+        let canonical = canonical_keystore_path(&path);
+        assert!(UNSEAL_CACHE.iter().any(|e| e.path == canonical));
+
+        invalidate(&path);
+        assert!(!UNSEAL_CACHE.iter().any(|e| e.path == canonical));
+        let before = derivations();
+        open_store_keystore(&path, &pass_creds("pw")).unwrap();
+        assert_eq!(derivations() - before, 1);
+    }
+
+    #[test]
+    fn opening_one_keystore_does_not_wait_on_another() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("a").join("keystore.json");
+        let free = dir.path().join("b").join("keystore.json");
+
+        let lock = RECORD_KEYSTORE_OPEN
+            .entry(canonical_keystore_path(&held))
+            .or_default()
+            .clone();
+        let guard = lock.lock().unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (held_tx, held_rx) = mpsc::channel();
+        let (free_tx, free_rx) = mpsc::channel();
+        let spawn = |path: std::path::PathBuf, tx: mpsc::Sender<Result<(), String>>| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let opened = open_store_keystore(&path, &pass_creds("pw"))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                tx.send(opened).unwrap();
+            })
+        };
+        let held_opener = spawn(held.clone(), held_tx);
+        let free_opener = spawn(free.clone(), free_tx);
+
+        free_rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("the other keystore opened while this one was locked")
+            .unwrap();
+        assert!(
+            held_rx.try_recv().is_err(),
+            "the locked keystore waits for its own lock"
+        );
+        assert!(!held.exists());
+
+        drop(guard);
+        drop(lock);
+        held_rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("the locked keystore opens once released")
+            .unwrap();
+        held_opener.join().unwrap();
+        free_opener.join().unwrap();
+        assert!(held.exists() && free.exists());
+    }
+
+    #[test]
+    fn concurrent_first_opens_of_one_tenant_create_one_keystore() {
+        use std::sync::{Arc, Barrier};
+
+        const OPENERS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tenant").join("storage").join("keystore.json");
+        let barrier = Arc::new(Barrier::new(OPENERS));
+
+        let openers: Vec<_> = (0..OPENERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let before = derivations();
+                    let (_, kek) = open_store_keystore(&path, &pass_creds("pw")).unwrap();
+                    (*kek, derivations() - before)
+                })
+            })
+            .collect();
+        let opened: Vec<_> = openers.into_iter().map(|t| t.join().unwrap()).collect();
+
+        assert!(opened.iter().all(|(kek, _)| *kek == opened[0].0));
+        assert_eq!(
+            opened.iter().map(|(_, n)| n).sum::<usize>(),
+            2,
+            "one opener creates and unseals; every other is served the result"
+        );
+        assert!(
+            !path.with_extension("json.bak").exists(),
+            "a second create would have backed up the first"
+        );
     }
 }
