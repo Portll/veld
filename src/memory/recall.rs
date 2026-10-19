@@ -2560,6 +2560,40 @@ impl super::MemorySystem {
                 }
             }
 
+            // ===========================================================================
+            // LAYER 4.97: CONVERSATION NEIGHBOUR EXPANSION
+            // ===========================================================================
+            // The turn after a well-ranked conversation turn joins the pool just below
+            // it, so a reply that shares no word with the query reaches the
+            // cross-encoder and is judged on its own text. After every fused-score
+            // adjustment, before the cut it has to survive. Full pipeline only, so the
+            // layer-attribution rungs below Full measure what they did before.
+            let neighbours = if query
+                .layer_mode()
+                .allows(crate::memory::types::LayerMode::Full)
+            {
+                self.neighbour_candidates(&res)
+            } else {
+                Vec::new()
+            };
+            crate::memory::gold_funnel::record("neighbour", neighbours.iter().map(|(id, _)| id));
+            if !neighbours.is_empty() {
+                let position: std::collections::HashMap<MemoryId, usize> = res
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, _))| (id.clone(), i))
+                    .collect();
+                let added = neighbours.len();
+                for (id, score) in neighbours {
+                    match position.get(&id) {
+                        Some(&i) => res[i].1 = res[i].1.max(score),
+                        None => res.push((id, score)),
+                    }
+                }
+                res.sort_by(|a, b| b.1.total_cmp(&a.1));
+                tracing::debug!("Layer 4.97: neighbour expansion placed {added} turns");
+            }
+
             // Phase 2.1: Keep wider candidate pool for cross-encoder reranking.
             // Decomposed queries produce a wider candidate set — widen the budget
             // so more candidates survive into the cross-encoder.
@@ -4930,6 +4964,99 @@ impl super::MemorySystem {
         }
     }
 
+    /// Neighbour expansion (recall Layer 4.97): the conversation turns next to the
+    /// best-ranked fused candidates, scored for the pre-rerank pool.
+    ///
+    /// An anaphoric reply ("Nate: I've had them for 3 years now!") has no word in common
+    /// with the question about it, but the turn before it usually does. For each of the
+    /// first `neighbour_expansion_top` candidates in `ranked` that is a live conversation
+    /// turn with a positive score, the turns recorded as following it (and, under
+    /// `neighbour_expansion_predecessor`, the turn it follows) are returned at the parent's
+    /// score times [`crate::constants::NEIGHBOUR_EXPANSION_SCORE_DECAY`].
+    ///
+    /// A neighbour already in `ranked` at that score or above is left out. One below it is
+    /// returned, so the caller lifts it: a turn already in the pool but under the cut is
+    /// as far from the cross-encoder as one that is not in the pool at all. The first
+    /// (best-ranked) parent to reach a neighbour scores it. Empty when the dial is off.
+    /// `ranked` must be in rank order; the result is in parent order.
+    pub(crate) fn neighbour_candidates(&self, ranked: &[(MemoryId, f32)]) -> Vec<(MemoryId, f32)> {
+        let (enabled, top, with_predecessor) = {
+            let dials = self.cognitive_dials.read();
+            (
+                dials.neighbour_expansion_enabled(),
+                dials.neighbour_expansion_top_n(),
+                dials.neighbour_expansion_predecessor_enabled(),
+            )
+        };
+        if !enabled || ranked.is_empty() {
+            return Vec::new();
+        }
+
+        let held: std::collections::HashMap<&MemoryId, f32> =
+            ranked.iter().map(|(id, score)| (id, *score)).collect();
+        let mut claimed: HashSet<MemoryId> = HashSet::new();
+        let mut out: Vec<(MemoryId, f32)> = Vec::new();
+        let (mut successors, mut predecessors) = (0u64, 0u64);
+
+        for (parent_id, parent_score) in ranked.iter().take(top) {
+            if !parent_score.is_finite() || *parent_score <= 0.0 {
+                continue;
+            }
+            let Some(parent) = self.live_memory(parent_id) else {
+                continue;
+            };
+            if !super::index_text::applies(&parent.experience) {
+                continue;
+            }
+            let score = parent_score * crate::constants::NEIGHBOUR_EXPANSION_SCORE_DECAY;
+
+            let mut neighbours: Vec<(MemoryId, bool)> = self
+                .live_turn_successors(parent_id)
+                .into_iter()
+                .take(crate::constants::NEIGHBOUR_EXPANSION_SUCCESSORS_PER_TURN)
+                .map(|successor| (successor.id.clone(), false))
+                .collect();
+            if with_predecessor {
+                if let Some(predecessor) =
+                    super::index_text::preceding_memory_id(&parent.experience)
+                        .and_then(|id| self.live_memory(&id))
+                        .filter(|memory| super::index_text::applies(&memory.experience))
+                {
+                    neighbours.push((predecessor.id.clone(), true));
+                }
+            }
+
+            for (id, is_predecessor) in neighbours {
+                if !claimed.insert(id.clone()) {
+                    continue;
+                }
+                if held.get(&id).is_some_and(|current| *current >= score) {
+                    continue;
+                }
+                if is_predecessor {
+                    predecessors += 1;
+                } else {
+                    successors += 1;
+                }
+                out.push((id, score));
+            }
+        }
+
+        crate::metrics::RECALL_NEIGHBOUR_CANDIDATES_TOTAL
+            .with_label_values(&["successor"])
+            .inc_by(successors);
+        crate::metrics::RECALL_NEIGHBOUR_CANDIDATES_TOTAL
+            .with_label_values(&["predecessor"])
+            .inc_by(predecessors);
+        tracing::debug!(
+            parents = top.min(ranked.len()),
+            successors,
+            predecessors,
+            "recall [layer:4.97] neighbour expansion"
+        );
+        out
+    }
+
     /// Expand retrieved memories with their hierarchy context
     ///
     /// When a memory is retrieved, its parent chain and children are also
@@ -5874,5 +6001,181 @@ mod query_token_tests {
         ));
         // A plain word keeps the old substring rule.
         assert!(query_token_matches_entity("serv", "observer"));
+    }
+}
+
+#[cfg(test)]
+mod neighbour_expansion_tests {
+    use super::*;
+    use crate::memory::dials::CognitiveDials;
+    use crate::memory::{MemoryConfig, MemorySystem};
+    use chrono::TimeZone;
+    use tempfile::TempDir;
+
+    const DECAY: f32 = crate::constants::NEIGHBOUR_EXPANSION_SCORE_DECAY;
+
+    fn fresh_system() -> (MemorySystem, TempDir) {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        (sys, tmp)
+    }
+
+    fn at(minute: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2023, 5, 20, 14, minute, 0)
+            .unwrap()
+    }
+
+    fn turn(sys: &MemorySystem, content: &str, speaker: &str, minute: u32) -> MemoryId {
+        sys.remember(
+            Experience {
+                experience_type: ExperienceType::Conversation,
+                content: content.to_string(),
+                tags: vec!["conv-42".to_string(), speaker.to_string()],
+                entities: vec!["conv-42".to_string(), speaker.to_string()],
+                ..Default::default()
+            },
+            Some(at(minute)),
+        )
+        .expect("turn stored")
+    }
+
+    /// question → reply → follow-up, one conversation.
+    fn conversation(sys: &MemorySystem) -> (MemoryId, MemoryId, MemoryId) {
+        let question = turn(
+            sys,
+            "Joanna: How are your turtles doing, Nate?",
+            "Joanna",
+            1,
+        );
+        let reply = turn(sys, "Nate: I've had them for 3 years now!", "Nate", 2);
+        let follow_up = turn(sys, "Joanna: Wow, that long!", "Joanna", 3);
+        (question, reply, follow_up)
+    }
+
+    #[test]
+    fn a_ranked_turn_brings_its_successor_in_just_below_it() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let got = sys.neighbour_candidates(&[(question, 0.5)]);
+        assert_eq!(got, vec![(reply, 0.5 * DECAY)]);
+    }
+
+    #[test]
+    fn a_successor_already_above_the_decayed_score_is_left_alone() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let got = sys.neighbour_candidates(&[(question, 0.5), (reply.clone(), 0.48)]);
+        assert!(!got.iter().any(|(id, _)| *id == reply), "{got:?}");
+    }
+
+    #[test]
+    fn a_successor_below_the_cut_is_lifted() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let got = sys.neighbour_candidates(&[(question, 0.5), (reply.clone(), 0.01)]);
+        assert!(got.contains(&(reply, 0.5 * DECAY)), "{got:?}");
+    }
+
+    #[test]
+    fn the_best_ranked_parent_scores_a_shared_neighbour() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, follow_up) = conversation(&sys);
+        sys.set_cognitive_dials(CognitiveDials {
+            neighbour_expansion_predecessor: Some(true),
+            ..Default::default()
+        });
+        // The reply is the question's successor and the follow-up's predecessor.
+        let got = sys.neighbour_candidates(&[(follow_up, 0.6), (question, 0.5)]);
+        assert_eq!(
+            got.iter().filter(|(id, _)| *id == reply).count(),
+            1,
+            "{got:?}"
+        );
+        assert!(got.contains(&(reply, 0.6 * DECAY)), "{got:?}");
+    }
+
+    #[test]
+    fn only_the_top_n_are_read() {
+        let (sys, _tmp) = fresh_system();
+        let (question, _, _) = conversation(&sys);
+        let absent = MemoryId(uuid::Uuid::new_v4());
+        sys.set_cognitive_dials(CognitiveDials {
+            neighbour_expansion_top: Some(1),
+            ..Default::default()
+        });
+        assert!(sys
+            .neighbour_candidates(&[(absent, 0.9), (question, 0.5)])
+            .is_empty());
+    }
+
+    #[test]
+    fn a_non_turn_parent_and_a_non_positive_score_bring_nothing() {
+        let (sys, _tmp) = fresh_system();
+        let (question, _, _) = conversation(&sys);
+        let note = sys
+            .remember(
+                Experience {
+                    experience_type: ExperienceType::Observation,
+                    content: "Turtles can live for decades.".to_string(),
+                    ..Default::default()
+                },
+                Some(at(4)),
+            )
+            .expect("note stored");
+        assert!(sys.neighbour_candidates(&[(note, 0.9)]).is_empty());
+        assert!(sys.neighbour_candidates(&[(question, 0.0)]).is_empty());
+    }
+
+    #[test]
+    fn the_predecessor_comes_in_only_under_its_dial() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let alone = sys.neighbour_candidates(&[(reply.clone(), 0.5)]);
+        assert!(
+            !alone.iter().any(|(id, _)| *id == question),
+            "the predecessor leg is off by default: {alone:?}"
+        );
+        sys.set_cognitive_dials(CognitiveDials {
+            neighbour_expansion_predecessor: Some(true),
+            ..Default::default()
+        });
+        let got = sys.neighbour_candidates(&[(reply, 0.5)]);
+        assert!(got.contains(&(question, 0.5 * DECAY)), "{got:?}");
+    }
+
+    #[test]
+    fn the_dial_switches_expansion_off() {
+        let (sys, _tmp) = fresh_system();
+        let (question, _, _) = conversation(&sys);
+        sys.set_cognitive_dials(CognitiveDials {
+            neighbour_expansion: Some(false),
+            ..Default::default()
+        });
+        assert!(sys.neighbour_candidates(&[(question, 0.5)]).is_empty());
+    }
+
+    /// The gold funnel's `neighbour` stage records the leg's own list, the way
+    /// `date_window` records the date leg's.
+    #[test]
+    fn the_funnel_records_the_neighbour_stage() {
+        let (sys, _tmp) = fresh_system();
+        let (_, reply, _) = conversation(&sys);
+        let query = Query {
+            query_text: Some("How are your turtles doing, Nate?".to_string()),
+            max_results: 5,
+            ..Default::default()
+        };
+        crate::memory::gold_funnel::begin(HashSet::from([reply]));
+        sys.recall(&query).expect("recall");
+        let funnel = crate::memory::gold_funnel::take().expect("funnel armed");
+        assert!(
+            funnel.iter().any(|(stage, _)| stage == "neighbour"),
+            "{funnel:?}"
+        );
     }
 }
