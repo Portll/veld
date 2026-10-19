@@ -128,6 +128,13 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub turn_context: Option<bool>,
 
+    /// Whether a contextualised turn's embedding also carries its date and the prior
+    /// turn, on top of the BM25 document. `None` keeps the engine default, which is
+    /// off: on the LoCoMo gate the prior turn's text pulled short turns' embeddings
+    /// toward the turn they answered and cost more gold than it found.
+    #[serde(default)]
+    pub turn_context_embedding: Option<bool>,
+
     /// Override the RRF fusion weights `(bm25, vector, graph)`. `None` keeps the
     /// engine/learned weights.
     #[serde(default)]
@@ -405,6 +412,7 @@ impl Default for CognitiveDials {
             candidate_count: None,
             rerank_count: None,
             turn_context: None,
+            turn_context_embedding: None,
             rrf_weights: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
@@ -491,6 +499,13 @@ impl CognitiveDials {
         self.turn_context.unwrap_or(true)
     }
 
+    /// Whether a contextualised turn's embedding carries the context too
+    /// (`turn_context_embedding`; the engine default is off).
+    #[inline]
+    pub fn turn_context_embedding_enabled(&self) -> bool {
+        self.turn_context_enabled() && self.turn_context_embedding.unwrap_or(false)
+    }
+
     /// Seed dials from process environment (`VELD_*`), overlaying [`Default`]. Used at
     /// `MemorySystem` construction. Unset vars keep the (inert) default. Result is
     /// [`sanitized`](Self::sanitized). Recognized vars:
@@ -549,6 +564,9 @@ impl CognitiveDials {
         if let Some(v) = env_bool("VELD_DIALS_TURN_CONTEXT") {
             d.turn_context = Some(v);
         }
+        if let Some(v) = env_bool("VELD_DIALS_TURN_CONTEXT_EMBEDDING") {
+            d.turn_context_embedding = Some(v);
+        }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
         d.rrf_k_decomp = env_parse::<f32>("VELD_TUNE_RRF_K_DECOMP").or(d.rrf_k_decomp);
@@ -599,6 +617,8 @@ mod tests {
         assert!(d.use_reranking.is_none());
         assert!(d.turn_context.is_none());
         assert!(d.turn_context_enabled());
+        assert!(d.turn_context_embedding.is_none());
+        assert!(!d.turn_context_embedding_enabled());
         assert!(d.candidate_count.is_none());
         assert!(d.rrf_weights.is_none());
         assert_eq!(
