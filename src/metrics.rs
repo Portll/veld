@@ -172,6 +172,32 @@ pub static ONTOLOGICAL_FALLBACK_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("ONTOLOGICAL_FALLBACK_TOTAL metric must be valid at compile time")
 });
 
+/// Cross-encoder (query, document) pairs by where their score came from: `model` for a
+/// forward pass, `cache` for a repeat of a pair already scored by the same reranker.
+pub static CROSS_ENCODER_PAIRS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_cross_encoder_pairs_total",
+            "Cross-encoder pairs scored, by source (model or cache)",
+        ),
+        &["source"],
+    )
+    .expect("CROSS_ENCODER_PAIRS_TOTAL metric must be valid at compile time")
+});
+
+/// ONNX sessions a cross-encoder has open. A second one opens only when two recalls
+/// reranked at once, and each holds its own copy of the model's weights.
+pub static CROSS_ENCODER_SESSIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "veld_cross_encoder_sessions",
+            "Open ONNX sessions per cross-encoder model",
+        ),
+        &["model"],
+    )
+    .expect("CROSS_ENCODER_SESSIONS metric must be valid at compile time")
+});
+
 /// Queries where ontological filtering was disabled due to high graph density
 pub static ONTOLOGICAL_DENSITY_SKIP_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
@@ -919,6 +945,8 @@ fn do_register_metrics() -> Result<(), MetricsError> {
         "ONTOLOGICAL_RERANK_BOOST_APPLIED"
     );
     register!(ONTOLOGICAL_FALLBACK_TOTAL, "ONTOLOGICAL_FALLBACK_TOTAL");
+    register!(CROSS_ENCODER_PAIRS_TOTAL, "CROSS_ENCODER_PAIRS_TOTAL");
+    register!(CROSS_ENCODER_SESSIONS, "CROSS_ENCODER_SESSIONS");
     register!(LTR_TRACE_LABEL_JOIN_MISS, "LTR_TRACE_LABEL_JOIN_MISS");
     register!(LTR_TRACE_GRADUATED_TOTAL, "LTR_TRACE_GRADUATED_TOTAL");
     register!(
