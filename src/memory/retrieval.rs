@@ -964,7 +964,7 @@ impl RetrievalEngine {
         let start = std::time::Instant::now();
         self.invalidate_saved_index();
         let dimension = self.embedder.primary_dimension();
-        let chunk_config = ChunkConfig::default();
+        let chunk_config = ChunkConfig::for_space(&self.index_space);
         let mapped: HashSet<MemoryId> = self
             .storage
             .get_all_vector_mappings()?
@@ -1297,7 +1297,7 @@ impl RetrievalEngine {
         use crate::embeddings::chunking::{chunk_text, ChunkConfig};
 
         let text = Self::extract_searchable_text(memory);
-        let chunk_config = ChunkConfig::default();
+        let chunk_config = ChunkConfig::for_space(&self.index_space);
         let chunk_result = chunk_text(&text, &chunk_config);
 
         let vector_ids = if chunk_result.was_chunked {

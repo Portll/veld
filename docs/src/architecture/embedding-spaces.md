@@ -67,6 +67,22 @@ the secondary index's space moves to the secondary slot.
 A vector stored with no space at the index's width is indexed as before: that is what every
 vector was taken to be before spaces were recorded.
 
+## Caches, chunking and the registry
+
+- **Caches.** The content and query embedding caches are keyed by `(space, SHA-256 of the
+  text)` (`src/memory/embedding_cache.rs`), so a vector cached for one model is never served for
+  another.
+- **Chunking.** The chunk size, overlap and minimum come from the space's model
+  (`ChunkConfig::for_space`). A model gets a row only from a `chunk-audit --sweep` over its own
+  tokenizer, because chunking decides how many vectors a memory gets and so how it ranks. Only
+  MiniLM has a measured row. Every other model gets MiniLM's chunks, which fit any supported
+  window, at the cost of more vectors than a wider window needs.
+- **Registry.** `.veld_spaces.json` beside the corpus markers lists every space the corpus holds:
+  model, width, codec, what each index holds, the backlog waiting for each, and what is stranded
+  in a refused space, plus the alignment maps between pairs. The server rewrites it after a
+  backlog drain when its content changed. `veld doctor` reads it without opening the store and
+  names each tenant with vectors waiting or stranded.
+
 ## `/health`
 
 `GET /health` reports `embedding_spaces`, summed over the users in cache:
@@ -74,9 +90,9 @@ vector was taken to be before spaces were recorded.
 ```json
 "embedding_spaces": [
   {"id": "nomic-embed-text-v1.5@768", "model": "nomic-embed-text-v1.5", "dimension": 768,
-   "memories": 9874, "backlog": 12, "stranded": 0},
+   "codec": "f32", "memories": 9874, "backlog": 12, "stranded": 0},
   {"id": "unrecorded@384", "model": "unrecorded", "dimension": 384,
-   "memories": 0, "backlog": 0, "stranded": 56}
+   "codec": "f32", "memories": 0, "backlog": 0, "stranded": 56}
 ]
 ```
 
