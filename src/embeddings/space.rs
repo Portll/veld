@@ -1,0 +1,333 @@
+//! Which embedder produced a vector, as a value a stored record can carry.
+//!
+//! A space id is `<model>@<dimension>`: the canonical model name and the vector width. Two
+//! vectors are comparable by cosine only when their space ids are equal, so the id goes
+//! wherever a vector goes. It is derived from a live embedder or from the corpus markers,
+//! never written by hand.
+
+use std::fmt;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use super::Embedder;
+
+/// The model part of a space whose vectors predate space ids and whose model the corpus
+/// markers cannot name. Only the width is known.
+pub const UNRECORDED_MODEL: &str = "unrecorded";
+
+/// The corpus embedder marker beside a tenant's store.
+pub const EMBEDDER_MARKER: &str = ".veld_embedder";
+/// The corpus dimension marker beside a tenant's store.
+pub const DIMENSION_MARKER: &str = ".veld_embedding_dim";
+/// The space every absent field in the store was stamped with, written once the stamp pass
+/// has run, so the pass is not repeated on every boot.
+pub const STAMP_MARKER: &str = ".veld_spaces_stamped";
+
+/// LM Studio publishes embedding models as `text-embedding-<model>`; llama-server and the ONNX
+/// loaders use `<model>`. The weights are the same, so the vectors share a space.
+const SERVER_MODEL_PREFIX: &str = "text-embedding-";
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SpaceId(String);
+
+impl SpaceId {
+    pub fn new(model: &str, dimension: usize) -> Self {
+        Self(format!("{}@{dimension}", canonical_model(model)))
+    }
+
+    /// A vector of `dimension` floats whose model nothing recorded.
+    pub fn unrecorded(dimension: usize) -> Self {
+        Self(format!("{UNRECORDED_MODEL}@{dimension}"))
+    }
+
+    /// The space `embedder` writes at its configured width.
+    pub fn of(embedder: &dyn Embedder) -> Self {
+        Self::new(&embedder_model(embedder), embedder.dimension())
+    }
+
+    /// The space of `vector` as produced by `embedder`. The width comes from the vector, not
+    /// the embedder's configuration, because an HTTP embedder reports a default width until
+    /// its first answer.
+    pub fn for_vector(embedder: &dyn Embedder, vector: &[f32]) -> Self {
+        Self::new(&embedder_model(embedder), vector.len())
+    }
+
+    /// `<model>@<dimension>` with a non-empty model and a positive width, else `None`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (model, dimension) = raw.trim().rsplit_once('@')?;
+        let dimension: usize = dimension.parse().ok()?;
+        (!model.trim().is_empty() && dimension > 0).then(|| Self::new(model, dimension))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn model(&self) -> &str {
+        self.0.rsplit_once('@').map_or(self.0.as_str(), |(m, _)| m)
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.0
+            .rsplit_once('@')
+            .and_then(|(_, d)| d.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Whether the model is known, as opposed to a width-only legacy space.
+    pub fn is_recorded(&self) -> bool {
+        self.model() != UNRECORDED_MODEL
+    }
+}
+
+impl fmt::Display for SpaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Trimmed, lowercased, without the server catalogue prefix.
+pub fn canonical_model(name: &str) -> String {
+    let lowered = name.trim().to_ascii_lowercase();
+    match lowered.strip_prefix(SERVER_MODEL_PREFIX) {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => lowered,
+    }
+}
+
+/// The model an embedder runs. An embedder that does not name its model is identified by its
+/// id instead, so two anonymous embedders of one width are still told apart by kind.
+pub fn embedder_model(embedder: &dyn Embedder) -> String {
+    match embedder.model_id() {
+        "" | "unknown" => embedder.id().to_string(),
+        model => model.to_string(),
+    }
+}
+
+/// The model the corpus marker's embedder id runs, when the id names one. Mirrors the dispatch
+/// in `load_embedder_by_id`. An HTTP id without `#model` predates model-qualified ids and names
+/// no model, so it maps to `None`.
+pub fn model_for_embedder_id(id: &str) -> Option<String> {
+    let id = id.trim();
+    let id = id.strip_prefix("unverified:").unwrap_or(id);
+    if id.starts_with("http://") || id.starts_with("https://") {
+        return id
+            .split_once('#')
+            .map(|(_, model)| model.trim())
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
+    }
+    if id.starts_with("nomic") {
+        return Some(super::nomic::MODEL_ID.to_string());
+    }
+    if id.starts_with("minilm") {
+        return Some(super::minilm::MODEL_ID.to_string());
+    }
+    None
+}
+
+/// The space the corpus markers say the store's primary vectors were written in.
+/// `None` when either marker is missing or the embedder id names no model.
+pub fn corpus_space(storage_path: &Path) -> Option<SpaceId> {
+    let read = |name: &str| {
+        std::fs::read_to_string(storage_path.join(name))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let dimension: usize = read(DIMENSION_MARKER)?.parse().ok()?;
+    let model = model_for_embedder_id(&read(EMBEDDER_MARKER)?)?;
+    (dimension > 0).then(|| SpaceId::new(&model, dimension))
+}
+
+/// The space of a stored vector of `len` floats. A recorded space is the truth. An absent one
+/// is `assumed` when the widths agree, else a width-only space: a vector cannot be in a space
+/// whose width it does not have.
+pub fn resolve(stored: Option<&SpaceId>, len: usize, assumed: Option<&SpaceId>) -> SpaceId {
+    match (stored, assumed) {
+        (Some(space), _) => space.clone(),
+        (None, Some(space)) if space.dimension() == len => space.clone(),
+        (None, _) => SpaceId::unrecorded(len),
+    }
+}
+
+/// What one corpus, or a fleet of them, holds in a space.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpaceSummary {
+    pub id: SpaceId,
+    pub model: String,
+    pub dimension: usize,
+    /// Memories an index in this space holds.
+    pub memories: usize,
+    /// Backlog rows waiting for a vector in this space.
+    pub backlog: usize,
+    /// Memories whose stored vector is in this space and was refused by an index in another.
+    pub stranded: usize,
+}
+
+impl SpaceSummary {
+    pub fn empty(id: SpaceId) -> Self {
+        Self {
+            model: id.model().to_string(),
+            dimension: id.dimension(),
+            id,
+            memories: 0,
+            backlog: 0,
+            stranded: 0,
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.memories += other.memories;
+        self.backlog += other.backlog;
+        self.stranded += other.stranded;
+    }
+}
+
+/// Sum summaries by space id, in id order.
+pub fn merge_summaries(summaries: impl IntoIterator<Item = SpaceSummary>) -> Vec<SpaceSummary> {
+    let mut merged: std::collections::BTreeMap<SpaceId, SpaceSummary> = Default::default();
+    for summary in summaries {
+        merged
+            .entry(summary.id.clone())
+            .or_insert_with(|| SpaceSummary::empty(summary.id.clone()))
+            .add(&summary);
+    }
+    merged.into_values().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summaries_sum_by_space() {
+        let nomic = SpaceId::new("nomic-embed-text-v1.5", 768);
+        let minilm = SpaceId::new("minilm-l6-v2", 384);
+        let mut a = SpaceSummary::empty(nomic.clone());
+        a.memories = 10;
+        let mut b = SpaceSummary::empty(nomic.clone());
+        b.memories = 5;
+        b.backlog = 2;
+        let mut c = SpaceSummary::empty(minilm.clone());
+        c.stranded = 3;
+        let merged = merge_summaries([a, b, c]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, minilm);
+        assert_eq!(merged[0].stranded, 3);
+        assert_eq!((merged[1].memories, merged[1].backlog), (15, 2));
+        assert_eq!(merged[1].model, "nomic-embed-text-v1.5");
+        assert_eq!(merged[1].dimension, 768);
+    }
+
+    struct Named {
+        id: &'static str,
+        model: &'static str,
+        dim: usize,
+    }
+
+    impl Embedder for Named {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn model_id(&self) -> &str {
+            self.model
+        }
+        fn encode(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; self.dim])
+        }
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+    }
+
+    #[test]
+    fn a_space_is_model_at_dimension_and_parses_back() {
+        let space = SpaceId::new("nomic-embed-text-v1.5", 768);
+        assert_eq!(space.as_str(), "nomic-embed-text-v1.5@768");
+        assert_eq!(space.model(), "nomic-embed-text-v1.5");
+        assert_eq!(space.dimension(), 768);
+        assert_eq!(SpaceId::parse(space.as_str()), Some(space));
+        assert_eq!(SpaceId::parse("nomic"), None);
+        assert_eq!(SpaceId::parse("@768"), None);
+        assert_eq!(SpaceId::parse("m@0"), None);
+    }
+
+    #[test]
+    fn the_server_catalogue_name_and_the_model_name_are_one_space() {
+        assert_eq!(
+            SpaceId::new("text-embedding-nomic-embed-text-v1.5", 768),
+            SpaceId::new("Nomic-Embed-Text-v1.5", 768)
+        );
+        assert_ne!(
+            SpaceId::new("nomic-embed-text-v1.5", 768),
+            SpaceId::new("nomic-embed-text-v1.5", 256),
+            "a Matryoshka width is its own space"
+        );
+    }
+
+    #[test]
+    fn a_marker_id_maps_to_the_model_its_embedder_reports() {
+        assert_eq!(
+            model_for_embedder_id("nomic").as_deref(),
+            Some(super::super::nomic::MODEL_ID)
+        );
+        assert_eq!(
+            model_for_embedder_id("minilm").as_deref(),
+            Some(super::super::minilm::MODEL_ID)
+        );
+        assert_eq!(
+            model_for_embedder_id("unverified:minilm").as_deref(),
+            Some(super::super::minilm::MODEL_ID)
+        );
+        assert_eq!(
+            model_for_embedder_id("http://127.0.0.1:8095#text-embedding-nomic-embed-text-v1.5")
+                .as_deref(),
+            Some("text-embedding-nomic-embed-text-v1.5")
+        );
+        assert_eq!(model_for_embedder_id("http://127.0.0.1:1234"), None);
+        assert_eq!(model_for_embedder_id("zenoh"), None);
+    }
+
+    #[test]
+    fn the_corpus_space_needs_both_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(corpus_space(dir.path()), None);
+        std::fs::write(dir.path().join(DIMENSION_MARKER), "384").unwrap();
+        assert_eq!(corpus_space(dir.path()), None, "a dimension names no model");
+        std::fs::write(dir.path().join(EMBEDDER_MARKER), "minilm\n").unwrap();
+        assert_eq!(
+            corpus_space(dir.path()),
+            Some(SpaceId::new(super::super::minilm::MODEL_ID, 384))
+        );
+    }
+
+    #[test]
+    fn an_anonymous_embedder_is_named_by_its_id() {
+        let anonymous = Named {
+            id: "zenoh",
+            model: "unknown",
+            dim: 384,
+        };
+        assert_eq!(SpaceId::of(&anonymous).as_str(), "zenoh@384");
+        let named = Named {
+            id: "http://h#m",
+            model: "m",
+            dim: 768,
+        };
+        assert_eq!(SpaceId::for_vector(&named, &[0.0; 1024]).as_str(), "m@1024");
+    }
+
+    #[test]
+    fn an_absent_space_is_assumed_only_at_the_assumed_width() {
+        let nomic = SpaceId::new("nomic-embed-text-v1.5", 768);
+        let minilm = SpaceId::new("minilm-l6-v2", 384);
+        assert_eq!(resolve(Some(&minilm), 384, Some(&nomic)), minilm);
+        assert_eq!(resolve(None, 768, Some(&nomic)), nomic);
+        assert_eq!(resolve(None, 384, Some(&nomic)), SpaceId::unrecorded(384));
+        assert_eq!(resolve(None, 384, None), SpaceId::unrecorded(384));
+        assert!(!SpaceId::unrecorded(384).is_recorded());
+    }
+}

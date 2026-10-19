@@ -1203,6 +1203,8 @@ impl MemorySystem {
                                 );
                             }
                         }
+                        // Queued for a vector in the index's space, not lost.
+                        Err(e) if crate::memory::retrieval::is_space_mismatch(&e) => {}
                         Err(e) => {
                             failed += 1;
                             tracing::error!(
@@ -1656,23 +1658,22 @@ impl MemorySystem {
     ) -> Result<MemoryId> {
         let importance = self.calculate_importance(&experience);
 
-        // Generate embedding if not provided (primary: MiniLM 384d)
+        // Generate embedding if not provided
         if experience.embeddings.is_none() {
-            let content_hash = Self::sha256_hash(&experience.content);
-            if let Some(cached) = self.content_cache.get(&content_hash) {
-                experience.embeddings = Some(cached.clone());
-            } else if let Ok(embedding) = self.embedder.encode(&experience.content) {
-                self.content_cache.insert(content_hash, embedding.clone());
-                experience.embeddings = Some(embedding);
+            if let Ok((embedding, space)) = self.embed_primary_cached(&experience.content) {
+                experience.set_primary_vector(embedding, space);
             }
         }
 
-        // Generate secondary embedding if dual-embedder is active (Nomic 768d)
+        // Generate secondary embedding if dual-embedder is active
         if experience.embeddings_secondary.is_none() && self.embedder.has_secondary() {
             if let Ok(Some(secondary)) = self.embedder.encode_secondary(&experience.content) {
-                experience.embeddings_secondary = Some(secondary);
+                if let Some(space) = self.embedder.secondary_space_for(&secondary) {
+                    experience.set_secondary_vector(secondary, space);
+                }
             }
         }
+        self.stamp_supplied_vectors(&mut experience);
 
         let memory = Arc::new(Memory::new(
             memory_id.clone(),
@@ -1692,7 +1693,7 @@ impl MemorySystem {
             .add_shared(Arc::clone(&memory))?;
 
         if let Err(e) = self.retriever.index_memory(&memory) {
-            tracing::warn!("Failed to index imported memory {}: {}", memory.id.0, e);
+            self.note_index_failure(&memory.id, &e, "imported memory");
         }
 
         Ok(memory_id)
@@ -1790,42 +1791,25 @@ impl MemorySystem {
         // If experience doesn't have embeddings, check cache or generate.
         // Skipped when defer_embedding=true — handled by embed_and_index() later.
         if !defer_embedding && experience.embeddings.is_none() {
-            // SHA256 hash for stable cache keys (survives restarts, unlike DefaultHasher)
-            let content_hash = Self::sha256_hash(&experience.content);
-
-            // Check cache first
-            if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
-                experience.embeddings = Some(cached_embedding.clone());
-                EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
-                tracing::debug!("Content embedding cache HIT");
-            } else {
-                // Cache miss - generate embedding
-                EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
-                match self.embedder.encode(&experience.content) {
-                    Ok(embedding) => {
-                        // Store in cache for future use
-                        self.content_cache.insert(content_hash, embedding.clone());
-                        EMBEDDING_CACHE_CONTENT_SIZE.set(self.content_cache.entry_count() as i64);
-                        experience.embeddings = Some(embedding);
-                        tracing::debug!("Content embedding cache MISS - generated and cached");
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to generate embedding: {}", e);
-                        // The write goes ahead without a vector; the backlog drain supplies one.
-                        if let Err(record_err) = self.embedding_backlog.record(
-                            &memory_id,
-                            embedding_backlog::EnqueueReason::EmbedFailed,
-                            Some(&e.to_string()),
-                        ) {
-                            tracing::error!(
-                                "embedding backlog: could not record {}: {record_err}",
-                                memory_id.0
-                            );
-                        }
+            match self.embed_primary_cached(&experience.content) {
+                Ok((embedding, space)) => experience.set_primary_vector(embedding, space),
+                Err(e) => {
+                    tracing::warn!("Failed to generate embedding: {}", e);
+                    // The write goes ahead without a vector; the backlog drain supplies one.
+                    if let Err(record_err) = self.embedding_backlog.record(
+                        &memory_id,
+                        embedding_backlog::EnqueueReason::EmbedFailed,
+                        Some(&e.to_string()),
+                    ) {
+                        tracing::error!(
+                            "embedding backlog: could not record {}: {record_err}",
+                            memory_id.0
+                        );
                     }
                 }
             }
         }
+        self.stamp_supplied_vectors(&mut experience);
 
         // TEMPORAL EXTRACTION: Extract dates from content for temporal filtering
         // Based on TEMPR approach (Hindsight paper achieving 89.6% on LoCoMo)
@@ -1882,17 +1866,7 @@ impl MemorySystem {
         // BM25 keyword search (below) provides immediate searchability regardless.
         let indexed = if !defer_embedding {
             if let Err(e) = self.retriever.index_memory(&memory) {
-                tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
-                if let Err(record_err) = self.embedding_backlog.record(
-                    &memory.id,
-                    embedding_backlog::EnqueueReason::IndexFailed,
-                    Some(&e.to_string()),
-                ) {
-                    tracing::error!(
-                        "embedding backlog: could not record {}: {record_err}",
-                        memory.id.0
-                    );
-                }
+                self.note_index_failure(&memory.id, &e, "memory");
                 false
             } else {
                 true
@@ -2362,42 +2336,50 @@ impl MemorySystem {
 
         let importance = memory.importance();
 
-        // Generate embedding if not already present
-        if memory.experience.embeddings.is_none() {
+        // Generate an embedding unless the stored one is already in the primary index's space.
+        // A vector in another space, from an older corpus or another instance, is replaced: the
+        // index refuses it, and the backlog row that brought this memory here waits for this.
+        let index_space = self.retriever.index_space().clone();
+        let stored_space = memory.experience.primary_space(Some(&index_space));
+        if stored_space.as_ref() != Some(&index_space) {
+            let displaced = memory.experience.embeddings.clone().zip(stored_space);
             // Use enriched searchable text (with context prefix) for consistency
             // with the synchronous index_memory() path. Without this, deferred
             // embeddings lack context prefixes and produce different similarity
             // scores than the Vamana index, breaking Layer 3.5 brute-force cosine.
             let searchable_text =
                 crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
-            let content_hash = Self::sha256_hash(&searchable_text);
-
-            if let Some(cached) = self.content_cache.get(&content_hash) {
-                memory.experience.embeddings = Some(cached.clone());
-                EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
-            } else {
-                EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
-                match self.embedder.encode(&searchable_text) {
-                    Ok(embedding) => {
-                        self.content_cache.insert(content_hash, embedding.clone());
-                        EMBEDDING_CACHE_CONTENT_SIZE.set(self.content_cache.entry_count() as i64);
-                        memory.experience.embeddings = Some(embedding);
+            match self.embed_primary_cached(&searchable_text) {
+                Ok((embedding, space)) => memory.experience.set_primary_vector(embedding, space),
+                Err(e) => {
+                    tracing::warn!("Background embedding generation failed: {e}");
+                    if let Err(record_err) = self.embedding_backlog.record(
+                        memory_id,
+                        embedding_backlog::EnqueueReason::EmbedFailed,
+                        Some(&e.to_string()),
+                    ) {
+                        tracing::error!(
+                            "embedding backlog: could not record {}: {record_err}",
+                            memory_id.0
+                        );
                     }
-                    Err(e) => {
-                        tracing::warn!("Background embedding generation failed: {e}");
-                        if let Err(record_err) = self.embedding_backlog.record(
-                            memory_id,
-                            embedding_backlog::EnqueueReason::EmbedFailed,
-                            Some(&e.to_string()),
-                        ) {
-                            tracing::error!(
-                                "embedding backlog: could not record {}: {record_err}",
-                                memory_id.0
-                            );
-                        }
-                        // Non-fatal: memory is still searchable via BM25
-                        return Ok(());
-                    }
+                    // Non-fatal: memory is still searchable via BM25
+                    return Ok(());
+                }
+            }
+            // A displaced vector in the secondary index's space is kept where that index reads.
+            if let Some((vector, space)) = displaced {
+                if memory.experience.embeddings_secondary.is_none()
+                    && self.retriever.secondary_index_space() == Some(&space)
+                {
+                    memory.experience.set_secondary_vector(vector, space);
+                } else {
+                    tracing::debug!(
+                        memory_id = %memory_id.0,
+                        from = %space,
+                        to = %index_space,
+                        "replaced a stored vector in another space"
+                    );
                 }
             }
 
@@ -2435,8 +2417,14 @@ impl MemorySystem {
         if memory.experience.embeddings_secondary.is_none() && self.embedder.has_secondary() {
             let secondary_text =
                 crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
-            if let Ok(Some(secondary)) = self.embedder.encode_secondary(&secondary_text) {
-                memory.experience.embeddings_secondary = Some(secondary);
+            if let Some((secondary, space)) = self
+                .embedder
+                .encode_secondary(&secondary_text)
+                .ok()
+                .flatten()
+                .and_then(|v| self.embedder.secondary_space_for(&v).map(|s| (v, s)))
+            {
+                memory.experience.set_secondary_vector(secondary, space);
                 // Persist so restarts retain the secondary embedding (parity with
                 // the primary, which is persisted above). No-op for the no-secondary
                 // common case since this branch is skipped entirely.
@@ -2449,17 +2437,7 @@ impl MemorySystem {
         // Vector index (uses pre-computed embedding for short content, re-embeds chunks)
         let memory_arc = Arc::new(memory);
         if let Err(e) = self.retriever.index_memory(&memory_arc) {
-            tracing::warn!("Background vector indexing failed for {}: {e}", memory_id.0);
-            if let Err(record_err) = self.embedding_backlog.record(
-                memory_id,
-                embedding_backlog::EnqueueReason::IndexFailed,
-                Some(&e.to_string()),
-            ) {
-                tracing::error!(
-                    "embedding backlog: could not record {}: {record_err}",
-                    memory_id.0
-                );
-            }
+            self.note_index_failure(memory_id, &e, "background memory");
         } else {
             self.stats.write().vector_index_count += 1;
             if let Err(e) = self.embedding_backlog.delete(memory_id) {
@@ -2705,19 +2683,11 @@ impl MemorySystem {
         // PERFORMANCE: Content embedding cache
         // Skipped when defer_embedding=true — handled by embed_and_index() later.
         if !defer_embedding && experience.embeddings.is_none() {
-            let content_hash = Self::sha256_hash(&experience.content);
-            if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
-                experience.embeddings = Some(cached_embedding.clone());
-                EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
-            } else {
-                EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
-                if let Ok(embedding) = self.embedder.encode(&experience.content) {
-                    self.content_cache.insert(content_hash, embedding.clone());
-                    EMBEDDING_CACHE_CONTENT_SIZE.set(self.content_cache.entry_count() as i64);
-                    experience.embeddings = Some(embedding);
-                }
+            if let Ok((embedding, space)) = self.embed_primary_cached(&experience.content) {
+                experience.set_primary_vector(embedding, space);
             }
         }
+        self.stamp_supplied_vectors(&mut experience);
 
         // TEMPORAL EXTRACTION: Extract dates from content for temporal filtering
         if experience.temporal_refs.is_empty() {
@@ -2765,7 +2735,7 @@ impl MemorySystem {
         // Index for semantic search (skipped when deferred — embed_and_index handles it)
         if !defer_embedding {
             if let Err(e) = self.retriever.index_memory(&memory) {
-                tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
+                self.note_index_failure(&memory.id, &e, "memory");
             }
         }
 
@@ -3531,6 +3501,93 @@ impl MemorySystem {
         self.embedder.encode(text)
     }
 
+    /// The space the primary index holds, the one every new primary vector here is written in.
+    pub fn index_space(&self) -> SpaceId {
+        self.retriever.index_space().clone()
+    }
+
+    /// The primary-space vector for `text`: from the content cache, else from the embedder.
+    fn embed_primary_cached(&self, text: &str) -> Result<(Vec<f32>, SpaceId)> {
+        // SHA256 hash for stable cache keys (survives restarts, unlike DefaultHasher)
+        let content_hash = Self::sha256_hash(text);
+        if let Some(cached) = self.content_cache.get(&content_hash) {
+            EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
+            let space = self.embedder.primary_space_for(&cached);
+            return Ok((cached, space));
+        }
+        EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
+        let embedding = self.embedder.encode(text)?;
+        self.content_cache.insert(content_hash, embedding.clone());
+        EMBEDDING_CACHE_CONTENT_SIZE.set(self.content_cache.entry_count() as i64);
+        let space = self.embedder.primary_space_for(&embedding);
+        Ok((embedding, space))
+    }
+
+    /// Name the space of vectors a caller supplied with no space: this corpus's own space at
+    /// its width, as supplied vectors have always been taken to be, else their width alone.
+    fn stamp_supplied_vectors(&self, experience: &mut Experience) {
+        let primary = self.retriever.index_space().clone();
+        let secondary = self
+            .retriever
+            .secondary_index_space()
+            .cloned()
+            .or_else(|| self.embedder.secondary_space());
+        experience.stamp_vector_spaces(Some(&primary), secondary.as_ref());
+    }
+
+    /// One rule for an index refusal on every write path. A space refusal is already a backlog
+    /// row targeting the index's space, recorded by the engine, so it is neither warned nor
+    /// recorded again; anything else is a warning and a row.
+    fn note_index_failure(&self, memory_id: &MemoryId, error: &anyhow::Error, what: &str) {
+        if retrieval::is_space_mismatch(error) {
+            return;
+        }
+        tracing::warn!(
+            "Failed to index {what} {} in vector DB: {error}",
+            memory_id.0
+        );
+        if let Err(record_err) = self.embedding_backlog.record(
+            memory_id,
+            embedding_backlog::EnqueueReason::IndexFailed,
+            Some(&error.to_string()),
+        ) {
+            tracing::error!(
+                "embedding backlog: could not record {}: {record_err}",
+                memory_id.0
+            );
+        }
+    }
+
+    /// The spaces this corpus holds vectors in: what each index holds, what waits in the
+    /// backlog for a vector in each, and what is stored in a space the index it was offered to
+    /// does not hold.
+    pub fn embedding_spaces(&self) -> Result<Vec<crate::embeddings::space::SpaceSummary>> {
+        use crate::embeddings::space::SpaceSummary;
+        fn at<'a>(
+            map: &'a mut std::collections::BTreeMap<SpaceId, SpaceSummary>,
+            id: &SpaceId,
+        ) -> &'a mut SpaceSummary {
+            map.entry(id.clone())
+                .or_insert_with(|| SpaceSummary::empty(id.clone()))
+        }
+        let index_space = self.retriever.index_space().clone();
+        let mut by_space = std::collections::BTreeMap::new();
+        for (space, indexed) in self.retriever.indexed_by_space() {
+            at(&mut by_space, &space).memories += indexed;
+        }
+        for (key, row) in self.embedding_backlog.rows()? {
+            let target = key
+                .space
+                .or(row.target_space)
+                .unwrap_or_else(|| index_space.clone());
+            at(&mut by_space, &target).backlog += 1;
+            if let Some(stored) = row.stored_space {
+                at(&mut by_space, &stored).stranded += 1;
+            }
+        }
+        Ok(by_space.into_values().collect())
+    }
+
     /// Compute a *query* embedding for arbitrary text (retrieval side).
     ///
     /// Honors the embedder's document/query asymmetry — Nomic prepends
@@ -4024,14 +4081,10 @@ impl MemorySystem {
             // Store in long-term
             self.long_term_memory.store(&compressed_memory)?;
 
-            // PRODUCTION: Index memory in Vamana vector DB for semantic search
+            // PRODUCTION: Index memory in Vamana vector DB for semantic search.
+            // Don't fail promotion if indexing fails - memory is still stored
             if let Err(e) = self.retriever.index_memory(&compressed_memory) {
-                tracing::warn!(
-                    "Failed to index memory {} in vector DB: {}",
-                    compressed_memory.id.0,
-                    e
-                );
-                // Don't fail promotion if indexing fails - memory is still stored
+                self.note_index_failure(&compressed_memory.id, &e, "promoted memory");
             }
 
             // Remove from session
@@ -4966,11 +5019,7 @@ impl MemorySystem {
 
         // Re-index in vector DB with updated embeddings
         if let Err(e) = self.retriever.reindex_memory(memory) {
-            tracing::warn!(
-                "Failed to reindex memory {} in vector DB: {}",
-                memory_id.0,
-                e
-            );
+            self.note_index_failure(&memory_id, &e, "updated memory");
         }
 
         // Re-index in BM25 with updated content
@@ -5342,6 +5391,8 @@ impl MemorySystem {
                     repaired += 1;
                     tracing::info!(memory_id = %memory.id.0, "Successfully repaired orphaned memory");
                 }
+                // Queued for a vector in the index's space, not lost.
+                Err(e) if retrieval::is_space_mismatch(&e) => {}
                 Err(e) => {
                     failed += 1;
                     tracing::error!(
@@ -5495,15 +5546,26 @@ impl MemorySystem {
     /// One attempt to give a backlogged memory its vector. The embedder is probed after a
     /// failure so a host that is down stops the drain, while a memory the embedder refuses on
     /// its own merits stays in the queue with its error.
-    fn embed_backlog_outcome(&self, memory_id: &MemoryId) -> embedding_backlog::EmbedOutcome {
+    fn embed_backlog_outcome(
+        &self,
+        key: &embedding_backlog::BacklogKey,
+    ) -> embedding_backlog::EmbedOutcome {
         use embedding_backlog::EmbedOutcome;
-        match self.long_term_memory.get(memory_id) {
+        let memory_id = &key.memory;
+        let memory = match self.long_term_memory.get(memory_id) {
             Ok(memory) if memory.is_forgotten() => return EmbedOutcome::MemoryGone,
-            Ok(_) => {}
+            Ok(memory) => memory,
             Err(e) if e.to_string().contains("Memory not found") => {
                 return EmbedOutcome::MemoryGone
             }
             Err(e) => return EmbedOutcome::Failed(e.to_string()),
+        };
+        match &key.space {
+            None => {}
+            Some(space) if self.retriever.secondary_index_space() == Some(space) => {
+                return self.embed_secondary_outcome(memory)
+            }
+            Some(space) => return EmbedOutcome::Failed(format!("no embedder here writes {space}")),
         }
         if let Err(e) = self.embed_and_index(memory_id) {
             return EmbedOutcome::Failed(e.to_string());
@@ -5526,11 +5588,38 @@ impl MemorySystem {
         }
     }
 
+    /// Give a memory a secondary vector in the secondary index's space and index it there.
+    fn embed_secondary_outcome(&self, mut memory: Memory) -> embedding_backlog::EmbedOutcome {
+        use embedding_backlog::EmbedOutcome;
+        let text = crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
+        let vector = match self.embedder.encode_secondary(&text) {
+            Ok(Some(vector)) => vector,
+            Ok(None) => return EmbedOutcome::Failed("no secondary embedder".to_string()),
+            Err(e) => {
+                return match self.embedder.encode_secondary("veld embedder probe") {
+                    Ok(_) => EmbedOutcome::Failed(e.to_string()),
+                    Err(probe) => EmbedOutcome::EmbedderUnavailable(format!("{e}; probe: {probe}")),
+                }
+            }
+        };
+        let Some(space) = self.embedder.secondary_space_for(&vector) else {
+            return EmbedOutcome::Failed("no secondary embedder".to_string());
+        };
+        memory.experience.set_secondary_vector(vector, space);
+        if let Err(e) = self.long_term_memory.update(&memory) {
+            return EmbedOutcome::Failed(format!("persisting the secondary vector: {e}"));
+        }
+        match self.retriever.reindex_secondary(&memory) {
+            Ok(()) => EmbedOutcome::Indexed,
+            Err(e) => EmbedOutcome::Failed(e.to_string()),
+        }
+    }
+
     /// Embed and index up to `limit` backlogged memories, oldest first.
     pub fn drain_embedding_backlog(&self, limit: usize) -> Result<embedding_backlog::DrainReport> {
         let report = self
             .embedding_backlog
-            .drain_with(limit, |id| self.embed_backlog_outcome(id))?;
+            .drain_with(limit, |key| self.embed_backlog_outcome(key))?;
         if report.drained > 0 {
             if let Err(e) = self.retriever.save() {
                 tracing::warn!("embedding backlog: index save after drain failed: {e}");
@@ -5948,19 +6037,14 @@ impl MemorySystem {
                 existing.experience.tags = experience.tags;
             }
 
-            // Regenerate embeddings for new content
-            let content_hash = Self::sha256_hash(&existing.experience.content);
-            if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
-                existing.experience.embeddings = Some(cached_embedding.clone());
-            } else {
-                match self.embedder.encode(&existing.experience.content) {
-                    Ok(embedding) => {
-                        self.content_cache.insert(content_hash, embedding.clone());
-                        existing.experience.embeddings = Some(embedding);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to regenerate embedding during upsert: {}", e);
-                    }
+            // Regenerate embeddings for new content. When that fails the old vector goes too:
+            // it describes the content this upsert replaced, and the backlog row the reindex
+            // below records gets the new content its own vector.
+            match self.embed_primary_cached(&existing.experience.content) {
+                Ok((embedding, space)) => existing.experience.set_primary_vector(embedding, space),
+                Err(e) => {
+                    tracing::warn!("Failed to regenerate embedding during upsert: {}", e);
+                    existing.experience.clear_primary_vector();
                 }
             }
 
@@ -5980,21 +6064,7 @@ impl MemorySystem {
 
             // Re-index in vector DB with new embeddings
             if let Err(e) = self.retriever.reindex_memory(&existing) {
-                tracing::warn!(
-                    "Failed to reindex memory {} in vector DB: {}",
-                    memory_id.0,
-                    e
-                );
-                if let Err(record_err) = self.embedding_backlog.record(
-                    &memory_id,
-                    embedding_backlog::EnqueueReason::IndexFailed,
-                    Some(&e.to_string()),
-                ) {
-                    tracing::error!(
-                        "embedding backlog: could not record {}: {record_err}",
-                        &memory_id.0
-                    );
-                }
+                self.note_index_failure(&memory_id, &e, "upserted memory");
             }
 
             // Re-index in BM25 with updated content
@@ -6041,31 +6111,24 @@ impl MemorySystem {
 
             // Generate embeddings if not provided
             if experience.embeddings.is_none() {
-                let content_hash = Self::sha256_hash(&experience.content);
-                if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
-                    experience.embeddings = Some(cached_embedding.clone());
-                } else {
-                    match self.embedder.encode(&experience.content) {
-                        Ok(embedding) => {
-                            self.content_cache.insert(content_hash, embedding.clone());
-                            experience.embeddings = Some(embedding);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to generate embedding: {}", e);
-                            if let Err(record_err) = self.embedding_backlog.record(
-                                &memory_id,
-                                embedding_backlog::EnqueueReason::EmbedFailed,
-                                Some(&e.to_string()),
-                            ) {
-                                tracing::error!(
-                                    "embedding backlog: could not record {}: {record_err}",
-                                    &memory_id.0
-                                );
-                            }
+                match self.embed_primary_cached(&experience.content) {
+                    Ok((embedding, space)) => experience.set_primary_vector(embedding, space),
+                    Err(e) => {
+                        tracing::warn!("Failed to generate embedding: {}", e);
+                        if let Err(record_err) = self.embedding_backlog.record(
+                            &memory_id,
+                            embedding_backlog::EnqueueReason::EmbedFailed,
+                            Some(&e.to_string()),
+                        ) {
+                            tracing::error!(
+                                "embedding backlog: could not record {}: {record_err}",
+                                &memory_id.0
+                            );
                         }
                     }
                 }
             }
+            self.stamp_supplied_vectors(&mut experience);
 
             // TEMPORAL EXTRACTION: Extract dates from content for temporal filtering
             if experience.temporal_refs.is_empty() {
@@ -6111,17 +6174,7 @@ impl MemorySystem {
 
             // Index in vector DB
             if let Err(e) = self.retriever.index_memory(&memory) {
-                tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
-                if let Err(record_err) = self.embedding_backlog.record(
-                    &memory.id,
-                    embedding_backlog::EnqueueReason::IndexFailed,
-                    Some(&e.to_string()),
-                ) {
-                    tracing::error!(
-                        "embedding backlog: could not record {}: {record_err}",
-                        &memory.id.0
-                    );
-                }
+                self.note_index_failure(&memory.id, &e, "memory");
             }
 
             // Add entities to knowledge graph with co-occurrence edges
@@ -6510,7 +6563,10 @@ impl MemorySystem {
         }
 
         // Layer 3: blend the embedding toward the retrieval-context embedding (L2-norm).
-        if dials.re_encode_embedding_nudge {
+        let index_space = self.retriever.index_space().clone();
+        let own_vector =
+            m.experience.primary_space(Some(&index_space)).as_ref() == Some(&index_space);
+        if dials.re_encode_embedding_nudge && own_vector {
             if let Some(mem_emb) = m.experience.embeddings.clone() {
                 if !mem_emb.is_empty() {
                     if let Ok(ctx_emb) = self.compute_embedding(&shadow.retrieval_context) {

@@ -26,6 +26,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 use super::alignment::Alignment;
+use super::space::SpaceId;
 use super::Embedder;
 
 type DualEmbeddingBatch = (Vec<Vec<f32>>, Option<Vec<Vec<f32>>>);
@@ -172,6 +173,28 @@ impl CompetitiveEmbedder {
         self.primary.id()
     }
 
+    /// The space the primary writes, and so the space of the primary index.
+    pub fn primary_space(&self) -> SpaceId {
+        SpaceId::of(self.primary.as_ref())
+    }
+
+    /// The space the secondary writes, when one is configured.
+    pub fn secondary_space(&self) -> Option<SpaceId> {
+        self.secondary.as_ref().map(|e| SpaceId::of(e.as_ref()))
+    }
+
+    /// The space of a vector the primary produced.
+    pub fn primary_space_for(&self, vector: &[f32]) -> SpaceId {
+        SpaceId::for_vector(self.primary.as_ref(), vector)
+    }
+
+    /// The space of a vector the secondary produced.
+    pub fn secondary_space_for(&self, vector: &[f32]) -> Option<SpaceId> {
+        self.secondary
+            .as_ref()
+            .map(|e| SpaceId::for_vector(e.as_ref(), vector))
+    }
+
     /// Get a reference to the primary embedder.
     pub fn primary_embedder(&self) -> &Arc<dyn Embedder> {
         &self.primary
@@ -284,6 +307,10 @@ impl Embedder for CompetitiveEmbedder {
     // swapping it does not invalidate anything already written.
     fn id(&self) -> &str {
         self.primary.id()
+    }
+
+    fn model_id(&self) -> &str {
+        self.primary.model_id()
     }
 
     fn encode(&self, text: &str) -> Result<Vec<f32>> {

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use super::embedding_backlog::{BacklogKey, EmbeddingBacklogStore};
 use super::introspection::ConsolidationEventBuffer;
 use super::storage::SearchCriteria;
 use super::types::*;
@@ -25,6 +26,7 @@ use crate::constants::{
     VECTOR_SEARCH_CANDIDATE_MULTIPLIER,
 };
 use crate::embeddings::competitive::CompetitiveEmbedder;
+use crate::embeddings::space::{self, SpaceId};
 use crate::embeddings::Embedder;
 use crate::vector_db::vamana::{VamanaConfig, VamanaIndex};
 
@@ -35,6 +37,23 @@ const VAMANA_INDEX_FILE: &str = "vamana.idx";
 pub(crate) const MAPPINGS_MARKER_FILE: &str = "mappings.authoritative";
 /// Filename for persisted secondary Vamana index
 const SECONDARY_VAMANA_INDEX_FILE: &str = "secondary_vamana.idx";
+
+/// An index refused a stored vector because it is in another space than the index's.
+///
+/// The refusal is already a backlog row targeting the index's space when this is returned, so
+/// a caller neither warns nor records it again; see [`is_space_mismatch`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("memory {} stores a vector in {stored}; the index holds {index}", .memory.0)]
+pub struct SpaceMismatch {
+    pub memory: MemoryId,
+    pub stored: SpaceId,
+    pub index: SpaceId,
+}
+
+/// Whether an indexing error is a space refusal the engine has already recorded.
+pub fn is_space_mismatch(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SpaceMismatch>().is_some()
+}
 
 /// Multi-modal retrieval engine with production vector search
 ///
@@ -69,6 +88,12 @@ pub struct RetrievalEngine {
     secondary_vector_index: Option<Arc<RwLock<VamanaIndex>>>,
     /// Lock order: 4 - Secondary ID mapping, mirrors secondary_vector_index
     secondary_id_mapping: Option<Arc<RwLock<IdMapping>>>,
+    /// The space every vector in `vector_index` is in.
+    index_space: SpaceId,
+    /// The space every vector in `secondary_vector_index` is in.
+    secondary_index_space: Option<SpaceId>,
+    /// Where a refusal is recorded: the ledger the memory system drains, over the same store.
+    backlog: EmbeddingBacklogStore,
     /// Storage path for persisting vector index and ID mapping
     storage_path: PathBuf,
     /// Lock order: 5 - Acquire last
@@ -278,6 +303,11 @@ impl RetrievalEngine {
                 (None, None)
             };
 
+        let index_space = embedder.primary_space();
+        let secondary_index_space = secondary_vector_index
+            .as_ref()
+            .and_then(|_| embedder.secondary_space());
+        let backlog = EmbeddingBacklogStore::with_kv(storage.key_value_store());
         let engine = Self {
             vector_index_failures: std::sync::atomic::AtomicU64::new(0),
             storage,
@@ -286,6 +316,9 @@ impl RetrievalEngine {
             id_mapping: Arc::new(RwLock::new(id_mapping)),
             secondary_vector_index,
             secondary_id_mapping,
+            index_space,
+            secondary_index_space,
+            backlog,
             storage_path,
             consolidation_events,
         };
@@ -327,25 +360,32 @@ impl RetrievalEngine {
         Ok(engine)
     }
 
-    /// Re-embed stored vectors when the primary embedding dimension changes.
+    /// Bring every stored vector's space in line with the corpus markers and the active
+    /// embedder, in one pass over the store.
     ///
-    /// Triggered by promoting Nomic to primary, or by changing `VELD_NOMIC_DIM`.
-    /// A marker file (`.veld_embedding_dim`) records the dimension the corpus was
-    /// last embedded at; when it differs from the active embedder, every memory
-    /// whose primary embedding has the wrong length is re-embedded from content
-    /// and persisted.
+    /// Two jobs share the pass because both must read the markers as they were before this
+    /// boot moves them:
+    ///
+    /// - **Stamp.** A vector stored before spaces were named gets the space the corpus markers
+    ///   name, the embedder that wrote the corpus, when the widths agree, else a width-only
+    ///   space. Runs once per corpus (`.veld_spaces_stamped`), and again inside any migration.
+    /// - **Migrate.** When the active embedder is not the one the markers name, every primary
+    ///   vector in another space than the active one is re-embedded, or promoted from a
+    ///   secondary already in it.
     ///
     /// Properties:
-    /// - **Idempotent**: a matching marker short-circuits in O(1).
-    /// - **Crash-resumable**: the marker advances only after a clean pass; the
-    ///   per-memory length check skips already-migrated memories on retry.
-    /// - **Reuses vectors**: an old Nomic `embeddings_secondary` already at the
-    ///   target length is promoted in place instead of re-running ONNX.
-    fn migrate_embeddings_if_dimension_changed(&self) -> Result<()> {
+    /// - **Idempotent**: current markers and a stamp marker short-circuit in O(1).
+    /// - **Crash-resumable**: markers advance only after a pass without a failed write; a
+    ///   stamped record keeps its space, so a resumed pass reads what the first one recorded.
+    /// - **Never names a model it was not told**: a width the markers do not explain is
+    ///   recorded as `unrecorded@<width>`.
+    fn reconcile_corpus_spaces(&self) -> Result<()> {
         let target = self.embedder.primary_dimension();
         let target_id = self.embedder.primary_id().to_string();
-        let marker = self.storage_path.join(".veld_embedding_dim");
-        let id_marker = self.storage_path.join(".veld_embedder");
+        let target_space = self.index_space.clone();
+        let marker = self.storage_path.join(space::DIMENSION_MARKER);
+        let id_marker = self.storage_path.join(space::EMBEDDER_MARKER);
+        let stamp_marker = self.storage_path.join(space::STAMP_MARKER);
 
         let recorded: Option<usize> = std::fs::read_to_string(&marker)
             .ok()
@@ -357,28 +397,29 @@ impl RetrievalEngine {
 
         // DIMENSION IS NOT IDENTITY. Two different models at the same dimension —
         // the hash-bigram fallback and MiniLM are both 384 — leave `recorded ==
-        // Some(target)` true, so this returned early over a corpus embedded by
-        // something else entirely. The length check below cannot see it either:
-        // every vector is the right SHAPE and the wrong CONTENT.
+        // Some(target)` true, so a width check alone returns early over a corpus embedded by
+        // something else entirely: every vector the right SHAPE and the wrong CONTENT.
         let action = corpus_action(recorded, recorded_id.as_deref(), target, &target_id);
-        if action == CorpusAction::UpToDate {
-            return Ok(()); // corpus is at the active dimension AND the active embedder
+        let stamped = stamp_marker.exists();
+        if action == CorpusAction::UpToDate && stamped {
+            return Ok(());
         }
 
         let ids = self.storage.get_all_ids()?;
         if ids.is_empty() {
-            // Fresh / empty store — record both; nothing to migrate.
+            // Fresh / empty store — record everything; nothing to stamp or migrate.
             let _ = std::fs::write(&marker, target.to_string());
             let _ = std::fs::write(&id_marker, &target_id);
+            let _ = std::fs::write(&stamp_marker, target_space.as_str());
             return Ok(());
         }
 
-        // A corpus written before this marker existed. We CANNOT tell what embedded
-        // it, and neither answer is safe to assume: re-embedding thousands of vectors
-        // unasked is expensive, and writing the current id claims a provenance nobody
-        // established. So the unknown gets its own value — `unverified:<id>` — which
-        // is not equal to `<id>`, so it never satisfies the early return above, and
-        // says in the file itself that this was believed rather than checked.
+        // A corpus written before the embedder marker existed. We CANNOT tell what embedded
+        // it, and neither answer is safe to assume: re-embedding thousands of vectors unasked
+        // is expensive, and writing the current id claims a provenance nobody established.
+        // So the unknown gets its own value — `unverified:<id>` — which is not equal to
+        // `<id>`, so it never satisfies the early return above, and says in the file itself
+        // that this was believed rather than checked.
         if action == CorpusAction::RecordUnverified {
             warn!(
                 embedder = %target_id,
@@ -389,36 +430,59 @@ impl RetrievalEngine {
                  /api/index/reembed to make the corpus current, after which this resolves."
             );
             let _ = std::fs::write(&id_marker, format!("unverified:{target_id}"));
-            return Ok(());
         }
 
-        // An embedder swap at the SAME dimension invalidates every vector while
-        // leaving all their lengths correct, so the per-memory length check below is
-        // blind to it and everything must be re-embedded.
-        let force_all = action == CorpusAction::MigrateAll;
+        // Read after an unverified marker is written: a corpus whose provenance was never
+        // recorded is stamped with what it is believed to be, which is what it was indexed as.
+        let corpus = space::corpus_space(&self.storage_path);
+        let migrate = matches!(
+            action,
+            CorpusAction::MigrateChangedLength | CorpusAction::MigrateAll
+        );
+        // A primary vector already at the target width in a corpus whose width changed was
+        // written by an earlier, interrupted run of this migration.
+        let resumed = (action == CorpusAction::MigrateChangedLength).then(|| target_space.clone());
+        let primary_assumption = |len: usize| -> Option<SpaceId> {
+            corpus
+                .clone()
+                .filter(|c| c.dimension() == len)
+                .or_else(|| resumed.clone().filter(|t| t.dimension() == len))
+        };
+        // A secondary at the live secondary's width was written by it. One at the target width
+        // during a migration is the old Nomic secondary this migration promotes.
+        let secondary_assumption = |len: usize| -> Option<SpaceId> {
+            self.secondary_index_space
+                .clone()
+                .filter(|s| s.dimension() == len)
+                .or_else(|| Some(target_space.clone()).filter(|t| migrate && t.dimension() == len))
+        };
 
-        info!(
-            "Embedding dimension change detected (was {:?}, now {}d) — checking {} memories",
-            recorded,
-            target,
-            ids.len()
-        );
-
-        // Stale persisted indices must not be loaded against the new dimension.
-        let _ = std::fs::remove_file(
-            self.storage_path
-                .join("vector_index")
-                .join(VAMANA_INDEX_FILE),
-        );
-        let _ = std::fs::remove_file(
-            self.storage_path
-                .join("secondary_vector_index")
-                .join(SECONDARY_VAMANA_INDEX_FILE),
-        );
+        if migrate {
+            info!(
+                "Embedding space change detected (corpus {:?} at {:?}d, now {}) — checking {} memories",
+                recorded_id,
+                recorded,
+                target_space,
+                ids.len()
+            );
+            // Stale persisted indices must not be loaded against the new space.
+            let _ = std::fs::remove_file(
+                self.storage_path
+                    .join("vector_index")
+                    .join(VAMANA_INDEX_FILE),
+            );
+            let _ = std::fs::remove_file(
+                self.storage_path
+                    .join("secondary_vector_index")
+                    .join(SECONDARY_VAMANA_INDEX_FILE),
+            );
+        }
 
         let mut reembedded = 0usize;
         let mut reused = 0usize;
+        let mut stamped_now = 0usize;
         let mut unchanged = 0usize;
+        let mut unreadable = 0usize;
         let mut failed = 0usize;
 
         for id in &ids {
@@ -427,77 +491,109 @@ impl RetrievalEngine {
                 Err(e) => {
                     // Named, because a count of failures cannot be acted on and an id can:
                     // 24 of these blocked the marker on the 2026-09-13 deploy.
-                    warn!("Embedding migration cannot load {}: {}", id.0, e);
-                    failed += 1;
+                    warn!("Embedding space pass cannot load {}: {}", id.0, e);
+                    unreadable += 1;
                     continue;
                 }
             };
 
-            // Already the correct length — nothing to do (keeps retries cheap).
-            // Unless the EMBEDDER changed at the same dimension, in which case length
-            // is exactly the property that stayed correct while the content did not.
-            let needs_migration =
-                force_all || matches!(&memory.experience.embeddings, Some(e) if e.len() != target);
-            if !needs_migration {
-                unchanged += 1;
-                continue;
+            let primary_assumed = memory
+                .experience
+                .embeddings
+                .as_ref()
+                .and_then(|v| primary_assumption(v.len()));
+            let secondary_assumed = memory
+                .experience
+                .embeddings_secondary
+                .as_ref()
+                .and_then(|v| secondary_assumption(v.len()));
+            let mut dirty = memory
+                .experience
+                .stamp_vector_spaces(primary_assumed.as_ref(), secondary_assumed.as_ref());
+            if dirty {
+                stamped_now += 1;
             }
 
-            // Prefer an existing secondary embedding already at the target length
-            // (installs that ran the old Nomic secondary have one for free).
-            let new_emb = match &memory.experience.embeddings_secondary {
-                Some(sec) if sec.len() == target => {
-                    reused += 1;
-                    sec.clone()
+            let stale = migrate
+                && memory
+                    .experience
+                    .primary_space(None)
+                    .is_some_and(|s| s != target_space);
+            if stale {
+                let promoted = memory.experience.embeddings_secondary.clone().filter(|_| {
+                    memory.experience.secondary_space(None).as_ref() == Some(&target_space)
+                });
+                match promoted {
+                    Some(vector) => {
+                        reused += 1;
+                        memory
+                            .experience
+                            .set_primary_vector(vector, target_space.clone());
+                        dirty = true;
+                    }
+                    None => match self.embedder.encode(&memory.experience.content) {
+                        Ok(e) if e.len() == target => {
+                            reembedded += 1;
+                            let space = self.embedder.primary_space_for(&e);
+                            memory.experience.set_primary_vector(e, space);
+                            dirty = true;
+                        }
+                        Ok(e) => {
+                            warn!(
+                                "Re-embed for {} produced {}d, expected {}d — skipping",
+                                id.0,
+                                e.len(),
+                                target
+                            );
+                            failed += 1;
+                        }
+                        Err(e) => {
+                            warn!("Re-embed failed for {}: {}", id.0, e);
+                            failed += 1;
+                        }
+                    },
                 }
-                _ => match self.embedder.encode(&memory.experience.content) {
-                    Ok(e) if e.len() == target => {
-                        reembedded += 1;
-                        e
-                    }
-                    Ok(e) => {
-                        warn!(
-                            "Re-embed for {} produced {}d, expected {}d — skipping",
-                            id.0,
-                            e.len(),
-                            target
-                        );
-                        failed += 1;
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!("Re-embed failed for {}: {}", id.0, e);
-                        failed += 1;
-                        continue;
-                    }
-                },
-            };
+            }
 
-            memory.experience.embeddings = Some(new_emb);
-            if let Err(e) = self.storage.update(&memory) {
-                warn!("Failed to persist re-embedded memory {}: {}", id.0, e);
-                failed += 1;
+            if dirty {
+                if let Err(e) = self.storage.update(&memory) {
+                    warn!("Failed to persist embedding spaces for {}: {}", id.0, e);
+                    failed += 1;
+                }
+            } else {
+                unchanged += 1;
             }
         }
 
-        // Advance the marker only after a clean pass — a crash or failure leaves
-        // it stale so the next startup resumes the remaining memories.
-        if failed == 0 {
-            let _ = std::fs::write(&marker, target.to_string());
-            // Both markers advance together, or neither does. Advancing the
-            // dimension alone would leave the corpus recorded as unverified
-            // forever and re-run the whole pass on every startup.
-            let _ = std::fs::write(&id_marker, &target_id);
+        // Advance the markers only after a clean pass — a crash or failure leaves them stale
+        // so the next startup resumes the remaining memories. A record that cannot be read
+        // cannot be stamped either, so it holds back the migration markers but not the stamp.
+        if failed == 0 && !(migrate && unreadable > 0) {
+            if migrate {
+                // Both markers advance together, or neither does. Advancing the dimension
+                // alone would leave the corpus recorded as unverified forever and re-run the
+                // whole pass on every startup.
+                let _ = std::fs::write(&marker, target.to_string());
+                let _ = std::fs::write(&id_marker, &target_id);
+            }
+            let _ = std::fs::write(&stamp_marker, target_space.as_str());
         } else {
             warn!(
-                "Embedding migration finished with {} failures — marker not advanced, will retry next startup",
-                failed
+                failed,
+                unreadable,
+                "Embedding space pass incomplete — markers not advanced, will retry next startup"
             );
         }
 
         info!(
-            "Embedding migration: {} re-embedded, {} reused from secondary, {} already correct, {} failed",
-            reembedded, reused, unchanged, failed
+            stamped = stamped_now,
+            reembedded,
+            reused_from_secondary = reused,
+            unchanged,
+            unreadable,
+            failed,
+            space = %target_space,
+            "Embedding space pass"
         );
 
         Ok(())
@@ -514,11 +610,11 @@ impl RetrievalEngine {
     fn rebuild_from_rocksdb(&self) -> Result<()> {
         let start_time = std::time::Instant::now();
 
-        // MIGRATION: if the primary embedding dimension changed (Nomic promoted
-        // to primary, or VELD_NOMIC_DIM changed), re-embed stored vectors before
-        // any index load/rebuild so the corpus and index dimensions agree.
-        if let Err(e) = self.migrate_embeddings_if_dimension_changed() {
-            warn!("Embedding dimension migration failed (rebuilding best-effort): {e}");
+        // Stamp unnamed vectors with the space the corpus markers name, and re-embed into the
+        // active space if the embedder changed, before any index load or rebuild, so every
+        // vector an index admits is in the index's space.
+        if let Err(e) = self.reconcile_corpus_spaces() {
+            warn!("Embedding space pass failed (rebuilding best-effort): {e}");
         }
 
         let mut primary_loaded_from_file = false;
@@ -601,7 +697,7 @@ impl RetrievalEngine {
                             if memory.is_forgotten() {
                                 continue;
                             }
-                            if memory.experience.embeddings_secondary.is_some() {
+                            if self.holds_own_secondary(&memory) {
                                 // Assign sequential vector IDs matching the order they were
                                 // inserted during the save that produced this file.
                                 // This works because VamanaIndex assigns IDs sequentially
@@ -647,8 +743,12 @@ impl RetrievalEngine {
                 if memory.is_forgotten() {
                     continue;
                 }
-                if let Some(ref sec_emb) = memory.experience.embeddings_secondary {
-                    to_index.push((memory_id.clone(), sec_emb.clone()));
+                match &memory.experience.embeddings_secondary {
+                    Some(sec_emb) if self.holds_own_secondary(&memory) => {
+                        to_index.push((memory_id.clone(), sec_emb.clone()));
+                    }
+                    Some(_) => self.refuse_secondary(&memory),
+                    None => {}
                 }
             }
         }
@@ -814,11 +914,10 @@ impl RetrievalEngine {
             let Ok(memory) = self.storage.get(memory_id) else {
                 continue;
             };
-            let Some(own) = memory
-                .experience
-                .embeddings
-                .as_ref()
-                .filter(|e| e.len() == index.config.dimension)
+            let Some(own) =
+                memory.experience.embeddings.as_ref().filter(|e| {
+                    e.len() == index.config.dimension && self.holds_own_vector(&memory)
+                })
             else {
                 continue;
             };
@@ -884,7 +983,7 @@ impl RetrievalEngine {
                 .experience
                 .embeddings
                 .as_ref()
-                .filter(|e| e.len() == dimension);
+                .filter(|e| e.len() == dimension && self.holds_own_vector(&memory));
             let single = own.is_some()
                 && !chunk_text(&Self::extract_searchable_text(&memory), &chunk_config).was_chunked;
             match own {
@@ -1114,12 +1213,84 @@ impl RetrievalEngine {
         match self.index_memory_inner(memory) {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Counted at the boundary, not at the seven call sites.
-                self.vector_index_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Counted and recorded at the boundary, not at the seven call sites. A space
+                // refusal is not a loss: it becomes a row the drain fills in the index's space.
+                match e.downcast_ref::<SpaceMismatch>() {
+                    Some(mismatch) => {
+                        self.record_refusal(&BacklogKey::primary(&memory.id), mismatch)
+                    }
+                    None => {
+                        self.vector_index_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 Err(e)
             }
         }
+    }
+
+    /// The space of the primary index.
+    pub fn index_space(&self) -> &SpaceId {
+        &self.index_space
+    }
+
+    /// The space of the secondary index, when there is one.
+    pub fn secondary_index_space(&self) -> Option<&SpaceId> {
+        self.secondary_index_space.as_ref()
+    }
+
+    /// Whether the memory's primary vector is in the primary index's space. A vector stored
+    /// without a space is taken to be in it when the widths agree, as before spaces existed.
+    fn holds_own_vector(&self, memory: &Memory) -> bool {
+        memory
+            .experience
+            .primary_space(Some(&self.index_space))
+            .as_ref()
+            == Some(&self.index_space)
+    }
+
+    /// Whether the memory's secondary vector is in the secondary index's space.
+    fn holds_own_secondary(&self, memory: &Memory) -> bool {
+        match &self.secondary_index_space {
+            Some(space) => memory.experience.secondary_space(Some(space)).as_ref() == Some(space),
+            None => false,
+        }
+    }
+
+    fn record_refusal(&self, key: &BacklogKey, mismatch: &SpaceMismatch) {
+        tracing::debug!("{mismatch}; queued for a vector in {}", mismatch.index);
+        if let Err(e) = self
+            .backlog
+            .record_mismatch(key, &mismatch.stored, &mismatch.index)
+        {
+            tracing::error!(
+                "embedding backlog: could not record {}: {e}",
+                mismatch.memory.0
+            );
+        }
+    }
+
+    /// Record that the secondary index cannot hold the memory's secondary vector.
+    fn refuse_secondary(&self, memory: &Memory) {
+        let (Some(index), Some(vector)) = (
+            &self.secondary_index_space,
+            &memory.experience.embeddings_secondary,
+        ) else {
+            return;
+        };
+        let stored = space::resolve(
+            memory.experience.embedding_space_secondary.as_ref(),
+            vector.len(),
+            Some(index),
+        );
+        self.record_refusal(
+            &BacklogKey::in_space(&memory.id, index),
+            &SpaceMismatch {
+                memory: memory.id.clone(),
+                stored,
+                index: index.clone(),
+            },
+        );
     }
 
     fn index_memory_inner(&self, memory: &Memory) -> Result<()> {
@@ -1168,12 +1339,24 @@ impl RetrievalEngine {
             ids
         } else {
             // Short content: single embedding (use pre-computed if available)
-            let embedding = if let Some(emb) = &memory.experience.embeddings {
-                emb.clone()
-            } else {
-                self.embedder
+            let embedding = match &memory.experience.embeddings {
+                Some(emb) if self.holds_own_vector(memory) => emb.clone(),
+                Some(emb) => {
+                    return Err(SpaceMismatch {
+                        memory: memory.id.clone(),
+                        stored: space::resolve(
+                            memory.experience.embedding_space.as_ref(),
+                            emb.len(),
+                            Some(&self.index_space),
+                        ),
+                        index: self.index_space.clone(),
+                    }
+                    .into())
+                }
+                None => self
+                    .embedder
                     .encode(&text)
-                    .context("Failed to generate embedding")?
+                    .context("Failed to generate embedding")?,
             };
 
             let mut index = self.vector_index.write();
@@ -1193,25 +1376,107 @@ impl RetrievalEngine {
             .update_vector_mapping(&memory.id, vector_ids)
             .context("Failed to persist vector mapping to RocksDB")?;
 
-        // Index into secondary Vamana if available and memory has secondary embeddings
-        if let (Some(ref sec_index), Some(ref sec_mapping)) =
-            (&self.secondary_vector_index, &self.secondary_id_mapping)
-        {
-            if let Some(ref sec_emb) = memory.experience.embeddings_secondary {
-                // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
-                match sec_index.write().add_vector(sec_emb.clone()) {
-                    Ok(sec_vector_id) => {
-                        sec_mapping.write().insert(memory.id.clone(), sec_vector_id);
-                    }
-                    Err(e) => {
-                        // Secondary failure is non-fatal — primary is authoritative
-                        warn!("Failed to index secondary for {}: {}", memory.id.0, e);
+        // Secondary failure is non-fatal — primary is authoritative. It is recorded, so the
+        // drain gives the secondary index its vector.
+        if let Err(e) = self.add_secondary(memory) {
+            if !is_space_mismatch(&e) {
+                if let Some(space) = &self.secondary_index_space {
+                    if let Err(record_err) = self.backlog.record_key(
+                        &BacklogKey::in_space(&memory.id, space),
+                        super::embedding_backlog::EnqueueReason::IndexFailed,
+                        Some(space),
+                        None,
+                        Some(&e.to_string()),
+                    ) {
+                        tracing::error!(
+                            "embedding backlog: could not record {}: {record_err}",
+                            memory.id.0
+                        );
                     }
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Add the memory's secondary vector to the secondary index, when both exist. A vector in
+    /// another space is refused and recorded, never added.
+    fn add_secondary(&self, memory: &Memory) -> Result<()> {
+        let (Some(sec_index), Some(sec_mapping)) =
+            (&self.secondary_vector_index, &self.secondary_id_mapping)
+        else {
+            return Ok(());
+        };
+        let Some(sec_emb) = &memory.experience.embeddings_secondary else {
+            return Ok(());
+        };
+        if !self.holds_own_secondary(memory) {
+            self.refuse_secondary(memory);
+            return Err(SpaceMismatch {
+                memory: memory.id.clone(),
+                stored: space::resolve(
+                    memory.experience.embedding_space_secondary.as_ref(),
+                    sec_emb.len(),
+                    self.secondary_index_space.as_ref(),
+                ),
+                index: self
+                    .secondary_index_space
+                    .clone()
+                    .unwrap_or_else(|| SpaceId::unrecorded(sec_index.read().config.dimension)),
+            }
+            .into());
+        }
+        // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
+        let sec_vector_id = sec_index
+            .write()
+            .add_vector(sec_emb.clone())
+            .context("Failed to add secondary vector to index")?;
+        sec_mapping.write().insert(memory.id.clone(), sec_vector_id);
+        Ok(())
+    }
+
+    /// Replace the memory's vector in the secondary index with the one it stores now. For the
+    /// drain of a row targeting the secondary space.
+    pub fn reindex_secondary(&self, memory: &Memory) -> Result<()> {
+        if let (Some(sec_index), Some(sec_mapping)) =
+            (&self.secondary_vector_index, &self.secondary_id_mapping)
+        {
+            // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
+            let old_ids = sec_mapping
+                .read()
+                .memory_to_vectors
+                .get(&memory.id)
+                .cloned()
+                .unwrap_or_default();
+            if !old_ids.is_empty() {
+                let idx = sec_index.read();
+                for vid in &old_ids {
+                    idx.mark_deleted(*vid);
+                }
+                drop(idx);
+                sec_mapping.write().remove_all(&memory.id);
+            }
+        }
+        self.add_secondary(memory)
+    }
+
+    /// Whether the secondary index holds the memory.
+    pub fn is_secondary_indexed(&self, memory_id: &MemoryId) -> bool {
+        self.secondary_id_mapping
+            .as_ref()
+            .is_some_and(|m| m.read().contains(memory_id))
+    }
+
+    /// Memories each index holds, by the index's space.
+    pub fn indexed_by_space(&self) -> Vec<(SpaceId, usize)> {
+        let mut out = vec![(self.index_space.clone(), self.len())];
+        if let (Some(space), Some(mapping)) =
+            (&self.secondary_index_space, &self.secondary_id_mapping)
+        {
+            out.push((space.clone(), mapping.read().len()));
+        }
+        out
     }
 
     /// Re-index an existing memory with updated embeddings
@@ -2229,7 +2494,7 @@ impl RetrievalEngine {
 
                     // Clear pre-computed embedding to force re-generation
                     // through extract_searchable_text() → encode()
-                    memory.experience.embeddings = None;
+                    memory.experience.clear_primary_vector();
 
                     // Persist the cleared embedding so deferred path also re-generates
                     if let Err(e) = self.storage.update(&memory) {
@@ -3312,5 +3577,222 @@ mod corpus_action_tests {
             corpus_action(None, None, 384, "minilm"),
             CorpusAction::MigrateChangedLength
         );
+    }
+}
+
+#[cfg(all(test, feature = "storage-redb"))]
+mod space_tests {
+    use super::*;
+    use crate::memory::embedding_backlog::{BacklogKey, EmbeddingBacklogStore};
+    use crate::storage::PrimaryMemoryStore;
+
+    const DIM: usize = 8;
+
+    struct Stub {
+        id: String,
+        model: &'static str,
+        dim: usize,
+        fail: bool,
+    }
+
+    impl Stub {
+        fn new(model: &'static str, dim: usize) -> Arc<Self> {
+            Arc::new(Self {
+                id: format!("http://stub#{model}"),
+                model,
+                dim,
+                fail: false,
+            })
+        }
+
+        fn failing(model: &'static str, dim: usize) -> Arc<Self> {
+            Arc::new(Self {
+                id: format!("http://stub#{model}"),
+                model,
+                dim,
+                fail: true,
+            })
+        }
+    }
+
+    impl Embedder for Stub {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn model_id(&self) -> &str {
+            self.model
+        }
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+        fn encode(&self, text: &str) -> Result<Vec<f32>> {
+            if self.fail {
+                anyhow::bail!("stub embedder is down");
+            }
+            let seed = text
+                .bytes()
+                .fold(17u32, |h, b| h.wrapping_mul(31) ^ u32::from(b));
+            let mut v: Vec<f32> = (0..self.dim)
+                .map(|i| ((seed.wrapping_add(i as u32 * 7919) % 1000) as f32 / 1000.0) + 0.01)
+                .collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= norm);
+            Ok(v)
+        }
+    }
+
+    fn store(dir: &Path) -> Arc<dyn PrimaryMemoryStore> {
+        Arc::new(crate::storage::redb::RedbPrimaryMemoryStore::open(dir).expect("redb store"))
+    }
+
+    fn engine(
+        store: &Arc<dyn PrimaryMemoryStore>,
+        dir: &Path,
+        primary: Arc<Stub>,
+        secondary: Option<Arc<Stub>>,
+    ) -> RetrievalEngine {
+        let embedder = Arc::new(CompetitiveEmbedder::new(
+            primary,
+            secondary.map(|s| s as Arc<dyn Embedder>),
+        ));
+        RetrievalEngine::new(store.clone(), dir, embedder).expect("engine")
+    }
+
+    fn memory(content: &str, vector: Option<Vec<f32>>) -> Memory {
+        Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                content: content.to_string(),
+                embeddings: vector,
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn markers(dir: &Path, embedder_id: &str, dim: usize) {
+        std::fs::write(dir.join(space::EMBEDDER_MARKER), embedder_id).unwrap();
+        std::fs::write(dir.join(space::DIMENSION_MARKER), dim.to_string()).unwrap();
+    }
+
+    #[test]
+    fn the_stamp_pass_names_old_vectors_by_the_corpus_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let legacy = memory("written before spaces", Some(a.encode("x").unwrap()));
+        let narrow = memory("written by a narrower model", Some(vec![0.5; 4]));
+        store.store(&legacy).unwrap();
+        store.store(&narrow).unwrap();
+        markers(tmp.path(), &a.id, DIM);
+
+        let engine = engine(&store, tmp.path(), a, None);
+
+        let model_a = SpaceId::new("model-a", DIM);
+        assert_eq!(engine.index_space(), &model_a);
+        assert_eq!(
+            store.get(&legacy.id).unwrap().experience.embedding_space,
+            Some(model_a.clone())
+        );
+        assert_eq!(
+            store.get(&narrow.id).unwrap().experience.embedding_space,
+            Some(SpaceId::unrecorded(4)),
+            "a width the markers do not explain names no model"
+        );
+        assert!(tmp.path().join(space::STAMP_MARKER).exists());
+        assert!(engine.is_indexed(&legacy.id));
+        assert!(!engine.is_indexed(&narrow.id));
+    }
+
+    #[test]
+    fn an_embedder_change_keeps_the_old_space_on_what_it_could_not_re_embed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let mut written = memory("written under model a", None);
+        let v = a.encode(&written.experience.content).unwrap();
+        written
+            .experience
+            .set_primary_vector(v, SpaceId::new("model-a", DIM));
+        store.store(&written).unwrap();
+        markers(tmp.path(), &a.id, DIM);
+        drop(engine(&store, tmp.path(), a, None));
+
+        // Same width, another model, and down: the migration cannot re-embed.
+        let b = engine(&store, tmp.path(), Stub::failing("model-b", DIM), None);
+        let read = store.get(&written.id).unwrap();
+        assert_eq!(
+            read.experience.embedding_space,
+            Some(SpaceId::new("model-a", DIM)),
+            "the vector still says where it came from"
+        );
+        assert_eq!(b.index_space(), &SpaceId::new("model-b", DIM));
+
+        let err = b
+            .index_memory(&read)
+            .expect_err("a same-width foreign vector is refused");
+        assert!(is_space_mismatch(&err));
+        assert_eq!(b.vector_index_failure_count(), 0, "a refusal is not a loss");
+        let row = EmbeddingBacklogStore::with_kv(store.key_value_store())
+            .get(&written.id)
+            .unwrap()
+            .expect("the refusal is a backlog row");
+        assert_eq!(row.stored_space, Some(SpaceId::new("model-a", DIM)));
+        assert_eq!(row.target_space, Some(SpaceId::new("model-b", DIM)));
+        assert_eq!(
+            b.indexed_by_space(),
+            vec![(SpaceId::new("model-b", DIM), 0)]
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(space::EMBEDDER_MARKER)).unwrap(),
+            "http://stub#model-a",
+            "a failed migration does not advance the marker"
+        );
+    }
+
+    #[test]
+    fn a_vector_with_no_space_at_the_index_width_is_indexed_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let engine = engine(&store, tmp.path(), a.clone(), None);
+        let supplied = memory(
+            "a caller supplied this vector",
+            Some(a.encode("y").unwrap()),
+        );
+        store.store(&supplied).unwrap();
+        engine.index_memory(&supplied).unwrap();
+        assert!(engine.is_indexed(&supplied.id));
+    }
+
+    #[test]
+    fn a_secondary_in_another_space_is_queued_and_the_primary_still_indexes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let s = Stub::new("model-s", 6);
+        let engine = engine(&store, tmp.path(), a.clone(), Some(s));
+        let model_s = SpaceId::new("model-s", 6);
+        assert_eq!(engine.secondary_index_space(), Some(&model_s));
+
+        let mut m = memory("two vectors, one foreign", None);
+        m.experience
+            .set_primary_vector(a.encode("z").unwrap(), SpaceId::new("model-a", DIM));
+        m.experience
+            .set_secondary_vector(vec![0.4; 6], SpaceId::new("model-t", 6));
+        store.store(&m).unwrap();
+        engine.index_memory(&m).unwrap();
+
+        assert!(engine.is_indexed(&m.id));
+        assert!(!engine.is_secondary_indexed(&m.id));
+        let row = EmbeddingBacklogStore::with_kv(store.key_value_store())
+            .get_key(&BacklogKey::in_space(&m.id, &model_s))
+            .unwrap()
+            .expect("a space row for the secondary");
+        assert_eq!(row.stored_space, Some(SpaceId::new("model-t", 6)));
     }
 }

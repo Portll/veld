@@ -34,6 +34,7 @@ pub mod minilm;
 pub mod model_tape;
 pub mod ner;
 pub mod nomic;
+pub mod space;
 #[cfg(feature = "zenoh")]
 pub mod zenoh_embedder;
 
@@ -63,6 +64,7 @@ pub use circuit_breaker::{
 
 // Re-export competitive embedder
 pub use competitive::CompetitiveEmbedder;
+pub use space::SpaceId;
 
 // Re-export alignment scaffolding (Phase 1) + Procrustes (Phase 3)
 pub use alignment::{
