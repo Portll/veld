@@ -173,8 +173,21 @@ impl HttpLlmConsolidator {
             }],
             temperature: 0.0,
         };
+        let body = serde_json::to_string(&request)?;
+        // A model tape answers by the exact body, so a replay needs no endpoint at all.
+        if let Some(taped) = crate::embeddings::model_tape::llm(&body, || self.post(&body)) {
+            return taped;
+        }
+        self.post(&body)
+    }
 
-        let mut req = self.client()?.post(&self.endpoint).json(&request);
+    /// Send a serialised chat request and return the first choice's content.
+    fn post(&self, body: &str) -> Result<String> {
+        let mut req = self
+            .client()?
+            .post(&self.endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }

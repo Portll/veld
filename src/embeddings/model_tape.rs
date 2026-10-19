@@ -16,6 +16,11 @@
 //! code rather than a model and is never taped. The HTTP and Nomic embedders are not
 //! taped either, so a tape measures the MiniLM pipeline only.
 //!
+//! The LLM behind write-time fact extraction ([`crate::memory::llm::HttpLlmConsolidator`])
+//! is taped too, so a run recorded against a local model replays on a machine that has
+//! none. Its key is the exact chat-completions request body and its value the reply
+//! text, and the header names the model in place of a file hash.
+//!
 //! **A replay miss must never be absorbed.** This codebase degrades on purpose when a
 //! model fails: the embedder falls back to simplified embeddings, NER to the rule-based
 //! extractor, and `recall()` skips the reranker. Each of those would turn a miss into a
@@ -28,7 +33,10 @@
 //! cross-encoder's key is the (query, candidate) pair. Values are kept per input, not
 //! per batch: the first value recorded for a key is the one kept, and a later value
 //! that differs is counted as a conflict. Batches pad to their longest member, so the
-//! conflict count measures whether batch composition changes outputs.
+//! conflict count measures whether batch composition changes outputs. The LLM is the
+//! exception: a request already on the tape is answered from it while recording too,
+//! because a sampled reply can differ between calls, and a second, different reply
+//! would change every input downstream of it.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -48,7 +56,12 @@ pub const RECORD_ENV: &str = "VELD_MODEL_TAPE_RECORD";
 pub const REPLAY_ENV: &str = "VELD_MODEL_TAPE_REPLAY";
 
 /// Bumped when the file layout changes, so an old tape is refused rather than misread.
+/// LLM lines are an addition this version reads and an older reader refuses by name, so
+/// they did not need a new one.
 const FORMAT_VERSION: u32 = 1;
+
+/// The header's name for the LLM, whose entry is the model name rather than a hash.
+const LLM: &str = "llm";
 
 /// The three models a tape covers, named as they appear in a tape's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -138,6 +151,10 @@ enum Line {
         doc: String,
         bits: u32,
     },
+    Llm {
+        request: String,
+        response: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +162,7 @@ struct Tables {
     embed: HashMap<String, Vec<f32>>,
     ner: HashMap<String, Vec<TapedEntity>>,
     ce: HashMap<(String, String), f32>,
+    llm: HashMap<String, String>,
     /// Record order, so a written tape is stable for identical runs.
     order: Vec<Key>,
 }
@@ -154,6 +172,7 @@ enum Key {
     Embed(String),
     Ner(String),
     Ce(String, String),
+    Llm(String),
 }
 
 struct Tape {
@@ -510,6 +529,84 @@ pub fn cross_encode(
     }))
 }
 
+/// Send one LLM request through the tape. `request` is the exact body the model would
+/// receive; `live` sends it and returns the reply text. `None` when no tape is in use.
+///
+/// Replay returns the recorded reply or an error. Recording returns the recorded reply
+/// when the request is already on the tape (see the module docs), and otherwise sends
+/// it and keeps the reply.
+pub fn llm(request: &str, live: impl FnOnce() -> Result<String>) -> Option<Result<String>> {
+    let tape = state()?;
+    {
+        let mut t = tape.lock();
+        if let Some(kept) = t.tables.llm.get(request) {
+            return Some(Ok(kept.clone()));
+        }
+        if t.mode == Mode::Replay {
+            return Some(Err(miss(
+                &mut t,
+                format!("LLM request {:?}", clip(request)),
+            )));
+        }
+    }
+    let what = || format!("LLM request {:?}", clip(request));
+    Some(record_failure(tape, live(), what).inspect(|response| {
+        let mut t = tape.lock();
+        if !t.tables.llm.contains_key(request) {
+            t.tables.llm.insert(request.to_string(), response.clone());
+            t.tables.order.push(Key::Llm(request.to_string()));
+        }
+    }))
+}
+
+/// Declare the LLM model in use. Recording names it in the header; replaying compares
+/// it with the header, since each request names its model and another one would miss.
+/// A no-op with no tape.
+pub fn register_llm(model: &str) {
+    let Some(tape) = state() else { return };
+    let mut t = tape.lock();
+    match t.mode {
+        Mode::Record => match t.models.get(LLM) {
+            Some(existing) if existing != model => {
+                let msg = format!(
+                    "{LLM}: two different models were used in one recording ({existing} and {model})"
+                );
+                t.problems.push(msg);
+            }
+            _ => {
+                t.models.insert(LLM.to_string(), model.to_string());
+            }
+        },
+        Mode::Replay => match t.models.get(LLM) {
+            Some(expected) if expected == model => {
+                t.verified.insert(LLM);
+            }
+            Some(expected) => {
+                let msg = format!(
+                    "{LLM}: the tape was recorded with model {expected}, but this process \
+                     asks {model}; unset VELD_LLM_MODEL or re-record the tape"
+                );
+                t.problems.push(msg);
+            }
+            None => {
+                let msg = format!("{LLM}: the tape has no outputs for this model");
+                t.problems.push(msg);
+            }
+        },
+    }
+}
+
+/// On replay, the LLM model the tape was recorded with. `None` when the tape holds no
+/// LLM outputs, when recording, and with no tape.
+pub fn recorded_llm_model() -> Option<String> {
+    let tape = state()?;
+    let t = tape.lock();
+    match t.mode {
+        Mode::Replay => t.models.get(LLM).cloned(),
+        Mode::Record => None,
+    }
+}
+
 /// Whether the tape already holds a cross-encoder score for this pair.
 pub fn has_cross_encoding(query: &str, doc: &str) -> bool {
     state().is_some_and(|t| {
@@ -638,6 +735,10 @@ pub fn write_recording(provenance: serde_json::Value) -> Result<(PathBuf, usize)
                 doc: d.clone(),
                 bits: t.tables.ce[&(q.clone(), d.clone())].to_bits(),
             },
+            Key::Llm(request) => Line::Llm {
+                request: request.clone(),
+                response: t.tables.llm[request].clone(),
+            },
         };
         writeln!(w, "{}", serde_json::to_string(&line)?)?;
     }
@@ -685,6 +786,9 @@ fn read_tape(path: &Path) -> Result<(HashMap<String, String>, Tables)> {
             }
             Line::Ce { query, doc, bits } => {
                 tables.ce.insert((query, doc), f32::from_bits(bits));
+            }
+            Line::Llm { request, response } => {
+                tables.llm.insert(request, response);
             }
         }
     }
@@ -760,6 +864,28 @@ mod tests {
             "Nate invited Joanna.".to_string(),
         );
         assert_eq!(t.ce[&key].to_bits(), (-1.630_57f32).to_bits());
+    }
+
+    #[test]
+    fn an_llm_exchange_reads_back_exactly() {
+        let request = r#"{"model":"qwen2.5-7b-instruct","messages":[{"role":"user","content":"[1] T1 (TARGET), said Sunday 23 January 2022, 19:31 UTC: Nate: I've had them for 3 years."}],"temperature":0.0}"#;
+        let response = "[{\"fact\": \"Nate has had turtles for about three years.\"}]\n";
+        let mut models = HashMap::from([("embedder".to_string(), "abc".to_string())]);
+        models.insert(LLM.to_string(), "qwen2.5-7b-instruct".to_string());
+        let f = write_lines(&[
+            Line::Header {
+                version: FORMAT_VERSION,
+                models,
+                provenance: serde_json::json!({}),
+            },
+            Line::Llm {
+                request: request.to_string(),
+                response: response.to_string(),
+            },
+        ]);
+        let (models, t) = read_tape(f.path()).unwrap();
+        assert_eq!(models[LLM], "qwen2.5-7b-instruct");
+        assert_eq!(t.llm[request], response);
     }
 
     /// Hashing a path the first time takes the cache's lock twice, once to look and

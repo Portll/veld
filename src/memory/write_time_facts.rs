@@ -582,15 +582,38 @@ enum StoreOutcome {
     Unchanged,
 }
 
-/// Build the extractor's model from the environment, or `None` to leave it off:
-/// `VELD_LLM_ENDPOINT` (with `VELD_LLM_MODEL`, `VELD_LLM_API_KEY`), the variables
-/// [`HttpLlmConsolidator::from_env`] reads.
+/// Build the extractor's model from the environment, or `None` to leave it off.
+///
+/// Live: `VELD_LLM_ENDPOINT` (with `VELD_LLM_MODEL`, `VELD_LLM_API_KEY`), the variables
+/// [`HttpLlmConsolidator::from_env`] reads. Replaying a model tape that holds LLM
+/// outputs: the model the tape names, answered from the tape and never contacted, so a
+/// run recorded against a local model replays where there is none. An endpoint set
+/// while replaying a tape without LLM outputs is reported as a tape problem rather than
+/// called.
 pub fn consolidator_from_env() -> Result<Option<Arc<dyn LlmConsolidator>>> {
-    let Some(llm) = HttpLlmConsolidator::from_env()? else {
+    use crate::embeddings::model_tape;
+    let endpoint_set = std::env::var("VELD_LLM_ENDPOINT").is_ok_and(|v| !v.trim().is_empty());
+    let recorded = model_tape::recorded_llm_model();
+    if !endpoint_set && recorded.is_none() {
         return Ok(None);
+    }
+    let llm = if model_tape::replaying() {
+        let model = std::env::var("VELD_LLM_MODEL")
+            .ok()
+            .filter(|m| !m.trim().is_empty())
+            .or(recorded)
+            .unwrap_or_else(|| HttpLlmConsolidator::DEFAULT_MODEL.to_string());
+        HttpLlmConsolidator::new(String::new(), String::new(), model)?
+    } else {
+        match HttpLlmConsolidator::from_env()? {
+            Some(llm) => llm,
+            None => return Ok(None),
+        }
     };
+    model_tape::register_llm(llm.model());
     tracing::info!(
         model = %llm.llm_version(),
+        replaying = model_tape::replaying(),
         "write-time facts: LLM configured; the write_time_facts dial turns extraction on"
     );
     Ok(Some(Arc::new(llm)))
