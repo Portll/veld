@@ -1071,6 +1071,11 @@ fn handle_doctor() -> Result<()> {
         config.requested_storage_backend, config.effective_storage_backend
     );
 
+    // 1b. Per-tenant storage sizes
+    if storage.is_dir() {
+        all_ok &= report_tenant_storage(&storage);
+    }
+
     // 2. Config
     let config_dir = config_directory();
     let config_path = config_dir.join("config.toml");
@@ -1135,6 +1140,103 @@ fn handle_doctor() -> Result<()> {
     eprintln!();
 
     Ok(())
+}
+
+/// Tenant entries `veld doctor` sizes, in report order.
+const TENANT_DOCTOR_ENTRIES: [&str; 6] = [
+    "projection_checkpoints.bin.sidedata",
+    "intent.log",
+    "slow_store.db-wal",
+    "graph",
+    "storage",
+    "slow_store.db",
+];
+
+/// Remedy line when `entry` at `bytes` is past its warning threshold.
+fn tenant_size_warning(entry: &str, bytes: u64) -> Option<&'static str> {
+    const MIB: u64 = 1024 * 1024;
+    match entry {
+        "projection_checkpoints.bin.sidedata" if bytes > 256 * MIB => {
+            Some("restart the server so the new side-data compaction runs")
+        }
+        "slow_store.db-wal" if bytes > 128 * MIB => {
+            Some("a passive checkpoint runs after the next slow-store mirror rebuild")
+        }
+        "intent.log" if bytes > 1024 * MIB => {
+            Some("intent-log rotation is not implemented yet")
+        }
+        _ => None,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Size of a file, or of a directory tree. Symlinks are not followed and
+/// unreadable entries count as zero: this is a diagnostic, not an audit.
+fn path_size_bytes(path: &std::path::Path) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.is_file() {
+        return Some(meta.len());
+    }
+    if !meta.is_dir() {
+        return Some(0);
+    }
+    let mut total = 0;
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        total += path_size_bytes(&entry.path()).unwrap_or(0);
+    }
+    Some(total)
+}
+
+/// Print per-tenant store sizes. Returns false when any threshold is exceeded.
+fn report_tenant_storage(storage: &std::path::Path) -> bool {
+    let Ok(read_dir) = std::fs::read_dir(storage) else {
+        return true;
+    };
+    let mut tenants: Vec<std::path::PathBuf> = read_dir
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    tenants.sort();
+
+    let mut ok = true;
+    for tenant in tenants {
+        let sizes: Vec<(&str, u64)> = TENANT_DOCTOR_ENTRIES
+            .iter()
+            .filter_map(|name| path_size_bytes(&tenant.join(name)).map(|b| (*name, b)))
+            .collect();
+        if sizes.is_empty() {
+            continue;
+        }
+        let label = tenant
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        eprintln!("  … Tenant {label}");
+        for (name, bytes) in sizes {
+            match tenant_size_warning(name, bytes) {
+                Some(remedy) => {
+                    eprintln!("    ⚠ {name}: {} — {remedy}", format_bytes(bytes));
+                    ok = false;
+                }
+                None => eprintln!("    ✓ {name}: {}", format_bytes(bytes)),
+            }
+        }
+    }
+    ok
 }
 
 fn handle_version() {
@@ -2308,6 +2410,32 @@ async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_size_warning_thresholds() {
+        const MIB: u64 = 1024 * 1024;
+        let side = "projection_checkpoints.bin.sidedata";
+        assert!(tenant_size_warning(side, 256 * MIB).is_none());
+        assert!(tenant_size_warning(side, 256 * MIB + 1).is_some());
+        assert!(tenant_size_warning("slow_store.db-wal", 128 * MIB).is_none());
+        assert!(tenant_size_warning("slow_store.db-wal", 128 * MIB + 1).is_some());
+        assert!(tenant_size_warning("intent.log", 1024 * MIB).is_none());
+        assert!(tenant_size_warning("intent.log", 1024 * MIB + 1).is_some());
+        // Directories and the main db have no threshold, however large.
+        assert!(tenant_size_warning("graph", u64::MAX).is_none());
+        assert!(tenant_size_warning("storage", u64::MAX).is_none());
+    }
+
+    #[test]
+    fn path_size_bytes_sums_trees_and_skips_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), [0u8; 10]).unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        std::fs::write(dir.path().join("d").join("b"), [0u8; 5]).unwrap();
+        assert_eq!(path_size_bytes(dir.path()), Some(15));
+        assert_eq!(path_size_bytes(&dir.path().join("missing")), None);
+        assert_eq!(format_bytes(1536 * 1024), "1.5 MiB");
+    }
 
     /// Regression: the server's `/api/remember` response shape is `{id, success}`
     /// (see `handlers::remember::RememberResponse`). An earlier CLI mirror
