@@ -33,11 +33,13 @@ exporters for ops teams who want distributed tracing.
 
 ## What's the storage backend?
 
-Today: **RocksDB**. Tomorrow (v0.9): **Redb**. The trait abstraction
-(`PrimaryMemoryStore`, `GraphStore`, `KeyValueStore`) is already in place;
-the runtime cutover happens once Redb passes its acceptance benchmarks.
+Both **RocksDB** and **Redb** are built by default. RocksDB is the default
+engine; select redb with `VELD_STORAGE_BACKEND=redb`. redb becomes the default
+only when the gates in [decision 0007](decisions/0007-rocksdb-default-engine.md)
+hold. `veld migrate` moves data between the two. The engines sit behind the
+trait abstraction (`PrimaryMemoryStore`, `GraphStore`, `KeyValueStore`).
 
-See [decision 0001](decisions/0001-redb-migration.md) and
+See [decision 0001](decisions/0001-redb-migration.md), [decision 0007](decisions/0007-rocksdb-default-engine.md) and
 [Storage](architecture/storage.md) for details.
 
 ## Why two MCP servers (Rust + TypeScript)?

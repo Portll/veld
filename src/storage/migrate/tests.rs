@@ -1,11 +1,15 @@
 use super::*;
 use crate::graph_memory::{EntityLabel, EntityNode, GraphMemory, PiiClassification};
 use crate::keystore::{Keystore, RecordCryptors};
-use crate::memory::storage::{SearchCriteria, VectorMappingEntry};
+#[cfg(feature = "storage-redb")]
+use crate::memory::storage::SearchCriteria;
+use crate::memory::storage::VectorMappingEntry;
 use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId, MemoryTier};
 use crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore;
+#[cfg(feature = "storage-redb")]
 use crate::storage::redb::RedbPrimaryMemoryStore;
 use crate::storage::PrimaryMemoryStore;
+#[cfg(feature = "storage-redb")]
 use sha2::{Digest, Sha256};
 
 fn memory(content: &str, tag: &str) -> Memory {
@@ -96,6 +100,7 @@ fn rocks_user(base: &Path, id: &str, tags: &[&str]) -> (Vec<Memory>, uuid::Uuid)
     (memories, uuid)
 }
 
+#[cfg(feature = "storage-redb")]
 fn rocks_rows(dir: &Path) -> u64 {
     let store = readonly::open_rocks(dir).unwrap().expect("store present");
     let mut n = 0;
@@ -110,6 +115,7 @@ fn rocks_rows(dir: &Path) -> u64 {
 }
 
 /// Every file under `root` with a content hash, so "unchanged" is measured, not assumed.
+#[cfg(feature = "storage-redb")]
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
     fn walk(dir: &Path, root: &Path, out: &mut BTreeMap<PathBuf, String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -133,10 +139,12 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
     out
 }
 
+#[cfg(feature = "storage-redb")]
 fn plant_undecodable_memory(base: &Path, id: &str) -> uuid::Uuid {
     plant_undecodable_rocks_memory(&base.join(id))
 }
 
+#[cfg(feature = "storage-redb")]
 fn logical_dump(path: &Path, frames: &[(&str, &[u8], &[u8])]) {
     let mut buf = Vec::new();
     let mut w = PortableWriter::new(&mut buf).unwrap();
@@ -156,6 +164,7 @@ fn user(id: &str) -> Scope {
     Scope::User(id.to_string())
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn rocks_to_redb_is_read_back_by_the_redb_stores_themselves() {
     let tmp = tempfile::tempdir().unwrap();
@@ -209,6 +218,7 @@ fn rocks_to_redb_is_read_back_by_the_redb_stores_themselves() {
     );
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn redb_to_rocks_rebuilds_the_index_rocksdb_search_depends_on() {
     let tmp = tempfile::tempdir().unwrap();
@@ -243,6 +253,7 @@ fn redb_to_rocks_rebuilds_the_index_rocksdb_search_depends_on() {
     );
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn shared_stores_cross_backends_with_audit_in_its_own_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -305,6 +316,7 @@ fn shared_stores_cross_backends_with_audit_in_its_own_file() {
     );
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn an_undecodable_record_fails_the_export_and_is_counted_not_skipped() {
     let tmp = tempfile::tempdir().unwrap();
@@ -384,6 +396,7 @@ fn a_sixteen_byte_row_under_a_subsystem_prefix_is_not_mistaken_for_a_memory() {
     assert_eq!(seen.decode_failures, 0, "{:?}", seen.failed_keys);
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn an_import_whose_rows_do_not_land_as_declared_fails_verification() {
     let tmp = tempfile::tempdir().unwrap();
@@ -408,6 +421,7 @@ fn an_import_whose_rows_do_not_land_as_declared_fails_verification() {
     assert!(msg.contains("re-derives 4 frames"), "{msg}");
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn verify_catches_a_target_changed_after_a_good_import() {
     let tmp = tempfile::tempdir().unwrap();
@@ -432,6 +446,7 @@ fn verify_catches_a_target_changed_after_a_good_import() {
     assert!(format!("{err:#}").contains("verification FAILED"));
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn dry_run_writes_nothing_on_either_side() {
     let tmp = tempfile::tempdir().unwrap();
@@ -465,6 +480,7 @@ fn dry_run_writes_nothing_on_either_side() {
     );
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn a_dry_run_never_creates_an_absent_target() {
     let tmp = tempfile::tempdir().unwrap();
@@ -484,6 +500,7 @@ fn a_dry_run_never_creates_an_absent_target() {
     assert!(!base.join("gina/storage.redb").exists());
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn migrate_leaves_the_source_byte_identical() {
     let tmp = tempfile::tempdir().unwrap();
@@ -514,6 +531,7 @@ fn migrate_leaves_the_source_byte_identical() {
     );
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn a_redb_source_is_read_without_touching_its_bytes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -538,6 +556,7 @@ fn a_redb_source_is_read_without_touching_its_bytes() {
     );
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn a_redb_store_held_by_a_writer_is_refused_not_read_mid_write() {
     let tmp = tempfile::tempdir().unwrap();
@@ -558,6 +577,7 @@ fn a_redb_store_held_by_a_writer_is_refused_not_read_mid_write() {
     drop(live);
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn a_populated_target_refuses_the_whole_migration_before_writing() {
     let tmp = tempfile::tempdir().unwrap();
@@ -587,6 +607,7 @@ fn a_populated_target_refuses_the_whole_migration_before_writing() {
     );
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn an_export_directory_missing_a_listed_dump_does_not_import() {
     let tmp = tempfile::tempdir().unwrap();
@@ -654,6 +675,7 @@ fn a_named_user_with_no_store_is_an_error_not_an_empty_dump() {
     assert!(format!("{err:#}").contains("no rocksdb store for user 'nobody'"));
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn quarantine_sets_undecodable_records_aside_byte_for_byte_and_accounts_for_them() {
     let tmp = tempfile::tempdir().unwrap();
@@ -721,6 +743,7 @@ fn quarantine_sets_undecodable_records_aside_byte_for_byte_and_accounts_for_them
     assert_eq!(sorted_ids(&redb.get_all().unwrap()), sorted_ids(&memories));
 }
 
+#[cfg(feature = "storage-redb")]
 #[test]
 fn migrate_with_quarantine_migrates_the_rest_and_reports_what_it_set_aside() {
     let tmp = tempfile::tempdir().unwrap();
@@ -973,4 +996,563 @@ fn a_source_sentinel_ahead_of_its_keystore_refuses_the_extraction() {
     )
     .expect_err("a keystore older than the store's sentinel");
     assert!(format!("{err:#}").contains("rollback"), "{err:#}");
+}
+
+#[cfg(all(feature = "rocksdb", feature = "storage-redb"))]
+mod round_trip {
+    use super::*;
+    use crate::graph_memory::{EdgeSource, EdgeTier, LtpStatus, RelationType, RelationshipEdge};
+    use crate::storage::boot_guard::{refuse_stranded_data, BackendCensus};
+    use crate::storage::redb::{open_graph_database, RedbColumnStore};
+
+    const TENANT: &str = "wanda";
+    const CORPUS_SIZE: usize = 320;
+    const ENTITY_COUNT: usize = 40;
+    const KV_ROWS: usize = 30;
+    const AUDIT_ENTRIES: usize = 150;
+    const TODO_ROWS: usize = 8;
+    const FACT_WATERMARK: i64 = 1_726_000_000_000;
+
+    type Row = (String, Vec<u8>, Vec<u8>);
+    type Canonical = BTreeMap<Unit, (u64, String, Vec<Row>)>;
+
+    fn opposite(backend: StorageBackend) -> StorageBackend {
+        match backend {
+            StorageBackend::RocksDb => StorageBackend::Redb,
+            StorageBackend::Redb => StorageBackend::RocksDb,
+        }
+    }
+
+    fn corpus_memories() -> Vec<Memory> {
+        (0..CORPUS_SIZE)
+            .map(|i| {
+                memory(
+                    &format!("corpus memory {i} on subject {}", i % 17),
+                    &format!("subject-{}", i % 17),
+                )
+            })
+            .collect()
+    }
+
+    fn kv_rows() -> Vec<(Vec<u8>, Vec<u8>)> {
+        (0..KV_ROWS)
+            .map(|i| {
+                (
+                    format!("dial-{i:02}").into_bytes(),
+                    format!("value-{i}").into_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    fn audit_rows() -> Vec<(Vec<u8>, Vec<u8>)> {
+        (0..AUDIT_ENTRIES)
+            .map(|i| {
+                (
+                    format!("{TENANT}:{i:020}").into_bytes(),
+                    format!("event-{i}").into_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    fn todo_rows() -> Vec<(Vec<u8>, Vec<u8>)> {
+        (0..TODO_ROWS)
+            .map(|i| {
+                (
+                    format!("todo-{i}").into_bytes(),
+                    format!("finish migration step {i}").into_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    fn edge_between(from: uuid::Uuid, to: uuid::Uuid, strength: f32) -> RelationshipEdge {
+        let now = chrono::Utc::now();
+        RelationshipEdge {
+            uuid: uuid::Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::RelatedTo,
+            strength,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: "round trip corpus".to_string(),
+            last_activated: now,
+            activation_count: 3,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L1Working,
+            created_by: EdgeSource::CoOccurrence,
+            entity_confidence: None,
+            forward_strength: strength,
+            backward_strength: strength,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
+        }
+    }
+
+    fn write_graph(graph: &GraphMemory) {
+        let ids: Vec<uuid::Uuid> = (0..ENTITY_COUNT)
+            .map(|i| graph.add_entity(entity(&format!("node{i}x"))).unwrap())
+            .collect();
+        for pair in ids.windows(2) {
+            graph
+                .add_relationship(edge_between(pair[0], pair[1], 0.6))
+                .unwrap();
+        }
+    }
+
+    fn fill_primary(store: &impl PrimaryMemoryStore, memories: &[Memory]) {
+        for (i, m) in memories.iter().enumerate() {
+            store.put_memory(m).unwrap();
+            store
+                .put_vector_mapping(&m.id, &mapping(i as u32 * 2))
+                .unwrap();
+        }
+        for (key, value) in kv_rows() {
+            store.key_value_store().put_bytes(&key, &value).unwrap();
+        }
+        store.set_fact_watermark(TENANT, FACT_WATERMARK);
+    }
+
+    fn rocks_origin(base: &Path) -> Vec<Memory> {
+        let dir = base.join(TENANT);
+        let memories = corpus_memories();
+        let store = RocksDbPrimaryMemoryStore::open(&dir, None).unwrap();
+        fill_primary(&store, &memories);
+        store.flush().unwrap();
+        drop(store);
+
+        let graph = GraphMemory::new(&dir.join("graph"), None).unwrap();
+        write_graph(&graph);
+        drop(graph);
+
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let shared =
+            rocksdb::DB::open_cf(&opts, base.join("shared"), ["default", "audit", "todos"])
+                .unwrap();
+        for (cf, rows) in [("audit", audit_rows()), ("todos", todo_rows())] {
+            let handle = shared.cf_handle(cf).unwrap();
+            for (key, value) in rows {
+                shared.put_cf(handle, key, value).unwrap();
+            }
+        }
+        shared.flush().unwrap();
+        memories
+    }
+
+    fn write_redb_table(path: &Path, table: &str, rows: &[(Vec<u8>, Vec<u8>)]) {
+        let db = redb::Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut handle = txn.open_table(RawTable::new(table)).unwrap();
+            for (key, value) in rows {
+                handle.insert(key.as_slice(), value.as_slice()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    fn redb_origin(base: &Path) -> Vec<Memory> {
+        let dir = base.join(TENANT);
+        let memories = corpus_memories();
+        let store = RedbPrimaryMemoryStore::open(&dir).unwrap();
+        fill_primary(&store, &memories);
+        drop(store);
+
+        let graph_db = open_graph_database(&dir.join("graph")).unwrap();
+        let graph =
+            GraphMemory::with_store(std::sync::Arc::new(RedbColumnStore::new(graph_db))).unwrap();
+        write_graph(&graph);
+        drop(graph);
+
+        write_redb_table(&base.join("audit.redb"), "audit", &audit_rows());
+        write_redb_table(&base.join("shared.redb"), "todos", &todo_rows());
+        memories
+    }
+
+    fn build_origin(base: &Path, backend: StorageBackend) -> Vec<Memory> {
+        match backend {
+            StorageBackend::RocksDb => rocks_origin(base),
+            StorageBackend::Redb => redb_origin(base),
+        }
+    }
+
+    /// Every unit's frame count, digest and frames in dump order, read through the same
+    /// extraction migrate verifies with.
+    fn canonical(base: &Path, backend: StorageBackend) -> Canonical {
+        resolve_units(base, backend, &Scope::All)
+            .unwrap()
+            .into_iter()
+            .map(|unit| {
+                let mut dump = Vec::new();
+                let extraction = extract(base, backend, &unit, &mut dump).unwrap();
+                assert_eq!(
+                    extraction.decode_failures, 0,
+                    "{unit}: {:?}",
+                    extraction.failed_keys
+                );
+                let rows = portable::read_all(dump.as_slice())
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| (r.cf, r.key, r.value))
+                    .collect();
+                (unit, (extraction.frames, extraction.digest, rows))
+            })
+            .collect()
+    }
+
+    fn rows_in(rows: &[Row], keyspace: &str) -> usize {
+        rows.iter().filter(|(cf, _, _)| cf == keyspace).count()
+    }
+
+    fn assert_corpus_is_fully_represented(state: &Canonical) {
+        let (_, _, user) = &state[&Unit::User(TENANT.to_string())];
+        assert_eq!(rows_in(user, "primary/memories"), CORPUS_SIZE);
+        assert_eq!(rows_in(user, "primary/vector_mappings"), CORPUS_SIZE);
+        assert!(rows_in(user, "primary/kv") >= KV_ROWS);
+        let graph_rows = user
+            .iter()
+            .filter(|(cf, _, _)| cf.starts_with("graph/"))
+            .count();
+        assert!(
+            graph_rows >= ENTITY_COUNT + ENTITY_COUNT - 1,
+            "the graph contributed {graph_rows} rows"
+        );
+        let (_, _, shared) = &state[&Unit::Shared];
+        assert_eq!(rows_in(shared, "audit/audit"), AUDIT_ENTRIES);
+        assert_eq!(rows_in(shared, "shared/todos"), TODO_ROWS);
+    }
+
+    fn engine_paths(base: &Path, backend: StorageBackend) -> Vec<PathBuf> {
+        let user = base.join(TENANT);
+        match backend {
+            StorageBackend::RocksDb => vec![
+                user.join("storage"),
+                user.join("graph/graph"),
+                base.join("shared"),
+            ],
+            StorageBackend::Redb => vec![
+                user.join("storage.redb"),
+                user.join("graph/graph.redb"),
+                user.join(KEYSTORE),
+                base.join("shared.redb"),
+                base.join("audit.redb"),
+            ],
+        }
+    }
+
+    fn engine_files(base: &Path, backend: StorageBackend) -> BTreeMap<PathBuf, String> {
+        let mut files = BTreeMap::new();
+        for path in engine_paths(base, backend) {
+            if path.is_dir() {
+                for (relative, digest) in snapshot(&path) {
+                    files.insert(path.join(relative), digest);
+                }
+            } else if path.is_file() {
+                let digest: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
+                files.insert(path, portable::hex(&digest));
+            }
+        }
+        files
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// A copy of `from` without the `source` engine, so the next hop starts from only
+    /// what the previous migration produced.
+    fn carry_over_target_only(from: &Path, to: &Path, source: StorageBackend) {
+        copy_tree(from, to);
+        for path in engine_paths(to, source) {
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else if path.is_file() {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+    }
+
+    fn users() -> Vec<String> {
+        vec![TENANT.to_string()]
+    }
+
+    fn assert_boot_refused(
+        outcome: anyhow::Result<BackendCensus>,
+        selected: StorageBackend,
+        holder: StorageBackend,
+    ) {
+        let message = format!("{:#}", outcome.expect_err("an empty engine must not boot"));
+        for expected in [
+            "refusing to serve".to_string(),
+            format!("the {selected} store is empty"),
+            TENANT.to_string(),
+            format!("VELD_STORAGE_BACKEND={holder}"),
+            format!("veld migrate --from {holder} --to {selected}"),
+        ] {
+            assert!(
+                message.contains(&expected),
+                "{expected:?} not in: {message}"
+            );
+        }
+    }
+
+    fn assert_both_engines_boot(base: &Path) {
+        for backend in [StorageBackend::Redb, StorageBackend::RocksDb] {
+            let census = refuse_stranded_data(base, backend, &users())
+                .unwrap_or_else(|e| panic!("{backend} refused to boot: {e:#}"));
+            assert_eq!((census.rocksdb, census.redb), (1, Some(1)));
+        }
+    }
+
+    fn assert_serves_corpus(base: &Path, backend: StorageBackend, expected: &[Memory]) {
+        fn check(store: &impl PrimaryMemoryStore, expected: &[Memory]) {
+            let served = store.get_all().unwrap();
+            assert_eq!(sorted_ids(&served), sorted_ids(expected));
+            let content: std::collections::HashMap<_, _> = served
+                .iter()
+                .map(|m| (m.id.0, m.experience.content.clone()))
+                .collect();
+            for m in expected {
+                assert_eq!(content[&m.id.0], m.experience.content);
+                assert!(
+                    store.get_vector_mapping(&m.id).unwrap().is_some(),
+                    "mapping of {} lost",
+                    m.id.0
+                );
+            }
+            assert_eq!(
+                store.key_value_store().get_bytes(b"dial-07").unwrap(),
+                Some(b"value-7".to_vec())
+            );
+            assert_eq!(store.get_fact_watermark(TENANT), Some(FACT_WATERMARK));
+        }
+        let dir = base.join(TENANT);
+        match backend {
+            StorageBackend::RocksDb => check(
+                &RocksDbPrimaryMemoryStore::open(&dir, None).unwrap(),
+                expected,
+            ),
+            StorageBackend::Redb => check(&RedbPrimaryMemoryStore::open(&dir).unwrap(), expected),
+        }
+    }
+
+    fn migrate_and_check_hop(
+        base: &Path,
+        from: StorageBackend,
+        to: StorageBackend,
+        origin: &Canonical,
+    ) {
+        let source_before = engine_files(base, from);
+        let report = migrate(base, from, to, &Scope::All, false, None)
+            .unwrap_or_else(|e| panic!("{from} -> {to}: {e:#}"));
+        assert_eq!(report.imported.len(), origin.len(), "{from} -> {to}");
+        for imported in &report.imported {
+            assert_eq!(
+                (imported.verified_frames, &imported.verified_digest),
+                (imported.frames, &imported.digest),
+                "{from} -> {to}: {} did not verify",
+                imported.unit
+            );
+            let (frames, digest, _) = &origin[&imported.unit];
+            assert_eq!(
+                (imported.frames, &imported.digest),
+                (*frames, digest),
+                "{from} -> {to}: {} drifted from the origin",
+                imported.unit
+            );
+        }
+        assert_eq!(
+            engine_files(base, from),
+            source_before,
+            "{from} -> {to} modified its source"
+        );
+    }
+
+    fn round_trip(origin_backend: StorageBackend) {
+        let other = opposite(origin_backend);
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let memories = build_origin(&first, origin_backend);
+
+        assert_boot_refused(
+            refuse_stranded_data(&first, other, &users()),
+            other,
+            origin_backend,
+        );
+        refuse_stranded_data(&first, origin_backend, &users()).expect("the holder boots");
+
+        let origin = canonical(&first, origin_backend);
+        assert_corpus_is_fully_represented(&origin);
+
+        migrate_and_check_hop(&first, origin_backend, other, &origin);
+        assert_eq!(
+            canonical(&first, other),
+            origin,
+            "{origin_backend} -> {other} changed the logical contents"
+        );
+        carry_over_target_only(&first, &second, origin_backend);
+        assert_both_engines_boot(&first);
+        assert_serves_corpus(&first, origin_backend, &memories);
+        assert_serves_corpus(&first, other, &memories);
+
+        assert_boot_refused(
+            refuse_stranded_data(&second, origin_backend, &users()),
+            origin_backend,
+            other,
+        );
+        refuse_stranded_data(&second, other, &users()).expect("the migrated engine boots");
+
+        migrate_and_check_hop(&second, other, origin_backend, &origin);
+        assert_eq!(
+            canonical(&second, origin_backend),
+            origin,
+            "{origin_backend} -> {other} -> {origin_backend} did not return the origin"
+        );
+        assert_both_engines_boot(&second);
+        assert_serves_corpus(&second, origin_backend, &memories);
+        assert_serves_corpus(&second, other, &memories);
+    }
+
+    #[test]
+    fn rocksdb_to_redb_to_rocksdb_returns_the_origin_with_every_hop_verified() {
+        round_trip(StorageBackend::RocksDb);
+    }
+
+    #[test]
+    fn redb_to_rocksdb_to_redb_returns_the_origin_with_every_hop_verified() {
+        round_trip(StorageBackend::Redb);
+    }
+
+    #[test]
+    fn a_dry_run_changes_no_byte_of_the_data_directory_in_either_direction() {
+        for from in [StorageBackend::RocksDb, StorageBackend::Redb] {
+            let to = opposite(from);
+            let tmp = tempfile::tempdir().unwrap();
+            build_origin(tmp.path(), from);
+            let before = snapshot(tmp.path());
+
+            let plan = migrate(tmp.path(), from, to, &Scope::All, true, None).unwrap();
+            assert!(!plan.blocked(), "{from} -> {to}: {:?}", plan.units);
+            assert!(plan.imported.is_empty());
+            assert_eq!(plan.units.len(), 2);
+            for unit in &plan.units {
+                assert!(unit.source.as_ref().unwrap().records > 0);
+                assert_eq!(unit.target.as_ref().unwrap().records, 0, "{from} -> {to}");
+            }
+
+            assert_eq!(
+                snapshot(tmp.path()),
+                before,
+                "{from} -> {to}: a dry run changed the data directory"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "rocksdb", feature = "storage-redb"))]
+mod sealed_redb_dump {
+    use super::*;
+
+    fn seal_redb_user(base: &Path, id: &str) -> (Keystore, Vec<Row>) {
+        use crate::keystore::KdfParams;
+        let dir = base.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+        let kek = ks.unseal_with_passphrase("pw").unwrap();
+        let before = RecordCryptors::from_keystore(&ks, &kek).unwrap();
+        ks.rotate_dek(&kek).unwrap();
+        let after = RecordCryptors::from_keystore(&ks, &kek).unwrap();
+        std::fs::write(dir.join(KEYSTORE), ks.to_json().unwrap()).unwrap();
+
+        let mut rows = Vec::new();
+        for (cryptors, n) in [(&before, 0), (&after, 1)] {
+            let m = memory(&format!("{SEALED_SECRET} {n}"), "sealed");
+            let plain = bincode::serde::encode_to_vec(&m, bincode::config::standard()).unwrap();
+            let sealed = cryptors
+                .active()
+                .encrypt_record(&plain, m.id.0.as_bytes())
+                .unwrap();
+            rows.push((m.id.0.as_bytes().to_vec(), sealed));
+        }
+        rows.sort();
+        let database = redb::Database::create(dir.join("storage.redb")).unwrap();
+        let txn = database.begin_write().unwrap();
+        {
+            let mut memories = txn.open_table(RawTable::new("memories")).unwrap();
+            for (key, value) in &rows {
+                memories.insert(key.as_slice(), value.as_slice()).unwrap();
+            }
+            let mut default = txn.open_table(RawTable::new("default")).unwrap();
+            default
+                .insert(GENERATION_SENTINEL, 1u64.to_le_bytes().as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        (ks, rows)
+    }
+
+    #[test]
+    fn a_migration_dump_of_a_redb_store_carries_sealed_records_as_stored_and_no_plaintext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let (ks, sealed) = seal_redb_user(base, "vera");
+        let cryptors = record_keys(&ks);
+
+        let dump = tmp.path().join("vera.veldport");
+        let (stats, _) = export_unit(
+            base,
+            StorageBackend::Redb,
+            &Unit::User("vera".to_string()),
+            &dump,
+            None,
+            Sealed::Opened(Some(Keys {
+                cryptors: &cryptors,
+                generation: Some(ks.generation),
+            })),
+        )
+        .expect("a migration export of an encrypted redb store");
+        assert_eq!(stats.sealed_records, 2);
+        assert_eq!(stats.decode_failures, 0);
+
+        let bytes = std::fs::read(&dump).unwrap();
+        assert!(
+            !contains(&bytes, SEALED_SECRET),
+            "a sealed record reached the dump opened"
+        );
+        let records = portable::read_all(bytes.as_slice()).unwrap();
+        for (key, value) in &sealed {
+            let carried = records
+                .iter()
+                .find(|r| r.cf == "primary/memories" && &r.key == key)
+                .expect("sealed record carried");
+            assert_eq!(
+                &carried.value, value,
+                "a sealed record was not carried as stored"
+            );
+        }
+        let sentinel: Vec<_> = records
+            .iter()
+            .filter(|r| r.key == GENERATION_SENTINEL)
+            .collect();
+        assert_eq!(sentinel.len(), 1);
+        assert_eq!(sentinel[0].cf, "primary/default");
+        assert_eq!(sentinel[0].value, 1u64.to_le_bytes());
+    }
 }

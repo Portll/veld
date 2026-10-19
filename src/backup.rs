@@ -712,7 +712,8 @@ impl VeldBackupEngine {
     }
 
     #[cfg(feature = "rocksdb")]
-    /// List all available backups for a user
+    /// Every available backup for a user, newest first — the order the redb engines list
+    /// in, and the one API clients show.
     pub fn list_backups(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
         let backup_dir = self.user_backup_dir(user_id)?;
 
@@ -724,14 +725,12 @@ impl VeldBackupEngine {
         let env = Env::new()?;
         let backup_engine = BackupEngine::open(&backup_opts, &env)?;
 
-        let backup_info = backup_engine.get_backup_info();
-        let mut metadata_list = Vec::new();
-
-        for info in backup_info {
-            if let Ok(metadata) = self.load_metadata(user_id, info.backup_id) {
-                metadata_list.push(metadata);
-            }
-        }
+        let mut metadata_list: Vec<BackupMetadata> = backup_engine
+            .get_backup_info()
+            .into_iter()
+            .filter_map(|info| self.load_metadata(user_id, info.backup_id).ok())
+            .collect();
+        metadata_list.sort_by_key(|metadata| std::cmp::Reverse(metadata.backup_id));
 
         Ok(metadata_list)
     }
@@ -1102,9 +1101,22 @@ impl VeldBackupEngine {
         let metadata = self.load_metadata(user_id, backup_id)?;
         let backup_dir = self.user_backup_dir(user_id)?;
 
-        let current_checksum = self.calculate_backup_checksum(&backup_dir, backup_id)?;
-
-        Ok(current_checksum == metadata.checksum)
+        if self.calculate_backup_checksum(&backup_dir, backup_id)? == metadata.checksum {
+            return Ok(true);
+        }
+        // A backup written before the checksum covered the engine's shared files recorded
+        // the narrower digest. The two digests hash different inputs, so a recorded value
+        // can match only the one it was computed as.
+        let private_files_only =
+            self.calculate_private_files_checksum(&backup_dir, backup_id)? == metadata.checksum;
+        if private_files_only {
+            tracing::warn!(
+                user_id,
+                backup_id,
+                "backup predates whole-backup checksums: its shared table files were not verified"
+            );
+        }
+        Ok(private_files_only)
     }
 
     // ========================================================================
@@ -1135,7 +1147,57 @@ impl VeldBackupEngine {
         Ok(metadata)
     }
 
+    /// The digest a backup's manifest records: every file the RocksDB BackupEngine wrote for
+    /// `backup_id` — its `meta/<id>` file and each file that lists, the table files under
+    /// `shared_checksum/` included — then the secondary-store checkpoints and the intent log.
+    ///
+    /// A file the backup needs and does not have hashes as absent rather than failing, so
+    /// a damaged backup verifies as invalid instead of as an error.
     fn calculate_backup_checksum(&self, backup_dir: &Path, backup_id: u32) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(ENGINE_FILES_CHECKSUM_DOMAIN);
+
+        let meta_path = backup_dir.join("meta").join(backup_id.to_string());
+        let engine_files = match fs::read_to_string(&meta_path) {
+            Ok(meta) => {
+                hasher.update(meta.as_bytes());
+                backup_engine_files(&meta)
+                    .with_context(|| format!("reading the file list in {}", meta_path.display()))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update(ABSENT_FILE_MARKER);
+                Vec::new()
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", meta_path.display()));
+            }
+        };
+        for relative in engine_files {
+            hasher.update(relative.as_bytes());
+            hasher.update([0u8]);
+            hash_file_contents(&backup_dir.join(&relative), &mut hasher)?;
+        }
+
+        self.hash_directory_sorted(
+            &backup_dir.join(format!("secondary_{backup_id}")),
+            &mut hasher,
+        )?;
+        self.hash_directory_sorted(
+            &backup_dir.join(format!("intent_log_{backup_id}")),
+            &mut hasher,
+        )?;
+
+        let result = hasher.finalize();
+        Ok(format!("{result:x}"))
+    }
+
+    /// The digest backups recorded before [`Self::calculate_backup_checksum`] covered the
+    /// engine's shared files: `private/<id>`, the secondary stores and the intent log.
+    fn calculate_private_files_checksum(
+        &self,
+        backup_dir: &Path,
+        backup_id: u32,
+    ) -> Result<String> {
         let mut hasher = Sha256::new();
 
         // Hash main backup directory (sorted by filename for deterministic ordering)
@@ -1432,6 +1494,85 @@ fn enumerate_present_cfs(db: &DB) -> Vec<String> {
         }
     }
     out
+}
+
+/// Leads the whole-backup digest's input. The private-files scope's input starts with a
+/// file name, and no file name holds a NUL, so the two scopes never hash the same bytes.
+const ENGINE_FILES_CHECKSUM_DOMAIN: &[u8] = b"veld-backup-engine-files-v1\0";
+
+/// Hashed in place of a file the backup needs and does not have.
+const ABSENT_FILE_MARKER: &[u8] = b"\0absent\0";
+
+/// The files a RocksDB BackupEngine `meta/<id>` file lists for its backup, as paths
+/// relative to the backup directory.
+///
+/// Layout (RocksDB `BackupMeta::StoreToFile`): an optional `schema_version` line, the
+/// timestamp, the sequence number, optional `<field> <value>` lines, the file count, then
+/// that many lines whose first space-separated field is a file's path. Lines after those
+/// (`ni::excluded` entries, the schema-2 footer) name nothing the backup holds.
+fn backup_engine_files(meta: &str) -> Result<Vec<String>> {
+    let mut lines = meta.lines();
+    let mut next_line = |what: &str| {
+        lines
+            .next()
+            .ok_or_else(|| anyhow!("backup meta file ends before its {what}"))
+    };
+    if next_line("timestamp")?.starts_with("schema_version ") {
+        next_line("timestamp")?;
+    }
+    next_line("sequence number")?;
+    let count: usize = loop {
+        let line = next_line("file count")?;
+        if line.starts_with(|c: char| c.is_ascii_digit()) {
+            break line
+                .trim()
+                .parse()
+                .with_context(|| format!("backup meta file count {line:?}"))?;
+        }
+    };
+
+    let mut files = Vec::with_capacity(count);
+    for _ in 0..count {
+        let line = next_line("file list")?;
+        let path = line
+            .split(' ')
+            .next()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| anyhow!("backup meta file entry {line:?} names no file"))?;
+        let stays_inside = Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !stays_inside {
+            return Err(anyhow!(
+                "backup meta file entry {path:?} is not a path inside the backup directory"
+            ));
+        }
+        files.push(path.to_string());
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Stream `path`'s bytes into `hasher`, or [`ABSENT_FILE_MARKER`] when it does not exist.
+fn hash_file_contents(path: &Path, hasher: &mut Sha256) -> Result<()> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update(ABSENT_FILE_MARKER);
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if n == 0 {
+            return Ok(());
+        }
+        hasher.update(&buf[..n]);
+    }
 }
 
 /// Stream-copy `src` to `dst` while computing its SHA-256 and byte count.
@@ -1756,6 +1897,147 @@ mod tests {
             .join(user_id)
             .join(format!("backup_{}.json", first.backup_id));
         assert!(!first_metadata_path.exists());
+    }
+
+    /// A database whose rows sit in a flushed table file, so a backup of it writes that
+    /// file under `shared_checksum/` rather than a WAL under `private/<id>/`.
+    fn flushed_db(path: &Path, rows: usize) -> DB {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, path).unwrap();
+        for i in 0..rows {
+            db.put(format!("key-{i:05}"), vec![i as u8; 64]).unwrap();
+        }
+        db.flush().unwrap();
+        db
+    }
+
+    fn shared_table_files(user_backup_dir: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = fs::read_dir(user_backup_dir.join("shared_checksum"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sst"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn list_backups_is_newest_first_and_every_backup_still_verifies() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = VeldBackupEngine::new(temp_dir.path().join("backups")).unwrap();
+        let db = flushed_db(&temp_dir.path().join("db"), 16);
+        let mut created = Vec::new();
+        for round in 0..3 {
+            db.put(format!("round-{round}"), b"v").unwrap();
+            db.flush().unwrap();
+            created.push(engine.create_backup(&db, "lister").unwrap().backup_id);
+        }
+
+        let listed: Vec<u32> = engine
+            .list_backups("lister")
+            .unwrap()
+            .iter()
+            .map(|metadata| metadata.backup_id)
+            .collect();
+        let mut newest_first = created.clone();
+        newest_first.reverse();
+        assert_eq!(listed, newest_first);
+        for id in created {
+            assert!(
+                engine.verify_backup("lister", id).unwrap(),
+                "backup {id} no longer verifies after later backups"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_backup_detects_a_corrupted_shared_table_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
+        let db = flushed_db(&temp_dir.path().join("db"), 200);
+        let metadata = engine.create_backup(&db, "corrupt").unwrap();
+        assert!(engine.verify_backup("corrupt", metadata.backup_id).unwrap());
+
+        let tables = shared_table_files(&backup_root.join("corrupt"));
+        let table = tables
+            .first()
+            .expect("the flushed rows were not backed up as a shared table file");
+        let mut bytes = fs::read(table).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x01;
+        fs::write(table, bytes).unwrap();
+
+        assert!(
+            !engine.verify_backup("corrupt", metadata.backup_id).unwrap(),
+            "a flipped byte in {} passed verification",
+            table.display()
+        );
+    }
+
+    #[test]
+    fn verify_backup_detects_a_missing_shared_table_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
+        let db = flushed_db(&temp_dir.path().join("db"), 50);
+        let metadata = engine.create_backup(&db, "missing").unwrap();
+
+        for table in shared_table_files(&backup_root.join("missing")) {
+            fs::remove_file(table).unwrap();
+        }
+
+        assert!(!engine.verify_backup("missing", metadata.backup_id).unwrap());
+    }
+
+    #[test]
+    fn a_backup_recorded_with_the_private_files_checksum_still_verifies() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
+        let db = flushed_db(&temp_dir.path().join("db"), 10);
+        let mut metadata = engine.create_backup(&db, "legacy").unwrap();
+        let user_dir = backup_root.join("legacy");
+
+        metadata.checksum = engine
+            .calculate_private_files_checksum(&user_dir, metadata.backup_id)
+            .unwrap();
+        assert_ne!(
+            metadata.checksum,
+            engine
+                .calculate_backup_checksum(&user_dir, metadata.backup_id)
+                .unwrap()
+        );
+        engine.save_metadata(&metadata).unwrap();
+
+        assert!(engine.verify_backup("legacy", metadata.backup_id).unwrap());
+    }
+
+    #[test]
+    fn the_engine_file_list_is_read_from_both_meta_schemas() {
+        let schema_one = "1700000000\n42\nmetadata 6869\n2\n\
+                          shared_checksum/000009_123_456.sst crc32 99\n\
+                          private/1/MANIFEST-000005 crc32 7\n";
+        assert_eq!(
+            backup_engine_files(schema_one).unwrap(),
+            vec![
+                "private/1/MANIFEST-000005".to_string(),
+                "shared_checksum/000009_123_456.sst".to_string(),
+            ]
+        );
+
+        let schema_two = "schema_version 2.1\n1700000000\n42\n1\n\
+                          shared_checksum/000011_1_2.sst crc32 5 temp hot\n\
+                          shared_checksum/000012_3_4.sst ni::excluded true\n\
+                          // FOOTER\n";
+        assert_eq!(
+            backup_engine_files(schema_two).unwrap(),
+            vec!["shared_checksum/000011_1_2.sst".to_string()]
+        );
+
+        assert!(backup_engine_files("1700000000\n42\n2\nprivate/1/CURRENT crc32 1\n").is_err());
+        assert!(backup_engine_files("1700000000\n42\n1\n../../etc/passwd crc32 1\n").is_err());
     }
 
     // ========================================================================

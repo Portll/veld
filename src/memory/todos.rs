@@ -240,15 +240,10 @@ impl TodoStore {
             None => format!("seq:{}:_standalone_", user_id),
         };
         let current = match self.store.get_cf(CF_TODO_INDEX, key.as_bytes())? {
-            Some(data) => {
-                if data.len() >= 4 {
-                    let bytes: [u8; 4] = [data[0], data[1], data[2], data[3]];
-                    u32::from_le_bytes(bytes)
-                } else {
-                    0
-                }
+            Some(data) if data.len() >= 4 => {
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]])
             }
-            None => 0,
+            _ => 0,
         };
         let next = current + 1;
         self.store
@@ -1164,7 +1159,7 @@ impl TodoStore {
         }
 
         // Sort by name
-        projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        projects.sort_by_key(|project| project.name.to_lowercase());
 
         Ok(projects)
     }
@@ -1193,7 +1188,7 @@ impl TodoStore {
         }
 
         // Sort by name
-        subprojects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        subprojects.sort_by_key(|project| project.name.to_lowercase());
 
         Ok(subprojects)
     }
@@ -1509,6 +1504,7 @@ mod tests {
         (store, temp_dir)
     }
 
+    #[cfg(feature = "storage-redb")]
     #[test]
     fn test_with_store_redb_round_trip() {
         // The point of with_store: the same store logic over the other backend,

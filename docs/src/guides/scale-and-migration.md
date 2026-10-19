@@ -23,11 +23,19 @@ How veld behaves as data grows, and the migration paths between tiers / backends
 
 `Working → Session → LongTerm → Archive`. Promotion is `age × importance × access_count` against the `TIER_PROMOTION_*` constants in [src/constants.rs](src/constants.rs). Archive-tier memories stay indexed in HNSW but are excluded from default `/api/recall`; surface them explicitly with `/api/recall?include_archived=true`.
 
-### Storage backend migration (RocksDB → Redb, v0.9 target)
+### Storage backend migration (RocksDB and redb, on demand)
 
-No `veld migrate` subcommand today. The trait abstraction (`PrimaryMemoryStore` / `GraphStore` / `KeyValueStore`) means new write code lands ready for the cutover. The runtime flip happens via `effective_storage_backend_for_current_build` in [src/config.rs](src/config.rs). Once the redb path passes acceptance benchmarks, that function returns `Redb` and the cold-start re-indexing happens on first boot. Backup via `POST /api/backup/create` before the flip; restore via `/api/backup/restore` if you need to roll back to the legacy backend.
+`veld migrate` copies one engine's stores into the other inside the same data directory and never modifies the source. Each unit is verified by frame count and SHA-256 digest. It needs a build with both engines (the default build). Try it first with a dry run, which writes nothing:
 
-See [decision 0001](docs/src/decisions/0001-redb-migration.md) for context.
+```bash
+veld migrate --from rocksdb --to redb --user all --dry-run
+```
+
+`veld export` and `veld import` use the same VELDPORT codec ([src/storage/portable.rs](src/storage/portable.rs)). Migrating an encrypted tenant needs `VELD_MASTER_PASSPHRASE` (or `VELD_KMS_WRAP_KEY`), including for the dry run. The boot guard ([src/storage/boot_guard.rs](src/storage/boot_guard.rs)) refuses to serve an empty store while the other engine holds data, so a forgotten migration fails loudly instead of serving nothing. Back up before migrating: `POST /api/backup/create` covers RocksDB; for redb use `veld export`.
+
+Engine speed is unmeasured in this document. The comparison benches are [benches/storage_engine_benchmarks.rs](benches/storage_engine_benchmarks.rs), being added on the redb-parity branch; do not quote a figure until they have run.
+
+See [decision 0001](docs/src/decisions/0001-redb-migration.md) (amended) and [decision 0007](docs/src/decisions/0007-rocksdb-default-engine.md) for context; src/storage/README.md is canonical.
 
 ### Record-schema migration
 

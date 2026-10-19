@@ -50,3 +50,37 @@ the gates below hold. [0006](0006-backend-parity-and-on-demand-migration.md) sta
   outside `src/storage/` still applies.
 - A capability added for RocksDB without a redb implementation shows up as a named refusal, so the
   distance to the gates is visible.
+
+## Backup and restore gate
+
+`tests/backup_restore_parity.rs` is the named test for the backup gate. It writes the same corpus
+to both engines, backs it up, verifies the backup, changes the live stores, then restores into a
+fresh directory. Each restored store must equal its own engine's snapshot from before the backup,
+and the two restored stores must equal each other. It covers the `BackupStore` trait (the primary
+store) and the tenant backup behind `/api/backup/*` (primary store, graph and audit log), each with
+a plaintext and an encryption-v2 corpus, plus list and purge retention. Point-in-time restore to a
+journal LSN (`max_lsn`) is outside this test.
+
+## Recall-gate equivalence
+
+`tests/recall_engine_parity.rs` is the named test for the recall gate. Each of its tests builds
+three tenants in one process from one corpus, user id, embedder (MiniLM in hash mode, which needs
+no model files or network) and frozen scoring clock: a RocksDB tenant, a second RocksDB tenant as a
+same-engine control, and a redb tenant. Every probe runs on all three and must give the same ranked
+corpus keys, the same scores, tiers and importances within 1e-6, and the same `SignalAttribution`
+and `ScoringFeatures` for each returned memory. A difference between the two RocksDB tenants is
+reported as nondeterminism; the cross-engine comparison is not loosened for it.
+
+- `locomo_gate_cases_rank_and_score_identically_on_both_engines`: the LoCoMo gate corpus and its
+  100 cases, ingested and queried as `recall-eval` does.
+- `structured_recall_is_identical_on_both_engines_through_maintenance_and_forgetting`: 490 gate
+  turns given episodes, tags, parents, types and a nine-month timeline, probed by 35 recalls
+  (factual, exploratory, time-scoped, ordinal-session, episode, tag, date-range, filtered and
+  filter-only), `recall_by_tags`, `recall_by_date` and `proactive_context`, after ingest, after a
+  heavy maintenance cycle, and after soft and hard forgetting.
+- `sealed_structured_recall_is_identical_on_both_engines`: the same scenario over a 164-memory
+  corpus sealed under encryption-v2.
+
+The normalisations each comparison applies are listed at the top of the test file: memory ids
+become corpus keys, results tied on score are compared in key order, storage-order reads are
+compared as sets, and wall-clock fields and fact ids are dropped.
