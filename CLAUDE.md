@@ -61,6 +61,7 @@ The TypeScript MCP server ([mcp-server/index.ts](mcp-server/index.ts), published
 | `veld init` | First-time setup — config, API key, ONNX runtime |
 | `veld status` | Check server health |
 | `veld doctor` | Diagnose common issues (storage, ONNX, port) |
+| `veld restart [--port N]` | Stop a server gracefully and bring it back as the monitor's Restart does: its launchd job or supervisor, else a relaunch from its launch recipe |
 | `veld hook session-start \| prompt \| commit` | Output Claude Code hook JSON |
 | `veld claude [args...]` | Launch Claude Code with the Veld proxy wired up |
 | `veld version` | Print version and build info | Representative tools:

@@ -7,6 +7,7 @@
 //!   veld init                - First-time setup wizard
 //!   veld status              - Check server health
 //!   veld doctor              - Diagnose common issues
+//!   veld restart [--port N]  - Restart a server the way the monitor does
 //!   veld hook session-start  - Output session start hook JSON
 //!   veld hook prompt <msg>   - Output prompt submit hook JSON
 //!   veld hook commit         - Sync the latest git commit into Veld memory
@@ -167,6 +168,19 @@ enum Commands {
     Stop {
         /// Port the target server is listening on (e.g. --port 3032)
         #[arg(long)]
+        port: u16,
+    },
+
+    /// Restart a veld server the way the monitor does: stop it gracefully, then let
+    /// its launchd job or supervisor bring it back, else relaunch it from its recipe
+    Restart {
+        /// Port the server listens on (defaults to the configured port)
+        #[arg(
+            long,
+            env = "VELD_PORT",
+            default_value_t = 3030,
+            value_parser = clap::value_parser!(u16).range(1..)
+        )]
         port: u16,
     },
 
@@ -546,6 +560,13 @@ async fn main() -> Result<()> {
         // =====================================================================
         Commands::Stop { port } => {
             handle_stop(port)?;
+        }
+
+        // =====================================================================
+        // NEW: veld restart — stop a server and bring it back as the monitor does
+        // =====================================================================
+        Commands::Restart { port } => {
+            handle_restart(port).await?;
         }
 
         // =====================================================================
@@ -1034,6 +1055,113 @@ fn pid_listening_on_port(port: u16) -> Option<u32> {
     text.lines()
         .next()
         .and_then(|l| l.trim().parse::<u32>().ok())
+}
+
+/// Restart the server on `port` through status-core's `restart_instance`, with the
+/// saved launch recipes, `server.env` layer and log path the monitor's Restart uses.
+async fn handle_restart(port: u16) -> Result<()> {
+    use anyhow::Context as _;
+
+    let instance = veld_status_core::discover_instances()
+        .into_iter()
+        .find(|i| i.port == port);
+    let recipes = veld_status_core::load_launch_recipes()?;
+    let base_url = restart_base_url(port, instance.as_ref(), &recipes);
+    let mut request = veld_status_core::restart_request(&base_url, instance, &recipes, Vec::new());
+    // The new process inherits this one's environment, which now holds config.toml's
+    // values: carried over, they would beat the file at every later start.
+    if let Some(at_start) = veld::config::veld_env_names_at_start() {
+        request.env_remove = bridged_from_config(
+            std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()),
+            at_start,
+        );
+    }
+
+    match (&request.instance, &request.recipe) {
+        (Some(inst), _) => eprintln!(
+            "Stopping veld on port {port} (pid {}) and waiting for it to come back…",
+            inst.pid
+        ),
+        (None, Some(_)) => eprintln!(
+            "No veld is registered on port {port}; starting it from the launch recipe saved for {base_url}…"
+        ),
+        (None, None) => {}
+    }
+
+    let outcome = veld_status_core::restart_instance(request)
+        .await
+        .with_context(|| format!("could not restart veld on port {port}"))?;
+    println!("{}", describe_restart(port, &outcome));
+    Ok(())
+}
+
+/// The base URL a restart of the server on `port` probes: the registry's when one
+/// is registered there, else the one a launch recipe for that port was saved under,
+/// else loopback.
+fn restart_base_url(
+    port: u16,
+    instance: Option<&veld_status_core::DiscoveredInstance>,
+    recipes: &std::collections::BTreeMap<String, veld_status_core::LaunchSpec>,
+) -> String {
+    if let Some(inst) = instance {
+        return inst.base_url.trim_end_matches('/').to_string();
+    }
+    let loopback = format!("http://127.0.0.1:{port}");
+    if recipes.contains_key(&loopback) {
+        return loopback;
+    }
+    let suffix = format!(":{port}");
+    recipes
+        .keys()
+        .find(|k| k.ends_with(&suffix))
+        .cloned()
+        .unwrap_or(loopback)
+}
+
+/// The `VELD_*` names in `current` that the `config.toml` bridge set, i.e. that
+/// the process was not started with.
+fn bridged_from_config(
+    current: impl IntoIterator<Item = String>,
+    at_start: &[String],
+) -> Vec<String> {
+    current
+        .into_iter()
+        .filter(|k| k.starts_with("VELD_") && !at_start.contains(k))
+        .collect()
+}
+
+/// One paragraph on how a restart went: what brought the server back, where its
+/// output goes, and which of the old process's variables the new one lacks.
+fn describe_restart(port: u16, outcome: &veld_status_core::RestartOutcome) -> String {
+    let mut text = match (outcome.supervisor.as_deref(), outcome.pid) {
+        (Some(job), _) => format!(
+            "veld on port {port} is back: launchd started its job {job} again after the graceful stop, with the environment and log its plist sets."
+        ),
+        (None, None) => format!(
+            "veld on port {port} is back: its supervisor (Veld Desktop or another process manager) started it again after the graceful stop, with its own environment and log."
+        ),
+        (None, Some(pid)) => {
+            let recipe = if outcome.recipe_source == "recipe" {
+                "the launch recipe saved in the monitor"
+            } else {
+                "the launch recipe in the instance registry"
+            };
+            let log = outcome
+                .log_path
+                .as_deref()
+                .map(|p| format!("; its output is appended to {p}"))
+                .unwrap_or_default();
+            format!("veld on port {port} is back as pid {pid}, relaunched from {recipe}{log}.")
+        }
+    };
+    if !outcome.missing_env.is_empty() {
+        text.push_str(&format!(
+            " Not carried, so the new process runs without them: {}. Add them to {} to keep them across restarts.",
+            outcome.missing_env.join(", "),
+            veld_status_core::server_env_path().display()
+        ));
+    }
+    text
 }
 
 fn handle_doctor() -> Result<()> {
@@ -2377,6 +2505,171 @@ mod tests {
         let body = r#"{"id":"mem-xyz","success":true,"message":"ok","latency_ms":42}"#;
         let resp: RememberResponse = serde_json::from_str(body).expect("must deserialize");
         assert_eq!(resp.id, "mem-xyz");
+    }
+
+    fn registered(base_url: &str, port: u16) -> veld_status_core::DiscoveredInstance {
+        veld_status_core::DiscoveredInstance {
+            base_url: base_url.into(),
+            label: String::new(),
+            pid: 4242,
+            host: "127.0.0.1".into(),
+            port,
+            version: String::new(),
+            data_path: String::new(),
+            last_heartbeat: chrono::Utc::now(),
+            launch: None,
+        }
+    }
+
+    #[test]
+    fn restart_takes_a_port_and_defaults_to_the_configured_one() {
+        let cli = Cli::try_parse_from(["veld", "restart", "--port", "3031"]).unwrap();
+        assert!(matches!(cli.command, Commands::Restart { port: 3031 }));
+
+        let configured = std::env::var("VELD_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(3030);
+        let cli = Cli::try_parse_from(["veld", "restart"]).unwrap();
+        assert!(matches!(cli.command, Commands::Restart { port } if port == configured));
+
+        assert!(Cli::try_parse_from(["veld", "restart", "--port", "0"]).is_err());
+        assert!(Cli::try_parse_from(["veld", "restart", "--port", "65536"]).is_err());
+        assert!(Cli::try_parse_from(["veld", "restart", "3031"]).is_err());
+    }
+
+    #[test]
+    fn restart_base_url_prefers_the_registry_then_a_recipe_for_the_port() {
+        let mut recipes = std::collections::BTreeMap::new();
+        assert_eq!(
+            restart_base_url(3031, None, &recipes),
+            "http://127.0.0.1:3031"
+        );
+
+        recipes.insert(
+            "http://localhost:13031".to_string(),
+            veld_status_core::LaunchSpec::default(),
+        );
+        assert_eq!(
+            restart_base_url(3031, None, &recipes),
+            "http://127.0.0.1:3031"
+        );
+
+        recipes.insert(
+            "http://localhost:3031".to_string(),
+            veld_status_core::LaunchSpec::default(),
+        );
+        assert_eq!(
+            restart_base_url(3031, None, &recipes),
+            "http://localhost:3031"
+        );
+
+        recipes.insert(
+            "http://127.0.0.1:3031".to_string(),
+            veld_status_core::LaunchSpec::default(),
+        );
+        assert_eq!(
+            restart_base_url(3031, None, &recipes),
+            "http://127.0.0.1:3031"
+        );
+
+        let inst = registered("http://10.0.0.5:3031/", 3031);
+        assert_eq!(
+            restart_base_url(3031, Some(&inst), &recipes),
+            "http://10.0.0.5:3031"
+        );
+    }
+
+    #[test]
+    fn restart_request_matches_the_monitors() {
+        let saved = veld_status_core::LaunchSpec {
+            exe: "/usr/local/bin/veld".into(),
+            args: vec!["server".into()],
+            ..Default::default()
+        };
+        let mut recipes = std::collections::BTreeMap::new();
+        recipes.insert("http://127.0.0.1:3031".to_string(), saved.clone());
+        let inst = registered("http://127.0.0.1:3031", 3031);
+
+        let base_url = restart_base_url(3031, Some(&inst), &recipes);
+        let req = veld_status_core::restart_request(&base_url, Some(inst), &recipes, Vec::new());
+
+        assert_eq!(req.base_url, "http://127.0.0.1:3031");
+        assert_eq!(req.instance.as_ref().map(|i| i.pid), Some(4242));
+        assert_eq!(req.recipe, Some(saved));
+        assert_eq!(req.log_path, veld_status_core::server_log_path(3031));
+        let server_env = veld_status_core::server_env_path();
+        let expected_files = if server_env.is_file() {
+            vec![server_env]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(req.env_files, expected_files);
+        assert!(req.env_overrides.is_empty());
+    }
+
+    #[test]
+    fn only_variables_config_toml_set_are_withheld_from_the_new_server() {
+        let at_start = vec!["VELD_EMBEDDER".to_string(), "VELD_PORT".to_string()];
+        let current = [
+            "VELD_EMBEDDER",
+            "VELD_API_KEY",
+            "VELD_PORT",
+            "VELD_STORAGE_BACKEND",
+            "PATH",
+        ]
+        .map(String::from);
+        assert_eq!(
+            bridged_from_config(current, &at_start),
+            vec![
+                "VELD_API_KEY".to_string(),
+                "VELD_STORAGE_BACKEND".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn restart_outcome_names_who_brought_the_server_back() {
+        let outcome = |pid: Option<u32>, supervisor: Option<&str>, source: &str| {
+            veld_status_core::RestartOutcome {
+                base_url: "http://127.0.0.1:3030".into(),
+                pid,
+                supervised: pid.is_none(),
+                log_path: pid.map(|_| "/cfg/veld/logs/veld-3030.log".to_string()),
+                missing_env: Vec::new(),
+                carried_env: Vec::new(),
+                recipe_source: source.into(),
+                supervisor: supervisor.map(str::to_string),
+            }
+        };
+
+        let launchd = describe_restart(
+            3030,
+            &outcome(None, Some("gui/501/net.portll.veld"), "launchd"),
+        );
+        assert!(
+            launchd.contains("launchd started its job gui/501/net.portll.veld"),
+            "{launchd}"
+        );
+
+        let supervised = describe_restart(3030, &outcome(None, None, "supervisor"));
+        assert!(supervised.contains("its supervisor"), "{supervised}");
+        assert!(!supervised.contains("Not carried"), "{supervised}");
+
+        let mut relaunched = outcome(Some(777), None, "registry");
+        relaunched.missing_env = vec!["VELD_EMBEDDER".into(), "VELD_EMBEDDING_API_URL".into()];
+        let text = describe_restart(3030, &relaunched);
+        assert!(text.contains("back as pid 777"), "{text}");
+        assert!(text.contains("instance registry"), "{text}");
+        assert!(text.contains("/cfg/veld/logs/veld-3030.log"), "{text}");
+        assert!(
+            text.contains("VELD_EMBEDDER, VELD_EMBEDDING_API_URL"),
+            "{text}"
+        );
+        assert!(!text.contains('\n'), "one paragraph");
+
+        let saved = describe_restart(3031, &outcome(Some(778), None, "recipe"));
+        assert!(saved.contains("saved in the monitor"), "{saved}");
     }
 }
 

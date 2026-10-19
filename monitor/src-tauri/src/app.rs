@@ -17,8 +17,9 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use std::collections::BTreeMap;
 
 use veld_status_core::{
-    discover_instances, inspect_process, parse_env_file, restart_instance, rewrite_env_var,
-    LaunchSpec, RestartRequest, StatusClient, StatusClientConfig, StatusSnapshot,
+    discover_instances, inspect_process, launch_recipes_path, load_launch_recipes, parse_env_file,
+    restart_instance, restart_request, rewrite_env_var, server_env_path, LaunchSpec, StatusClient,
+    StatusClientConfig, StatusSnapshot,
 };
 
 use crate::tray;
@@ -661,18 +662,8 @@ struct ConfigBackend {
     server_env_backend: Option<String>,
 }
 
-/// `~/.config/veld/server.env`: the `KEY=VALUE` file Veld Desktop hands to the
-/// server it spawns, on every platform under `~/.config` (its own convention).
-fn desktop_server_env_path() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".config").join("veld").join("server.env")
-}
-
 fn server_env_vars() -> Vec<(String, String)> {
-    std::fs::read_to_string(desktop_server_env_path())
+    std::fs::read_to_string(server_env_path())
         .map(|t| parse_env_file(&t))
         .unwrap_or_default()
 }
@@ -713,7 +704,7 @@ fn config_backend() -> ConfigBackend {
     ConfigBackend {
         path: path.display().to_string(),
         backend,
-        server_env_path: desktop_server_env_path().display().to_string(),
+        server_env_path: server_env_path().display().to_string(),
         server_env_backend: server_env_backend(),
     }
 }
@@ -760,7 +751,7 @@ fn set_config_backend(backend: String) -> Result<ConfigBackend, String> {
     }
     write_private_file(&path, &text)?;
 
-    let env_path = desktop_server_env_path();
+    let env_path = server_env_path();
     let mut server_env_backend = server_env_backend();
     if server_env_backend.is_some() {
         let current = std::fs::read_to_string(&env_path)
@@ -797,37 +788,12 @@ fn open_in_browser(url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Where a relaunched server's output goes: `<config>/veld/logs/veld-<port>.log`.
-fn server_log_path(port: u16) -> std::path::PathBuf {
-    veld_status_core::instances_dir()
-        .parent()
-        .map(|p| p.join("logs"))
-        .unwrap_or_else(|| std::path::PathBuf::from("logs"))
-        .join(format!("veld-{port}.log"))
-}
-
-/// Launch recipes the user saved, keyed by normalized base URL:
-/// `<config>/veld/monitor/launch-recipes.json`, owner-readable only since a
-/// recipe's variables can hold keys.
-fn recipes_path() -> std::path::PathBuf {
-    veld_status_core::instances_dir()
-        .parent()
-        .map(|p| p.join("monitor"))
-        .unwrap_or_else(|| std::path::PathBuf::from("monitor"))
-        .join("launch-recipes.json")
-}
-
 fn load_recipes() -> Result<BTreeMap<String, LaunchSpec>, String> {
-    let path = recipes_path();
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(format!("read {}: {e}", path.display())),
-    }
+    load_launch_recipes().map_err(|e| e.to_string())
 }
 
 fn save_recipes(recipes: &BTreeMap<String, LaunchSpec>) -> Result<(), String> {
-    let path = recipes_path();
+    let path = launch_recipes_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
@@ -840,14 +806,6 @@ fn find_instance(base_url: &str) -> Option<veld_status_core::DiscoveredInstance>
     discover_instances()
         .into_iter()
         .find(|i| norm(&i.base_url) == key)
-}
-
-fn port_of(base_url: &str) -> u16 {
-    base_url
-        .trim_end_matches('/')
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .unwrap_or(3030)
 }
 
 /// What a restart of `base_url` would use, for the Launch card.
@@ -877,8 +835,8 @@ fn launch_recipe(base_url: String) -> Result<LaunchInfo, String> {
         pid: instance.as_ref().map(|i| i.pid).filter(|p| *p != 0),
         registry,
         saved,
-        recipes_path: recipes_path().display().to_string(),
-        server_env_path: desktop_server_env_path().display().to_string(),
+        recipes_path: launch_recipes_path().display().to_string(),
+        server_env_path: server_env_path().display().to_string(),
         server_env_names: server_env_vars().into_iter().map(|(k, _)| k).collect(),
     })
 }
@@ -916,34 +874,23 @@ async fn capture_launch_recipe(base_url: String) -> Result<LaunchSpec, String> {
         .ok_or_else(|| format!("could not read process {pid}: it may be gone, or this platform does not expose it"))
 }
 
-/// Stop the instance at `base_url`, if it runs, and bring it back. The recipe is
-/// the one saved for it, else the registry's. The operator's `server.env` is the
-/// base environment layer. `storage_backend`, when given, is set as
-/// `VELD_STORAGE_BACKEND` on the new process (a swap just performed).
+/// Stop the instance at `base_url`, if it runs, and bring it back the way
+/// `veld restart` does (`restart_request`). `storage_backend`, when given, is set
+/// as `VELD_STORAGE_BACKEND` on the new process (a swap just performed).
 async fn restart_at(
     base_url: &str,
     storage_backend: Option<String>,
 ) -> Result<veld_status_core::RestartOutcome, String> {
     let key = norm(base_url);
     let instance = find_instance(&key);
-    let recipe = load_recipes()?.remove(&key);
+    let recipes = load_recipes()?;
     let mut env_overrides = Vec::new();
     if let Some(backend) = storage_backend.filter(|b| !b.trim().is_empty()) {
         env_overrides.push(("VELD_STORAGE_BACKEND".to_string(), backend));
     }
-    let env_path = desktop_server_env_path();
-    let env_files = if env_path.is_file() { vec![env_path] } else { Vec::new() };
-    let port = instance.as_ref().map(|i| i.port).unwrap_or_else(|| port_of(&key));
-    restart_instance(RestartRequest {
-        base_url: key,
-        instance,
-        recipe,
-        env_files,
-        env_overrides,
-        log_path: server_log_path(port),
-    })
-    .await
-    .map_err(|e| e.to_string())
+    restart_instance(restart_request(&key, instance, &recipes, env_overrides))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

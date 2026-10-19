@@ -24,8 +24,9 @@ ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
 WORKDIR /app
 
-# Copy manifests first for Docker layer caching
+# Copy manifests first for Docker layer caching, with the path dependency they name
 COPY Cargo.toml Cargo.lock ./
+COPY status-core ./status-core
 
 # Download ONNX Runtime for embedding model inference (cacheable independent of source)
 ARG ORT_VERSION=1.23.2
