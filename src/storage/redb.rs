@@ -1782,12 +1782,12 @@ mod redb_domain_tests {
         let memory = memory_with("written by an older binary", &["Veld"], &[]);
         let id = memory.id.clone();
         let current = encode(&memory).unwrap();
-        assert_eq!(&current[current.len() - 2..], &[0, 0]);
+        assert_eq!(&current[current.len() - 3..], &[0, 0, 0]);
         table_put(
             &store.database,
             MEMORIES_TABLE,
             id.0.as_bytes(),
-            &current[..current.len() - 2],
+            &current[..current.len() - 3],
         )
         .unwrap();
 

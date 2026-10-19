@@ -49,6 +49,7 @@ pub mod session_detect;
 pub mod sessions;
 pub mod sleep_time;
 pub mod slow_store;
+pub mod space_index;
 pub mod storage;
 pub mod tag_sources;
 pub mod temporal_facts;
@@ -2374,7 +2375,9 @@ impl MemorySystem {
                     return Ok(());
                 }
             }
-            // A displaced vector in the secondary index's space is kept where that index reads.
+            // The displaced vector stays stored: in the secondary slot when that is its space
+            // and the slot is free, else among the memory's kept vectors, until its space is
+            // retired.
             if let Some((vector, space)) = displaced {
                 if memory.experience.embeddings_secondary.is_none()
                     && self.retriever.secondary_index_space() == Some(&space)
@@ -2385,8 +2388,9 @@ impl MemorySystem {
                         memory_id = %memory_id.0,
                         from = %space,
                         to = %index_space,
-                        "replaced a stored vector in another space"
+                        "kept a stored vector in another space beside the new one"
                     );
+                    memory.experience.keep_vector(space, vector);
                 }
             }
 
@@ -5640,7 +5644,10 @@ impl MemorySystem {
         if let Err(e) = self.long_term_memory.update(&memory) {
             return EmbedOutcome::Failed(format!("persisting the secondary vector: {e}"));
         }
-        match self.retriever.reindex_secondary(&memory) {
+        let Some(space) = memory.experience.embedding_space_secondary.clone() else {
+            return EmbedOutcome::Failed("the secondary vector names no space".to_string());
+        };
+        match self.retriever.reindex_space(&memory, &space) {
             Ok(()) => EmbedOutcome::Indexed,
             Err(e) => EmbedOutcome::Failed(e.to_string()),
         }

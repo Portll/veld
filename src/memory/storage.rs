@@ -434,6 +434,7 @@ impl LegacyExperienceV1 {
             embeddings_secondary: None,
             embedding_space: None,
             embedding_space_secondary: None,
+            other_vectors: Vec::new(),
         }
     }
 }
@@ -4764,15 +4765,15 @@ mod tests {
         assert!(storage.db.get(memory.id.0.as_bytes()).unwrap().is_some());
     }
 
-    /// Strips the encoding of the two embedding-space fields, both `None`: the wire every record
-    /// had before they were appended to `MemoryFlat`.
+    /// Strips the encoding of the fields appended for embedding spaces — two `None` spaces and
+    /// an empty `other_vectors` — the wire every record had before they were appended.
     pub(crate) fn strip_space_fields(current: &[u8]) -> Vec<u8> {
         assert_eq!(
-            &current[current.len() - 2..],
-            &[0, 0],
+            &current[current.len() - 3..],
+            &[0, 0, 0],
             "fixture must carry no spaces"
         );
-        current[..current.len() - 2].to_vec()
+        current[..current.len() - 3].to_vec()
     }
 
     #[test]
