@@ -114,6 +114,10 @@ pub struct SqliteProjection {
     /// amortizes the checkpoint fsync over [`LIVE_CHECKPOINT_PERSIST_INTERVAL`]
     /// applies; the replay arm is unaffected (it batches via the driver).
     applies_since_persist: usize,
+    /// Lowest LSN whose deferred live apply failed. The persisted checkpoint
+    /// is kept strictly below it so replay on the next open retries it, even
+    /// though later records keep applying and advance the in-memory cursor.
+    checkpoint_hold: Option<Lsn>,
 }
 
 impl SqliteProjection {
@@ -128,6 +132,7 @@ impl SqliteProjection {
             checkpoint,
             relational: None,
             applies_since_persist: 0,
+            checkpoint_hold: None,
         }
     }
 
@@ -152,6 +157,7 @@ impl SqliteProjection {
             checkpoint,
             relational: Some(relational),
             applies_since_persist: 0,
+            checkpoint_hold: None,
         }
     }
 
@@ -228,8 +234,18 @@ impl SqliteProjection {
         Ok(())
     }
 
+    /// Checkpoint that may be made durable: the in-memory cursor, clamped
+    /// below any held (failed) LSN.
+    fn durable_checkpoint(&self) -> Option<Lsn> {
+        match (self.checkpoint, self.checkpoint_hold) {
+            (cursor, None) => cursor,
+            (_, Some(Lsn(0))) => None,
+            (cursor, Some(held)) => cursor.map(|c| c.min(Lsn(held.0 - 1))),
+        }
+    }
+
     fn persist(&mut self) -> Result<(), SqliteProjectionError> {
-        if let Some(lsn) = self.checkpoint {
+        if let Some(lsn) = self.durable_checkpoint() {
             let mut store = self.checkpoint_store.lock();
             store.set(PROJECTION_NAME, lsn)?;
             store.sync()?;
@@ -250,9 +266,9 @@ impl SqliteProjection {
 }
 
 /// Dyn-friendly arm: the [`JournaledWriter`] hands us typed payloads at
-/// live-write time. We immediately persist the checkpoint so a crash
-/// after one successful apply doesn't silently roll back to the start of
-/// the log.
+/// live-write time, from its deferred worker (this projection is registered
+/// with `add_deferred_projection`). The checkpoint is persisted on an
+/// amortized cadence; see [`LIVE_CHECKPOINT_PERSIST_INTERVAL`].
 impl TypedProjection for SqliteProjection {
     fn name(&self) -> &str {
         PROJECTION_NAME
@@ -281,6 +297,14 @@ impl TypedProjection for SqliteProjection {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn hold_checkpoint_below(&mut self, lsn: Lsn) {
+        self.checkpoint_hold = Some(self.checkpoint_hold.map_or(lsn, |held| held.min(lsn)));
+    }
+
+    fn flush_checkpoint(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        SqliteProjection::flush_checkpoint(self).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
     }
 }
 
@@ -647,5 +671,29 @@ mod tests {
         TypedProjection::apply(&mut proj, Lsn(100), &mk_remember("u", "m100", b"x")).unwrap();
         proj.flush_checkpoint().unwrap();
         assert_eq!(ckpt.lock().get(PROJECTION_NAME), Some(Lsn(100)));
+    }
+
+    #[test]
+    fn held_checkpoint_stays_below_a_failed_lsn() {
+        let (sqlite_path, _, checkpoint_path) = tmp_paths("hold");
+        let (store, ckpt, mut proj) = open_projection(&sqlite_path, &checkpoint_path);
+
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember("u", "m0", b"x")).unwrap();
+        TypedProjection::apply(&mut proj, Lsn(1), &mk_remember("u", "m1", b"x")).unwrap();
+        // The apply at lsn 2 failed on the deferred worker; later ones succeed.
+        TypedProjection::hold_checkpoint_below(&mut proj, Lsn(2));
+        TypedProjection::apply(&mut proj, Lsn(3), &mk_remember("u", "m3", b"x")).unwrap();
+        TypedProjection::flush_checkpoint(&mut proj).unwrap();
+
+        assert_eq!(store.count_memories("u").unwrap(), 3);
+        assert_eq!(ckpt.lock().get(PROJECTION_NAME), Some(Lsn(1)));
+
+        // A failure at lsn 0 leaves nothing durable to resume from.
+        let (_, _, ckpt0_path) = tmp_paths("hold0");
+        let (_store0, ckpt0, mut proj0) = open_projection(&sqlite_path, &ckpt0_path);
+        TypedProjection::hold_checkpoint_below(&mut proj0, Lsn(0));
+        TypedProjection::apply(&mut proj0, Lsn(1), &mk_remember("u", "m1", b"x")).unwrap();
+        TypedProjection::flush_checkpoint(&mut proj0).unwrap();
+        assert_eq!(ckpt0.lock().get(PROJECTION_NAME), None);
     }
 }

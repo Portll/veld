@@ -23,14 +23,21 @@
 //!     *before* the failing record, so on restart the driver re-applies it
 //!     (and idempotency makes that safe).
 
+use std::collections::HashSet;
 use std::error::Error;
+
+use parking_lot::Mutex;
 
 use crate::metrics::{
     Timer, CHECKPOINT_PERSIST_TOTAL, PROJECTION_APPLY_DURATION, PROJECTION_APPLY_TOTAL,
     PROJECTION_CHECKPOINT_LSN, PROJECTION_LAG_RECORDS, PROJECTION_REPLAY_RECORDS_TOTAL,
 };
 
-use super::{IntentLog, IntentLogError, IntentRecord, Lsn};
+use super::checkpoint_store::{
+    CheckpointStore, INTENT_LOG_SIDE_DATA, LIVE_MEMORY_IDS_KEY, MAX_SIDE_DATA_BYTES,
+};
+use super::payload::{IntentPayload, PayloadError};
+use super::{FramePosition, IntentLog, IntentLogError, IntentRecord, Lsn, FRAME_POSITION_BYTES};
 
 /// Trait implemented by every store that derives its state from the intent
 /// log. See module docs for the idempotency and crash-recovery contract.
@@ -75,6 +82,38 @@ pub enum ReplayError {
     },
 }
 
+/// Object-safe view of a [`Projection`], so one replay pass can drive
+/// projections of different concrete types. Implemented for every
+/// `Projection`; the method names differ from `Projection`'s so both traits
+/// can be in scope without ambiguity.
+pub trait ReplayTarget {
+    fn target_name(&self) -> &str;
+    fn target_checkpoint(&self) -> Option<Lsn>;
+    fn apply_record(&mut self, record: &IntentRecord) -> Result<(), BoxError>;
+    fn persist_target_checkpoint(&mut self) -> Result<(), BoxError>;
+}
+
+type BoxError = Box<dyn Error + Send + Sync>;
+
+impl<P: Projection> ReplayTarget for P {
+    fn target_name(&self) -> &str {
+        self.name()
+    }
+
+    fn target_checkpoint(&self) -> Option<Lsn> {
+        self.checkpoint()
+    }
+
+    fn apply_record(&mut self, record: &IntentRecord) -> Result<(), BoxError> {
+        self.apply(record).map_err(|e| Box::new(e) as BoxError)
+    }
+
+    fn persist_target_checkpoint(&mut self) -> Result<(), BoxError> {
+        self.persist_checkpoint()
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+}
+
 /// Replay every record in `log` whose LSN is greater than the projection's
 /// current checkpoint. Returns the number of records applied.
 ///
@@ -91,115 +130,434 @@ pub fn replay<P: Projection>(
     projection: &mut P,
     persist_every: Option<u64>,
 ) -> Result<u64, ReplayError> {
-    let projection_name = projection.name().to_string();
-    let resume_at = projection.checkpoint().map(Lsn::next).unwrap_or(Lsn::ZERO);
-    let head_lsn = log.next_lsn();
+    let mut targets: [&mut dyn ReplayTarget; 1] = [projection];
+    replay_all(log, &mut targets, persist_every)?
+        .pop()
+        .unwrap_or(Ok(0))
+}
 
-    // INFO-level span around the whole replay driver loop, with structured
-    // fields the dashboards can lift.
+/// Replay several projections in one pass over the log. Each frame is read
+/// and CRC-checked once, and opened (decrypted) only when at least one
+/// projection still needs it; it is then applied to every projection whose
+/// checkpoint is below its LSN, in slice order. Reading starts at the indexed
+/// frame nearest the lowest checkpoint, not at the first frame.
+///
+/// Checkpoints stay independent: a projection whose `apply` or checkpoint
+/// persist fails stops receiving records at that LSN (its checkpoint stays at
+/// its last successful apply, so a restart retries the record) while the
+/// others replay to the head. The same `persist_every` cadence and final
+/// persist as [`replay`] apply to each projection.
+///
+/// Returns one result per projection, index-aligned with `targets`: the
+/// number of records applied, or the failure that stopped it. An unreadable
+/// frame (corruption, I/O) fails the whole pass with [`ReplayError::Log`],
+/// after the projections that were still healthy have persisted the progress
+/// they made up to it.
+pub fn replay_all(
+    log: &IntentLog,
+    targets: &mut [&mut dyn ReplayTarget],
+    persist_every: Option<u64>,
+) -> Result<Vec<Result<u64, ReplayError>>, ReplayError> {
+    let head_lsn = log.next_lsn();
+    let mut lanes: Vec<Lane> = targets
+        .iter()
+        .map(|t| Lane::new(t.target_name(), t.target_checkpoint()))
+        .collect();
+    let start = lanes.iter().map(|l| l.resume_at).min();
+
     let span = tracing::info_span!(
         "projection.replay",
-        projection = %projection_name,
-        resume_at = resume_at.0,
+        projections = lanes.len(),
+        start_lsn = start.map(|l| l.0),
         head_lsn = head_lsn.0,
-        applied = tracing::field::Empty,
+        frames_read = tracing::field::Empty,
+        payloads_opened = tracing::field::Empty,
     );
     let _guard = span.enter();
 
-    let mut applied = 0u64;
-    let mut last_persisted_at = 0u64;
+    let mut stats = ScanStats::default();
+    let scan = match start {
+        Some(start) if start < head_lsn => dispatch_frames(
+            log,
+            start,
+            &mut lanes,
+            targets,
+            head_lsn,
+            persist_every,
+            &mut stats,
+        ),
+        _ => Ok(()),
+    };
 
-    for frame in log.iter()? {
-        let record = frame?;
-        if record.lsn < resume_at {
+    for (lane, target) in lanes.iter_mut().zip(targets.iter_mut()) {
+        if lane.failure.is_none() {
+            lane.persist(&mut **target, head_lsn, "at end of replay");
+        }
+    }
+    span.record("frames_read", stats.frames_read);
+    span.record("payloads_opened", stats.payloads_opened);
+    scan?;
+
+    Ok(lanes
+        .into_iter()
+        .map(|lane| match lane.failure {
+            Some(e) => Err(e),
+            None => Ok(lane.applied),
+        })
+        .collect())
+}
+
+#[derive(Default)]
+struct ScanStats {
+    frames_read: u64,
+    payloads_opened: u64,
+}
+
+fn dispatch_frames(
+    log: &IntentLog,
+    start: Lsn,
+    lanes: &mut [Lane],
+    targets: &mut [&mut dyn ReplayTarget],
+    head_lsn: Lsn,
+    persist_every: Option<u64>,
+    stats: &mut ScanStats,
+) -> Result<(), ReplayError> {
+    let mut frames = log.iter_from(start)?;
+    while let Some(frame) = frames.read_frame()? {
+        stats.frames_read += 1;
+        if !lanes.iter().any(|l| l.needs(frame.lsn)) {
+            if lanes.iter().all(|l| l.failure.is_some()) {
+                break;
+            }
             continue;
         }
-        let timer =
-            Timer::new(PROJECTION_APPLY_DURATION.with_label_values(&[projection_name.as_str()]));
-        let apply_result = projection.apply(&record);
-        drop(timer);
-        match apply_result {
-            Ok(()) => {
-                PROJECTION_APPLY_TOTAL
-                    .with_label_values(&[projection_name.as_str(), "ok"])
-                    .inc();
-                PROJECTION_REPLAY_RECORDS_TOTAL
-                    .with_label_values(&[projection_name.as_str()])
-                    .inc();
-            }
-            Err(e) => {
-                PROJECTION_APPLY_TOTAL
-                    .with_label_values(&[projection_name.as_str(), "error"])
-                    .inc();
-                tracing::error!(
-                    projection = %projection_name,
-                    lsn = record.lsn.0,
-                    error = %e,
-                    "projection apply failed during replay",
-                );
-                return Err(ReplayError::ProjectionFailed {
-                    projection: projection_name,
-                    lsn: record.lsn,
-                    source: Box::new(e),
-                });
+        stats.payloads_opened += 1;
+        let record = IntentRecord {
+            lsn: frame.lsn,
+            payload: frames.take_payload()?,
+        };
+        for (lane, target) in lanes.iter_mut().zip(targets.iter_mut()) {
+            if lane.needs(record.lsn) {
+                lane.apply(&mut **target, &record, head_lsn, persist_every);
             }
         }
-        applied += 1;
+        frames.recycle(record.payload);
+    }
+    Ok(())
+}
+
+/// One projection's progress through a [`replay_all`] pass.
+struct Lane {
+    name: String,
+    resume_at: Lsn,
+    applied: u64,
+    last_persisted_at: u64,
+    failure: Option<ReplayError>,
+}
+
+impl Lane {
+    fn new(name: &str, checkpoint: Option<Lsn>) -> Self {
+        Self {
+            name: name.to_string(),
+            resume_at: checkpoint.map(Lsn::next).unwrap_or(Lsn::ZERO),
+            applied: 0,
+            last_persisted_at: 0,
+            failure: None,
+        }
+    }
+
+    fn needs(&self, lsn: Lsn) -> bool {
+        self.failure.is_none() && lsn >= self.resume_at
+    }
+
+    fn apply(
+        &mut self,
+        target: &mut dyn ReplayTarget,
+        record: &IntentRecord,
+        head_lsn: Lsn,
+        persist_every: Option<u64>,
+    ) {
+        let name = self.name.as_str();
+        let timer = Timer::new(PROJECTION_APPLY_DURATION.with_label_values(&[name]));
+        let apply_result = target.apply_record(record);
+        drop(timer);
+        if let Err(e) = apply_result {
+            PROJECTION_APPLY_TOTAL
+                .with_label_values(&[name, "error"])
+                .inc();
+            tracing::error!(
+                projection = %name,
+                lsn = record.lsn.0,
+                error = %e,
+                "projection apply failed during replay",
+            );
+            self.failure = Some(ReplayError::ProjectionFailed {
+                projection: self.name.clone(),
+                lsn: record.lsn,
+                source: e,
+            });
+            return;
+        }
+        PROJECTION_APPLY_TOTAL
+            .with_label_values(&[name, "ok"])
+            .inc();
+        PROJECTION_REPLAY_RECORDS_TOTAL
+            .with_label_values(&[name])
+            .inc();
+        self.applied += 1;
 
         if let Some(n) = persist_every {
-            if applied - last_persisted_at >= n {
-                if let Err(e) = projection.persist_checkpoint() {
-                    CHECKPOINT_PERSIST_TOTAL
-                        .with_label_values(&[projection_name.as_str(), "error"])
-                        .inc();
-                    tracing::error!(
-                        projection = %projection_name,
-                        lsn = record.lsn.0,
-                        error = %e,
-                        "checkpoint persist failed during replay",
-                    );
-                    return Err(ReplayError::ProjectionFailed {
-                        projection: projection_name,
-                        lsn: record.lsn,
-                        source: Box::new(e),
-                    });
-                }
-                CHECKPOINT_PERSIST_TOTAL
-                    .with_label_values(&[projection_name.as_str(), "ok"])
-                    .inc();
-                publish_checkpoint_gauges(
-                    projection_name.as_str(),
-                    projection.checkpoint(),
-                    head_lsn,
-                );
-                last_persisted_at = applied;
+            if self.applied - self.last_persisted_at >= n
+                && self.persist(target, head_lsn, "during replay")
+            {
+                self.last_persisted_at = self.applied;
             }
         }
     }
 
-    if let Err(e) = projection.persist_checkpoint() {
-        CHECKPOINT_PERSIST_TOTAL
-            .with_label_values(&[projection_name.as_str(), "error"])
-            .inc();
-        tracing::error!(
-            projection = %projection_name,
-            lsn = projection.checkpoint().map(|l| l.0).unwrap_or(0),
-            error = %e,
-            "checkpoint persist failed at end of replay",
-        );
-        return Err(ReplayError::ProjectionFailed {
-            projection: projection_name,
-            lsn: projection.checkpoint().unwrap_or(Lsn::ZERO),
-            source: Box::new(e),
-        });
+    /// Persist the projection's checkpoint. A failure is recorded against
+    /// this lane and stops it; returns whether the persist succeeded.
+    fn persist(&mut self, target: &mut dyn ReplayTarget, head_lsn: Lsn, when: &str) -> bool {
+        let name = self.name.as_str();
+        match target.persist_target_checkpoint() {
+            Ok(()) => {
+                CHECKPOINT_PERSIST_TOTAL
+                    .with_label_values(&[name, "ok"])
+                    .inc();
+                publish_checkpoint_gauges(name, target.target_checkpoint(), head_lsn);
+                true
+            }
+            Err(e) => {
+                CHECKPOINT_PERSIST_TOTAL
+                    .with_label_values(&[name, "error"])
+                    .inc();
+                let lsn = target.target_checkpoint().unwrap_or(Lsn::ZERO);
+                tracing::error!(
+                    projection = %name,
+                    lsn = lsn.0,
+                    error = %e,
+                    "checkpoint persist failed {when}",
+                );
+                self.failure = Some(ReplayError::ProjectionFailed {
+                    projection: self.name.clone(),
+                    lsn,
+                    source: e,
+                });
+                false
+            }
+        }
     }
-    CHECKPOINT_PERSIST_TOTAL
-        .with_label_values(&[projection_name.as_str(), "ok"])
-        .inc();
-    publish_checkpoint_gauges(projection_name.as_str(), projection.checkpoint(), head_lsn);
+}
 
-    tracing::Span::current().record("applied", applied);
-    Ok(applied)
+/// Memory ids the log considers live at its head: created, updated or
+/// anchored, and not forgotten since. The same set as
+/// [`super::payload::live_memory_ids`], resumed from the snapshot an earlier
+/// call left in `store` so only the frames appended since are read.
+///
+/// The snapshot is stamped with the [`super::FramePosition`] of the last
+/// frame it covers and is used only while that exact frame (LSN and CRC) is
+/// still at that offset; a truncated, restored or rewritten log fails the
+/// check and the whole log is read. The memory id is taken from the encoded
+/// payload's fixed prefix, so the memory snapshot inside a `Remember` or
+/// `Update` is never decoded. The first frame of each kind is also decoded
+/// in full and compared, and a disagreement switches the rest of the pass
+/// to full decoding.
+///
+/// Persisting the refreshed snapshot is best effort: a failure is logged and
+/// the next call reads further back.
+pub fn live_memory_ids_resumable(
+    log: &IntentLog,
+    store: &Mutex<CheckpointStore>,
+) -> Result<HashSet<String>, PayloadError> {
+    let snapshot = store
+        .lock()
+        .get_side_data(INTENT_LOG_SIDE_DATA, LIVE_MEMORY_IDS_KEY)
+        .and_then(LiveIdSnapshot::decode);
+    let previous_stamp = snapshot.as_ref().map(|s| s.stamp);
+
+    let (mut ids, mut frames, resume_at) = match snapshot {
+        Some(snapshot) => match log.iter_at(snapshot.stamp)? {
+            Some(frames) => (snapshot.ids, frames, snapshot.stamp.lsn.next()),
+            None => {
+                tracing::info!(
+                    path = %log.path().display(),
+                    stamp_lsn = snapshot.stamp.lsn.0,
+                    "live-id snapshot no longer matches the intent log; reading the whole log",
+                );
+                (HashSet::new(), log.iter()?, Lsn::ZERO)
+            }
+        },
+        None => (HashSet::new(), log.iter()?, Lsn::ZERO),
+    };
+
+    let mut prefix = PrefixReader::default();
+    let mut last = None;
+    while let Some(frame) = frames.read_frame()? {
+        last = Some(frame.position());
+        if frame.lsn < resume_at {
+            continue;
+        }
+        let payload = frames.take_payload()?;
+        let (forget, memory_id) = prefix.memory_ref(&payload)?;
+        if forget {
+            ids.remove(memory_id.as_ref());
+        } else if !ids.contains(memory_id.as_ref()) {
+            ids.insert(memory_id.into_owned());
+        }
+        frames.recycle(payload);
+    }
+
+    if let Some(stamp) = last.filter(|s| Some(*s) != previous_stamp) {
+        let Some(encoded) = LiveIdSnapshot::encode(stamp, &ids) else {
+            return Ok(ids);
+        };
+        let mut store = store.lock();
+        let persisted = store
+            .set_side_data_at(
+                INTENT_LOG_SIDE_DATA,
+                LIVE_MEMORY_IDS_KEY,
+                stamp.lsn,
+                &encoded,
+            )
+            .and_then(|()| store.sync_side_data());
+        if let Err(e) = persisted {
+            tracing::warn!(
+                path = %log.path().display(),
+                error = %e,
+                ids = ids.len(),
+                "could not persist the live-id snapshot; the next reconcile reads the whole log",
+            );
+        }
+    }
+    Ok(ids)
+}
+
+/// Variant indices of [`IntentPayload`] on the wire (declaration order).
+const REMEMBER_TAG: u32 = 0;
+const FORGET_TAG: u32 = 1;
+const UPDATE_TAG: u32 = 2;
+const ANCHOR_TAG: u32 = 3;
+
+fn variant_tag(payload: &IntentPayload) -> u32 {
+    match payload {
+        IntentPayload::Remember { .. } => REMEMBER_TAG,
+        IntentPayload::Forget { .. } => FORGET_TAG,
+        IntentPayload::Update { .. } => UPDATE_TAG,
+        IntentPayload::Anchor { .. } => ANCHOR_TAG,
+    }
+}
+
+/// Reads `(is_forget, memory_id)` off encoded payloads, from the prefix
+/// every variant shares — `[variant u32][user_id: len u64, bytes][memory_id:
+/// len u64, bytes]` under the payload's fixed-int bincode configuration —
+/// cross-checked against a full decode for the first frame of each variant.
+#[derive(Default)]
+struct PrefixReader {
+    checked: [bool; ANCHOR_TAG as usize + 1],
+    disabled: bool,
+}
+
+impl PrefixReader {
+    fn memory_ref<'a>(
+        &mut self,
+        bytes: &'a [u8],
+    ) -> Result<(bool, std::borrow::Cow<'a, str>), PayloadError> {
+        if !self.disabled {
+            if let Some((tag, id)) = peek_memory_ref(bytes) {
+                let slot = tag as usize;
+                if self.checked[slot] {
+                    return Ok((tag == FORGET_TAG, id.into()));
+                }
+                let decoded = super::payload::decode(bytes)?;
+                if decoded.memory_id() == id && variant_tag(&decoded) == tag {
+                    self.checked[slot] = true;
+                } else {
+                    tracing::warn!(
+                        variant = tag,
+                        "intent payload prefix does not match its decoded form; decoding every frame",
+                    );
+                    self.disabled = true;
+                }
+                return Ok(full_memory_ref(decoded));
+            }
+        }
+        Ok(full_memory_ref(super::payload::decode(bytes)?))
+    }
+}
+
+fn full_memory_ref(payload: IntentPayload) -> (bool, std::borrow::Cow<'static, str>) {
+    let forget = matches!(payload, IntentPayload::Forget { .. });
+    (forget, payload.memory_id().to_owned().into())
+}
+
+/// `(variant, memory_id)` from an encoded payload's shared prefix, or `None`
+/// when the bytes do not have that shape or name a variant this binary does
+/// not know.
+fn peek_memory_ref(bytes: &[u8]) -> Option<(u32, &str)> {
+    fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(
+            bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+        ))
+    }
+    let tag = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+    if tag > ANCHOR_TAG {
+        return None;
+    }
+    let user_len = usize::try_from(read_u64(bytes, 4)?).ok()?;
+    let id_len_at = 12usize.checked_add(user_len)?;
+    let id_len = usize::try_from(read_u64(bytes, id_len_at)?).ok()?;
+    let id_at = id_len_at.checked_add(8)?;
+    let id = bytes.get(id_at..id_at.checked_add(id_len)?)?;
+    Some((tag, std::str::from_utf8(id).ok()?))
+}
+
+const LIVE_ID_SNAPSHOT_VERSION: u8 = 1;
+
+/// The live-id set as of one frame: `[version u8][stamp][count u32]` then
+/// each id as `[len u16][utf-8 bytes]`, little-endian.
+struct LiveIdSnapshot {
+    stamp: FramePosition,
+    ids: HashSet<String>,
+}
+
+impl LiveIdSnapshot {
+    /// `None` when an id is too long for the format or the set too large
+    /// to keep as side data; the caller then keeps no snapshot.
+    fn encode(stamp: FramePosition, ids: &HashSet<String>) -> Option<Vec<u8>> {
+        let body: usize = ids.iter().map(|id| 2 + id.len()).sum();
+        let total = 1 + FRAME_POSITION_BYTES + 4 + body;
+        if total > MAX_SIDE_DATA_BYTES || ids.iter().any(|id| id.len() > u16::MAX as usize) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(total);
+        out.push(LIVE_ID_SNAPSHOT_VERSION);
+        out.extend_from_slice(&stamp.to_bytes());
+        out.extend_from_slice(&u32::try_from(ids.len()).ok()?.to_le_bytes());
+        for id in ids {
+            out.extend_from_slice(&(id.len() as u16).to_le_bytes());
+            out.extend_from_slice(id.as_bytes());
+        }
+        Some(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&version, rest) = bytes.split_first()?;
+        if version != LIVE_ID_SNAPSHOT_VERSION {
+            return None;
+        }
+        let stamp = FramePosition::from_bytes(rest.get(..FRAME_POSITION_BYTES)?)?;
+        let rest = &rest[FRAME_POSITION_BYTES..];
+        let count = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let mut rest = &rest[4..];
+        let mut ids = HashSet::with_capacity(count.min(rest.len() / 2));
+        for _ in 0..count {
+            let len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
+            let id = std::str::from_utf8(rest.get(2..2 + len)?).ok()?;
+            ids.insert(id.to_owned());
+            rest = &rest[2 + len..];
+        }
+        rest.is_empty().then_some(Self { stamp, ids })
+    }
 }
 
 /// Publish (or refresh) the `veld_projection_checkpoint_lsn` and
@@ -554,5 +912,228 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn numbered_log(
+        name: &str,
+        count: u8,
+        cryptor: Option<crate::keystore::SecretCryptor>,
+    ) -> (PathBuf, IntentLog) {
+        let path = tmp_log_path(name);
+        let mut log = IntentLog::open_with_cryptor(&path, cryptor).unwrap();
+        for i in 0..count {
+            log.append(&[i]).unwrap();
+        }
+        log.sync().unwrap();
+        (path, log)
+    }
+
+    fn key() -> Option<crate::keystore::SecretCryptor> {
+        Some(crate::keystore::SecretCryptor::new(
+            zeroize::Zeroizing::new([5u8; 32]),
+        ))
+    }
+
+    fn at_checkpoint(name: &str, checkpoint: Option<Lsn>) -> VecProjection {
+        let mut proj = VecProjection::new(name);
+        proj.checkpoint = checkpoint;
+        proj.persisted_checkpoint = checkpoint;
+        proj
+    }
+
+    #[test]
+    fn replay_all_applies_each_frame_once_to_each_projection_below_it() {
+        let (path, log) = numbered_log("all_once", 8, None);
+        let mut fresh = at_checkpoint("fresh", None);
+        let mut mid = at_checkpoint("mid", Some(Lsn(2)));
+        let mut current = at_checkpoint("current", Some(Lsn(7)));
+        let results = {
+            let mut targets: [&mut dyn ReplayTarget; 3] = [&mut fresh, &mut mid, &mut current];
+            replay_all(&log, &mut targets, Some(3)).unwrap()
+        };
+        let applied: Vec<u64> = results.into_iter().map(Result::unwrap).collect();
+        assert_eq!(applied, vec![8, 5, 0]);
+
+        let lsns = |p: &VecProjection| p.applied.iter().map(|(l, _)| l.0).collect::<Vec<_>>();
+        assert_eq!(lsns(&fresh), (0..8).collect::<Vec<_>>());
+        assert_eq!(lsns(&mid), (3..8).collect::<Vec<_>>());
+        assert!(current.applied.is_empty());
+        assert_eq!(mid.applied[0].1, vec![3u8]);
+        for p in [&fresh, &mid, &current] {
+            assert_eq!(p.persisted_checkpoint, Some(Lsn(7)), "{}", p.name);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_all_keeps_a_failed_projection_from_blocking_the_others() {
+        let (path, log) = numbered_log("all_failure", 6, None);
+        let mut flaky = FlakyProjection {
+            name: "flaky".to_string(),
+            applied: Vec::new(),
+            checkpoint: None,
+            fail_once_at: Some(Lsn(2)),
+        };
+        let mut steady = at_checkpoint("steady", Some(Lsn(0)));
+        let results = {
+            let mut targets: [&mut dyn ReplayTarget; 2] = [&mut flaky, &mut steady];
+            replay_all(&log, &mut targets, None).unwrap()
+        };
+        match &results[0] {
+            Err(ReplayError::ProjectionFailed {
+                projection, lsn, ..
+            }) => {
+                assert_eq!(projection, "flaky");
+                assert_eq!(*lsn, Lsn(2));
+            }
+            other => panic!("expected the flaky projection to fail, got {other:?}"),
+        }
+        assert_eq!(*results[1].as_ref().unwrap(), 5);
+        assert_eq!(flaky.applied, vec![Lsn(0), Lsn(1)]);
+        assert_eq!(flaky.checkpoint, Some(Lsn(1)));
+        assert_eq!(steady.persisted_checkpoint, Some(Lsn(5)));
+
+        // The next pass retries the failed record for the stalled projection
+        // only; the caught-up one is not re-fed.
+        let results = {
+            let mut targets: [&mut dyn ReplayTarget; 2] = [&mut flaky, &mut steady];
+            replay_all(&log, &mut targets, None).unwrap()
+        };
+        assert_eq!(*results[0].as_ref().unwrap(), 4);
+        assert_eq!(*results[1].as_ref().unwrap(), 0);
+        assert_eq!(flaky.applied, (0..6).map(Lsn).collect::<Vec<_>>());
+        assert_eq!(steady.applied.len(), 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn frames_no_projection_needs_are_never_decrypted() {
+        let (path, log) = numbered_log("no_decrypt", 10, key());
+        let mut behind = at_checkpoint("behind", Some(Lsn(7)));
+        let mut ahead = at_checkpoint("ahead", Some(Lsn(8)));
+        let before = super::super::payload_decrypts_on_this_thread();
+        let results = {
+            let mut targets: [&mut dyn ReplayTarget; 2] = [&mut behind, &mut ahead];
+            replay_all(&log, &mut targets, None).unwrap()
+        };
+        assert_eq!(
+            super::super::payload_decrypts_on_this_thread() - before,
+            2,
+            "only LSNs 8 and 9 are opened"
+        );
+        assert_eq!(*results[0].as_ref().unwrap(), 2);
+        assert_eq!(*results[1].as_ref().unwrap(), 1);
+        assert_eq!(behind.applied[0], (Lsn(8), vec![8u8]));
+        assert_eq!(ahead.applied, vec![(Lsn(9), vec![9u8])]);
+
+        // Fully caught up: nothing is read or opened at all.
+        let before = super::super::payload_decrypts_on_this_thread();
+        let mut targets: [&mut dyn ReplayTarget; 2] = [&mut behind, &mut ahead];
+        replay_all(&log, &mut targets, None).unwrap();
+        assert_eq!(super::super::payload_decrypts_on_this_thread(), before);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn payload(kind: u32, memory_id: &str) -> IntentPayload {
+        let user_id = "tenant-with-a-longer-name".to_string();
+        let memory_id = memory_id.to_string();
+        let schema_version = Some(super::super::payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
+        match kind {
+            REMEMBER_TAG => IntentPayload::Remember {
+                user_id,
+                memory_id,
+                memory_bincode: vec![9; 64],
+                schema_version,
+            },
+            FORGET_TAG => IntentPayload::Forget {
+                user_id,
+                memory_id,
+                schema_version,
+            },
+            UPDATE_TAG => IntentPayload::Update {
+                user_id,
+                memory_id,
+                memory_bincode: vec![7; 16],
+                schema_version,
+            },
+            _ => IntentPayload::Anchor {
+                user_id,
+                memory_id,
+                importance: 0.9,
+                schema_version,
+            },
+        }
+    }
+
+    #[test]
+    fn the_payload_prefix_names_the_same_variant_and_memory_as_a_full_decode() {
+        for kind in [REMEMBER_TAG, FORGET_TAG, UPDATE_TAG, ANCHOR_TAG] {
+            let original = payload(kind, "4a1f0c3e-0000-4000-8000-00000000abcd");
+            let bytes = super::super::payload::encode(&original).unwrap();
+            let (tag, id) = peek_memory_ref(&bytes).expect("prefix parses");
+            assert_eq!(tag, variant_tag(&original));
+            assert_eq!(id, original.memory_id());
+            let mut reader = PrefixReader::default();
+            let (forget, id) = reader.memory_ref(&bytes).unwrap();
+            assert_eq!(forget, kind == FORGET_TAG);
+            assert_eq!(id, original.memory_id());
+            assert!(!reader.disabled);
+        }
+        assert!(peek_memory_ref(&[0, 0, 0]).is_none());
+        assert!(peek_memory_ref(&[9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn live_ids_resume_from_the_snapshot_and_fall_back_when_it_goes_stale() {
+        use super::super::payload::append;
+        let path = tmp_log_path("live_ids");
+        let ckpt_path = tmp_log_path("live_ids_ckpt");
+        let store = Mutex::new(CheckpointStore::open(&ckpt_path).unwrap());
+        let mut log = IntentLog::open_with_cryptor(&path, key()).unwrap();
+        for (kind, id) in [
+            (REMEMBER_TAG, "m0"),
+            (REMEMBER_TAG, "m1"),
+            (FORGET_TAG, "m1"),
+            (UPDATE_TAG, "m2"),
+            (ANCHOR_TAG, "m3"),
+        ] {
+            append(&mut log, &payload(kind, id)).unwrap();
+        }
+        log.sync().unwrap();
+        let set = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+
+        let first = live_memory_ids_resumable(&log, &store).unwrap();
+        assert_eq!(first, set(&["m0", "m2", "m3"]));
+        assert_eq!(first, super::super::payload::live_memory_ids(&log).unwrap());
+
+        append(&mut log, &payload(FORGET_TAG, "m0")).unwrap();
+        append(&mut log, &payload(REMEMBER_TAG, "m4")).unwrap();
+        log.sync().unwrap();
+        let before = super::super::payload_decrypts_on_this_thread();
+        let second = live_memory_ids_resumable(&log, &store).unwrap();
+        assert_eq!(second, set(&["m2", "m3", "m4"]));
+        assert_eq!(
+            super::super::payload_decrypts_on_this_thread() - before,
+            2,
+            "only the two frames after the snapshot are opened"
+        );
+
+        // A reopened store resumes from the persisted snapshot too.
+        drop(store);
+        let store = Mutex::new(CheckpointStore::open(&ckpt_path).unwrap());
+        let before = super::super::payload_decrypts_on_this_thread();
+        assert_eq!(live_memory_ids_resumable(&log, &store).unwrap(), second);
+        assert_eq!(super::super::payload_decrypts_on_this_thread(), before);
+
+        // Truncating below the snapshot's frame invalidates it.
+        log.truncate_to_lsn(Lsn(1)).unwrap();
+        assert_eq!(
+            live_memory_ids_resumable(&log, &store).unwrap(),
+            set(&["m0", "m1"])
+        );
+        let side = store.lock().side_data_path().to_path_buf();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&ckpt_path);
+        let _ = std::fs::remove_file(&side);
     }
 }
