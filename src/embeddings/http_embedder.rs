@@ -115,7 +115,7 @@ fn pieces(text: &str, piece_bytes: usize, fits: &dyn Fn(&str) -> bool) -> Vec<St
 }
 
 /// Configuration for HTTP embedding API
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HttpEmbedderConfig {
     /// Base URL of the embedding API
     pub base_url: String,

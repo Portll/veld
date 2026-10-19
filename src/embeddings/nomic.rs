@@ -27,81 +27,31 @@
 //! - VELD_NOMIC_EMBED_TIMEOUT_MS: Embedding timeout in ms (default: 5000)
 //! - VELD_NOMIC_DIM: Matryoshka output dimension — 64|128|256|512|768 (default: 768)
 //! - VELD_LAZY_LOAD: Set to "false" to load model at startup (default: true)
-//! - VELD_ONNX_THREADS: Number of ONNX threads (default: 1 on macOS ARM64, min(cores,8) elsewhere)
+//! - VELD_ONNX_THREADS: intra-op threads per session (default: 1 on macOS ARM64,
+//!   min(cores, 8) elsewhere); see [`super::minilm::OrtThreading`]
 //! - VELD_NOMIC_POOL_SIZE: Number of ONNX sessions in the pool, each independently
 //!   lockable. Trades memory (~150-200 MB per session) for concurrent throughput.
-//!   Default: 2 on macOS ARM64, min(cores/2, 4) elsewhere. Set to 1 for low-memory
-//!   deployments.
+//!   The pool is shared by every tenant on the model, so this bounds Nomic's concurrent
+//!   inferences for the whole process. Default: 2 on macOS ARM64, min(cores/2, 4)
+//!   elsewhere. Set to 1 for low-memory deployments.
 
 use anyhow::{Context, Result};
 use ort::session::Session;
 use ort::value::Value;
-use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokenizers::Tokenizer;
 
+use super::minilm::{OrtThreading, SessionPool};
 use super::Embedder;
 
-/// Thread-pool / spinning knobs handed to the ORT session builder.
-#[derive(Clone, Copy)]
-struct ThreadsConfig {
-    intra: usize,
-    inter: usize,
-    intra_spin: bool,
-    inter_spin: bool,
-}
-
-/// Per-platform safe defaults for ORT threading.
-///
-/// macOS aarch64 (M-series) hits an Eigen spin-to-block deadlock on heterogeneous
-/// P/E cores (microsoft/onnxruntime#10270), so we keep a single non-spinning
-/// thread there. Every other platform gets a wide thread pool and enables
-/// spinning — leaving these off costs 3-5x on x86 CPUs that are not vulnerable
-/// to the macOS bug.
-fn default_threads_config() -> ThreadsConfig {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        ThreadsConfig {
-            intra: 1,
-            inter: 1,
-            intra_spin: false,
-            inter_spin: false,
-        }
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(8);
-        ThreadsConfig {
-            intra: cores,
-            inter: 1,
-            intra_spin: true,
-            inter_spin: true,
-        }
-    }
-}
-
-/// Default number of independently-lockable sessions in the pool.
-///
-/// Each session is ~150-200 MB resident; the pool multiplies throughput by N
-/// at the cost of N× model memory. A modest pool (~cores/2 capped at 4) gives
-/// good concurrency without ballooning RSS.
-fn default_pool_size() -> usize {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        2
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        std::thread::available_parallelism()
-            .map(|n| (n.get() / 2).max(2))
-            .unwrap_or(2)
-            .min(4)
-    }
+/// `VELD_NOMIC_POOL_SIZE` when set to at least 1, else the shared default.
+pub fn pool_size_from_env() -> usize {
+    std::env::var("VELD_NOMIC_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n >= 1)
+        .unwrap_or_else(super::minilm::default_session_pool_size)
 }
 
 /// Round a sequence length up to the next multiple of 32, capped at `max_length`.
@@ -111,18 +61,10 @@ fn align_seq_len(n: usize, max_length: usize) -> usize {
     aligned.clamp(32, max_length)
 }
 
-/// Build a single ORT session with the supplied threading config.
-fn build_session(model_path: &Path, threads: ThreadsConfig) -> Result<Session> {
-    Session::builder()
-        .context("Failed to create session builder")?
-        .with_intra_threads(threads.intra)
-        .context("Failed to set intra thread count")?
-        .with_inter_threads(threads.inter)
-        .context("Failed to set inter thread count")?
-        .with_intra_op_spinning(threads.intra_spin)
-        .context("Failed to set intra-op spinning")?
-        .with_inter_op_spinning(threads.inter_spin)
-        .context("Failed to set inter-op spinning")?
+/// Build a single ORT session with the supplied threading.
+fn build_session(model_path: &Path, threading: OrtThreading) -> Result<Session> {
+    threading
+        .apply(Session::builder().context("Failed to create session builder")?)?
         .commit_from_file(model_path)
         .context("Failed to load Nomic ONNX model")
 }
@@ -175,79 +117,45 @@ fn resolve_output_dim() -> usize {
 
 /// Pool of independently-lockable ONNX sessions sharing one tokenizer.
 ///
-/// The `ort` v2 API requires `&mut Session` for `Session::run`, so concurrent
-/// inference on one session is impossible. The pool sidesteps that by holding
-/// N sessions, each guarded by its own mutex, and round-robins requests across
-/// them. Real-world throughput scales close to linearly with pool size until
-/// CPU saturates.
+/// Real-world throughput scales close to linearly with pool size until CPU saturates.
 struct LazyNomicModel {
-    /// One `Mutex<Session>` per pool slot. Pool size is fixed at construction.
-    sessions: Vec<Mutex<Session>>,
-    /// Wrapping counter used to pick the next pool slot for a request.
-    next: AtomicUsize,
+    sessions: SessionPool,
     tokenizer: Tokenizer,
 }
 
 impl LazyNomicModel {
-    fn new(config: &NomicConfig) -> Result<Self> {
-        let threads_env = std::env::var("VELD_ONNX_THREADS")
-            // The recall harness pins the upstream spelling.
-            .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let mut threads = default_threads_config();
-        if let Some(n) = threads_env {
-            threads.intra = n;
-        }
-
-        let pool_size = std::env::var("VELD_NOMIC_POOL_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|n: &usize| *n >= 1)
-            .unwrap_or_else(default_pool_size);
-
+    fn new(config: &NomicConfig, threading: OrtThreading, pool_size: usize) -> Result<Self> {
         tracing::info!(
-            "Loading Nomic-embed-text-v1.5 from {:?} (pool={}, intra={}, inter={}, spin_intra={}, spin_inter={})",
+            "Loading Nomic-embed-text-v1.5 from {:?} (pool={}, intra={}, inter={}, spinning={})",
             config.model_path,
             pool_size,
-            threads.intra,
-            threads.inter,
-            threads.intra_spin,
-            threads.inter_spin
+            threading.intra,
+            threading.inter,
+            threading.spinning
         );
 
         let tokenizer = Tokenizer::from_file(&config.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load Nomic tokenizer: {e}"))?;
 
-        let mut sessions = Vec::with_capacity(pool_size);
-        for slot in 0..pool_size {
-            let session = build_session(&config.model_path, threads)
-                .with_context(|| format!("Failed to build Nomic session #{slot}"))?;
-            sessions.push(Mutex::new(session));
-        }
+        let sessions = SessionPool::build(pool_size, |slot| {
+            build_session(&config.model_path, threading)
+                .with_context(|| format!("Failed to build Nomic session #{slot}"))
+        })?;
 
         tracing::info!(
             "Nomic-embed-text-v1.5 model loaded successfully ({} sessions)",
-            pool_size
+            sessions.len()
         );
 
         Ok(Self {
             sessions,
-            next: AtomicUsize::new(0),
             tokenizer,
         })
-    }
-
-    /// Pick the next pool slot. Round-robin via a wrapping counter — cheaper than
-    /// scanning for the least-contended slot and good enough for uniform loads.
-    fn acquire(&self) -> &Mutex<Session> {
-        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
-        &self.sessions[i]
     }
 }
 
 /// Configuration for Nomic embedder
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NomicConfig {
     /// Path to ONNX model file
     pub model_path: PathBuf,
@@ -361,6 +269,8 @@ impl NomicConfig {
 /// - `encode()` (trait method) defaults to "search_document: " prefix
 pub struct NomicEmbedder {
     config: NomicConfig,
+    threading: OrtThreading,
+    pool_size: usize,
     /// Lazily initialized model (OnceLock for thread-safe init)
     lazy_model: OnceLock<Result<Arc<LazyNomicModel>, String>>,
     /// Flag for simplified mode (no ONNX)
@@ -417,6 +327,16 @@ impl NomicEmbedder {
     /// - If ONNX Runtime not found, downloads from GitHub (~50MB)
     /// - Files cached in ~/.cache/veld/models/nomic-embed-v1.5/
     pub fn new(config: NomicConfig) -> Result<Self> {
+        Self::with_runtime(config, OrtThreading::resolve(), pool_size_from_env())
+    }
+
+    /// [`Self::new`] with the session threading and pool size given rather than resolved, so a
+    /// shared instance is built from exactly the values its spec was keyed on.
+    pub fn with_runtime(
+        config: NomicConfig,
+        threading: OrtThreading,
+        pool_size: usize,
+    ) -> Result<Self> {
         let lazy_load = std::env::var("VELD_LAZY_LOAD")
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
@@ -481,7 +401,7 @@ impl NomicEmbedder {
                         ..config
                     };
 
-                    return Self::new(updated_config);
+                    return Self::with_runtime(updated_config, threading, pool_size);
                 }
                 Err(e) => {
                     return Self::simplified_or_fail(
@@ -495,6 +415,8 @@ impl NomicEmbedder {
         let embedder = Self {
             dimension: config.output_dim,
             config: config.clone(),
+            threading,
+            pool_size,
             lazy_model: OnceLock::new(),
             simplified_mode: false,
         };
@@ -512,7 +434,7 @@ impl NomicEmbedder {
     /// Ensure the model is loaded (thread-safe, idempotent)
     fn ensure_model_loaded(&self) -> Result<&Arc<LazyNomicModel>> {
         let result = self.lazy_model.get_or_init(|| {
-            LazyNomicModel::new(&self.config)
+            LazyNomicModel::new(&self.config, self.threading, self.pool_size)
                 .map(Arc::new)
                 .map_err(|e| e.to_string())
         });
@@ -526,6 +448,12 @@ impl NomicEmbedder {
     /// Check if model is currently loaded (for diagnostics)
     pub fn is_model_loaded(&self) -> bool {
         self.lazy_model.get().is_some()
+    }
+
+    /// True once a load was attempted and failed. The failure is kept for this instance's
+    /// lifetime, so a shared registry replaces such an instance rather than handing it out.
+    pub fn model_load_failed(&self) -> bool {
+        matches!(self.lazy_model.get(), Some(Err(_)))
     }
 
     /// Degrade to hash embeddings, but only if someone asked for that.
@@ -575,6 +503,8 @@ impl NomicEmbedder {
         Ok(Self {
             dimension: config.output_dim,
             config,
+            threading: OrtThreading::resolve(),
+            pool_size: 1,
             lazy_model: OnceLock::new(),
             simplified_mode: true,
         })
@@ -954,8 +884,7 @@ impl NomicEmbedder {
         // run so the operator can tell which one is hot.
         let lock_timeout = std::time::Duration::from_secs(30);
         let queue_start = std::time::Instant::now();
-        let session_mutex = model.acquire();
-        let mut session = session_mutex.try_lock_for(lock_timeout).ok_or_else(|| {
+        let mut session = model.sessions.acquire(lock_timeout).ok_or_else(|| {
             tracing::error!(
                 "Nomic ONNX session lock acquisition timed out after {}s",
                 lock_timeout.as_secs()
@@ -1085,8 +1014,7 @@ impl NomicEmbedder {
 
         // Acquire a pool slot for the run only.
         let lock_timeout = std::time::Duration::from_secs(30);
-        let session_mutex = model.acquire();
-        let mut session = session_mutex.try_lock_for(lock_timeout).ok_or_else(|| {
+        let mut session = model.sessions.acquire(lock_timeout).ok_or_else(|| {
             tracing::error!(
                 "Nomic ONNX session lock timed out after {}s in batch embed",
                 lock_timeout.as_secs()
