@@ -122,6 +122,27 @@ Comprehensive performance measurements for Veld - Agentic Memory v0.1.5+.
 
 ---
 
+### Embedding spaces (per-space cost, step 12 of the embedding-spaces plan)
+
+`cargo bench --bench embedding_spaces` measures what each embedding space costs: vector-leg
+search latency over one space and over two, the bytes and RSS each space holds as full vectors
+and as product-quantized codes, inline write cost with an embedder paced like a remote host,
+and drain throughput per batch size against a real host when `VELD_BENCH_EMBEDDER_URL` is set.
+It writes a JSON report under `evaluations/spaces/`. The plan's rows use
+`VELD_BENCH_SPACE_SIZES=10000,100000`.
+
+Every later step of the plan re-runs it and adds a row here, so each step has a before and after.
+No numbers are recorded yet: the baseline is the first run, before deferred embedding lands.
+
+| Step | Commit | Memories | Spaces | Search p95 | RSS per space | Write per memory | Drain at 64 |
+|---|---|---|---|---|---|---|---|
+| baseline | | 10k | 1 / 2 | | | | |
+| baseline | | 100k | 1 / 2 | | | | |
+
+The LoCoMo gate under each space configuration runs in CI (`.github/workflows/recall.yml`).
+
+---
+
 ## 4. Associative Retrieval (Density-Dependent Hybrid)
 
 ### Cross-Domain Association Discovery
