@@ -72,14 +72,22 @@ to undo experiments.
 
 ## Reranker dials
 
-Three retrieval dials drive the Layer 5.3 cross-encoder
+Five retrieval dials drive the Layer 5.3 cross-encoder
 ([retrieval.md](retrieval.md#cross-encoder-reranking)):
 
 | Dial | Type | `None` means | Env seed |
 |---|---|---|---|
 | `use_reranking` | `Option<bool>` | the layer runs | `VELD_DIALS_USE_RERANKING` |
-| `rerank_count` | `Option<usize>`, clamped to 1..=200 | 20 candidates (30 for a decomposed query) | `VELD_DIALS_RERANK_COUNT` |
+| `rerank_count` | `Option<usize>`, clamped to 1..=200 | at most 20 candidates (30 for a decomposed query), and never more than twice `max_results`; a set value is the budget itself | `VELD_DIALS_RERANK_COUNT` |
+| `rerank_pool` | `Option<usize>`, clamped to 10..=500 | Layer 4 keeps 30 fused candidates (50 for a decomposed query) for the layer; never fewer than `rerank_count` | `VELD_DIALS_RERANK_POOL` |
+| `ce_blend` | `Option<f32>`, clamped to 0..=1 | the cross-encoder carries 18% of the blended score (45% for a decomposed query, which never takes less) | `VELD_TUNE_CE_BLEND` |
 | `rerank_model` | `Option<String>`, a registry id | the process-wide model: `VELD_CROSS_ENCODER`, else `mxbai-rerank-xsmall-v1` | `VELD_DIALS_RERANK_MODEL` |
+
+Depth takes all three of `rerank_pool`, `rerank_count` and `ce_blend`. On the LoCoMo
+gate a quarter of all gold sits between rank 11 and rank 100. A larger `rerank_count`
+cannot reach gold that Layer 4 already cut, and at an 18% blend the cross-encoder moves
+a candidate a few places, not from rank 40 into the top ten. Each candidate in the
+budget is one cross-encoder forward pass, so latency grows with `rerank_count`.
 
 `rerank_model` is applied when the dials are loaded at startup and on every
 `PUT /api/dials`: the user's `CrossEncoderReranker` switches to the named
@@ -89,12 +97,12 @@ a model that cannot be built clears the dial before it is stored, so
 `GET /api/dials` never names a model that is not reranking. Both dials default to
 `None`: the shipped pipeline is unchanged until someone turns them.
 
-The recall gate records the model and cap it measured under
+The recall gate records the model, cap, pool and blend it measured under
 (`RerankSetting` in `src/recall_harness/report.rs`) and refuses to gate across
-them. `recall.yml` takes `rerank_model` and `rerank_count` as dispatch inputs
-for a comparison run (`record=true`): the baseline is `mxbai-rerank-xsmall-v1`
-at cap 20, and the parity arm against upstream shodh-memory is
-`ms-marco-MiniLM-L-6-v2` at cap 30.
+them. `recall.yml` takes `rerank_model`, `rerank_count`, `rerank_pool` and
+`ce_blend` as dispatch inputs for a comparison run (`record=true`). The baseline
+is `mxbai-rerank-xsmall-v1` at cap 20 with the shipped pool and blend, and the
+parity arm against upstream shodh-memory is `ms-marco-MiniLM-L-6-v2` at cap 30.
 
 Selectable models (`src/embeddings/cross_encoder.rs`). Two are pinned to a
 revision and verified by SHA-256 before they load; the rest follow their

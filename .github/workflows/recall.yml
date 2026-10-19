@@ -70,6 +70,18 @@ on:
           As with rerank_model, a different cap is not gated: pair it with record=true.
         required: false
         default: ''
+      rerank_pool:
+        description: >-
+          Fused candidates kept for the cross-encoder (rerank_pool dial); empty keeps the shipped
+          30, or 50 for a decomposed query. Not gated: pair it with record=true.
+        required: false
+        default: ''
+      ce_blend:
+        description: >-
+          Cross-encoder weight in the final blend (ce_blend dial, 0..1); empty keeps the shipped
+          0.18. Not gated: pair it with record=true.
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -219,6 +231,8 @@ jobs:
           # empty model id (sanitized away) and an unparsable count.
           VELD_DIALS_RERANK_MODEL: ${{ github.event.inputs.rerank_model || '' }}
           VELD_DIALS_RERANK_COUNT: ${{ github.event.inputs.rerank_count || '' }}
+          VELD_DIALS_RERANK_POOL: ${{ github.event.inputs.rerank_pool || '' }}
+          VELD_TUNE_CE_BLEND: ${{ github.event.inputs.ce_blend || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
         run: |
