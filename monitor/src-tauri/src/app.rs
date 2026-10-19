@@ -1049,8 +1049,9 @@ fn is_loopback(base_url: &str) -> bool {
 /// Ask every reachable instance in the fleet whether it follows a leader and keep
 /// the tray's line on those that do. The status route is admin-gated: the key is
 /// this process's `VELD_ADMIN_API_KEY`, else the one in the operator's
-/// `server.env`, which the servers on this host were started with and which is
-/// therefore sent to loopback instances only.
+/// `server.env`. Either is sent to loopback instances only: an admin key reads
+/// every tenant's memories through the replication feed, and a remote instance in
+/// the fleet is not known to share it.
 async fn poll_replication(
     fleet: Arc<Mutex<HashMap<String, FleetEntry>>>,
     api_key: String,
@@ -1071,10 +1072,12 @@ async fn poll_replication(
             .map(|(_, v)| v);
         let mut replicas = Vec::new();
         for (base_url, label) in targets {
-            let key = admin_key
-                .as_deref()
-                .or_else(|| env_key.as_deref().filter(|_| is_loopback(&base_url)));
-            let Some(key) = key else { continue };
+            if !is_loopback(&base_url) {
+                continue;
+            }
+            let Some(key) = admin_key.as_deref().or(env_key.as_deref()) else {
+                continue;
+            };
             match StatusClient::data_request(
                 &base_url,
                 &api_key,
