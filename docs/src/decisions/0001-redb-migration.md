@@ -1,7 +1,7 @@
 ---
 id: 0001
 title: Redb migration target
-status: accepted
+status: accepted, amended by 0007
 date: 2026-05-28
 amended-by: 0007
 ---

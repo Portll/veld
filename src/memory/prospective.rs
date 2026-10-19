@@ -390,7 +390,7 @@ impl ProspectiveStore {
         }
 
         // Sort by created_at descending (newest first)
-        tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.created_at));
 
         Ok(tasks)
     }
@@ -549,7 +549,7 @@ impl ProspectiveStore {
         }
 
         // Sort by priority
-        matches.sort_by(|a, b| b.priority.cmp(&a.priority));
+        matches.sort_by_key(|task| std::cmp::Reverse(task.priority));
 
         Ok(matches)
     }
@@ -754,6 +754,7 @@ mod tests {
         (temp_dir, store)
     }
 
+    #[cfg(feature = "storage-redb")]
     #[test]
     fn test_with_store_redb_round_trip() {
         // The point of with_store: the same store logic over the other backend,

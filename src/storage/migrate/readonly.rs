@@ -5,8 +5,7 @@
 //! moment a database is opened and flips it back on drop. A migration source must
 //! never be modified and a dry run must write nothing, so neither open is usable here.
 
-use anyhow::{bail, Context, Result};
-use std::io::{Read, Seek, SeekFrom};
+use anyhow::{Context, Result};
 use std::path::Path;
 
 #[cfg(feature = "rocksdb")]
@@ -43,6 +42,8 @@ pub(crate) use redb_read_only::open_redb;
 #[cfg(feature = "storage-redb")]
 mod redb_read_only {
     use super::*;
+    use anyhow::bail;
+    use std::io::{Read, Seek, SeekFrom};
     use std::sync::Mutex;
 
     /// Field order matters: the database drops before the shared lock is released.

@@ -440,23 +440,17 @@ pub fn run_merge_pass(
     Ok(merged)
 }
 
-/// Whether anything still cites `target`, found by reading the store rather
-/// than an index: a memory's forward references, a `SemanticFact`'s
-/// `source_memories`, a `TemporalFact`'s `source_memory_id`.  For an engine
-/// that keeps no inbound-reference index; RocksDB answers the same question
-/// from its `inbound_ref:` index.
-pub fn scan_inbound_refs(
+/// Whether a `SemanticFact`'s `source_memories` or a `TemporalFact`'s
+/// `source_memory_id` still cites `target`, read from the facts in the store's
+/// default keyspace.  redb's fact half of
+/// [`PrimaryMemoryStore::has_any_inbound_refs`], whose memory half both engines
+/// answer from an inbound-reference index; neither engine indexes fact citations,
+/// and RocksDB reads the same rows with its own prefix scans.
+pub fn fact_cites_memory(
     store: &dyn PrimaryMemoryStore,
     target: &MemoryId,
     user_id: &str,
 ) -> Result<bool> {
-    if store
-        .get_all()?
-        .iter()
-        .any(|m| m.forward_ref_targets().contains(target))
-    {
-        return Ok(true);
-    }
     let kv = store.default_key_value_store();
     // Primary keys are `{prefix}{user_id}:{fact_id}`; secondary index rows carry more colons.
     let primary_rows = |prefix: &str| -> Result<Vec<Vec<u8>>> {

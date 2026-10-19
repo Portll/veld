@@ -335,6 +335,7 @@ zenoh = { version = "1.1", default-features = false, features = ["transport_tcp"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 http-body-util = "0.1"
+proptest = "1"
 serde-reflection = "0.6.0"
 tempfile = "3.24"
 
@@ -384,6 +385,14 @@ harness = false
 
 [[bench]]
 name = "softmax_benchmarks"
+harness = false
+
+[[bench]]
+name = "storage_engine_benchmarks"
+harness = false
+
+[[bench]]
+name = "cold_start_benchmarks"
 harness = false
 
 # =============================================================================
@@ -478,8 +487,8 @@ incremental = false     # Full rebuild every time (no incremental artifacts)
 # The default build carries both engines; RocksDB is the default engine (ADR 0007).
 default = ["rocksdb", "storage-redb"]
 
-# The RocksDB engine and what only it provides today: record-level at-rest encryption, the
-# RocksDB backup engine and the semantic merge pass. Needs libclang and a C++ toolchain. A build
+# The RocksDB engine and what only it provides today: the RocksDB backup engine and the
+# `MemoryStorage` in src/memory/storage.rs. Needs libclang and a C++ toolchain. A build
 # without it refuses those paths and names this feature:
 # `--no-default-features --features storage-redb` is the redb-only build.
 rocksdb = ["dep:rocksdb"]

@@ -4,7 +4,7 @@
 //! direct RocksDB types.
 
 use anyhow::{anyhow, Context, Result};
-use rocksdb::{ColumnFamily, Direction, IteratorMode, WriteBatch, DB};
+use rocksdb::{ColumnFamily, Direction, IteratorMode, WriteBatch, WriteOptions, DB};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,15 +19,33 @@ use crate::graph_memory::{EntityNode, EpisodicNode, GraphMemory, GraphStats, Rel
 use crate::memory::storage::{MemoryStorage, SearchCriteria, VectorMappingEntry};
 use crate::memory::{Memory, MemoryConfig, MemoryId};
 
+/// Options for one write: `sync` syncs the write-ahead log before the write returns,
+/// which is what `StorageDurability::Immediate` means on RocksDB.
+pub fn write_options(sync: bool) -> WriteOptions {
+    let mut options = WriteOptions::default();
+    options.set_sync(sync);
+    options
+}
+
+/// The process's choice, for adapters built over a handle that carries none.
+fn process_sync_writes() -> bool {
+    crate::config::StorageTuning::process().rocksdb_sync_writes()
+}
+
 /// DB-scoped atomic batch writer — see [`super::WriteBatch`] for why it hangs
 /// off the database rather than off a single store.
 pub struct RocksDbBatchWriter {
     db: Arc<DB>,
+    sync_writes: bool,
 }
 
 impl RocksDbBatchWriter {
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self::with_sync_writes(db, process_sync_writes())
+    }
+
+    pub fn with_sync_writes(db: Arc<DB>, sync_writes: bool) -> Self {
+        Self { db, sync_writes }
     }
 }
 
@@ -93,8 +111,9 @@ impl BatchWriter for RocksDbBatchWriter {
             wb
         };
 
+        let opts = write_options(self.sync_writes);
         let latch = super::write_latch::global();
-        match self.db.write(build()) {
+        match self.db.write_opt(build(), &opts) {
             Ok(()) => {
                 latch.note_write_ok(self.db.path());
                 Ok(())
@@ -103,7 +122,7 @@ impl BatchWriter for RocksDbBatchWriter {
                 let err = anyhow::Error::new(e).context("write_batch: rocksdb refused the batch");
                 super::write_latch::recover_write(latch, &self.db, self.db.path(), err, || {
                     self.db
-                        .write(build())
+                        .write_opt(build(), &opts)
                         .context("write_batch: rocksdb refused the batch")
                 })
             }
@@ -114,16 +133,22 @@ impl BatchWriter for RocksDbBatchWriter {
 /// Multi-column-family access over a live rocksdb handle.
 pub struct RocksDbColumnStore {
     db: Arc<DB>,
+    sync_writes: bool,
 }
 
 impl RocksDbColumnStore {
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self::with_sync_writes(db, process_sync_writes())
     }
 
-    /// A named family, or an error naming it. Never a silent default: resolving a
-    /// missing family to the default keyspace would put a store's rows somewhere
-    /// nothing reads, and every write would report success.
+    pub fn with_sync_writes(db: Arc<DB>, sync_writes: bool) -> Self {
+        Self { db, sync_writes }
+    }
+
+    /// A named family for a write, or an error naming it. Never a silent default:
+    /// resolving a missing family to the default keyspace would put a store's rows
+    /// somewhere nothing reads, and every write would report success. Reads do not
+    /// come here: a family the database does not have holds no rows (see `ColumnStore`).
     fn cf(&self, name: &str) -> Result<&ColumnFamily> {
         self.db
             .cf_handle(name)
@@ -137,16 +162,21 @@ impl ColumnStore for RocksDbColumnStore {
     }
 
     fn get_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.db.get_cf(self.cf(cf)?, key)?)
+        match self.db.cf_handle(cf) {
+            Some(handle) => Ok(self.db.get_cf(handle, key)?),
+            None => Ok(None),
+        }
     }
 
     fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
-        self.db.put_cf(self.cf(cf)?, key, value)?;
+        self.db
+            .put_cf_opt(self.cf(cf)?, key, value, &write_options(self.sync_writes))?;
         Ok(())
     }
 
     fn delete_cf(&self, cf: &str, key: &[u8]) -> Result<()> {
-        self.db.delete_cf(self.cf(cf)?, key)?;
+        self.db
+            .delete_cf_opt(self.cf(cf)?, key, &write_options(self.sync_writes))?;
         Ok(())
     }
 
@@ -162,7 +192,9 @@ impl ColumnStore for RocksDbColumnStore {
         prefix: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let handle = self.cf(cf)?;
+        let Some(handle) = self.db.cf_handle(cf) else {
+            return Ok(Vec::new());
+        };
         let mode = match prefix {
             Some(p) => IteratorMode::From(p, Direction::Forward),
             None => IteratorMode::Start,
@@ -193,7 +225,8 @@ impl ColumnStore for RocksDbColumnStore {
     }
 
     fn write_batch(&self, batch: &StorageWriteBatch) -> Result<()> {
-        RocksDbBatchWriter::new(Arc::clone(&self.db)).write_batch(batch)
+        RocksDbBatchWriter::with_sync_writes(Arc::clone(&self.db), self.sync_writes)
+            .write_batch(batch)
     }
 }
 
@@ -245,8 +278,16 @@ pub fn visit_records_read_only(path: &Path, mut visit: impl FnMut(&[u8], &[u8]))
 
 impl RocksDbPrimaryMemoryStore {
     pub fn open(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
+        Self::open_with_tuning(path, shared_cache, crate::config::StorageTuning::process())
+    }
+
+    pub fn open_with_tuning(
+        path: &Path,
+        shared_cache: Option<&rocksdb::Cache>,
+        tuning: crate::config::StorageTuning,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: Arc::new(MemoryStorage::new(path, shared_cache)?),
+            inner: Arc::new(MemoryStorage::new_with_tuning(path, shared_cache, tuning)?),
         })
     }
 
@@ -395,16 +436,11 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
     }
 
     fn put_vector_mapping(&self, id: &MemoryId, mapping: &VectorMappingEntry) -> Result<()> {
-        let mapping_key = format!("vmapping:{}", id.0);
-        let mapping_value = bincode::serde::encode_to_vec(mapping, bincode::config::standard())
-            .context("Failed to serialize vector mapping for legacy RocksDB store")?;
+        self.inner.put_vector_mapping(id, mapping)
+    }
 
-        self.inner
-            .db()
-            .put(mapping_key.as_bytes(), mapping_value)
-            .context("Failed to write vector mapping into legacy RocksDB store")?;
-
-        Ok(())
+    fn store_with_vectors(&self, memory: &Memory, vector_ids: Vec<u32>) -> Result<()> {
+        self.inner.store_with_vectors(memory, vector_ids)
     }
 
     fn delete_vector_mapping(&self, id: &MemoryId) -> Result<()> {
@@ -494,7 +530,7 @@ impl GraphStore for RocksDbGraphStore {
     }
 
     fn put_entity(&self, entity: &EntityNode) -> Result<()> {
-        self.inner.add_entity(entity.clone()).map(|_| ())
+        self.inner.put_entity_record(entity)
     }
 
     fn get_relationship(&self, uuid: &uuid::Uuid) -> Result<Option<RelationshipEdge>> {
@@ -502,7 +538,7 @@ impl GraphStore for RocksDbGraphStore {
     }
 
     fn put_relationship(&self, edge: &RelationshipEdge) -> Result<()> {
-        self.inner.add_relationship(edge.clone()).map(|_| ())
+        self.inner.put_relationship_record(edge)
     }
 
     fn list_relationships_for_entity(
@@ -712,6 +748,7 @@ pub fn import_separate_db_into_cf(db: &DB, old_dir: &Path, cf_name: &str) -> Res
             return Ok(());
         }
     };
+    let write_opts = write_options(process_sync_writes());
     let mut batch = WriteBatch::default();
     let mut count = 0usize;
     for item in old_db.iterator(IteratorMode::Start) {
@@ -724,11 +761,11 @@ pub fn import_separate_db_into_cf(db: &DB, old_dir: &Path, cf_name: &str) -> Res
         batch.put_cf(cf, &key, &value);
         count += 1;
         if count.is_multiple_of(10_000) {
-            db.write(std::mem::take(&mut batch))?;
+            db.write_opt(std::mem::take(&mut batch), &write_opts)?;
         }
     }
     if !batch.is_empty() {
-        db.write(batch)?;
+        db.write_opt(batch, &write_opts)?;
     }
     drop(old_db);
     tracing::info!(
@@ -763,13 +800,23 @@ pub(crate) fn create_separate_db_for_test(path: &Path, rows: &[(Vec<u8>, Vec<u8>
 pub struct RocksDbColumnFamilyStore {
     db: Arc<DB>,
     column_family: String,
+    sync_writes: bool,
 }
 
 impl RocksDbColumnFamilyStore {
     pub fn new(db: Arc<DB>, column_family: impl Into<String>) -> Self {
+        Self::with_sync_writes(db, column_family, process_sync_writes())
+    }
+
+    pub fn with_sync_writes(
+        db: Arc<DB>,
+        column_family: impl Into<String>,
+        sync_writes: bool,
+    ) -> Self {
         Self {
             db,
             column_family: column_family.into(),
+            sync_writes,
         }
     }
 
@@ -791,11 +838,16 @@ impl RocksDbColumnFamilyStore {
 /// a refactor's clothes.
 pub struct RocksDbDefaultKeyValueStore {
     db: Arc<DB>,
+    sync_writes: bool,
 }
 
 impl RocksDbDefaultKeyValueStore {
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self::with_sync_writes(db, process_sync_writes())
+    }
+
+    pub fn with_sync_writes(db: Arc<DB>, sync_writes: bool) -> Self {
+        Self { db, sync_writes }
     }
 }
 
@@ -809,12 +861,13 @@ impl KeyValueStore for RocksDbDefaultKeyValueStore {
     }
 
     fn put_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.db.put(key, value)?;
+        self.db
+            .put_opt(key, value, &write_options(self.sync_writes))?;
         Ok(())
     }
 
     fn delete_bytes(&self, key: &[u8]) -> Result<()> {
-        self.db.delete(key)?;
+        self.db.delete_opt(key, &write_options(self.sync_writes))?;
         Ok(())
     }
 
@@ -851,7 +904,7 @@ impl KeyValueStore for RocksDbDefaultKeyValueStore {
         for (k, v) in pairs {
             wb.put(k, v);
         }
-        self.db.write(wb)?;
+        self.db.write_opt(wb, &write_options(self.sync_writes))?;
         Ok(())
     }
 
@@ -860,7 +913,7 @@ impl KeyValueStore for RocksDbDefaultKeyValueStore {
         for k in keys {
             wb.delete(k);
         }
-        self.db.write(wb)?;
+        self.db.write_opt(wb, &write_options(self.sync_writes))?;
         Ok(())
     }
 }
@@ -875,12 +928,14 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
     }
 
     fn put_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.db.put_cf(self.cf()?, key, value)?;
+        self.db
+            .put_cf_opt(self.cf()?, key, value, &write_options(self.sync_writes))?;
         Ok(())
     }
 
     fn delete_bytes(&self, key: &[u8]) -> Result<()> {
-        self.db.delete_cf(self.cf()?, key)?;
+        self.db
+            .delete_cf_opt(self.cf()?, key, &write_options(self.sync_writes))?;
         Ok(())
     }
 
@@ -915,7 +970,7 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
         for (k, v) in pairs {
             wb.put_cf(cf, k, v);
         }
-        self.db.write(wb)?;
+        self.db.write_opt(wb, &write_options(self.sync_writes))?;
         Ok(())
     }
 
@@ -925,7 +980,7 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
         for k in keys {
             wb.delete_cf(cf, k);
         }
-        self.db.write(wb)?;
+        self.db.write_opt(wb, &write_options(self.sync_writes))?;
         Ok(())
     }
 }
@@ -934,6 +989,7 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
 pub struct RocksDbAuditStore {
     db: Arc<DB>,
     column_family: String,
+    sync_writes: bool,
 }
 
 impl RocksDbAuditStore {
@@ -941,6 +997,7 @@ impl RocksDbAuditStore {
         Self {
             db,
             column_family: column_family.into(),
+            sync_writes: process_sync_writes(),
         }
     }
 
@@ -965,7 +1022,12 @@ impl AuditStore for RocksDbAuditStore {
         let value = bincode::serde::encode_to_vec(event, bincode::config::standard())
             .context("Failed to serialize audit log entry for RocksDB audit store")?;
 
-        self.db.put_cf(self.cf()?, key.as_bytes(), value)?;
+        self.db.put_cf_opt(
+            self.cf()?,
+            key.as_bytes(),
+            value,
+            &write_options(self.sync_writes),
+        )?;
         Ok(())
     }
 
@@ -1045,7 +1107,7 @@ impl AuditStore for RocksDbAuditStore {
         }
 
         if removed > 0 {
-            self.db.write(batch)?;
+            self.db.write_opt(batch, &write_options(self.sync_writes))?;
         }
 
         Ok(removed)
@@ -1274,6 +1336,32 @@ mod migration_export_tests {
     }
 
     #[test]
+    fn writes_sync_only_under_immediate_durability() {
+        use crate::config::{StorageDurability, StorageTuning};
+        let immediate = StorageTuning {
+            durability: StorageDurability::Immediate,
+            ..StorageTuning::default()
+        };
+        assert!(immediate.rocksdb_sync_writes());
+        assert!(!StorageTuning::default().rocksdb_sync_writes());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_with_families(dir.path());
+        let mut batch = StorageWriteBatch::new();
+        batch.put_cf("kv", b"synced".to_vec(), b"1".to_vec());
+        RocksDbBatchWriter::with_sync_writes(Arc::clone(&db), true)
+            .write_batch(&batch)
+            .expect("a synced batch");
+        let kv = RocksDbColumnFamilyStore::with_sync_writes(Arc::clone(&db), "kv", true);
+        kv.put_bytes(b"also-synced", b"2").expect("a synced put");
+        assert_eq!(kv.get_bytes(b"synced").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(
+            kv.get_bytes(b"also-synced").unwrap().as_deref(),
+            Some(&b"2"[..])
+        );
+    }
+
+    #[test]
     fn migrate_in_place_refuses_and_says_what_to_do_instead() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = db_with_families(dir.path());
@@ -1281,5 +1369,780 @@ mod migration_export_tests {
             .migrate_in_place("alice", StorageBackend::Redb, dir.path())
             .expect_err("R-6d is do-not-implement");
         assert!(err.to_string().contains("export_portable"));
+    }
+}
+
+/// Behaviour both engines must share, asserted on each through the storage traits.
+#[cfg(all(test, feature = "storage-redb"))]
+mod engine_parity_tests {
+    use super::*;
+    use crate::backup::VeldBackupEngine;
+    use crate::memory::context::ContextBuilder;
+    use crate::memory::types::{EpisodeContext, Experience, ExperienceType, MemoryTier};
+    use crate::storage::redb::{RedbBackupStore, RedbPrimaryMemoryStore};
+
+    const MERGE_USER: &str = "parity-user";
+
+    fn memory(content: &str, importance: f32) -> Memory {
+        let now = chrono::Utc::now();
+        Memory::from_legacy(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                experience_type: ExperienceType::Observation,
+                content: content.to_string(),
+                ..Default::default()
+            },
+            importance,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// A child with a row in every keyed index: external id, episode and sequence,
+    /// tags, entities, and a parent that its inbound-reference row also names.
+    fn fully_indexed_child(parent: &MemoryId, external_id: &str, content: &str) -> Memory {
+        let mut child = memory(content, 0.5);
+        child.experience.tags = vec!["Parity".to_string()];
+        child.experience.entities = vec!["Tauranga".to_string()];
+        child.experience.context = Some(
+            ContextBuilder::new()
+                .with_episode(EpisodeContext {
+                    episode_id: Some(format!("episode-{external_id}")),
+                    sequence_number: Some(2),
+                    ..Default::default()
+                })
+                .build(),
+        );
+        child.parent_id = Some(parent.clone());
+        child.external_id = Some(external_id.to_string());
+        child
+    }
+
+    fn engines() -> Vec<(&'static str, Box<dyn PrimaryMemoryStore>, tempfile::TempDir)> {
+        let rocks_dir = tempfile::tempdir().expect("tempdir");
+        let rocks = RocksDbPrimaryMemoryStore::open(rocks_dir.path(), None).expect("rocksdb");
+        let redb_dir = tempfile::tempdir().expect("tempdir");
+        let redb = RedbPrimaryMemoryStore::open(redb_dir.path()).expect("redb");
+        vec![
+            ("rocksdb", Box::new(rocks), rocks_dir),
+            ("redb", Box::new(redb), redb_dir),
+        ]
+    }
+
+    fn ids(memories: Result<Vec<Memory>>) -> Vec<MemoryId> {
+        let mut ids: Vec<MemoryId> = memories
+            .expect("lookup")
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// What every lookup answers about a deleted child of `parent`.
+    #[derive(Debug, PartialEq)]
+    struct AfterDelete {
+        get_memory: Option<MemoryId>,
+        external_id: Option<MemoryId>,
+        children: Vec<MemoryId>,
+        by_parent: Vec<MemoryId>,
+        by_tag: Vec<MemoryId>,
+        by_entity: Vec<MemoryId>,
+        by_episode: Vec<MemoryId>,
+        by_episode_sequence: Vec<MemoryId>,
+        content_hash: Option<MemoryId>,
+        parent_still_cited: bool,
+        vector_mapping: bool,
+    }
+
+    impl AfterDelete {
+        const NOTHING: AfterDelete = AfterDelete {
+            get_memory: None,
+            external_id: None,
+            children: Vec::new(),
+            by_parent: Vec::new(),
+            by_tag: Vec::new(),
+            by_entity: Vec::new(),
+            by_episode: Vec::new(),
+            by_episode_sequence: Vec::new(),
+            content_hash: None,
+            parent_still_cited: false,
+            vector_mapping: false,
+        };
+
+        fn observe(
+            store: &dyn PrimaryMemoryStore,
+            parent: &MemoryId,
+            child: &Memory,
+            external_id: &str,
+        ) -> Self {
+            let episode = format!("episode-{external_id}");
+            Self {
+                get_memory: store
+                    .get_memory(&child.id)
+                    .expect("get_memory")
+                    .map(|m| m.id),
+                external_id: store
+                    .find_by_external_id(external_id)
+                    .expect("find_by_external_id")
+                    .map(|m| m.id),
+                children: ids(store.get_children(parent)),
+                by_parent: ids(store.search(SearchCriteria::ByParent(parent.clone()))),
+                by_tag: ids(store.search(SearchCriteria::ByTags(vec!["parity".to_string()]))),
+                by_entity: ids(store.search(SearchCriteria::ByEntity("tauranga".to_string()))),
+                by_episode: ids(store.search(SearchCriteria::ByEpisode(episode.clone()))),
+                by_episode_sequence: ids(store.search(SearchCriteria::ByEpisodeSequence {
+                    episode_id: episode,
+                    min_sequence: None,
+                    max_sequence: None,
+                })),
+                content_hash: store.get_by_content_hash(&child.experience.content),
+                parent_still_cited: store
+                    .has_any_inbound_refs(parent, MERGE_USER)
+                    .expect("has_any_inbound_refs"),
+                vector_mapping: store
+                    .get_vector_mapping(&child.id)
+                    .expect("get_vector_mapping")
+                    .is_some(),
+            }
+        }
+    }
+
+    #[test]
+    fn memories_sharing_content_answer_the_lowest_live_id_on_both_engines() {
+        let shared = "the same words, remembered three times";
+        let with_id = |first_byte: u8| {
+            let mut stored = memory(shared, 0.5);
+            stored.id = MemoryId(uuid::Uuid::from_bytes([first_byte; 16]));
+            stored
+        };
+        let (low, middle, high) = (with_id(0x10), with_id(0x80), with_id(0xF0));
+        for (engine, store, _dir) in engines() {
+            for stored in [&high, &low, &middle] {
+                store.put_memory(stored).unwrap();
+            }
+            assert_eq!(
+                store.get_by_content_hash(shared),
+                Some(low.id.clone()),
+                "{engine}: the lowest id answers, not the last stored"
+            );
+
+            store.delete_memory(&low.id).unwrap();
+            assert_eq!(
+                store.get_by_content_hash(shared),
+                Some(middle.id.clone()),
+                "{engine}: deleting one holder leaves the others findable"
+            );
+
+            let mut moved_on = middle.clone();
+            moved_on.experience.content = "other words now".to_string();
+            store.update_memory(&moved_on).unwrap();
+            assert_eq!(
+                store.get_by_content_hash(shared),
+                Some(high.id.clone()),
+                "{engine}: a rewritten holder stops answering for its old content"
+            );
+            assert_eq!(
+                store.get_by_content_hash("other words now"),
+                Some(middle.id.clone()),
+                "{engine}"
+            );
+
+            store.delete_memory(&high.id).unwrap();
+            assert_eq!(store.get_by_content_hash(shared), None, "{engine}");
+        }
+    }
+
+    #[test]
+    fn a_deleted_memory_answers_no_lookup_on_either_engine() {
+        for (engine, store, _dir) in engines() {
+            let parent = memory("the parent", 0.5);
+            store.put_memory(&parent).unwrap();
+
+            let by_delete_memory =
+                fully_indexed_child(&parent.id, "linear:VELD-1", "removed by delete_memory");
+            let by_delete = fully_indexed_child(&parent.id, "linear:VELD-2", "removed by delete");
+            for child in [&by_delete_memory, &by_delete] {
+                store.store_with_vectors(child, vec![5]).unwrap();
+            }
+            assert_eq!(
+                AfterDelete::observe(
+                    store.as_ref(),
+                    &parent.id,
+                    &by_delete_memory,
+                    "linear:VELD-1"
+                )
+                .external_id,
+                Some(by_delete_memory.id.clone()),
+                "{engine}: the fixture is not findable before the delete"
+            );
+
+            store.delete_memory(&by_delete_memory.id).unwrap();
+            store.delete(&by_delete.id).unwrap();
+
+            for (child, external_id) in [
+                (&by_delete_memory, "linear:VELD-1"),
+                (&by_delete, "linear:VELD-2"),
+            ] {
+                assert_eq!(
+                    AfterDelete::observe(store.as_ref(), &parent.id, child, external_id),
+                    AfterDelete::NOTHING,
+                    "{engine}: a lookup still answers for {external_id} after its delete"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_all_leaves_out_forgotten_memories_on_both_engines() {
+        for (engine, store, _dir) in engines() {
+            let kept = [memory("kept one", 0.9), memory("kept two", 0.9)];
+            let forgotten = memory("forgotten", 0.1);
+            for m in kept.iter().chain([&forgotten]) {
+                store.put_memory(m).unwrap();
+            }
+            assert_eq!(
+                store.mark_forgotten_by_importance(0.5).unwrap(),
+                vec![forgotten.id.clone()],
+                "{engine}"
+            );
+
+            let mut live: Vec<MemoryId> = kept.iter().map(|m| m.id.clone()).collect();
+            live.sort();
+            assert_eq!(ids(store.get_all()), live, "{engine}: get_all");
+
+            let mut every = live.clone();
+            every.push(forgotten.id.clone());
+            every.sort();
+            let mut all_ids = store.get_all_ids().unwrap();
+            all_ids.sort();
+            assert_eq!(
+                all_ids, every,
+                "{engine}: get_all_ids keeps forgotten records"
+            );
+            assert!(
+                store.get(&forgotten.id).unwrap().is_forgotten(),
+                "{engine}: a forgotten record is still readable by id"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_stores_list_newest_first_on_both_engines() {
+        let rocks_dir = tempfile::tempdir().expect("tempdir");
+        let rocks = RocksDbPrimaryMemoryStore::open(&rocks_dir.path().join("store"), None).unwrap();
+        let rocks_backups = RocksDbBackupStore::new(
+            VeldBackupEngine::new(rocks_dir.path().join("backups")).unwrap(),
+            rocks.inner().db(),
+        );
+        let redb_dir = tempfile::tempdir().expect("tempdir");
+        let redb = RedbPrimaryMemoryStore::open(redb_dir.path()).unwrap();
+        let redb_backups = RedbBackupStore::from_database(redb.database(), redb_dir.path());
+
+        let stores: [(&str, &dyn PrimaryMemoryStore, &dyn BackupStore); 2] = [
+            ("rocksdb", &rocks, &rocks_backups),
+            ("redb", &redb, &redb_backups),
+        ];
+        for (engine, primary, backups) in stores {
+            let mut created = Vec::new();
+            for round in 0..3 {
+                primary
+                    .put_memory(&memory(&format!("round {round}"), 0.5))
+                    .unwrap();
+                created.push(backups.create_backup(MERGE_USER).unwrap().backup_id);
+            }
+            created.reverse();
+            let listed: Vec<u32> = backups
+                .list_backups(MERGE_USER)
+                .unwrap()
+                .iter()
+                .map(|metadata| metadata.backup_id)
+                .collect();
+            assert_eq!(
+                listed, created,
+                "{engine}: backups are not listed newest first"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_combined_search_finds_nothing_on_both_engines() {
+        for (engine, store, _dir) in engines() {
+            store.put_memory(&memory("a live memory", 0.5)).unwrap();
+            assert!(
+                store
+                    .search(SearchCriteria::Combined(Vec::new()))
+                    .unwrap()
+                    .is_empty(),
+                "{engine}: Combined([]) answered with memories"
+            );
+            assert!(
+                store
+                    .search(SearchCriteria::Combined(vec![
+                        SearchCriteria::Combined(Vec::new()),
+                        SearchCriteria::RootsOnly,
+                    ]))
+                    .unwrap()
+                    .is_empty(),
+                "{engine}: an empty Combined nested in another matched"
+            );
+        }
+    }
+
+    #[test]
+    fn range_searches_answer_their_exact_bounds_on_both_engines() {
+        let day = chrono::DateTime::parse_from_rfc3339("2026-03-04T00:00:00Z")
+            .expect("a valid instant")
+            .with_timezone(&chrono::Utc);
+        let placed = |content: &str, importance: f32, hour: i64, reward: f32, at: (f64, f64)| {
+            let mut placed = memory(content, importance);
+            placed.created_at = day + chrono::Duration::hours(hour);
+            placed.experience.reward = Some(reward);
+            placed.experience.geo_location = Some([at.0, at.1, 0.0]);
+            placed
+        };
+        let london = (51.5074, -0.1278);
+        let low = placed("on the bucket edge", 0.30, 1, -0.30, london);
+        let inside = placed("inside every bound", 0.34, 13, -0.26, (51.5074, 0.5900));
+        let high = placed("past every bound", 0.39, 23, -0.21, (51.5074, 0.6400));
+        let north = placed("49 km north", 0.10, 30, 0.9, (51.9474, -0.1278));
+
+        for (engine, store, _dir) in engines() {
+            for m in [&low, &inside, &high, &north] {
+                store.put_memory(m).unwrap();
+            }
+            let found = |criteria: SearchCriteria| ids(store.search(criteria));
+            assert_eq!(
+                found(SearchCriteria::ByImportance {
+                    min: 0.31,
+                    max: 0.35
+                }),
+                vec![inside.id.clone()],
+                "{engine}: importance answered from its tenth bucket"
+            );
+            assert_eq!(
+                found(SearchCriteria::ByDate {
+                    start: day + chrono::Duration::hours(12),
+                    end: day + chrono::Duration::hours(14),
+                }),
+                vec![inside.id.clone()],
+                "{engine}: a mid-day bound answered with the whole day"
+            );
+            assert_eq!(
+                found(SearchCriteria::ByReward {
+                    min: -0.28,
+                    max: -0.24
+                }),
+                vec![inside.id.clone()],
+                "{engine}: reward answered from its twentieth bucket"
+            );
+            let mut near_london = vec![low.id.clone(), inside.id.clone(), north.id.clone()];
+            near_london.sort();
+            assert_eq!(
+                found(SearchCriteria::ByLocation {
+                    lat: london.0,
+                    lon: london.1,
+                    radius_meters: 51_000.0,
+                }),
+                near_london,
+                "{engine}: a radius search missed or overshot the circle"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_prefix_keys_answers_memory_keys_only_on_both_engines() {
+        for (engine, store, _dir) in engines() {
+            let stored = memory("a memory to find by key", 0.5);
+            store.put_memory(&stored).unwrap();
+            store
+                .default_key_value_store()
+                .put_bytes(b"dkv:not-a-memory", b"1")
+                .unwrap();
+            store
+                .put_vector_mapping(&stored.id, &VectorMappingEntry::default())
+                .unwrap();
+
+            assert_eq!(
+                store.scan_prefix_keys(b"").unwrap(),
+                vec![stored.id.0.as_bytes().to_vec()],
+                "{engine}: a scan of every key reached past the memories"
+            );
+            assert!(
+                store.scan_prefix_keys(b"dkv:").unwrap().is_empty(),
+                "{engine}: a default-keyspace row answered as a memory key"
+            );
+            assert_eq!(
+                store
+                    .scan_prefix_keys(&stored.id.0.as_bytes()[..1])
+                    .unwrap(),
+                vec![stored.id.0.as_bytes().to_vec()],
+                "{engine}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rewrite_over_a_live_id_leaves_no_lookup_for_the_old_version_on_both_engines() {
+        type Write = fn(&dyn PrimaryMemoryStore, &Memory) -> Result<()>;
+        let writes: [(&str, Write); 4] = [
+            ("store", |store, memory| store.store(memory)),
+            ("put_memory", |store, memory| store.put_memory(memory)),
+            ("update", |store, memory| store.update(memory)),
+            ("store_with_vectors", |store, memory| {
+                store.store_with_vectors(memory, vec![4])
+            }),
+        ];
+        for (path, write) in writes {
+            for (engine, store, _dir) in engines() {
+                let parent = memory("the old parent", 0.5);
+                store.put_memory(&parent).unwrap();
+                let original =
+                    fully_indexed_child(&parent.id, "linear:VELD-9", "the original version");
+                store.put_memory(&original).unwrap();
+
+                let mut rewritten = memory("the rewritten version", 0.5);
+                rewritten.id = original.id.clone();
+                write(store.as_ref(), &rewritten).unwrap();
+
+                let stale = AfterDelete {
+                    get_memory: store.get_memory(&original.id).unwrap().map(|m| m.id),
+                    vector_mapping: false,
+                    ..AfterDelete::observe(store.as_ref(), &parent.id, &original, "linear:VELD-9")
+                };
+                let expected = AfterDelete {
+                    get_memory: Some(original.id.clone()),
+                    ..AfterDelete::NOTHING
+                };
+                assert_eq!(
+                    stale, expected,
+                    "{engine} {path}: a lookup still answers for the replaced version"
+                );
+                assert_eq!(
+                    store.get_by_content_hash("the rewritten version"),
+                    Some(original.id.clone()),
+                    "{engine} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_batch_naming_kv_applies_to_a_fresh_store_on_both_engines() {
+        for (engine, store, _dir) in engines() {
+            let mut batch = StorageWriteBatch::new();
+            batch.put_cf("kv", b"dials".to_vec(), b"1".to_vec());
+            store
+                .write_batch(&batch)
+                .unwrap_or_else(|e| panic!("{engine}: {e}"));
+            assert_eq!(
+                store.key_value_store().get_bytes(b"dials").unwrap(),
+                Some(b"1".to_vec()),
+                "{engine}"
+            );
+        }
+    }
+
+    /// A record under a memory key that no decoder accepts.
+    const UNDECODABLE: &[u8] = b"not a memory";
+
+    #[test]
+    fn an_undecodable_record_is_skipped_counted_and_alone_cleaned_up_on_both_engines() {
+        let rocks_dir = tempfile::tempdir().expect("tempdir");
+        let rocks = RocksDbPrimaryMemoryStore::open(rocks_dir.path(), None).unwrap();
+        let redb_dir = tempfile::tempdir().expect("tempdir");
+        let redb = RedbPrimaryMemoryStore::open(redb_dir.path()).unwrap();
+        let corrupt = MemoryId(uuid::Uuid::new_v4());
+        rocks
+            .inner()
+            .db()
+            .put(corrupt.0.as_bytes(), UNDECODABLE)
+            .unwrap();
+        {
+            let txn = redb.database().begin_write().unwrap();
+            txn.open_table(::redb::TableDefinition::<&[u8], &[u8]>::new("memories"))
+                .unwrap()
+                .insert(corrupt.0.as_bytes().as_slice(), UNDECODABLE)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+
+        let skipped = |engine: &str| match engine {
+            "rocksdb" => rocks.inner().undecodable_records_skipped(),
+            _ => redb.undecodable_records_skipped(),
+        };
+        let stores: [(&str, &dyn PrimaryMemoryStore); 2] = [("rocksdb", &rocks), ("redb", &redb)];
+        for (engine, store) in stores {
+            let live = memory("a decodable neighbour", 0.5);
+            store.put_memory(&live).unwrap();
+            let kv = store.default_key_value_store();
+            kv.put_bytes(b"dkv:a", b"kept").unwrap();
+            kv.put_bytes(b"merge_audit:parity-user:1", b"kept").unwrap();
+            kv.put_bytes(b"merge_tombstone:parity-user:1", b"kept")
+                .unwrap();
+
+            assert_eq!(
+                ids(store.get_all()),
+                vec![live.id.clone()],
+                "{engine}: get_all did not skip the undecodable record"
+            );
+            assert!(
+                skipped(engine) >= 1,
+                "{engine}: the skipped record was not counted"
+            );
+            assert_eq!(
+                store.cleanup_corrupted().unwrap(),
+                1,
+                "{engine}: cleanup removed something other than the undecodable record"
+            );
+            assert_eq!(
+                store.get_all_ids().unwrap(),
+                vec![live.id.clone()],
+                "{engine}"
+            );
+            for key in [
+                &b"dkv:a"[..],
+                b"merge_audit:parity-user:1",
+                b"merge_tombstone:parity-user:1",
+            ] {
+                assert_eq!(
+                    kv.get_bytes(key).unwrap(),
+                    Some(b"kept".to_vec()),
+                    "{engine}: cleanup deleted a default-keyspace row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_undeclared_family_reads_empty_on_both_engines() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let rocks_db = Arc::new(DB::open(&opts, tmp.path().join("rocks")).unwrap());
+        let redb_db =
+            crate::storage::redb::create_redb_database_for_test(&tmp.path().join("t.redb"))
+                .unwrap();
+        let stores: [(&str, Arc<dyn ColumnStore>); 2] = [
+            ("rocksdb", Arc::new(RocksDbColumnStore::new(rocks_db))),
+            (
+                "redb",
+                Arc::new(crate::storage::redb::RedbColumnStore::new(redb_db)),
+            ),
+        ];
+        for (engine, store) in stores {
+            assert_eq!(store.get_cf("undeclared", b"k").unwrap(), None, "{engine}");
+            assert!(
+                store.scan_cf("undeclared", None, None).unwrap().is_empty(),
+                "{engine}"
+            );
+            assert!(
+                store
+                    .scan_cf("undeclared", Some(b"k"), Some(1))
+                    .unwrap()
+                    .is_empty(),
+                "{engine}"
+            );
+        }
+    }
+
+    fn graph_engines() -> Vec<(&'static str, Box<dyn GraphStore>, tempfile::TempDir)> {
+        let rocks_dir = tempfile::tempdir().expect("tempdir");
+        let rocks = RocksDbGraphStore::open(rocks_dir.path(), None).expect("rocksdb graph");
+        let redb_dir = tempfile::tempdir().expect("tempdir");
+        let redb = crate::storage::redb::RedbGraphStore::open(redb_dir.path()).expect("redb graph");
+        vec![
+            ("rocksdb", Box::new(rocks), rocks_dir),
+            ("redb", Box::new(redb), redb_dir),
+        ]
+    }
+
+    fn entity(name: &str) -> EntityNode {
+        let now = chrono::Utc::now();
+        EntityNode {
+            uuid: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            labels: Vec::new(),
+            created_at: now,
+            last_seen_at: now,
+            mention_count: 3,
+            summary: "given by the caller".to_string(),
+            attributes: Default::default(),
+            name_embedding: None,
+            salience: 0.4,
+            is_proper_noun: true,
+            pii_classification: Default::default(),
+        }
+    }
+
+    fn edge(from: &EntityNode, to: &EntityNode) -> RelationshipEdge {
+        let now = chrono::Utc::now();
+        RelationshipEdge {
+            uuid: uuid::Uuid::new_v4(),
+            from_entity: from.uuid,
+            to_entity: to.uuid,
+            relation_type: crate::graph_memory::RelationType::WorksWith,
+            strength: 0.3,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: "given by the caller".to_string(),
+            last_activated: now,
+            activation_count: 2,
+            ltp_status: Default::default(),
+            tier: Default::default(),
+            activation_timestamps: None,
+            entity_confidence: None,
+            created_by: Default::default(),
+            forward_strength: 0.0,
+            backward_strength: 0.0,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
+        }
+    }
+
+    fn episode(refs: Vec<uuid::Uuid>) -> EpisodicNode {
+        let now = chrono::Utc::now();
+        EpisodicNode {
+            uuid: uuid::Uuid::new_v4(),
+            name: "an episode".to_string(),
+            content: "the harbour survey".to_string(),
+            valid_at: now,
+            created_at: now,
+            entity_refs: refs,
+            source: crate::graph_memory::EpisodeSource::Observation,
+            metadata: Default::default(),
+        }
+    }
+
+    fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        serde_json::to_value(value).expect("graph records serialize")
+    }
+
+    #[test]
+    fn a_graph_record_reads_back_by_the_uuid_it_was_given_on_both_engines() {
+        for (engine, store, _dir) in graph_engines() {
+            let harbour = entity("harbour");
+            let lantern = entity("lantern");
+            for node in [&harbour, &lantern] {
+                store.put_entity(node).unwrap();
+            }
+            let link = edge(&harbour, &lantern);
+            store.put_relationship(&link).unwrap();
+
+            assert_eq!(
+                store.get_entity(&harbour.uuid).unwrap().as_ref().map(json),
+                Some(json(&harbour)),
+                "{engine}: the entity is not stored as given under its uuid"
+            );
+            assert_eq!(
+                store
+                    .get_relationship(&link.uuid)
+                    .unwrap()
+                    .as_ref()
+                    .map(json),
+                Some(json(&link)),
+                "{engine}: the edge is not stored as given under its uuid"
+            );
+            let listed: Vec<serde_json::Value> = store
+                .list_relationships_for_entity(&lantern.uuid)
+                .unwrap()
+                .iter()
+                .map(json)
+                .collect();
+            assert_eq!(listed, vec![json(&link)], "{engine}");
+
+            let mut rewritten = link.clone();
+            rewritten.strength = 0.9;
+            store.put_relationship(&rewritten).unwrap();
+            assert_eq!(
+                store
+                    .get_relationship(&link.uuid)
+                    .unwrap()
+                    .as_ref()
+                    .map(json),
+                Some(json(&rewritten)),
+                "{engine}: a rewrite is stored as given, not merged"
+            );
+            let stats = store.stats().unwrap();
+            assert_eq!(
+                (stats.entity_count, stats.relationship_count),
+                (2, 1),
+                "{engine}: a rewrite was counted as a new record"
+            );
+        }
+    }
+
+    #[test]
+    fn rewriting_an_episode_does_not_count_it_twice_on_both_engines() {
+        for (engine, store, _dir) in graph_engines() {
+            let first = episode(Vec::new());
+            store.put_episode(&first).unwrap();
+            let mut rewritten = first.clone();
+            rewritten.content = "the harbour survey, revised".to_string();
+            store.put_episode(&rewritten).unwrap();
+            store.put_episode(&episode(Vec::new())).unwrap();
+            assert_eq!(store.stats().unwrap().episode_count, 2, "{engine}");
+            assert_eq!(
+                store.get_episode(&first.uuid).unwrap().as_ref().map(json),
+                Some(json(&rewritten)),
+                "{engine}"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_memory_counts_episodes_not_writes_over_either_column_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let graphs = [
+            (
+                "rocksdb",
+                GraphMemory::new(&tmp.path().join("rocks"), None).unwrap(),
+            ),
+            (
+                "redb",
+                GraphMemory::with_store(Arc::new(crate::storage::redb::RedbColumnStore::new(
+                    crate::storage::redb::create_redb_database_for_test(
+                        &tmp.path().join("graph.redb"),
+                    )
+                    .unwrap(),
+                )))
+                .unwrap(),
+            ),
+        ];
+        for (engine, graph) in graphs {
+            let anchor = graph.add_entity(entity("anchor")).unwrap();
+            let buoy = graph.add_entity(entity("buoy")).unwrap();
+            let mut written = episode(vec![anchor, buoy]);
+            graph.add_episode(written.clone()).unwrap();
+            written.entity_refs = vec![buoy];
+            graph.add_episode(written.clone()).unwrap();
+
+            assert_eq!(graph.get_stats().unwrap().episode_count, 1, "{engine}");
+            assert!(
+                graph
+                    .get_episodes_by_entity(&anchor)
+                    .unwrap()
+                    .iter()
+                    .all(|found| found.uuid != written.uuid),
+                "{engine}: the entity index still names an episode that dropped it"
+            );
+        }
     }
 }
