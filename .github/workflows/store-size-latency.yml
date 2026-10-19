@@ -1,0 +1,126 @@
+name: Store-Size Latency
+
+# bench/recall_latency_guard.py runs against a 20-memory corpus, so an O(N)-per-request path
+# costs the same before and after a fix. This lane seeds a tenant to N memories next to a
+# fresh tenant and compares per-route p95 on both. See BENCHMARKS.md, "Store-Size Latency Lane".
+#
+# Not a PR gate: seeding 10 000 memories through the embedder takes a while. It runs nightly
+# and on demand, and fails the job when the probe exits non-zero.
+on:
+  workflow_dispatch:
+    inputs:
+      size:
+        description: "memories to seed on the large tenant"
+        required: false
+        default: "10000"
+      max_ratio:
+        description: "max large/fresh p95 ratio"
+        required: false
+        default: "5"
+  schedule:
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: store-size-latency-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  store-size-latency:
+    name: Store-size latency (release build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
+      # The ONNX runtime and MiniLM, as in ci.yml: ort is load-dynamic and the runner has neither.
+      - uses: actions/cache@v4
+        id: models
+        with:
+          path: ~/.cache/veld
+          key: veld-models-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs') }}
+      - name: Fetch the ONNX runtime and MiniLM
+        if: steps.models.outputs.cache-hit != 'true'
+        run: cargo run --release --quiet --bin model-fetch -- --onnxruntime --minilm
+
+      - name: Build release server
+        run: cargo build --release --bin veld
+
+      - name: Start veld server
+        env:
+          VELD_HOST: 127.0.0.1
+          VELD_PORT: "3030"
+          VELD_API_KEYS: store-size-probe-key
+        run: |
+          DATA_DIR="$(mktemp -d "$RUNNER_TEMP/veld-data.XXXXXX")"
+          VELD_MEMORY_PATH="$DATA_DIR" nohup ./target/release/veld server > "$RUNNER_TEMP/veld-server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/veld.pid"
+          for _ in $(seq 1 120); do
+            if curl -sf http://127.0.0.1:3030/health > /dev/null; then
+              echo "veld is up"
+              exit 0
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/veld.pid")" 2>/dev/null; then
+              echo "::error::veld exited during startup"
+              cat "$RUNNER_TEMP/veld-server.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::veld did not answer /health within 120 s"
+          cat "$RUNNER_TEMP/veld-server.log"
+          exit 1
+
+      - name: Run store-size latency probe
+        env:
+          VELD_API_URL: http://127.0.0.1:3030
+          VELD_API_KEY: store-size-probe-key
+          PROBE_SIZE: ${{ github.event.inputs.size || '10000' }}
+          PROBE_MAX_RATIO: ${{ github.event.inputs.max_ratio || '5' }}
+        run: |
+          python3 bench/store_size_latency_probe.py \
+            --size "$PROBE_SIZE" \
+            --max-ratio "$PROBE_MAX_RATIO" \
+            --out store-size-latency.json 2>&1 | tee probe-output.txt
+          # tee masks the probe's exit code; propagate it.
+          exit "${PIPESTATUS[0]}"
+
+      - name: Post probe summary
+        if: always()
+        run: |
+          echo "## Store-Size Latency" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat probe-output.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload probe result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: store-size-latency
+          path: |
+            store-size-latency.json
+            probe-output.txt
+          if-no-files-found: ignore
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veld-server-log
+          path: ${{ runner.temp }}/veld-server.log
+          if-no-files-found: ignore
+
+      - name: Stop veld server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/veld.pid" ]; then kill "$(cat "$RUNNER_TEMP/veld.pid")" 2>/dev/null || true; fi
