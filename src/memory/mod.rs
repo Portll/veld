@@ -1778,8 +1778,10 @@ impl MemorySystem {
         // moves into the record, and threads the episode when the writer did not.
         let turn_text = self.turn_index_text(&mut experience, created_at);
         let embed_input: std::borrow::Cow<'_, str> = match &turn_text {
-            Some(text) => std::borrow::Cow::Owned(text.embedding.clone()),
-            None => std::borrow::Cow::Borrowed(experience.content.as_str()),
+            Some(text) if self.cognitive_dials.read().turn_context_embedding_enabled() => {
+                std::borrow::Cow::Owned(text.embedding.clone())
+            }
+            _ => std::borrow::Cow::Borrowed(experience.content.as_str()),
         };
 
         // PERFORMANCE: Content embedding cache (80ms → <1μs for repeated content)
@@ -2477,7 +2479,7 @@ impl MemorySystem {
     /// enriched searchable text every other record gets.
     fn stored_embedding_text(&self, memory: &Memory) -> String {
         if index_text::applies(&memory.experience)
-            && self.cognitive_dials.read().turn_context_enabled()
+            && self.cognitive_dials.read().turn_context_embedding_enabled()
         {
             let prior = index_text::preceding_memory_id(&memory.experience)
                 .and_then(|id| self.long_term_memory.get(&id).ok())
