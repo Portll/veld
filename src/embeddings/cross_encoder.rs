@@ -388,6 +388,22 @@ pub fn list_registered() -> Vec<(String, u32, u32, u16, &'static str)> {
 // ONNX cross-encoder
 // -----------------------------------------------------------------------------
 
+/// One download lock per cache directory, shared by every [`OnnxCrossEncoder`] that
+/// resolves to it: the registry can hand out two instances of one id (the env-selected
+/// model and a dial-selected one, or the harness's tape filler), and they must not fetch
+/// the same files at once.
+static DOWNLOAD_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn download_lock(dir: &std::path::Path) -> Arc<Mutex<()>> {
+    Arc::clone(
+        DOWNLOAD_LOCKS
+            .lock()
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
 /// What the model's primary output head looks like — detected by inspecting
 /// the loaded ONNX graph, not the registry's hint, so a wrong (or missing)
 /// `rerank_top_k`/`has_token_type_ids` config never lets a runtime bug
@@ -502,11 +518,24 @@ impl OnnxCrossEncoder {
         }));
     }
 
+    /// The files on disk, downloading whichever is missing. Downloads of one cache
+    /// directory are serialised process-wide: the background pre-warm and the first
+    /// scorer (the recall harness's probe, a first query) both arrive here within
+    /// milliseconds of each other on a cold cache, and two downloads of one file share one
+    /// `.part` path, so the second to finish found its partial file renamed away by the
+    /// first and failed as "Failed to download model". Under the lock the second finds
+    /// the files present and returns.
     fn ensure_downloaded(&self) -> Result<(PathBuf, PathBuf)> {
         let dir = self.cache_dir();
         let model_path = dir.join("model.onnx");
         let tokenizer_path = dir.join("tokenizer.json");
 
+        if model_path.exists() && tokenizer_path.exists() {
+            return Ok((model_path, tokenizer_path));
+        }
+
+        let lock = download_lock(&dir);
+        let _downloading = lock.lock();
         if model_path.exists() && tokenizer_path.exists() {
             return Ok((model_path, tokenizer_path));
         }
