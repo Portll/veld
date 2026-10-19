@@ -102,6 +102,14 @@ pub struct TurnIndexText {
     pub bm25_entities: Vec<String>,
 }
 
+/// What ingest resolved for one turn: the text its indexes receive and the turn it
+/// was found to follow, which `remember` records in the successor index.
+#[derive(Debug, Clone)]
+pub struct ContextualisedTurn {
+    pub text: TurnIndexText,
+    pub prior: Option<MemoryId>,
+}
+
 /// Tail of the per-conversation chain: the latest turn seen for a conversation key.
 #[derive(Debug, Clone)]
 pub struct ChainTail {
