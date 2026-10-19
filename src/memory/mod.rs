@@ -842,7 +842,45 @@ pub struct EmbedIndexOutcome {
     pub absorbed_by: Option<String>,
 }
 
+/// How a new memory's vectors fared in [`MemorySystem::store_new_memory`].
+enum VectorIndexing {
+    /// Vectors indexed; mapping stored with the memory.
+    Indexed,
+    /// Embedding deferred to `embed_and_index`; memory stored without a mapping.
+    Deferred,
+    /// Vector indexing failed; memory stored without a mapping.
+    Failed(anyhow::Error),
+}
+
 impl MemorySystem {
+    /// Persist a NEW memory and, unless `defer_embedding`, its vector mapping in one
+    /// storage write. The vectors enter the in-memory index first because their ids
+    /// are what the mapping records; a failed write takes them back out, so the index
+    /// never serves a vector whose memory was not stored. A failed index still stores
+    /// the memory, for the caller to hand to the embedding backlog.
+    ///
+    /// Only for an id with no stored vectors: undoing a failed write removes every
+    /// vector the id has, which for an existing memory would include its own.
+    fn store_new_memory(&self, memory: &Memory, defer_embedding: bool) -> Result<VectorIndexing> {
+        if defer_embedding {
+            self.long_term_memory.store(memory)?;
+            return Ok(VectorIndexing::Deferred);
+        }
+        match self.retriever.index_vectors(memory) {
+            Ok(vector_ids) => {
+                if let Err(e) = self.long_term_memory.store_with_vectors(memory, vector_ids) {
+                    self.retriever.remove_memory(&memory.id);
+                    return Err(e);
+                }
+                Ok(VectorIndexing::Indexed)
+            }
+            Err(e) => {
+                self.long_term_memory.store(memory)?;
+                Ok(VectorIndexing::Failed(e))
+            }
+        }
+    }
+
     /// Create a new memory system.
     ///
     /// If `shared_cache` is provided, all per-user RocksDB instances share the
@@ -2030,9 +2068,12 @@ impl MemorySystem {
         // Reference: Ehlers & Clark (2000) — poor elaboration → pathological intrusions.
         memory.set_elaboration_score(Self::compute_elaboration_score(&memory));
 
-        // CRITICAL: Persist to RocksDB storage FIRST (before indexing/in-memory tiers)
-        // This ensures retrieval can always fetch the memory from persistent storage
-        self.long_term_memory.store(&memory)?;
+        // CRITICAL: Persist to storage before the in-memory tiers, so retrieval can
+        // always fetch the memory. The vector mapping is written in the same commit.
+        // When defer_embedding=true, vector indexing is skipped — embed_and_index()
+        // handles it later; BM25 keyword search (below) provides immediate
+        // searchability regardless.
+        let vector_indexing = self.store_new_memory(&memory, defer_embedding)?;
 
         // Log creation
         self.logger.write().log_created(&memory, "working");
@@ -2042,11 +2083,10 @@ impl MemorySystem {
             .write()
             .add_shared(Arc::clone(&memory))?;
 
-        // Index memory for semantic search (vector DB).
-        // When defer_embedding=true, this is skipped — embed_and_index() handles it later.
-        // BM25 keyword search (below) provides immediate searchability regardless.
-        let indexed = if !defer_embedding {
-            if let Err(e) = self.retriever.index_memory(&memory) {
+        let indexed = match vector_indexing {
+            VectorIndexing::Indexed => true,
+            VectorIndexing::Deferred => false,
+            VectorIndexing::Failed(e) => {
                 tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
                 if let Err(record_err) = self.embedding_backlog.record(
                     &memory.id,
@@ -2059,11 +2099,7 @@ impl MemorySystem {
                     );
                 }
                 false
-            } else {
-                true
             }
-        } else {
-            false
         };
 
         // NOTE: Graph processing (entities + co-occurrence edges) is handled by
@@ -3011,8 +3047,9 @@ impl MemorySystem {
         // FIX-R2: Compute elaboration score at encoding time
         memory.set_elaboration_score(Self::compute_elaboration_score(&memory));
 
-        // Persist to RocksDB storage
-        self.long_term_memory.store(&memory)?;
+        // Persist with its vector mapping (indexing skipped when deferred —
+        // embed_and_index handles it)
+        let vector_indexing = self.store_new_memory(&memory, defer_embedding)?;
         self.logger.write().log_created(&memory, "working");
 
         // Add to working memory
@@ -3020,11 +3057,8 @@ impl MemorySystem {
             .write()
             .add_shared(Arc::clone(&memory))?;
 
-        // Index for semantic search (skipped when deferred — embed_and_index handles it)
-        if !defer_embedding {
-            if let Err(e) = self.retriever.index_memory(&memory) {
-                tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
-            }
+        if let VectorIndexing::Failed(e) = vector_indexing {
+            tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
         }
 
         // Add entities to knowledge graph with co-occurrence edges
@@ -3110,6 +3144,10 @@ impl MemorySystem {
                 }
             }
 
+            // Every co-occurrence and causal edge goes to the graph in one batch: one
+            // commit for the memory rather than one per edge, and none half-indexed.
+            let mut edges = Vec::new();
+
             // Semantic edge weighting
             let l1_base_weight = crate::graph_memory::EdgeTier::L1Working.initial_weight();
             for (entity1, entity2) in cooccurrence_pairs {
@@ -3151,15 +3189,7 @@ impl MemorySystem {
                         strengthening_sources: Default::default(),
                         last_corroborated: None,
                     };
-
-                    if let Err(e) = graph_guard.add_relationship(edge) {
-                        tracing::trace!(
-                            "Failed to add co-occurrence edge {}<->{}: {}",
-                            entity1,
-                            entity2,
-                            e
-                        );
-                    }
+                    edges.push(edge);
                 }
             }
 
@@ -3198,20 +3228,23 @@ impl MemorySystem {
                             strengthening_sources: Default::default(),
                             last_corroborated: None,
                         };
-                        if let Err(e) = graph_guard.add_relationship(edge) {
-                            tracing::trace!(
-                                "Failed to add causal edge {}→{}: {}",
-                                cause_entity,
-                                effect_entity,
-                                e
-                            );
-                        }
+                        edges.push(edge);
                     }
                 }
                 tracing::debug!(
                     "Extracted {} causal edges from memory {}",
                     causal_pairs.len(),
                     memory.id.0
+                );
+            }
+
+            let edge_count = edges.len();
+            if let Err(e) = graph_guard.add_relationships(edges) {
+                tracing::trace!(
+                    "Failed to add {} co-occurrence and causal edges for memory {}: {}",
+                    edge_count,
+                    memory.id.0,
+                    e
                 );
             }
         }
@@ -4738,6 +4771,26 @@ impl MemorySystem {
         }
     }
 
+    /// Every long-term record a hard-delete pass must test, soft-forgotten ones included:
+    /// `get_all` leaves those out on every engine, so a pass that enumerated through it
+    /// would keep a forgotten memory its criterion names. A record that will not decode
+    /// cannot be tested and is logged; `cleanup_corrupted` is what removes it.
+    fn long_term_memories_for_erasure(&self) -> Result<Vec<Memory>> {
+        let mut memories = Vec::new();
+        for id in self.long_term_memory.get_all_ids()? {
+            match self.long_term_memory.get_memory(&id) {
+                Ok(Some(memory)) => memories.push(memory),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    memory_id = %id.0,
+                    error = %e,
+                    "long-term record does not decode; an erasure pass cannot test it"
+                ),
+            }
+        }
+        Ok(memories)
+    }
+
     /// Forget memories matching a pattern
     ///
     /// Uses validated regex compilation with ReDoS protection
@@ -4797,9 +4850,8 @@ impl MemorySystem {
         }
 
         // Remove from long-term memory
-        let all_lt = self.long_term_memory.get_all()?;
         let mut lt_ids = Vec::new();
-        for memory in all_lt {
+        for memory in self.long_term_memories_for_erasure()? {
             if regex.is_match(&memory.experience.content) {
                 lt_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
@@ -4892,8 +4944,7 @@ impl MemorySystem {
         }
 
         // Remove from long-term memory (hard delete for tag-based)
-        let all_lt = self.long_term_memory.get_all()?;
-        for memory in all_lt {
+        for memory in self.long_term_memories_for_erasure()? {
             if memory.experience.tags.iter().any(|t| tags.contains(t)) {
                 all_deleted_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
@@ -5148,14 +5199,24 @@ impl MemorySystem {
             }
         }
 
-        // Step 2: Clear long-term memory (persistent, most important to delete)
-        let all_lt = self.long_term_memory.get_all()?;
-        let long_term_count = all_lt.len();
-        for memory in all_lt {
-            self.retriever.remove_memory(&memory.id);
-            self.bm25_remove_direct(&memory.id, bm25);
-            self.long_term_memory.delete(&memory.id)?;
-            self.note_removed(memory.importance());
+        // Step 2: Clear long-term memory (persistent, most important to delete). By id,
+        // not through get_all: that leaves soft-forgotten records out, and an erasure
+        // must also reach a record that no longer decodes.
+        let long_term_ids = self.long_term_memory.get_all_ids()?;
+        let long_term_count = long_term_ids.len();
+        for id in &long_term_ids {
+            let live_importance = self
+                .long_term_memory
+                .get(id)
+                .ok()
+                .filter(|memory| !memory.is_forgotten())
+                .map(|memory| memory.importance());
+            self.retriever.remove_memory(id);
+            self.bm25_remove_direct(id, bm25);
+            self.long_term_memory.delete(id)?;
+            if let Some(importance) = live_importance {
+                self.note_removed(importance);
+            }
         }
         count += long_term_count;
 
@@ -5204,11 +5265,11 @@ impl MemorySystem {
 
         // Step 6: Clear semantic facts (GDPR — knowledge derived from memories)
         {
-            // Through the trait, not through db(). The raw version enumerated with
-            // rocksdb's prefix_iterator, which may run PAST the prefix, and guarded
-            // that with a hand-written `break` in each of two loops — a guard whose
-            // absence deletes keys nobody asked about, in an erasure path. The bound
-            // is now the implementation's, asserted once.
+            // The fact stores write the DEFAULT keyspace on both engines, so that is the
+            // keyspace enumerated here, through the same handle they write with. It was
+            // once `scan_prefix_keys`, which on redb reads the memories table: every
+            // fact survived an erasure there while the step logged success.
+            let default_keyspace = self.long_term_memory.default_key_value_store();
             let mut batch = crate::storage::WriteBatch::new();
             let mut facts_deleted = 0usize;
             let mut unenumerated: Vec<&str> = Vec::new();
@@ -5219,16 +5280,16 @@ impl MemorySystem {
                 "facts_embedding:",
                 "temporal_facts:",
             ] {
-                match self.long_term_memory.scan_prefix_keys(prefix.as_bytes()) {
-                    Ok(keys) => {
+                match default_keyspace.scan_prefix(prefix.as_bytes(), None) {
+                    Ok(rows) => {
                         if *prefix == "facts:" {
                             // `facts:{user}:{fact}:decay` rows sit beside each fact; count facts only.
-                            facts_deleted += keys
+                            facts_deleted += rows
                                 .iter()
-                                .filter(|key| !key.ends_with(b":decay"))
+                                .filter(|(key, _)| !key.ends_with(b":decay"))
                                 .count();
                         }
-                        for key in keys {
+                        for (key, _) in rows {
                             batch.delete(key);
                         }
                     }
@@ -6112,7 +6173,7 @@ impl MemorySystem {
     /// RelationshipEdges between all pairs. Uses L2Episodic tier because facts are
     /// consolidated knowledge (survived 7-day aging + 2+ supporting memories).
     /// `add_entity` upserts (increments mention_count if existing), and
-    /// `add_relationship` strengthens via Hebbian learning if the edge already exists.
+    /// `add_relationships` strengthens via Hebbian learning if the edge already exists.
     fn connect_facts_to_graph(&self, facts: &[SemanticFact]) {
         let graph = match &self.graph_memory {
             Some(g) => g,
@@ -6122,6 +6183,7 @@ impl MemorySystem {
         let now = chrono::Utc::now();
         let mut entities_added = 0;
         let mut edges_added = 0;
+        let mut edges = Vec::new();
 
         // Collect all unique entity names across all facts for batch encoding
         let mut all_entity_names: Vec<String> = Vec::new();
@@ -6220,11 +6282,17 @@ impl MemorySystem {
                             strengthening_sources: Default::default(),
                             last_corroborated: None,
                         };
-                        if graph_guard.add_relationship(edge).is_ok() {
-                            edges_added += 1;
-                        }
+                        edges.push(edge);
                     }
                 }
+            }
+        }
+
+        // Every fact's edges in one batch: one commit for the pass, not one per edge.
+        if !edges.is_empty() {
+            match graph_guard.add_relationships(edges) {
+                Ok(ids) => edges_added = ids.len(),
+                Err(e) => tracing::debug!(error = %e, "Failed to connect fact edges to the graph"),
             }
         }
 
@@ -6580,8 +6648,8 @@ impl MemorySystem {
                 provenance.created_at,
             ));
 
-            // Persist to storage
-            self.long_term_memory.store(&memory)?;
+            // Persist to storage, with the vector mapping in the same commit
+            let vector_indexing = self.store_new_memory(&memory, false)?;
 
             // Log creation
             self.logger.write().log_created(&memory, "working");
@@ -6591,8 +6659,7 @@ impl MemorySystem {
                 .write()
                 .add_shared(Arc::clone(&memory))?;
 
-            // Index in vector DB
-            if let Err(e) = self.retriever.index_memory(&memory) {
+            if let VectorIndexing::Failed(e) = vector_indexing {
                 tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
                 if let Err(record_err) = self.embedding_backlog.record(
                     &memory.id,
@@ -6684,6 +6751,9 @@ impl MemorySystem {
                     }
                 }
 
+                // One batch, one commit, for every co-occurrence edge of the memory.
+                let mut edges = Vec::new();
+
                 // Semantic edge weighting
                 let l1_base_weight = crate::graph_memory::EdgeTier::L1Working.initial_weight();
                 for (entity1, entity2) in cooccurrence_pairs {
@@ -6726,16 +6796,18 @@ impl MemorySystem {
                             strengthening_sources: Default::default(),
                             last_corroborated: None,
                         };
-
-                        if let Err(e) = graph_guard.add_relationship(edge) {
-                            tracing::trace!(
-                                "Failed to add co-occurrence edge {}<->{}: {}",
-                                entity1,
-                                entity2,
-                                e
-                            );
-                        }
+                        edges.push(edge);
                     }
+                }
+
+                let edge_count = edges.len();
+                if let Err(e) = graph_guard.add_relationships(edges) {
+                    tracing::trace!(
+                        "Failed to add {} co-occurrence edges for memory {}: {}",
+                        edge_count,
+                        memory.id.0,
+                        e
+                    );
                 }
             }
 
@@ -10451,6 +10523,92 @@ mod lifecycle_tests {
                 stored.experience.embeddings,
                 Some(system.compute_embedding(new_content).unwrap()),
                 "{backend}"
+            );
+        }
+    }
+
+    /// A long-term memory already soft-forgotten, as a forget pass leaves it.
+    fn store_soft_forgotten(system: &MemorySystem, content: &str, tag: &str) -> MemoryId {
+        let mut forgotten = memory(ExperienceType::Observation, content);
+        forgotten.experience.tags = vec![tag.to_string()];
+        forgotten
+            .experience
+            .metadata
+            .insert("forgotten".to_string(), "true".to_string());
+        system.long_term_memory.store(&forgotten).unwrap();
+        forgotten.id
+    }
+
+    #[test]
+    fn forget_all_erases_soft_forgotten_memories_and_facts_on_every_engine() {
+        for (backend, system, _tmp) in systems() {
+            let user = "erasure-user";
+            let live = memory(ExperienceType::Observation, "the harbour crane log");
+            system.long_term_memory.store(&live).unwrap();
+            let forgotten = store_soft_forgotten(&system, "the dredging permit", "permits");
+            system
+                .fact_store
+                .store(user, &aged_fact("erased", 1))
+                .unwrap();
+            assert!(
+                system
+                    .long_term_memory
+                    .get(&forgotten)
+                    .unwrap()
+                    .is_forgotten(),
+                "{backend}: the fixture is soft-forgotten"
+            );
+
+            system.forget(ForgetCriteria::All).unwrap();
+
+            assert!(
+                system.long_term_memory.get_all_ids().unwrap().is_empty(),
+                "{backend}: a record survived a full erasure"
+            );
+            assert!(
+                system.fact_store.get(user, "erased").unwrap().is_none(),
+                "{backend}: a semantic fact survived a full erasure"
+            );
+            assert!(
+                system
+                    .long_term_memory
+                    .default_key_value_store()
+                    .scan_prefix(b"facts:", None)
+                    .unwrap()
+                    .is_empty(),
+                "{backend}: fact rows remain in the default keyspace"
+            );
+        }
+    }
+
+    #[test]
+    fn forget_by_pattern_and_by_tags_reach_soft_forgotten_memories_on_every_engine() {
+        for (backend, system, _tmp) in systems() {
+            let by_pattern =
+                store_soft_forgotten(&system, "the quarantined ballast report", "ballast");
+            let by_tag = store_soft_forgotten(&system, "the mooring inspection", "moorings");
+            let kept = store_soft_forgotten(&system, "the tide table", "tides");
+
+            system
+                .forget(ForgetCriteria::Pattern("quarantined ballast".to_string()))
+                .unwrap();
+            system
+                .forget(ForgetCriteria::ByTags(vec!["moorings".to_string()]))
+                .unwrap();
+
+            for (removed, criterion) in [(&by_pattern, "pattern"), (&by_tag, "tags")] {
+                assert!(
+                    system
+                        .long_term_memory
+                        .get_memory(removed)
+                        .unwrap()
+                        .is_none(),
+                    "{backend}: a soft-forgotten memory survived forget by {criterion}"
+                );
+            }
+            assert!(
+                system.long_term_memory.get_memory(&kept).unwrap().is_some(),
+                "{backend}: a memory neither criterion names was erased"
             );
         }
     }

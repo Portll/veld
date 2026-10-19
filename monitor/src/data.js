@@ -248,6 +248,7 @@ const unitLabel = (u) => (typeof u === "string" ? "shared stores" : `user ${u.us
 const other = (backend) => BACKENDS.find((b) => b !== backend) || BACKENDS[0];
 
 function restartSummary(out) {
+  if (out.supervisor) return `${out.base_url} stopped and was started again by its launchd job ${out.supervisor}.`;
   if (out.supervised) return `${out.base_url} stopped and came back on its own: whatever started it restarted it.`;
   let text = `${out.base_url} is back (pid ${out.pid}, ${out.recipe_source} recipe); output in ${out.log_path}.`;
   if (out.missing_env?.length) text += ` Not carried over: ${out.missing_env.join(", ")}.`;

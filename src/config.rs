@@ -5,6 +5,7 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tracing::info;
 
 /// Legacy storage directory name used in versions <= 0.1.80.
@@ -82,6 +83,209 @@ pub const fn effective_storage_backend_for_current_build(
         #[cfg(not(feature = "storage-redb"))]
         StorageBackend::Redb => StorageBackend::RocksDb,
         StorageBackend::RocksDb => StorageBackend::RocksDb,
+    }
+}
+
+/// What a storage commit guarantees by the time it returns. One class governs both
+/// engines, so a store survives the same failures whichever engine holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageDurability {
+    /// On stable storage: survives a power loss. redb `Durability::Immediate`; RocksDB
+    /// syncs its write-ahead log on every write.
+    Immediate,
+    /// Handed to the operating system: survives a process crash, and a power loss can take
+    /// the most recent commits. redb `Durability::Eventual` (redb 2.6 still syncs the file on
+    /// Linux and orders writes with `F_BARRIERFSYNC` on macOS); RocksDB writes its
+    /// write-ahead log without a sync.
+    Eventual,
+}
+
+impl StorageDurability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Eventual => "eventual",
+        }
+    }
+}
+
+impl std::fmt::Display for StorageDurability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for StorageDurability {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "immediate" => Ok(Self::Immediate),
+            "eventual" => Ok(Self::Eventual),
+            other => Err(format!(
+                "unsupported storage durability '{other}' (expected 'immediate' or 'eventual')"
+            )),
+        }
+    }
+}
+
+// Eventual because RocksDB, the default engine (ADR 0007), has never synced a write unless asked.
+pub const DEFAULT_STORAGE_DURABILITY: StorageDurability = StorageDurability::Eventual;
+
+/// redb's own page-cache default, which every redb database opened with before
+/// `VELD_REDB_CACHE_BYTES` existed. It is a ceiling per database file, filled as pages are read.
+pub const DEFAULT_REDB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Block cache a RocksDB memory store opens with when no shared cache is supplied
+/// (standalone and CLI use; the server supplies one shared cache for every store).
+pub const DEFAULT_ROCKSDB_STANDALONE_BLOCK_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Storage-engine durability, cache and write-buffer settings, read from `VELD_*`.
+///
+/// Process-wide: every store either engine opens without an explicit tuning (the
+/// `*_with_tuning` constructors, for tests and tools) takes [`StorageTuning::process`], so
+/// two stores in one process never disagree about what a commit means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageTuning {
+    /// `VELD_STORAGE_DURABILITY`.
+    pub durability: StorageDurability,
+    /// `VELD_REDB_CACHE_BYTES`: page cache per redb database file.
+    pub redb_cache_bytes: usize,
+    /// `VELD_ROCKSDB_WRITE_BUFFER_BYTES`: memtable size of each column family of a RocksDB
+    /// memory store.
+    pub rocksdb_write_buffer_bytes: usize,
+    /// `VELD_ROCKSDB_BLOCK_CACHE_BYTES`: the RocksDB block cache, which is the server's one
+    /// shared cache or a standalone store's own. `None` keeps each one's built-in size.
+    pub rocksdb_block_cache_bytes: Option<usize>,
+}
+
+impl Default for StorageTuning {
+    fn default() -> Self {
+        Self {
+            durability: DEFAULT_STORAGE_DURABILITY,
+            redb_cache_bytes: DEFAULT_REDB_CACHE_BYTES,
+            rocksdb_write_buffer_bytes: crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES,
+            rocksdb_block_cache_bytes: None,
+        }
+    }
+}
+
+impl StorageTuning {
+    /// The tuning this process opens its stores with: the environment, read once.
+    pub fn process() -> Self {
+        static PROCESS_TUNING: OnceLock<StorageTuning> = OnceLock::new();
+        *PROCESS_TUNING.get_or_init(Self::from_env)
+    }
+
+    /// Parse the environment now. An unparsable value keeps its default and logs a warning.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let defaults = Self::default();
+        Self {
+            durability: durability_from_lookup(&lookup),
+            redb_cache_bytes: byte_count_from_lookup(
+                &lookup,
+                "VELD_REDB_CACHE_BYTES",
+                defaults.redb_cache_bytes,
+            ),
+            rocksdb_write_buffer_bytes: byte_count_from_lookup(
+                &lookup,
+                "VELD_ROCKSDB_WRITE_BUFFER_BYTES",
+                defaults.rocksdb_write_buffer_bytes,
+            ),
+            rocksdb_block_cache_bytes: lookup("VELD_ROCKSDB_BLOCK_CACHE_BYTES").and_then(|raw| {
+                parse_byte_count("VELD_ROCKSDB_BLOCK_CACHE_BYTES", &raw, "the built-in size")
+            }),
+        }
+    }
+
+    /// Whether RocksDB writes sync the write-ahead log before returning.
+    pub const fn rocksdb_sync_writes(&self) -> bool {
+        matches!(self.durability, StorageDurability::Immediate)
+    }
+
+    /// Block cache for a RocksDB store opened without a shared cache.
+    pub fn rocksdb_standalone_block_cache_bytes(&self) -> usize {
+        self.rocksdb_block_cache_bytes
+            .unwrap_or(DEFAULT_ROCKSDB_STANDALONE_BLOCK_CACHE_BYTES)
+    }
+
+    /// The server's one block cache, shared by every RocksDB store it opens.
+    pub fn rocksdb_shared_block_cache_bytes(&self) -> usize {
+        self.rocksdb_block_cache_bytes
+            .unwrap_or(crate::constants::ROCKSDB_SHARED_CACHE_BYTES)
+    }
+}
+
+/// `VELD_STORAGE_DURABILITY`, else the legacy `VELD_WRITE_MODE` (`sync` was RocksDB's opt-in
+/// to a synced write), else the default.
+fn durability_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> StorageDurability {
+    if let Some(raw) = lookup("VELD_STORAGE_DURABILITY") {
+        return match raw.parse::<StorageDurability>() {
+            Ok(durability) => durability,
+            Err(err) => {
+                tracing::warn!(
+                    "VELD_STORAGE_DURABILITY='{}' ignored: {}. Using default {}.",
+                    raw,
+                    err,
+                    DEFAULT_STORAGE_DURABILITY
+                );
+                DEFAULT_STORAGE_DURABILITY
+            }
+        };
+    }
+    match lookup("VELD_WRITE_MODE") {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "sync" => StorageDurability::Immediate,
+            "async" => StorageDurability::Eventual,
+            _ => {
+                tracing::warn!(
+                    "VELD_WRITE_MODE='{}' ignored (expected 'sync' or 'async'; \
+                     VELD_STORAGE_DURABILITY supersedes it). Using default {}.",
+                    raw,
+                    DEFAULT_STORAGE_DURABILITY
+                );
+                DEFAULT_STORAGE_DURABILITY
+            }
+        },
+        None => DEFAULT_STORAGE_DURABILITY,
+    }
+}
+
+fn byte_count_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    default: usize,
+) -> usize {
+    lookup(name)
+        .and_then(|raw| parse_byte_count(name, &raw, &default.to_string()))
+        .unwrap_or(default)
+}
+
+/// A positive whole number of bytes, or `None` after a warning naming the default kept.
+fn parse_byte_count(name: &str, raw: &str, default_label: &str) -> Option<usize> {
+    match raw.trim().parse::<usize>() {
+        Ok(0) => {
+            tracing::warn!(
+                "{}=0 is invalid (a zero-byte cache or buffer), using default {}",
+                name,
+                default_label
+            );
+            None
+        }
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            tracing::warn!(
+                "{}='{}' ignored: not a whole number of bytes. Using default {}.",
+                name,
+                raw,
+                default_label
+            );
+            None
+        }
     }
 }
 
@@ -926,6 +1130,13 @@ impl ServerConfig {
                 self.requested_storage_backend, self.effective_storage_backend
             );
         }
+        let tuning = StorageTuning::process();
+        info!(
+            "   Storage durability: {} (redb cache {}MB per database, RocksDB write buffer {}MB)",
+            tuning.durability,
+            tuning.redb_cache_bytes / (1024 * 1024),
+            tuning.rocksdb_write_buffer_bytes / (1024 * 1024)
+        );
         info!("   Max users in memory: {}", self.max_users_in_memory);
         if self.rate_limit_per_second > 0 {
             info!(
@@ -975,7 +1186,7 @@ pub fn print_env_help() {
     println!("  VELD_HOST             - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)");
     println!("  VELD_PORT             - Server port (default: 3030)");
     println!("  VELD_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/veld/)");
-    println!("  VELD_STORAGE_BACKEND  - Requested backend: redb (target default) or rocksdb (legacy compatibility)");
+    println!("  VELD_STORAGE_BACKEND  - Storage engine: rocksdb (default, ADR 0007) or redb");
     println!("  VELD_REPLICATE_FROM   - Base URL of a veld instance to follow (live memory replication)");
     println!("  VELD_REPLICATE_ADMIN_KEY - That instance's admin key (its VELD_ADMIN_API_KEY)");
     println!("  VELD_REPLICATE_API_KEY - That instance's API key (default: this server's own first key)");
@@ -1030,6 +1241,22 @@ pub fn print_env_help() {
     println!("  VELD_BACKUP_ENABLED   - Enable automatic backups true/false (default: auto in production)");
     println!("  VELD_BACKUP_INTERVAL  - Backup interval in seconds (default: 86400 = 24 hours)");
     println!("  VELD_BACKUP_MAX_COUNT - Max backups to keep per user (default: 7)");
+    println!();
+    println!("Storage Engine Tuning:");
+    println!("  VELD_STORAGE_DURABILITY         - immediate or eventual, for both engines (default: {DEFAULT_STORAGE_DURABILITY}).");
+    println!("                                    immediate = every commit synced to disk (redb Immediate, RocksDB synced WAL);");
+    println!("                                    eventual = survives a process crash, a power loss can lose the last commits.");
+    println!("                                    Supersedes VELD_WRITE_MODE (sync = immediate, async = eventual).");
+    println!("  VELD_REDB_CACHE_BYTES           - redb page cache per database file, in bytes (default: {DEFAULT_REDB_CACHE_BYTES})");
+    println!(
+        "  VELD_ROCKSDB_WRITE_BUFFER_BYTES - RocksDB memtable size per column family, in bytes (default: {})",
+        crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES
+    );
+    println!(
+        "  VELD_ROCKSDB_BLOCK_CACHE_BYTES  - RocksDB block cache, in bytes: the server's shared cache (default: {})",
+        crate::constants::ROCKSDB_SHARED_CACHE_BYTES
+    );
+    println!("                                    or a standalone store's own (default: {DEFAULT_ROCKSDB_STANDALONE_BLOCK_CACHE_BYTES})");
     println!();
     println!("  RUST_LOG               - Log level (e.g., info, debug, trace)");
     println!();
@@ -1372,6 +1599,135 @@ mod tests {
             ..Default::default()
         };
         let _layer = cors.to_layer(); // Should not panic
+    }
+
+    fn tuning_from(vars: &[(&str, &str)]) -> StorageTuning {
+        let vars: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        StorageTuning::from_lookup(|name| vars.get(name).cloned())
+    }
+
+    #[test]
+    fn storage_tuning_without_variables_is_the_default() {
+        let tuning = tuning_from(&[]);
+        assert_eq!(tuning, StorageTuning::default());
+        assert_eq!(tuning.durability, StorageDurability::Eventual);
+        assert!(!tuning.rocksdb_sync_writes());
+        assert_eq!(tuning.redb_cache_bytes, DEFAULT_REDB_CACHE_BYTES);
+        assert_eq!(
+            tuning.rocksdb_write_buffer_bytes,
+            crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES
+        );
+        assert_eq!(
+            tuning.rocksdb_standalone_block_cache_bytes(),
+            DEFAULT_ROCKSDB_STANDALONE_BLOCK_CACHE_BYTES
+        );
+        assert_eq!(
+            tuning.rocksdb_shared_block_cache_bytes(),
+            crate::constants::ROCKSDB_SHARED_CACHE_BYTES
+        );
+    }
+
+    #[test]
+    fn storage_durability_parses_each_class() {
+        let immediate = tuning_from(&[("VELD_STORAGE_DURABILITY", "immediate")]);
+        assert_eq!(immediate.durability, StorageDurability::Immediate);
+        assert!(immediate.rocksdb_sync_writes());
+
+        let eventual = tuning_from(&[("VELD_STORAGE_DURABILITY", " Eventual ")]);
+        assert_eq!(eventual.durability, StorageDurability::Eventual);
+        assert!(!eventual.rocksdb_sync_writes());
+    }
+
+    #[test]
+    fn an_invalid_storage_durability_keeps_the_default() {
+        for raw in ["fsync", "", "sync", "1"] {
+            assert_eq!(
+                tuning_from(&[("VELD_STORAGE_DURABILITY", raw)]).durability,
+                DEFAULT_STORAGE_DURABILITY,
+                "VELD_STORAGE_DURABILITY={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_legacy_write_mode_selects_durability_only_when_storage_durability_is_unset() {
+        assert_eq!(
+            tuning_from(&[("VELD_WRITE_MODE", "sync")]).durability,
+            StorageDurability::Immediate
+        );
+        assert_eq!(
+            tuning_from(&[("VELD_WRITE_MODE", "ASYNC")]).durability,
+            StorageDurability::Eventual
+        );
+        assert_eq!(
+            tuning_from(&[("VELD_WRITE_MODE", "fast")]).durability,
+            DEFAULT_STORAGE_DURABILITY
+        );
+        assert_eq!(
+            tuning_from(&[
+                ("VELD_WRITE_MODE", "sync"),
+                ("VELD_STORAGE_DURABILITY", "eventual"),
+            ])
+            .durability,
+            StorageDurability::Eventual,
+            "VELD_STORAGE_DURABILITY must win over the legacy variable"
+        );
+    }
+
+    #[test]
+    fn byte_count_variables_parse_and_fall_back_on_invalid_values() {
+        let tuned = tuning_from(&[
+            ("VELD_REDB_CACHE_BYTES", "67108864"),
+            ("VELD_ROCKSDB_WRITE_BUFFER_BYTES", " 4194304 "),
+            ("VELD_ROCKSDB_BLOCK_CACHE_BYTES", "33554432"),
+        ]);
+        assert_eq!(tuned.redb_cache_bytes, 64 * 1024 * 1024);
+        assert_eq!(tuned.rocksdb_write_buffer_bytes, 4 * 1024 * 1024);
+        assert_eq!(tuned.rocksdb_block_cache_bytes, Some(32 * 1024 * 1024));
+        assert_eq!(
+            tuned.rocksdb_standalone_block_cache_bytes(),
+            32 * 1024 * 1024
+        );
+        assert_eq!(tuned.rocksdb_shared_block_cache_bytes(), 32 * 1024 * 1024);
+
+        let defaults = StorageTuning::default();
+        for raw in ["0", "-1", "64MB", "", "1.5"] {
+            let tuning = tuning_from(&[
+                ("VELD_REDB_CACHE_BYTES", raw),
+                ("VELD_ROCKSDB_WRITE_BUFFER_BYTES", raw),
+                ("VELD_ROCKSDB_BLOCK_CACHE_BYTES", raw),
+            ]);
+            assert_eq!(tuning, defaults, "byte count {raw:?} was not rejected");
+        }
+    }
+
+    #[test]
+    fn storage_tuning_from_env_reads_the_process_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("VELD_STORAGE_DURABILITY", "immediate");
+        env::set_var("VELD_REDB_CACHE_BYTES", "1048576");
+        env::set_var("VELD_ROCKSDB_WRITE_BUFFER_BYTES", "2097152");
+        env::set_var("VELD_ROCKSDB_BLOCK_CACHE_BYTES", "not-a-number");
+
+        let tuning = StorageTuning::from_env();
+
+        env::remove_var("VELD_STORAGE_DURABILITY");
+        env::remove_var("VELD_REDB_CACHE_BYTES");
+        env::remove_var("VELD_ROCKSDB_WRITE_BUFFER_BYTES");
+        env::remove_var("VELD_ROCKSDB_BLOCK_CACHE_BYTES");
+
+        assert_eq!(
+            tuning,
+            StorageTuning {
+                durability: StorageDurability::Immediate,
+                redb_cache_bytes: 1024 * 1024,
+                rocksdb_write_buffer_bytes: 2 * 1024 * 1024,
+                rocksdb_block_cache_bytes: None,
+            }
+        );
     }
 }
 

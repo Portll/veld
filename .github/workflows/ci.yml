@@ -224,8 +224,28 @@ jobs:
           if-no-files-found: ignore
 
   test:
-    name: Tests
+    name: Tests (${{ matrix.engines }})
     runs-on: ubuntu-latest
+    # One job per engine set, so a red RocksDB-and-redb run cannot hide whether either engine alone
+    # still builds and passes: the second set used to run only if the first came back green. The
+    # default build carries both engines; the redb-only and rocksdb-only builds keep each engine
+    # from leaning on the other (a redb reference in a RocksDB-only test path once broke the
+    # rocksdb-only build without any job noticing). Each runs
+    # the library tests (including the engine differential harness in src/storage/), every
+    # integration test in tests/ (backup_restore_parity, migrate_round_trip, recall_engine_parity,
+    # engine_refusal_ratchet), and compiles every bench so a bench cannot rot unbuilt.
+    # The encrypted-tenant tests set and clear VELD_MASTER_PASSPHRASE themselves, in their own
+    # binaries; a job-level value would leak into tests that assert it is absent.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engines: rocksdb-and-redb
+            cargo_features: ''
+          - engines: redb-only
+            cargo_features: '--no-default-features --features storage-redb'
+          - engines: rocksdb-only
+            cargo_features: '--no-default-features --features rocksdb'
     # Runs on every push, pull request, tag and dispatch. From 2026-09-27 to 2026-10-11 it ran on
     # tags and dispatch only, because the account's Actions budget ran out twice in September and
     # the suite needs ~20 runner minutes; the repository went public on 2026-10-11 and standard
@@ -245,6 +265,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: tests-${{ matrix.engines }}
 
       - name: Install LLVM
         run: |
@@ -269,9 +291,13 @@ jobs:
         # error could fail this job.
         run: |
           set -o pipefail
-          # The default build carries both engines; the redb-only build keeps redb from leaning on RocksDB.
-          cargo test --no-fail-fast 2>&1 | tee test-output.txt
-          cargo test --no-fail-fast --no-default-features --features storage-redb 2>&1 | tee -a test-output.txt
+          cargo test --no-fail-fast ${{ matrix.cargo_features }} 2>&1 | tee test-output.txt
+
+      # Compile-only: benches are timing harnesses, but a bench that no longer builds goes unnoticed
+      # until someone wants a number. Covers storage_engine_benchmarks and cold_start_benchmarks
+      # along with the rest of the [[bench]] targets in Cargo.toml.
+      - name: Build the benches (no run)
+        run: cargo bench --no-run ${{ matrix.cargo_features }}
 
       - name: Generate test summary
         if: always()

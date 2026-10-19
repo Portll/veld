@@ -179,6 +179,7 @@ impl RedbBackupEngine {
         pending.finish()
     }
 
+    /// Newest first, as `VeldBackupEngine::list_backups` and `RedbBackupStore` list.
     pub fn list(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
         let mut out = Vec::new();
         for id in self.ids(user_id)?.into_iter().rev() {
@@ -521,7 +522,7 @@ impl PendingBackup<'_> {
             Component {
                 name: "memory_index".into(),
                 captured: false,
-                detail: "rocksdb-only derived index; redb keeps none".into(),
+                detail: "derived index; redb rebuilds its index_* tables on the first open after a restore".into(),
             },
             Component {
                 name: "user_auth".into(),
