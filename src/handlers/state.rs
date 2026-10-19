@@ -399,6 +399,9 @@ pub struct MultiUserMemoryManager {
     /// How far replication followers have read each tenant's feed, for the
     /// journal purge (kept only while the purge is on).
     feed_floors: parking_lot::Mutex<crate::replication::FeedFloors>,
+    /// The model every user's write-time fact extractor uses, read from `VELD_LLM_*` once
+    /// at startup. `None` (the default: no endpoint) leaves extraction off for everyone.
+    write_time_fact_llm: Option<Arc<dyn crate::memory::llm::LlmConsolidator>>,
 }
 
 /// Written into a tenant's directory by a backup restore and removed by the C2
@@ -809,6 +812,11 @@ impl MultiUserMemoryManager {
             feed_floors: parking_lot::Mutex::new(crate::replication::FeedFloors::load(
                 &base_path_for_floors,
             )),
+            write_time_fact_llm: crate::memory::write_time_facts::consolidator_from_env()
+                .unwrap_or_else(|e| {
+                    tracing::error!("write-time facts: LLM configuration refused: {e:#}");
+                    None
+                }),
         };
 
         info!("Running initial audit log rotation...");
@@ -1610,8 +1618,10 @@ impl MultiUserMemoryManager {
         user_mem.set_graph_memory(graph);
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
         user_mem.set_feedback_store(self.feedback_store.clone());
+        user_mem.set_write_time_fact_llm(self.write_time_fact_llm.clone());
 
         let memory_arc: SharedUserMemory = Arc::new(parking_lot::RwLock::new(user_mem));
+        crate::memory::write_time_facts::start_worker(&memory_arc);
 
         self.user_memories
             .insert(user_id.to_string(), memory_arc.clone());

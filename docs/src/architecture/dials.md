@@ -30,6 +30,22 @@ reconsolidation behaves exactly as it did pre-dials.
 The recall gate records the overrides a run was measured under
 (`retrieval_dials` in `tests/recall/locomo-gate-baseline.json`) and refuses to
 diff two runs that overrode them differently.
+## Write-time facts
+
+Three dials drive the write-time fact extractor
+([src/memory/write_time_facts.rs](https://github.com/Portll/veld/blob/main/src/memory/write_time_facts.rs)).
+Nothing they enable runs unless an LLM is configured (`VELD_LLM_ENDPOINT`, with
+`VELD_LLM_MODEL` and `VELD_LLM_API_KEY`), or a model tape that holds LLM outputs
+is replayed, so the offline default is unchanged whatever they are set to.
+
+| Dial | Env var | Default | Range | Effect |
+|---|---|---|---|---|
+| `write_time_facts` | `VELD_DIALS_WRITE_TIME_FACTS` | `false` | bool | Queue each stored conversation turn for a background worker that asks the model for self-contained, absolutely dated statements, stored as `learning` records linked to their source turns. `remember` never waits on the model. |
+| `write_time_fact_window` | `VELD_DIALS_WRITE_TIME_FACT_WINDOW` | `4` | `0`–`16` | Earlier turns of the same conversation (episode id, else first `conv-*` tag) shown with each turn, so references and relative dates can be resolved. Read when a turn is queued. |
+| `write_time_fact_expansion` | `VELD_DIALS_WRITE_TIME_FACT_EXPANSION` | `true` | bool | When a derived fact ranks in recall, its source turns enter the candidate pool before the pre-rerank truncation, and the fact stays in the results. Skipped entirely on a store that has never held a fact. |
+
+`write_time_fact_expansion` is the one dial that defaults on. It has nothing to
+act on until facts exist, which needs `write_time_facts` and a model.
 
 ## Lifecycle
 

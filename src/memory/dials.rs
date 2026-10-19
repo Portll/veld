@@ -49,6 +49,15 @@ fn default_working_memory_threshold() -> u32 {
     crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD
 }
 
+/// Default number of earlier turns the write-time fact extractor shows the model.
+fn default_write_time_fact_window() -> usize {
+    4
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// KV key under which a user's `CognitiveDials` are persisted. The store is per-user
 /// (each `MemorySystem` opens that user's own database), so a bare key is sufficient.
 pub const COGNITIVE_DIALS_KEY: &[u8] = b"cognitive_dials";
@@ -262,6 +271,24 @@ pub struct CognitiveDials {
     /// `people_density`, `prf`.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
+
+    // ---- Write-time facts ------------------------------------------------------
+    /// Queue every stored conversation turn for the background extractor, which asks
+    /// the configured LLM ([`crate::memory::llm::LlmConsolidator`]) to rewrite it into
+    /// self-contained, absolutely dated statements stored as memories of their own.
+    /// Inert without an LLM endpoint, so the offline default is unchanged either way.
+    #[serde(default)]
+    pub write_time_facts: bool,
+
+    /// Earlier turns of the same conversation shown to the model with each turn, so
+    /// it can resolve "them" and "yesterday". Read when a turn is queued.
+    #[serde(default = "default_write_time_fact_window")]
+    pub write_time_fact_window: usize,
+
+    /// When a derived fact ranks, put the turns it came from into the candidate pool
+    /// before the pre-rerank truncation. Costs nothing on a store with no facts.
+    #[serde(default = "default_true")]
+    pub write_time_fact_expansion: bool,
 }
 
 /// UI/range metadata for a recall slider (consumed by `GET /api/dials/schema`).
@@ -658,6 +685,9 @@ impl Default for CognitiveDials {
             density_linguistic_w: None,
             updated_at: None,
             disabled_signals: HashSet::new(),
+            write_time_facts: false,
+            write_time_fact_window: default_write_time_fact_window(),
+            write_time_fact_expansion: true,
         }
     }
 }
@@ -730,6 +760,9 @@ impl CognitiveDials {
         cl(&mut self.mmr_lambda_abstract, 0.0, 1.0);
         cl(&mut self.mmr_lambda_relationship, 0.0, 1.0);
         cl(&mut self.density_linguistic_w, 0.0, 1.0);
+        self.write_time_fact_window = self
+            .write_time_fact_window
+            .min(crate::memory::write_time_facts::MAX_WINDOW);
         self
     }
 
@@ -785,7 +818,8 @@ impl CognitiveDials {
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
-    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG}`.
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG}`,
+    /// `VELD_DIALS_WRITE_TIME_{FACTS,FACT_WINDOW,FACT_EXPANSION}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -845,6 +879,15 @@ impl CognitiveDials {
         }
         if let Some(v) = env_bool("VELD_DIALS_DATE_WINDOW_LEG") {
             d.date_window_leg = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_WRITE_TIME_FACTS") {
+            d.write_time_facts = v;
+        }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_WRITE_TIME_FACT_WINDOW") {
+            d.write_time_fact_window = v;
+        }
+        if let Some(v) = env_bool("VELD_DIALS_WRITE_TIME_FACT_EXPANSION") {
+            d.write_time_fact_expansion = v;
         }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
@@ -931,6 +974,31 @@ mod tests {
         );
         // disabled_signals must be empty by default — every signal enabled.
         assert!(d.disabled_signals.is_empty());
+        assert!(!d.write_time_facts);
+    }
+
+    #[test]
+    fn write_time_fact_dials_default_and_clamp() {
+        let d = CognitiveDials::default();
+        assert_eq!(d.write_time_fact_window, 4);
+        assert!(d.write_time_fact_expansion);
+
+        let clamped = CognitiveDials {
+            write_time_fact_window: 500,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(
+            clamped.write_time_fact_window,
+            crate::memory::write_time_facts::MAX_WINDOW
+        );
+
+        // A blob persisted before these dials existed decodes to the defaults.
+        let old: CognitiveDials =
+            serde_json::from_str(r#"{"reconsolidation_enabled": false}"#).expect("decode");
+        assert!(!old.write_time_facts);
+        assert!(old.write_time_fact_expansion);
+        assert_eq!(old.write_time_fact_window, 4);
     }
 
     #[test]

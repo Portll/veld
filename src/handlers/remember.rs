@@ -2673,6 +2673,7 @@ pub async fn upsert_memory(
         episode_id: req.episode_id.clone(),
         writer: req.writer.clone(),
         repo,
+        kind: None,
     };
 
     let store_start = std::time::Instant::now();

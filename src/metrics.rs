@@ -1028,6 +1028,53 @@ pub static SUPPRESSOR_DETECTIONS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| 
     .expect("SUPPRESSOR_DETECTIONS_TOTAL metric must be valid at compile time")
 });
 
+// ============================================================================
+// Write-time fact metrics (src/memory/write_time_facts.rs)
+// ============================================================================
+
+/// Conversation turns waiting for the write-time fact extractor, across users.
+pub static WRITE_TIME_FACT_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "veld_write_time_fact_queue_depth",
+        "Conversation turns queued for write-time fact extraction",
+    )
+    .expect("WRITE_TIME_FACT_QUEUE_DEPTH metric must be valid at compile time")
+});
+
+/// Derived facts stored, by outcome: created, updated, unchanged, removed.
+pub static WRITE_TIME_FACTS_WRITTEN_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_write_time_facts_written_total",
+            "Write-time facts stored, by outcome",
+        ),
+        &["outcome"],
+    )
+    .expect("WRITE_TIME_FACTS_WRITTEN_TOTAL metric must be valid at compile time")
+});
+
+/// Extraction failures, by reason: llm (the call or its payload), invalid (an element
+/// that broke the schema), store (the write).
+pub static WRITE_TIME_FACT_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_write_time_fact_failures_total",
+            "Write-time fact extraction failures, by reason",
+        ),
+        &["reason"],
+    )
+    .expect("WRITE_TIME_FACT_FAILURES_TOTAL metric must be valid at compile time")
+});
+
+/// Source turns that a ranked fact put into the recall candidate pool.
+pub static WRITE_TIME_FACT_EXPANSION_CANDIDATES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_write_time_fact_expansion_candidates_total",
+        "Source turns added to the recall candidate pool by a ranked write-time fact",
+    )
+    .expect("WRITE_TIME_FACT_EXPANSION_CANDIDATES_TOTAL metric must be valid at compile time")
+});
+
 /// Register all metrics with the global registry
 ///
 /// # Returns
@@ -1212,6 +1259,21 @@ fn do_register_metrics() -> Result<(), MetricsError> {
         "RETRIEVAL_VARIANCE_LINGUISTIC"
     );
     register!(SUPPRESSOR_DETECTIONS_TOTAL, "SUPPRESSOR_DETECTIONS_TOTAL");
+
+    // Write-time fact metrics
+    register!(WRITE_TIME_FACT_QUEUE_DEPTH, "WRITE_TIME_FACT_QUEUE_DEPTH");
+    register!(
+        WRITE_TIME_FACTS_WRITTEN_TOTAL,
+        "WRITE_TIME_FACTS_WRITTEN_TOTAL"
+    );
+    register!(
+        WRITE_TIME_FACT_FAILURES_TOTAL,
+        "WRITE_TIME_FACT_FAILURES_TOTAL"
+    );
+    register!(
+        WRITE_TIME_FACT_EXPANSION_CANDIDATES_TOTAL,
+        "WRITE_TIME_FACT_EXPANSION_CANDIDATES_TOTAL"
+    );
 
     if errors.is_empty() {
         Ok(())
