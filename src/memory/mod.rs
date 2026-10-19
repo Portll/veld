@@ -5423,9 +5423,9 @@ impl MemorySystem {
         Ok(())
     }
 
-    /// [`update_memory`](Self::update_memory) over many memories with one BM25 commit
-    /// at the end. Replication applies pages of snapshots; a Tantivy commit and reader
-    /// reload per memory made each frame cost an fsync round trip.
+    /// Store and vector-index replicated snapshots. BM25 is left to the intent-log
+    /// projection: replication journals every frame after this returns, and the
+    /// projection is the only BM25 writer for journaled writes.
     pub fn upsert_memories(&self, memories: &[Memory]) -> Result<usize> {
         for memory in memories {
             self.long_term_memory.update(memory)?;
@@ -5435,14 +5435,6 @@ impl MemorySystem {
                     memory.id.0,
                     e
                 );
-            }
-            if let Err(e) = self.hybrid_search.index_memory(
-                &memory.id,
-                &memory.experience.content,
-                &memory.experience.tags,
-                &memory.experience.entities,
-            ) {
-                tracing::warn!("Failed to reindex memory {} in BM25: {}", memory.id.0, e);
             }
             let shared = std::sync::Arc::new(memory.clone());
             {
@@ -5458,11 +5450,6 @@ impl MemorySystem {
                     let _ = session.remove(&memory.id);
                     let _ = session.add_shared(shared);
                 }
-            }
-        }
-        if !memories.is_empty() {
-            if let Err(e) = self.hybrid_search.commit_and_reload() {
-                tracing::warn!("Failed to commit/reload BM25 index: {}", e);
             }
         }
         Ok(memories.len())
