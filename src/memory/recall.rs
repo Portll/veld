@@ -2715,10 +2715,41 @@ impl super::MemorySystem {
                 let d = self.cognitive_dials.read();
                 (d.rerank_pool, d.rerank_count)
             };
-            let rerank_budget = pool_dial
+            let mut rerank_budget = pool_dial
                 .unwrap_or(if decomposed { 50_usize } else { 30_usize })
                 .max(rerank_count_dial.or(query.rerank_count).unwrap_or(0))
                 .max(query.max_results);
+
+            // ===========================================================================
+            // LAYER 4.97: WRITE-TIME FACT EXPANSION
+            // ===========================================================================
+            // A derived fact that ranks brings the turns it was extracted from into the
+            // pool, as candidates of their own, before the truncation below. A store that
+            // never held a fact skips this without a single lookup.
+            if early_dials_snapshot.write_time_fact_expansion
+                && self.write_time_facts.facts_present()
+                && query
+                    .layer_mode()
+                    .allows(crate::memory::types::LayerMode::PlusFacts)
+            {
+                let expansion = super::write_time_facts::expand_fact_sources(
+                    &mut res,
+                    rerank_budget,
+                    super::write_time_facts::MAX_EXPANSION,
+                    |id| self.write_time_fact_sources(id),
+                );
+                crate::memory::gold_funnel::record("fact", expansion.leg.iter());
+                if expansion.injected > 0 {
+                    crate::metrics::WRITE_TIME_FACT_EXPANSION_CANDIDATES_TOTAL
+                        .inc_by(expansion.injected as u64);
+                    rerank_budget += expansion.injected;
+                    tracing::debug!(
+                        "Layer 4.97: ranked facts name {} source turns, {} new to the pool",
+                        expansion.leg.len(),
+                        expansion.injected
+                    );
+                }
+            }
             // Query filters are applied in the Layer 5 scan below, which stops once
             // `scan_limit` memories pass. Cutting the list here first meant a selective
             // filter (tags, type, time range) judged only the top 30/50 and could discard
