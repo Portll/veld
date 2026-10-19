@@ -8,7 +8,7 @@
 //!
 //! See issue #266 for the runner's CLI and acceptance criteria.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -769,7 +769,7 @@ fn run_one_pass(
                 }
             };
 
-            let retrieved_uuids: Vec<Uuid> = memories.iter().map(|m| m.id.0).collect();
+            let retrieved_uuids: Vec<Uuid> = credited_uuids(&memories);
             let retrieved_corpus_ids: Vec<String> = retrieved_uuids
                 .iter()
                 .map(|u| {
@@ -847,13 +847,13 @@ fn run_one_pass(
                 };
                 manager.annotate_query_ner(&mut deep_query);
                 match system.read().recall(&deep_query) {
-                    Ok(deep) => deep
+                    Ok(deep) => credited_uuids(&deep)
                         .iter()
-                        .map(|m| {
+                        .map(|u| {
                             uuid_to_corpus_id
-                                .get(&m.id.0)
+                                .get(u)
                                 .cloned()
-                                .unwrap_or_else(|| format!("<unknown:{}>", m.id.0))
+                                .unwrap_or_else(|| format!("<unknown:{u}>"))
                         })
                         .collect(),
                     Err(e) => {
@@ -1023,20 +1023,22 @@ fn finish_model_tape(
 /// Score, through the tape, every (query, corpus item) pair it does not hold yet.
 ///
 /// The queries are the ones the run sent to the reranker. The candidates are the
-/// corpus contents, which must include every text the reranker saw apart from the
-/// pairs that only load the model (the harness's probe and the background pre-warm):
-/// if one is not a corpus item, candidates are built some other way and the corpus
-/// cannot complete the table.
+/// corpus contents and the write-time facts extracted from them, which must include
+/// every text the reranker saw apart from the pairs that only load the model (the
+/// harness's probe and the background pre-warm): if one is neither, candidates are
+/// built some other way and the corpus cannot complete the table.
 fn fill_cross_encoder_table(corpus: &[CorpusItem]) -> Result<usize> {
     use crate::embeddings::cross_encoder::WARMUP_TEXT;
     use crate::embeddings::model_tape as tape;
     use crate::memory::hybrid_search::CROSS_ENCODER_PROBE;
     let loads_only = |t: &str| t == CROSS_ENCODER_PROBE || t == WARMUP_TEXT;
     let ce = crate::embeddings::cross_encoder::load_cross_encoder_from_env();
+    let derived = DERIVED_CANDIDATES.lock().clone();
     let mut seen = std::collections::HashSet::new();
     let docs: Vec<&str> = corpus
         .iter()
         .map(|c| c.content.as_str())
+        .chain(derived.iter().map(String::as_str))
         .filter(|d| seen.insert(*d))
         .collect();
     let foreign: Vec<String> = tape::cross_encoder_docs()
@@ -1045,8 +1047,8 @@ fn fill_cross_encoder_table(corpus: &[CorpusItem]) -> Result<usize> {
         .collect();
     if let Some(first) = foreign.first() {
         anyhow::bail!(
-            "{} candidate texts the reranker saw are not corpus contents (first: {:?}), \
-             so the corpus cannot complete the cross-encoder table",
+            "{} candidate texts the reranker saw are neither corpus contents nor write-time \
+             facts (first: {:?}), so the corpus cannot complete the cross-encoder table",
             foreign.len(),
             first.chars().take(80).collect::<String>()
         );
@@ -1206,6 +1208,35 @@ pub(crate) fn guard_ner_backend(manager: &MultiUserMemoryManager) -> Result<()> 
     Ok(())
 }
 
+/// Texts the runs of this process stored besides the corpus: the write-time facts
+/// extracted from it. The reranker sees them as candidates, so a recorded model tape
+/// must score them against every query as it does the corpus.
+static DERIVED_CANDIDATES: std::sync::LazyLock<parking_lot::Mutex<BTreeSet<String>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(BTreeSet::new()));
+
+/// The ids a result list is scored by. A write-time fact stands for the turns it was
+/// extracted from, at its rank: a fact hit is a hit on its evidence, and the rank lists
+/// name stable corpus ids rather than a fact id that changes every run. A turn already
+/// credited through an earlier fact is not counted again. Without facts this is the
+/// list's own ids.
+fn credited_uuids(memories: &[crate::memory::SharedMemory]) -> Vec<Uuid> {
+    let mut credited = Vec::with_capacity(memories.len());
+    let mut via_fact = HashSet::new();
+    for memory in memories {
+        if crate::memory::write_time_facts::is_write_time_fact(memory) {
+            for source in &memory.experience.related_memories {
+                if !credited.contains(&source.0) {
+                    via_fact.insert(source.0);
+                    credited.push(source.0);
+                }
+            }
+        } else if !via_fact.contains(&memory.id.0) {
+            credited.push(memory.id.0);
+        }
+    }
+    credited
+}
+
 pub fn ingest_corpus(
     manager: &MultiUserMemoryManager,
     corpus: &[CorpusItem],
@@ -1214,6 +1245,11 @@ pub fn ingest_corpus(
     let mut map = HashMap::with_capacity(corpus.len());
     let ner = manager.get_neural_ner();
     let user_mem = manager.get_user_memory(EVAL_USER)?;
+    // Write-time facts are extracted after ingest, on this thread and in queue order,
+    // rather than by the background worker while turns are still arriving: the facts are
+    // then written in the same order on every run, and all exist before any query.
+    let write_time_facts = user_mem.read().write_time_facts();
+    let hold = write_time_facts.hold();
     // Eval-fidelity gate: production embeds entity names so Tier-4 embedding
     // concept-merge runs (cross-memory entity resolution). The eval passed None →
     // Tier-4 OFF → entities under-resolved vs prod (every reach number measured
@@ -1285,6 +1321,30 @@ pub fn ingest_corpus(
             .with_context(|| format!("graph-processing corpus item {}", item.id))?;
 
         map.insert(item.id.clone(), memory_id.0);
+    }
+
+    let drained = user_mem.read().drain_write_time_facts();
+    drop(hold);
+    if drained.jobs > 0 {
+        eprintln!(
+            "  write-time facts: {} turns, {} created, {} updated, {} unchanged, {} removed, \
+             {} elements rejected, {} failures",
+            drained.jobs,
+            drained.created,
+            drained.updated,
+            drained.unchanged,
+            drained.removed,
+            drained.rejected,
+            drained.failures
+        );
+        let guard = user_mem.read();
+        let mut derived = DERIVED_CANDIDATES.lock();
+        for id in &drained.fact_ids {
+            let fact = guard
+                .get_memory(id)
+                .with_context(|| format!("reading write-time fact {}", id.0))?;
+            derived.insert(fact.experience.content);
+        }
     }
 
     // Consolidation fidelity (SHODH_EVAL_CONSOLIDATE): production runs a periodic
@@ -3469,6 +3529,57 @@ fn category_name(c: SmokeCategory) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored(
+        n: u128,
+        kind: crate::memory::facets::RecordKind,
+        sources: &[u128],
+    ) -> crate::memory::SharedMemory {
+        let mut memory = crate::memory::types::Memory::new(
+            MemoryId(Uuid::from_u128(n)),
+            Experience {
+                content: format!("memory {n}"),
+                related_memories: sources
+                    .iter()
+                    .map(|s| MemoryId(Uuid::from_u128(*s)))
+                    .collect(),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        memory.kind = kind;
+        if kind == crate::memory::facets::RecordKind::Learning {
+            memory.external_id = Some(format!(
+                "{}wtf-1:digest:{n}",
+                crate::memory::write_time_facts::EXTERNAL_ID_PREFIX
+            ));
+        }
+        std::sync::Arc::new(memory)
+    }
+
+    #[test]
+    fn a_write_time_fact_is_scored_as_the_turns_it_came_from() {
+        use crate::memory::facets::RecordKind::{Learning, Memory};
+        let u = Uuid::from_u128;
+        // A turn, then a fact naming that turn and two more, then one of those turns.
+        let results = vec![
+            stored(1, Memory, &[]),
+            stored(9, Learning, &[1, 2, 3]),
+            stored(3, Memory, &[]),
+            stored(4, Memory, &[]),
+        ];
+        assert_eq!(credited_uuids(&results), vec![u(1), u(2), u(3), u(4)]);
+
+        // A learning record that is not a write-time fact is scored as itself.
+        let mut other = (*stored(8, Learning, &[1])).clone();
+        other.external_id = None;
+        let plain = vec![std::sync::Arc::new(other), stored(5, Memory, &[])];
+        assert_eq!(credited_uuids(&plain), vec![u(8), u(5)]);
+    }
 
     fn unique_storage_dir(label: &str) -> PathBuf {
         let id = Uuid::new_v4().simple().to_string();

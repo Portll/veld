@@ -74,6 +74,40 @@ A change to what a model is fed (another corpus text, a prefix, another candidat
 model or ONNX Runtime upgrade needs a new tape: replay misses fail the run, and the tape refuses
 model files other than the ones it was recorded from.
 
+### Write-time facts on a tape
+
+Write-time fact extraction (`src/memory/write_time_facts.rs`) calls an LLM, which CI does not
+have. The tape records those calls too, keyed by the exact chat-completions request body, and
+names the model in its header. A replay answers them from the tape without an endpoint, using the
+model the tape names, so a tape recorded on a laptop against LM Studio or Ollama replays on a
+runner. The harness drains the extractor after ingest and before the first query, on its own
+thread and in queue order, and scores a fact that ranks as the turns it came from.
+
+Recording is local, because the model is. With a model loaded in LM Studio and its server
+started (Ollama: `http://localhost:11434/v1/chat/completions`, model as `ollama list` names it),
+from the repository root:
+
+```bash
+./scripts/cargo-dev.sh build --release --bin recall-eval
+VELD_LLM_ENDPOINT=http://localhost:1234/v1/chat/completions \
+VELD_LLM_MODEL=qwen2.5-7b-instruct \
+VELD_DIALS_WRITE_TIME_FACTS=1 \
+VELD_MODEL_TAPE_RECORD=model-tape-rocksdb.jsonl.gz \
+SHODH_ALLOW_FALLBACK_NER=1 RECALL_DIAG_K=100 \
+./target/release/recall-eval --suite locomo-gate --layer full --repeats 2 \
+  --output current-facts.json --per-case-output per-case-facts.json \
+  --storage "$HOME/Library/Caches/veld-recall-facts"
+```
+
+`VELD_LLM_MODEL` is the model id the server lists; it is part of every request, so the replay
+asks for the same one. The log line `write-time facts: ... turns, ... created` says what the
+extractor did, and the run must report no tape problem. The second repeat answers every LLM
+request from the tape, so it adds no entries unless something upstream of the model changed.
+Pin the tape as in steps 2 and 3 above, and add `VELD_DIALS_WRITE_TIME_FACTS: '1'` to the gate
+step's environment in `.github/workflows/recall.yml`: replaying a facts tape with the dial off
+measures the run without facts. A change to the prompt changes every request and so needs a new
+recording; bump `PROMPT_VERSION` with it, which every fact records.
+
 ## Files
 
 - `corpora/shodh-smoke.jsonl` — L1 smoke corpus (memories ingested by the runner).
