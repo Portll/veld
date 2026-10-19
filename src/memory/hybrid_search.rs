@@ -15,7 +15,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +25,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
+use tantivy::schema::{
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING, TEXT,
+};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument};
 use tracing::{debug, info};
 
@@ -500,10 +502,47 @@ pub struct BM25Index {
     uncommitted: AtomicU64,
     /// When the writer last committed, from any caller.
     last_commit: parking_lot::Mutex<Instant>,
+    /// Sibling file of the index directory that exists from the moment
+    /// [`BM25Index::new`] discards an index built with another schema until the
+    /// projection has refilled the new one. `None` for an in-memory index, which
+    /// starts empty on every open and always replays the whole log.
+    rebuild_marker: Option<PathBuf>,
 }
 
+/// Tantivy analyzer that lowercases and applies the English (Snowball) stemmer.
+/// Registered by `TokenizerManager::default()` under tantivy's `stemmer`
+/// feature, which is in its default feature set.
+const STEMMED_TOKENIZER: &str = "en_stem";
+
 impl BM25Index {
+    /// The schema this binary indexes and queries with.
+    ///
+    /// `content` keeps tantivy's `default` analyzer and is paired with
+    /// `stemmed_content`, the same text run through [`stem_text`] at index time;
+    /// a query carries both its surface words and their stems
+    /// (`search_with_term_and_phrase_weights`), so "letters" reaches a document
+    /// that says "letter" through the stemmed field while an exact surface match
+    /// still scores on `content`. That is veld's shape of upstream's #560, which
+    /// moved `content` itself to `en_stem`.
+    ///
+    /// `tags` was the holdout: it carried the `default` analyzer, so a tag could
+    /// only be reached by its exact inflection. It now uses `en_stem`, which
+    /// stems the field's query terms with the same Snowball stemmer `stem_text`
+    /// uses, so the surface and stemmed query terms both land on the stem.
+    /// Positions are kept because phrase boosts run over every field.
+    ///
+    /// `entities` stays unstemmed on purpose: it holds proper nouns, and stemming
+    /// them re-creates the collision `GraphMemory` keeps proper nouns out of its
+    /// stemmed index to avoid ("Paris" → "pari" merging with "Parison"). Tantivy
+    /// analyzes a query per field with that field's own analyzer, so one term
+    /// stems against `tags` and stays literal against `entities`.
     fn schema() -> Schema {
+        let stemmed = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(STEMMED_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+
         let mut schema_builder = Schema::builder();
 
         // Memory ID (stored, not tokenized)
@@ -512,10 +551,10 @@ impl BM25Index {
         // Main content (tokenized for BM25)
         schema_builder.add_text_field("content", TEXT | STORED);
 
-        // Tags (tokenized)
-        schema_builder.add_text_field("tags", TEXT);
+        // Tags (tokenized + stemmed: lowercase common nouns, low proper-noun risk)
+        schema_builder.add_text_field("tags", stemmed);
 
-        // Entities (tokenized)
+        // Entities (tokenized, not stemmed; see above)
         schema_builder.add_text_field("entities", TEXT);
 
         // Stemmed content for morphological matching (search-only, not stored)
@@ -524,9 +563,32 @@ impl BM25Index {
         schema_builder.build()
     }
 
-    /// Create or open a BM25 index at the given path
+    /// Create or open a BM25 index at the given path.
+    ///
+    /// # Schema migration
+    ///
+    /// An on-disk index carries its own schema, including each field's
+    /// tokenizer name, in `meta.json`, and `Index::open` takes no schema: it
+    /// rebuilds everything from that file and ignores the one built here. The
+    /// writer and the `QueryParser` then resolve analyzers from the opened
+    /// index, so an index created before an analyzer change would keep indexing
+    /// and querying with the old one indefinitely, with no error, answering
+    /// differently from a fresh install of the same binary. The previous check
+    /// here only looked for the `stemmed_content` field, which cannot see an
+    /// analyzer change on a field that already exists.
+    ///
+    /// So the whole schema is compared on open, and a mismatch rebuilds: the
+    /// stale directory is deleted and recreated empty. The index is derived
+    /// data and the intent log holds every document it contained, but the BM25
+    /// projection resumes from its persisted checkpoint, which describes the
+    /// index just discarded. The rebuild therefore leaves a marker beside the
+    /// directory ([`BM25Index::rebuild_pending`]); the projection replays the
+    /// whole log while it is present and clears it once that replay has
+    /// committed. A crash mid-replay leaves the marker, so the next start
+    /// replays again instead of resuming into a half-filled index.
     pub fn new(path: &Path) -> Result<Self> {
         let schema = Self::schema();
+        let rebuild_marker = Self::rebuild_marker_path(path);
 
         // Create or open index
         std::fs::create_dir_all(path)?;
@@ -535,26 +597,75 @@ impl BM25Index {
 
         let index = if Index::exists(&dir)? {
             let existing = Index::open(dir).context("Failed to open existing BM25 index")?;
-            // Schema migration: if existing index lacks stemmed_content, rebuild
-            if existing.schema().get_field("stemmed_content").is_err() {
-                tracing::warn!(
-                    "BM25 schema missing stemmed_content — rebuilding index for stemming support"
-                );
+            if existing.schema() == schema {
+                existing
+            } else {
+                // Every handle onto the directory must be gone before removing
+                // it: on Windows the mmapped segment files stay open until this
+                // value is dropped, and `remove_dir_all` fails with a sharing
+                // violation.
                 drop(existing);
-                if let Err(e) = std::fs::remove_dir_all(path) {
-                    tracing::warn!("Failed to remove old BM25 index: {e}");
-                }
+                tracing::warn!(
+                    "BM25 index at {:?} was built with a different schema (analyzer or \
+                     field change); discarding it and rebuilding from the intent log. \
+                     Lexical search is incomplete until the replay finishes.",
+                    path
+                );
+                // The marker goes down before the directory does: if the process
+                // dies between the two, the next open finds an empty or absent
+                // index and the marker still says the log must be replayed.
+                std::fs::write(&rebuild_marker, b"")
+                    .with_context(|| format!("Failed to write {rebuild_marker:?}"))?;
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("Failed to remove stale BM25 index at {path:?}"))?;
                 std::fs::create_dir_all(path)?;
                 Index::create_in_dir(path, schema)
-                    .context("Failed to create BM25 index with stemmed_content")?
-            } else {
-                existing
+                    .context("Failed to recreate BM25 index after schema change")?
             }
         } else {
             Index::create_in_dir(path, schema).context("Failed to create BM25 index")?
         };
         info!("BM25 index initialized at {:?}", path);
-        Self::from_index(index, false)
+        let mut index = Self::from_index(index, false)?;
+        index.rebuild_marker = Some(rebuild_marker);
+        Ok(index)
+    }
+
+    /// Where [`BM25Index::new`] keeps the rebuild marker for the index at
+    /// `path`: a sibling file, not one inside the directory, so tantivy's
+    /// directory management never sees it.
+    fn rebuild_marker_path(path: &Path) -> PathBuf {
+        let mut name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("bm25_index"));
+        name.push(".rebuild-pending");
+        path.with_file_name(name)
+    }
+
+    /// Whether this index was recreated empty after a schema change (or a
+    /// previous recreation's replay never finished) and the projection must
+    /// replay the whole intent log into it rather than resume from its
+    /// checkpoint. Always `false` for an in-memory index, which replays the
+    /// whole log on every open anyway.
+    pub fn rebuild_pending(&self) -> bool {
+        self.rebuild_marker
+            .as_deref()
+            .is_some_and(|marker| marker.exists())
+    }
+
+    /// Clear the rebuild marker. Call only after the full replay has committed
+    /// and reloaded, which is what [`crate::intent_log::replay_all`] guarantees on
+    /// return. Idempotent: clearing an absent marker is not an error.
+    pub fn finish_rebuild(&self) -> Result<()> {
+        let Some(marker) = self.rebuild_marker.as_deref() else {
+            return Ok(());
+        };
+        match std::fs::remove_file(marker) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("Failed to remove {marker:?}")),
+        }
     }
 
     /// The index for an ENCRYPTED tenant: built in RAM, never written to disk.
@@ -630,6 +741,7 @@ impl BM25Index {
             in_memory,
             uncommitted: AtomicU64::new(0),
             last_commit: parking_lot::Mutex::new(Instant::now()),
+            rebuild_marker: None,
         })
     }
 
@@ -1965,6 +2077,85 @@ impl HybridSearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A schema change recreates the index empty, but the projection's checkpoint
+    /// still describes the index that was discarded. The marker is what tells the
+    /// next open to replay the whole log, and it has to survive the process: a
+    /// crash before the replay commits must not leave an index that is non-empty,
+    /// incomplete, and never refilled.
+    #[test]
+    fn a_schema_rebuild_stays_pending_across_a_reopen_until_finished() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let path = home.path().join("bm25_index");
+
+        // An index with the previous schema: `tags` on the default analyzer.
+        {
+            let mut old_schema = Schema::builder();
+            old_schema.add_text_field("id", STRING | STORED);
+            old_schema.add_text_field("content", TEXT | STORED);
+            old_schema.add_text_field("tags", TEXT);
+            old_schema.add_text_field("entities", TEXT);
+            old_schema.add_text_field("stemmed_content", TEXT);
+            std::fs::create_dir_all(&path).expect("mkdir");
+            let index = Index::create_in_dir(&path, old_schema.build()).expect("old index");
+            let mut writer = index.writer::<TantivyDocument>(15_000_000).expect("writer");
+            let mut doc = TantivyDocument::new();
+            doc.add_text(
+                index.schema().get_field("id").unwrap(),
+                uuid::Uuid::new_v4().to_string(),
+            );
+            doc.add_text(index.schema().get_field("content").unwrap(), "old");
+            writer.add_document(doc).expect("add");
+            writer.commit().expect("commit");
+        }
+
+        let rebuilt = BM25Index::new(&path).expect("open rebuilds");
+        assert!(rebuilt.is_empty(), "the old-schema index is discarded");
+        assert!(
+            rebuilt.rebuild_pending(),
+            "a rebuilt index must say the log has to be replayed into it"
+        );
+        // The projection's first batch reaches disk, then the process dies.
+        rebuilt
+            .upsert(&MemoryId(uuid::Uuid::new_v4()), "first batch", &[], &[])
+            .expect("upsert");
+        rebuilt.commit().expect("commit");
+        drop(rebuilt);
+
+        let reopened = BM25Index::new(&path).expect("reopen");
+        reopened.reload().expect("reload");
+        assert!(
+            !reopened.is_empty(),
+            "precondition: the first batch reached disk, so emptiness alone cannot \
+             see the interruption"
+        );
+        assert!(
+            reopened.rebuild_pending(),
+            "an interrupted rebuild must still read as pending after a restart"
+        );
+
+        reopened.finish_rebuild().expect("finish");
+        assert!(!reopened.rebuild_pending());
+        reopened
+            .finish_rebuild()
+            .expect("finishing twice is not an error");
+
+        let again = BM25Index::new(&path).expect("reopen with a current schema");
+        assert!(
+            !again.rebuild_pending() && !again.is_empty(),
+            "a current-schema index is kept as it is"
+        );
+    }
+
+    /// The in-memory index of an encrypted tenant has no marker to keep: it starts
+    /// empty on every open and the projection already replays the whole log.
+    #[test]
+    fn an_in_memory_index_never_reports_a_pending_rebuild() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let index = BM25Index::in_memory(&home.path().join("bm25_index")).expect("in memory");
+        assert!(!index.rebuild_pending());
+        index.finish_rebuild().expect("no-op");
+    }
 
     /// An encrypted tenant's index never reaches disk, and an index left there from
     /// before encryption is removed rather than reopened.

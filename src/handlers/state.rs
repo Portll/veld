@@ -2459,9 +2459,12 @@ impl MultiUserMemoryManager {
 
         // Third projection: BM25 inverted index.
         let bm25_index = self.get_user_bm25_index(user_id)?;
-        // An in-memory index starts empty every time, so its projection replays
-        // the whole log rather than resuming from the checkpoint a past index wrote.
-        let mut bm25_projection = if bm25_index.is_in_memory() {
+        // An in-memory index starts empty every time, and an on-disk index that
+        // `BM25Index::new` recreated after a schema change is empty too, so both
+        // replay the whole log rather than resuming from the checkpoint a past
+        // index wrote. The marker stays until this replay has committed.
+        let bm25_rebuilding = bm25_index.rebuild_pending();
+        let mut bm25_projection = if bm25_index.is_in_memory() || bm25_rebuilding {
             crate::memory::Bm25Projection::new_from_start(
                 bm25_index.clone(),
                 checkpoint_store.clone(),
@@ -2520,9 +2523,14 @@ impl MultiUserMemoryManager {
         let wiki_name = wiki_projection
             .as_ref()
             .map(|wp| crate::intent_log::ReplayTarget::target_name(wp).to_string());
+        let bm25_name = crate::intent_log::ReplayTarget::target_name(&bm25_projection).to_string();
+        let mut bm25_rebuilt = None;
         let mut first_failure = None;
         for (name, result) in replay_results {
             match result {
+                Ok(applied) if bm25_rebuilding && name == bm25_name => {
+                    bm25_rebuilt = Some(applied);
+                }
                 Ok(applied) if applied > 0 => tracing::info!(
                     user_id = %user_id,
                     projection = %name,
@@ -2552,6 +2560,16 @@ impl MultiUserMemoryManager {
         if let Some(e) = first_failure {
             return Err(
                 anyhow::Error::new(e).context(format!("replay intent log for user {user_id}"))
+            );
+        }
+        if let Some(applied) = bm25_rebuilt {
+            bm25_index.finish_rebuild().with_context(|| {
+                format!("clear the BM25 rebuild marker after replay for user {user_id}")
+            })?;
+            tracing::info!(
+                user_id = %user_id,
+                applied,
+                "BM25 index rebuilt from the intent log after a schema change",
             );
         }
 
