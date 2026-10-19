@@ -419,37 +419,43 @@ pub async fn consolidate_memories(
             }
         }
 
-        // Step 4: Gap analysis — sync graph to SQLite, detect structural gaps
-        if let Ok(graph) = state_clone.get_user_graph(&user_id) {
-            if let Ok(store) = state_clone.get_user_slow_store(&user_id) {
-                let graph_guard = graph.read();
-                match (
-                    graph_guard.get_all_entities(),
-                    graph_guard.get_all_relationships(),
-                ) {
-                    (Ok(entities), Ok(edges)) => {
-                        if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
-                            let config = GapDetectionConfig::default();
-                            match GapDetector::detect(store.as_ref(), &config) {
-                                Ok(result) => {
-                                    persist_detected_gaps(&store, &user_id, &result);
-                                    tracing::info!(
-                                        user_id = %user_id,
-                                        gaps = result.gaps.len(),
-                                        types = ?result.type_counts,
-                                        "Gap detection complete + persisted (post-consolidation)"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::debug!("Gap detection failed: {e}");
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        tracing::debug!("Could not load graph data for gap analysis");
-                    }
+        // Step 4: Gap analysis — refresh the SQLite graph mirror, then detect
+        // structural gaps. The refresh is gated inside SlowStore (one rebuild
+        // in flight, TTL since the last); when it is skipped, detection runs
+        // on the existing mirror.
+        if let (Ok(graph), Ok(store)) = (
+            state_clone.get_user_graph(&user_id),
+            state_clone.get_user_slow_store(&user_id),
+        ) {
+            let scope = user_id.clone();
+            let ttl = state_clone.server_config().graph_mirror_sync_ttl();
+            let gap_step = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                if let Some(sync) = store.begin_sync(ttl) {
+                    // Hold the graph read lock only for the snapshot.
+                    let (entities, edges) = {
+                        let graph_guard = graph.read();
+                        (
+                            graph_guard.get_all_entities()?,
+                            graph_guard.get_all_relationships()?,
+                        )
+                    };
+                    sync.rebuild(&entities, &edges)?;
                 }
+                let result = GapDetector::detect(store.as_ref(), &GapDetectionConfig::default())?;
+                persist_detected_gaps(&store, &scope, &result);
+                tracing::info!(
+                    user_id = %scope,
+                    gaps = result.gaps.len(),
+                    types = ?result.type_counts,
+                    "Gap detection complete + persisted (post-consolidation)"
+                );
+                Ok(())
+            })
+            .await;
+            match gap_step {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!("Gap analysis failed: {e}"),
+                Err(e) => tracing::debug!("Gap analysis task panicked: {e}"),
             }
         }
 
@@ -768,22 +774,41 @@ pub async fn sleep_phase_consolidation(
             }
         }
 
-        // Phase 7: Gap analysis
-        if let Ok(graph) = state_clone.get_user_graph(&user_id) {
-            if let Ok(store) = state_clone.get_user_slow_store(&user_id) {
-                let graph_guard = graph.read();
-                if let (Ok(entities), Ok(edges)) = (
-                    graph_guard.get_all_entities(),
-                    graph_guard.get_all_relationships(),
-                ) {
-                    if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
-                        let config = GapDetectionConfig::default();
-                        if let Ok(result) = GapDetector::detect(store.as_ref(), &config) {
-                            persist_detected_gaps(&store, &user_id, &result);
-                            tracing::info!(user_id = %user_id, gaps = result.gaps.len(), "Sleep-phase gap detection complete + persisted");
-                        }
-                    }
+        // Phase 7: Gap analysis — same gated mirror refresh as the
+        // post-consolidation step: snapshot under the graph lock, rebuild
+        // without it, and detect on the existing mirror when the rebuild is
+        // skipped.
+        if let (Ok(graph), Ok(store)) = (
+            state_clone.get_user_graph(&user_id),
+            state_clone.get_user_slow_store(&user_id),
+        ) {
+            let scope = user_id.clone();
+            let ttl = state_clone.server_config().graph_mirror_sync_ttl();
+            let gap_step = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                if let Some(sync) = store.begin_sync(ttl) {
+                    let (entities, edges) = {
+                        let graph_guard = graph.read();
+                        (
+                            graph_guard.get_all_entities()?,
+                            graph_guard.get_all_relationships()?,
+                        )
+                    };
+                    sync.rebuild(&entities, &edges)?;
                 }
+                let result = GapDetector::detect(store.as_ref(), &GapDetectionConfig::default())?;
+                persist_detected_gaps(&store, &scope, &result);
+                tracing::info!(
+                    user_id = %scope,
+                    gaps = result.gaps.len(),
+                    "Sleep-phase gap detection complete + persisted"
+                );
+                Ok(())
+            })
+            .await;
+            match gap_step {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(user_id = %user_id, "Sleep-phase gap analysis failed: {e}"),
+                Err(e) => tracing::warn!(user_id = %user_id, "Sleep-phase gap analysis task panicked: {e}"),
             }
         }
 
