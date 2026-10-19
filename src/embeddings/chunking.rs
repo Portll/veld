@@ -46,6 +46,12 @@ static DIALOGUE_TURN_PATTERN: LazyLock<Regex> =
 static SECTION_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^(?:\[.*?\]|#{1,3}\s+\w|Session \d+|---+)").unwrap());
 
+/// Paragraph break: a blank line (possibly holding whitespace)
+static PARAGRAPH_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n\s*\n").unwrap());
+
+/// Sentence end: terminal punctuation followed by whitespace
+static SENTENCE_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[.!?]+\s+").unwrap());
+
 /// Chunk configuration for fixed-size chunking
 pub struct ChunkConfig {
     /// Target chunk size in characters (approximate tokens * 4)
@@ -439,10 +445,9 @@ fn split_into_segments(text: &str, config: &SemanticChunkConfig) -> Vec<Semantic
         }
     } else if config.split_on_paragraphs {
         // Split by paragraphs (double newlines) or section markers
-        let paragraph_pattern = Regex::new(r"\n\s*\n").unwrap();
         let mut last_end = 0;
 
-        for mat in paragraph_pattern.find_iter(text) {
+        for mat in PARAGRAPH_PATTERN.find_iter(text) {
             if mat.start() > last_end {
                 let para_text = text[last_end..mat.start()].trim();
                 if !para_text.is_empty() {
@@ -488,11 +493,10 @@ fn split_into_segments(text: &str, config: &SemanticChunkConfig) -> Vec<Semantic
 
 /// Split text by sentences for fallback
 fn split_by_sentences(text: &str) -> Vec<SemanticSegment> {
-    let sentence_pattern = Regex::new(r"[.!?]+\s+").unwrap();
     let mut segments = Vec::new();
     let mut last_end = 0;
 
-    for mat in sentence_pattern.find_iter(text) {
+    for mat in SENTENCE_PATTERN.find_iter(text) {
         let sentence = text[last_end..mat.end()].trim();
         if !sentence.is_empty() {
             segments.push(SemanticSegment {
@@ -869,6 +873,27 @@ mod tests {
                 found,
                 "Sentence {i} not found in any chunk! Coverage gap detected."
             );
+        }
+    }
+
+    #[test]
+    fn static_split_patterns_match_the_inline_ones() {
+        let text = "First. Second!  Third?\n  \nNext paragraph.\n\nLast one";
+        for (pattern, shared) in [
+            (r"\n\s*\n", &*PARAGRAPH_PATTERN),
+            (r"[.!?]+\s+", &*SENTENCE_PATTERN),
+        ] {
+            let inline: Vec<_> = Regex::new(pattern)
+                .unwrap()
+                .find_iter(text)
+                .map(|m| (m.start(), m.end()))
+                .collect();
+            let cached: Vec<_> = shared
+                .find_iter(text)
+                .map(|m| (m.start(), m.end()))
+                .collect();
+            assert!(!inline.is_empty());
+            assert_eq!(inline, cached, "pattern {pattern}");
         }
     }
 }
