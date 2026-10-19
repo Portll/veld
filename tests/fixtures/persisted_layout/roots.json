@@ -1294,6 +1294,29 @@
             }
           ]
         }
+      },
+      "4": {
+        "SetAnchored": {
+          "STRUCT": [
+            {
+              "user_id": "STR"
+            },
+            {
+              "memory_id": "STR"
+            },
+            {
+              "anchored": "BOOL"
+            },
+            {
+              "importance": "F32"
+            },
+            {
+              "schema_version": {
+                "OPTION": "U16"
+              }
+            }
+          ]
+        }
       }
     }
   },

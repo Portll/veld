@@ -465,7 +465,7 @@ pub fn apply_replicated_page(
     Ok(journaled)
 }
 
-/// The store-side effect of a `Forget` or `Anchor` frame; snapshots are handled in
+/// The store-side effect of a `Forget`, `Anchor` or `SetAnchored` frame; snapshots are handled in
 /// bulk by [`apply_replicated_page`].
 fn apply_non_snapshot(
     manager: &MultiUserMemoryManager,
@@ -497,6 +497,20 @@ fn apply_non_snapshot(
                 } else if *importance < memory.importance() {
                     memory.set_anchored(false);
                 }
+                memory.set_importance(*importance);
+                guard.update_memory(&memory)?;
+            }
+        }
+        IntentPayload::SetAnchored {
+            memory_id,
+            anchored,
+            importance,
+            ..
+        } => {
+            let id = MemoryId(uuid::Uuid::parse_str(memory_id)?);
+            let guard = memory_sys.read();
+            if let Ok(memory) = guard.get_memory(&id) {
+                memory.set_anchored(*anchored);
                 memory.set_importance(*importance);
                 guard.update_memory(&memory)?;
             }
@@ -1136,6 +1150,51 @@ mod tests {
             _ => IntentPayload::Anchor { user_id, memory_id: id.into(), importance: 0.9, schema_version: sv },
         };
         (lsn, p)
+    }
+
+    #[test]
+    fn a_release_that_keeps_importance_reaches_the_follower() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let memory_sys = manager.get_user_memory("u").unwrap();
+        let id = memory_sys
+            .read()
+            .remember(
+                crate::memory::types::Experience {
+                    content: "the deploy key rotates on the first of the month".into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let memory = memory_sys.read().get_memory(&id).unwrap();
+        memory.set_anchored(true);
+        memory_sys.read().update_memory(&memory).unwrap();
+        let importance = memory.importance();
+        let anchored = || memory_sys.read().get_memory(&id).unwrap().is_anchored();
+        let sv = Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
+
+        let legacy = IntentPayload::Anchor {
+            user_id: "u".into(),
+            memory_id: id.0.to_string(),
+            importance,
+            schema_version: sv,
+        };
+        apply_non_snapshot(&manager, "u", &legacy).unwrap();
+        assert!(anchored(), "a legacy frame cannot say the anchor was released");
+
+        let release = IntentPayload::SetAnchored {
+            user_id: "u".into(),
+            memory_id: id.0.to_string(),
+            anchored: false,
+            importance,
+            schema_version: sv,
+        };
+        apply_non_snapshot(&manager, "u", &release).unwrap();
+        assert!(!anchored());
+        assert_eq!(
+            memory_sys.read().get_memory(&id).unwrap().importance(),
+            importance
+        );
     }
 
     #[test]
