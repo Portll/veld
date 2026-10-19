@@ -14,6 +14,35 @@ pub const MAX_METADATA_SIZE: usize = 10_000; // Max metadata JSON size (10KB)
 #[allow(unused)] // Public API - available for validation
 pub const MAX_ENTITIES_PER_MEMORY: usize = 50; // Max entities per memory
 
+/// Directories under the data root that are not tenants: shared stores, backups, the
+/// instance registry (on macOS the config directory holding `instances/` is the data
+/// root) and the replication follower's cursors. A user_id naming one would open a
+/// tenant's stores inside it.
+pub const RESERVED_DATA_DIRS: &[&str] = &[
+    "audit_logs",
+    "audit_logs.pre_cf_migration",
+    "backups",
+    "feedback",
+    "feedback.pre_cf_migration",
+    "semantic_facts",
+    "files",
+    "files.pre_cf_migration",
+    "prospective",
+    "prospective.pre_cf_migration",
+    "todos",
+    "todos.pre_cf_migration",
+    "shared",
+    "instances",
+    "replication",
+];
+
+/// Case-insensitive, because the default macOS filesystem is.
+pub fn is_reserved_data_dir(name: &str) -> bool {
+    RESERVED_DATA_DIRS
+        .iter()
+        .any(|dir| dir.eq_ignore_ascii_case(name))
+}
+
 /// Validate user_id
 pub fn validate_user_id(user_id: &str) -> Result<()> {
     if user_id.is_empty() {
@@ -71,6 +100,13 @@ pub fn validate_user_id(user_id: &str) -> Result<()> {
                 user_id
             ));
         }
+    }
+
+    if is_reserved_data_dir(user_id) {
+        return Err(anyhow!(
+            "user_id names a reserved data directory, not a tenant: {}",
+            user_id
+        ));
     }
 
     Ok(())
@@ -310,6 +346,15 @@ mod tests {
         assert!(validate_user_id("").is_err()); // empty
         assert!(validate_user_id("user/123").is_err()); // invalid char
         assert!(validate_user_id(&"a".repeat(200)).is_err()); // too long
+    }
+
+    #[test]
+    fn reserved_data_directories_are_not_user_ids() {
+        for name in ["instances", "Instances", "replication", "todos", "shared"] {
+            assert!(validate_user_id(name).is_err(), "{name} must be refused");
+        }
+        assert!(validate_user_id("instance").is_ok());
+        assert!(validate_user_id("replication-bench").is_ok());
     }
 
     #[test]

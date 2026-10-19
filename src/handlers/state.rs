@@ -357,21 +357,6 @@ pub struct MultiUserMemoryManager {
 /// User directories under the data root. An unreadable entry is an error, not a
 /// skipped user: the boot guard must see every tenant or refuse.
 pub(crate) fn list_user_dirs(base_path: &std::path::Path) -> std::io::Result<Vec<String>> {
-    const SYSTEM_DIRS: &[&str] = &[
-        "audit_logs",
-        "audit_logs.pre_cf_migration",
-        "backups",
-        "feedback",
-        "feedback.pre_cf_migration",
-        "semantic_facts",
-        "files",
-        "files.pre_cf_migration",
-        "prospective",
-        "prospective.pre_cf_migration",
-        "todos",
-        "todos.pre_cf_migration",
-        "shared",
-    ];
     let mut users = Vec::new();
     for entry in std::fs::read_dir(base_path)? {
         let entry = entry?;
@@ -379,7 +364,7 @@ pub(crate) fn list_user_dirs(base_path: &std::path::Path) -> std::io::Result<Vec
             continue;
         }
         if let Some(name) = entry.file_name().to_str() {
-            if !SYSTEM_DIRS.contains(&name) {
+            if !crate::validation::is_reserved_data_dir(name) {
                 users.push(name.to_string());
             }
         }
@@ -1288,6 +1273,9 @@ impl MultiUserMemoryManager {
     /// absolute path in it would escape `base_path` at every join below. Every user-scoped path
     /// in this manager goes through here.
     pub(crate) fn user_dir(&self, user_id: &str) -> Result<std::path::PathBuf> {
+        if crate::validation::is_reserved_data_dir(user_id) {
+            anyhow::bail!("user id '{user_id}' names a reserved data directory, not a tenant");
+        }
         Ok(self
             .base_path
             .join(crate::path_guard::sanitize_component(user_id, "user id")?))
@@ -5484,5 +5472,35 @@ impl MultiUserMemoryManager {
             out.push((user_id, result));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod reserved_dir_tests {
+    use super::*;
+
+    #[test]
+    fn the_registry_and_cursor_directories_are_not_tenants() {
+        let root = tempfile::TempDir::new().unwrap();
+        for dir in ["alice", "instances", "replication", "todos"] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        assert_eq!(list_user_dirs(root.path()).unwrap(), vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn no_tenant_opens_inside_a_reserved_directory() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = ServerConfig {
+            storage_path: root.path().to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        let manager = MultiUserMemoryManager::new(root.path().to_path_buf(), config).unwrap();
+        assert!(manager.user_dir("instances").is_err());
+        assert!(manager.user_dir("Replication").is_err());
+        assert!(manager.get_user_memory("instances").is_err());
+        assert!(!root.path().join("instances").exists());
+        assert!(manager.user_dir("alice").is_ok());
     }
 }
