@@ -2563,7 +2563,16 @@ impl super::MemorySystem {
             // Phase 2.1: Keep wider candidate pool for cross-encoder reranking.
             // Decomposed queries produce a wider candidate set — widen the budget
             // so more candidates survive into the cross-encoder.
-            let rerank_budget = if decomposed { 50_usize } else { 30_usize }.max(query.max_results);
+            // The `rerank_pool` dial overrides the width; the pool never drops below an explicit
+            // `rerank_count`, or Layer 5.3 would be asked to score candidates already cut.
+            let (pool_dial, rerank_count_dial) = {
+                let d = self.cognitive_dials.read();
+                (d.rerank_pool, d.rerank_count)
+            };
+            let rerank_budget = pool_dial
+                .unwrap_or(if decomposed { 50_usize } else { 30_usize })
+                .max(rerank_count_dial.or(query.rerank_count).unwrap_or(0))
+                .max(query.max_results);
             res.truncate(rerank_budget);
             tracing::debug!(
                 "Layer 4: {} fused results (rerank budget={})",
@@ -3197,9 +3206,9 @@ impl super::MemorySystem {
         // Dial gate: VELD_DIALS_USE_RERANKING=false (or cognitive_dials.use_reranking =
         // Some(false)) fully skips this layer. The `rerank_count` dial caps the
         // candidate budget; absent that, the hardcoded ce_cap applies.
-        let (layer53_use_reranking, layer53_rerank_count_dial) = {
+        let (layer53_use_reranking, layer53_rerank_count_dial, layer53_ce_blend) = {
             let d = self.cognitive_dials.read();
-            (d.use_reranking, d.rerank_count)
+            (d.use_reranking, d.rerank_count, d.ce_blend)
         };
         if memories.len() > 1
             && layer53_use_reranking.unwrap_or(true)
@@ -3211,11 +3220,13 @@ impl super::MemorySystem {
                 // Decomposed queries: widen CE budget from 20→30 to exploit the
                 // broader candidate pool from multi-query vector search.
                 let ce_cap = if decomposed { 30 } else { 20 };
-                // rerank_count dial caps the budget when set (query-level or dials-level).
-                let dial_cap = layer53_rerank_count_dial
-                    .or(query.rerank_count)
-                    .unwrap_or(ce_cap);
-                let rerank_budget = memories.len().min(query.max_results * 2).min(dial_cap);
+                // An explicit rerank_count (dial or query) is the budget, so it can reach past
+                // twice max_results to gold the fused order left below rank 20; absent one, the
+                // budget stays bounded by max_results for latency.
+                let rerank_budget = match layer53_rerank_count_dial.or(query.rerank_count) {
+                    Some(explicit) => memories.len().min(explicit),
+                    None => memories.len().min(query.max_results * 2).min(ce_cap),
+                };
                 // Pass each candidate's stored embedding so the reranker's
                 // bi-encoder pass can reuse it instead of re-embedding via the
                 // HTTP embedder (5–6s/call for CPU Nomic). The reranker
@@ -3276,11 +3287,18 @@ impl super::MemorySystem {
                         // Adaptive blend: decomposed queries shift weight toward
                         // cross-encoder (55/45) because the CE can reason about abstract
                         // membership ("is a Redis fix a performance improvement?") that
-                        // dot-product similarity cannot. Standard queries keep 82/18.
-                        let (base_w, ce_w) = if decomposed {
-                            (0.55, 0.45)
-                        } else {
-                            (0.82, 0.18)
+                        // dot-product similarity cannot. Standard queries take the ce_blend
+                        // dial, default 18%; a decomposed query never takes less than 45%.
+                        // The unset arms keep their literal pairs so a default run scores
+                        // bit-for-bit as the baseline did.
+                        let (base_w, ce_w): (f32, f32) = match layer53_ce_blend {
+                            None if decomposed => (0.55, 0.45),
+                            None => (0.82, 0.18),
+                            Some(w) => {
+                                let w = w.clamp(0.0, 1.0);
+                                let w = if decomposed { w.max(0.45) } else { w };
+                                (1.0 - w, w)
+                            }
                         };
                         for mem in memories.iter_mut().take(rerank_budget) {
                             if let Some(&ce_score) = ce_scores.get(&mem.id) {
