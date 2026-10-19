@@ -56,7 +56,7 @@ pub struct ServerRunConfig {
 /// Environment variables are set **before** the tokio runtime is created, so no
 /// threads exist yet. This avoids the `set_var` unsoundness on multi-threaded runtimes.
 pub fn run(config: ServerRunConfig) -> Result<()> {
-    raise_open_file_limit();
+    let file_limit = raise_open_file_limit();
     let local_dev_rate_limit_default = !config.production
         && crate::config::is_local_bind_host(&config.host)
         && std::env::var("VELD_RATE_LIMIT").is_err()
@@ -101,11 +101,30 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
     let _ = dotenvy::dotenv();
 
     // Build and enter the tokio runtime
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("Failed to build tokio runtime")
-        .block_on(async_main())
+        .expect("Failed to build tokio runtime");
+    let result = runtime.block_on(async_main(file_limit));
+    // Dropping a runtime waits without limit for blocking work still running. On
+    // 2026-10-18 a SlowStore sync and a gap detection kept the process alive 3 min 23 s
+    // after "Server shutdown complete". Stores are flushed by now; give stragglers a
+    // bounded moment, then exit. RocksDB's WAL and SQLite's journal keep an
+    // interrupted write atomic.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(
+        RUNTIME_SHUTDOWN_TIMEOUT_SECS,
+    ));
+    result
+}
+
+/// How long the runtime waits for blocking work after the shutdown sequence ends.
+const RUNTIME_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+
+/// Set once the shutdown signal arrives; background schedulers start nothing new.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Build the optional relational backend selected by
@@ -187,7 +206,7 @@ async fn build_relational_backend() -> Result<
 // ASYNC MAIN
 // =============================================================================
 
-async fn async_main() -> Result<()> {
+async fn async_main(file_limit: FileLimit) -> Result<()> {
     // Initialize tracing
     #[cfg(feature = "telemetry")]
     {
@@ -197,6 +216,7 @@ async fn async_main() -> Result<()> {
     {
         tracing_subscriber::fmt::init();
     }
+    file_limit.log();
 
     // Print startup banner
     print_banner();
@@ -519,6 +539,7 @@ async fn async_main() -> Result<()> {
 
     // Wait for shutdown signal (Ctrl+C / SIGTERM)
     shutdown_signal_with_drain().await;
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
 
     // Tell the server to stop accepting new connections
     shutdown_notify.notify_one();
@@ -571,7 +592,10 @@ async fn async_main() -> Result<()> {
 /// 2026-10-19. Logged, never fatal: a server that cannot raise it still serves
 /// what the limit allows.
 #[cfg(unix)]
-fn raise_open_file_limit() {
+// rlim_t is u64 on macOS and 64-bit Linux but narrower on some targets, so the
+// casts stay.
+#[allow(clippy::unnecessary_cast)]
+fn raise_open_file_limit() -> FileLimit {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -579,7 +603,7 @@ fn raise_open_file_limit() {
     // SAFETY: getrlimit/setrlimit only read and write the struct passed to them.
     unsafe {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-            return;
+            return FileLimit::Unknown;
         }
         let want = if limit.rlim_max == libc::RLIM_INFINITY {
             65_536
@@ -587,23 +611,51 @@ fn raise_open_file_limit() {
             limit.rlim_max
         };
         if limit.rlim_cur >= want {
-            return;
+            return FileLimit::Unchanged(limit.rlim_cur as u64);
         }
-        let before = limit.rlim_cur;
+        let before = limit.rlim_cur as u64;
         limit.rlim_cur = want;
         if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
-            info!("Open-file limit raised from {before} to {want}");
+            FileLimit::Raised {
+                from: before,
+                to: want as u64,
+            }
         } else {
-            warn!(
-                "Open-file limit stays at {before} (could not raise to {want}); \
-                 many tenants will exhaust it"
-            );
+            FileLimit::Refused {
+                at: before,
+                wanted: want as u64,
+            }
         }
     }
 }
 
 #[cfg(not(unix))]
-fn raise_open_file_limit() {}
+fn raise_open_file_limit() -> FileLimit {
+    FileLimit::Unknown
+}
+
+/// The outcome of [`raise_open_file_limit`], which runs before logging starts and
+/// is reported once it has.
+enum FileLimit {
+    Unknown,
+    Unchanged(u64),
+    Raised { from: u64, to: u64 },
+    Refused { at: u64, wanted: u64 },
+}
+
+impl FileLimit {
+    fn log(&self) {
+        match self {
+            FileLimit::Unknown => {}
+            FileLimit::Unchanged(n) => info!("Open-file limit: {n}"),
+            FileLimit::Raised { from, to } => info!("Open-file limit raised from {from} to {to}"),
+            FileLimit::Refused { at, wanted } => warn!(
+                "Open-file limit stays at {at} (could not raise to {wanted}); \
+                 many tenants will exhaust it"
+            ),
+        }
+    }
+}
 
 // =============================================================================
 // Background Schedulers
@@ -632,9 +684,13 @@ fn start_maintenance_scheduler(manager: AppState, interval_secs: u64) {
                 tracing::debug!("Ended {} stale user sessions", session_cleaned);
             }
 
-            // Run maintenance in blocking thread pool
+            if shutting_down() {
+                break;
+            }
+            // Tracked, so the shutdown drain waits for a pass in progress instead of
+            // leaving it to hold the process open after the stores are flushed.
             let manager_clone = Arc::clone(&manager);
-            tokio::task::spawn_blocking(move || {
+            manager.task_tracker.spawn_blocking(move || {
                 manager_clone.run_maintenance_all_users();
             });
         }
@@ -876,23 +932,42 @@ async fn run_shutdown_cleanup(manager: AppState) {
         let flush_handle =
             tokio::task::spawn_blocking(move || manager_for_flush.flush_all_databases());
 
-        match tokio::time::timeout(
+        let flushed = match tokio::time::timeout(
             std::time::Duration::from_secs(DATABASE_FLUSH_TIMEOUT_SECS),
             flush_handle,
         )
         .await
         {
-            Ok(Ok(Ok(()))) => info!("Databases flushed successfully"),
-            Ok(Ok(Err(e))) => error!("Failed to flush databases: {}", e),
-            Ok(Err(e)) => error!("Flush task panicked: {}", e),
-            Err(_) => error!(
-                "Database flush timed out after {}s",
-                DATABASE_FLUSH_TIMEOUT_SECS
-            ),
-        }
+            Ok(Ok(Ok(()))) => {
+                info!("Databases flushed successfully");
+                true
+            }
+            Ok(Ok(Err(e))) => {
+                error!("Failed to flush databases: {}", e);
+                false
+            }
+            Ok(Err(e)) => {
+                error!("Flush task panicked: {}", e);
+                false
+            }
+            Err(_) => {
+                error!(
+                    "Database flush timed out after {}s",
+                    DATABASE_FLUSH_TIMEOUT_SECS
+                );
+                false
+            }
+        };
 
-        // Save vector indices (blocking operation, must use spawn_blocking)
-        info!("Persisting vector indices...");
+        // A successful flush already saved every vector index (flush_storage saves the
+        // retriever). Saving again wrote the same 413 MB file a second time on every
+        // stop; it is now only the fallback when the flush did not finish.
+        if flushed {
+            #[cfg(feature = "telemetry")]
+            tracing_setup::shutdown_tracing();
+            return;
+        }
+        info!("Persisting vector indices (the flush did not complete)...");
         let manager_for_save = Arc::clone(&manager);
         let save_handle =
             tokio::task::spawn_blocking(move || manager_for_save.save_all_vector_indices());

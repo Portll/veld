@@ -519,10 +519,20 @@ async function renderReplication(body) {
   body.append(h("section", { class: "sec-card" },
     h("h3", {}, "Following"),
     f ? h("div", {},
-      h("p", {}, h("strong", {}, f.target.source), ` since ${when(f.target.since)} · ${f.polls} polls · last ${when(f.last_poll)}`),
-      f.last_error ? h("p", { class: "sec-flash error" }, f.last_error) : null,
-      table(["User", "Applied LSN", "Frames applied", "Leader log bytes"], Object.entries(f.users).map(([u, p]) => h("tr", {},
-        h("td", {}, u), h("td", {}, p.applied_lsn ?? "—"), h("td", {}, p.applied_records), h("td", {}, fmtBytes(p.source_bytes))))),
+      h("p", {}, h("strong", {}, f.target.source), ` since ${when(f.target.since)} · ${f.pages} pages · ${f.polls} polls finished · last ${when(f.last_poll)}`),
+      f.last_error ? h("p", { class: "sec-flash error" }, "Leader unreachable: " + f.last_error) : null,
+      table(["Tenant", "Applied LSN", "Behind", "Frames consumed", "Journaled here", "State"], Object.entries(f.users).map(([u, p]) => {
+        const behind = p.leader_head_lsn == null ? "—" : Math.max(0, p.leader_head_lsn - 1 - (p.applied_lsn ?? -1));
+        const state = p.diverged ? h("span", { class: "sec-bad", title: p.diverged }, "diverged")
+          : p.last_error ? h("span", { class: "sec-warn", title: p.last_error }, `retrying (${p.failures})`)
+          : behind === 0 ? "in sync" : "syncing";
+        return h("tr", {},
+          h("td", {}, u), h("td", {}, p.applied_lsn ?? "—"), h("td", {}, behind),
+          h("td", {}, p.applied_records), h("td", {}, p.journaled_records ?? 0), h("td", {}, state));
+      })),
+      Object.values(f.users).some((p) => p.diverged)
+        ? h("p", { class: "sec-note" }, "A diverged tenant's leader log moved backwards (restore, rollback or recreated log). It is no longer synced. To resync it, stop this follower, remove the tenant's directory here, and start it again; it replays from the start.")
+        : null,
       h("div", { class: "sec-actions" },
         h("button", { type: "button", class: "sec-danger", onclick: async () => {
           if (!(await confirmAction("Stop following", `${base()} keeps what it has and stops tailing ${f.target.source}. The cursor is kept, so following again resumes.`, "Stop"))) return;
