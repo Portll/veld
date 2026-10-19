@@ -16,6 +16,7 @@ pub mod context;
 pub mod context_blocks;
 pub mod dials;
 pub mod embedding_backlog;
+pub mod embedding_cache;
 pub mod facets;
 pub mod facts;
 pub mod feedback;
@@ -318,17 +319,15 @@ pub struct MemorySystem {
     /// Embedder for semantic search
     embedder: Arc<crate::embeddings::competitive::CompetitiveEmbedder>,
 
-    /// Query embedding cache - SHA256(query_text) → embedding
+    /// Query embedding cache - (space, SHA256(query_text)) → embedding
     /// Uses SHA256 for stable hashing across restarts (unlike DefaultHasher)
     /// MASSIVE PERF WIN: 80ms → <1ms for cached queries
-    /// LRU eviction: max 10,000 entries (~15MB for 384-dim embeddings)
-    query_cache: moka::sync::Cache<[u8; 32], Vec<f32>>,
+    query_cache: embedding_cache::EmbeddingCache,
 
-    /// Content embedding cache - SHA256(content) → embedding
+    /// Content embedding cache - (space, SHA256(content)) → embedding
     /// Uses SHA256 for stable hashing across restarts (unlike DefaultHasher)
     /// MASSIVE PERF WIN: 80ms → <1ms for repeated content
-    /// LRU eviction: max 10,000 entries (~15MB for 384-dim embeddings)
-    content_cache: moka::sync::Cache<[u8; 32], Vec<f32>>,
+    content_cache: embedding_cache::EmbeddingCache,
 
     /// Memory statistics
     stats: Arc<RwLock<MemoryStats>>,
@@ -436,6 +435,10 @@ pub struct MemorySystem {
 
     /// Memories stored without a vector, drained when the embedder answers again.
     embedding_backlog: embedding_backlog::EmbeddingBacklogStore,
+
+    /// The space registry last written beside the corpus markers, so an unchanged corpus is
+    /// not rewritten on every drain tick.
+    space_registry_written: parking_lot::Mutex<Option<crate::embeddings::space::SpaceRegistry>>,
 
     /// One row per recall, including empty ones — the question side the trace store lacks.
     recall_event_store: recall_events::RecallEventStore,
@@ -1012,7 +1015,9 @@ impl MemorySystem {
         } else {
             let http_config = if secondary_choice == "auto" {
                 crate::embeddings::http_embedder::HttpEmbedderConfig::from_env()
-            } else if secondary_choice.starts_with("http://") || secondary_choice.starts_with("https://") {
+            } else if secondary_choice.starts_with("http://")
+                || secondary_choice.starts_with("https://")
+            {
                 crate::embeddings::http_embedder::HttpEmbedderConfig::from_id(&secondary_choice)
             } else {
                 anyhow::bail!(
@@ -1376,6 +1381,7 @@ impl MemorySystem {
             Arc::new(RwLock::new(detector))
         };
 
+        let cache_space = embedder.primary_space();
         Ok(Self {
             config: config.clone(),
             working_memory: Arc::new(RwLock::new(WorkingMemory::new(config.working_memory_size))),
@@ -1390,8 +1396,8 @@ impl MemorySystem {
             retriever,
             embedder,
             // LRU embedding caches: max 2,000 entries each (~3MB for 384-dim embeddings)
-            query_cache: moka::sync::Cache::builder().max_capacity(2_000).build(),
-            content_cache: moka::sync::Cache::builder().max_capacity(2_000).build(),
+            query_cache: embedding_cache::EmbeddingCache::new(cache_space.clone(), 2_000),
+            content_cache: embedding_cache::EmbeddingCache::new(cache_space, 2_000),
             stats: Arc::new(RwLock::new(initial_stats)),
             logger,
             consolidation_events, // Use the shared buffer created earlier
@@ -1444,6 +1450,7 @@ impl MemorySystem {
             embedding_backlog: embedding_backlog::EmbeddingBacklogStore::with_kv(
                 primary_store.key_value_store(),
             ),
+            space_registry_written: parking_lot::Mutex::new(None),
             // R3a (F3): per-user persistent learned-weight store over this user's
             // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
             // weights are loaded on init (below) but NOT injected into scoring.
@@ -5524,6 +5531,30 @@ impl MemorySystem {
         self.embedding_backlog.report()
     }
 
+    /// Write the space registry beside the corpus markers when what it would say has changed.
+    /// Returns whether a file was written.
+    pub fn refresh_space_registry(&self) -> Result<bool> {
+        use crate::embeddings::space::{SpaceRegistry, REGISTRY_VERSION};
+        let registry = SpaceRegistry {
+            version: REGISTRY_VERSION,
+            updated_at: chrono::Utc::now(),
+            index_space: self.retriever.index_space().clone(),
+            secondary_index_space: self.retriever.secondary_index_space().cloned(),
+            spaces: self.embedding_spaces()?,
+            alignments: Vec::new(),
+        };
+        let mut written = self.space_registry_written.lock();
+        if written
+            .as_ref()
+            .is_some_and(|last| last.same_content(&registry))
+        {
+            return Ok(false);
+        }
+        registry.write(&self.config.storage_path)?;
+        *written = Some(registry);
+        Ok(true)
+    }
+
     /// Bring the backlog in line with what is stored and what is indexed. A live memory the
     /// index lacks gets a row whatever path lost it; a row for an indexed or deleted memory goes.
     pub fn reconcile_embedding_backlog(&self) -> Result<embedding_backlog::ReconcileReport> {
@@ -5620,6 +5651,9 @@ impl MemorySystem {
         let report = self
             .embedding_backlog
             .drain_with(limit, |key| self.embed_backlog_outcome(key))?;
+        if let Err(e) = self.refresh_space_registry() {
+            tracing::warn!("space registry: could not write: {e}");
+        }
         if report.drained > 0 {
             if let Err(e) = self.retriever.save() {
                 tracing::warn!("embedding backlog: index save after drain failed: {e}");
@@ -9672,5 +9706,70 @@ mod lifecycle_tests {
                 "{backend}: a memory under the age threshold is not promoted"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod space_registry_tests {
+    use super::*;
+    use crate::embeddings::space::{SpaceId, SpaceRegistry};
+
+    /// A vector supplied in another space than the index's is refused, waits in the backlog,
+    /// and the registry beside the markers lists both spaces.
+    #[test]
+    fn a_foreign_vector_and_the_index_space_both_reach_the_registry() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let system = MemorySystem::new(config, None).expect("memory system");
+        let index_space = system.index_space();
+        let foreign = SpaceId::new("nomic-embed-text-v1.5", 768);
+        assert_ne!(index_space, foreign);
+
+        let mut experience = Experience {
+            content: "a vector another instance made".to_string(),
+            ..Default::default()
+        };
+        experience.set_primary_vector(vec![0.036; 768], foreign.clone());
+        let id = system.remember(experience, None).expect("remember");
+        system
+            .remember(
+                Experience {
+                    content: "a vector this instance makes".to_string(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("remember");
+
+        let row = system
+            .embedding_backlog
+            .get(&id)
+            .unwrap()
+            .expect("the refused memory waits for a vector");
+        assert_eq!(row.stored_space, Some(foreign.clone()));
+        assert_eq!(row.target_space, Some(index_space.clone()));
+
+        assert!(system.refresh_space_registry().unwrap());
+        assert!(
+            !system.refresh_space_registry().unwrap(),
+            "an unchanged corpus is not rewritten"
+        );
+        let registry = SpaceRegistry::read(tmp.path()).unwrap().expect("registry");
+        assert_eq!(registry.index_space, index_space);
+        let listed: Vec<&SpaceId> = registry.spaces.iter().map(|s| &s.id).collect();
+        assert!(listed.contains(&&index_space), "{listed:?}");
+        assert!(listed.contains(&&foreign), "{listed:?}");
+        let stranded = registry.spaces.iter().find(|s| s.id == foreign).unwrap();
+        assert_eq!(stranded.stranded, 1);
+        let own = registry
+            .spaces
+            .iter()
+            .find(|s| s.id == index_space)
+            .unwrap();
+        assert!(own.memories >= 1);
+        assert_eq!(own.backlog, 1);
     }
 }

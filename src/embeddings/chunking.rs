@@ -90,6 +90,30 @@ impl Default for ChunkConfig {
     }
 }
 
+/// Chunking measured against a model's own tokenizer: `(model, chunk_size, overlap,
+/// min_chunk_size)`. Chunking decides how many vectors a memory gets and so how it ranks, so a
+/// model gets a row only from a `chunk-audit --sweep` over its tokenizer, never from its window
+/// size alone. MiniLM's row is the sweep recorded on `ChunkConfig::default`.
+const MEASURED_CHUNKING: &[(&str, usize, usize, usize)] =
+    &[(crate::embeddings::minilm::MODEL_ID, 480, 120, 120)];
+
+impl ChunkConfig {
+    /// The chunking for vectors in `space`. A model with no measured row gets MiniLM's: its
+    /// 256-token window is the narrowest any supported model has, so those chunks fit every
+    /// supported window, at the cost of more vectors than a wider window needs.
+    pub fn for_space(space: &crate::embeddings::space::SpaceId) -> Self {
+        MEASURED_CHUNKING
+            .iter()
+            .find(|(model, ..)| *model == space.model())
+            .map(|&(_, chunk_size, overlap, min_chunk_size)| Self {
+                chunk_size,
+                overlap,
+                min_chunk_size,
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// Result of chunking a text
 #[derive(Debug, Clone)]
 pub struct ChunkResult {
@@ -589,6 +613,26 @@ pub fn auto_chunk_text(text: &str) -> ChunkResult {
         semantic_chunk_text(text, &SemanticChunkConfig::default())
     } else {
         chunk_text(text, &ChunkConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod space_chunking_tests {
+    use super::*;
+    use crate::embeddings::space::SpaceId;
+
+    #[test]
+    fn the_measured_row_and_the_fallback_agree_with_the_default_today() {
+        let minilm =
+            ChunkConfig::for_space(&SpaceId::new(crate::embeddings::minilm::MODEL_ID, 384));
+        let default = ChunkConfig::default();
+        assert_eq!(
+            (minilm.chunk_size, minilm.overlap, minilm.min_chunk_size),
+            (default.chunk_size, default.overlap, default.min_chunk_size),
+            "the MiniLM row is the measurement Default records"
+        );
+        let unmeasured = ChunkConfig::for_space(&SpaceId::new("nomic-embed-text-v1.5", 768));
+        assert_eq!(unmeasured.chunk_size, default.chunk_size);
     }
 }
 

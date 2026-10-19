@@ -153,12 +153,26 @@ pub fn resolve(stored: Option<&SpaceId>, len: usize, assumed: Option<&SpaceId>) 
     }
 }
 
+/// The space registry beside a tenant's corpus markers: every space the corpus holds, read by
+/// `veld doctor` and anything else that must not open the store to ask.
+pub const REGISTRY_FILE: &str = ".veld_spaces.json";
+pub const REGISTRY_VERSION: u32 = 1;
+
+/// How a space's vectors are held in its index.
+pub const CODEC_F32: &str = "f32";
+
+fn default_codec() -> String {
+    CODEC_F32.to_string()
+}
+
 /// What one corpus, or a fleet of them, holds in a space.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpaceSummary {
     pub id: SpaceId,
     pub model: String,
     pub dimension: usize,
+    #[serde(default = "default_codec")]
+    pub codec: String,
     /// Memories an index in this space holds.
     pub memories: usize,
     /// Backlog rows waiting for a vector in this space.
@@ -172,6 +186,7 @@ impl SpaceSummary {
         Self {
             model: id.model().to_string(),
             dimension: id.dimension(),
+            codec: default_codec(),
             id,
             memories: 0,
             backlog: 0,
@@ -183,6 +198,61 @@ impl SpaceSummary {
         self.memories += other.memories;
         self.backlog += other.backlog;
         self.stranded += other.stranded;
+    }
+}
+
+/// A fitted map between two spaces, recorded where the registry's readers can see it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RegisteredAlignment {
+    pub from: SpaceId,
+    pub to: SpaceId,
+    pub method: String,
+    /// The fit's held-out residual; the confidence an aligned result is discounted by.
+    #[serde(default)]
+    pub residual: Option<f32>,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpaceRegistry {
+    pub version: u32,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// The space the primary index holds, the one new primary vectors are written in.
+    pub index_space: SpaceId,
+    #[serde(default)]
+    pub secondary_index_space: Option<SpaceId>,
+    pub spaces: Vec<SpaceSummary>,
+    #[serde(default)]
+    pub alignments: Vec<RegisteredAlignment>,
+}
+
+impl SpaceRegistry {
+    pub fn read(storage_path: &Path) -> anyhow::Result<Option<Self>> {
+        let path = storage_path.join(REGISTRY_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
+                anyhow::anyhow!("{} does not parse: {e}", path.display())
+            })?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+        }
+    }
+
+    /// Written to a temporary file and renamed over the old one, so a reader never sees half.
+    pub fn write(&self, storage_path: &Path) -> anyhow::Result<()> {
+        let path = storage_path.join(REGISTRY_FILE);
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Whether two registries describe the same corpus, whatever time each was written.
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.index_space == other.index_space
+            && self.secondary_index_space == other.secondary_index_space
+            && self.spaces == other.spaces
+            && self.alignments == other.alignments
     }
 }
 
@@ -201,6 +271,28 @@ pub fn merge_summaries(summaries: impl IntoIterator<Item = SpaceSummary>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registry_round_trips_through_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(SpaceRegistry::read(dir.path()).unwrap(), None);
+        let nomic = SpaceId::new("nomic-embed-text-v1.5", 768);
+        let mut stranded = SpaceSummary::empty(SpaceId::unrecorded(384));
+        stranded.stranded = 56;
+        let registry = SpaceRegistry {
+            version: REGISTRY_VERSION,
+            updated_at: chrono::Utc::now(),
+            index_space: nomic.clone(),
+            secondary_index_space: None,
+            spaces: vec![SpaceSummary::empty(nomic), stranded],
+            alignments: Vec::new(),
+        };
+        registry.write(dir.path()).unwrap();
+        let back = SpaceRegistry::read(dir.path()).unwrap().unwrap();
+        assert!(back.same_content(&registry));
+        assert_eq!(back.spaces[1].stranded, 56);
+        assert_eq!(back.spaces[0].codec, CODEC_F32);
+    }
 
     #[test]
     fn summaries_sum_by_space() {

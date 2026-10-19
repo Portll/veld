@@ -1103,7 +1103,12 @@ fn handle_doctor() -> Result<()> {
         }
     }
 
-    // 5. Server health (if running)
+    // 5. Embedding spaces, from each tenant's registry: the store is not opened to ask.
+    if !doctor_embedding_spaces(&storage) {
+        all_ok = false;
+    }
+
+    // 6. Server health (if running)
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()?;
@@ -1136,6 +1141,61 @@ fn handle_doctor() -> Result<()> {
     eprintln!();
 
     Ok(())
+}
+
+/// One line per tenant whose corpus holds a vector no index here can serve: stored in a space an
+/// index refused, or waiting in the backlog. False when any tenant's registry does not parse.
+fn doctor_embedding_spaces(storage: &std::path::Path) -> bool {
+    use veld::embeddings::space::SpaceRegistry;
+    let Ok(entries) = std::fs::read_dir(storage) else {
+        return true;
+    };
+    let mut tenants = 0usize;
+    let mut ok = true;
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        let tenant = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match SpaceRegistry::read(&dir) {
+            Ok(Some(registry)) => {
+                tenants += 1;
+                let waiting: usize = registry.spaces.iter().map(|s| s.backlog).sum();
+                let stranded: Vec<String> = registry
+                    .spaces
+                    .iter()
+                    .filter(|s| s.stranded > 0)
+                    .map(|s| format!("{} in {}", s.stranded, s.id))
+                    .collect();
+                if waiting > 0 || !stranded.is_empty() {
+                    eprintln!(
+                        "  ⚠ {tenant}: index {} — {waiting} waiting for a vector{}",
+                        registry.index_space,
+                        if stranded.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; stored in a refused space: {}", stranded.join(", "))
+                        }
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("  ✗ {tenant}: {e}");
+                ok = false;
+            }
+        }
+    }
+    if tenants > 0 {
+        eprintln!("  ✓ Embedding space registries read for {tenants} tenant(s)");
+    }
+    ok
 }
 
 fn handle_version() {
