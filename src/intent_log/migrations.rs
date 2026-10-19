@@ -19,10 +19,13 @@
 //! ## Why a registry, not "decode + re-encode"
 //!
 //! A naive scheme is to "always decode with the current code, fill in
-//! defaults". That is exactly what `#[serde(default)]` already buys us
-//! for *additive* changes. The migration registry exists for the cases
-//! that `#[serde(default)]` cannot handle:
+//! defaults". Bincode cannot do that: it is positional, so a field added to
+//! a variant makes every older frame of that variant fail to decode, and
+//! `#[serde(default)]` is never consulted. The additive change bincode does
+//! support is a new variant appended to the enum (see the payload module's
+//! "Schema evolution"). The migration registry exists for the rest:
 //!
+//! - A field was added to, or removed from, an existing variant.
 //! - A field's *meaning* changed (e.g. a flag whose semantics inverted).
 //! - A variant was renamed or replaced.
 //! - A type was widened (`u16` → `u32`) and the bincode wire shape moved

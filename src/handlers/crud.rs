@@ -1457,12 +1457,15 @@ pub async fn anchor_memory(
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     .map_err(AppError::Internal)?;
 
-    // W5: journal the anchor as an `Anchor` payload so the SQLite
+    // W5: journal the anchor as a `SetAnchored` payload so the SQLite
     // projection updates its `importance` column without rewriting the
-    // memory blob. See `handlers::remember` for the broader contract.
-    let journal_payload = crate::intent_log::IntentPayload::Anchor {
+    // memory blob, and a follower learns the flag itself: a release can
+    // leave importance unchanged. See `handlers::remember` for the broader
+    // contract.
+    let journal_payload = crate::intent_log::IntentPayload::SetAnchored {
         user_id: req.user_id.clone(),
         memory_id: req.memory_id.clone(),
+        anchored: anchor_value,
         importance: final_importance,
         schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
     };

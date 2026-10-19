@@ -3,7 +3,7 @@
 A follower instance tails a leader's per-user intent logs over HTTP and applies every
 frame to its own store, then journals the same frame locally so its projections and its own
 log follow. The intent log holds a full memory snapshot per `Remember`/`Update` and a
-`Forget`/`Anchor` otherwise, so a follower that starts empty converges on the leader's
+`Forget`/`SetAnchored` otherwise (`Anchor` in older logs), so a follower that starts empty converges on the leader's
 memories by replaying from LSN 0 with ids and timestamps intact. Embeddings travel inside
 the snapshot: the follower never re-embeds.
 
@@ -45,7 +45,7 @@ Every interval: `GET status` on the leader; then each tenant is synced on its ow
   its backoff after a failure, or while it is diverged.
 - **Paged** from its cursor through `records`. A page is **coalesced** before it is applied:
   for each memory id, only the last `Remember`/`Update` snapshot in the page and the frames
-  after it (`Forget`, `Anchor`) survive. Logs are Update-heavy because every access and
+  after it (`Forget`, `SetAnchored`, `Anchor`) survive. Logs are Update-heavy because every access and
   consolidation re-journals a memory, so this removes more than half the writes. Surviving
   snapshots are upserted through `MemorySystem::upsert_memories` with one BM25 commit per
   page; then each surviving frame is journaled locally with `journal_and_apply`. A frame
@@ -88,8 +88,12 @@ and divergence; and overall: pages applied, polls finished and the last leader e
   spaces plan (`docs/EXECUTION-embedding-spaces-2026-10-19.md`, step 4) lifts this.
 - **Frames leave the leader decrypted** and are sealed again by the follower's keystore on
   append.
-- **Anchor state is inferred.** The `Anchor` frame carries the importance after the change,
-  not the flag; the follower reads a rise as an anchor and a fall as its release.
+- **Upgrade followers before the leader** when the log gains a frame type. Anchoring now
+  journals `SetAnchored`, which carries the flag and the importance after the change; a
+  follower built before it cannot decode that frame, so the tenant's page fails and retries
+  on its backoff until the follower is upgraded. Older logs carry `Anchor`, with the
+  importance only: for those the follower reads a rise as an anchor and a fall as its
+  release, and a release that leaves importance unchanged is not seen.
 
 ## Measured
 
