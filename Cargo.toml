@@ -166,6 +166,7 @@ async-trait = "0.1"  # Object-safe async trait sugar (W4 RelationalStore, W6 que
 thiserror = "2.0"
 dotenvy = "0.15"  # Load .env files
 toml = { version = "0.8", default-features = false, features = ["parse"] }  # Parse veld init's config.toml
+veld-status-core = { path = "status-core" }  # `veld restart`: the monitor's restart path, shared
 
 # Async runtime & web server
 tokio = { version = "1.48", features = ["full"] }
@@ -564,3 +565,7 @@ rocksdb = { version = "0.24", default-features = false, features = ["lz4"], opti
 
 [workspace]
 # Standalone workspace - not part of parent kalki-v2
+# status-core keeps its own workspace and lockfile, as the monitor and the status
+# TUI and widget that also depend on it do; a path dependency inside this directory
+# would otherwise be drawn in as a member.
+exclude = ["status-core"]
