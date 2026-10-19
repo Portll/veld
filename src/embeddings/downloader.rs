@@ -54,6 +54,16 @@ const NOMIC_MODEL_QUANTIZED_URL: &str =
 const NOMIC_TOKENIZER_URL: &str =
     "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json";
 
+/// URLs for snowflake-arctic-embed-xs model files (384-dimensional, CLS-pooled)
+/// Source: Snowflake/snowflake-arctic-embed-xs, a retrieval fine-tune of all-MiniLM-L6-v2
+/// Licence: Apache-2.0, stated in the model card's "License" section. The card carries no
+/// `license:` metadata tag, so the Hub's licence filter does not list it.
+/// Pinned to commit d8c86521 (2024-12-13); the ONNX exports date from 8284d472 (2024-04-16).
+/// Full model 90MB, int8 dynamic-quantised 23MB (the Hub's `model_int8.onnx` is the same file)
+const ARCTIC_XS_MODEL_ONNX_URL: &str = "https://huggingface.co/Snowflake/snowflake-arctic-embed-xs/resolve/d8c86521100d3556476a063fc2342036d45c106f/onnx/model.onnx";
+const ARCTIC_XS_MODEL_QUANTIZED_URL: &str = "https://huggingface.co/Snowflake/snowflake-arctic-embed-xs/resolve/d8c86521100d3556476a063fc2342036d45c106f/onnx/model_quantized.onnx";
+const ARCTIC_XS_TOKENIZER_URL: &str = "https://huggingface.co/Snowflake/snowflake-arctic-embed-xs/resolve/d8c86521100d3556476a063fc2342036d45c106f/tokenizer.json";
+
 /// SHA-256 checksums for model integrity verification
 /// Verified against pinned commit hashes above — these will not drift
 struct ModelChecksums;
@@ -95,6 +105,21 @@ impl ModelChecksums {
     /// Nomic tokenizer checksum (tokenizer.json)
     /// Will be populated after first verified download
     const NOMIC_TOKENIZER: Option<&'static str> = None;
+
+    /// arctic-embed-xs quantised model checksum (onnx/model_quantized.onnx)
+    /// Pinned: Snowflake/snowflake-arctic-embed-xs @ d8c86521; equals the Hub's LFS oid
+    const ARCTIC_XS_QUANTIZED_MODEL: Option<&'static str> =
+        Some("e6aa5e656466a73d7c3111e9a3378bd13e5b93af30eaac2b3f13fd56692589a1");
+
+    /// arctic-embed-xs full model checksum (onnx/model.onnx)
+    /// Pinned: Snowflake/snowflake-arctic-embed-xs @ d8c86521; equals the Hub's LFS oid
+    const ARCTIC_XS_FULL_MODEL: Option<&'static str> =
+        Some("cf2698d30ff05da02c70a088313bad56e5c2f401d734cb24a8390d446111936c");
+
+    /// arctic-embed-xs tokenizer checksum (tokenizer.json)
+    /// Pinned: Snowflake/snowflake-arctic-embed-xs @ d8c86521
+    const ARCTIC_XS_TOKENIZER: Option<&'static str> =
+        Some("91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854");
 }
 
 /// ONNX Runtime download URLs by platform (v1.23.2 required by ort 2.0.0-rc.11)
@@ -134,6 +159,28 @@ pub fn get_ner_models_dir() -> PathBuf {
 /// Get the models directory for Nomic-embed-text-v1.5
 pub fn get_nomic_models_dir() -> PathBuf {
     get_cache_dir().join("models").join("nomic-embed-v1.5")
+}
+
+/// Get the models directory for snowflake-arctic-embed-xs
+pub fn get_arctic_xs_models_dir() -> PathBuf {
+    get_cache_dir().join("models").join("arctic-embed-xs")
+}
+
+/// The arctic-embed-xs model file for one precision: (URL, file name, pinned checksum).
+fn arctic_xs_model_file(use_quantized: bool) -> (&'static str, &'static str, Option<&'static str>) {
+    if use_quantized {
+        (
+            ARCTIC_XS_MODEL_QUANTIZED_URL,
+            "model_quantized.onnx",
+            ModelChecksums::ARCTIC_XS_QUANTIZED_MODEL,
+        )
+    } else {
+        (
+            ARCTIC_XS_MODEL_ONNX_URL,
+            "model.onnx",
+            ModelChecksums::ARCTIC_XS_FULL_MODEL,
+        )
+    }
 }
 
 /// Get the ONNX Runtime directory
@@ -236,6 +283,42 @@ pub fn are_nomic_models_downloaded() -> bool {
         }
     }
 
+    true
+}
+
+/// Check if the quantised arctic-embed-xs model (the default) is downloaded and valid
+pub fn are_arctic_xs_models_downloaded() -> bool {
+    are_arctic_xs_models_downloaded_for(true)
+}
+
+/// Check if the arctic-embed-xs model of one precision and its tokenizer are downloaded and
+/// match their pinned checksums. A mismatching file is removed so the next fetch replaces it.
+pub fn are_arctic_xs_models_downloaded_for(use_quantized: bool) -> bool {
+    let models_dir = get_arctic_xs_models_dir();
+    let (_, model_filename, model_checksum) = arctic_xs_model_file(use_quantized);
+    let files = [
+        (models_dir.join(model_filename), model_checksum),
+        (
+            models_dir.join("tokenizer.json"),
+            ModelChecksums::ARCTIC_XS_TOKENIZER,
+        ),
+    ];
+
+    if files.iter().any(|(path, _)| !path.exists()) {
+        return false;
+    }
+    for (path, expected) in &files {
+        if let Some(expected) = expected {
+            if let Ok(false) = verify_checksum(path, expected) {
+                tracing::warn!(
+                    "arctic-embed-xs file {:?} checksum mismatch — will re-download",
+                    path
+                );
+                let _ = fs::remove_file(path);
+                return false;
+            }
+        }
+    }
     true
 }
 
@@ -624,6 +707,53 @@ pub fn download_nomic_models_internal(
     Ok(models_dir)
 }
 
+/// Download snowflake-arctic-embed-xs model files: the int8 quantised model (~23MB), the
+/// precision MiniLM ships at, and its tokenizer.
+pub fn download_arctic_xs_models(progress: Option<ProgressCallback>) -> Result<PathBuf> {
+    download_arctic_xs_models_internal(progress, true)
+}
+
+/// Download snowflake-arctic-embed-xs model files with option for full or quantised model
+pub fn download_arctic_xs_models_internal(
+    progress: Option<ProgressCallback>,
+    use_quantized: bool,
+) -> Result<PathBuf> {
+    let models_dir = get_arctic_xs_models_dir();
+
+    if are_arctic_xs_models_downloaded_for(use_quantized) {
+        tracing::info!("arctic-embed-xs already downloaded at {:?}", models_dir);
+        return Ok(models_dir);
+    }
+
+    let (model_url, model_filename, model_checksum) = arctic_xs_model_file(use_quantized);
+    tracing::info!(
+        "Downloading snowflake-arctic-embed-xs {} to {:?} (~{}MB)",
+        model_filename,
+        models_dir,
+        if use_quantized { 23 } else { 90 }
+    );
+    download_file_with_checksum(
+        model_url,
+        &models_dir.join(model_filename),
+        progress.as_ref().map(|p| p.as_ref()),
+        model_checksum,
+    )?;
+
+    tracing::info!("Downloading arctic-embed-xs tokenizer.json");
+    download_file_with_checksum(
+        ARCTIC_XS_TOKENIZER_URL,
+        &models_dir.join("tokenizer.json"),
+        progress.as_ref().map(|p| p.as_ref()),
+        ModelChecksums::ARCTIC_XS_TOKENIZER,
+    )?;
+
+    tracing::info!(
+        "snowflake-arctic-embed-xs downloaded successfully to {:?}",
+        models_dir
+    );
+    Ok(models_dir)
+}
+
 /// Download ONNX Runtime
 pub fn download_onnx_runtime(progress: Option<ProgressCallback>) -> Result<PathBuf> {
     let onnx_dir = get_onnx_runtime_dir();
@@ -959,12 +1089,14 @@ pub fn print_status() {
     let models_downloaded = are_models_downloaded();
     let ner_models_downloaded = are_ner_models_downloaded();
     let nomic_models_downloaded = are_nomic_models_downloaded();
+    let arctic_xs_models_downloaded = are_arctic_xs_models_downloaded();
     let onnx_downloaded = is_onnx_runtime_downloaded();
 
     println!("Veld Cache Status:");
     println!("  Cache directory: {cache_dir:?}");
     println!("  MiniLM embedding models downloaded: {models_downloaded}");
     println!("  Nomic embedding models downloaded: {nomic_models_downloaded}");
+    println!("  arctic-embed-xs embedding models downloaded: {arctic_xs_models_downloaded}");
     println!("  NER models downloaded: {ner_models_downloaded}");
     println!("  ONNX Runtime downloaded: {onnx_downloaded}");
 
@@ -976,6 +1108,11 @@ pub fn print_status() {
     if nomic_models_downloaded {
         let nomic_dir = get_nomic_models_dir();
         println!("  Nomic model path: {nomic_dir:?}");
+    }
+
+    if arctic_xs_models_downloaded {
+        let arctic_dir = get_arctic_xs_models_dir();
+        println!("  arctic-embed-xs model path: {arctic_dir:?}");
     }
 
     if ner_models_downloaded {
@@ -1010,6 +1147,30 @@ mod tests {
     fn test_nomic_models_dir() {
         let models_dir = get_nomic_models_dir();
         assert!(models_dir.to_string_lossy().contains("nomic-embed-v1.5"));
+    }
+
+    #[test]
+    fn arctic_xs_is_pinned_to_one_revision_with_a_checksum_per_file() {
+        const REVISION: &str = "/resolve/d8c86521100d3556476a063fc2342036d45c106f/";
+        let files = [
+            arctic_xs_model_file(true),
+            arctic_xs_model_file(false),
+            (
+                ARCTIC_XS_TOKENIZER_URL,
+                "tokenizer.json",
+                ModelChecksums::ARCTIC_XS_TOKENIZER,
+            ),
+        ];
+        for (url, name, sha) in files {
+            assert!(
+                url.contains(REVISION),
+                "{url} is not at the pinned revision"
+            );
+            assert!(url.ends_with(name), "{url} does not fetch {name}");
+            let sha = sha.unwrap_or_else(|| panic!("{name} has no pinned checksum"));
+            assert!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        assert!(get_arctic_xs_models_dir().ends_with("models/arctic-embed-xs"));
     }
 
     /// Serve `body` once over HTTP on loopback; returns the URL.
