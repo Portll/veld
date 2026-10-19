@@ -2516,6 +2516,7 @@ mod tests {
             port,
             version: String::new(),
             data_path: String::new(),
+            started_at: None,
             last_heartbeat: chrono::Utc::now(),
             launch: None,
         }
