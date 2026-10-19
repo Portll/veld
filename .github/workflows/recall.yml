@@ -59,12 +59,14 @@ on:
       embedder:
         description: >-
           Primary embedder. minilm-l6-v2 is what the baseline measures. arctic-embed-xs
-          (snowflake-arctic-embed-xs, CLS-pooled, query prefix) is an alternative arm: recall-eval
-          refuses to gate across embedders, so dispatch it with record=true.
+          (snowflake-arctic-embed-xs, CLS-pooled, query prefix) and nomic-embed-text-v1.5 (the
+          in-process ONNX build of the model a live server reaches over HTTP, with its task
+          prefixes) are alternative arms: recall-eval refuses to gate across embedders, so dispatch
+          them with record=true.
         required: false
         default: 'minilm-l6-v2'
         type: choice
-        options: ['minilm-l6-v2', 'arctic-embed-xs']
+        options: ['minilm-l6-v2', 'arctic-embed-xs', 'nomic-embed-text-v1.5']
 
 permissions:
   contents: read
@@ -137,7 +139,7 @@ jobs:
         if: steps.models.outputs.cache-hit != 'true'
         run: >-
           cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime
-          ${{ env.EMBEDDER == 'arctic-embed-xs' && '--arctic-xs' || '--minilm' }}
+          ${{ env.EMBEDDER == 'arctic-embed-xs' && '--arctic-xs' || env.EMBEDDER == 'nomic-embed-text-v1.5' && '--nomic' || '--minilm' }}
 
       # The cross-encoder downloads itself on first use; the models cache above is saved only on
       # a miss, so without this it would download every run, and a failed download in one repeat
@@ -218,8 +220,9 @@ jobs:
           RECALL_DIAG_K: '100'
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
-          # minilm-l6-v2 is VELD_EMBEDDER=minilm; arctic-embed-xs is its own id.
-          VELD_EMBEDDER: ${{ env.EMBEDDER == 'arctic-embed-xs' && 'arctic-embed-xs' || 'minilm' }}
+          # minilm-l6-v2 is VELD_EMBEDDER=minilm, nomic-embed-text-v1.5 is VELD_EMBEDDER=nomic;
+          # arctic-embed-xs is its own id.
+          VELD_EMBEDDER: ${{ env.EMBEDDER == 'arctic-embed-xs' && 'arctic-embed-xs' || env.EMBEDDER == 'nomic-embed-text-v1.5' && 'nomic' || 'minilm' }}
         run: |
           set +e
           set -o pipefail
