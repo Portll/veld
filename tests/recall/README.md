@@ -74,6 +74,23 @@ A change to what a model is fed (another corpus text, a prefix, another candidat
 model or ONNX Runtime upgrade needs a new tape: replay misses fail the run, and the tape refuses
 model files other than the ones it was recorded from.
 
+## Embedder arms
+
+The workflow's `embedder` input picks the primary embedder: `minilm-l6-v2`, the default and what
+the baseline measures, or `arctic-embed-xs` (snowflake-arctic-embed-xs, see
+`docs/src/guides/deploying.md`). It sets `VELD_EMBEDDER` for the eval, makes `model-fetch` fetch
+that model, and names the models cache, so an arm restores and runs its own model. The report's
+`embedder` field names the model that produced the vectors, and `recall-eval` refuses to gate one
+embedder against another's baseline, so an alternative arm is a recording:
+
+```text
+gh workflow run recall.yml --ref <branch> -f record=true -f embedder=arctic-embed-xs
+```
+
+A pinned tape holds one embedder's outputs, and it refuses to replay under another embedder's
+model files. Once a tape is pinned, run an alternative arm with `model_tape=off` or record a tape
+for it.
+
 ## Files
 
 - `corpora/shodh-smoke.jsonl` — L1 smoke corpus (memories ingested by the runner).
