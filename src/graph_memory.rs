@@ -32,9 +32,24 @@ const CF_NAME_INDEX: &str = "name_index";
 const CF_LOWERCASE_INDEX: &str = "lowercase_index";
 const CF_STEMMED_INDEX: &str = "stemmed_index";
 
+/// Row in `entity_episodes` recording that the recency-ordered index has been backfilled.
+/// `~` sorts after every hex digit, so no `{uuid}:` or `{uuid}#` prefix scan reaches it.
+const EPISODE_RECENCY_INDEX_MARKER: &[u8] = b"~episode_recency_index_v1";
+
 /// Maximum number of retrieval IDs held in the idempotency guard (S-R4).
 /// Oldest entries are evicted FIFO once this cap is reached.
 const SEEN_RETRIEVALS_CAPACITY: usize = 1024;
+
+/// The element at index `len / 2` of `values` in ascending order (the upper median for an
+/// even count), reordering `values` in place. `None` when empty.
+fn upper_median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mid = values.len() / 2;
+    let (_, median, _) = values.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    Some(*median)
+}
 
 const GRAPH_CF_NAMES: &[&str] = &[
     CF_ENTITIES,
@@ -1142,24 +1157,32 @@ impl RelationshipEdge {
     /// the edge effectively permanent.
     pub fn typical_activation_interval_hours(&self) -> Option<f64> {
         use crate::constants::ADAPTIVE_DECAY_MIN_SAMPLES;
+        // Read for every edge a traversal decays. Histories are capped per tier (L3 holds the
+        // most), so the gaps fit a stack buffer and the read path stays allocation-free.
+        const STACK_GAPS: usize = 256;
 
         let timestamps = self.activation_timestamps.as_ref()?;
         if timestamps.len() < ADAPTIVE_DECAY_MIN_SAMPLES {
             return None;
         }
 
-        let mut gaps: Vec<f64> = timestamps
+        let gaps = timestamps
             .iter()
             .zip(timestamps.iter().skip(1))
             .map(|(a, b)| (*b - *a).num_seconds() as f64 / 3600.0)
-            .filter(|g| *g > 0.0)
-            .collect();
+            .filter(|g| *g > 0.0);
 
-        if gaps.is_empty() {
-            return None;
+        if timestamps.len() <= STACK_GAPS {
+            let mut buf = [0.0_f64; STACK_GAPS];
+            let mut n = 0;
+            for gap in gaps {
+                buf[n] = gap;
+                n += 1;
+            }
+            upper_median(&mut buf[..n])
+        } else {
+            upper_median(&mut gaps.collect::<Vec<f64>>())
         }
-        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        Some(gaps[gaps.len() / 2])
     }
 
     /// Detect LTP status based on unified readiness model (PIPE-4 + PIPE-5)
@@ -1507,11 +1530,16 @@ impl RelationshipEdge {
     /// This is the main payoff of directional edges: "A often leads to B" is
     /// distinguished from "B often leads to A" in spreading activation.
     pub fn directional_strength(&self, traversal_source: &Uuid) -> f32 {
+        self.directional_strength_at(traversal_source, crate::memory::scoring_now())
+    }
+
+    /// As [`directional_strength`](Self::directional_strength), decayed to `now`.
+    pub fn directional_strength_at(&self, traversal_source: &Uuid, now: DateTime<Utc>) -> f32 {
         use crate::decay::tier_decay_factor;
 
         // If directional fields haven't been populated yet, use undirected effective
         if self.forward_strength == 0.0 && self.backward_strength == 0.0 {
-            return self.effective_strength();
+            return self.effective_strength_at(now);
         }
 
         let raw = if self.from_entity == *traversal_source {
@@ -1526,7 +1554,6 @@ impl RelationshipEdge {
         };
 
         // Apply the same time-based decay as effective_strength
-        let now = crate::memory::scoring_now();
         let elapsed = now.signed_duration_since(self.last_activated);
         let hours_elapsed = elapsed.num_seconds() as f64 / 3600.0;
 
@@ -2289,6 +2316,8 @@ impl GraphMemory {
         let entity_count = entity_name_index.len();
         let entity_path_suffix_index = Self::build_path_suffix_index(&entity_name_index);
 
+        Self::ensure_episode_recency_index(store.as_ref())?;
+
         // Count relationships and episodes during startup (one-time cost)
         // This is O(n) at startup, but get_stats() will be O(1) at runtime
         let relationship_count = Self::count_cf_entries(store.as_ref(), CF_RELATIONSHIPS);
@@ -2954,24 +2983,14 @@ impl GraphMemory {
         // Only the forward direction exists for this index — unlike
         // entity_pair_index above, which needs the reverse sweep because it is
         // written in both orientations.
-        let episode_prefix = format!("{}:", uuid);
+        // Both inverted indexes: `{uuid}:` (unordered) and `{uuid}#` (recency-ordered).
         let mut episode_keys_to_delete = Vec::new();
-        let iter = self
-            .store
-            .scan_cf(CF_ENTITY_EPISODES, Some(episode_prefix.as_bytes()), None)?
-            .into_iter()
-            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
-        for item in iter {
-            match item {
-                Ok((key, _)) => {
-                    let key_str = String::from_utf8_lossy(&key);
-                    if key_str.starts_with(&episode_prefix) {
-                        episode_keys_to_delete.push(key.to_vec());
-                    } else {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        for episode_prefix in [format!("{}:", uuid), format!("{}#", uuid)] {
+            for (key, _) in
+                self.store
+                    .scan_cf(CF_ENTITY_EPISODES, Some(episode_prefix.as_bytes()), None)?
+            {
+                episode_keys_to_delete.push(key);
             }
         }
         let leaked = episode_keys_to_delete.len();
@@ -3000,34 +3019,29 @@ impl GraphMemory {
     /// [`trace_causal_origins`](Self::trace_causal_origins): the fuzzy tiers can
     /// bind a query fragment to an arbitrary hub entity.
     pub fn find_entity_by_name_strict(&self, name: &str) -> Result<Option<EntityNode>> {
-        let uuid = {
-            let index = self.entity_name_index.read();
-            index.get(name).copied()
-        };
-        if let Some(uuid) = uuid {
-            return self.get_entity(&uuid);
+        match self.find_entity_uuid_strict(name) {
+            Some(uuid) => self.get_entity(&uuid),
+            None => Ok(None),
         }
+    }
 
-        let name_lower = name.to_lowercase();
-        let uuid = {
-            let lowercase_index = self.entity_lowercase_index.read();
-            lowercase_index.get(&name_lower).copied()
-        };
-        if let Some(uuid) = uuid {
-            return self.get_entity(&uuid);
+    /// The entity [`find_entity_by_name_strict`](Self::find_entity_by_name_strict) resolves,
+    /// as its uuid, from the in-memory name indexes alone: no storage read.
+    pub fn find_entity_uuid_strict(&self, name: &str) -> Option<Uuid> {
+        if let Some(uuid) = self.entity_name_index.read().get(name).copied() {
+            return Some(uuid);
         }
-
+        if let Some(uuid) = self
+            .entity_lowercase_index
+            .read()
+            .get(&name.to_lowercase())
+            .copied()
+        {
+            return Some(uuid);
+        }
         let stemmer = Stemmer::create(Algorithm::English);
         let stemmed_name = Self::stem_entity_name(&stemmer, name);
-        let uuid = {
-            let stemmed_index = self.entity_stemmed_index.read();
-            stemmed_index.get(&stemmed_name).copied()
-        };
-        if let Some(uuid) = uuid {
-            return self.get_entity(&uuid);
-        }
-
-        Ok(None)
+        self.entity_stemmed_index.read().get(&stemmed_name).copied()
     }
 
     /// Find entity by name (case-insensitive, O(1) lookup)
@@ -3129,6 +3143,83 @@ impl GraphMemory {
         Ok(None)
     }
 
+    /// [`find_entity_by_name_strict`](Self::find_entity_by_name_strict), then the substring
+    /// and word tiers of [`find_entity_by_name`](Self::find_entity_by_name) bounded for hot
+    /// read paths: at most `max_candidates` fuzzy matches are kept (shortest names first,
+    /// then by name), and only those are read from storage to rank by salience. The
+    /// unbounded form clones and reads every match, which on a large graph is most of the
+    /// name index for a short or common word.
+    pub fn find_entity_by_name_bounded(
+        &self,
+        name: &str,
+        max_candidates: usize,
+    ) -> Result<Option<EntityNode>> {
+        if let Some(found) = self.find_entity_by_name_strict(name)? {
+            return Ok(Some(found));
+        }
+        if name.len() < 3 || max_candidates == 0 {
+            return Ok(None);
+        }
+        let name_lower = name.to_lowercase();
+
+        let candidates: Vec<(usize, String, Uuid)> = {
+            let lowercase_index = self.entity_lowercase_index.read();
+            // Max-heap on (length, name): the top is the weakest kept candidate.
+            let mut kept: BinaryHeap<(usize, String, Uuid)> = BinaryHeap::new();
+            let offer = |kept: &mut BinaryHeap<(usize, String, Uuid)>,
+                         entity_name: &String,
+                         uuid: Uuid| {
+                if kept.len() < max_candidates {
+                    kept.push((entity_name.len(), entity_name.clone(), uuid));
+                } else if let Some((top_len, top_name, _)) = kept.peek() {
+                    if (entity_name.len(), entity_name.as_str()) < (*top_len, top_name.as_str()) {
+                        kept.pop();
+                        kept.push((entity_name.len(), entity_name.clone(), uuid));
+                    }
+                }
+            };
+
+            for (entity_name, uuid) in lowercase_index.iter() {
+                if entity_name.contains(&name_lower) {
+                    offer(&mut kept, entity_name, *uuid);
+                }
+            }
+            if kept.is_empty() {
+                let query_words: Vec<&str> = name_lower.split_whitespace().collect();
+                for (entity_name, uuid) in lowercase_index.iter() {
+                    let word_hit = entity_name
+                        .split_whitespace()
+                        .any(|ew| query_words.iter().any(|qw| ew == *qw || ew.starts_with(qw)));
+                    if word_hit {
+                        offer(&mut kept, entity_name, *uuid);
+                    }
+                }
+            }
+            kept.into_vec()
+        };
+
+        // Highest salience, then shortest name, then the name itself.
+        let mut best: Option<(EntityNode, usize, String)> = None;
+        for (len, lower_name, uuid) in candidates {
+            let Some(entity) = self.get_entity(&uuid)? else {
+                continue;
+            };
+            let better = match &best {
+                None => true,
+                Some((held, held_len, held_name)) => entity
+                    .salience
+                    .total_cmp(&held.salience)
+                    .then_with(|| held_len.cmp(&len))
+                    .then_with(|| held_name.as_str().cmp(lower_name.as_str()))
+                    .is_gt(),
+            };
+            if better {
+                best = Some((entity, len, lower_name));
+            }
+        }
+        Ok(best.map(|(entity, _, _)| entity))
+    }
+
     /// Find all entities matching a name with fuzzy matching
     ///
     /// Returns multiple matches ranked by match quality.
@@ -3224,7 +3315,20 @@ impl GraphMemory {
         entity_a: &Uuid,
         entity_b: &Uuid,
     ) -> Result<Option<RelationshipEdge>> {
-        // Fast path: O(1) pair index lookup
+        if let Some(edge) = self.find_relationship_by_pair_index(entity_a, entity_b)? {
+            return Ok(Some(edge));
+        }
+        let edges_a = self.get_entity_relationships(entity_a)?;
+        self.find_relationship_in_scan(entity_a, entity_b, &edges_a)
+    }
+
+    /// The pair-index half of [`find_relationship_between`](Self::find_relationship_between):
+    /// one O(1) lookup, removing the index row if the edge it names is gone.
+    fn find_relationship_by_pair_index(
+        &self,
+        entity_a: &Uuid,
+        entity_b: &Uuid,
+    ) -> Result<Option<RelationshipEdge>> {
         let key = Self::pair_key(entity_a, entity_b);
         if let Some(edge_uuid_bytes) = self.store.get_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes())? {
             if edge_uuid_bytes.len() == 16 {
@@ -3232,13 +3336,23 @@ impl GraphMemory {
                 if let Some(edge) = self.get_relationship(&edge_uuid)? {
                     return Ok(Some(edge));
                 }
-                // Edge was deleted but pair index is stale — clean up and fall through
+                // Edge was deleted but pair index is stale — clean up
                 if let Err(e) = self.store.delete_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes()) {
                     tracing::warn!("Failed to clean stale pair index entry: {e}");
                 }
             }
         }
+        Ok(None)
+    }
 
+    /// The fallback half of [`find_relationship_between`](Self::find_relationship_between):
+    /// the edge joining the pair among `edges_a` (entity_a's edges), backfilling the pair index.
+    fn find_relationship_in_scan(
+        &self,
+        entity_a: &Uuid,
+        entity_b: &Uuid,
+        edges_a: &[RelationshipEdge],
+    ) -> Result<Option<RelationshipEdge>> {
         // Slow path: linear scan for pre-index edges (backward compatibility)
         // This path is only hit for edges created before the pair index existed.
         // Once all old edges are either strengthened (which updates the index) or
@@ -3249,7 +3363,6 @@ impl GraphMemory {
             entity_b = %entity_b,
             "find_relationship_between: pair index miss, falling back to O(n) linear scan"
         );
-        let edges_a = self.get_entity_relationships(entity_a)?;
         for edge in edges_a {
             if (edge.from_entity == *entity_a && edge.to_entity == *entity_b)
                 || (edge.from_entity == *entity_b && edge.to_entity == *entity_a)
@@ -3261,7 +3374,7 @@ impl GraphMemory {
                         edge.uuid
                     );
                 }
-                return Ok(Some(edge));
+                return Ok(Some(edge.clone()));
             }
         }
         Ok(None)
@@ -3594,7 +3707,6 @@ impl GraphMemory {
 
     /// Get relationships for an entity with optional limit
     ///
-    /// Uses batch reading (multi_get) to eliminate N+1 query pattern.
     /// If limit is None, returns all edges (use sparingly for large graphs).
     pub fn get_entity_relationships(&self, entity_uuid: &Uuid) -> Result<Vec<RelationshipEdge>> {
         self.get_entity_relationships_limited(entity_uuid, None)
@@ -3602,7 +3714,7 @@ impl GraphMemory {
 
     /// Get relationships for an entity with limit, ordered by effective strength
     ///
-    /// Collects ALL edge UUIDs first, batch-reads them, sorts by effective_strength
+    /// Collects ALL edge UUIDs first, reads them, sorts by effective_strength
     /// descending, then returns the top `limit` strongest edges. This ensures
     /// traversal and queries always use the most valuable connections.
     ///
@@ -3612,6 +3724,33 @@ impl GraphMemory {
         entity_uuid: &Uuid,
         limit: Option<usize>,
     ) -> Result<Vec<RelationshipEdge>> {
+        self.get_entity_relationships_limited_at(entity_uuid, limit, crate::memory::scoring_now())
+    }
+
+    /// As [`get_entity_relationships_limited`](Self::get_entity_relationships_limited), with
+    /// every edge decayed to `now`.
+    pub fn get_entity_relationships_limited_at(
+        &self,
+        entity_uuid: &Uuid,
+        limit: Option<usize>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<RelationshipEdge>> {
+        Ok(self
+            .entity_edges_with_strength(entity_uuid, limit, now)?
+            .into_iter()
+            .map(|(edge, _)| edge)
+            .collect())
+    }
+
+    /// An entity's edges paired with their effective strength at `now`, strongest first,
+    /// at most `limit` of them. Each edge's strength is computed once and reused by the
+    /// ordering, the prune check and the caller.
+    pub fn entity_edges_with_strength(
+        &self,
+        entity_uuid: &Uuid,
+        limit: Option<usize>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<(RelationshipEdge, f32)>> {
         let prefix = format!("{entity_uuid}:");
 
         // Phase 1: Collect ALL edge UUIDs from index (fast prefix scan)
@@ -3641,35 +3780,23 @@ impl GraphMemory {
             return Ok(Vec::new());
         }
 
-        // Phase 2: Batch read all edges using multi_get (single RocksDB call)
-        let keys: Vec<[u8; 16]> = edge_uuids.iter().map(|u| *u.as_bytes()).collect();
-        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-
-        let results: Vec<anyhow::Result<Option<Vec<u8>>>> = key_refs
-            .iter()
-            .map(|k| self.store.get_cf(CF_RELATIONSHIPS, k))
-            .collect();
-
-        let mut edges = Vec::with_capacity(edge_uuids.len());
-        for value in results.into_iter().flatten().flatten() {
+        // Phase 2: one point read per edge. `ColumnStore` has no batch read, so this is
+        // N `get_cf` calls on either engine.
+        let mut edges: Vec<(RelationshipEdge, f32)> = Vec::with_capacity(edge_uuids.len());
+        for uuid in &edge_uuids {
+            let Ok(Some(value)) = self.store.get_cf(CF_RELATIONSHIPS, uuid.as_bytes()) else {
+                continue;
+            };
             if let Ok(edge) = RelationshipEdge::decode(&value) {
-                edges.push(edge);
+                let strength = edge.effective_strength_at(now);
+                edges.push((edge, strength));
             }
         }
 
-        // Phase 3: Sort by effective strength descending (strongest first)
-        // Snapshot strengths BEFORE sorting — effective_strength() calls Utc::now()
-        // internally, so repeated calls during sort can return different values,
-        // violating total ordering (Rust 1.81+ panics on this).
-        let mut strength_cache: HashMap<Uuid, f32> = HashMap::with_capacity(edges.len());
-        for edge in &edges {
-            strength_cache.insert(edge.uuid, edge.effective_strength());
-        }
-        edges.sort_by(|a, b| {
-            let sa = strength_cache.get(&a.uuid).copied().unwrap_or(0.0);
-            let sb = strength_cache.get(&b.uuid).copied().unwrap_or(0.0);
-            sb.total_cmp(&sa)
-        });
+        // Phase 3: Sort by effective strength descending (strongest first). Strengths are
+        // computed once above against one `now`: recomputing them inside the comparator
+        // could return different values across calls and break the total order.
+        edges.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         // Phase 3.1: equal-strength runs arrive in edge-UUID order, which is random per ingest,
         // and the limit below cuts through them on hub entities. Order each run by (peer entity
@@ -3683,23 +3810,16 @@ impl GraphMemory {
                     e.from_entity
                 }
             };
-            let strength_bits = |e: &RelationshipEdge| -> u32 {
-                strength_cache
-                    .get(&e.uuid)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .to_bits()
-            };
             let mut peer_names: HashMap<Uuid, String> = HashMap::new();
             let mut start = 0;
             while start < edges.len() {
-                let bits = strength_bits(&edges[start]);
+                let bits = edges[start].1.to_bits();
                 let mut end = start + 1;
-                while end < edges.len() && strength_bits(&edges[end]) == bits {
+                while end < edges.len() && edges[end].1.to_bits() == bits {
                     end += 1;
                 }
                 if end - start > 1 {
-                    for e in &edges[start..end] {
+                    for (e, _) in &edges[start..end] {
                         let peer = peer_of(e);
                         peer_names.entry(peer).or_insert_with(|| {
                             self.get_entity(&peer)
@@ -3709,7 +3829,7 @@ impl GraphMemory {
                                 .unwrap_or_default()
                         });
                     }
-                    edges[start..end].sort_by(|a, b| {
+                    edges[start..end].sort_by(|(a, _), (b, _)| {
                         peer_names[&peer_of(a)]
                             .cmp(&peer_names[&peer_of(b)])
                             .then_with(|| {
@@ -3731,18 +3851,13 @@ impl GraphMemory {
         // their tier's threshold for batch deletion on next maintenance cycle.
         // This replaces the eager full-scan apply_decay() with lazy on-read pruning.
         // NPMI rescue: edges with high enough NPMI are spared from pruning.
-        let mut has_prunable = false;
-        for edge in &edges {
-            if edge.effective_strength() < edge.tier.prune_threshold()
-                && !edge.ltp_status.is_potentiated()
-            {
-                has_prunable = true;
-                break;
-            }
-        }
-        if has_prunable {
-            // Build mention_count cache for NPMI rescue (only for prunable candidates)
-            let mention_counts = self.build_mention_count_cache(&edges);
+        let prunable = |(edge, strength): &(RelationshipEdge, f32)| {
+            *strength < edge.tier.prune_threshold() && !edge.ltp_status.is_potentiated()
+        };
+        if edges.iter().any(prunable) {
+            // Mention counts are read only for the endpoints of prunable edges.
+            let mention_counts = self
+                .build_mention_count_cache(edges.iter().filter(|e| prunable(e)).map(|(e, _)| e));
 
             let mut prune_queue = self.pending_prune.lock();
             let mut orphan_queue = self.pending_orphan_checks.lock();
@@ -3758,10 +3873,9 @@ impl GraphMemory {
             if orphan_queue.len() > 2000 {
                 orphan_queue.clear();
             }
-            edges.retain(|edge| {
-                if edge.effective_strength() < edge.tier.prune_threshold()
-                    && !edge.ltp_status.is_potentiated()
-                {
+            edges.retain(|entry| {
+                if prunable(entry) {
+                    let edge = &entry.0;
                     // NPMI rescue: check if edge has high enough NPMI to survive
                     let m_a = mention_counts.get(&edge.from_entity).copied().unwrap_or(0);
                     let m_b = mention_counts.get(&edge.to_entity).copied().unwrap_or(0);
@@ -4059,11 +4173,15 @@ impl GraphMemory {
         self.store.delete_cf(CF_EPISODES, episode_uuid.as_bytes())?;
         self.episode_count.fetch_sub(1, Ordering::Relaxed);
 
-        // Remove from entity_episodes inverted index
+        // Remove from both entity_episodes inverted indexes
         for entity_uuid in &episode.entity_refs {
-            let key = format!("{entity_uuid}:{episode_uuid}");
-            if let Err(e) = self.store.delete_cf(CF_ENTITY_EPISODES, key.as_bytes()) {
-                tracing::warn!(episode = %episode_uuid, key = %key, error = %e, "Failed to delete from entity_episodes index");
+            for key in [
+                format!("{entity_uuid}:{episode_uuid}"),
+                Self::episode_recency_key(entity_uuid, episode.created_at, episode_uuid),
+            ] {
+                if let Err(e) = self.store.delete_cf(CF_ENTITY_EPISODES, key.as_bytes()) {
+                    tracing::warn!(episode = %episode_uuid, key = %key, error = %e, "Failed to delete from entity_episodes index");
+                }
             }
         }
 
@@ -4117,6 +4235,9 @@ impl GraphMemory {
             }
             self.store.write_batch(&batch)?;
         }
+        // An empty graph has nothing to backfill; keep the next open from rescanning.
+        self.store
+            .put_cf(CF_ENTITY_EPISODES, EPISODE_RECENCY_INDEX_MARKER, b"1")?;
 
         // Clear in-memory indices
         self.entity_name_index.write().clear();
@@ -4154,25 +4275,109 @@ impl GraphMemory {
         );
 
         let value = bincode::serde::encode_to_vec(&episode, bincode::config::standard())?;
-        self.store.put_cf(CF_EPISODES, key, &value)?;
+
+        // The record and both inverted indexes (entity -> episode, and the recency-ordered
+        // one) land in one batch, so a reader never sees an index row without its episode.
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.put_cf(CF_EPISODES, key.as_slice(), value);
+        for entity_uuid in &episode.entity_refs {
+            batch.put_cf(
+                CF_ENTITY_EPISODES,
+                format!("{entity_uuid}:{}", episode.uuid).into_bytes(),
+                b"1".as_slice(),
+            );
+            batch.put_cf(
+                CF_ENTITY_EPISODES,
+                Self::episode_recency_key(entity_uuid, episode.created_at, &episode.uuid)
+                    .into_bytes(),
+                Vec::<u8>::new(),
+            );
+        }
+        self.store.write_batch(&batch)?;
 
         // Increment episode counter
         let prev = self.episode_count.fetch_add(1, Ordering::Relaxed);
         tracing::debug!("add_episode: count {} -> {}", prev, prev + 1);
 
-        // Update inverted index: entity_uuid -> episode_uuid
-        for entity_uuid in &episode.entity_refs {
-            self.index_entity_episode(entity_uuid, &episode.uuid)?;
-        }
-
         Ok(episode.uuid)
     }
 
-    /// Index an episode for an entity (inverted index)
-    fn index_entity_episode(&self, entity_uuid: &Uuid, episode_uuid: &Uuid) -> Result<()> {
-        let key = format!("{entity_uuid}:{episode_uuid}");
-        self.store
-            .put_cf(CF_ENTITY_EPISODES, key.as_bytes(), b"1")?;
+    /// Key of the recency-ordered entity -> episode index:
+    /// `{entity}#{rank:016x}:{episode}`, where `rank` falls as `created_at` rises, so an
+    /// ascending prefix scan of `{entity}#` yields an entity's newest episodes first. The `#`
+    /// keeps these rows out of every `{entity}:` prefix scan of the unordered index.
+    fn episode_recency_key(
+        entity_uuid: &Uuid,
+        created_at: DateTime<Utc>,
+        episode: &Uuid,
+    ) -> String {
+        format!(
+            "{entity_uuid}#{:016x}:{episode}",
+            Self::episode_recency_rank(created_at)
+        )
+    }
+
+    /// Microsecond timestamp mapped to a `u64` that sorts descending in time: the sign bit is
+    /// flipped so signed order becomes unsigned order, then all bits are inverted.
+    fn episode_recency_rank(created_at: DateTime<Utc>) -> u64 {
+        !((created_at.timestamp_micros() as u64) ^ (1u64 << 63))
+    }
+
+    /// Parse a recency-index key under `prefix` (`{entity}#`) into (rank, episode).
+    fn parse_episode_recency_key(prefix: &str, key: &[u8]) -> Option<(u64, Uuid)> {
+        let rest = std::str::from_utf8(key).ok()?.strip_prefix(prefix)?;
+        let (rank, episode) = rest.split_once(':')?;
+        Some((
+            u64::from_str_radix(rank, 16).ok()?,
+            Uuid::parse_str(episode).ok()?,
+        ))
+    }
+
+    /// Backfill the recency-ordered episode index for stores written before it existed.
+    /// Runs once: the marker row records completion, and every later `add_episode` writes
+    /// both indexes itself.
+    fn ensure_episode_recency_index(store: &dyn crate::storage::ColumnStore) -> Result<()> {
+        const BATCH_ROWS: usize = 10_000;
+        if store
+            .get_cf(CF_ENTITY_EPISODES, EPISODE_RECENCY_INDEX_MARKER)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mut batch = crate::storage::WriteBatch::new();
+        let mut written = 0usize;
+        for (_, value) in store.scan_cf(CF_EPISODES, None, None)? {
+            let Ok((episode, _)) = bincode::serde::decode_from_slice::<EpisodicNode, _>(
+                &value,
+                bincode::config::standard(),
+            ) else {
+                continue;
+            };
+            for entity_uuid in &episode.entity_refs {
+                batch.put_cf(
+                    CF_ENTITY_EPISODES,
+                    Self::episode_recency_key(entity_uuid, episode.created_at, &episode.uuid)
+                        .into_bytes(),
+                    Vec::<u8>::new(),
+                );
+                written += 1;
+            }
+            if batch.len() >= BATCH_ROWS {
+                store.write_batch(&std::mem::take(&mut batch))?;
+            }
+        }
+        batch.put_cf(
+            CF_ENTITY_EPISODES,
+            EPISODE_RECENCY_INDEX_MARKER,
+            b"1".as_slice(),
+        );
+        store.write_batch(&batch)?;
+        if written > 0 {
+            tracing::info!(
+                rows = written,
+                "Backfilled the recency-ordered entity episode index"
+            );
+        }
         Ok(())
     }
 
@@ -4253,6 +4458,71 @@ impl GraphMemory {
         Ok(episodes)
     }
 
+    /// An entity's `limit` most recent episodes: newest first, equal `created_at` ordered by
+    /// content. Reads the recency-ordered index, so only the returned episodes, plus any that
+    /// share the last one's timestamp, are decoded.
+    pub fn get_recent_episodes_by_entity(
+        &self,
+        entity_uuid: &Uuid,
+        limit: usize,
+    ) -> Result<Vec<EpisodicNode>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = format!("{entity_uuid}#");
+        // Headroom past `limit` absorbs rows left stale by a re-added episode and a
+        // timestamp tie at the cut, so one bounded scan is enough in the common case.
+        let mut scan_limit = Some(limit.saturating_mul(2).saturating_add(8));
+        let mut resume_after: Option<Vec<u8>> = None;
+        let mut episodes: Vec<EpisodicNode> = Vec::with_capacity(limit);
+        // Rank of the `limit`-th episode: past it, only rows tied with it can still rank.
+        let mut cut_rank: Option<u64> = None;
+
+        'scan: loop {
+            let rows =
+                self.store
+                    .scan_cf(CF_ENTITY_EPISODES, Some(prefix.as_bytes()), scan_limit)?;
+            let truncated = scan_limit.is_some_and(|n| rows.len() >= n);
+            for (key, _) in &rows {
+                if resume_after.as_ref().is_some_and(|last| key <= last) {
+                    continue;
+                }
+                let Some((rank, episode_uuid)) = Self::parse_episode_recency_key(&prefix, key)
+                else {
+                    continue;
+                };
+                if cut_rank.is_some_and(|cut| rank != cut) {
+                    break 'scan;
+                }
+                let Some(episode) = self.get_episode(&episode_uuid).ok().flatten() else {
+                    continue;
+                };
+                // A re-added episode leaves its earlier row behind; only the row matching the
+                // record's current timestamp counts.
+                if Self::episode_recency_rank(episode.created_at) != rank {
+                    continue;
+                }
+                episodes.push(episode);
+                if cut_rank.is_none() && episodes.len() >= limit {
+                    cut_rank = Some(rank);
+                }
+            }
+            if !truncated {
+                break;
+            }
+            resume_after = rows.last().map(|(key, _)| key.clone());
+            scan_limit = None;
+        }
+
+        episodes.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.content.cmp(&b.content))
+        });
+        episodes.truncate(limit);
+        Ok(episodes)
+    }
+
     /// Traverse graph starting from an entity (breadth-first)
     ///
     /// Implements Hebbian learning: edges traversed during retrieval are strengthened.
@@ -4291,6 +4561,7 @@ impl GraphMemory {
         // This enables deeper traversal than the old 0.7 factor
         use crate::constants::IMPORTANCE_DECAY_MAX;
         let hop_decay_factor: f32 = (-IMPORTANCE_DECAY_MAX).exp(); // e^(-0.15) ≈ 0.86
+        let now = crate::memory::scoring_now();
 
         let mut visited_entities = HashSet::new();
         let mut visited_edges = HashSet::new();
@@ -4323,9 +4594,9 @@ impl GraphMemory {
                 }
                 // Use limited edge reading
                 let edges =
-                    self.get_entity_relationships_limited(entity_uuid, Some(MAX_EDGES_PER_NODE))?;
+                    self.entity_edges_with_strength(entity_uuid, Some(MAX_EDGES_PER_NODE), now)?;
 
-                for edge in edges {
+                for (edge, effective) in edges {
                     if visited_edges.contains(&edge.uuid) {
                         continue;
                     }
@@ -4336,9 +4607,6 @@ impl GraphMemory {
                     if edge.invalidated_at.is_some() {
                         continue;
                     }
-
-                    // Compute effective strength (lazy decay calculation)
-                    let effective = edge.effective_strength();
 
                     // Skip weak edges if min_strength filter is set
                     if let Some(threshold) = min_strength {
@@ -4432,6 +4700,24 @@ impl GraphMemory {
         relation_types: Option<&[RelationType]>,
         min_strength: f32,
     ) -> Result<GraphTraversal> {
+        self.traverse_weighted_at(
+            start_uuid,
+            max_depth,
+            relation_types,
+            min_strength,
+            crate::memory::scoring_now(),
+        )
+    }
+
+    /// As [`traverse_weighted`](Self::traverse_weighted), with every edge decayed to `now`.
+    pub fn traverse_weighted_at(
+        &self,
+        start_uuid: &Uuid,
+        max_depth: usize,
+        relation_types: Option<&[RelationType]>,
+        min_strength: f32,
+        now: DateTime<Utc>,
+    ) -> Result<GraphTraversal> {
         // Performance limits - prevents exponential blowup on dense graphs
         const MAX_ENTITIES: usize = 200; // Stop after finding this many entities
         const MAX_EDGES_PER_NODE: usize = 100; // Limit edges loaded per node
@@ -4506,9 +4792,9 @@ impl GraphMemory {
             }
 
             // Use limited edge reading to avoid loading 10000+ edges
-            let edges = self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
+            let edges = self.entity_edges_with_strength(&uuid, Some(MAX_EDGES_PER_NODE), now)?;
 
-            for edge in edges {
+            for (edge, effective) in edges {
                 // Skip invalidated edges
                 if edge.invalidated_at.is_some() {
                     continue;
@@ -4522,7 +4808,6 @@ impl GraphMemory {
                 }
 
                 // Filter by minimum strength
-                let effective = edge.effective_strength();
                 if effective < min_strength {
                     continue;
                 }
@@ -4552,7 +4837,7 @@ impl GraphMemory {
                 visited.insert(connected_uuid, new_score);
 
                 // Add edge to results
-                let mut edge_with_strength = edge.clone();
+                let mut edge_with_strength = edge;
                 edge_with_strength.strength = effective;
                 all_edges.push(edge_with_strength);
 
@@ -4618,6 +4903,25 @@ impl GraphMemory {
         max_depth: usize,
         min_strength: f32,
     ) -> Result<GraphTraversal> {
+        self.traverse_bidirectional_at(
+            start_uuid,
+            goal_uuid,
+            max_depth,
+            min_strength,
+            crate::memory::scoring_now(),
+        )
+    }
+
+    /// As [`traverse_bidirectional`](Self::traverse_bidirectional), with every edge decayed
+    /// to `now`.
+    pub fn traverse_bidirectional_at(
+        &self,
+        start_uuid: &Uuid,
+        goal_uuid: &Uuid,
+        max_depth: usize,
+        min_strength: f32,
+        now: DateTime<Utc>,
+    ) -> Result<GraphTraversal> {
         const MAX_EDGES_PER_NODE: usize = 100;
 
         // Track forward search from start
@@ -4646,12 +4950,11 @@ impl GraphMemory {
                 }
 
                 let edges =
-                    self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
-                for edge in edges {
+                    self.entity_edges_with_strength(&uuid, Some(MAX_EDGES_PER_NODE), now)?;
+                for (edge, effective) in edges {
                     if edge.invalidated_at.is_some() {
                         continue;
                     }
-                    let effective = edge.effective_strength();
                     if effective < min_strength {
                         continue;
                     }
@@ -4693,12 +4996,11 @@ impl GraphMemory {
                 }
 
                 let edges =
-                    self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
-                for edge in edges {
+                    self.entity_edges_with_strength(&uuid, Some(MAX_EDGES_PER_NODE), now)?;
+                for (edge, effective) in edges {
                     if edge.invalidated_at.is_some() {
                         continue;
                     }
-                    let effective = edge.effective_strength();
                     if effective < min_strength {
                         continue;
                     }
@@ -5776,16 +6078,40 @@ impl GraphMemory {
         let mut batch = crate::storage::WriteBatch::new();
         let mut strengthened = 0;
 
-        // Iterate over unique entity pairs
-        let refs = &episode.entity_refs;
-        let max_pairs = refs.len().min(20); // Cap to avoid O(n²) on large episodes
-        for i in 0..max_pairs {
-            for j in (i + 1)..max_pairs {
+        // Unique entity refs, first 20 in episode order: caps the O(n²) pair walk.
+        let mut refs: Vec<Uuid> = Vec::with_capacity(episode.entity_refs.len().min(20));
+        for entity in &episode.entity_refs {
+            if refs.len() == 20 {
+                break;
+            }
+            if !refs.contains(entity) {
+                refs.push(*entity);
+            }
+        }
+
+        // Entity-entity edges are found through the entity-pair index (the `mem_edge:` index
+        // holds memory-memory edges only). A pair-index miss falls back to scanning the first
+        // entity's edges, as find_relationship_between does, loaded once per entity.
+        let mut scanned: HashMap<Uuid, Vec<RelationshipEdge>> = HashMap::new();
+        for i in 0..refs.len() {
+            for j in (i + 1)..refs.len() {
                 let entity_a = &refs[i];
                 let entity_b = &refs[j];
 
-                // Find existing edge between this entity pair
-                if let Ok(Some(mut edge)) = self.find_edge_between_entities(entity_a, entity_b) {
+                let found = match self.find_relationship_by_pair_index(entity_a, entity_b) {
+                    Ok(Some(edge)) => Some(edge),
+                    Ok(None) => {
+                        if !scanned.contains_key(entity_a) {
+                            let edges = self.get_entity_relationships(entity_a).unwrap_or_default();
+                            scanned.insert(*entity_a, edges);
+                        }
+                        self.find_relationship_in_scan(entity_a, entity_b, &scanned[entity_a])
+                            .ok()
+                            .flatten()
+                    }
+                    Err(_) => None,
+                };
+                if let Some(mut edge) = found {
                     if edge.invalidated_at.is_some() {
                         continue;
                     }
@@ -5851,11 +6177,12 @@ impl GraphMemory {
         let mut seen_edges: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
 
         const MAX_EDGES_PER_ENTITY: usize = 50; // Limit per entity for Hebbian lookup
+        let now = crate::memory::scoring_now();
         for entity_uuid in &episode.entity_refs {
             if let Ok(edges) =
-                self.get_entity_relationships_limited(entity_uuid, Some(MAX_EDGES_PER_ENTITY))
+                self.entity_edges_with_strength(entity_uuid, Some(MAX_EDGES_PER_ENTITY), now)
             {
-                for edge in edges {
+                for (edge, effective) in edges {
                     // Skip if already processed (edges are bidirectional in lookup)
                     if seen_edges.contains(&edge.uuid) {
                         continue;
@@ -5870,8 +6197,8 @@ impl GraphMemory {
                         if edge.invalidated_at.is_some() {
                             continue;
                         }
-                        // Use effective_strength which applies time-based decay
-                        strengths.push(edge.effective_strength());
+                        // Effective strength applies time-based decay
+                        strengths.push(effective);
                     }
                 }
             }
@@ -5979,7 +6306,7 @@ impl GraphMemory {
         // Build entity mention_count cache for NPMI computation.
         // Collect all unique entity UUIDs referenced by edges, then batch-read
         // their EntityNode.mention_count to avoid per-edge RocksDB lookups.
-        let mention_counts = self.build_mention_count_cache(edges);
+        let mention_counts = self.build_mention_count_cache(edges.iter());
 
         let mut batch = crate::storage::WriteBatch::new();
         let mut to_prune = Vec::new();
@@ -6243,8 +6570,11 @@ impl GraphMemory {
     /// Collects all unique entity UUIDs from edges, batch-reads them from RocksDB,
     /// and returns their mention_count values. Used to avoid per-edge entity lookups
     /// during NPMI computation in the maintenance pass.
-    fn build_mention_count_cache(&self, edges: &[RelationshipEdge]) -> HashMap<Uuid, usize> {
-        let mut entity_uuids: HashSet<Uuid> = HashSet::with_capacity(edges.len());
+    fn build_mention_count_cache<'e>(
+        &self,
+        edges: impl IntoIterator<Item = &'e RelationshipEdge>,
+    ) -> HashMap<Uuid, usize> {
+        let mut entity_uuids: HashSet<Uuid> = HashSet::new();
         for edge in edges {
             entity_uuids.insert(edge.from_entity);
             entity_uuids.insert(edge.to_entity);
@@ -10626,6 +10956,230 @@ mod tests {
         assert!(corroborated.strength > repeated.strength);
         assert_eq!(corroborated.distinct_sources(), 2);
         assert!(corroborated.last_corroborated >= created.last_corroborated);
+    }
+
+    fn episode_at(
+        entity_refs: Vec<Uuid>,
+        content: &str,
+        created_at: DateTime<Utc>,
+    ) -> EpisodicNode {
+        EpisodicNode {
+            uuid: Uuid::new_v4(),
+            name: content.to_string(),
+            content: content.to_string(),
+            valid_at: created_at,
+            created_at,
+            entity_refs,
+            source: EpisodeSource::Message,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn recent_episodes_are_newest_first_ties_by_content_and_capped() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let entity = graph.add_entity(named_entity("Kestrel")).unwrap();
+        let base = Utc::now() - Duration::days(100);
+        for day in 0..30 {
+            graph
+                .add_episode(episode_at(
+                    vec![entity],
+                    &format!("day {day:02}"),
+                    base + Duration::days(day),
+                ))
+                .unwrap();
+        }
+        // Three episodes tied at the newest instant: the cap cuts through them by content.
+        let newest = base + Duration::days(40);
+        for content in ["tie c", "tie a", "tie b"] {
+            graph
+                .add_episode(episode_at(vec![entity], content, newest))
+                .unwrap();
+        }
+
+        let recent = graph.get_recent_episodes_by_entity(&entity, 5).unwrap();
+        let contents: Vec<&str> = recent.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(contents, ["tie a", "tie b", "tie c", "day 29", "day 28"]);
+
+        let two = graph.get_recent_episodes_by_entity(&entity, 2).unwrap();
+        let contents: Vec<&str> = two.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["tie a", "tie b"],
+            "a tie at the cut is ordered by content"
+        );
+
+        // The capped read agrees with sorting every episode the unordered index holds.
+        let mut all = graph.get_episodes_by_entity(&entity).unwrap();
+        all.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.content.cmp(&b.content))
+        });
+        let expected: Vec<Uuid> = all.iter().take(20).map(|e| e.uuid).collect();
+        let capped: Vec<Uuid> = graph
+            .get_recent_episodes_by_entity(&entity, 20)
+            .unwrap()
+            .iter()
+            .map(|e| e.uuid)
+            .collect();
+        assert_eq!(capped, expected);
+    }
+
+    #[test]
+    fn recent_episodes_skip_rows_a_readd_left_behind_and_deleted_episodes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let entity = graph.add_entity(named_entity("Osprey")).unwrap();
+        let base = Utc::now() - Duration::days(10);
+
+        let mut moved = episode_at(vec![entity], "moved", base + Duration::days(5));
+        graph.add_episode(moved.clone()).unwrap();
+        moved.created_at = base;
+        graph.add_episode(moved.clone()).unwrap();
+        let kept = episode_at(vec![entity], "kept", base + Duration::days(1));
+        graph.add_episode(kept.clone()).unwrap();
+        let gone = episode_at(vec![entity], "gone", base + Duration::days(2));
+        graph.add_episode(gone.clone()).unwrap();
+        graph.delete_episode(&gone.uuid).unwrap();
+
+        let recent = graph.get_recent_episodes_by_entity(&entity, 10).unwrap();
+        let contents: Vec<&str> = recent.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["kept", "moved"],
+            "one row per live episode, at its current time"
+        );
+    }
+
+    #[test]
+    fn recency_index_is_backfilled_for_a_store_written_before_it() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let entity;
+        {
+            let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+            entity = graph.add_entity(named_entity("Heron")).unwrap();
+            let base = Utc::now() - Duration::days(3);
+            for (day, content) in ["first", "second", "third"].iter().enumerate() {
+                graph
+                    .add_episode(episode_at(
+                        vec![entity],
+                        content,
+                        base + Duration::days(day as i64),
+                    ))
+                    .unwrap();
+            }
+            // Strip the store back to the pre-index layout: no recency rows, no marker.
+            let prefix = format!("{entity}#");
+            for (key, _) in graph
+                .store
+                .scan_cf(CF_ENTITY_EPISODES, Some(prefix.as_bytes()), None)
+                .unwrap()
+            {
+                graph.store.delete_cf(CF_ENTITY_EPISODES, &key).unwrap();
+            }
+            graph
+                .store
+                .delete_cf(CF_ENTITY_EPISODES, EPISODE_RECENCY_INDEX_MARKER)
+                .unwrap();
+            assert!(graph
+                .get_recent_episodes_by_entity(&entity, 3)
+                .unwrap()
+                .is_empty());
+        }
+
+        let reopened = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let recent = reopened.get_recent_episodes_by_entity(&entity, 2).unwrap();
+        let contents: Vec<&str> = recent.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(contents, ["third", "second"]);
+    }
+
+    #[test]
+    fn deleting_an_entity_scrubs_its_recency_rows() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let entity = graph.add_entity(named_entity("Plover")).unwrap();
+        graph
+            .add_episode(episode_at(vec![entity], "only", Utc::now()))
+            .unwrap();
+        graph.delete_entity(&entity).unwrap();
+        let prefix = format!("{entity}#");
+        assert!(graph
+            .store
+            .scan_cf(CF_ENTITY_EPISODES, Some(prefix.as_bytes()), None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn strengthen_episode_entity_edges_strengthens_the_existing_pair_edge() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let a = graph.add_entity(named_entity("Lattice")).unwrap();
+        let b = graph.add_entity(named_entity("Furnace")).unwrap();
+        let c = graph.add_entity(named_entity("Quarry")).unwrap();
+        graph
+            .add_relationship(typed_edge(a, b, RelationType::RelatedTo, 0.4))
+            .unwrap();
+        let before = graph.find_relationship_between(&a, &b).unwrap().unwrap();
+
+        // `a` twice: duplicate refs must not strengthen one edge twice.
+        let episode = episode_at(vec![a, b, a, c], "lattice furnace quarry", Utc::now());
+        let episode_id = graph.add_episode(episode).unwrap();
+
+        let strengthened = graph
+            .strengthen_episode_entity_edges(&episode_id, "replay:test")
+            .unwrap();
+        assert_eq!(strengthened, 1, "one entity pair has an edge");
+
+        let after = graph.find_relationship_between(&a, &b).unwrap().unwrap();
+        assert_eq!(after.uuid, before.uuid);
+        assert!(after.strength > before.strength);
+        assert_eq!(after.activation_count, before.activation_count + 1);
+        assert!(graph.find_relationship_between(&a, &c).unwrap().is_none());
+    }
+
+    #[test]
+    fn bounded_name_resolution_keeps_the_strict_tiers_and_caps_the_fuzzy_ones() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let exact = graph.add_entity(named_entity("Vornak")).unwrap();
+        let mut longer = Vec::new();
+        for i in 0..5 {
+            longer.push(
+                graph
+                    .add_entity(named_entity(&format!("Talmor Station {i}")))
+                    .unwrap(),
+            );
+        }
+        let mut salient = named_entity("Talmor Station Annex");
+        salient.salience = 0.99;
+        let salient = graph.add_entity(salient).unwrap();
+
+        let bounded = |name: &str, cap: usize| {
+            graph
+                .find_entity_by_name_bounded(name, cap)
+                .unwrap()
+                .map(|e| e.uuid)
+        };
+        assert_eq!(
+            bounded("vornak", 1),
+            Some(exact),
+            "strict tiers win outright"
+        );
+        assert_eq!(graph.find_entity_uuid_strict("VORNAK"), Some(exact));
+        assert_eq!(graph.find_entity_uuid_strict("Talmor"), None);
+
+        // Uncapped fuzzy matching picks the most salient match...
+        assert_eq!(bounded("Talmor", 32), Some(salient));
+        // ...a cap keeps the shortest names, so the longer, salient one is never read.
+        let capped = bounded("Talmor", 2).unwrap();
+        assert!(
+            longer[..2].contains(&capped),
+            "kept candidates are the two shortest names"
+        );
+        assert_eq!(bounded("Talmor", 0), None);
     }
 }
 

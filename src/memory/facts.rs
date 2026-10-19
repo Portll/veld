@@ -34,6 +34,15 @@ pub struct FactStats {
     pub avg_support: f32,
 }
 
+/// How far a fact's confidence decay has been applied (see
+/// [`SemanticFactStore::apply_decay`]). `last_decayed_at` is `None` until a step is recorded,
+/// and decay then runs from the end of the grace period.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct FactDecayState {
+    #[serde(default)]
+    last_decayed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Pre-bi-temporal `SemanticFact` shape (the OLDEST on-disk format). Used as
 /// a fallback when decoding records written before `valid_from` / `valid_until`
 /// / `superseded_by` / `supersedes` were appended to the struct.
@@ -476,6 +485,9 @@ impl SemanticFactStore {
             // Delete embedding if present
             let _ = self.delete_embedding(user_id, fact_id);
 
+            self.store
+                .delete_bytes(Self::decay_state_key(user_id, fact_id).as_bytes())?;
+
             Ok(true)
         } else {
             Ok(false)
@@ -732,6 +744,90 @@ impl SemanticFactStore {
             .collect();
 
         Ok(decaying)
+    }
+
+    /// Key of a fact's decay watermark. It lives beside the fact rather than in it because
+    /// `SemanticFact` is bincode-positional: a new field would need another legacy decoder
+    /// for every record on disk. The third colon keeps it out of every primary-row scan of
+    /// `facts:{user}:`, which skip index-shaped keys, while the `facts:` prefix keeps it in
+    /// erasure, corruption cleanup and backend migration.
+    fn decay_state_key(user_id: &str, fact_id: &str) -> String {
+        format!("facts:{user_id}:{fact_id}:decay")
+    }
+
+    /// When `fact` was last decayed, if a decay step has been recorded for it.
+    pub fn last_decayed_at(
+        &self,
+        user_id: &str,
+        fact_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let key = Self::decay_state_key(user_id, fact_id);
+        match self.store.get_bytes(key.as_bytes())? {
+            Some(data) => {
+                let (state, _): (FactDecayState, _) =
+                    bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+                Ok(state.last_decayed_at)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Decay `fact` for the part of `elapsed_days` it has not already been decayed for, and
+    /// return the factor to multiply its confidence by.
+    ///
+    /// `elapsed_days` is the time since the grace period after `fact.last_reinforced` ended,
+    /// as the maintenance pass counts it; `half_life_days` the half-life that pass chose.
+    /// Decay was computed over that whole span every pass and the decayed confidence written
+    /// back, so each pass re-applied every earlier pass's decay. The watermark
+    /// (`last_decayed_at`) marks how far into the span decay has been applied; a
+    /// reinforcement moves the grace period past it, restarting the span.
+    ///
+    /// When the step is at least [`FACT_DECAY_MIN_STEP`](crate::constants::FACT_DECAY_MIN_STEP)
+    /// the decayed fact and the advanced watermark are written in one batch, so the
+    /// watermark only ever covers decay the stored confidence carries. A smaller step writes
+    /// nothing and keeps accruing.
+    pub fn apply_decay(
+        &self,
+        user_id: &str,
+        fact: &SemanticFact,
+        elapsed_days: f64,
+        half_life_days: f64,
+    ) -> Result<f32> {
+        use crate::constants::{FACT_DECAY_GRACE_DAYS, FACT_DECAY_MIN_STEP};
+        const SECONDS_PER_DAY: f64 = 86_400.0;
+
+        if elapsed_days <= 0.0 || half_life_days <= 0.0 {
+            return Ok(1.0);
+        }
+        let grace_end = fact.last_reinforced + chrono::Duration::days(FACT_DECAY_GRACE_DAYS);
+        let already_days = self
+            .last_decayed_at(user_id, &fact.id)?
+            .map(|at| (at - grace_end).num_seconds() as f64 / SECONDS_PER_DAY)
+            .unwrap_or(0.0)
+            .clamp(0.0, elapsed_days);
+        let interval_days = elapsed_days - already_days;
+        if interval_days <= 0.0 {
+            return Ok(1.0);
+        }
+
+        let factor = (0.5_f64).powf(interval_days / half_life_days) as f32;
+        let decayed_confidence = (fact.confidence * factor).max(0.0);
+        if fact.confidence - decayed_confidence > FACT_DECAY_MIN_STEP {
+            let mut decayed = fact.clone();
+            decayed.confidence = decayed_confidence;
+            let state = FactDecayState {
+                last_decayed_at: Some(
+                    grace_end + chrono::Duration::seconds((elapsed_days * SECONDS_PER_DAY) as i64),
+                ),
+            };
+            let mut pairs = Self::record_pairs(user_id, &decayed)?;
+            pairs.push((
+                Self::decay_state_key(user_id, &fact.id).into_bytes(),
+                bincode::serde::encode_to_vec(state, bincode::config::standard())?,
+            ));
+            self.store.put_many(&pairs)?;
+        }
+        Ok(factor)
     }
 
     /// Check if a similar fact already exists (hybrid dedup)
@@ -2072,5 +2168,91 @@ mod tests {
         // Both visible.
         let visible = store.list(user, 100).unwrap();
         assert_eq!(visible.len(), 2);
+    }
+
+    /// One maintenance pass over a fact as `decay_facts_for_all_users` runs it at `now`,
+    /// returning the confidence left in the store.
+    fn decay_pass(
+        store: &SemanticFactStore,
+        user: &str,
+        fact_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> f32 {
+        use crate::constants::{FACT_DECAY_GRACE_DAYS, FACT_DECAY_HALF_LIFE_BASE_DAYS};
+        let mut fact = store.get(user, fact_id).unwrap().unwrap();
+        let days_since_reinforcement = (now - fact.last_reinforced).num_days();
+        if days_since_reinforcement > FACT_DECAY_GRACE_DAYS {
+            let confidence_before = fact.confidence;
+            let elapsed = (days_since_reinforcement - FACT_DECAY_GRACE_DAYS) as f64;
+            let decay_factor = store
+                .apply_decay(user, &fact, elapsed, FACT_DECAY_HALF_LIFE_BASE_DAYS)
+                .unwrap();
+            fact.confidence = (confidence_before * decay_factor).max(0.0);
+            if (confidence_before - fact.confidence) > 0.001 {
+                store.update(user, &fact).unwrap();
+            }
+        }
+        store.get(user, fact_id).unwrap().unwrap().confidence
+    }
+
+    #[test]
+    fn apply_decay_decays_each_interval_once() {
+        on_both_backends(|store| {
+            use crate::constants::FACT_DECAY_GRACE_DAYS;
+            let user = "decay-user";
+            let now = chrono::Utc::now();
+            let mut fact = create_test_fact("f-decay", "tokio is the async runtime");
+            fact.last_reinforced = now - chrono::Duration::days(FACT_DECAY_GRACE_DAYS + 90);
+            store.store(user, &fact).unwrap();
+
+            let once = decay_pass(&store, user, "f-decay", now);
+            let expected = 0.8 * 0.5_f32.powf(90.0 / 180.0);
+            assert!((once - expected).abs() < 1e-5, "{once} vs {expected}");
+
+            // A second pass one second later owes nothing: the 90 days were applied once.
+            let again = decay_pass(&store, user, "f-decay", now + chrono::Duration::seconds(1));
+            assert_eq!(again, once);
+
+            // Thirty days on, only those thirty days decay.
+            let later = decay_pass(&store, user, "f-decay", now + chrono::Duration::days(30));
+            let expected_later = once * 0.5_f32.powf(30.0 / 180.0);
+            assert!(
+                (later - expected_later).abs() < 1e-5,
+                "{later} vs {expected_later}"
+            );
+
+            assert!(store.last_decayed_at(user, "f-decay").unwrap().is_some());
+            assert!(store.delete(user, "f-decay").unwrap());
+            assert!(
+                store.last_decayed_at(user, "f-decay").unwrap().is_none(),
+                "deleting a fact deletes its watermark"
+            );
+        });
+    }
+
+    #[test]
+    fn decay_too_small_to_record_keeps_accruing() {
+        on_both_backends(|store| {
+            use crate::constants::FACT_DECAY_GRACE_DAYS;
+            let user = "accrual-user";
+            let now = chrono::Utc::now();
+            let mut fact = create_test_fact("f-accrue", "a slowly fading fact");
+            fact.confidence = 0.2;
+            fact.last_reinforced = now - chrono::Duration::days(FACT_DECAY_GRACE_DAYS + 1);
+            store.store(user, &fact).unwrap();
+
+            // One day at a 180-day half-life drops 0.2 by under 0.001: nothing is recorded.
+            assert_eq!(decay_pass(&store, user, "f-accrue", now), 0.2);
+            assert!(store.last_decayed_at(user, "f-accrue").unwrap().is_none());
+
+            // Two days later the three days owed are applied together.
+            let after = decay_pass(&store, user, "f-accrue", now + chrono::Duration::days(2));
+            let expected = 0.2 * 0.5_f32.powf(3.0 / 180.0);
+            assert!((after - expected).abs() < 1e-6, "{after} vs {expected}");
+
+            // The watermark is not a primary row: listings still see one fact.
+            assert_eq!(store.list(user, 10).unwrap().len(), 1);
+            assert_eq!(store.list_users(10).unwrap(), vec![user.to_string()]);
+        });
     }
 }

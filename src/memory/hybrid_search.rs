@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -493,6 +495,11 @@ pub struct BM25Index {
     stemmed_content_field: Field,
     /// Held in RAM only (an encrypted tenant): nothing of it is on disk.
     in_memory: bool,
+    /// Upserts and deletes buffered in the writer since its last commit. Only
+    /// changed while the writer lock is held, so it agrees with the writer.
+    uncommitted: AtomicU64,
+    /// When the writer last committed, from any caller.
+    last_commit: parking_lot::Mutex<Instant>,
 }
 
 impl BM25Index {
@@ -616,6 +623,8 @@ impl BM25Index {
             entities_field,
             stemmed_content_field,
             in_memory,
+            uncommitted: AtomicU64::new(0),
+            last_commit: parking_lot::Mutex::new(Instant::now()),
         })
     }
 
@@ -642,6 +651,7 @@ impl BM25Index {
         doc.add_text(self.entities_field, entities.join(" "));
 
         writer.add_document(doc)?;
+        self.uncommitted.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -651,14 +661,54 @@ impl BM25Index {
         let writer = self.writer.write();
         let id_term = tantivy::Term::from_field_text(self.id_field, &memory_id.0.to_string());
         writer.delete_term(id_term);
+        self.uncommitted.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Commit pending changes to disk
     pub fn commit(&self) -> Result<()> {
         let mut writer = self.writer.write();
+        Self::commit_locked(&mut writer, &self.uncommitted, &self.last_commit)
+    }
+
+    fn commit_locked(
+        writer: &mut IndexWriter,
+        uncommitted: &AtomicU64,
+        last_commit: &parking_lot::Mutex<Instant>,
+    ) -> Result<()> {
         writer.commit().context("Failed to commit BM25 index")?;
+        uncommitted.store(0, Ordering::Relaxed);
+        *last_commit.lock() = Instant::now();
         Ok(())
+    }
+
+    /// Whether upserts or deletes are buffered in the writer and not yet
+    /// visible to searches.
+    pub fn has_uncommitted(&self) -> bool {
+        self.uncommitted.load(Ordering::Relaxed) > 0
+    }
+
+    /// Time since the writer last committed.
+    pub fn since_last_commit(&self) -> Duration {
+        self.last_commit.lock().elapsed()
+    }
+
+    /// Commit and reload the reader if anything is buffered; returns whether
+    /// a commit ran. The check is repeated under the writer lock so that
+    /// concurrent callers racing on one batch produce a single commit.
+    pub fn commit_pending(&self) -> Result<bool> {
+        if !self.has_uncommitted() {
+            return Ok(false);
+        }
+        {
+            let mut writer = self.writer.write();
+            if self.uncommitted.load(Ordering::Relaxed) == 0 {
+                return Ok(false);
+            }
+            Self::commit_locked(&mut writer, &self.uncommitted, &self.last_commit)?;
+        }
+        self.reload()?;
+        Ok(true)
     }
 
     /// Search using BM25
@@ -1294,6 +1344,17 @@ impl HybridSearchEngine {
         Ok(())
     }
 
+    /// Commit and reload only if documents are buffered. Writes journaled
+    /// through the intent log reach the index via the BM25 projection, which
+    /// commits in batches; a search calls this first so a memory written by
+    /// the caller is keyword-findable on its next recall.
+    pub fn commit_pending(&self) -> Result<bool> {
+        self.bm25_index.commit_pending().inspect_err(|_| {
+            self.bm25_commit_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+    }
+
     /// Commit batches lost since process start. Non-zero means the BM25 index
     /// is missing documents.
     pub fn bm25_commit_failure_count(&self) -> u64 {
@@ -1573,6 +1634,10 @@ impl HybridSearchEngine {
             .as_ref()
             .and_then(|d| d.candidate_count)
             .unwrap_or(self.config.candidate_count);
+
+        if let Err(e) = self.commit_pending() {
+            tracing::warn!(error = %e, "BM25 commit before search failed; buffered writes are not yet searchable");
+        }
 
         // 1. BM25 search with IC-weighted term boosting AND phrase matching
         let bm25_results = self.bm25_index.search_with_term_and_phrase_weights(
