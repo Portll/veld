@@ -918,6 +918,341 @@ pub fn extract_temporal_refs_with_events(
     augmented
 }
 
+// ============================================================================
+// Calendar windows named in a query
+// ============================================================================
+// `extract_temporal_refs` resolves every date it finds to one `NaiveDate` and
+// cannot say whether "May 2022" meant the month or its first day. The date
+// window leg in recall needs that distinction: it fetches memories by
+// `created_at`, so a month must widen to the whole month and a year must not
+// fire at all (a year of memories is not a candidate list). This extractor
+// reads the calendar granularity straight off the text.
+
+/// How much of the calendar a [`DateWindow`] covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DateWindowGranularity {
+    /// One calendar day: "1 May, 2022", "May 1, 2022", "2022-05-01", "05/01/2022".
+    Day,
+    /// One calendar month: "May 2022", "in April of 2022".
+    Month,
+}
+
+/// A calendar span a query names explicitly, with its year.
+///
+/// `end` is exclusive, so a day is `[d, d+1)` and a month is `[1st, 1st of next month)`.
+/// Year-only mentions ("in 2022") are not windows: they stay with the temporal boost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DateWindow {
+    /// First day covered.
+    pub start: NaiveDate,
+    /// First day NOT covered.
+    pub end: NaiveDate,
+    /// Day or month.
+    pub granularity: DateWindowGranularity,
+    /// The text the window was read from, as written.
+    pub original_text: String,
+}
+
+impl DateWindow {
+    /// The window for one calendar day.
+    pub fn day(date: NaiveDate, original_text: &str) -> Self {
+        Self {
+            start: date,
+            end: date + Duration::days(1),
+            granularity: DateWindowGranularity::Day,
+            original_text: original_text.to_string(),
+        }
+    }
+
+    /// The window for one calendar month. `None` when `month` is not 1..=12.
+    pub fn month(year: i32, month: u32, original_text: &str) -> Option<Self> {
+        let start = NaiveDate::from_ymd_opt(year, month, 1)?;
+        let end = if month == 12 {
+            NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+        } else {
+            NaiveDate::from_ymd_opt(year, month + 1, 1)?
+        };
+        Some(Self {
+            start,
+            end,
+            granularity: DateWindowGranularity::Month,
+            original_text: original_text.to_string(),
+        })
+    }
+
+    /// Whether `date` falls inside the window.
+    pub fn contains(&self, date: NaiveDate) -> bool {
+        date >= self.start && date < self.end
+    }
+}
+
+/// The calendar days and month-years a query names explicitly, in text order.
+///
+/// Recognised day forms: "May 7, 2023", "May 7th 2023", "7 May, 2023", "7th of May 2023",
+/// "2023-05-07" and "05/07/2023" (month first, as `extract_explicit_dates` reads it).
+/// Recognised month forms: "May 2023", "May, 2023", "May of 2023", with month names
+/// spelt out or abbreviated. A month-year that is part of a day form ("7 May, 2023")
+/// is reported once, as the day. Years outside 1900..=2100 are not dates. Two mentions
+/// of the same window are reported once.
+pub fn extract_date_windows(text: &str) -> Vec<DateWindow> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    const MONTH: &str = r"(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)";
+
+    // "May 7, 2023", "May 7th 2023", "Sept. 7, 2023"
+    static MONTH_DAY_YEAR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(
+            r"(?i)\b{MONTH}\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b"
+        ))
+        .expect("month-day-year regex")
+    });
+    // "7 May, 2023", "7th of May 2023"
+    static DAY_MONTH_YEAR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(
+            r"(?i)\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?{MONTH}\.?,?\s+(\d{{4}})\b"
+        ))
+        .expect("day-month-year regex")
+    });
+    // "2023-05-07"
+    static ISO_DAY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b").expect("iso-day regex"));
+    // "05/07/2023", month first.
+    static SLASH_DAY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b").expect("slash-day regex"));
+    // "May 2023", "May, 2023", "May of 2023"
+    static MONTH_YEAR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(r"(?i)\b{MONTH}\.?,?\s+(?:of\s+)?(\d{{4}})\b"))
+            .expect("month-year regex")
+    });
+
+    fn year_in_range(year: i32) -> bool {
+        (1900..=2100).contains(&year)
+    }
+
+    // (start offset, end offset, window)
+    let mut found: Vec<(usize, usize, DateWindow)> = Vec::new();
+    // Every day form's span, recorded whether or not its window is new: a repeated day
+    // still contains a month-year that must not surface as a month on its own.
+    let mut day_spans: Vec<(usize, usize)> = Vec::new();
+    fn push(
+        found: &mut Vec<(usize, usize, DateWindow)>,
+        start: usize,
+        end: usize,
+        window: DateWindow,
+    ) {
+        if !found
+            .iter()
+            .any(|(_, _, w)| w.start == window.start && w.end == window.end)
+        {
+            found.push((start, end, window));
+        }
+    }
+
+    for cap in MONTH_DAY_YEAR.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let month = month_to_num(&cap[1]);
+        let (Ok(day), Ok(year)) = (cap[2].parse::<u32>(), cap[3].parse::<i32>()) else {
+            continue;
+        };
+        if !year_in_range(year) {
+            continue;
+        }
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            day_spans.push((whole.start(), whole.end()));
+            push(
+                &mut found,
+                whole.start(),
+                whole.end(),
+                DateWindow::day(date, whole.as_str()),
+            );
+        }
+    }
+    for cap in DAY_MONTH_YEAR.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let (Ok(day), Ok(year)) = (cap[1].parse::<u32>(), cap[3].parse::<i32>()) else {
+            continue;
+        };
+        let month = month_to_num(&cap[2]);
+        if !year_in_range(year) {
+            continue;
+        }
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            day_spans.push((whole.start(), whole.end()));
+            push(
+                &mut found,
+                whole.start(),
+                whole.end(),
+                DateWindow::day(date, whole.as_str()),
+            );
+        }
+    }
+    for cap in ISO_DAY.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let (Ok(year), Ok(month), Ok(day)) = (
+            cap[1].parse::<i32>(),
+            cap[2].parse::<u32>(),
+            cap[3].parse::<u32>(),
+        ) else {
+            continue;
+        };
+        if !year_in_range(year) {
+            continue;
+        }
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            day_spans.push((whole.start(), whole.end()));
+            push(
+                &mut found,
+                whole.start(),
+                whole.end(),
+                DateWindow::day(date, whole.as_str()),
+            );
+        }
+    }
+    for cap in SLASH_DAY.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let (Ok(month), Ok(day), Ok(year)) = (
+            cap[1].parse::<u32>(),
+            cap[2].parse::<u32>(),
+            cap[3].parse::<i32>(),
+        ) else {
+            continue;
+        };
+        if !year_in_range(year) {
+            continue;
+        }
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            day_spans.push((whole.start(), whole.end()));
+            push(
+                &mut found,
+                whole.start(),
+                whole.end(),
+                DateWindow::day(date, whole.as_str()),
+            );
+        }
+    }
+    // A month-year inside a day form is that day, already recorded.
+    for cap in MONTH_YEAR.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let inside_day = day_spans
+            .iter()
+            .any(|(s, e)| whole.start() >= *s && whole.end() <= *e);
+        if inside_day {
+            continue;
+        }
+        let Ok(year) = cap[2].parse::<i32>() else {
+            continue;
+        };
+        if !year_in_range(year) {
+            continue;
+        }
+        let month = month_to_num(&cap[1]);
+        if let Some(window) = DateWindow::month(year, month, whole.as_str()) {
+            push(&mut found, whole.start(), whole.end(), window);
+        }
+    }
+
+    found.sort_by_key(|(start, _, _)| *start);
+    found.into_iter().map(|(_, _, w)| w).collect()
+}
+
+#[cfg(test)]
+mod date_window_tests {
+    use super::{extract_date_windows, DateWindow, DateWindowGranularity};
+    use chrono::NaiveDate;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn a_day_month_year_is_one_day() {
+        let w = extract_date_windows("What movie did Joanna watch on 1 May, 2022?");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].granularity, DateWindowGranularity::Day);
+        assert_eq!(w[0].start, d(2022, 5, 1));
+        assert_eq!(w[0].end, d(2022, 5, 2));
+        assert_eq!(w[0].original_text, "1 May, 2022");
+    }
+
+    #[test]
+    fn every_day_form_reads_as_that_day() {
+        for text in [
+            "on February 7, 2022",
+            "on February 7th, 2022",
+            "on 7 February 2022",
+            "on the 7th of February 2022",
+            "on 2022-02-07",
+            "on 02/07/2022",
+            "on Feb. 7, 2022",
+        ] {
+            let w = extract_date_windows(text);
+            assert_eq!(w.len(), 1, "{text}: {w:?}");
+            assert_eq!(
+                w[0],
+                DateWindow::day(d(2022, 2, 7), &w[0].original_text),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_month_year_is_the_whole_month() {
+        let w =
+            extract_date_windows("What physical transformation did Nate undergo in April 2022?");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].granularity, DateWindowGranularity::Month);
+        assert_eq!(w[0].start, d(2022, 4, 1));
+        assert_eq!(w[0].end, d(2022, 5, 1));
+        assert!(w[0].contains(d(2022, 4, 30)));
+        assert!(!w[0].contains(d(2022, 5, 1)));
+    }
+
+    #[test]
+    fn december_rolls_into_the_next_year() {
+        let w = extract_date_windows("in December of 2021");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].start, d(2021, 12, 1));
+        assert_eq!(w[0].end, d(2022, 1, 1));
+    }
+
+    #[test]
+    fn a_year_alone_is_not_a_window() {
+        assert!(extract_date_windows("What state did Joanna visit in 2021?").is_empty());
+        assert!(extract_date_windows("in summer 2021").is_empty());
+    }
+
+    #[test]
+    fn a_month_inside_a_day_form_is_reported_once_as_the_day() {
+        let w = extract_date_windows("on 25 February, 2022");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].granularity, DateWindowGranularity::Day);
+    }
+
+    #[test]
+    fn a_month_without_a_year_is_not_a_window() {
+        assert!(extract_date_windows("What happened in May?").is_empty());
+        assert!(extract_date_windows("last May").is_empty());
+    }
+
+    #[test]
+    fn impossible_dates_and_out_of_range_years_are_skipped() {
+        assert!(extract_date_windows("on February 30, 2022").is_empty());
+        assert!(extract_date_windows("on May 1, 1066").is_empty());
+        assert!(extract_date_windows("in May 3000").is_empty());
+    }
+
+    #[test]
+    fn windows_come_in_text_order_and_repeats_collapse() {
+        let w = extract_date_windows("between June 2022 and 3 May, 2022, or May 3, 2022");
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert_eq!(w[0].granularity, DateWindowGranularity::Month);
+        assert_eq!(w[0].start, d(2022, 6, 1));
+        assert_eq!(w[1].granularity, DateWindowGranularity::Day);
+        assert_eq!(w[1].start, d(2022, 5, 3));
+    }
+}
+
 /// Classify the type of temporal reference
 fn classify_temporal_ref(text: &str, date: &NaiveDate, now: &DateTime<Utc>) -> TemporalRefType {
     let text_lower = text.to_lowercase();
