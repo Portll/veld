@@ -57,6 +57,7 @@ pub mod types;
 pub mod visualization;
 pub mod voronoi;
 pub mod wavelet_sessions;
+pub mod write_time_facts;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -487,6 +488,10 @@ pub struct MemorySystem {
     /// (edge_uuid, raw_contribution) pairs — normalisation to 1.0 happens inside
     /// `GraphMemory::apply_path_credit`.
     spreading_path_credit: Arc<parking_lot::Mutex<Vec<(uuid::Uuid, f32)>>>,
+
+    /// Write-time fact extractor: the queue of conversation turns waiting for the model,
+    /// and the model itself (`None` keeps it off). See [`write_time_facts`].
+    write_time_facts: Arc<write_time_facts::WriteTimeFacts>,
 }
 
 /// Extract causal entity pairs from memory content.
@@ -653,6 +658,8 @@ pub struct UpsertProvenance {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub episode_id: Option<String>,
     pub writer: Option<crate::memory::facets::DeclaredWriter>,
+    /// The record kind; `None` creates a plain memory and leaves an update's kind alone.
+    pub kind: Option<crate::memory::facets::RecordKind>,
 }
 
 /// Write a declared episode id and writer onto a record's context, creating the context from
@@ -1446,6 +1453,9 @@ impl MemorySystem {
                 prefetch_tick::PrefetchUserState::default(),
             )),
             spreading_path_credit: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            write_time_facts: Arc::new(write_time_facts::WriteTimeFacts::new(
+                write_time_facts::facts_present_in(primary_store.key_value_store().as_ref()),
+            )),
         })
     }
 
@@ -2127,6 +2137,9 @@ impl MemorySystem {
         // Signal that fact extraction should run on next maintenance cycle
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Still under the write lock, so turns queue in the order they were written.
+        self.queue_write_time_facts(&memory);
 
         Ok(RememberOutcome::created(memory_id))
     }
@@ -2972,6 +2985,8 @@ impl MemorySystem {
         // Signal that fact extraction should run on next maintenance cycle
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        self.queue_write_time_facts(&memory);
 
         Ok(RememberOutcome::created(memory_id))
     }
@@ -5865,6 +5880,9 @@ impl MemorySystem {
                 existing.created_at = created_at;
                 existing.when.encoded_at = Some(created_at);
             }
+            if let Some(kind) = provenance.kind {
+                existing.kind = kind;
+            }
             overlay_declared_context(
                 &mut existing.experience.context,
                 experience.context.take(),
@@ -6021,7 +6039,7 @@ impl MemorySystem {
             );
 
             // Create memory with external_id
-            let memory = Arc::new(Memory::new_with_external_id(
+            let mut created = Memory::new_with_external_id(
                 memory_id.clone(),
                 experience,
                 importance,
@@ -6030,7 +6048,11 @@ impl MemorySystem {
                 None, // run_id
                 None, // actor_id
                 provenance.created_at,
-            ));
+            );
+            if let Some(kind) = provenance.kind {
+                created.kind = kind;
+            }
+            let memory = Arc::new(created);
 
             // Persist to storage
             self.long_term_memory.store(&memory)?;
@@ -8094,6 +8116,9 @@ impl MemorySystem {
 /// all in-memory state (vector index, ID mappings) must be persisted to disk.
 impl Drop for MemorySystem {
     fn drop(&mut self) {
+        // Stops the write-time fact worker, which otherwise waits on the queue forever.
+        self.write_time_facts.close();
+
         // Vector index saved via explicit shutdown (save_all_vector_indices)
         // Do NOT save here - Drop fires for temporary instances, overwriting valid saves
 

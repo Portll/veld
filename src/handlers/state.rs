@@ -352,6 +352,10 @@ pub struct MultiUserMemoryManager {
     /// embedding, audit persistence). Shutdown closes it and waits, so the stores are not
     /// flushed or released under a write still in flight.
     pub task_tracker: tokio_util::task::TaskTracker,
+
+    /// The model every user's write-time fact extractor uses, read from `VELD_LLM_*` once
+    /// at startup. `None` (the default: no endpoint) leaves extraction off for everyone.
+    write_time_fact_llm: Option<Arc<dyn crate::memory::llm::LlmConsolidator>>,
 }
 
 /// User directories under the data root. An unreadable entry is an error, not a
@@ -727,6 +731,11 @@ impl MultiUserMemoryManager {
             // See `set_sleep_time_orchestrator()`.
             sleep_time_orchestrator: parking_lot::RwLock::new(None),
             task_tracker: tokio_util::task::TaskTracker::new(),
+            write_time_fact_llm: crate::memory::write_time_facts::consolidator_from_env()
+                .unwrap_or_else(|e| {
+                    tracing::error!("write-time facts: LLM configuration refused: {e:#}");
+                    None
+                }),
         };
 
         info!("Running initial audit log rotation...");
@@ -1490,8 +1499,10 @@ impl MultiUserMemoryManager {
         user_mem.set_graph_memory(graph);
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
         user_mem.set_feedback_store(self.feedback_store.clone());
+        user_mem.set_write_time_fact_llm(self.write_time_fact_llm.clone());
 
         let memory_arc: SharedUserMemory = Arc::new(parking_lot::RwLock::new(user_mem));
+        crate::memory::write_time_facts::start_worker(&memory_arc);
 
         self.user_memories
             .insert(user_id.to_string(), memory_arc.clone());

@@ -108,21 +108,24 @@ pub struct HttpLlmConsolidator {
     endpoint: String,
     api_key: String,
     model: String,
-    client: reqwest::blocking::Client,
+    /// Built on the first call. reqwest's blocking client runs its own runtime and
+    /// panics when built inside a tokio context, and the server constructs this
+    /// type on a runtime thread while every call is made from a plain thread.
+    client: std::sync::OnceLock<reqwest::blocking::Client>,
 }
 
 impl HttpLlmConsolidator {
-    /// Build a consolidator with explicit configuration.
+    /// Model used when `VELD_LLM_MODEL` is unset.
+    pub const DEFAULT_MODEL: &'static str = "gpt-4o-mini";
+
+    /// Build a consolidator with explicit configuration. No connection is made
+    /// until the first call.
     pub fn new(endpoint: String, api_key: String, model: String) -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("veld-llm/1.0")
-            .timeout(Duration::from_secs(60))
-            .build()?;
         Ok(Self {
             endpoint,
             api_key,
             model,
-            client,
+            client: std::sync::OnceLock::new(),
         })
     }
 
@@ -135,8 +138,26 @@ impl HttpLlmConsolidator {
             _ => return Ok(None),
         };
         let api_key = std::env::var("VELD_LLM_API_KEY").unwrap_or_default();
-        let model = std::env::var("VELD_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let model =
+            std::env::var("VELD_LLM_MODEL").unwrap_or_else(|_| Self::DEFAULT_MODEL.to_string());
         Ok(Some(Self::new(endpoint, api_key, model)?))
+    }
+
+    /// The configured model name, as sent in each request.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn client(&self) -> Result<&reqwest::blocking::Client> {
+        if let Some(client) = self.client.get() {
+            return Ok(client);
+        }
+        let built = reqwest::blocking::Client::builder()
+            .user_agent("veld-llm/1.0")
+            .timeout(Duration::from_secs(60))
+            .build()?;
+        // Two first calls may race to build; the loser's client is dropped.
+        Ok(self.client.get_or_init(|| built))
     }
 }
 
@@ -153,7 +174,7 @@ impl HttpLlmConsolidator {
             temperature: 0.0,
         };
 
-        let mut req = self.client.post(&self.endpoint).json(&request);
+        let mut req = self.client()?.post(&self.endpoint).json(&request);
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }
