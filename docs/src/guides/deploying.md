@@ -122,9 +122,12 @@ refused. `packaging/macos/net.portll.veld-embedder.plist` runs it under launchd;
 `VELD_EMBEDDING_API_URL=http://127.0.0.1:8095`.
 
 **Switching embedders re-embeds the store.** The embedder id and dimension are recorded in
-`.veld_embedder` / `.veld_embedding_dim` beside each tenant's storage; when they differ from
-the active embedder, every memory is re-embedded at startup (crash-resumable; the marker
-advances only after a clean pass). Once a corpus marker names an HTTP endpoint, later boots
+`.veld_embedder` / `.veld_embedding_dim` beside each tenant's storage, and every stored vector
+records its own [embedding space](../architecture/embedding-spaces.md). When the markers differ
+from the active embedder, every memory whose vector is in another space is re-embedded at
+startup (crash-resumable; the marker advances only after a clean pass). A memory the pass could
+not re-embed keeps its old space and waits in the embedding backlog, counted on `/health` under
+`embedding_spaces`. Once a corpus marker names an HTTP endpoint, later boots
 use that endpoint or refuse, so an endpoint that happens to be down cannot silently swap
 the store back to a local model and trigger a second full re-embed. Budget the first boot
 after a switch accordingly: a 2.5 GB tenant is minutes to tens of minutes against a local

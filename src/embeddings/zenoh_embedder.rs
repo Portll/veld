@@ -345,6 +345,10 @@ impl Embedder for ZenohEmbedder {
         "zenoh"
     }
 
+    fn model_id(&self) -> &str {
+        &self.config.target_model
+    }
+
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         let embeddings = self.query_peer(&[text])?;
         embeddings

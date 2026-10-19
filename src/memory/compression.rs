@@ -346,9 +346,17 @@ impl CompressionPipeline {
             let (experience, _): (Experience, _) =
                 bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
 
-            // Restore the memory
+            // Restore the memory. The vectors come from the stored record, not the blob: a
+            // migration since compression re-embedded the record and named its spaces, and the
+            // blob's copy predates both.
             let mut restored = memory.clone();
             restored.experience = experience;
+            restored.experience.embeddings = memory.experience.embeddings.clone();
+            restored.experience.embedding_space = memory.experience.embedding_space.clone();
+            restored.experience.embeddings_secondary =
+                memory.experience.embeddings_secondary.clone();
+            restored.experience.embedding_space_secondary =
+                memory.experience.embedding_space_secondary.clone();
             restored.compressed = false;
             restored.experience.metadata.remove("compressed_data");
             restored.experience.metadata.remove("compression_ratio");

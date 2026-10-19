@@ -41,6 +41,10 @@ pub struct HealthResponse {
     /// Tenants holding data on each backend at boot. `users_count` over an empty
     /// store is the 2026-09-10 outage; this is what tells the two apart.
     pub tenants_with_data: crate::storage::boot_guard::BackendCensus,
+    /// Embedding spaces across the users in cache, summed by space: memories each index holds,
+    /// backlog rows waiting for a vector in the space, and memories stored in it that an index
+    /// in another space refused. Space ids name models and widths, never a tenant.
+    pub embedding_spaces: Vec<crate::embeddings::space::SpaceSummary>,
     /// One entry per store currently refusing writes; absent when none is.
     /// Measured 2026-10-11: this endpoint served `healthy` through 11,088
     /// consecutive failed writes.
@@ -103,8 +107,30 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         max_cache_size: config.max_users_in_memory,
         embedder: crate::embeddings::primary_embedder_info(),
         tenants_with_data: state.backend_census.clone(),
+        embedding_spaces: embedding_spaces(&state),
         write_latch,
     })
+}
+
+/// Cached users only, and only those not busy: a probe must neither load a tenant nor wait on
+/// one.
+fn embedding_spaces(state: &MultiUserMemoryManager) -> Vec<crate::embeddings::space::SpaceSummary> {
+    let mut summaries = Vec::new();
+    for user_id in state.list_cached_users() {
+        // The cache itself, not get_user_memory: a user evicted since the listing is skipped,
+        // never loaded.
+        let Some(memory) = state.user_memories.get(&user_id) else {
+            continue;
+        };
+        let Some(guard) = memory.try_read() else {
+            continue;
+        };
+        match guard.embedding_spaces() {
+            Ok(spaces) => summaries.extend(spaces),
+            Err(e) => tracing::debug!("embedding spaces unreadable for a cached user: {e}"),
+        }
+    }
+    crate::embeddings::space::merge_summaries(summaries)
 }
 
 /// Liveness probe - indicates if process is alive and not deadlocked
@@ -582,6 +608,7 @@ mod write_latch_reporting {
                 redb: None,
                 measured_at: chrono::Utc::now(),
             },
+            embedding_spaces: Vec::new(),
             write_latch,
         };
         serde_json::to_value(&response).expect("HealthResponse serializes")

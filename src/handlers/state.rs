@@ -2456,7 +2456,7 @@ impl MultiUserMemoryManager {
                 return Ok(false); // no real change
             }
             mem.experience.content = new_content;
-            mem.experience.embeddings = None; // force re-embed / re-index
+            mem.experience.clear_primary_vector(); // force re-embed / re-index
             guard.update_memory(&mem)?;
             bincode::serde::encode_to_vec(&mem, bincode::config::standard())
                 .map_err(|e| anyhow::anyhow!("wiki edit-back bincode: {e}"))?

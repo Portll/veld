@@ -1166,13 +1166,16 @@ impl NomicEmbedder {
     }
 }
 
+/// The model name this embedder reports, and the one a corpus marker of `nomic` maps to.
+pub const MODEL_ID: &str = "nomic-embed-text-v1.5";
+
 impl Embedder for NomicEmbedder {
     fn id(&self) -> &str {
         "nomic"
     }
 
     fn model_id(&self) -> &str {
-        "nomic-embed-text-v1.5"
+        MODEL_ID
     }
 
     /// Default encode uses the "search_document: " prefix (content being stored).
