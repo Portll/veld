@@ -2714,7 +2714,7 @@ pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
         .filter(|k| *k >= SMOKE_K)
         .unwrap_or(SMOKE_K);
 
-    const STAGES: [&str; 5] = ["graph", "vector", "hybrid", "fusion", "final"];
+    const STAGES: [&str; 6] = ["graph", "vector", "hybrid", "fact", "fusion", "final"];
 
     #[derive(Default, Clone)]
     struct Acc {

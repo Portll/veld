@@ -682,6 +682,75 @@ fn fail(reason: &str, detail: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Recall expansion
+// ---------------------------------------------------------------------------
+
+/// What [`expand_fact_sources`] did to one candidate list.
+#[derive(Debug, Default, PartialEq)]
+pub struct FactExpansion {
+    /// The source turns of every ranked fact, in the facts' rank order: the fact leg,
+    /// whether or not each turn was already in the pool.
+    pub leg: Vec<MemoryId>,
+    /// Source turns that were not in the pool and were put into it.
+    pub injected: usize,
+}
+
+/// Bring the source turns of every fact ranked in `ranked[..budget]` into the pool.
+///
+/// `ranked` is sorted by score, best first, and `budget` is how much of it survives the
+/// truncation that follows. A source turn already inside the budget stays where it is;
+/// any other goes right after its fact at the fact's score, moved up if it sat below the
+/// budget, so the list stays sorted. At most `max_injected` are added, and the caller
+/// widens its truncation by [`FactExpansion::injected`]. The facts keep their places.
+pub fn expand_fact_sources(
+    ranked: &mut Vec<(MemoryId, f32)>,
+    budget: usize,
+    max_injected: usize,
+    sources_of: impl Fn(&MemoryId) -> Option<Vec<MemoryId>>,
+) -> FactExpansion {
+    let budget = budget.min(ranked.len());
+    let mut pool: HashSet<MemoryId> = ranked[..budget].iter().map(|(id, _)| id.clone()).collect();
+    let mut leg = Vec::new();
+    let mut in_leg = HashSet::new();
+    let mut after: HashMap<usize, Vec<MemoryId>> = HashMap::new();
+    let mut injected = 0;
+    for (rank, (id, _)) in ranked[..budget].iter().enumerate() {
+        let Some(sources) = sources_of(id) else {
+            continue;
+        };
+        for source in sources {
+            if in_leg.insert(source.clone()) {
+                leg.push(source.clone());
+            }
+            if injected < max_injected && pool.insert(source.clone()) {
+                after.entry(rank).or_default().push(source);
+                injected += 1;
+            }
+        }
+    }
+    if injected == 0 {
+        return FactExpansion { leg, injected };
+    }
+
+    let moved: HashSet<MemoryId> = after.values().flatten().cloned().collect();
+    let mut expanded = Vec::with_capacity(ranked.len() + injected);
+    for (rank, (id, score)) in ranked.drain(..).enumerate() {
+        if rank >= budget {
+            if !moved.contains(&id) {
+                expanded.push((id, score));
+            }
+            continue;
+        }
+        expanded.push((id, score));
+        if let Some(sources) = after.remove(&rank) {
+            expanded.extend(sources.into_iter().map(|s| (s, score)));
+        }
+    }
+    *ranked = expanded;
+    FactExpansion { leg, injected }
+}
+
+// ---------------------------------------------------------------------------
 // MemorySystem integration
 // ---------------------------------------------------------------------------
 
@@ -700,6 +769,28 @@ impl MemorySystem {
     /// The extractor's queue, for a caller that must wait for it or hold it.
     pub fn write_time_facts(&self) -> Arc<WriteTimeFacts> {
         Arc::clone(&self.write_time_facts)
+    }
+
+    /// The source turns of `id` when it is a write-time fact; `None` for anything else.
+    pub(crate) fn write_time_fact_sources(&self, id: &MemoryId) -> Option<Vec<MemoryId>> {
+        let cached = self
+            .working_memory
+            .read()
+            .get(id)
+            .or_else(|| self.session_memory.read().get(id));
+        let sources = match cached {
+            Some(memory) => {
+                is_write_time_fact(&memory).then(|| memory.experience.related_memories.clone())
+            }
+            None => self
+                .long_term_memory
+                .get_memory(id)
+                .ok()
+                .flatten()
+                .filter(is_write_time_fact)
+                .map(|memory| memory.experience.related_memories),
+        };
+        sources.filter(|s| !s.is_empty())
     }
 
     /// Queue `memory` for extraction when it is a conversation turn, the dial is on and a
@@ -1554,6 +1645,116 @@ mod tests {
 
         drop(shared);
         assert!(facts.state.lock().closed);
+    }
+
+    fn id(n: u128) -> MemoryId {
+        MemoryId(uuid::Uuid::from_u128(n))
+    }
+
+    #[test]
+    fn a_ranked_fact_brings_its_source_turns_into_the_pool_after_it() {
+        let (fact, a, b, c, s1, s2) = (id(1), id(2), id(3), id(4), id(5), id(6));
+        let ranked = vec![
+            (fact.clone(), 0.9),
+            (a.clone(), 0.8),
+            (b.clone(), 0.7),
+            (c.clone(), 0.6),
+            (s2.clone(), 0.5),
+        ];
+        let sources = |m: &MemoryId| (*m == fact).then(|| vec![s1.clone(), a.clone(), s2.clone()]);
+
+        let mut expanded = ranked.clone();
+        let expansion = expand_fact_sources(&mut expanded, 3, MAX_EXPANSION, sources);
+        // s1 was nowhere, s2 sat below the budget, a was already in the pool.
+        assert_eq!(
+            expansion,
+            FactExpansion {
+                leg: vec![s1.clone(), a.clone(), s2.clone()],
+                injected: 2,
+            }
+        );
+        assert_eq!(
+            expanded,
+            vec![
+                (fact.clone(), 0.9),
+                (s1.clone(), 0.9),
+                (s2.clone(), 0.9),
+                (a.clone(), 0.8),
+                (b.clone(), 0.7),
+                (c.clone(), 0.6),
+            ]
+        );
+
+        // The cap holds: s2 keeps its place below the budget.
+        let mut capped = ranked.clone();
+        let expansion = expand_fact_sources(&mut capped, 3, 1, sources);
+        assert_eq!(expansion.injected, 1);
+        assert_eq!(capped[1], (s1, 0.9));
+        assert_eq!(capped.last(), Some(&(s2, 0.5)));
+
+        // No fact in the budget: nothing moves and the leg is empty.
+        let mut untouched = ranked.clone();
+        let expansion = expand_fact_sources(&mut untouched, 3, MAX_EXPANSION, |_| None);
+        assert_eq!(expansion, FactExpansion::default());
+        assert_eq!(untouched, ranked);
+    }
+
+    #[test]
+    fn recall_expands_a_ranked_fact_into_its_source_turns() {
+        let (sys, _tmp) = system(4);
+        sys.set_write_time_fact_llm(Some(ScriptedLlm::new(|snippets| {
+            if snippets.len() < 2 {
+                return Vec::new();
+            }
+            vec![json!({
+                "fact": "Nate has kept pet turtles for about three years, as of 21 January 2022.",
+                "source_turns": ["T1", "T2"],
+                "entities": ["Nate", "turtles"],
+            })]
+        })));
+        remember_turn(&sys, "Joanna: How are the little shelled ones?", at(21, 20));
+        let answer = remember_turn(&sys, "Nate: Great, three years now with them.", at(21, 21));
+        sys.drain_write_time_facts();
+        let fact = stored_facts(&sys).remove(0);
+        assert_eq!(sys.write_time_fact_sources(&answer), None);
+        assert!(sys
+            .write_time_fact_sources(&fact.id)
+            .is_some_and(|s| s.contains(&answer)));
+
+        let query = crate::memory::types::Query {
+            query_text: Some("How long has Nate kept pet turtles?".to_string()),
+            max_results: 10,
+            ..Default::default()
+        };
+        let fact_stage = |sys: &MemorySystem| {
+            crate::memory::gold_funnel::begin(HashSet::from([answer.clone()]));
+            let results = sys.recall(&query).expect("recall");
+            let stages = crate::memory::gold_funnel::take().unwrap_or_default();
+            let stage = stages
+                .into_iter()
+                .find(|(name, _)| name == "fact")
+                .map(|(_, rank)| rank);
+            (results, stage)
+        };
+
+        let (results, stage) = fact_stage(&sys);
+        assert!(
+            results.iter().any(|m| m.id == fact.id),
+            "the fact itself stays in the results"
+        );
+        assert_eq!(
+            stage,
+            Some(Some(1)),
+            "the answer turn is the fact's second source"
+        );
+
+        sys.set_cognitive_dials(CognitiveDials {
+            write_time_facts: true,
+            write_time_fact_expansion: false,
+            ..Default::default()
+        });
+        let (_, stage) = fact_stage(&sys);
+        assert_eq!(stage, None, "no fact leg with the dial off");
     }
 
     /// `start_worker` takes what the server shares, a lock around something that derefs
