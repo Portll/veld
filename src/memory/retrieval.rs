@@ -1670,6 +1670,13 @@ impl RetrievalEngine {
         self.storage.get(id)
     }
 
+    /// Read `ids` from storage, results in the same order. The one seam recall's candidate
+    /// projection reads through. `PrimaryMemoryStore` has no batch read, so today this is
+    /// one point read per id.
+    pub fn get_many_from_storage(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
+        ids.iter().map(|id| self.storage.get(id)).collect()
+    }
+
     /// Search for similar memories by embedding directly (SHO-106)
     ///
     /// Used for interference detection to find memories similar to a new memory.
