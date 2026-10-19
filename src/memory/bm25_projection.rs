@@ -51,7 +51,14 @@
 //! (each commit fsyncs the segment + bumps the meta), so the projection
 //! commits in batches.
 //!
-//! The cadence is owned in one place — [`COMMIT_EVERY`] — and the replay
+//! On the live-write path a batch closes at whichever comes first:
+//! [`COMMIT_EVERY`] applies, or an apply arriving when the index's last
+//! commit is older than [`COMMIT_INTERVAL`]. There is no timer thread; a
+//! quiet tenant's tail stays buffered until the next apply or until a search
+//! calls [`crate::memory::HybridSearchEngine::commit_pending`], which is how a
+//! recall sees a memory written just before it.
+//!
+//! The batch size is owned in one place — [`COMMIT_EVERY`] — and the replay
 //! driver is told to persist the projection checkpoint with the same
 //! period via `replay(..., Some(COMMIT_EVERY))`. This means the
 //! on-disk BM25 segments and the persisted intent-log checkpoint advance
@@ -76,6 +83,7 @@
 
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -133,6 +141,12 @@ pub const PROJECTION_NAME: &str = "bm25";
 /// the next replay will re-apply.
 pub const COMMIT_EVERY: u64 = 100;
 
+/// Age of the index's last commit past which the next live apply commits,
+/// whatever the batch size. Bounds how long a journaled write stays invisible
+/// to a reader that does not itself flush (searches flush via
+/// [`crate::memory::HybridSearchEngine::commit_pending`]).
+pub const COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Bridge between the intent log and the BM25 inverted index.
 ///
 /// One per tenant. Owns an `Arc<BM25Index>` (the tantivy handle shared
@@ -149,6 +163,8 @@ pub struct Bm25Projection {
     /// commit. Lets the dyn-`TypedProjection` arm batch commits without
     /// the replay driver's `persist_every` ceremony.
     applies_since_commit: u64,
+    /// Live-path time trigger; [`COMMIT_INTERVAL`] unless overridden.
+    commit_interval: Duration,
 }
 
 impl Bm25Projection {
@@ -162,6 +178,7 @@ impl Bm25Projection {
             checkpoint_store,
             checkpoint,
             applies_since_commit: 0,
+            commit_interval: COMMIT_INTERVAL,
         }
     }
 
@@ -177,7 +194,14 @@ impl Bm25Projection {
             checkpoint_store,
             checkpoint: None,
             applies_since_commit: 0,
+            commit_interval: COMMIT_INTERVAL,
         }
+    }
+
+    /// Replace the live-path time trigger (default [`COMMIT_INTERVAL`]).
+    pub fn with_commit_interval(mut self, interval: Duration) -> Self {
+        self.commit_interval = interval;
+        self
     }
 
     /// Borrow the underlying index. Used by tests and admin tooling that
@@ -235,24 +259,23 @@ impl Bm25Projection {
         Ok(())
     }
 
-    /// Commit the underlying tantivy writer if at least one record has
-    /// been applied since the last commit. Reloads the reader so reads
-    /// see the freshly-committed segments without an external nudge.
+    /// Commit the underlying tantivy writer if it holds buffered documents,
+    /// and reload the reader so a hybrid search engine sharing this
+    /// `Arc<BM25Index>` sees them. The index, not `applies_since_commit`,
+    /// decides: a search may already have committed this batch through
+    /// `commit_pending`, and committing again would be an empty fsync.
     fn commit_index(&mut self) -> Result<(), Bm25ProjectionError> {
-        if self.applies_since_commit == 0 {
-            return Ok(());
-        }
         self.index
-            .commit()
-            .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
-        // Reload the reader so any read-side hybrid search engine sharing
-        // this `Arc<BM25Index>` sees the new documents immediately. The
-        // reload is cheap — it just re-mmaps the segment files.
-        self.index
-            .reload()
+            .commit_pending()
             .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
         self.applies_since_commit = 0;
         Ok(())
+    }
+
+    /// Whether the live path should close the current batch now.
+    fn commit_due(&self) -> bool {
+        self.applies_since_commit >= COMMIT_EVERY
+            || self.index.since_last_commit() >= self.commit_interval
     }
 
     /// Persist the in-memory checkpoint to the shared checkpoint store.
@@ -287,8 +310,9 @@ fn decode_memory(bytes: &[u8]) -> Result<Memory, Bm25ProjectionError> {
 
 /// Dyn-friendly arm: the [`crate::intent_log::JournaledWriter`] hands us
 /// typed payloads at live-write time. We batch commits via
-/// [`COMMIT_EVERY`] and persist the checkpoint every time we commit so a
-/// crash never leaves the BM25 segments and the checkpoint out of sync.
+/// [`COMMIT_EVERY`] / [`COMMIT_INTERVAL`] and persist the checkpoint every
+/// time we commit, never before, so the checkpoint can trail the segments
+/// (replay re-applies idempotently) but never lead them.
 impl TypedProjection for Bm25Projection {
     fn name(&self) -> &str {
         PROJECTION_NAME
@@ -302,7 +326,7 @@ impl TypedProjection for Bm25Projection {
         self.apply_typed(lsn, payload)
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         self.applies_since_commit += 1;
-        if self.applies_since_commit >= COMMIT_EVERY {
+        if self.commit_due() {
             self.commit_index()
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
             self.persist()
@@ -696,6 +720,56 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, MemoryId(id));
         assert_eq!(proj.checkpoint(), Some(Lsn(1)));
+    }
+
+    /// Below the batch size, the live path commits on the first apply that
+    /// arrives once the last commit is older than the interval; until then
+    /// the documents stay buffered.
+    #[test]
+    fn an_apply_after_the_commit_interval_commits_the_batch() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("commit_interval");
+        let (index, ckpt, proj) = open_projection(&bm25_path, &checkpoint_path);
+        let interval = std::time::Duration::from_millis(500);
+        let mut proj = proj.with_commit_interval(interval);
+        index.commit().unwrap();
+
+        let first = mk_memory(Uuid::new_v4(), "buffered tamarind entry", &[], &[]);
+        TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&first)).unwrap();
+        assert!(index.has_uncommitted(), "inside the interval nothing commits");
+        assert!(index.search("tamarind", 10).unwrap().is_empty());
+        assert_eq!(ckpt.lock().get(PROJECTION_NAME), None);
+
+        std::thread::sleep(interval + std::time::Duration::from_millis(100));
+        let second = mk_memory(Uuid::new_v4(), "late tamarind entry", &[], &[]);
+        TypedProjection::apply(&mut proj, Lsn(1), &remember_payload(&second)).unwrap();
+
+        assert!(!index.has_uncommitted(), "the late apply closed the batch");
+        assert_eq!(index.search("tamarind", 10).unwrap().len(), 2);
+        assert_eq!(
+            ckpt.lock().get(PROJECTION_NAME),
+            Some(Lsn(1)),
+            "the checkpoint is persisted with the commit"
+        );
+    }
+
+    /// A search-side `commit_pending` commits what the projection buffered;
+    /// the projection's next batch close finds nothing to commit and still
+    /// persists its checkpoint.
+    #[test]
+    fn a_reader_flush_and_the_projection_batch_share_one_commit() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("reader_flush");
+        let (index, ckpt, proj) = open_projection(&bm25_path, &checkpoint_path);
+        let mut proj = proj.with_commit_interval(std::time::Duration::from_secs(3600));
+        index.commit().unwrap();
+
+        let memory = mk_memory(Uuid::new_v4(), "flushed by the reader", &[], &[]);
+        TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&memory)).unwrap();
+        assert!(index.commit_pending().unwrap(), "buffered work is committed");
+        assert!(!index.commit_pending().unwrap(), "and only once");
+        assert_eq!(index.search("flushed reader", 10).unwrap().len(), 1);
+
+        Projection::persist_checkpoint(&mut proj).unwrap();
+        assert_eq!(ckpt.lock().get(PROJECTION_NAME), Some(Lsn(0)));
     }
 
     /// Malformed memory_id in the payload returns a structured error

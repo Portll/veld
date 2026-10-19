@@ -239,7 +239,6 @@ pub async fn health_index(State(state): State<AppState>) -> (StatusCode, Json<se
     let mut users_checked: usize = 0;
     let mut users_needing_rebuild: usize = 0;
     let mut users_with_shortfall: usize = 0;
-    let mut users_coverage_unreadable: usize = 0;
     for user_id in state.list_cached_users() {
         if let Ok(memory) = state.get_user_memory(&user_id) {
             let guard = memory.read();
@@ -250,14 +249,12 @@ pub async fn health_index(State(state): State<AppState>) -> (StatusCode, Json<se
                 users_needing_rebuild += 1;
             }
             // Stored-vs-indexed, counted the same aggregate way as the rebuild
-            // flag above. An unreadable coverage is its own count, never folded
-            // into "no shortfall".
-            match guard.index_coverage() {
-                Ok((stored, vec_idx, lex_idx)) if vec_idx < stored || lex_idx < stored => {
-                    users_with_shortfall += 1
-                }
-                Ok(_) => {}
-                Err(_) => users_coverage_unreadable += 1,
+            // flag above. `stored` is the maintained count, not a key scan: an
+            // unauthenticated probe must not cost a store read per cached user.
+            // The exact population check is the authenticated per-user route.
+            let (stored, vec_idx, lex_idx) = guard.index_coverage_cached();
+            if vec_idx < stored || lex_idx < stored {
+                users_with_shortfall += 1;
             }
             users_checked += 1;
         }
@@ -272,7 +269,8 @@ pub async fn health_index(State(state): State<AppState>) -> (StatusCode, Json<se
             "total_incremental_inserts": total_incremental,
             "users_needing_rebuild_count": users_needing_rebuild,
             "users_with_index_shortfall_count": users_with_shortfall,
-            "users_coverage_unreadable_count": users_coverage_unreadable,
+            // Kept for existing clients: a maintained count is never unreadable.
+            "users_coverage_unreadable_count": 0,
             "rebuild_threshold": crate::vector_db::vamana::REBUILD_THRESHOLD,
             "timestamp": chrono::Utc::now().to_rfc3339()
         })),

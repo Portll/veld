@@ -81,22 +81,6 @@ use crate::constants::{
 use crate::memory::storage::MemoryStorage;
 pub use crate::memory::types::*;
 
-/// `VELD_RECALL_READONLY=1` — recall performs NO usage writes: no access-count persistence,
-/// no co-retrieval edge reinforcement, no interference accumulation, no retrieval-counter
-/// bump. Set by the eval harness (`recall_harness::runner` pins it at startup): eval repeats
-/// measure variance, not learning curves, and a first-repeat usage write shifts later repeats'
-/// rankings. Production default (unset): writes on, unchanged.
-///
-/// Ported from shodh-memory 4ec3b6e / 622a439. The harness imported at 369e21c pins the
-/// upstream spelling `SHODH_RECALL_READONLY`, and until this function existed nothing here read
-/// EITHER name, so every "read-only" eval query was mutating the store it measured. Both names
-/// are honoured; `VELD_` wins when both are set.
-///
-/// This is the single source of truth for the gate: every recall-path mutation site checks
-/// this function rather than re-deriving the env read. Known residual: `traverse_bidirectional`
-/// in `graph_memory.rs` strengthens the edges it walks and is reached from the multi-hop leg
-/// of `recall`; gating it needs a parameter on that function and that file is under another
-/// session's edit at the time of writing.
 /// The embedder id the corpus marker names, when it is an HTTP endpoint (`http(s)://…#model`).
 /// `None` for a local model id, an `unverified:` provenance, or no marker.
 fn marker_names_http(storage_path: &std::path::Path) -> Option<String> {
@@ -123,6 +107,22 @@ pub(crate) fn scoring_now() -> chrono::DateTime<chrono::Utc> {
         .unwrap_or_else(chrono::Utc::now)
 }
 
+/// `VELD_RECALL_READONLY=1` — recall performs NO usage writes: no access-count persistence,
+/// no co-retrieval edge reinforcement, no interference accumulation, no retrieval-counter
+/// bump. Set by the eval harness (`recall_harness::runner` pins it at startup): eval repeats
+/// measure variance, not learning curves, and a first-repeat usage write shifts later repeats'
+/// rankings. Production default (unset): writes on, unchanged.
+///
+/// Ported from shodh-memory 4ec3b6e / 622a439. The harness imported at 369e21c pins the
+/// upstream spelling `SHODH_RECALL_READONLY`, and until this function existed nothing here read
+/// EITHER name, so every "read-only" eval query was mutating the store it measured. Both names
+/// are honoured; `VELD_` wins when both are set.
+///
+/// This is the single source of truth for the gate: every recall-path mutation site checks
+/// this function rather than re-deriving the env read. Known residual: `traverse_bidirectional`
+/// in `graph_memory.rs` strengthens the edges it walks and is reached from the multi-hop leg
+/// of `recall`; gating it needs a parameter on that function and that file is under another
+/// session's edit at the time of writing.
 pub(crate) fn recall_readonly() -> bool {
     if RECALL_WRITES_FORCED.with(|f| f.get()) {
         return false;
@@ -332,6 +332,10 @@ pub struct MemorySystem {
 
     /// Memory statistics
     stats: Arc<RwLock<MemoryStats>>,
+
+    /// Long-term population and importance sum behind `stats().average_importance` and
+    /// the cached index coverage.
+    stored_totals: parking_lot::Mutex<StoredTotals>,
 
     /// Visualization logger
     logger: Arc<RwLock<MemoryLogger>>,
@@ -645,6 +649,95 @@ fn open_standalone_bm25(path: &std::path::Path, sealed: bool) -> Result<hybrid_s
     .context("Failed to open BM25 index for hybrid search")
 }
 
+/// Whether two versions of a memory index differently in BM25, which reads
+/// content, tags and entities and nothing else.
+fn bm25_text_differs(before: &Memory, after: &Memory) -> bool {
+    before.experience.content != after.experience.content
+        || before.experience.tags != after.experience.tags
+        || before.experience.entities != after.experience.entities
+}
+
+/// The long-term store's population (records not forgotten) and their importance sum,
+/// kept current by the write paths so `stats()` and the health probes read it without a
+/// scan. Seeded from the store at open and re-based on a full read by
+/// [`MemorySystem::reconcile_stored_totals`].
+#[derive(Debug, Default)]
+struct StoredTotals {
+    count: usize,
+    importance_sum: f64,
+    /// Deltas noted since a reconciliation began reading the store, added on top of what
+    /// the read returns. Writers are not held off for the read, so a write whose storage
+    /// change the read already saw and whose note lands after it began counts twice until
+    /// the next reconciliation; that window is the gap between a store call and its note.
+    since_reconcile_began: Option<(i64, f64)>,
+}
+
+impl StoredTotals {
+    fn apply(&mut self, count_delta: i64, importance_delta: f64) {
+        self.count = (self.count as i64 + count_delta).max(0) as usize;
+        self.importance_sum = (self.importance_sum + importance_delta).max(0.0);
+        if let Some((count, importance)) = self.since_reconcile_began.as_mut() {
+            *count += count_delta;
+            *importance += importance_delta;
+        }
+    }
+
+    fn average_importance(&self) -> f32 {
+        if self.count == 0 {
+            0.0
+        } else {
+            (self.importance_sum / self.count as f64) as f32
+        }
+    }
+}
+
+/// A content embedding computed before the per-user write lock is taken, valid only for
+/// the content it was computed from.
+struct PrecomputedEmbedding {
+    content_hash: [u8; 32],
+    outcome: std::result::Result<Vec<f32>, String>,
+}
+
+impl PrecomputedEmbedding {
+    /// The precomputed outcome when `content` is what it was computed from.
+    fn for_content(&self, content: &str) -> Option<&std::result::Result<Vec<f32>, String>> {
+        (MemorySystem::sha256_hash(content) == self.content_hash).then_some(&self.outcome)
+    }
+}
+
+/// Byte prefixes of the 16-byte UUID keys whose hex form starts with `hex_prefix`
+/// (hyphens ignored, case-insensitive). An odd digit count fixes only the high nibble of
+/// the last byte, so it expands to the 16 byte values that share it. `None` when no UUID
+/// can match: a non-hex character, or more than 32 digits.
+fn uuid_key_prefixes(hex_prefix: &str) -> Option<Vec<Vec<u8>>> {
+    let digits: Vec<u8> = hex_prefix
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_digit(16).map(|d| d as u8))
+        .collect::<Option<Vec<u8>>>()?;
+    if digits.len() > 32 {
+        return None;
+    }
+    let whole: Vec<u8> = digits
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[high, low]| (high << 4) | low)
+        .collect();
+    Some(if digits.len() % 2 == 1 {
+        let high = digits[digits.len() - 1] << 4;
+        (0..16u8)
+            .map(|low| {
+                let mut prefix = whole.clone();
+                prefix.push(high | low);
+                prefix
+            })
+            .collect()
+    } else {
+        vec![whole]
+    })
+}
+
 /// Provenance an upsert caller declares, as `remember` accepts it. On update, `None` means
 /// "leave the stored value", never "clear it".
 #[derive(Debug, Clone, Default)]
@@ -722,6 +815,31 @@ impl RememberOutcome {
     pub fn needs_graph_rebuild(&self) -> bool {
         self.deduped && !(self.delta.entities_added.is_empty() && self.delta.tags_added.is_empty())
     }
+}
+
+/// Who keeps the BM25 index in step with a write.
+///
+/// In server mode the index is shared with the intent log's
+/// [`Bm25Projection`], so a write the caller journals afterwards must not also
+/// be indexed here: that indexed every document twice and committed (an
+/// fsync) per write, defeating the projection's batching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bm25Sync {
+    /// No intent-log frame follows: index directly and commit.
+    Direct,
+    /// The caller journals a `Remember` / `Update` / `Forget` for the write,
+    /// and the projection indexes it.
+    Journaled,
+}
+
+/// What [`MemorySystem::embed_and_index_journaled`] did beyond indexing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmbedIndexOutcome {
+    /// Set when the write gate found a near-identical memory and deleted the
+    /// one being indexed from the store; holds the memory it was absorbed
+    /// into. A journaled caller owes the intent log a `Forget` for the
+    /// deleted id.
+    pub absorbed_by: Option<String>,
 }
 
 impl MemorySystem {
@@ -843,6 +961,8 @@ impl MemorySystem {
         let storage_path = config.storage_path.clone();
 
         // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine.
+        // The models themselves come from `embeddings::shared`, one instance per spec for the
+        // whole process, so a tenant open after the first loads nothing and probes nothing.
         //
         // PRIMARY embedder, in order:
         //   1. `VELD_EMBEDDER` when set: `nomic` | `minilm` | `http` | an `http(s)://` URL
@@ -859,7 +979,8 @@ impl MemorySystem {
         //      box with no model files ended up: on the binary built 2026-08-29 that meant
         //      silently non-semantic vectors; on the current code, a refusal to boot.
         let primary: Arc<dyn crate::embeddings::Embedder> = {
-            use crate::embeddings::{http_embedder, minilm, nomic, PrimaryEmbedderInfo};
+            use crate::embeddings::shared::{self, EmbedderSpec};
+            use crate::embeddings::{http_embedder, PrimaryEmbedderInfo};
 
             let record =
                 |e: &dyn crate::embeddings::Embedder, kind: &'static str, reason: String| {
@@ -873,45 +994,37 @@ impl MemorySystem {
                 };
 
             let nomic_onnx = |reason: &str| -> Result<Arc<dyn crate::embeddings::Embedder>> {
-                let n = nomic::NomicEmbedder::new(nomic::NomicConfig::from_env())?;
-                if n.is_simplified() {
-                    anyhow::bail!("Nomic ONNX available only in simplified (hash) mode");
-                }
+                let n = shared::embedder_for(&EmbedderSpec::nomic_from_env())?;
                 tracing::info!(
                     "Primary embedder: Nomic-embed-text-v1.5 ONNX ({}d) — {reason}",
                     n.dimension()
                 );
-                record(&n, "nomic-onnx", reason.to_string());
-                Ok(Arc::new(n))
+                record(n.as_ref(), "nomic-onnx", reason.to_string());
+                Ok(n)
             };
             let minilm_onnx = |reason: &str| -> Result<Arc<dyn crate::embeddings::Embedder>> {
-                let m = minilm::MiniLMEmbedder::new(minilm::EmbeddingConfig::default())
+                let m = shared::embedder_for(&EmbedderSpec::minilm_from_env())
                     .context("Failed to initialize MiniLM embedder (ONNX model)")?;
                 tracing::info!(
                     "Primary embedder: MiniLM ONNX ({}d) — {reason}",
                     m.dimension()
                 );
-                record(&m, "minilm-onnx", reason.to_string());
-                Ok(Arc::new(m))
+                record(m.as_ref(), "minilm-onnx", reason.to_string());
+                Ok(m)
             };
             let http = |cfg: http_embedder::HttpEmbedderConfig,
                         reason: &str|
              -> Result<Arc<dyn crate::embeddings::Embedder>> {
-                let e = http_embedder::HttpEmbedder::new(cfg);
-                let dim = e.probe().with_context(|| {
-                    format!(
-                        "HTTP embedder {} ({}) failed its probe",
-                        e.base_url(),
-                        e.model_id()
-                    )
+                let (base_url, model) = (cfg.base_url.clone(), cfg.model.clone());
+                let e = shared::embedder_for(&EmbedderSpec::Http(cfg)).with_context(|| {
+                    format!("HTTP embedder {base_url} ({model}) failed its probe")
                 })?;
                 tracing::info!(
-                    "Primary embedder: HTTP {} at {} ({dim}d) — {reason}",
-                    e.model_id(),
-                    e.base_url()
+                    "Primary embedder: HTTP {model} at {base_url} ({}d) — {reason}",
+                    e.dimension()
                 );
-                record(&e, "http", reason.to_string());
-                Ok(Arc::new(e))
+                record(e.as_ref(), "http", reason.to_string());
+                Ok(e)
             };
 
             let explicit = std::env::var("VELD_EMBEDDER")
@@ -995,9 +1108,11 @@ impl MemorySystem {
         // competitive retrieval. The local Nomic ONNX model is the PRIMARY now,
         // so it is not re-used here — the secondary slot is for HTTP / Zenoh peers.
         let secondary: Option<Arc<dyn crate::embeddings::Embedder>> = {
-            // HTTP-backed embedder via any declared host (see crate::llm_hosts)
-            let http_config = crate::embeddings::http_embedder::HttpEmbedderConfig::from_env();
-            let http_embedder = crate::embeddings::http_embedder::HttpEmbedder::new(http_config);
+            // HTTP-backed embedder via any declared host (see crate::llm_hosts). Shared, so its
+            // cached availability answer is too: a tenant open does not re-ask the endpoint.
+            let http_embedder = crate::embeddings::shared::http_embedder(
+                &crate::embeddings::http_embedder::HttpEmbedderConfig::from_env(),
+            );
             // The same endpoint and model as the primary is not a second opinion.
             if http_embedder.id() != primary.id() && http_embedder.is_available() {
                 tracing::info!(
@@ -1005,7 +1120,7 @@ impl MemorySystem {
                     std::env::var("VELD_EMBEDDING_API_URL")
                         .unwrap_or_else(|_| "http://127.0.0.1:1234".into())
                 );
-                Some(Arc::new(http_embedder))
+                Some(http_embedder)
             } else {
                 None
             }
@@ -1219,8 +1334,13 @@ impl MemorySystem {
         let logger = Arc::new(RwLock::new(MemoryLogger::new(false)));
 
         // Load stats from storage to recover state after restart
+        let storage_stats = primary_store.get_stats().unwrap_or_default();
+        let initial_totals = StoredTotals {
+            count: storage_stats.total_count,
+            importance_sum: f64::from(storage_stats.importance_sum),
+            since_reconcile_began: None,
+        };
         let initial_stats = {
-            let storage_stats = primary_store.get_stats().unwrap_or_default();
             let vector_count = retriever.len();
             MemoryStats {
                 total_memories: storage_stats.total_count,
@@ -1370,6 +1490,7 @@ impl MemorySystem {
             query_cache: moka::sync::Cache::builder().max_capacity(2_000).build(),
             content_cache: moka::sync::Cache::builder().max_capacity(2_000).build(),
             stats: Arc::new(RwLock::new(initial_stats)),
+            stored_totals: parking_lot::Mutex::new(initial_totals),
             logger,
             consolidation_events, // Use the shared buffer created earlier
             // SHO-105: Memory replay manager
@@ -1663,7 +1784,21 @@ impl MemorySystem {
             created_at,
         ));
 
+        // An import may re-supply an id already stored; that replaces a record, it does not
+        // add one.
+        let replaced = self
+            .long_term_memory
+            .get_memory(&memory_id)
+            .ok()
+            .flatten()
+            .filter(|previous| !previous.is_forgotten());
         self.long_term_memory.store(&memory)?;
+        match replaced {
+            Some(previous) => {
+                self.note_importance_change(previous.importance(), memory.importance())
+            }
+            None => self.note_stored(memory.importance()),
+        }
         self.logger.write().log_created(&memory, "import");
 
         self.working_memory
@@ -1696,7 +1831,18 @@ impl MemorySystem {
         experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RememberOutcome> {
-        self.remember_impl(experience, created_at, None, false)
+        self.remember_impl(experience, created_at, None, false, Bm25Sync::Direct)
+    }
+
+    /// [`Self::remember_detailed`] for a caller that journals the write: the
+    /// caller MUST journal an `IntentPayload::Remember` for the returned id,
+    /// whose BM25 projection indexes it. Nothing is written to BM25 here.
+    pub fn remember_detailed_journaled(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RememberOutcome> {
+        self.remember_impl(experience, created_at, None, false, Bm25Sync::Journaled)
     }
 
     /// Store a new memory WITHOUT embedding generation or vector indexing (fast path).
@@ -1722,7 +1868,25 @@ impl MemorySystem {
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         external_id: Option<String>,
     ) -> Result<RememberOutcome> {
-        self.remember_impl(experience, created_at, external_id, true)
+        self.remember_impl(experience, created_at, external_id, true, Bm25Sync::Direct)
+    }
+
+    /// [`Self::remember_deferred_detailed`] for a caller that journals the
+    /// write: the caller MUST journal an `IntentPayload::Remember` for the
+    /// returned id, whose BM25 projection indexes it.
+    pub fn remember_deferred_detailed_journaled(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        external_id: Option<String>,
+    ) -> Result<RememberOutcome> {
+        self.remember_impl(
+            experience,
+            created_at,
+            external_id,
+            true,
+            Bm25Sync::Journaled,
+        )
     }
 
     /// Internal implementation shared by `remember()` and `remember_deferred()`.
@@ -1737,6 +1901,7 @@ impl MemorySystem {
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         external_id: Option<String>,
         defer_embedding: bool,
+        bm25: Bm25Sync,
     ) -> Result<RememberOutcome> {
         // C1: serialize the per-user write path. Every writer (HTTP ingest,
         // WebSocket streaming, hooks) funnels through remember_impl, so holding
@@ -1757,7 +1922,7 @@ impl MemorySystem {
             .long_term_memory
             .get_by_content_hash(&experience.content)
         {
-            return self.merge_into_existing(existing_id, &experience);
+            return self.merge_into_existing(existing_id, &experience, bm25);
         }
 
         let memory_id = MemoryId(Uuid::new_v4());
@@ -1886,15 +2051,7 @@ impl MemorySystem {
         // entity embedding for concept-level dedup. Doing it here too would cause
         // double entity inserts and inflated mention_counts.
 
-        // Index in BM25 for hybrid search (keyword + semantic)
-        if let Err(e) = self.hybrid_search.index_memory(
-            &memory.id,
-            &memory.experience.content,
-            &memory.experience.tags,
-            &memory.experience.entities,
-        ) {
-            tracing::warn!("Failed to index memory {} in BM25: {}", memory.id.0, e);
-        }
+        self.bm25_index_direct(&memory, bm25);
 
         // PIPE-2: Register memory for pattern-triggered replay
         // Tracks entity co-occurrence, salience spikes, and temporal clusters
@@ -1947,30 +2104,6 @@ impl MemorySystem {
             }
         }
 
-        // TEMPORAL FACT EXTRACTION: Extract and index temporal facts for multi-hop reasoning
-        // Key insight: Multi-hop temporal queries like "When is X planning Y?" require:
-        // 1. Finding the FIRST/PLANNING mention, not any mention
-        // 2. Resolving relative dates ("next month", "last Saturday") to absolute dates
-        // This enables accurate answers to temporal questions in LoCoMo benchmark
-        if !memory.experience.entities.is_empty() {
-            let facts = temporal_facts::extract_temporal_facts(
-                &memory.experience.content,
-                &memory.id,
-                memory.created_at,
-                &memory.experience.entities,
-            );
-            if !facts.is_empty() {
-                // Note: We don't have user_id in remember(), will need to pass it
-                // For now, extract facts but don't store - storage happens at handler level
-                // or we can use a placeholder user_id
-                tracing::debug!(
-                    "Extracted {} temporal facts from memory {}",
-                    facts.len(),
-                    memory.id.0
-                );
-            }
-        }
-
         // SHO-106: Check for interference with existing memories
         // Find similar memories and apply retroactive/proactive interference.
         // Skipped when defer_embedding=true — embed_and_index() runs this later.
@@ -2015,11 +2148,18 @@ impl MemorySystem {
                                     if let Ok(old_memory) =
                                         self.long_term_memory.get(&MemoryId(old_uuid))
                                     {
+                                        let before = old_memory.importance();
                                         old_memory.decay_importance(*decay_amount);
-                                        if let Err(e) = self.long_term_memory.update(&old_memory) {
-                                            tracing::debug!(
+                                        match self.long_term_memory.update(&old_memory) {
+                                            Ok(()) if !old_memory.is_forgotten() => self
+                                                .note_importance_change(
+                                                    before,
+                                                    old_memory.importance(),
+                                                ),
+                                            Ok(()) => {}
+                                            Err(e) => tracing::debug!(
                                                 "Failed to persist retroactive decay: {e}"
-                                            );
+                                            ),
                                         }
                                     }
                                 } else {
@@ -2113,22 +2253,60 @@ impl MemorySystem {
                 stats.vector_index_count += 1;
             }
         }
+        self.note_stored(memory.importance());
 
-        // Trigger background consolidation if needed
+        // Tier promotion only: compression reads the store and runs from maintenance.
         self.consolidate_if_needed()?;
 
-        // Commit and reload BM25 index changes (makes documents searchable immediately)
-        // Note: This is done per-memory for immediate searchability.
-        // For high-throughput scenarios, consider batching commits.
-        if let Err(e) = self.hybrid_search.commit_and_reload() {
-            tracing::warn!("Failed to commit/reload BM25 index: {}", e);
-        }
+        self.bm25_commit_direct(bm25);
 
         // Signal that fact extraction should run on next maintenance cycle
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         Ok(RememberOutcome::created(memory_id))
+    }
+
+    /// Index `memory` in BM25 unless the write is journaled, in which case the
+    /// intent log's BM25 projection indexes it from the journaled snapshot.
+    fn bm25_index_direct(&self, memory: &Memory, bm25: Bm25Sync) {
+        if bm25 == Bm25Sync::Journaled {
+            return;
+        }
+        if let Err(e) = self.hybrid_search.index_memory(
+            &memory.id,
+            &memory.experience.content,
+            &memory.experience.tags,
+            &memory.experience.entities,
+        ) {
+            tracing::warn!("Failed to index memory {} in BM25: {}", memory.id.0, e);
+        }
+    }
+
+    /// Remove `memory_id` from BM25 unless the caller journals a `Forget` for it.
+    fn bm25_remove_direct(&self, memory_id: &MemoryId, bm25: Bm25Sync) {
+        if bm25 == Bm25Sync::Journaled {
+            return;
+        }
+        if let Err(e) = self.hybrid_search.remove_memory(memory_id) {
+            tracing::warn!(
+                memory_id = %memory_id.0,
+                error = %e,
+                "Failed to remove memory from BM25 index"
+            );
+        }
+    }
+
+    /// Commit direct BM25 writes so they are searchable at once. A journaled
+    /// write leaves committing to the projection's batch and to the
+    /// `commit_pending` a search runs first.
+    fn bm25_commit_direct(&self, bm25: Bm25Sync) {
+        if bm25 == Bm25Sync::Journaled {
+            return;
+        }
+        if let Err(e) = self.hybrid_search.commit_and_reload() {
+            tracing::warn!("Failed to commit/reload BM25 index: {}", e);
+        }
     }
 
     /// Folds a content-identical duplicate's enrichment into the stored memory.
@@ -2144,6 +2322,7 @@ impl MemorySystem {
         &self,
         existing_id: MemoryId,
         incoming: &Experience,
+        bm25: Bm25Sync,
     ) -> Result<RememberOutcome> {
         let mut existing = match self.long_term_memory.get(&existing_id) {
             Ok(memory) => memory,
@@ -2169,27 +2348,19 @@ impl MemorySystem {
             return Ok(RememberOutcome::deduped(existing_id, delta, None));
         }
 
+        let before = existing.importance();
         let enriched = self.calculate_importance(&existing.experience);
-        if enriched > existing.importance() {
+        if enriched > before {
             existing.set_importance(enriched);
         }
         self.long_term_memory.update(&existing)?;
+        if !existing.is_forgotten() {
+            self.note_importance_change(before, existing.importance());
+        }
 
         if !delta.entities_added.is_empty() || !delta.tags_added.is_empty() {
-            if let Err(e) = self.hybrid_search.index_memory(
-                &existing_id,
-                &existing.experience.content,
-                &existing.experience.tags,
-                &existing.experience.entities,
-            ) {
-                tracing::warn!(
-                    "Failed to reindex merged memory {} in BM25: {e}",
-                    existing_id.0
-                );
-            }
-            if let Err(e) = self.hybrid_search.commit_and_reload() {
-                tracing::warn!("Failed to commit/reload BM25 index after merge: {e}");
-            }
+            self.bm25_index_direct(&existing, bm25);
+            self.bm25_commit_direct(bm25);
         }
 
         let shared = Arc::new(existing.clone());
@@ -2330,6 +2501,24 @@ impl MemorySystem {
     /// Safe to call from a background thread (e.g. `tokio::task::spawn_blocking`).
     /// All errors are non-fatal — the memory remains searchable via BM25 regardless.
     pub fn embed_and_index(&self, memory_id: &MemoryId) -> Result<()> {
+        self.embed_and_index_with(memory_id, Bm25Sync::Direct)
+            .map(|_| ())
+    }
+
+    /// [`Self::embed_and_index`] for a caller that journals: when the write
+    /// gate absorbs the memory into an existing one, the memory is deleted
+    /// from the store and the caller MUST journal an `IntentPayload::Forget`
+    /// for it (reported in [`EmbedIndexOutcome::absorbed_by`]); the BM25
+    /// projection removes it from the keyword index.
+    pub fn embed_and_index_journaled(&self, memory_id: &MemoryId) -> Result<EmbedIndexOutcome> {
+        self.embed_and_index_with(memory_id, Bm25Sync::Journaled)
+    }
+
+    fn embed_and_index_with(
+        &self,
+        memory_id: &MemoryId,
+        bm25: Bm25Sync,
+    ) -> Result<EmbedIndexOutcome> {
         let _span = tracing::info_span!("embed_and_index", memory_id = %memory_id.0).entered();
         let start = std::time::Instant::now();
 
@@ -2375,7 +2564,7 @@ impl MemorySystem {
                             );
                         }
                         // Non-fatal: memory is still searchable via BM25
-                        return Ok(());
+                        return Ok(EmbedIndexOutcome::default());
                     }
                 }
             }
@@ -2485,15 +2674,27 @@ impl MemorySystem {
                                     if let Ok(existing) =
                                         self.long_term_memory.get(&MemoryId(best_uuid))
                                     {
+                                        let before = existing.importance();
                                         existing.boost_importance(
                                             crate::constants::WRITE_GATE_ABSORPTION_BOOST,
                                         );
-                                        let _ = self.long_term_memory.update(&existing);
+                                        if self.long_term_memory.update(&existing).is_ok()
+                                            && !existing.is_forgotten()
+                                        {
+                                            self.note_importance_change(
+                                                before,
+                                                existing.importance(),
+                                            );
+                                        }
                                     }
                                 }
                                 // Remove the redundant new memory
-                                let _ = self.long_term_memory.delete(memory_id);
+                                if self.long_term_memory.delete(memory_id).is_ok() {
+                                    self.note_removed(memory_arc.importance());
+                                }
                                 self.retriever.remove_memory(memory_id);
+                                self.bm25_remove_direct(memory_id, bm25);
+                                self.bm25_commit_direct(bm25);
                                 self.record_consolidation_event(
                                     ConsolidationEvent::MemoryWeakened {
                                         memory_id: memory_id.0.to_string(),
@@ -2520,7 +2721,9 @@ impl MemorySystem {
                                 let elapsed = start.elapsed();
                                 crate::metrics::EMBED_BACKGROUND_DURATION
                                     .observe(elapsed.as_secs_f64());
-                                return Ok(());
+                                return Ok(EmbedIndexOutcome {
+                                    absorbed_by: Some(best_id.clone()),
+                                });
                             }
                         }
                     }
@@ -2542,15 +2745,26 @@ impl MemorySystem {
                                 if let Ok(old_memory) =
                                     self.long_term_memory.get(&MemoryId(old_uuid))
                                 {
+                                    let before = old_memory.importance();
                                     old_memory.decay_importance(*decay_amount);
-                                    let _ = self.long_term_memory.update(&old_memory);
+                                    if self.long_term_memory.update(&old_memory).is_ok()
+                                        && !old_memory.is_forgotten()
+                                    {
+                                        self.note_importance_change(
+                                            before,
+                                            old_memory.importance(),
+                                        );
+                                    }
                                 }
                             }
                         }
 
                         if interference_result.proactive_decay > 0.0 {
+                            let before = memory_arc.importance();
                             memory_arc.decay_importance(interference_result.proactive_decay);
-                            let _ = self.long_term_memory.update(&memory_arc);
+                            if self.long_term_memory.update(&memory_arc).is_ok() {
+                                self.note_importance_change(before, memory_arc.importance());
+                            }
                         }
 
                         for event in &interference_result.events {
@@ -2562,8 +2776,11 @@ impl MemorySystem {
                                 memory_id = %memory_arc.id.0,
                                 "Near-duplicate detected (>=0.95 cosine), suppressing importance"
                             );
+                            let before = memory_arc.importance();
                             memory_arc.decay_importance(0.99);
-                            let _ = self.long_term_memory.update(&memory_arc);
+                            if self.long_term_memory.update(&memory_arc).is_ok() {
+                                self.note_importance_change(before, memory_arc.importance());
+                            }
                         }
 
                         {
@@ -2594,7 +2811,7 @@ impl MemorySystem {
         );
         crate::metrics::EMBED_BACKGROUND_DURATION.observe(elapsed.as_secs_f64());
 
-        Ok(())
+        Ok(EmbedIndexOutcome::default())
     }
 
     /// Remember with agent context for multi-agent systems
@@ -2620,7 +2837,15 @@ impl MemorySystem {
         agent_id: Option<String>,
         run_id: Option<String>,
     ) -> Result<RememberOutcome> {
-        self.remember_with_agent_impl(experience, created_at, agent_id, run_id, None, false)
+        self.remember_with_agent_impl(
+            experience,
+            created_at,
+            agent_id,
+            run_id,
+            None,
+            false,
+            Bm25Sync::Direct,
+        )
     }
 
     /// Fast-path variant of `remember_with_agent` — skips content embedding,
@@ -2652,9 +2877,41 @@ impl MemorySystem {
         run_id: Option<String>,
         external_id: Option<String>,
     ) -> Result<RememberOutcome> {
-        self.remember_with_agent_impl(experience, created_at, agent_id, run_id, external_id, true)
+        self.remember_with_agent_impl(
+            experience,
+            created_at,
+            agent_id,
+            run_id,
+            external_id,
+            true,
+            Bm25Sync::Direct,
+        )
     }
 
+    /// [`Self::remember_with_agent_deferred_detailed`] for a caller that
+    /// journals the write: the caller MUST journal an
+    /// `IntentPayload::Remember` for the returned id, whose BM25 projection
+    /// indexes it.
+    pub fn remember_with_agent_deferred_detailed_journaled(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<String>,
+        run_id: Option<String>,
+        external_id: Option<String>,
+    ) -> Result<RememberOutcome> {
+        self.remember_with_agent_impl(
+            experience,
+            created_at,
+            agent_id,
+            run_id,
+            external_id,
+            true,
+            Bm25Sync::Journaled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn remember_with_agent_impl(
         &self,
         mut experience: Experience,
@@ -2663,6 +2920,7 @@ impl MemorySystem {
         run_id: Option<String>,
         external_id: Option<String>,
         defer_embedding: bool,
+        bm25: Bm25Sync,
     ) -> Result<RememberOutcome> {
         // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
         experience.migrate_robotics_to_facets();
@@ -2673,7 +2931,7 @@ impl MemorySystem {
             .long_term_memory
             .get_by_content_hash(&experience.content)
         {
-            return self.merge_into_existing(existing_id, &experience);
+            return self.merge_into_existing(existing_id, &experience, bm25);
         }
 
         let memory_id = MemoryId(Uuid::new_v4());
@@ -2937,15 +3195,7 @@ impl MemorySystem {
             }
         }
 
-        // Index in BM25 for hybrid search
-        if let Err(e) = self.hybrid_search.index_memory(
-            &memory.id,
-            &memory.experience.content,
-            &memory.experience.tags,
-            &memory.experience.entities,
-        ) {
-            tracing::warn!("Failed to index memory {} in BM25: {}", memory.id.0, e);
-        }
+        self.bm25_index_direct(&memory, bm25);
 
         // If important enough, add to session memory
         if importance > self.config.importance_threshold {
@@ -2961,13 +3211,11 @@ impl MemorySystem {
             stats.long_term_memory_count += 1;
             stats.working_memory_count += 1;
         }
+        self.note_stored(memory.importance());
 
         self.consolidate_if_needed()?;
 
-        // Commit and reload BM25 index changes
-        if let Err(e) = self.hybrid_search.commit_and_reload() {
-            tracing::warn!("Failed to commit/reload BM25 index: {}", e);
-        }
+        self.bm25_commit_direct(bm25);
 
         // Signal that fact extraction should run on next maintenance cycle
         self.fact_extraction_needed
@@ -3245,7 +3493,7 @@ impl MemorySystem {
     ) -> Result<(usize, Vec<MemoryId>)> {
         use std::collections::HashSet;
         let before: HashSet<MemoryId> = self.long_term_memory.get_all_ids()?.into_iter().collect();
-        let count = self.forget(criteria)?;
+        let count = self.forget_with(criteria, Bm25Sync::Journaled)?;
         let after: HashSet<MemoryId> = self.long_term_memory.get_all_ids()?.into_iter().collect();
         let removed: Vec<MemoryId> = before.difference(&after).cloned().collect();
         Ok((count, removed))
@@ -3254,6 +3502,18 @@ impl MemorySystem {
     /// Forget memories based on criteria
     /// Thread-safe: uses interior mutability for all internal state
     pub fn forget(&self, criteria: ForgetCriteria) -> Result<usize> {
+        self.forget_with(criteria, Bm25Sync::Direct)
+    }
+
+    /// [`Self::forget`] for a caller that journals an `IntentPayload::Forget`
+    /// for every memory hard-deleted from the store (for `ById`, the id
+    /// itself); the BM25 projection removes those. Soft forgets, which only
+    /// flag a record and are not journaled, are still removed from BM25 here.
+    pub fn forget_journaled(&self, criteria: ForgetCriteria) -> Result<usize> {
+        self.forget_with(criteria, Bm25Sync::Journaled)
+    }
+
+    fn forget_with(&self, criteria: ForgetCriteria, bm25: Bm25Sync) -> Result<usize> {
         let forgotten_count = match criteria {
             ForgetCriteria::ById(memory_id) => {
                 // Delete a single memory by ID from all tiers, tracking which tiers had it
@@ -3275,9 +3535,13 @@ impl MemorySystem {
                 }
 
                 // Remove from long-term storage
+                let stored = self.long_term_memory.get_memory(&memory_id).ok().flatten();
                 if self.long_term_memory.delete(&memory_id).is_ok() {
                     deleted_from_any = true;
                     was_in_longterm = true;
+                    if let Some(stored) = stored.filter(|m| !m.is_forgotten()) {
+                        self.note_removed(stored.importance());
+                    }
                 }
 
                 // Remove from vector index (soft delete) - CRITICAL for semantic search
@@ -3309,14 +3573,7 @@ impl MemorySystem {
                     }
                 }
 
-                // Clean up BM25 keyword index
-                if let Err(e) = self.hybrid_search.remove_memory(&memory_id) {
-                    tracing::warn!(
-                        memory_id = %memory_id.0,
-                        error = %e,
-                        "Failed to clean BM25 index for deleted memory"
-                    );
-                }
+                self.bm25_remove_direct(&memory_id, bm25);
 
                 // Clean up interference records
                 self.cleanup_interference_for_ids(std::slice::from_ref(&memory_id));
@@ -3355,11 +3612,18 @@ impl MemorySystem {
                 // Mark as forgotten in long-term (don't delete, just flag)
                 let flagged_ids = self.long_term_memory.mark_forgotten_by_age(cutoff)?;
                 let lt_flagged = flagged_ids.len();
+                // The flagging pass reports ids, not the importance it took out of the
+                // population; this bulk path already reads the whole store, so re-read it.
+                if lt_flagged > 0 {
+                    self.reconcile_stored_totals_from_storage();
+                }
 
-                // Clean up secondary indices for soft-forgotten memories
+                // Clean up secondary indices for soft-forgotten memories. A flag
+                // keeps the store key, so no Forget is journaled for it and BM25
+                // is cleaned here whatever the caller journals.
                 for id in &flagged_ids {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, Bm25Sync::Direct);
                 }
                 self.cleanup_graph_for_ids(&flagged_ids);
                 self.cleanup_interference_for_ids(&flagged_ids);
@@ -3394,11 +3658,16 @@ impl MemorySystem {
                     .long_term_memory
                     .mark_forgotten_by_importance(threshold)?;
                 let lt_flagged = flagged_ids.len();
+                if lt_flagged > 0 {
+                    self.reconcile_stored_totals_from_storage();
+                }
 
-                // Clean up secondary indices for soft-forgotten memories
+                // Clean up secondary indices for soft-forgotten memories. A flag
+                // keeps the store key, so no Forget is journaled for it and BM25
+                // is cleaned here whatever the caller journals.
                 for id in &flagged_ids {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, Bm25Sync::Direct);
                 }
                 self.cleanup_graph_for_ids(&flagged_ids);
                 self.cleanup_interference_for_ids(&flagged_ids);
@@ -3422,51 +3691,102 @@ impl MemorySystem {
             }
             ForgetCriteria::Pattern(pattern) => {
                 // Remove memories matching pattern
-                self.forget_by_pattern(&pattern)?
+                self.forget_by_pattern(&pattern, bm25)?
             }
             ForgetCriteria::ByTags(tags) => {
                 // Remove memories matching ANY of the specified tags
-                self.forget_by_tags(&tags)?
+                self.forget_by_tags_with(&tags, bm25)?
             }
             ForgetCriteria::ByDateRange { start, end } => {
                 // Remove memories within the date range
-                self.forget_by_date_range(start, end)?
+                self.forget_by_date_range(start, end, bm25)?
             }
             ForgetCriteria::ByType(exp_type) => {
                 // Remove memories of a specific type
-                self.forget_by_type(exp_type)?
+                self.forget_by_type(exp_type, bm25)?
             }
             ForgetCriteria::All => {
                 // GDPR: Clear ALL memories for the user
-                self.forget_all()?
+                self.forget_all(bm25)?
             }
         };
 
         // Commit BM25 changes after any deletion to make removals visible
         if forgotten_count > 0 {
-            if let Err(e) = self.hybrid_search.commit_and_reload() {
-                tracing::warn!(error = %e, "Failed to commit BM25 after forget");
-            }
+            self.bm25_commit_direct(bm25);
         }
 
         Ok(forgotten_count)
     }
 
-    /// Get memory statistics
+    /// Get memory statistics.
     ///
-    /// Returns current stats with fresh average_importance calculated from storage.
-    /// Most counters are cached in-memory for performance, but importance is
-    /// recalculated to ensure accuracy after memory modifications.
+    /// Every counter is held in memory; nothing here reads the store. `average_importance`
+    /// follows the importance changes the write paths note, and is re-based on the stored
+    /// records by each heavy maintenance cycle and by [`Self::get_storage_stats`].
     pub fn stats(&self) -> MemoryStats {
         let mut stats = self.stats.read().clone();
-
-        // Recalculate average_importance from storage for accuracy
-        // This ensures importance reflects current memory state after adds/deletes
-        if let Ok(storage_stats) = self.long_term_memory.get_stats() {
-            stats.average_importance = storage_stats.average_importance;
-        }
-
+        stats.average_importance = self.stored_totals.lock().average_importance();
         stats
+    }
+
+    /// Records in the long-term store that are not forgotten, as last noted.
+    pub fn stored_count(&self) -> usize {
+        self.stored_totals.lock().count
+    }
+
+    fn note_stored(&self, importance: f32) {
+        self.stored_totals.lock().apply(1, f64::from(importance));
+    }
+
+    fn note_removed(&self, importance: f32) {
+        self.stored_totals.lock().apply(-1, -f64::from(importance));
+    }
+
+    fn note_importance_change(&self, before: f32, after: f32) {
+        if before != after {
+            self.stored_totals
+                .lock()
+                .apply(0, f64::from(after) - f64::from(before));
+        }
+    }
+
+    /// Re-base the stored totals on a full read of the store. `read` produces
+    /// (records not forgotten, importance sum); writes noted while it runs are carried
+    /// over. `read` always runs; its result is not applied when another reconciliation
+    /// was already reading.
+    fn reconcile_stored_totals(&self, read: impl FnOnce() -> Option<(usize, f64)>) {
+        let began = {
+            let mut totals = self.stored_totals.lock();
+            let idle = totals.since_reconcile_began.is_none();
+            if idle {
+                totals.since_reconcile_began = Some((0, 0.0));
+            }
+            idle
+        };
+        let observed = read();
+        if !began {
+            return;
+        }
+        let mut totals = self.stored_totals.lock();
+        let Some((count_delta, importance_delta)) = totals.since_reconcile_began.take() else {
+            return;
+        };
+        if let Some((count, importance_sum)) = observed {
+            totals.count = (count as i64 + count_delta).max(0) as usize;
+            totals.importance_sum = (importance_sum + importance_delta).max(0.0);
+        }
+    }
+
+    /// Re-base the stored totals on the store's own full scan.
+    fn reconcile_stored_totals_from_storage(&self) {
+        self.reconcile_stored_totals(|| match self.long_term_memory.get_stats() {
+            Ok(s) => Some((s.total_count, f64::from(s.importance_sum))),
+            Err(e) => {
+                tracing::warn!("stored totals not reconciled: {e}");
+                None
+            }
+        });
     }
 
     /// Export visualization graph as DOT format for Graphviz
@@ -3571,35 +3891,83 @@ impl MemorySystem {
     /// Searches working → session → long-term memory with deduplication.
     /// Returns `Err` for ambiguous prefixes (multiple matches).
     pub fn find_memory_by_prefix(&self, id_prefix: &str) -> Result<Option<SharedMemory>> {
-        // Fast path: try full UUID first via direct lookup
         if let Ok(uuid) = uuid::Uuid::parse_str(id_prefix) {
             let target_id = MemoryId(uuid);
-            let all = self.get_all_memories()?;
-            return Ok(all.into_iter().find(|m| m.id == target_id));
+            if let Some(memory) = self.cached_tier_copy(&target_id) {
+                return Ok(Some(memory));
+            }
+            return Ok(self.live_long_term(&target_id).map(Arc::new));
         }
 
-        // Prefix search across all tiers
-        let prefix_lower = id_prefix.to_lowercase();
-        let all_memories = self.get_all_memories()?;
-        let matches: Vec<SharedMemory> = all_memories
-            .into_iter()
-            .filter(|m| {
-                m.id.0
-                    .to_string()
-                    .replace('-', "")
-                    .to_lowercase()
-                    .starts_with(&prefix_lower)
-            })
-            .collect();
+        let Some(key_prefixes) = uuid_key_prefixes(id_prefix) else {
+            return Ok(None);
+        };
+        let hex_prefix: String = id_prefix
+            .chars()
+            .filter(|c| *c != '-')
+            .collect::<String>()
+            .to_lowercase();
+        let id_matches = |id: &MemoryId| id.0.simple().to_string().starts_with(&hex_prefix);
+
+        let mut matches: Vec<SharedMemory> = Vec::new();
+        let mut seen: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
+        let tiers = [
+            self.working_memory.read().all_memories(),
+            self.session_memory.read().all_memories(),
+        ];
+        for tier_memories in tiers {
+            for memory in tier_memories {
+                if id_matches(&memory.id) && seen.insert(memory.id.clone()) {
+                    matches.push(memory);
+                }
+            }
+        }
+
+        // Keys only, over the byte range the prefix pins; only the hits are decoded.
+        for key_prefix in &key_prefixes {
+            for key in self.long_term_memory.scan_prefix_keys(key_prefix)? {
+                let Ok(uuid) = uuid::Uuid::from_slice(&key) else {
+                    continue;
+                };
+                let id = MemoryId(uuid);
+                if seen.contains(&id) {
+                    continue;
+                }
+                if let Some(memory) = self.live_long_term(&id) {
+                    seen.insert(id);
+                    matches.push(Arc::new(memory));
+                }
+            }
+        }
 
         match matches.len() {
             0 => Ok(None),
-            1 => Ok(Some(matches.into_iter().next().unwrap())),
+            1 => Ok(matches.pop()),
             n => Err(anyhow::anyhow!(
                 "Ambiguous memory ID prefix '{}': matches {} memories",
                 id_prefix,
                 n
             )),
+        }
+    }
+
+    /// The working or session copy of a memory, preferring working.
+    fn cached_tier_copy(&self, id: &MemoryId) -> Option<SharedMemory> {
+        if let Some(memory) = self.working_memory.read().get(id) {
+            return Some(memory);
+        }
+        self.session_memory.read().get(id)
+    }
+
+    /// A long-term record by point read, excluding forgotten ones. An unreadable record is
+    /// treated as absent, as the corpus scans treat it.
+    fn live_long_term(&self, id: &MemoryId) -> Option<Memory> {
+        match self.long_term_memory.get_memory(id) {
+            Ok(memory) => memory.filter(|m| !m.is_forgotten()),
+            Err(e) => {
+                tracing::warn!("memory {} could not be read: {e}", id.0);
+                None
+            }
         }
     }
 
@@ -3870,17 +4238,15 @@ impl MemorySystem {
     /// Tier promotion criteria:
     /// - Working → Session: importance >= 0.4 AND age >= 5 minutes
     /// - Session → LongTerm: importance >= 0.6 AND age >= 1 hour
+    ///
+    /// Touches only the in-memory tiers, so it is cheap enough for every remember.
+    /// Compression of old long-term records runs from heavy maintenance instead.
     fn consolidate_if_needed(&self) -> Result<()> {
         // Promote eligible memories from working to session (importance + time based)
         self.promote_working_to_session()?;
 
         // Promote eligible memories from session to long-term (importance + time based)
         self.promote_session_to_longterm()?;
-
-        // Compress old memories if auto-compress is enabled
-        if self.config.auto_compress {
-            self.compress_old_memories()?;
-        }
 
         Ok(())
     }
@@ -4118,7 +4484,8 @@ impl MemorySystem {
                 });
                 applied += 1;
             } else if let Ok(memory) = self.long_term_memory.get(&memory_id) {
-                let new_importance = (memory.importance() + boost.boost as f32).min(1.0);
+                let before = memory.importance();
+                let new_importance = (before + boost.boost as f32).min(1.0);
                 memory.set_importance(new_importance);
                 if let Err(e) = self.long_term_memory.store(&memory) {
                     tracing::debug!(
@@ -4127,6 +4494,9 @@ impl MemorySystem {
                         e
                     );
                     continue;
+                }
+                if !memory.is_forgotten() {
+                    self.note_importance_change(before, memory.importance());
                 }
                 self.record_consolidation_event(ConsolidationEvent::EdgePromotionBoostApplied {
                     memory_id: boost.memory_id.clone(),
@@ -4207,21 +4577,35 @@ impl MemorySystem {
         Ok(compensated)
     }
 
-    /// Compress old memories to save space
-    fn compress_old_memories(&self) -> Result<()> {
+    /// Compress long-term records older than `compression_age_days`.
+    ///
+    /// Each record is re-read and rewritten under the per-user write lock, so a writer
+    /// that changed it after the candidate scan is not overwritten with the stale copy;
+    /// the lock is released between records so remembers interleave with a long pass.
+    /// Returns the number of records compressed.
+    fn compress_old_memories(&self) -> Result<usize> {
         let cutoff =
             chrono::Utc::now() - chrono::Duration::days(self.config.compression_age_days as i64);
 
-        // Get uncompressed old memories
-        let to_compress = self.long_term_memory.get_uncompressed_older_than(cutoff)?;
+        let candidates = self.long_term_memory.get_uncompressed_older_than(cutoff)?;
 
-        for memory in to_compress {
+        let mut compressed_count = 0;
+        for candidate in candidates {
+            let _write_guard = self.write_lock.lock();
+            let Some(memory) = self.long_term_memory.get_memory(&candidate.id)? else {
+                continue;
+            };
+            if memory.compressed || memory.is_forgotten() || memory.created_at >= cutoff {
+                continue;
+            }
             let compressed = self.compressor.compress(&memory)?;
             self.long_term_memory.update(&compressed)?;
+            self.note_importance_change(memory.importance(), compressed.importance());
             self.stats.write().compressed_count += 1;
+            compressed_count += 1;
         }
 
-        Ok(())
+        Ok(compressed_count)
     }
 
     /// Check if a memory should be compressed
@@ -4336,7 +4720,7 @@ impl MemorySystem {
     /// Forget memories matching a pattern
     ///
     /// Uses validated regex compilation with ReDoS protection
-    fn forget_by_pattern(&self, pattern: &str) -> Result<usize> {
+    fn forget_by_pattern(&self, pattern: &str, bm25: Bm25Sync) -> Result<usize> {
         // Use validated pattern compilation with ReDoS protection
         let regex = crate::validation::validate_and_compile_pattern(pattern)
             .map_err(|e| anyhow::anyhow!("Invalid pattern: {e}"))?;
@@ -4361,7 +4745,7 @@ impl MemorySystem {
             for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, bm25);
                     working_removed += 1;
                     count += 1;
                 }
@@ -4384,7 +4768,7 @@ impl MemorySystem {
             for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, bm25);
                     session_removed += 1;
                     count += 1;
                 }
@@ -4398,8 +4782,9 @@ impl MemorySystem {
             if regex.is_match(&memory.experience.content) {
                 lt_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
-                let _ = self.hybrid_search.remove_memory(&memory.id);
+                self.bm25_remove_direct(&memory.id, bm25);
                 self.long_term_memory.delete(&memory.id)?;
+                self.note_removed(memory.importance());
                 long_term_removed += 1;
                 count += 1;
             }
@@ -4431,6 +4816,14 @@ impl MemorySystem {
 
     /// Forget memories matching ANY of the specified tags
     pub fn forget_by_tags(&self, tags: &[String]) -> Result<usize> {
+        let count = self.forget_by_tags_with(tags, Bm25Sync::Direct)?;
+        if count > 0 {
+            self.bm25_commit_direct(Bm25Sync::Direct);
+        }
+        Ok(count)
+    }
+
+    fn forget_by_tags_with(&self, tags: &[String], bm25: Bm25Sync) -> Result<usize> {
         let mut count = 0;
         let mut working_removed = 0;
         let mut session_removed = 0;
@@ -4449,7 +4842,7 @@ impl MemorySystem {
             for id in &ids_to_remove {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, bm25);
                     working_removed += 1;
                     count += 1;
                 }
@@ -4469,7 +4862,7 @@ impl MemorySystem {
             for id in &ids_to_remove {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, bm25);
                     session_removed += 1;
                     count += 1;
                 }
@@ -4483,8 +4876,9 @@ impl MemorySystem {
             if memory.experience.tags.iter().any(|t| tags.contains(t)) {
                 all_deleted_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
-                let _ = self.hybrid_search.remove_memory(&memory.id);
+                self.bm25_remove_direct(&memory.id, bm25);
                 self.long_term_memory.delete(&memory.id)?;
+                self.note_removed(memory.importance());
                 long_term_removed += 1;
                 count += 1;
             }
@@ -4514,6 +4908,7 @@ impl MemorySystem {
         &self,
         start: chrono::DateTime<chrono::Utc>,
         end: chrono::DateTime<chrono::Utc>,
+        bm25: Bm25Sync,
     ) -> Result<usize> {
         let mut count = 0;
         let mut working_removed = 0;
@@ -4536,7 +4931,7 @@ impl MemorySystem {
             for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, bm25);
                     working_removed += 1;
                     count += 1;
                 }
@@ -4559,7 +4954,7 @@ impl MemorySystem {
             for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, bm25);
                     session_removed += 1;
                     count += 1;
                 }
@@ -4574,8 +4969,11 @@ impl MemorySystem {
         for memory in memories {
             lt_ids.push(memory.id.clone());
             self.retriever.remove_memory(&memory.id);
-            let _ = self.hybrid_search.remove_memory(&memory.id);
+            self.bm25_remove_direct(&memory.id, bm25);
             self.long_term_memory.delete(&memory.id)?;
+            if !memory.is_forgotten() {
+                self.note_removed(memory.importance());
+            }
             long_term_removed += 1;
             count += 1;
         }
@@ -4605,7 +5003,7 @@ impl MemorySystem {
     }
 
     /// Forget memories of a specific type
-    fn forget_by_type(&self, exp_type: ExperienceType) -> Result<usize> {
+    fn forget_by_type(&self, exp_type: ExperienceType, bm25: Bm25Sync) -> Result<usize> {
         let mut count = 0;
         let mut working_removed = 0;
         let mut session_removed = 0;
@@ -4627,7 +5025,7 @@ impl MemorySystem {
             for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, bm25);
                     working_removed += 1;
                     count += 1;
                 }
@@ -4650,7 +5048,7 @@ impl MemorySystem {
             for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
-                    let _ = self.hybrid_search.remove_memory(id);
+                    self.bm25_remove_direct(id, bm25);
                     session_removed += 1;
                     count += 1;
                 }
@@ -4665,8 +5063,11 @@ impl MemorySystem {
         for memory in memories {
             lt_ids.push(memory.id.clone());
             self.retriever.remove_memory(&memory.id);
-            let _ = self.hybrid_search.remove_memory(&memory.id);
+            self.bm25_remove_direct(&memory.id, bm25);
             self.long_term_memory.delete(&memory.id)?;
+            if !memory.is_forgotten() {
+                self.note_removed(memory.importance());
+            }
             long_term_removed += 1;
             count += 1;
         }
@@ -4699,7 +5100,7 @@ impl MemorySystem {
     ///
     /// WARNING: This is a destructive operation. All memories across all tiers
     /// will be permanently deleted. This cannot be undone.
-    fn forget_all(&self) -> Result<usize> {
+    fn forget_all(&self, bm25: Bm25Sync) -> Result<usize> {
         // Deletion order: graph → long-term → session → working → stats
         // This is fail-safe: if we crash mid-way, the most durable data
         // (graph/long-term) is already deleted. Working/session memory is
@@ -4731,8 +5132,9 @@ impl MemorySystem {
         let long_term_count = all_lt.len();
         for memory in all_lt {
             self.retriever.remove_memory(&memory.id);
-            let _ = self.hybrid_search.remove_memory(&memory.id);
+            self.bm25_remove_direct(&memory.id, bm25);
             self.long_term_memory.delete(&memory.id)?;
+            self.note_removed(memory.importance());
         }
         count += long_term_count;
 
@@ -4748,7 +5150,7 @@ impl MemorySystem {
         let session_count = session_ids.len();
         for id in &session_ids {
             self.retriever.remove_memory(id);
-            let _ = self.hybrid_search.remove_memory(id);
+            self.bm25_remove_direct(id, bm25);
         }
         {
             let mut session = self.session_memory.write();
@@ -4768,7 +5170,7 @@ impl MemorySystem {
         let working_count = working_ids.len();
         for id in &working_ids {
             self.retriever.remove_memory(id);
-            let _ = self.hybrid_search.remove_memory(id);
+            self.bm25_remove_direct(id, bm25);
         }
         {
             let mut working = self.working_memory.write();
@@ -4777,9 +5179,7 @@ impl MemorySystem {
         count += working_count;
 
         // Step 5: Commit BM25 deletions
-        if let Err(e) = self.hybrid_search.commit_and_reload() {
-            tracing::warn!(error = %e, "BM25 commit failed during forget_all");
-        }
+        self.bm25_commit_direct(bm25);
 
         // Step 6: Clear semantic facts (GDPR — knowledge derived from memories)
         {
@@ -4801,7 +5201,11 @@ impl MemorySystem {
                 match self.long_term_memory.scan_prefix_keys(prefix.as_bytes()) {
                     Ok(keys) => {
                         if *prefix == "facts:" {
-                            facts_deleted += keys.len();
+                            // `facts:{user}:{fact}:decay` rows sit beside each fact; count facts only.
+                            facts_deleted += keys
+                                .iter()
+                                .filter(|key| !key.ends_with(b":decay"))
+                                .count();
                         }
                         for key in keys {
                             batch.delete(key);
@@ -4937,8 +5341,30 @@ impl MemorySystem {
     /// 2. Re-indexing in vector DB (semantic search) if embeddings changed
     /// 3. Re-indexing in BM25 (keyword/hybrid search)
     /// 4. Updating working/session memory caches if the memory is cached
+    ///
+    /// BM25 is rewritten only when the indexed text (content, tags, entities)
+    /// differs from the stored record: most callers change importance, anchor
+    /// state, validity or embeddings, and re-indexing those cost a tantivy
+    /// commit per call for an identical document.
     pub fn update_memory(&self, memory: &Memory) -> Result<()> {
+        self.update_memory_with(memory, Bm25Sync::Direct)
+    }
+
+    /// [`Self::update_memory`] for a caller that journals the write: the
+    /// caller MUST journal an `IntentPayload::Update` carrying `memory`, whose
+    /// BM25 projection re-indexes it. Nothing is written to BM25 here.
+    pub fn update_memory_journaled(&self, memory: &Memory) -> Result<()> {
+        self.update_memory_with(memory, Bm25Sync::Journaled)
+    }
+
+    fn update_memory_with(&self, memory: &Memory, bm25: Bm25Sync) -> Result<()> {
         let memory_id = memory.id.clone();
+
+        let reindex_bm25 = bm25 == Bm25Sync::Direct
+            && match self.long_term_memory.get_memory(&memory_id) {
+                Ok(Some(previous)) => bm25_text_differs(&previous, memory),
+                Ok(None) | Err(_) => true,
+            };
 
         // Update in storage (removes old indices, re-stores with fresh indices)
         self.long_term_memory.update(memory)?;
@@ -4952,17 +5378,9 @@ impl MemorySystem {
             );
         }
 
-        // Re-index in BM25 with updated content
-        if let Err(e) = self.hybrid_search.index_memory(
-            &memory_id,
-            &memory.experience.content,
-            &memory.experience.tags,
-            &memory.experience.entities,
-        ) {
-            tracing::warn!("Failed to reindex memory {} in BM25: {}", memory_id.0, e);
-        }
-        if let Err(e) = self.hybrid_search.commit_and_reload() {
-            tracing::warn!("Failed to commit/reload BM25 index: {}", e);
+        if reindex_bm25 {
+            self.bm25_index_direct(memory, Bm25Sync::Direct);
+            self.bm25_commit_direct(Bm25Sync::Direct);
         }
 
         // Update in working/session memory caches if present
@@ -5223,9 +5641,18 @@ impl MemorySystem {
         self.compressor.is_lossless(memory)
     }
 
-    /// Get storage statistics
+    /// Storage statistics from a full read of the store, which also re-bases the totals
+    /// `stats()` reports.
     pub fn get_storage_stats(&self) -> Result<storage::StorageStats> {
-        self.long_term_memory.get_stats()
+        let mut outcome = Err(anyhow::anyhow!("storage statistics were not read"));
+        self.reconcile_stored_totals(|| {
+            outcome = self.long_term_memory.get_stats();
+            outcome
+                .as_ref()
+                .ok()
+                .map(|s| (s.total_count, f64::from(s.importance_sum)))
+        });
+        outcome
     }
 
     /// Get uncompressed old memories
@@ -5510,6 +5937,17 @@ impl MemorySystem {
         let vector_indexed = self.retriever.len();
         let lexically_indexed = self.hybrid_search.bm25_doc_count();
         Ok((stored, vector_indexed, lexically_indexed))
+    }
+
+    /// [`Self::index_coverage`] with `stored` taken from the maintained count of records
+    /// not forgotten instead of a key scan: for probes that run per cached user on every
+    /// request. A measurement that must not trust the write paths uses `index_coverage`.
+    pub fn index_coverage_cached(&self) -> (usize, usize, usize) {
+        (
+            self.stored_count(),
+            self.retriever.len(),
+            self.hybrid_search.bm25_doc_count(),
+        )
     }
 
     /// Index inserts lost during ingest, vector and lexical.
@@ -5825,6 +6263,26 @@ impl MemorySystem {
         )
     }
 
+    /// The content embedding, from the content cache or the embedder (which fills the
+    /// cache).
+    fn embed_content(&self, content: &str) -> PrecomputedEmbedding {
+        let content_hash = Self::sha256_hash(content);
+        let outcome = match self.content_cache.get(&content_hash) {
+            Some(cached) => Ok(cached),
+            None => match self.embedder.encode(content) {
+                Ok(embedding) => {
+                    self.content_cache.insert(content_hash, embedding.clone());
+                    Ok(embedding)
+                }
+                Err(e) => Err(e.to_string()),
+            },
+        };
+        PrecomputedEmbedding {
+            content_hash,
+            outcome,
+        }
+    }
+
     /// [`Self::upsert`] carrying the provenance `remember` accepts.
     ///
     /// On create, `agent_id` and `created_at` are stored as `remember` stores them, and the
@@ -5834,12 +6292,66 @@ impl MemorySystem {
     pub fn upsert_with_provenance(
         &self,
         external_id: String,
-        mut experience: Experience,
+        experience: Experience,
         change_type: ChangeType,
         changed_by: Option<String>,
         change_reason: Option<String>,
         provenance: UpsertProvenance,
     ) -> Result<(MemoryId, bool)> {
+        self.upsert_impl(
+            external_id,
+            experience,
+            change_type,
+            changed_by,
+            change_reason,
+            provenance,
+            Bm25Sync::Direct,
+        )
+    }
+
+    /// [`Self::upsert_with_provenance`] for a caller that journals the write:
+    /// the caller MUST journal an `IntentPayload::Update` (update) or
+    /// `Remember` (create) for the returned id, whose BM25 projection indexes
+    /// it. Nothing is written to BM25 here.
+    pub fn upsert_with_provenance_journaled(
+        &self,
+        external_id: String,
+        experience: Experience,
+        change_type: ChangeType,
+        changed_by: Option<String>,
+        change_reason: Option<String>,
+        provenance: UpsertProvenance,
+    ) -> Result<(MemoryId, bool)> {
+        self.upsert_impl(
+            external_id,
+            experience,
+            change_type,
+            changed_by,
+            change_reason,
+            provenance,
+            Bm25Sync::Journaled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_impl(
+        &self,
+        external_id: String,
+        mut experience: Experience,
+        change_type: ChangeType,
+        changed_by: Option<String>,
+        change_reason: Option<String>,
+        provenance: UpsertProvenance,
+        bm25: Bm25Sync,
+    ) -> Result<(MemoryId, bool)> {
+        // The embedding is the slow part (ONNX or an HTTP embedder), so it is computed
+        // before the per-user lock. Both paths embed the incoming content, except a create
+        // that already carries a vector.
+        let precomputed = experience
+            .embeddings
+            .is_none()
+            .then(|| self.embed_content(&experience.content));
+
         // C1: the find-then-create below must be atomic, or two concurrent upserts of one
         // external_id both miss the lookup and both create. Same per-user lock as remember_impl.
         let _write_guard = self.write_lock.lock();
@@ -5882,19 +6394,19 @@ impl MemorySystem {
                 existing.experience.tags = experience.tags;
             }
 
-            // Regenerate embeddings for new content
-            let content_hash = Self::sha256_hash(&existing.experience.content);
-            if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
-                existing.experience.embeddings = Some(cached_embedding.clone());
-            } else {
-                match self.embedder.encode(&existing.experience.content) {
-                    Ok(embedding) => {
-                        self.content_cache.insert(content_hash, embedding.clone());
-                        existing.experience.embeddings = Some(embedding);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to regenerate embedding during upsert: {}", e);
-                    }
+            // Regenerate embeddings for new content: the vector computed before the lock
+            // when it was computed from this content, otherwise encoded here.
+            let regenerated = match precomputed
+                .as_ref()
+                .and_then(|p| p.for_content(&existing.experience.content))
+            {
+                Some(outcome) => outcome.clone(),
+                None => self.embed_content(&existing.experience.content).outcome,
+            };
+            match regenerated {
+                Ok(embedding) => existing.experience.embeddings = Some(embedding),
+                Err(e) => {
+                    tracing::warn!("Failed to regenerate embedding during upsert: {}", e);
                 }
             }
 
@@ -5931,18 +6443,8 @@ impl MemorySystem {
                 }
             }
 
-            // Re-index in BM25 with updated content
-            if let Err(e) = self.hybrid_search.index_memory(
-                &memory_id,
-                &existing.experience.content,
-                &existing.experience.tags,
-                &existing.experience.entities,
-            ) {
-                tracing::warn!("Failed to reindex memory {} in BM25: {}", memory_id.0, e);
-            }
-            if let Err(e) = self.hybrid_search.commit_and_reload() {
-                tracing::warn!("Failed to commit/reload BM25 index: {}", e);
-            }
+            self.bm25_index_direct(&existing, bm25);
+            self.bm25_commit_direct(bm25);
 
             // Update in working/session memory if cached
             {
@@ -5973,29 +6475,22 @@ impl MemorySystem {
             let memory_id = MemoryId(Uuid::new_v4());
             let importance = self.calculate_importance(&experience);
 
-            // Generate embeddings if not provided
-            if experience.embeddings.is_none() {
-                let content_hash = Self::sha256_hash(&experience.content);
-                if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
-                    experience.embeddings = Some(cached_embedding.clone());
-                } else {
-                    match self.embedder.encode(&experience.content) {
-                        Ok(embedding) => {
-                            self.content_cache.insert(content_hash, embedding.clone());
-                            experience.embeddings = Some(embedding);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to generate embedding: {}", e);
-                            if let Err(record_err) = self.embedding_backlog.record(
-                                &memory_id,
-                                embedding_backlog::EnqueueReason::EmbedFailed,
-                                Some(&e.to_string()),
-                            ) {
-                                tracing::error!(
-                                    "embedding backlog: could not record {}: {record_err}",
-                                    &memory_id.0
-                                );
-                            }
+            // Generate embeddings if not provided (computed before the lock; the content
+            // has not been touched since, so the precomputed outcome applies).
+            if let Some(precomputed) = precomputed {
+                match precomputed.outcome {
+                    Ok(embedding) => experience.embeddings = Some(embedding),
+                    Err(e) => {
+                        tracing::warn!("Failed to generate embedding: {}", e);
+                        if let Err(record_err) = self.embedding_backlog.record(
+                            &memory_id,
+                            embedding_backlog::EnqueueReason::EmbedFailed,
+                            Some(&e),
+                        ) {
+                            tracing::error!(
+                                "embedding backlog: could not record {}: {record_err}",
+                                &memory_id.0
+                            );
                         }
                     }
                 }
@@ -6191,18 +6686,8 @@ impl MemorySystem {
                 }
             }
 
-            // Index in BM25 for hybrid search
-            if let Err(e) = self.hybrid_search.index_memory(
-                &memory.id,
-                &memory.experience.content,
-                &memory.experience.tags,
-                &memory.experience.entities,
-            ) {
-                tracing::warn!("Failed to index memory {} in BM25: {}", memory.id.0, e);
-            }
-            if let Err(e) = self.hybrid_search.commit_and_reload() {
-                tracing::warn!("Failed to commit/reload BM25 index: {}", e);
-            }
+            self.bm25_index_direct(&memory, bm25);
+            self.bm25_commit_direct(bm25);
 
             // Add to session if important
             if importance > self.config.importance_threshold {
@@ -6213,6 +6698,7 @@ impl MemorySystem {
 
             // Update stats
             self.stats.write().total_memories += 1;
+            self.note_stored(memory.importance());
 
             tracing::info!(
                 external_id = %external_id,
@@ -6652,11 +7138,22 @@ impl MemorySystem {
 
         // 3.7. Heavy cycle: load all memories once for both fact extraction and replay.
         // This avoids two separate RocksDB full scans on the same cycle.
-        let all_memories_for_heavy: Vec<SharedMemory> = if is_heavy {
-            self.get_all_memories().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // The same read re-bases the stored totals behind stats().
+        let mut all_memories_for_heavy: Vec<SharedMemory> = Vec::new();
+        if is_heavy {
+            self.reconcile_stored_totals(|| match self.get_all_memories() {
+                Ok(all) => {
+                    let importance_sum: f64 = all.iter().map(|m| f64::from(m.importance())).sum();
+                    let count = all.len();
+                    all_memories_for_heavy = all;
+                    Some((count, importance_sum))
+                }
+                Err(e) => {
+                    tracing::warn!("heavy maintenance could not read the corpus: {e}");
+                    None
+                }
+            });
+        }
 
         // 3.8. Fact extraction: consolidate episodic memories into semantic facts
         // HEAVY ONLY: requires ONNX inference for embedding new facts.
@@ -6956,9 +7453,16 @@ impl MemorySystem {
                     for (mem_id_str, boost) in &memory_boosts {
                         if let Ok(mem_id) = uuid::Uuid::parse_str(mem_id_str) {
                             if let Ok(memory) = self.long_term_memory.get(&MemoryId(mem_id)) {
+                                let before = memory.importance();
                                 memory.boost_importance(*boost);
-                                if let Err(e) = self.long_term_memory.update(&memory) {
-                                    tracing::debug!("Failed to persist replay boost: {e}");
+                                match self.long_term_memory.update(&memory) {
+                                    Ok(()) if !memory.is_forgotten() => {
+                                        self.note_importance_change(before, memory.importance())
+                                    }
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        tracing::debug!("Failed to persist replay boost: {e}")
+                                    }
                                 }
                             }
                         }
@@ -7004,6 +7508,15 @@ impl MemorySystem {
         // repair_vector_index() does a full RocksDB scan + ONNX inference per orphan
         if is_heavy {
             self.auto_repair_and_compact();
+        }
+
+        // 5.2. Compression of aged long-term records (heavy only, when auto_compress).
+        if is_heavy && self.config.auto_compress {
+            match self.compress_old_memories() {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(user_id, compressed = n, "Compressed aged memories"),
+                Err(e) => tracing::warn!(user_id, error = %e, "Compression pass failed"),
+            }
         }
 
         // 5.5. S-R6: Semantic merge pass + GC sweep (heavy only, flag-gated).
@@ -8039,7 +8552,9 @@ impl MemorySystem {
                     0.0
                 };
                 let half_life = FACT_DECAY_HALF_LIFE_BASE_DAYS + support_extension;
-                let decay_factor = (0.5_f64).powf(elapsed / half_life) as f32;
+                let decay_factor = self
+                    .fact_store
+                    .apply_decay(user_id, &fact, elapsed, half_life)?;
                 fact.confidence = (confidence_before * decay_factor).max(0.0);
 
                 // Delete if below threshold
@@ -8914,6 +9429,50 @@ mod embedder_selection_tests {
         });
     }
 
+    /// Opens a store whose corpus marker names `marker`; the system drops before its directory.
+    fn open_with_marker(marker: &str) -> (super::MemorySystem, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".veld_embedder"), marker).unwrap();
+        let config = super::MemoryConfig {
+            storage_path: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let system = super::MemorySystem::new(config, None)
+            .unwrap_or_else(|e| panic!("store on {marker} must open: {e:#}"));
+        (system, dir)
+    }
+
+    /// Tenants whose stores resolve to the same model hold one primary instance, probed once;
+    /// a store whose corpus marker names another endpoint gets its own.
+    #[test]
+    fn tenants_on_one_spec_share_the_primary_and_markers_keep_theirs() {
+        use crate::embeddings::test_support::FakeEmbeddingServer;
+        use std::sync::Arc;
+
+        let a = FakeEmbeddingServer::start("fake-shared-a", 8);
+        let b = FakeEmbeddingServer::start("fake-shared-b", 8);
+        with_embedder_env(None, || {
+            let (first, _d1) = open_with_marker(&a.id());
+            let (second, _d2) = open_with_marker(&a.id());
+            assert!(
+                Arc::ptr_eq(
+                    first.embedder.primary_embedder(),
+                    second.embedder.primary_embedder()
+                ),
+                "one spec, one instance"
+            );
+            assert_eq!(a.model_listings(), 1, "the probe runs once per spec");
+
+            let (other, _d3) = open_with_marker(&b.id());
+            assert!(!Arc::ptr_eq(
+                first.embedder.primary_embedder(),
+                other.embedder.primary_embedder()
+            ));
+            assert_eq!(first.embedder.primary_id(), a.id());
+            assert_eq!(other.embedder.primary_id(), b.id());
+        });
+    }
+
     /// LIVE: `VELD_LIVE_EMBEDDER=1 cargo test -- --ignored live_http_primary` against a running
     /// OpenAI-compatible embedding server (LM Studio :1234 with nomic loaded). Proves the whole
     /// path: explicit selection, probe, task prefixes, 768-d vectors, remember → recall, and the
@@ -9548,6 +10107,297 @@ mod lifecycle_tests {
                 control.tier,
                 MemoryTier::Working,
                 "{backend}: a memory under the age threshold is not promoted"
+            );
+        }
+    }
+
+    fn remember_text(system: &MemorySystem, content: &str) -> MemoryId {
+        system
+            .remember(
+                Experience {
+                    content: content.to_string(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+    }
+
+    /// (records not forgotten, importance sum) as the store itself reports them.
+    fn stored_truth(system: &MemorySystem) -> (usize, f32) {
+        let s = system.long_term_memory.get_stats().unwrap();
+        (s.total_count, s.average_importance)
+    }
+
+    #[test]
+    fn cached_stats_track_remember_and_forget_without_a_scan() {
+        for (backend, system, _tmp) in systems() {
+            let first = remember_text(&system, "The ferry timetable changes in the first week.");
+            let second = remember_text(&system, "Quarterly invoices are reconciled on Fridays.");
+            remember_text(
+                &system,
+                "The greenhouse vents open above twenty-six degrees.",
+            );
+
+            let (count, average) = stored_truth(&system);
+            assert_eq!(count, 3, "{backend}");
+            assert_eq!(system.stored_count(), count, "{backend}");
+            assert!(
+                (system.stats().average_importance - average).abs() < 1e-4,
+                "{backend}: cached {} vs stored {average}",
+                system.stats().average_importance
+            );
+
+            system.forget(ForgetCriteria::ById(first)).unwrap();
+            let (count, average) = stored_truth(&system);
+            assert_eq!(count, 2, "{backend}");
+            assert_eq!(system.stored_count(), 2, "{backend}");
+            assert!(
+                (system.stats().average_importance - average).abs() < 1e-4,
+                "{backend}"
+            );
+
+            system.forget(ForgetCriteria::ById(second)).unwrap();
+            assert_eq!(system.stored_count(), 1, "{backend}");
+            let (stored, _, _) = system.index_coverage_cached();
+            assert_eq!(stored, 1, "{backend}");
+        }
+    }
+
+    #[test]
+    fn a_full_read_re_bases_drifted_totals() {
+        for (backend, system, _tmp) in systems() {
+            remember_text(&system, "The lighthouse keeper logs the fog signal hours.");
+            {
+                let mut totals = system.stored_totals.lock();
+                totals.count = 40;
+                totals.importance_sum = 0.0;
+            }
+            system.get_storage_stats().unwrap();
+            let (count, average) = stored_truth(&system);
+            assert_eq!(system.stored_count(), count, "{backend}");
+            assert!(
+                (system.stats().average_importance - average).abs() < 1e-4,
+                "{backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_during_a_reconciliation_are_carried_over() {
+        for (backend, system, _tmp) in systems() {
+            system.reconcile_stored_totals(|| {
+                system.note_stored(0.5);
+                Some((10, 5.0))
+            });
+            assert_eq!(system.stored_count(), 11, "{backend}");
+            assert!(
+                (system.stats().average_importance - 5.5 / 11.0).abs() < 1e-6,
+                "{backend}"
+            );
+        }
+    }
+
+    fn stored_with_id(system: &MemorySystem, id: Uuid, content: &str) -> Memory {
+        let memory = Memory::new(
+            MemoryId(id),
+            Experience {
+                content: content.to_string(),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        system.long_term_memory.store(&memory).unwrap();
+        memory
+    }
+
+    #[test]
+    fn an_id_prefix_resolves_through_a_key_range() {
+        for (backend, system, _tmp) in systems() {
+            let target = Uuid::parse_str("3f2a9c41-0000-4000-8000-000000000001").unwrap();
+            stored_with_id(
+                &system,
+                target,
+                "The orchard is netted before the starlings come.",
+            );
+            let sibling = Uuid::parse_str("3f2a9c40-0000-4000-8000-000000000002").unwrap();
+            stored_with_id(
+                &system,
+                sibling,
+                "The cellar pump is checked after heavy rain.",
+            );
+
+            let full = target.to_string();
+            for prefix in [
+                "3f2a9c41",
+                "3F2A9C41",
+                "3f2a9c41-0",
+                "3f2a9c410",
+                full.as_str(),
+            ] {
+                let found = system.find_memory_by_prefix(prefix).unwrap();
+                assert_eq!(
+                    found.map(|m| m.id.clone()),
+                    Some(MemoryId(target)),
+                    "{backend}: {prefix}"
+                );
+            }
+            assert!(
+                system.find_memory_by_prefix("3f2a9c42").unwrap().is_none(),
+                "{backend}"
+            );
+            assert!(
+                system.find_memory_by_prefix("3f2a9c4z").unwrap().is_none(),
+                "{backend}"
+            );
+
+            let err = system
+                .find_memory_by_prefix("3f2a9c4")
+                .expect_err("two memories share the prefix");
+            assert!(
+                err.to_string().starts_with("Ambiguous") && err.to_string().contains("matches 2"),
+                "{backend}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_lookup_skips_forgotten_records() {
+        for (backend, system, _tmp) in systems() {
+            let id = Uuid::parse_str("7c000000-0000-4000-8000-000000000001").unwrap();
+            let mut memory = stored_with_id(&system, id, "The old bridge closed for repairs.");
+            memory
+                .experience
+                .metadata
+                .insert("forgotten".to_string(), "true".to_string());
+            system.long_term_memory.update(&memory).unwrap();
+            assert!(memory.is_forgotten(), "{backend}: fixture");
+
+            assert!(
+                system
+                    .find_memory_by_prefix(&id.to_string())
+                    .unwrap()
+                    .is_none(),
+                "{backend}"
+            );
+            assert!(
+                system.find_memory_by_prefix("7c000000").unwrap().is_none(),
+                "{backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn uuid_key_prefixes_pin_the_byte_range() {
+        assert_eq!(uuid_key_prefixes("ab12"), Some(vec![vec![0xab, 0x12]]));
+        let odd = uuid_key_prefixes("ab1").unwrap();
+        assert_eq!(odd.len(), 16);
+        assert_eq!(odd[0], vec![0xab, 0x10]);
+        assert_eq!(odd[15], vec![0xab, 0x1f]);
+        assert_eq!(uuid_key_prefixes("AB-12"), Some(vec![vec![0xab, 0x12]]));
+        assert_eq!(uuid_key_prefixes("ab1g"), None);
+        assert_eq!(uuid_key_prefixes(&"a".repeat(33)), None);
+    }
+
+    #[test]
+    fn compression_runs_in_heavy_maintenance_not_on_remember() {
+        for (backend, system, _tmp) in systems() {
+            let mut old = Memory::new(
+                MemoryId(Uuid::new_v4()),
+                Experience {
+                    content: "The tide tables for the estuary were reprinted last spring."
+                        .to_string(),
+                    ..Default::default()
+                },
+                0.5,
+                None,
+                None,
+                None,
+                Some(chrono::Utc::now() - chrono::Duration::days(60)),
+            );
+            old.tier = MemoryTier::LongTerm;
+            system.long_term_memory.store(&old).unwrap();
+
+            remember_text(&system, "The harbour master posts the berth list at dawn.");
+            assert!(
+                !system.long_term_memory.get(&old.id).unwrap().compressed,
+                "{backend}: remember leaves compression to maintenance"
+            );
+
+            system.run_maintenance(1.0, "compress-user", false).unwrap();
+            assert!(
+                !system.long_term_memory.get(&old.id).unwrap().compressed,
+                "{backend}: a light cycle does not compress"
+            );
+
+            system.run_maintenance(1.0, "compress-user", true).unwrap();
+            assert!(
+                system.long_term_memory.get(&old.id).unwrap().compressed,
+                "{backend}: the heavy cycle compresses an aged record"
+            );
+        }
+    }
+
+    #[test]
+    fn a_precomputed_embedding_applies_only_to_its_own_content() {
+        let precomputed = PrecomputedEmbedding {
+            content_hash: MemorySystem::sha256_hash("the new content"),
+            outcome: Ok(vec![0.25, 0.5]),
+        };
+        assert_eq!(
+            precomputed.for_content("the new content"),
+            Some(&Ok(vec![0.25, 0.5]))
+        );
+        assert!(precomputed.for_content("content changed since").is_none());
+    }
+
+    #[test]
+    fn an_upsert_update_stores_the_embedding_of_the_new_content() {
+        for (backend, system, _tmp) in systems() {
+            let experience = |content: &str| Experience {
+                content: content.to_string(),
+                ..Default::default()
+            };
+            let (id, updated) = system
+                .upsert(
+                    "linear:VELD-1".to_string(),
+                    experience("The deploy window opens at nine."),
+                    ChangeType::ContentUpdated,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(!updated, "{backend}");
+            assert_eq!(system.stored_count(), 1, "{backend}");
+
+            let new_content = "The deploy window moved to eleven.";
+            let (same_id, updated) = system
+                .upsert(
+                    "linear:VELD-1".to_string(),
+                    experience(new_content),
+                    ChangeType::ContentUpdated,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(updated, "{backend}");
+            assert_eq!(same_id, id, "{backend}");
+            assert_eq!(
+                system.stored_count(),
+                1,
+                "{backend}: an update adds nothing"
+            );
+
+            let stored = system.long_term_memory.get(&id).unwrap();
+            assert_eq!(stored.experience.content, new_content, "{backend}");
+            assert_eq!(
+                stored.experience.embeddings,
+                Some(system.compute_embedding(new_content).unwrap()),
+                "{backend}"
             );
         }
     }
