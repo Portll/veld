@@ -498,6 +498,67 @@ async function renderBackend(body) {
 
 // ── Replication ─────────────────────────────────────────────────────────
 
+// A page applies up to 500 frames and takes minutes when they are re-embedded, so
+// only this long without one, while tenants are behind, reads as a stall.
+const STALL_SECS = 600;
+
+const secsSince = (iso) => (iso ? Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000)) : null);
+
+function duration(s) {
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+}
+
+const ago = (iso) => (iso ? duration(secsSince(iso)) + " ago" : "never");
+
+// Leader frames a tenant has yet to apply: the server's own figure when it gives
+// one, else head - 1 - applied. Null while either LSN is unknown.
+function tenantLag(p) {
+  if (typeof p.lag === "number") return p.lag;
+  if (p.leader_head_lsn == null || p.applied_lsn == null) return null;
+  return Math.max(0, p.leader_head_lsn - 1 - p.applied_lsn);
+}
+
+// Trouble first, then the furthest behind, then unknown lag, then caught up.
+function tenantRank(p, lag) {
+  if (p.diverged) return 0;
+  if (p.last_error) return 1;
+  if (lag > 0) return 2;
+  return lag == null ? 3 : 4;
+}
+
+function followingSummary(f) {
+  const since = ` since ${when(f.target.since)} · `;
+  return f.polls === 0
+    ? since + `first pass: ${f.pages} pages applied, last ${ago(f.last_applied)}`
+    : since + `${f.pages} pages · ${f.polls} polls finished · last poll ${ago(f.last_poll)} · last page ${ago(f.last_applied)}`;
+}
+
+function tenantTable(f) {
+  const rows = Object.entries(f.users)
+    .map(([user, p]) => ({ user, p, lag: p.diverged ? null : tenantLag(p) }))
+    .map((t) => ({ ...t, rank: tenantRank(t.p, t.lag) }))
+    .sort((a, b) => a.rank - b.rank || (b.lag ?? 0) - (a.lag ?? 0) || a.user.localeCompare(b.user));
+  const behind = rows.filter((t) => t.rank === 2);
+  const idle = secsSince(f.last_applied ?? f.target.since);
+  const stalled = behind.length > 0 && idle != null && idle >= STALL_SECS;
+  return h("div", {},
+    stalled ? h("p", { class: "sec-flash warn" },
+      `No page applied for ${duration(idle)} while ${behind.length} tenant${behind.length === 1 ? " is" : "s are"} behind.`) : null,
+    table(["Tenant", "Applied LSN", "Lag (frames)", "Frames consumed", "Journaled here", "State"], rows.map(({ user, p, lag }) => {
+      const state = p.diverged ? h("span", { class: "sec-bad", title: p.diverged }, "diverged")
+        : p.last_error ? h("span", { class: "sec-warn", title: p.last_error }, `retrying (${p.failures})`)
+        : lag == null ? h("span", { title: "Unknown until this tenant's next page: the leader reports its head with each page." }, "lag unknown")
+        : lag === 0 ? "in sync" : "syncing";
+      return h("tr", { class: p.diverged ? "sec-bad" : p.last_error ? "sec-warn" : "" },
+        h("td", {}, user), h("td", {}, p.applied_lsn ?? "—"),
+        h("td", { class: stalled && lag > 0 ? "sec-warn" : "" }, lag ?? "—"),
+        h("td", {}, p.applied_records), h("td", {}, p.journaled_records ?? 0), h("td", {}, state));
+    })));
+}
+
 async function renderReplication(body) {
   if (!(await ensureAdminKey())) {
     body.append(h("p", { class: "sec-flash warn" }, "The replication routes need this server's admin key."));
@@ -520,17 +581,9 @@ async function renderReplication(body) {
   body.append(h("section", { class: "sec-card" },
     h("h3", {}, "Following"),
     f ? h("div", {},
-      h("p", {}, h("strong", {}, f.target.source), ` since ${when(f.target.since)} · ${f.pages} pages · ${f.polls} polls finished · last ${when(f.last_poll)}`),
+      h("p", {}, h("strong", {}, f.target.source), followingSummary(f)),
       f.last_error ? h("p", { class: "sec-flash error" }, "Leader unreachable: " + f.last_error) : null,
-      table(["Tenant", "Applied LSN", "Behind", "Frames consumed", "Journaled here", "State"], Object.entries(f.users).map(([u, p]) => {
-        const behind = p.leader_head_lsn == null ? "—" : Math.max(0, p.leader_head_lsn - 1 - (p.applied_lsn ?? -1));
-        const state = p.diverged ? h("span", { class: "sec-bad", title: p.diverged }, "diverged")
-          : p.last_error ? h("span", { class: "sec-warn", title: p.last_error }, `retrying (${p.failures})`)
-          : behind === 0 ? "in sync" : "syncing";
-        return h("tr", {},
-          h("td", {}, u), h("td", {}, p.applied_lsn ?? "—"), h("td", {}, behind),
-          h("td", {}, p.applied_records), h("td", {}, p.journaled_records ?? 0), h("td", {}, state));
-      })),
+      tenantTable(f),
       Object.values(f.users).some((p) => p.diverged)
         ? h("p", { class: "sec-note" }, "A diverged tenant's leader log moved backwards (restore, rollback or recreated log). It is no longer synced. To resync it, stop this follower, remove the tenant's directory here, and start it again; it replays from the start.")
         : null,

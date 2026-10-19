@@ -145,7 +145,16 @@ function render(snap) {
       Math.floor((Date.now() - new Date(snap.server.first_seen).getTime()) / 1000)
     );
   }
-  document.getElementById("uptime").textContent = fmtUptime(uptimeSecs);
+  document.getElementById("uptime").textContent = "watching " + fmtUptime(uptimeSecs);
+  // The server's own uptime: first_seen restarts with the monitor, not the server.
+  const startedAt = instances.find((i) => i.base_url === snap.base_url)?.started_at;
+  const serverUptime = document.getElementById("server-uptime");
+  serverUptime.textContent = "up " + fmtUptime(
+    startedAt ? Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000)) : null
+  );
+  serverUptime.title = startedAt
+    ? "Server started " + new Date(startedAt).toLocaleString() + " (instance registry)"
+    : "Not in the instance registry: the server's start time is unknown";
   document.getElementById("version").textContent = snap.server.version || "—";
 
   // Memory
