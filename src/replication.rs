@@ -415,7 +415,8 @@ fn check_tenant(user_id: &str, frames: &[(u64, IntentPayload)]) -> Result<()> {
 
 /// Follower side: apply a page of leader frames to the canonical store, then
 /// journal each applied frame here so the local projections and log follow. The
-/// page is coalesced first; snapshots are indexed with one BM25 commit. Idempotent:
+/// page is coalesced first; the BM25 projection indexes snapshots as their frames
+/// are journaled, on its own commit cadence. Idempotent:
 /// a snapshot is an upsert, a forget of an unknown id is a no-op. Returns the
 /// number of frames journaled. Blocking.
 pub fn apply_replicated_page(
