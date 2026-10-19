@@ -1746,8 +1746,10 @@ impl MultiUserMemoryManager {
         match &self.shared_db {
             #[cfg(feature = "rocksdb")]
             crate::storage::SharedEngineDb::RocksDb(db) => {
-                db.flush()
-                    .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))?;
+                crate::storage::write_latch::guard(db, || {
+                    db.flush()
+                        .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))
+                })?;
                 info!("  Shared database flushed (todos, prospective, files, feedback, audit)");
             }
             #[cfg(feature = "storage-redb")]

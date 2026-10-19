@@ -1860,20 +1860,12 @@ impl MemoryStorage {
     ///
     /// `op` is called at most twice, so it must be replayable.
     fn guarded_write<T>(&self, op: impl Fn() -> Result<T>) -> Result<T> {
-        let latch = crate::storage::write_latch::global();
-        match op() {
-            Ok(value) => {
-                latch.note_write_ok(&self.storage_path);
-                Ok(value)
-            }
-            Err(err) => crate::storage::write_latch::recover_write(
-                latch,
-                &self.db,
-                &self.storage_path,
-                err,
-                op,
-            ),
-        }
+        crate::storage::write_latch::guard(&self.db, op)
+    }
+
+    /// [`Self::guarded_write`] for a batch already built.
+    fn guarded_batch(&self, batch: &WriteBatch, opts: &WriteOptions) -> Result<()> {
+        crate::storage::write_latch::guard_batch(&self.db, batch, opts)
     }
 
     /// Store a memory at the store's durability (`VELD_STORAGE_DURABILITY`).
@@ -1939,8 +1931,7 @@ impl MemoryStorage {
         for k in &stale {
             batch.delete_cf(idx, k.as_ref());
         }
-        self.db
-            .write_opt(batch, &self.write_options())
+        self.guarded_batch(&batch, &self.write_options())
             .context("Failed to clear stale index entries during rebuild")?;
 
         // Forgotten memories too: a soft delete rewrites the record and leaves its index
@@ -1957,8 +1948,7 @@ impl MemoryStorage {
     fn update_indices(&self, memory: &Memory) -> Result<()> {
         let mut batch = WriteBatch::default();
         self.queue_index_writes(memory, &mut batch);
-        self.db.write_opt(batch, &self.write_options())?;
-        Ok(())
+        self.guarded_batch(&batch, &self.write_options())
     }
 
     /// Add to `batch` every index row `memory` owns.
@@ -2362,7 +2352,7 @@ impl MemoryStorage {
             for key in &dangling {
                 batch.delete_cf(idx, key);
             }
-            if let Err(e) = self.db.write_opt(batch, &self.write_options()) {
+            if let Err(e) = self.guarded_batch(&batch, &self.write_options()) {
                 tracing::warn!(
                     rows = dangling.len(),
                     error = %e,
@@ -2464,7 +2454,7 @@ impl MemoryStorage {
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(false); // Async is fine for migration
 
-        self.db.put_opt(key, &value, &write_opts)?;
+        self.guarded_write(|| Ok(self.db.put_opt(key, &value, &write_opts)?))?;
         tracing::debug!("Migrated memory {} to current format", memory.id.0);
         Ok(())
     }
@@ -2513,7 +2503,7 @@ impl MemoryStorage {
             for key in &dangling {
                 batch.delete_cf(idx, key);
             }
-            if let Err(e) = self.db.write_opt(batch, &self.write_options()) {
+            if let Err(e) = self.guarded_batch(&batch, &self.write_options()) {
                 tracing::warn!(
                     rows = dangling.len(),
                     error = %e,
@@ -3453,7 +3443,7 @@ impl MemoryStorage {
         if !flagged_ids.is_empty() {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);
-            self.db.write_opt(batch, &write_opts)?;
+            self.guarded_batch(&batch, &write_opts)?;
         }
 
         Ok(flagged_ids)
@@ -3504,7 +3494,7 @@ impl MemoryStorage {
         if !flagged_ids.is_empty() {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);
-            self.db.write_opt(batch, &write_opts)?;
+            self.guarded_batch(&batch, &write_opts)?;
         }
 
         Ok(flagged_ids)
@@ -3658,11 +3648,12 @@ impl MemoryStorage {
         const RETRIEVAL_KEY: &[u8] = b"stats:total_retrievals";
         let current = self.get_retrieval_count().unwrap_or(0);
         let new_count = current + 1;
-        self.db.put_opt(
-            RETRIEVAL_KEY,
-            new_count.to_le_bytes(),
-            &self.write_options(),
-        )?;
+        let opts = self.write_options();
+        self.guarded_write(|| {
+            Ok(self
+                .db
+                .put_opt(RETRIEVAL_KEY, new_count.to_le_bytes(), &opts)?)
+        })?;
         Ok(new_count)
     }
 
@@ -3714,7 +3705,7 @@ impl MemoryStorage {
             batch.delete(id.as_bytes());
         }
         self.queue_index_rows_naming(&doomed, &mut batch);
-        self.db.write_opt(batch, &self.write_options())?;
+        self.guarded_batch(&batch, &self.write_options())?;
         self.flush()?;
         Ok(doomed.len())
     }
@@ -3805,7 +3796,9 @@ impl MemoryStorage {
             for (key, memory) in to_migrate {
                 match self.serialize_memory(&memory) {
                     Ok(serialized) => {
-                        if let Err(e) = self.db.put_opt(&key, &serialized, &write_opts) {
+                        if let Err(e) = self.guarded_write(|| {
+                            Ok(self.db.put_opt(&key, &serialized, &write_opts)?)
+                        }) {
                             tracing::warn!("Failed to migrate memory: {e}");
                             failed += 1;
                         } else {
@@ -4321,8 +4314,7 @@ impl MemoryStorage {
                 .context("Failed to serialize vector mapping")?;
         batch.put(mapping_key.as_bytes(), &mapping_value);
 
-        self.db
-            .write_opt(batch, &self.write_options())
+        self.guarded_batch(&batch, &self.write_options())
             .context("Atomic write of memory, vector mapping and index rows failed")?;
         Ok(())
     }
@@ -4395,18 +4387,19 @@ impl MemoryStorage {
         let mapping_key = format!("vmapping:{}", memory_id.0);
         let mapping_value = bincode::serde::encode_to_vec(mapping, bincode::config::standard())
             .context("Failed to serialize vector mapping")?;
-        self.db
-            .put_opt(mapping_key.as_bytes(), mapping_value, &self.write_options())
-            .context("Failed to write vector mapping")?;
-        Ok(())
+        let opts = self.write_options();
+        self.guarded_write(|| {
+            self.db
+                .put_opt(mapping_key.as_bytes(), &mapping_value, &opts)
+                .context("Failed to write vector mapping")
+        })
     }
 
     /// Delete vector mapping for a memory (called when deleting memory)
     pub fn delete_vector_mapping(&self, memory_id: &MemoryId) -> Result<()> {
         let mapping_key = format!("vmapping:{}", memory_id.0);
         let write_opts = self.write_options();
-        self.db.delete_opt(mapping_key.as_bytes(), &write_opts)?;
-        Ok(())
+        self.guarded_write(|| Ok(self.db.delete_opt(mapping_key.as_bytes(), &write_opts)?))
     }
 
     /// Update text vector mapping for a memory (for reindex operations)
@@ -4437,9 +4430,11 @@ impl MemoryStorage {
             bincode::serde::encode_to_vec(&mapping_entry, bincode::config::standard())?;
 
         let write_opts = self.write_options();
-        self.db
-            .put_opt(mapping_key.as_bytes(), &mapping_value, &write_opts)?;
-        Ok(())
+        self.guarded_write(|| {
+            Ok(self
+                .db
+                .put_opt(mapping_key.as_bytes(), &mapping_value, &write_opts)?)
+        })
     }
 
     /// Delete a memory, its vector mapping and its index rows in one atomic write.
@@ -4462,8 +4457,7 @@ impl MemoryStorage {
         let mapping_key = format!("vmapping:{}", id.0);
         batch.delete(mapping_key.as_bytes());
 
-        self.db.write_opt(batch, &self.write_options())?;
-        Ok(())
+        self.guarded_batch(&batch, &self.write_options())
     }
 
     /// Count memories with vector mappings (for health checks)
@@ -4568,11 +4562,11 @@ impl MemoryStorage {
             serde_json::to_vec(records).context("Failed to serialize interference records")?;
 
         let write_opts = self.write_options();
-        self.db
-            .put_opt(key.as_bytes(), &value, &write_opts)
-            .context("Failed to persist interference records")?;
-
-        Ok(())
+        self.guarded_write(|| {
+            self.db
+                .put_opt(key.as_bytes(), &value, &write_opts)
+                .context("Failed to persist interference records")
+        })
     }
 
     /// Load all interference records from storage on startup
@@ -4640,10 +4634,11 @@ impl MemoryStorage {
     pub fn delete_interference_records(&self, memory_id: &str) -> Result<()> {
         let key = format!("interference:{memory_id}");
         let write_opts = self.write_options();
-        self.db
-            .delete_opt(key.as_bytes(), &write_opts)
-            .context("Failed to delete interference records")?;
-        Ok(())
+        self.guarded_write(|| {
+            self.db
+                .delete_opt(key.as_bytes(), &write_opts)
+                .context("Failed to delete interference records")
+        })
     }
 
     /// Persist the total interference event count
@@ -4651,14 +4646,15 @@ impl MemoryStorage {
     /// Key: `interference_meta:total` → 8-byte little-endian u64
     pub fn save_interference_event_count(&self, count: usize) -> Result<()> {
         let write_opts = self.write_options();
-        self.db
-            .put_opt(
-                b"interference_meta:total",
-                (count as u64).to_le_bytes(),
-                &write_opts,
-            )
-            .context("Failed to persist interference event count")?;
-        Ok(())
+        self.guarded_write(|| {
+            self.db
+                .put_opt(
+                    b"interference_meta:total",
+                    (count as u64).to_le_bytes(),
+                    &write_opts,
+                )
+                .context("Failed to persist interference event count")
+        })
     }
 
     /// Load the fact extraction watermark for a user.
@@ -4681,10 +4677,11 @@ impl MemoryStorage {
     pub fn set_fact_watermark(&self, user_id: &str, timestamp_millis: i64) {
         let key = format!("_watermark:fact_extraction:{user_id}");
         let write_opts = self.write_options();
-        if let Err(e) = self
-            .db
-            .put_opt(key.as_bytes(), timestamp_millis.to_le_bytes(), &write_opts)
-        {
+        if let Err(e) = self.guarded_write(|| {
+            Ok(self
+                .db
+                .put_opt(key.as_bytes(), timestamp_millis.to_le_bytes(), &write_opts)?)
+        }) {
             tracing::warn!("Failed to persist fact extraction watermark: {e}");
         }
     }
@@ -4713,7 +4710,7 @@ impl MemoryStorage {
 
         if count > 0 {
             let write_opts = self.write_options();
-            self.db.write_opt(batch, &write_opts)?;
+            self.guarded_batch(&batch, &write_opts)?;
         }
 
         Ok(count)

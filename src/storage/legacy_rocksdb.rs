@@ -112,21 +112,11 @@ impl BatchWriter for RocksDbBatchWriter {
         };
 
         let opts = write_options(self.sync_writes);
-        let latch = super::write_latch::global();
-        match self.db.write_opt(build(), &opts) {
-            Ok(()) => {
-                latch.note_write_ok(self.db.path());
-                Ok(())
-            }
-            Err(e) => {
-                let err = anyhow::Error::new(e).context("write_batch: rocksdb refused the batch");
-                super::write_latch::recover_write(latch, &self.db, self.db.path(), err, || {
-                    self.db
-                        .write_opt(build(), &opts)
-                        .context("write_batch: rocksdb refused the batch")
-                })
-            }
-        }
+        super::write_latch::guard(&self.db, || {
+            self.db
+                .write_opt(build(), &opts)
+                .context("write_batch: rocksdb refused the batch")
+        })
     }
 }
 
@@ -169,15 +159,19 @@ impl ColumnStore for RocksDbColumnStore {
     }
 
     fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
-        self.db
-            .put_cf_opt(self.cf(cf)?, key, value, &write_options(self.sync_writes))?;
-        Ok(())
+        let handle = self.cf(cf)?;
+        let opts = write_options(self.sync_writes);
+        super::write_latch::guard(&self.db, || {
+            Ok(self.db.put_cf_opt(handle, key, value, &opts)?)
+        })
     }
 
     fn delete_cf(&self, cf: &str, key: &[u8]) -> Result<()> {
-        self.db
-            .delete_cf_opt(self.cf(cf)?, key, &write_options(self.sync_writes))?;
-        Ok(())
+        let handle = self.cf(cf)?;
+        let opts = write_options(self.sync_writes);
+        super::write_latch::guard(&self.db, || {
+            Ok(self.db.delete_cf_opt(handle, key, &opts)?)
+        })
     }
 
     fn ensure_cf(&self, cf: &str) -> Result<()> {
@@ -220,8 +214,8 @@ impl ColumnStore for RocksDbColumnStore {
     }
 
     fn flush_cf(&self, cf: &str) -> Result<()> {
-        self.db.flush_cf(self.cf(cf)?)?;
-        Ok(())
+        let handle = self.cf(cf)?;
+        super::write_latch::guard(&self.db, || Ok(self.db.flush_cf(handle)?))
     }
 
     fn write_batch(&self, batch: &StorageWriteBatch) -> Result<()> {
@@ -561,12 +555,14 @@ impl GraphStore for RocksDbGraphStore {
     }
 
     fn flush(&self) -> Result<()> {
-        self.inner
+        let db = self
+            .inner
             .rocksdb_for_backup()
-            .ok_or_else(|| anyhow!("legacy rocksdb graph adapter wraps a non-rocksdb graph"))?
-            .flush()
-            .context("Failed to flush legacy RocksDB graph store")?;
-        Ok(())
+            .ok_or_else(|| anyhow!("legacy rocksdb graph adapter wraps a non-rocksdb graph"))?;
+        super::write_latch::guard(db, || {
+            db.flush()
+                .context("Failed to flush legacy RocksDB graph store")
+        })
     }
 }
 
@@ -761,11 +757,12 @@ pub fn import_separate_db_into_cf(db: &DB, old_dir: &Path, cf_name: &str) -> Res
         batch.put_cf(cf, &key, &value);
         count += 1;
         if count.is_multiple_of(10_000) {
-            db.write_opt(std::mem::take(&mut batch), &write_opts)?;
+            super::write_latch::guard_batch(db, &batch, &write_opts)?;
+            batch.clear();
         }
     }
     if !batch.is_empty() {
-        db.write_opt(batch, &write_opts)?;
+        super::write_latch::guard_batch(db, &batch, &write_opts)?;
     }
     drop(old_db);
     tracing::info!(
@@ -861,14 +858,13 @@ impl KeyValueStore for RocksDbDefaultKeyValueStore {
     }
 
     fn put_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.db
-            .put_opt(key, value, &write_options(self.sync_writes))?;
-        Ok(())
+        let opts = write_options(self.sync_writes);
+        super::write_latch::guard(&self.db, || Ok(self.db.put_opt(key, value, &opts)?))
     }
 
     fn delete_bytes(&self, key: &[u8]) -> Result<()> {
-        self.db.delete_opt(key, &write_options(self.sync_writes))?;
-        Ok(())
+        let opts = write_options(self.sync_writes);
+        super::write_latch::guard(&self.db, || Ok(self.db.delete_opt(key, &opts)?))
     }
 
     fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -896,16 +892,14 @@ impl KeyValueStore for RocksDbDefaultKeyValueStore {
     }
 
     fn flush(&self) -> Result<()> {
-        self.db.flush()?;
-        Ok(())
+        super::write_latch::guard(&self.db, || Ok(self.db.flush()?))
     }
     fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
         let mut wb = WriteBatch::default();
         for (k, v) in pairs {
             wb.put(k, v);
         }
-        self.db.write_opt(wb, &write_options(self.sync_writes))?;
-        Ok(())
+        super::write_latch::guard_batch(&self.db, &wb, &write_options(self.sync_writes))
     }
 
     fn delete_many(&self, keys: &[Vec<u8>]) -> Result<()> {
@@ -913,8 +907,7 @@ impl KeyValueStore for RocksDbDefaultKeyValueStore {
         for k in keys {
             wb.delete(k);
         }
-        self.db.write_opt(wb, &write_options(self.sync_writes))?;
-        Ok(())
+        super::write_latch::guard_batch(&self.db, &wb, &write_options(self.sync_writes))
     }
 }
 
@@ -928,15 +921,17 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
     }
 
     fn put_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.db
-            .put_cf_opt(self.cf()?, key, value, &write_options(self.sync_writes))?;
-        Ok(())
+        let cf = self.cf()?;
+        let opts = write_options(self.sync_writes);
+        super::write_latch::guard(&self.db, || {
+            Ok(self.db.put_cf_opt(cf, key, value, &opts)?)
+        })
     }
 
     fn delete_bytes(&self, key: &[u8]) -> Result<()> {
-        self.db
-            .delete_cf_opt(self.cf()?, key, &write_options(self.sync_writes))?;
-        Ok(())
+        let cf = self.cf()?;
+        let opts = write_options(self.sync_writes);
+        super::write_latch::guard(&self.db, || Ok(self.db.delete_cf_opt(cf, key, &opts)?))
     }
 
     fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -961,8 +956,8 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
     }
 
     fn flush(&self) -> Result<()> {
-        self.db.flush_cf(self.cf()?)?;
-        Ok(())
+        let cf = self.cf()?;
+        super::write_latch::guard(&self.db, || Ok(self.db.flush_cf(cf)?))
     }
     fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
         let cf = self.cf()?;
@@ -970,8 +965,7 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
         for (k, v) in pairs {
             wb.put_cf(cf, k, v);
         }
-        self.db.write_opt(wb, &write_options(self.sync_writes))?;
-        Ok(())
+        super::write_latch::guard_batch(&self.db, &wb, &write_options(self.sync_writes))
     }
 
     fn delete_many(&self, keys: &[Vec<u8>]) -> Result<()> {
@@ -980,8 +974,7 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
         for k in keys {
             wb.delete_cf(cf, k);
         }
-        self.db.write_opt(wb, &write_options(self.sync_writes))?;
-        Ok(())
+        super::write_latch::guard_batch(&self.db, &wb, &write_options(self.sync_writes))
     }
 }
 
@@ -1022,13 +1015,11 @@ impl AuditStore for RocksDbAuditStore {
         let value = bincode::serde::encode_to_vec(event, bincode::config::standard())
             .context("Failed to serialize audit log entry for RocksDB audit store")?;
 
-        self.db.put_cf_opt(
-            self.cf()?,
-            key.as_bytes(),
-            value,
-            &write_options(self.sync_writes),
-        )?;
-        Ok(())
+        let cf = self.cf()?;
+        let opts = write_options(self.sync_writes);
+        super::write_latch::guard(&self.db, || {
+            Ok(self.db.put_cf_opt(cf, key.as_bytes(), &value, &opts)?)
+        })
     }
 
     fn list_user_ids(&self) -> Result<Vec<String>> {
@@ -1107,15 +1098,15 @@ impl AuditStore for RocksDbAuditStore {
         }
 
         if removed > 0 {
-            self.db.write_opt(batch, &write_options(self.sync_writes))?;
+            super::write_latch::guard_batch(&self.db, &batch, &write_options(self.sync_writes))?;
         }
 
         Ok(removed)
     }
 
     fn flush(&self) -> Result<()> {
-        self.db.flush_cf(self.cf()?)?;
-        Ok(())
+        let cf = self.cf()?;
+        super::write_latch::guard(&self.db, || Ok(self.db.flush_cf(cf)?))
     }
 }
 
