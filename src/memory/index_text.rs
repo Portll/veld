@@ -28,7 +28,11 @@
 
 use chrono::{DateTime, Datelike, Utc};
 
-use super::types::{Experience, ExperienceType, Memory, MemoryId};
+use super::types::{
+    CodeContext, ContextId, ConversationContext, DocumentContext, EmotionalContext,
+    EnvironmentContext, EpisodeContext, Experience, ExperienceType, Memory, MemoryId,
+    ProjectContext, RichContext, SemanticContext, SourceContext, TemporalContext, UserContext,
+};
 
 /// Tag prefix that names a conversation when no `episode_id` is set.
 pub const CONVERSATION_TAG_PREFIX: &str = "conv-";
@@ -194,6 +198,40 @@ pub fn later_tail(current: Option<ChainTail>, candidate: ChainTail) -> ChainTail
                 held
             }
         }
+    }
+}
+
+/// The context given to a turn that arrived without one, so the resolved prior turn
+/// can be recorded on it as `preceding_memory_id`.
+///
+/// Nothing in it is detected. `session_detect` describes the process that runs the
+/// detection, which here is the veld server, not the writer: its cwd, git branch and
+/// editor window would be stamped onto someone else's turn. The session stays default
+/// and both timestamps are the turn's own `created_at`, not the wall clock at ingest.
+pub fn threaded_context(created_at: DateTime<Utc>) -> RichContext {
+    RichContext {
+        id: ContextId(uuid::Uuid::new_v4()),
+        conversation: ConversationContext::default(),
+        user: UserContext::default(),
+        project: ProjectContext::default(),
+        temporal: TemporalContext::default(),
+        semantic: SemanticContext::default(),
+        code: CodeContext::default(),
+        document: DocumentContext::default(),
+        environment: EnvironmentContext::default(),
+        emotional: EmotionalContext::default(),
+        source: SourceContext::default(),
+        episode: EpisodeContext::default(),
+        place: Default::default(),
+        who: Default::default(),
+        why: Default::default(),
+        binding: Default::default(),
+        session: Default::default(),
+        parent: None,
+        embeddings: None,
+        decay_rate: 1.0,
+        created_at,
+        updated_at: created_at,
     }
 }
 
@@ -466,6 +504,15 @@ mod tests {
         let next_day = at(2022, 5, 2);
         assert!(chain_tail_precedes(&tail, same_session, None));
         assert!(!chain_tail_precedes(&tail, next_day, None));
+    }
+
+    #[test]
+    fn a_threaded_context_carries_no_detected_session_and_the_turns_own_time() {
+        let ctx = threaded_context(at(2022, 5, 1));
+        assert_eq!(ctx.session, crate::memory::facets::AgentSession::default());
+        assert_eq!(ctx.created_at, at(2022, 5, 1));
+        assert_eq!(ctx.updated_at, at(2022, 5, 1));
+        assert!(ctx.episode.preceding_memory_id.is_none());
     }
 
     #[test]
