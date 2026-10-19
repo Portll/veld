@@ -2131,6 +2131,7 @@ pub async fn upsert_memory(
         created_at: req.created_at,
         episode_id: req.episode_id.clone(),
         writer: req.writer.clone(),
+        kind: None,
     };
 
     let (memory_id, was_update) = {
