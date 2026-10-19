@@ -4362,25 +4362,7 @@ impl MultiUserMemoryManager {
         // Filter noise entities
         let filtered_entities: Vec<_> = extracted_entities
             .into_iter()
-            .filter(|e| {
-                let name = e.text.trim();
-                if name.len() < 3 {
-                    return false;
-                }
-                if !name.chars().any(|c| c.is_uppercase()) && e.confidence < 0.7 {
-                    return false;
-                }
-                if stop_words.contains(name.to_lowercase().as_str()) {
-                    return false;
-                }
-                if name.len() < 5 && e.confidence < 0.8 {
-                    return false;
-                }
-                if declared_names.contains(&name.to_lowercase()) {
-                    return false;
-                }
-                true
-            })
+            .filter(|e| ner_span_becomes_node(e, &stop_words, &declared_names))
             .collect();
 
         tracing::debug!(
@@ -5529,6 +5511,116 @@ mod shared_store_bootstrap_tests {
         // a restart would reload, so the two agree by construction.
         let stats = graph.get_stats().expect("stats");
         assert_eq!(stats.entity_count, 1);
+    }
+}
+
+/// Whether a NER span becomes a graph node.
+///
+/// Port of upstream shodh-memory #573 (902daf83), adapted to veld's typer.
+/// Upstream found that a confidence floor calibrated for BERT-tiny's per-token
+/// softmax, where real names score 0.9+, rejected 88–95% of the spans GLiNER's
+/// per-span sigmoid commits (every PER span on the first 50 LoCoMo gate turns),
+/// and redefined the floor as the typer's own commit threshold. veld's two
+/// confidence rules here were written against the same BERT-tiny distribution:
+/// a lowercase span needed 0.7 and a span under five characters needed 0.8.
+/// The rule-based fallback typer scales salience into 0.54–0.81, so a
+/// four-letter name it typed `PER` ("Nate") failed the short-span rule and
+/// never became a node while a six-letter one ("Joanna") did, and GLiNER's
+/// PER spans fail both rules.
+///
+/// A PER, ORG or LOC label is the typer's claim that the span denotes a person,
+/// organisation or place; that claim is the authority for a node, and a
+/// confidence number from a differently scaled model must not overrule it.
+/// Both confidence rules therefore apply only to `MISC`, the label the typers
+/// give to spans they could not place and the fallback NER gives to generic
+/// nouns, where a confidence floor still earns its keep against verb noise.
+/// There is no absolute floor: the fallback typer runs in the gate, and its
+/// salience-derived confidence is not the quantity a floor would be set in.
+///
+/// The length, stop-word and declared-name rules are unchanged and apply to
+/// every label: a declared name is already the declared entity, and a stop
+/// word names nothing whatever label it carries.
+fn ner_span_becomes_node(
+    span: &crate::embeddings::ner::NerEntity,
+    stop_words: &std::collections::HashSet<&str>,
+    declared_names: &std::collections::HashSet<String>,
+) -> bool {
+    let name = span.text.trim();
+    if name.len() < 3 {
+        return false;
+    }
+    let lower = name.to_lowercase();
+    if stop_words.contains(lower.as_str()) || declared_names.contains(&lower) {
+        return false;
+    }
+    if matches!(span.entity_type, NerEntityType::Misc) {
+        if !name.chars().any(|c| c.is_uppercase()) && span.confidence < 0.7 {
+            return false;
+        }
+        if name.len() < 5 && span.confidence < 0.8 {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod ner_span_admission_tests {
+    use super::*;
+    use crate::embeddings::ner::NerEntity;
+
+    fn span(text: &str, entity_type: NerEntityType, confidence: f32) -> NerEntity {
+        NerEntity {
+            text: text.to_string(),
+            entity_type,
+            confidence,
+            start: 0,
+            end: text.len(),
+        }
+    }
+
+    fn admitted(span: &NerEntity) -> bool {
+        let stop_words: std::collections::HashSet<&str> = ["the", "team"].into_iter().collect();
+        let declared: std::collections::HashSet<String> = ["joanna".to_string()].into();
+        ner_span_becomes_node(span, &stop_words, &declared)
+    }
+
+    /// A four-letter PER span at the fallback typer's confidence was the exact
+    /// shape the short-span rule rejected: "Nate" at 0.72 never became a node.
+    #[test]
+    fn a_short_typed_person_span_is_admitted_at_fallback_confidence() {
+        assert!(admitted(&span("Nate", NerEntityType::Person, 0.72)));
+    }
+
+    /// GLiNER commits PER spans in the 0.3–0.6 band; the label is the authority.
+    #[test]
+    fn typed_spans_are_admitted_regardless_of_confidence() {
+        for ty in [
+            NerEntityType::Person,
+            NerEntityType::Organization,
+            NerEntityType::Location,
+        ] {
+            assert!(admitted(&span("Nate", ty, 0.31)), "{ty:?}");
+            assert!(admitted(&span("nate", ty, 0.31)));
+        }
+    }
+
+    /// MISC keeps both confidence rules: it is where verb noise lands.
+    #[test]
+    fn misc_spans_still_need_confidence() {
+        assert!(!admitted(&span("decided", NerEntityType::Misc, 0.65)));
+        assert!(admitted(&span("decided", NerEntityType::Misc, 0.7)));
+        assert!(!admitted(&span("Oslo", NerEntityType::Misc, 0.79)));
+        assert!(admitted(&span("Oslo", NerEntityType::Misc, 0.8)));
+        assert!(admitted(&span("Covid", NerEntityType::Misc, 0.5)));
+    }
+
+    /// Length, stop-word and declared-name rules bind every label.
+    #[test]
+    fn structural_rules_apply_to_typed_spans_too() {
+        assert!(!admitted(&span("Al", NerEntityType::Person, 0.99)));
+        assert!(!admitted(&span("Team", NerEntityType::Organization, 0.99)));
+        assert!(!admitted(&span("Joanna", NerEntityType::Person, 0.99)));
     }
 }
 
