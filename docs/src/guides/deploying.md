@@ -150,10 +150,11 @@ tenant wait for the open. The remember, recall, upsert, list and memory CRUD rou
 and the streaming websockets wait on the blocking pool, so `/health`, `/health/live`
 and requests for other tenants keep answering while it runs.
 
-`GET /health/ready` answers `503 not_ready` with `reason: "tenant_opening"` while any
-request is waiting on an open, and reports how many in `tenant_open_waiters`. It goes
-back to `200 ready` when the open finishes. A hard write latch (below) takes precedence
-in `reason`.
+`GET /health/ready` stays `200 ready` during an open and reports how many requests are
+waiting on one in `tenant_open_waiters`. Readiness is about the process: an open delays
+only its own tenant, and a 503 would make a load balancer pull every tenant off the
+instance on each reopen after an idle eviction. Readiness fails for conditions that
+affect every tenant: shared stores that did not open, and a hard write latch (below).
 
 ## Disk full: the write latch
 

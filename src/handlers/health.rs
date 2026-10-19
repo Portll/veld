@@ -67,19 +67,21 @@ fn write_latch_fields(
     (status.to_string(), latched)
 }
 
-/// Readiness. 503 while the shared stores are unusable, while a tenant is opening
-/// (`tenant_open_waiters` callers are waiting on one), or when ANY store is
-/// hard-latched; a soft latch is still inside its bounded recovery and the next
-/// write may land. Returns the hard-latched store count, which the status code
+/// Readiness of the process, not of one tenant: 503 while the shared stores are
+/// unusable or when ANY store is hard-latched. A soft latch is still inside its
+/// bounded recovery and the next write may land; a tenant still opening delays
+/// only that tenant's requests (they wait on the blocking pool, not on a worker),
+/// so it is reported as `tenant_open_waiters` without failing readiness, which a
+/// load balancer would otherwise apply to every tenant on every reopen after an
+/// idle eviction. Returns the hard-latched store count, which the status code
 /// cannot carry and which is the difference between one tenant affected and all
 /// of them.
 fn ready_decision(
     shared_stores_ready: bool,
-    tenant_open_waiters: usize,
     latch: &crate::storage::write_latch::WriteLatch,
 ) -> (StatusCode, &'static str, usize) {
     let hard_stores = latch.hard_count();
-    if shared_stores_ready && tenant_open_waiters == 0 && hard_stores == 0 {
+    if shared_stores_ready && hard_stores == 0 {
         (StatusCode::OK, "ready", 0)
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not_ready", hard_stores)
@@ -134,11 +136,8 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
 /// `router.rs` and the `public_router_has_no_per_user_handlers` test.
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let tenant_open_waiters = state.tenant_open_waiters();
-    let (status_code, status_str, hard_stores) = ready_decision(
-        state.is_ready(),
-        tenant_open_waiters,
-        crate::storage::write_latch::global(),
-    );
+    let (status_code, status_str, hard_stores) =
+        ready_decision(state.is_ready(), crate::storage::write_latch::global());
 
     let users_in_cache = state.users_in_cache();
     let mut body = serde_json::json!({
@@ -149,9 +148,8 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<se
         "tenant_open_waiters": tenant_open_waiters,
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
-    if let Some(object) = body.as_object_mut() {
-        // A hard latch outranks an open: the open finishes by itself, the latch needs a restart.
-        if hard_stores > 0 {
+    if hard_stores > 0 {
+        if let Some(object) = body.as_object_mut() {
             object.insert(
                 "reason".to_string(),
                 serde_json::json!("storage_write_latched"),
@@ -160,8 +158,6 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<se
                 "hard_latched_stores".to_string(),
                 serde_json::json!(hard_stores),
             );
-        } else if tenant_open_waiters > 0 {
-            object.insert("reason".to_string(), serde_json::json!("tenant_opening"));
         }
     }
     (status_code, Json(body))
@@ -718,7 +714,7 @@ mod write_latch_reporting {
         let latch = WriteLatch::new();
         latch_at(&latch, "/var/lib/veld/users/tenant-a/storage");
 
-        let (code, status, hard_stores) = ready_decision(true, 0, &latch);
+        let (code, status, hard_stores) = ready_decision(true, &latch);
         assert_eq!(code, StatusCode::OK);
         assert_eq!(status, "ready");
         assert_eq!(hard_stores, 0);
@@ -733,7 +729,7 @@ mod write_latch_reporting {
         latch_at(&latch, b);
         latch.mark_hard(Path::new(b));
 
-        let (code, status, hard_stores) = ready_decision(true, 0, &latch);
+        let (code, status, hard_stores) = ready_decision(true, &latch);
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(status, "not_ready");
         assert_eq!(
@@ -745,22 +741,12 @@ mod write_latch_reporting {
     #[test]
     fn ready_is_unaffected_when_nothing_is_latched() {
         let latch = WriteLatch::new();
-        assert_eq!(ready_decision(true, 0, &latch).0, StatusCode::OK);
+        assert_eq!(ready_decision(true, &latch).0, StatusCode::OK);
         assert_eq!(
-            ready_decision(false, 0, &latch).0,
+            ready_decision(false, &latch).0,
             StatusCode::SERVICE_UNAVAILABLE
         );
-        assert_eq!(ready_decision(false, 0, &latch).2, 0);
-    }
-
-    #[test]
-    fn ready_returns_503_while_a_tenant_is_opening_and_200_once_it_has() {
-        let latch = WriteLatch::new();
-        let (code, status, hard_stores) = ready_decision(true, 3, &latch);
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(status, "not_ready");
-        assert_eq!(hard_stores, 0, "an open is not a latch");
-        assert_eq!(ready_decision(true, 0, &latch).0, StatusCode::OK);
+        assert_eq!(ready_decision(false, &latch).2, 0);
     }
 }
 
@@ -859,8 +845,7 @@ mod probes_while_a_tenant_opens {
 
         let (status, body) =
             ready.expect("/health/ready did not answer while requests waited on a tenant open");
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["reason"], "tenant_opening");
+        assert_eq!(status, StatusCode::OK, "an open delays its tenant, not the process: {body}");
         assert_eq!(body["tenant_open_waiters"], WORKERS * 2);
 
         let (status, body) = ready_after.expect("/health/ready answers after the open");
