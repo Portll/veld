@@ -38,7 +38,6 @@ const MAX_NUM_INTERVALS: usize = 200;
 const MIN_OVERLAP: f32 = 0.0;
 const MAX_OVERLAP: f32 = 0.9;
 const MAX_ENTITIES: usize = 2000;
-const SYNC_TTL_SECS: u64 = 30;
 /// How long a gap detection result is served as fresh.
 const GAP_FRESH_SECS: i64 = 300;
 /// Detection results kept at most, the oldest dropped first.
@@ -918,26 +917,31 @@ fn get_or_create_slow_store(
 }
 
 /// Sync graph data from RocksDB (GraphMemory) into SQLite (SlowStore).
-/// Skips sync if the last sync was less than SYNC_TTL_SECS ago.
+/// Serves the existing mirror when a rebuild is already in flight or the last
+/// one finished less than the configured `graph_mirror_sync_secs` ago.
 fn sync_graph_to_slow_store(
     state: &MultiUserMemoryManager,
     user_id: &str,
     store: &SlowStore,
 ) -> Result<(), anyhow::Error> {
-    if !store.should_sync(SYNC_TTL_SECS) {
-        tracing::debug!("SlowStore sync skipped (TTL)");
+    let Some(sync) = store.begin_sync(state.server_config().graph_mirror_sync_ttl()) else {
+        tracing::debug!("SlowStore sync skipped: rebuild in flight or within TTL");
         return Ok(());
-    }
+    };
 
     let graph = state
         .get_user_graph(user_id)
         .map_err(|e| anyhow::anyhow!("Failed to get graph for user {user_id}: {e}"))?;
-    let graph_guard = graph.read();
+    // Hold the graph read lock only for the snapshot, not the SQLite writes.
+    let (entities, edges) = {
+        let graph_guard = graph.read();
+        (
+            graph_guard.get_all_entities()?,
+            graph_guard.get_all_relationships()?,
+        )
+    };
 
-    let entities = graph_guard.get_all_entities()?;
-    let edges = graph_guard.get_all_relationships()?;
-
-    store.sync_from_graph(&entities, &edges)?;
+    sync.rebuild(&entities, &edges)?;
     Ok(())
 }
 

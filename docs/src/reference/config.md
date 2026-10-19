@@ -6,7 +6,7 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **113** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **115** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
@@ -24,6 +24,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_API_KEYS` | — | `src/auth.rs` |
 | `VELD_AUDIT_MAX_ENTRIES` | — | `src/config.rs` |
 | `VELD_AUDIT_RETENTION_DAYS` | — | `src/config.rs` |
+| `VELD_AUTO_COMPRESS` | — | `src/config.rs` |
 | `VELD_BACKUP_ENABLED` | — | `src/config.rs` |
 | `VELD_BACKUP_INTERVAL` | — | `src/config.rs` |
 | `VELD_BACKUP_MAX_COUNT` | — | `src/config.rs` |
@@ -50,6 +51,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_ENV` | — | `src/config.rs` |
 | `VELD_EVAL_NOW` | — | `src/memory/ablation.rs` |
 | `VELD_GAP_TIMEOUT` | — | `src/config.rs` |
+| `VELD_GRAPH_MIRROR_SYNC_SECS` | — | `src/config.rs` |
 | `VELD_HIDE_DEV_KEY` | — | `src/auth.rs` |
 | `VELD_HOST` | — | `src/config.rs` |
 | `VELD_INSTANCE_LABEL` | — | `src/instance_registry.rs` |
