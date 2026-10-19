@@ -156,7 +156,7 @@ const FRAME_TRAILER_BYTES: usize = 4; // crc
 /// `append` writes are buffered; call `sync` to force them to disk.
 pub struct IntentLog {
     path: PathBuf,
-    writer: BufWriter<File>,
+    writer: BufWriter<LogFile>,
     next_lsn: Lsn,
     /// File offset (in bytes from start) of the byte *after* the last
     /// successfully-written frame. Used by `truncate_corrupt_tail` and to
@@ -164,6 +164,15 @@ pub struct IntentLog {
     /// extra fstat. Includes any header bytes — `durable_end_offset` is
     /// always relative to byte 0 of the file.
     durable_end_offset: u64,
+    /// `next_lsn` and `durable_end_offset` as of the last successful `sync`
+    /// (or open, or truncation). No caller has been told the frames past
+    /// this point are durable, so a failed append or sync rolls back to it.
+    synced_next_lsn: Lsn,
+    synced_end_offset: u64,
+    /// A failed write left bytes past `synced_end_offset` that could not be
+    /// cut yet. `append` and `sync` retry the cut before writing anything,
+    /// so no frame ever lands after a torn one.
+    cut_pending: bool,
     /// Versioning mode this log file is in. `Versioned { .. }` means the
     /// file starts with a valid [`IntentLogHeader`]; `Legacy` means it
     /// was created before headers existed and frames start at offset 0.
@@ -175,6 +184,55 @@ pub struct IntentLog {
     /// the slow store. The CRC is computed over the on-disk (sealed) bytes, so
     /// `scan_for_tail` validates frames without decrypting.
     cryptor: Option<crate::keystore::SecretCryptor>,
+}
+
+/// The file under the log's `BufWriter`. A newtype rather than a bare `File`
+/// so a test can make a write stop part-way through a frame, as ENOSPC does,
+/// on a filesystem that has room.
+struct LogFile {
+    file: File,
+    /// Bytes later writes may still put on disk before each one fails with
+    /// `StorageFull`. `None` means no fault is armed.
+    #[cfg(test)]
+    write_budget: Option<usize>,
+}
+
+impl LogFile {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            #[cfg(test)]
+            write_budget: None,
+        }
+    }
+}
+
+impl Write for LogFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(left) = self.write_budget {
+            if left == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "injected: no space left on device",
+                ));
+            }
+            let n = self.file.write(&buf[..buf.len().min(left)])?;
+            self.write_budget = Some(left - n);
+            return Ok(n);
+        }
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Open `path` for appending, behind the log's write buffer.
+fn append_writer(path: &Path) -> io::Result<BufWriter<LogFile>> {
+    let file = OpenOptions::new().read(true).append(true).open(path)?;
+    Ok(BufWriter::new(LogFile::new(file)))
 }
 
 /// Versioning mode for an open intent log.
@@ -210,11 +268,13 @@ impl LogMode {
 
 impl IntentLog {
     /// Open (create if missing) the log file at `path`. Scans the existing
-    /// file to compute the next LSN and the durable-end offset. If the file
-    /// ends in a partial or CRC-bad frame, **does not** auto-truncate — the
-    /// caller decides whether to `truncate_corrupt_tail()` or to bail. This
-    /// avoids silently destroying data when the file is unexpectedly short
-    /// (e.g. disk full mid-write that's about to be retried).
+    /// file to compute the next LSN and the durable-end offset.
+    ///
+    /// A torn tail (the partial or CRC-bad last frame a crash or a full disk
+    /// leaves) is cut with `truncate_corrupt_tail()`, because the first
+    /// append would otherwise land after it where no reader reaches. A
+    /// corrupt frame with intact frames after it is left for an operator and
+    /// reported by `iter()`: cutting there would drop acknowledged records.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IntentLogError> {
         Self::open_with_cryptor(path, None)
     }
@@ -281,14 +341,34 @@ impl IntentLog {
         INTENT_LOG_NEXT_LSN.set(next_lsn.0 as i64);
         INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(durable_end as i64);
 
-        Ok(Self {
+        let mut log = Self {
             path,
-            writer: BufWriter::new(file),
+            writer: BufWriter::new(LogFile::new(file)),
             next_lsn,
             durable_end_offset: durable_end,
+            synced_next_lsn: next_lsn,
+            synced_end_offset: durable_end,
+            cut_pending: false,
             mode,
             cryptor,
-        })
+        };
+        if actual_len > durable_end {
+            if tail_is_torn(&log.path, durable_end, actual_len, next_lsn)? {
+                tracing::warn!(
+                    path = %log.path.display(),
+                    torn_bytes = actual_len - durable_end,
+                    "intent log ends in a torn frame; cutting it",
+                );
+                log.truncate_corrupt_tail()?;
+            } else {
+                tracing::error!(
+                    path = %log.path.display(),
+                    offset = durable_end,
+                    "intent log has a corrupt frame with intact frames after it; left in place",
+                );
+            }
+        }
+        Ok(log)
     }
 
     /// Versioning mode this log was opened in. Callers that need the
@@ -318,7 +398,7 @@ impl IntentLog {
         // record the caller has written. Upgrade then reads the file
         // contents and prepends a header in a side file.
         self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
+        self.writer.get_ref().file.sync_data()?;
 
         let header = IntentLogHeader::new_current();
         let header_bytes = header.to_bytes();
@@ -339,18 +419,15 @@ impl IntentLog {
         // to rename over an open file with an exclusive append handle.
         // We replace `self.writer` with a handle on the tmp file in the
         // interim, then swing it back after the rename completes.
-        let staged = OpenOptions::new().read(true).append(true).open(&tmp_path)?;
-        self.writer = BufWriter::new(staged);
+        self.writer = append_writer(&tmp_path)?;
         std::fs::rename(&tmp_path, &self.path)?;
-        let live = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        self.writer = BufWriter::new(live);
+        self.writer = append_writer(&self.path)?;
 
         // The frame region just shifted by HEADER_BYTES, so durable_end
         // moves with it.
         self.durable_end_offset += HEADER_BYTES as u64;
+        self.synced_next_lsn = self.next_lsn;
+        self.synced_end_offset = self.durable_end_offset;
         self.mode = LogMode::Versioned {
             format_version: header.format_version,
             created_unix_secs: header.created_unix_secs,
@@ -361,6 +438,11 @@ impl IntentLog {
     /// Append a record. Returns the LSN assigned to it. Writes go through a
     /// `BufWriter` — call `sync` for durability before returning to a caller
     /// that requires the record to survive a crash.
+    ///
+    /// If the write fails, every frame appended since the last successful
+    /// `sync` is dropped from the buffer and cut from the file, and
+    /// `next_lsn` rewinds to the first of them: the log ends at a frame
+    /// boundary, so the next append is readable.
     #[tracing::instrument(
         level = "info",
         name = "intent_log.append",
@@ -388,6 +470,9 @@ impl IntentLog {
                 "intent log append rejected: payload too large",
             );
             return Err(err);
+        }
+        if self.cut_pending {
+            self.cut_unsynced()?;
         }
 
         let lsn = self.next_lsn;
@@ -423,6 +508,7 @@ impl IntentLog {
                 lsn = lsn.0,
                 "intent log append failed: I/O error",
             );
+            self.roll_back_unsynced();
             return Err(IntentLogError::Io(e));
         }
 
@@ -437,7 +523,9 @@ impl IntentLog {
     }
 
     /// Flush the BufWriter and fsync the file. After this returns, every
-    /// frame `append`-ed since the last `sync` is durable.
+    /// frame `append`-ed since the last `sync` is durable. If it fails, those
+    /// frames are rolled back as for a failed `append`, so a record the
+    /// caller was told failed cannot become durable with a later sync.
     #[tracing::instrument(
         level = "info",
         name = "intent_log.sync",
@@ -449,17 +537,58 @@ impl IntentLog {
     )]
     pub fn sync(&mut self) -> Result<(), IntentLogError> {
         let _timer = Timer::new(INTENT_LOG_SYNC_DURATION.clone());
+        if self.cut_pending {
+            self.cut_unsynced()?;
+        }
         if let Err(e) = self.writer.flush() {
             INTENT_LOG_SYNC_TOTAL.with_label_values(&["io_error"]).inc();
             tracing::error!(error = %e, "intent log sync failed: flush error");
+            self.roll_back_unsynced();
             return Err(IntentLogError::Io(e));
         }
-        if let Err(e) = self.writer.get_ref().sync_data() {
+        if let Err(e) = self.writer.get_ref().file.sync_data() {
             INTENT_LOG_SYNC_TOTAL.with_label_values(&["io_error"]).inc();
             tracing::error!(error = %e, "intent log sync failed: fsync error");
+            self.roll_back_unsynced();
             return Err(IntentLogError::Io(e));
         }
+        self.synced_next_lsn = self.next_lsn;
+        self.synced_end_offset = self.durable_end_offset;
         INTENT_LOG_SYNC_TOTAL.with_label_values(&["ok"]).inc();
+        Ok(())
+    }
+
+    /// Forget every frame since the last successful sync and cut its bytes,
+    /// after an append or sync failed part-way through them.
+    fn roll_back_unsynced(&mut self) {
+        self.next_lsn = self.synced_next_lsn;
+        self.durable_end_offset = self.synced_end_offset;
+        INTENT_LOG_NEXT_LSN.set(self.next_lsn.0 as i64);
+        INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(self.durable_end_offset as i64);
+        self.cut_pending = true;
+        if let Err(e) = self.cut_unsynced() {
+            tracing::error!(
+                error = %e,
+                end_offset = self.synced_end_offset,
+                "intent log could not cut a failed write back to the last synced frame; \
+                 appends are refused until it can",
+            );
+        }
+    }
+
+    fn cut_unsynced(&mut self) -> io::Result<()> {
+        // Swap the handle before cutting so no later flush can write the
+        // stale bytes: `into_parts` discards them, where dropping the
+        // BufWriter would flush them.
+        let stale = std::mem::replace(&mut self.writer, append_writer(&self.path)?);
+        drop(stale.into_parts());
+        // A transient read+write handle, as in `truncate_corrupt_tail`.
+        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        if file.metadata()?.len() > self.synced_end_offset {
+            file.set_len(self.synced_end_offset)?;
+        }
+        file.sync_data()?;
+        self.cut_pending = false;
         Ok(())
     }
 
@@ -513,11 +642,10 @@ impl IntentLog {
         drop(trunc_handle);
 
         // Reopen so BufWriter's seek matches the new EOF.
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        self.writer = BufWriter::new(file);
+        self.writer = append_writer(&self.path)?;
+        self.synced_next_lsn = self.next_lsn;
+        self.synced_end_offset = target;
+        self.cut_pending = false;
         INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL.inc();
         INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(target as i64);
         tracing::info!(target_offset = target, "intent log truncated corrupt tail",);
@@ -607,13 +735,12 @@ impl IntentLog {
 
         // Reopen so BufWriter's append position matches the new EOF, and
         // refresh the in-memory tail bookkeeping.
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        self.writer = BufWriter::new(file);
+        self.writer = append_writer(&self.path)?;
         self.durable_end_offset = last_good_offset;
         self.next_lsn = max_lsn.next();
+        self.synced_next_lsn = self.next_lsn;
+        self.synced_end_offset = last_good_offset;
+        self.cut_pending = false;
         Ok(last_good_offset)
     }
 }
@@ -892,6 +1019,41 @@ fn scan_for_tail(path: &Path, frame_region_start: u64) -> Result<(Lsn, u64), Int
     Ok((next_lsn, last_good_offset))
 }
 
+/// Whether the bytes past the last valid frame, `start..end`, are a torn
+/// tail: what a write cut short by a crash or a full disk leaves. That is at
+/// most one frame long and holds no complete frame. Anything else is a
+/// corrupt frame with frames after it that callers were told are durable.
+fn tail_is_torn(path: &Path, start: u64, end: u64, next_lsn: Lsn) -> io::Result<bool> {
+    let len = end - start;
+    if len > (FRAME_HEADER_BYTES + MAX_PAYLOAD_BYTES + FRAME_TRAILER_BYTES) as u64 {
+        return Ok(false);
+    }
+    let mut tail = vec![0u8; len as usize];
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut tail)?;
+    // A frame after the bad one carries a later LSN, and no more of them fit
+    // than empty frames would; that window keeps the CRC checks to a few.
+    let min_frame = (FRAME_HEADER_BYTES + FRAME_TRAILER_BYTES) as u64;
+    let lsns = next_lsn.0..=next_lsn.0.saturating_add(len / min_frame);
+    Ok(!(0..tail.len()).any(|at| frame_starts_at(&tail[at..], &lsns)))
+}
+
+/// Whether `bytes` begins with a complete, CRC-valid frame whose LSN is in `lsns`.
+fn frame_starts_at(bytes: &[u8], lsns: &std::ops::RangeInclusive<u64>) -> bool {
+    if bytes.len() < FRAME_HEADER_BYTES + FRAME_TRAILER_BYTES {
+        return false;
+    }
+    let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let lsn = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+    let body = FRAME_HEADER_BYTES + len;
+    if len > MAX_PAYLOAD_BYTES || !lsns.contains(&lsn) || bytes.len() < body + FRAME_TRAILER_BYTES {
+        return false;
+    }
+    let stored = u32::from_le_bytes(bytes[body..body + FRAME_TRAILER_BYTES].try_into().unwrap());
+    crc32fast::hash(&bytes[..body]) == stored
+}
+
 /// Probe a log file's versioning mode.
 ///
 /// - File missing or empty → `LogMode::Versioned { format_version: 1, .. }`
@@ -1092,9 +1254,8 @@ mod tests {
             f.sync_data().unwrap();
         }
 
-        // Reopen — should see two good records and a TruncatedFrame error.
-        let mut log = IntentLog::open(&path).unwrap();
-        let mut iter = log.iter().unwrap();
+        // A scan sees two good records and a TruncatedFrame error.
+        let mut iter = IntentLogIter::open_for_scan(&path).unwrap();
         let r0 = iter.next().unwrap().unwrap();
         assert_eq!(r0.payload, b"first");
         let r1 = iter.next().unwrap().unwrap();
@@ -1102,9 +1263,13 @@ mod tests {
         let err = iter.next().unwrap().unwrap_err();
         assert!(matches!(err, IntentLogError::TruncatedFrame { .. }));
         assert!(iter.next().is_none());
+        drop(iter);
 
-        // durable_end_offset should point to end of the second good frame.
+        // Open cuts the file to the end of the second good frame; cutting
+        // again finds nothing more to remove.
+        let mut log = IntentLog::open(&path).unwrap();
         let good_end = log.durable_end_offset();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_end);
         let truncated_to = log.truncate_corrupt_tail().unwrap();
         assert_eq!(truncated_to, good_end);
 
@@ -1119,6 +1284,205 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The bytes `append` writes for `payload` at `lsn`, for hand-built logs.
+    fn encode_frame(lsn: u64, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&lsn.to_le_bytes());
+        frame.extend_from_slice(payload);
+        let crc = crc32fast::hash(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        frame
+    }
+
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        let mut f = OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_data().unwrap();
+    }
+
+    fn read_all(path: &Path) -> Vec<(u64, Vec<u8>)> {
+        let log = IntentLog::open(path).unwrap();
+        log.iter()
+            .unwrap()
+            .map(|r| r.map(|r| (r.lsn.0, r.payload)))
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_torn_frame_before_later_frames() {
+        // Larger than the BufWriter's 8 KiB, so append itself reaches the file.
+        const BIG: usize = 10_000;
+        let frame = FRAME_HEADER_BYTES + BIG + FRAME_TRAILER_BYTES;
+        // Where the disk fills: before the frame, inside and after len+lsn,
+        // inside the payload, and before and inside the CRC. append buffers
+        // the CRC, so the last two surface as a failed sync instead.
+        let cuts = [
+            0,
+            5,
+            FRAME_HEADER_BYTES,
+            FRAME_HEADER_BYTES + 100,
+            frame - FRAME_TRAILER_BYTES,
+            frame - 1,
+        ];
+        for budget in cuts {
+            let path = tmp_log_path(&format!("failed_write_{budget}"));
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"first").unwrap();
+            log.sync().unwrap();
+
+            log.writer.get_mut().write_budget = Some(budget);
+            let failed = log.append(&[0xAB; BIG]).and_then(|_| log.sync());
+            assert!(failed.is_err(), "cut at {budget}: the write should fail");
+            log.writer.get_mut().write_budget = None;
+
+            assert_eq!(log.append(b"second").unwrap(), Lsn(1), "cut at {budget}");
+            log.sync().unwrap();
+            assert_eq!(log.append(b"third").unwrap(), Lsn(2), "cut at {budget}");
+            log.sync().unwrap();
+            let end = log.durable_end_offset();
+            drop(log);
+
+            assert_eq!(
+                read_all(&path),
+                vec![
+                    (0, b"first".to_vec()),
+                    (1, b"second".to_vec()),
+                    (2, b"third".to_vec())
+                ],
+                "cut at {budget}",
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                end,
+                "cut at {budget}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn a_failed_write_whose_cut_also_fails_blocks_appends_until_it_succeeds() {
+        let path = tmp_log_path("cut_fails");
+        let away = path.with_extension("away");
+        let mut log = IntentLog::open(&path).unwrap();
+        log.append(b"first").unwrap();
+        log.sync().unwrap();
+
+        // With the file moved, the writer's handle still reaches it but the
+        // cut, which reopens the path, cannot.
+        std::fs::rename(&path, &away).unwrap();
+        log.writer.get_mut().write_budget = Some(5);
+        assert!(log.append(&[0xAB; 10_000]).is_err());
+        assert!(
+            log.append(b"second").is_err(),
+            "an append after an uncut failed write must not write"
+        );
+        assert!(log.sync().is_err());
+
+        std::fs::rename(&away, &path).unwrap();
+        assert_eq!(log.append(b"second").unwrap(), Lsn(1));
+        log.sync().unwrap();
+        drop(log);
+        assert_eq!(
+            read_all(&path),
+            vec![(0, b"first".to_vec()), (1, b"second".to_vec())]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_cuts_a_torn_tail_so_the_next_append_is_readable() {
+        // A frame cut short at each point: inside len+lsn, after them, and
+        // inside the payload.
+        for keep in [3, FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + 4] {
+            let path = tmp_log_path(&format!("torn_open_{keep}"));
+            {
+                let mut log = IntentLog::open(&path).unwrap();
+                log.append(b"first").unwrap();
+                log.sync().unwrap();
+            }
+            append_raw(&path, &encode_frame(1, b"never-finished")[..keep]);
+
+            let mut log = IntentLog::open(&path).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                log.durable_end_offset(),
+                "keep {keep}: open should cut the torn frame",
+            );
+            assert_eq!(log.append(b"second").unwrap(), Lsn(1));
+            log.sync().unwrap();
+            drop(log);
+            assert_eq!(
+                read_all(&path),
+                vec![(0, b"first".to_vec()), (1, b"second".to_vec())],
+                "keep {keep}",
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn open_cuts_a_full_length_last_frame_that_never_reached_the_disk() {
+        // After a crash the file can keep a frame's length while its blocks
+        // read back as zeros; the frame is whole-sized but CRC-bad.
+        let path = tmp_log_path("zeroed_tail");
+        {
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"first").unwrap();
+            log.sync().unwrap();
+        }
+        let mut zeroed = encode_frame(1, b"lost-in-the-crash");
+        zeroed[FRAME_HEADER_BYTES..].fill(0);
+        append_raw(&path, &zeroed);
+        append_raw(&path, &[0u8; 40]);
+
+        let mut log = IntentLog::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            log.durable_end_offset()
+        );
+        assert_eq!(log.append(b"second").unwrap(), Lsn(1));
+        log.sync().unwrap();
+        drop(log);
+        assert_eq!(
+            read_all(&path),
+            vec![(0, b"first".to_vec()), (1, b"second".to_vec())]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_keeps_a_corrupt_frame_that_intact_frames_follow() {
+        // What a failed write left before this was fixed: a torn frame, then
+        // frames that were acknowledged as durable. Cutting at the torn frame
+        // would drop them, so open must leave the file alone.
+        let path = tmp_log_path("torn_mid_log");
+        {
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"first").unwrap();
+            log.sync().unwrap();
+        }
+        append_raw(
+            &path,
+            &encode_frame(1, &[0xAB; 10_000])[..FRAME_HEADER_BYTES],
+        );
+        append_raw(&path, &encode_frame(1, b"second"));
+        append_raw(&path, &encode_frame(2, b"third"));
+        let len_before = std::fs::metadata(&path).unwrap().len();
+
+        let log = IntentLog::open(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
+        let mut iter = log.iter().unwrap();
+        assert_eq!(iter.next().unwrap().unwrap().payload, b"first");
+        assert!(matches!(
+            iter.next().unwrap().unwrap_err(),
+            IntentLogError::TruncatedFrame { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn crc_corruption_detected() {
         let path = tmp_log_path("crc");
@@ -1126,6 +1490,7 @@ mod tests {
             let mut log = IntentLog::open(&path).unwrap();
             log.append(b"untouched").unwrap();
             log.append(b"will-be-flipped").unwrap();
+            log.append(b"after-the-flip").unwrap();
             log.sync().unwrap();
         }
         // Flip one byte inside the second payload.
@@ -1147,7 +1512,11 @@ mod tests {
             f.write_all(&b).unwrap();
             f.sync_data().unwrap();
         }
+        // An intact frame follows the flipped one, so open leaves the file
+        // as it is.
+        let len_before = std::fs::metadata(&path).unwrap().len();
         let log = IntentLog::open(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
         let mut iter = log.iter().unwrap();
         // First frame still good.
         let r0 = iter.next().unwrap().unwrap();

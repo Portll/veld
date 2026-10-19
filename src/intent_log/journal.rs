@@ -152,11 +152,10 @@ impl JournaledWriter {
     /// driver will retry on restart; idempotency in `apply` makes that
     /// safe.
     ///
-    /// If step 1, 2, or 3 fails, the call returns `Err` and no
-    /// projection is touched. The log may have a partial frame in this
-    /// case; `IntentLog::open` on the next process will detect it via
-    /// CRC mismatch / truncated frame and `truncate_corrupt_tail()`
-    /// will clear it.
+    /// If step 1, 2, or 3 fails, the call returns `Err`, no projection is
+    /// touched, and the record is not in the log: `IntentLog` cuts a failed
+    /// write back to the last synced frame and the next record takes its
+    /// LSN. A frame torn by a crash is cut by `IntentLog::open`.
     #[tracing::instrument(
         level = "info",
         name = "journal.record_and_apply",

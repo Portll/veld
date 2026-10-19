@@ -845,10 +845,10 @@ impl VeldBackupEngine {
     ///    `intent_log_target.source_dir`, verifying its SHA-256 against
     ///    the manifest. A mismatch aborts the restore (no partial state
     ///    on disk — files written so far are removed).
-    /// 4. Open the journal file via [`IntentLog::open`] and **iterate
-    ///    every frame**. A CRC mismatch or torn frame aborts the restore
-    ///    with a clear error — half-restoring a corrupt log is
-    ///    catastrophic and we refuse to do it.
+    /// 4. Open the journal file via [`IntentLog::open`], which cuts a torn
+    ///    tail, and **iterate every frame**. Any other CRC mismatch or
+    ///    truncated frame aborts the restore with a clear error —
+    ///    half-restoring a corrupt log is catastrophic and we refuse to do it.
     /// 5. If `options.max_lsn` is set, call
     ///    [`IntentLog::truncate_to_lsn`] on the freshly-restored journal
     ///    so that the final on-disk log ends at exactly that LSN.
