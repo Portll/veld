@@ -307,7 +307,13 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
         Ok(None) => {}
         Err(e) => error!("Replication: not following at boot: {e:#}"),
     }
-    tokio::spawn(crate::replication::run_follower(Arc::clone(&manager)));
+    let replication_shutdown = tokio_util::sync::CancellationToken::new();
+    manager
+        .task_tracker
+        .spawn(crate::replication::run_follower(
+            Arc::clone(&manager),
+            replication_shutdown.clone(),
+        ));
     start_embedding_backlog_drainer(Arc::clone(&manager));
 
     // Start backup scheduler if enabled
@@ -540,6 +546,7 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
     // Wait for shutdown signal (Ctrl+C / SIGTERM)
     shutdown_signal_with_drain().await;
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
+    replication_shutdown.cancel();
 
     // Tell the server to stop accepting new connections
     shutdown_notify.notify_one();

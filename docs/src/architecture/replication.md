@@ -67,14 +67,23 @@ Every interval: `GET status` on the leader; then each tenant is synced on its ow
   replays from the start.
 - **Leader unreachable.** The loop backs off the same way and logs a warning only when the
   error changes.
+- **Shutdown.** At the shutdown signal the follower starts no request and no page; a page
+  already being applied finishes and saves its cursor. The follower runs on the server's
+  task tracker, so the shutdown drain (up to 10 s) waits for that page before the store
+  flush and the vector-index save. Before this, it kept applying through both: on
+  2026-10-19 the replica applied frames for 51 s after "Server shutdown complete".
 
 A `follow` or `unfollow` bumps a generation number; a poll started under an older
 generation stops at its next page and writes nothing, so switching targets cannot mix
 two leaders' cursors.
 
-Status reports, per tenant: applied LSN, the leader's next LSN (so lag is
-`leader_head_lsn - 1 - applied_lsn`), frames consumed and journaled, failures, last error
-and divergence; and overall: pages applied, polls finished and the last leader error.
+Status reports, per tenant: applied LSN, the leader's next LSN, `lag` (leader frames not
+yet applied: `leader_head_lsn - 1 - applied_lsn`, or the whole log when nothing is
+applied), frames consumed and journaled, failures, last error and divergence; and overall:
+pages applied, polls (passes over every tenant) finished, when the current pass started
+(`pass_started`), the tenant it is syncing (`syncing`) and the last leader error. An
+initial sync is a single pass that can last hours, so `polls` stays at 0 through it;
+`pages`, `syncing` and `last_applied` show it moving.
 
 ## Limits, stated
 
