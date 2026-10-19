@@ -14,6 +14,12 @@
 //! A supervisor is never guessed from the environment: a process spawned by a
 //! launchd job inherits `XPC_SERVICE_NAME` without being the job. It is observed
 //! instead, as a new registry entry on the same port after the old pid is gone.
+//!
+//! A launchd job is asked rather than observed: when launchd names the pid as a
+//! job's main process, the job is started again with `launchctl kickstart` once
+//! the graceful stop has finished. Relaunching it from a recipe would take it out
+//! of launchd's KeepAlive and resource limits, and launchd itself does not bring it
+//! back after a clean exit when KeepAlive sets `SuccessfulExit` false.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -72,8 +78,10 @@ pub struct RestartOutcome {
     pub missing_env: Vec<String>,
     /// The variables that were given to the new process, by name.
     pub carried_env: Vec<String>,
-    /// Where the recipe came from: `registry`, `recipe` or `supervisor`.
+    /// Where the recipe came from: `registry`, `recipe`, `supervisor` or `launchd`.
     pub recipe_source: String,
+    /// The launchd job that was started again, as `gui/<uid>/<label>`.
+    pub supervisor: Option<String>,
 }
 
 fn fail(msg: impl Into<String>) -> StatusError {
@@ -198,6 +206,59 @@ fn capture_env(pid: u32) -> Option<Vec<(String, String)>> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn capture_env(_pid: u32) -> Option<Vec<(String, String)>> {
     None
+}
+
+/// The label of the job whose main process is `pid`, from `launchctl list` output
+/// (`PID\tStatus\tLabel`); a job that is not running shows `-` as its pid.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn launchd_label(listing: &str, pid: u32) -> Option<String> {
+    let pid = pid.to_string();
+    listing.lines().find_map(|line| {
+        let mut cols = line.split('\t');
+        let (job_pid, _status, label) = (cols.next()?, cols.next()?, cols.next()?);
+        (job_pid == pid).then(|| label.trim().to_string())
+    })
+}
+
+/// The launchd job whose main process is `pid`, as a `gui/<uid>/<label>` or
+/// `user/<uid>/<label>` service target. A process a job's script spawned without
+/// `exec` is not the main process and is not found. Blocking.
+#[cfg(target_os = "macos")]
+fn launchd_job(pid: u32) -> Option<String> {
+    let run = |args: &[&str]| -> Option<String> {
+        let out = Command::new(args[0]).args(&args[1..]).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let label = launchd_label(&run(&["launchctl", "list"])?, pid)?;
+    let uid = run(&["id", "-u"])?.trim().to_string();
+    ["gui", "user"]
+        .iter()
+        .map(|domain| format!("{domain}/{uid}/{label}"))
+        .find(|target| run(&["launchctl", "print", target]).is_some())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_job(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Start a launchd job that is not running. Without `-k`: that flag stops a running
+/// job first and kills it once the job's exit timeout passes, mid-flush for a server.
+fn kickstart(job: &str) -> Result<()> {
+    let out = Command::new("launchctl")
+        .args(["kickstart", job])
+        .output()
+        .map_err(|e| fail(format!("launchctl kickstart {job}: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(fail(format!(
+            "launchctl kickstart {job} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
 }
 
 /// The command line of a live process, executable first. `ps -o comm=` gives the
@@ -424,13 +485,36 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
         if pid == 0 {
             return Err(fail("the registry entry carries no pid"));
         }
-        captured = tokio::task::spawn_blocking(move || capture_env(pid))
+        let (env, job) = tokio::task::spawn_blocking(move || (capture_env(pid), launchd_job(pid)))
             .await
-            .map_err(|e| fail(e.to_string()))?
-            .unwrap_or_default();
+            .map_err(|e| fail(e.to_string()))?;
+        captured = env.unwrap_or_default();
 
         terminate(pid)?;
         wait_for_exit(pid).await?;
+
+        if let Some(job) = job {
+            let target = job.clone();
+            tokio::task::spawn_blocking(move || kickstart(&target))
+                .await
+                .map_err(|e| fail(e.to_string()))??;
+            if !wait_for_health(&http, &base_url).await {
+                return Err(fail(format!(
+                    "launchd started {job} again but {base_url} has not answered /health after {}s",
+                    READY_TIMEOUT.as_secs()
+                )));
+            }
+            return Ok(RestartOutcome {
+                base_url,
+                pid: None,
+                supervised: true,
+                log_path: None,
+                missing_env: Vec::new(),
+                carried_env: Vec::new(),
+                recipe_source: "launchd".into(),
+                supervisor: Some(job),
+            });
+        }
 
         let port = inst.port;
         let grace_end = Instant::now() + SUPERVISOR_GRACE;
@@ -454,6 +538,7 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
                     missing_env: Vec::new(),
                     carried_env: Vec::new(),
                     recipe_source: "supervisor".into(),
+                    supervisor: None,
                 });
             }
             tokio::time::sleep(POLL).await;
@@ -548,6 +633,7 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
                 missing_env,
                 carried_env,
                 recipe_source: recipe_source.into(),
+                supervisor: None,
             });
         }
         tokio::time::sleep(POLL).await;
@@ -563,6 +649,21 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launchd_label_is_the_job_whose_main_process_is_the_pid() {
+        let listing = "PID\tStatus\tLabel\n\
+                       -\t0\tnet.portll.veld-upstream-triage\n\
+                       50447\t-9\tnet.portll.veld-redb-replica\n\
+                       4404\t0\tnet.portll.veld-embedder\n";
+        assert_eq!(
+            launchd_label(listing, 50447).as_deref(),
+            Some("net.portll.veld-redb-replica")
+        );
+        assert_eq!(launchd_label(listing, 5044), None);
+        assert_eq!(launchd_label(listing, 0), None);
+        assert_eq!(launchd_label("", 50447), None);
+    }
 
     #[test]
     fn split_cmdline_keeps_an_executable_path_with_spaces() {
