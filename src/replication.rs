@@ -346,22 +346,7 @@ pub fn feed(
         (guard.log().iter()?, guard.log().next_lsn().0, log_created)
     };
     let floor = after_lsn.map(|l| l + 1).unwrap_or(0);
-    let mut records = Vec::new();
-    let mut more = false;
-    for frame in iter {
-        let record = frame.context("reading the intent log")?;
-        if record.lsn.0 < floor {
-            continue;
-        }
-        if records.len() >= limit {
-            more = true;
-            break;
-        }
-        records.push(FeedRecord {
-            lsn: record.lsn.0,
-            frame_b64: base64::engine::general_purpose::STANDARD.encode(&record.payload),
-        });
-    }
+    let (records, more) = page_below_head(iter, floor, head_lsn, limit)?;
     Ok(FeedPage {
         user_id: user_id.to_string(),
         records,
@@ -369,6 +354,45 @@ pub fn feed(
         more,
         log_created,
     })
+}
+
+/// Frames from `floor` up to `limit`, ending at the last frame below `head_lsn`.
+/// The file is read after the writer lock is released, so anything at or past the
+/// head was appended later: it may still be partly flushed (and read as torn) or be
+/// rolled back by a failed sync, after which its LSN names a different frame. LSNs
+/// are contiguous, so the frame at `head_lsn - 1` is the last one read.
+fn page_below_head<E>(
+    frames: impl Iterator<Item = std::result::Result<crate::intent_log::IntentRecord, E>>,
+    floor: u64,
+    head_lsn: u64,
+    limit: usize,
+) -> Result<(Vec<FeedRecord>, bool)>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut records = Vec::new();
+    if floor >= head_lsn {
+        return Ok((records, false));
+    }
+    for frame in frames {
+        let record = frame.context("reading the intent log")?;
+        if record.lsn.0 >= head_lsn {
+            break;
+        }
+        if record.lsn.0 >= floor {
+            if records.len() >= limit {
+                return Ok((records, true));
+            }
+            records.push(FeedRecord {
+                lsn: record.lsn.0,
+                frame_b64: base64::engine::general_purpose::STANDARD.encode(&record.payload),
+            });
+        }
+        if record.lsn.0 + 1 == head_lsn {
+            break;
+        }
+    }
+    Ok((records, false))
 }
 
 /// Why a tenant's cursor no longer fits the leader's log, or None when it does.
@@ -1193,6 +1217,41 @@ mod tests {
         assert_eq!(out.chars().count(), MAX_ECHO_CHARS + 1);
         assert!(out.ends_with('…'));
         assert_eq!(echo("  short  "), "short");
+    }
+
+    fn record(lsn: u64) -> std::result::Result<crate::intent_log::IntentRecord, std::io::Error> {
+        Ok(crate::intent_log::IntentRecord {
+            lsn: crate::intent_log::Lsn(lsn),
+            payload: vec![lsn as u8],
+        })
+    }
+
+    fn lsns(page: &[FeedRecord]) -> Vec<u64> {
+        page.iter().map(|r| r.lsn).collect()
+    }
+
+    #[test]
+    fn the_feed_ends_below_the_head_it_captured() {
+        let torn = || std::iter::once(Err(std::io::Error::other("truncated frame")));
+
+        let appended_after_capture = (0..5).map(record).chain(torn());
+        let (page, more) = page_below_head(appended_after_capture, 0, 4, 500).unwrap();
+        assert_eq!(lsns(&page), vec![0, 1, 2, 3], "frame 4 came after the head was read");
+        assert!(!more);
+
+        let (page, _) = page_below_head((0..4).map(record).chain(torn()), 2, 4, 500)
+            .expect("a frame being flushed past the head is never read");
+        assert_eq!(lsns(&page), vec![2, 3]);
+
+        let (page, more) = page_below_head((0..4).map(record), 0, 4, 2).unwrap();
+        assert_eq!(lsns(&page), vec![0, 1]);
+        assert!(more);
+        let (page, more) = page_below_head((0..2).map(record), 0, 2, 2).unwrap();
+        assert_eq!(lsns(&page), vec![0, 1]);
+        assert!(!more, "the page that reaches the head is the last");
+
+        let (page, more) = page_below_head((0..4).map(record).chain(torn()), 4, 4, 500).unwrap();
+        assert!(page.is_empty() && !more);
     }
 
     fn frame(lsn: u64, id: &str, kind: &str) -> (u64, IntentPayload) {
