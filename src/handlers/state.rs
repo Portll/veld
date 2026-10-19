@@ -298,6 +298,11 @@ pub struct MultiUserMemoryManager {
     /// access; this guards against re-running it on every cache miss.
     reconciled_users: DashMap<String, ()>,
 
+    /// Callers that missed the tenant cache and do not have their tenant yet: the one
+    /// opening it and any queued on its init lock. Non-zero means a tenant is opening,
+    /// and `/health/ready` answers 503 until it has.
+    tenant_open_waiters: std::sync::atomic::AtomicUsize,
+
     /// (b) Live wiki edit-back watchers, one per user, kept alive here so the
     /// `notify` watcher keeps running (dropping the handle stops it). The
     /// `Mutex` only satisfies `Sync` — the value is a keep-alive handle, never
@@ -371,6 +376,23 @@ pub(crate) fn list_user_dirs(base_path: &std::path::Path) -> std::io::Result<Vec
     }
     users.sort();
     Ok(users)
+}
+
+/// One count in `MultiUserMemoryManager::tenant_open_waiters` for as long as it lives, so
+/// every way out of `get_user_memory`'s slow path, errors included, gives it back.
+struct TenantOpenWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> TenantOpenWaiter<'a> {
+    fn enter(waiters: &'a std::sync::atomic::AtomicUsize) -> Self {
+        waiters.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(waiters)
+    }
+}
+
+impl Drop for TenantOpenWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl MultiUserMemoryManager {
@@ -698,6 +720,7 @@ impl MultiUserMemoryManager {
             journaled_writers: DashMap::new(),
             journaled_writer_init_locks: DashMap::new(),
             reconciled_users: DashMap::new(),
+            tenant_open_waiters: std::sync::atomic::AtomicUsize::new(0),
             wiki_watchers: DashMap::new(),
             storage_capabilities,
             user_auth_runtime,
@@ -1394,11 +1417,19 @@ impl MultiUserMemoryManager {
     /// Uses double-checked locking to prevent TOCTOU races where concurrent
     /// first-access requests both miss the cache and try to open RocksDB.
     /// RocksDB holds exclusive file locks, so the second open would fail.
+    ///
+    /// A miss opens the tenant on the calling thread, and every concurrent caller for
+    /// that tenant waits on its init lock until the open is done: 11.7 s for the live
+    /// server's largest tenant and 10 min for the redb replica's on 2026-10-19. Async
+    /// code calls [`Self::get_user_memory_async`] instead; each tokio worker parked here
+    /// is one fewer to run `/health` on, and enough of them stop it answering at all.
     pub fn get_user_memory(&self, user_id: &str) -> Result<SharedUserMemory> {
         // Fast path: already cached
         if let Some(memory) = self.user_memories.get(user_id) {
             return Ok(memory);
         }
+
+        let _waiter = TenantOpenWaiter::enter(&self.tenant_open_waiters);
 
         // Acquire per-user creation lock to serialize initialization
         let lock = self
@@ -1509,6 +1540,40 @@ impl MultiUserMemoryManager {
         }
 
         Ok(memory_arc)
+    }
+
+    /// [`Self::get_user_memory`] for async code. A cached tenant comes back at once; an
+    /// open, or a wait behind one, runs on the blocking pool so the worker stays free for
+    /// other requests and the probes. A request dropped mid-open leaves the open to finish
+    /// and cache the tenant for the next one.
+    pub async fn get_user_memory_async(
+        self: &Arc<Self>,
+        user_id: &str,
+    ) -> Result<SharedUserMemory> {
+        if let Some(memory) = self.user_memories.get(user_id) {
+            return Ok(memory);
+        }
+        let manager = Arc::clone(self);
+        let user_id = user_id.to_string();
+        tokio::task::spawn_blocking(move || manager.get_user_memory(&user_id))
+            .await
+            .context("tenant open task did not complete")?
+    }
+
+    /// Callers in `get_user_memory`'s slow path right now; see `tenant_open_waiters`.
+    pub fn tenant_open_waiters(&self) -> usize {
+        self.tenant_open_waiters
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The lock `get_user_memory` opens `user_id` under. Holding it stands in for an
+    /// open that is taking as long as a large tenant's does.
+    #[cfg(test)]
+    pub(crate) fn user_memory_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
+        self.user_memory_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
     }
 
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).

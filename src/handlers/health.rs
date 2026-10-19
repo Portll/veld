@@ -67,16 +67,19 @@ fn write_latch_fields(
     (status.to_string(), latched)
 }
 
-/// Readiness under the write latch. 503 when ANY store is hard-latched; a soft
-/// latch is still inside its bounded recovery and the next write may land.
-/// Returns the hard-latched store count, which the status code cannot carry and
-/// which is the difference between one tenant affected and all of them.
+/// Readiness. 503 while the shared stores are unusable, while a tenant is opening
+/// (`tenant_open_waiters` callers are waiting on one), or when ANY store is
+/// hard-latched; a soft latch is still inside its bounded recovery and the next
+/// write may land. Returns the hard-latched store count, which the status code
+/// cannot carry and which is the difference between one tenant affected and all
+/// of them.
 fn ready_decision(
-    ready: bool,
+    shared_stores_ready: bool,
+    tenant_open_waiters: usize,
     latch: &crate::storage::write_latch::WriteLatch,
 ) -> (StatusCode, &'static str, usize) {
     let hard_stores = latch.hard_count();
-    if ready && hard_stores == 0 {
+    if shared_stores_ready && tenant_open_waiters == 0 && hard_stores == 0 {
         (StatusCode::OK, "ready", 0)
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not_ready", hard_stores)
@@ -130,8 +133,12 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
 /// router reads `?user_id=` for per-tenant data — see `PUBLIC_PATHS` in
 /// `router.rs` and the `public_router_has_no_per_user_handlers` test.
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let (status_code, status_str, hard_stores) =
-        ready_decision(state.is_ready(), crate::storage::write_latch::global());
+    let tenant_open_waiters = state.tenant_open_waiters();
+    let (status_code, status_str, hard_stores) = ready_decision(
+        state.is_ready(),
+        tenant_open_waiters,
+        crate::storage::write_latch::global(),
+    );
 
     let users_in_cache = state.users_in_cache();
     let mut body = serde_json::json!({
@@ -139,10 +146,12 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<se
         "version": env!("VELD_VERSION_FULL"),
         "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
         "users_in_cache": users_in_cache,
+        "tenant_open_waiters": tenant_open_waiters,
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
-    if hard_stores > 0 {
-        if let Some(object) = body.as_object_mut() {
+    if let Some(object) = body.as_object_mut() {
+        // A hard latch outranks an open: the open finishes by itself, the latch needs a restart.
+        if hard_stores > 0 {
             object.insert(
                 "reason".to_string(),
                 serde_json::json!("storage_write_latched"),
@@ -151,6 +160,8 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<se
                 "hard_latched_stores".to_string(),
                 serde_json::json!(hard_stores),
             );
+        } else if tenant_open_waiters > 0 {
+            object.insert("reason".to_string(), serde_json::json!("tenant_opening"));
         }
     }
     (status_code, Json(body))
@@ -288,7 +299,9 @@ pub async fn health_index(State(state): State<AppState>) -> (StatusCode, Json<se
     let mut users_with_shortfall: usize = 0;
     let mut users_coverage_unreadable: usize = 0;
     for user_id in state.list_cached_users() {
-        if let Ok(memory) = state.get_user_memory(&user_id) {
+        // The cache itself, not get_user_memory: a tenant evicted since the listing
+        // would otherwise be reopened by this probe, on the worker serving it.
+        if let Some(memory) = state.user_memories.get(&user_id) {
             let guard = memory.read();
             let h = guard.index_health();
             total_vectors += h.total_vectors;
@@ -705,7 +718,7 @@ mod write_latch_reporting {
         let latch = WriteLatch::new();
         latch_at(&latch, "/var/lib/veld/users/tenant-a/storage");
 
-        let (code, status, hard_stores) = ready_decision(true, &latch);
+        let (code, status, hard_stores) = ready_decision(true, 0, &latch);
         assert_eq!(code, StatusCode::OK);
         assert_eq!(status, "ready");
         assert_eq!(hard_stores, 0);
@@ -720,7 +733,7 @@ mod write_latch_reporting {
         latch_at(&latch, b);
         latch.mark_hard(Path::new(b));
 
-        let (code, status, hard_stores) = ready_decision(true, &latch);
+        let (code, status, hard_stores) = ready_decision(true, 0, &latch);
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(status, "not_ready");
         assert_eq!(
@@ -732,11 +745,157 @@ mod write_latch_reporting {
     #[test]
     fn ready_is_unaffected_when_nothing_is_latched() {
         let latch = WriteLatch::new();
-        assert_eq!(ready_decision(true, &latch).0, StatusCode::OK);
+        assert_eq!(ready_decision(true, 0, &latch).0, StatusCode::OK);
         assert_eq!(
-            ready_decision(false, &latch).0,
+            ready_decision(false, 0, &latch).0,
             StatusCode::SERVICE_UNAVAILABLE
         );
-        assert_eq!(ready_decision(false, &latch).2, 0);
+        assert_eq!(ready_decision(false, 0, &latch).2, 0);
+    }
+
+    #[test]
+    fn ready_returns_503_while_a_tenant_is_opening_and_200_once_it_has() {
+        let latch = WriteLatch::new();
+        let (code, status, hard_stores) = ready_decision(true, 3, &latch);
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, "not_ready");
+        assert_eq!(hard_stores, 0, "an open is not a latch");
+        assert_eq!(ready_decision(true, 0, &latch).0, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod probes_while_a_tenant_opens {
+    //! Each first request for a tenant still opening used to park a tokio worker on the
+    //! tenant's init lock. On 2026-10-19 the live server took 11.7 s to open its largest
+    //! tenant, and six websocket handshakes that had waited for a worker all logged within
+    //! 0.4 ms of the open finishing; the redb replica's open of the same tenant took 10 min.
+    use super::*;
+    use crate::handlers::router::build_probe_routes;
+    use crate::handlers::test_helpers::{get, get_unauthenticated, post_json, send, TestHarness};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const WORKERS: usize = 2;
+    const TENANT: &str = "tenant-mid-open";
+
+    /// Sends `uri` from a spawned task, which needs a free worker as a real connection's
+    /// does, and waits on this thread, which is not a worker.
+    fn probe(app: &axum::Router, uri: &str) -> Option<(StatusCode, serde_json::Value)> {
+        let (tx, rx) = mpsc::channel();
+        let app = app.clone();
+        let request = get_unauthenticated(uri);
+        tokio::spawn(async move {
+            let _ = tx.send(send(app, request).await);
+        });
+        rx.recv_timeout(Duration::from_secs(5)).ok()
+    }
+
+    fn wait_for_open_waiters(manager: &MultiUserMemoryManager, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while manager.tenant_open_waiters() < count {
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {count} requests reached the tenant open",
+                manager.tenant_open_waiters()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probes_answer_while_first_requests_wait_on_a_tenant_open() {
+        let harness = TestHarness::new();
+        let app = harness.router().merge(build_probe_routes(harness.state()));
+
+        // An open holds the tenant's init lock until it is done. Hold it the same way.
+        let init_lock = harness.manager.user_memory_init_lock(TENANT);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let opener = std::thread::spawn(move || {
+            let _open = init_lock.lock();
+            held_tx.send(()).expect("test waits for the hold");
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().expect("init lock held");
+
+        // Twice as many first requests as the runtime has workers, one per hot path.
+        let requests = vec![
+            post_json(
+                "/api/remember",
+                &serde_json::json!({"user_id": TENANT, "content": "written while the tenant opened"}),
+            ),
+            post_json(
+                "/api/recall",
+                &serde_json::json!({"user_id": TENANT, "query": "tenant opened"}),
+            ),
+            post_json(
+                "/api/upsert",
+                &serde_json::json!({"user_id": TENANT, "external_id": "probe:1", "content": "upserted while the tenant opened"}),
+            ),
+            get(&format!("/api/list/{TENANT}")),
+        ];
+        assert_eq!(requests.len(), WORKERS * 2);
+        let waiters: Vec<_> = requests
+            .into_iter()
+            .map(|request| tokio::spawn(send(app.clone(), request)))
+            .collect();
+        wait_for_open_waiters(&harness.manager, WORKERS * 2);
+
+        let health = probe(&app, "/health");
+        let ready = probe(&app, "/health/ready");
+
+        release_tx.send(()).expect("opener waits for release");
+        opener.join().expect("opener thread");
+        for waiter in waiters {
+            let (status, body) = waiter.await.expect("request task");
+            assert!(status.is_success(), "{status}: {body}");
+        }
+        let ready_after = probe(&app, "/health/ready");
+
+        let (status, _) =
+            health.expect("/health did not answer while requests waited on a tenant open");
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) =
+            ready.expect("/health/ready did not answer while requests waited on a tenant open");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["reason"], "tenant_opening");
+        assert_eq!(body["tenant_open_waiters"], WORKERS * 2);
+
+        let (status, body) = ready_after.expect("/health/ready answers after the open");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["tenant_open_waiters"], 0);
+        assert!(body.get("reason").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_async_accessor_hands_back_the_one_cached_tenant() {
+        let harness = TestHarness::new();
+        let opened = harness
+            .manager
+            .get_user_memory_async("tenant-a")
+            .await
+            .expect("first open");
+        let cached = harness
+            .manager
+            .get_user_memory_async("tenant-a")
+            .await
+            .expect("cached");
+        let sync = harness.manager.get_user_memory("tenant-a").expect("sync");
+        assert!(std::sync::Arc::ptr_eq(&opened, &cached));
+        assert!(std::sync::Arc::ptr_eq(&opened, &sync));
+        assert_eq!(harness.manager.tenant_open_waiters(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_is_not_left_counted_as_opening() {
+        let harness = TestHarness::new();
+        assert!(harness
+            .manager
+            .get_user_memory_async("../escape")
+            .await
+            .is_err());
+        assert_eq!(harness.manager.tenant_open_waiters(), 0);
     }
 }
