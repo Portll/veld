@@ -33,15 +33,16 @@
 //! - **Manual**: Explicit flush via `{ type: "flush" }` message
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::embeddings::{NerEntity, NeuralNer};
 use crate::graph_memory::GraphMemory;
-use crate::memory::{Experience, ExperienceType, Query as MemoryQuery};
+use crate::memory::{Experience, ExperienceType, MemoryId, Query as MemoryQuery};
 use crate::similarity::cosine_similarity;
 use crate::user_memory::SharedUserMemory;
 
@@ -706,21 +707,57 @@ impl StreamSession {
     }
 }
 
+/// Shared handle to one session. The mutex is only ever held for short,
+/// synchronous bookkeeping and never across an `.await` or blocking work, so one
+/// connection's flush cannot stall another connection's messages.
+type SessionHandle = Arc<Mutex<StreamSession>>;
+
+/// Result of running one drained buffer through NER and the deferred write path.
+struct BatchOutcome {
+    /// Every id the store returned, as strings for the wire result.
+    memory_ids: Vec<String>,
+    /// Ids that still need their embedding computed and vector indexing done.
+    pending_index: Vec<MemoryId>,
+    entities: Vec<DetectedEntity>,
+    dedupe_skipped: usize,
+}
+
 /// Streaming Memory Extractor - core processing engine
 pub struct StreamingMemoryExtractor {
     /// Neural NER for entity extraction
     neural_ner: Arc<NeuralNer>,
 
-    /// Active sessions
-    sessions: Arc<RwLock<HashMap<String, StreamSession>>>,
-    // PIPE-9: feedback_store removed - feedback momentum now applied in MemorySystem pipeline
+    /// Active sessions, one lock per session
+    sessions: Arc<DashMap<String, SessionHandle>>,
+    /// Tracks the background embed passes so shutdown waits for them.
+    task_tracker: Option<tokio_util::task::TaskTracker>,
 }
 
 impl StreamingMemoryExtractor {
     pub fn new(neural_ner: Arc<NeuralNer>) -> Self {
         Self {
             neural_ner,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(DashMap::new()),
+            task_tracker: None,
+        }
+    }
+
+    pub fn with_task_tracker(mut self, tracker: tokio_util::task::TaskTracker) -> Self {
+        self.task_tracker = Some(tracker);
+        self
+    }
+
+    /// Clone the handle out of the map so no shard guard is held while the caller works.
+    fn session(&self, session_id: &str) -> Option<SessionHandle> {
+        self.sessions.get(session_id).map(|entry| entry.clone())
+    }
+
+    fn session_not_found(session_id: &str) -> ExtractionResult {
+        ExtractionResult::Error {
+            code: "SESSION_NOT_FOUND".to_string(),
+            message: format!("Session {} not found", session_id),
+            fatal: true,
+            timestamp: Utc::now(),
         }
     }
 
@@ -729,10 +766,8 @@ impl StreamingMemoryExtractor {
         // Cleanup stale sessions first
         self.cleanup_stale_sessions().await;
 
-        let mut sessions = self.sessions.write().await;
-
         // Check max concurrent sessions limit
-        if sessions.len() >= MAX_CONCURRENT_SESSIONS {
+        if self.sessions.len() >= MAX_CONCURRENT_SESSIONS {
             return Err(format!(
                 "Maximum concurrent sessions ({}) reached. Try again later.",
                 MAX_CONCURRENT_SESSIONS
@@ -741,19 +776,24 @@ impl StreamingMemoryExtractor {
 
         let session = StreamSession::new(handshake);
         let session_id = session.session_id.clone();
-        sessions.insert(session_id.clone(), session);
+        self.sessions
+            .insert(session_id.clone(), Arc::new(Mutex::new(session)));
 
         Ok(session_id)
     }
 
     /// Remove stale sessions that have been inactive for too long
     pub async fn cleanup_stale_sessions(&self) -> usize {
-        let mut sessions = self.sessions.write().await;
-        let before_count = sessions.len();
+        let before_count = self.sessions.len();
 
-        sessions.retain(|_id, session| !session.is_stale());
+        // A session whose mutex is held is processing a message right now, so it is
+        // not stale; `try_lock` keeps the sweep from ever waiting on a connection.
+        self.sessions.retain(|_id, handle| match handle.try_lock() {
+            Some(session) => !session.is_stale(),
+            None => true,
+        });
 
-        let removed = before_count - sessions.len();
+        let removed = before_count.saturating_sub(self.sessions.len());
         if removed > 0 {
             tracing::info!("Cleaned up {} stale streaming sessions", removed);
         }
@@ -762,7 +802,7 @@ impl StreamingMemoryExtractor {
 
     /// Get current session count
     pub async fn session_count(&self) -> usize {
-        self.sessions.read().await.len()
+        self.sessions.len()
     }
 
     /// Process incoming message
@@ -772,22 +812,13 @@ impl StreamingMemoryExtractor {
         message: StreamMessage,
         memory_system: SharedUserMemory,
     ) -> ExtractionResult {
-        let mut sessions = self.sessions.write().await;
-
-        let session = match sessions.get_mut(session_id) {
-            Some(s) => s,
-            None => {
-                return ExtractionResult::Error {
-                    code: "SESSION_NOT_FOUND".to_string(),
-                    message: format!("Session {} not found", session_id),
-                    fatal: true,
-                    timestamp: Utc::now(),
-                }
-            }
+        let handle = match self.session(session_id) {
+            Some(h) => h,
+            None => return Self::session_not_found(session_id),
         };
 
         // Update activity timestamp to prevent stale session cleanup
-        session.touch();
+        handle.lock().touch();
 
         match message {
             StreamMessage::Content {
@@ -807,16 +838,18 @@ impl StreamingMemoryExtractor {
                     metadata,
                 };
 
-                let buffered = session.buffer_message(msg);
+                let should_extract = {
+                    let mut session = handle.lock();
+                    let buffered = session.buffer_message(msg);
 
-                // Check triggers
-                let should_extract = session.should_extract_by_time()
-                    || session.should_extract_by_size()
-                    || !buffered; // Force extract if couldn't buffer (duplicate)
+                    // Check triggers
+                    session.should_extract_by_time()
+                        || session.should_extract_by_size()
+                        || !buffered // Force extract if couldn't buffer (duplicate)
+                };
 
                 if should_extract {
-                    drop(sessions);
-                    return self.extract_memories(session_id, memory_system).await;
+                    return self.extract_memories(&handle, memory_system).await;
                 }
 
                 ExtractionResult::Ack {
@@ -832,28 +865,13 @@ impl StreamingMemoryExtractor {
                 severity,
                 data,
             } => {
-                // Release the guard taken at the top of this function before doing
-                // anything that locks again. `tokio::sync::RwLock` is NOT reentrant,
-                // so the read below — and the write further down, and
-                // `extract_memories`, which locks internally — would each block
-                // forever on a guard this same task is holding. Every re-acquire
-                // below already handles the session being gone, so dropping here is
-                // safe as well as necessary.
-                drop(sessions);
-
                 // Check if this event type triggers immediate extraction
-                let is_trigger = {
-                    let sessions = self.sessions.read().await;
-                    sessions
-                        .get(session_id)
-                        .map(|s| {
-                            s.config
-                                .trigger_events
-                                .iter()
-                                .any(|t| t.eq_ignore_ascii_case(&event))
-                        })
-                        .unwrap_or(false)
-                };
+                let is_trigger = handle
+                    .lock()
+                    .config
+                    .trigger_events
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(&event));
 
                 let content = format!(
                     "[{}] {}: {}",
@@ -873,15 +891,10 @@ impl StreamingMemoryExtractor {
                     metadata,
                 };
 
-                {
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(session) = sessions.get_mut(session_id) {
-                        session.buffer_message(msg);
-                    }
-                }
+                handle.lock().buffer_message(msg);
 
                 if is_trigger {
-                    return self.extract_memories(session_id, memory_system).await;
+                    return self.extract_memories(&handle, memory_system).await;
                 }
 
                 ExtractionResult::Ack {
@@ -896,11 +909,6 @@ impl StreamingMemoryExtractor {
                 timestamp,
                 units,
             } => {
-                // Same reason as the Event arm: the write below and
-                // `extract_memories` both lock, and this task still holds the guard
-                // from the top of the function. Non-reentrant lock, so drop first.
-                drop(sessions);
-
                 // Format sensor reading as content
                 let mut parts: Vec<String> = Vec::new();
                 for (key, value) in &values {
@@ -919,23 +927,14 @@ impl StreamingMemoryExtractor {
                 };
 
                 let should_extract = {
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(session) = sessions.get_mut(session_id) {
-                        session.buffer_message(msg);
-                        session.should_extract_by_time() || session.should_extract_by_size()
-                    } else {
-                        return ExtractionResult::Error {
-                            code: "SESSION_NOT_FOUND".to_string(),
-                            message: format!("Session '{}' not found", session_id),
-                            fatal: true,
-                            timestamp: Utc::now(),
-                        };
-                    }
+                    let mut session = handle.lock();
+                    session.buffer_message(msg);
+                    session.should_extract_by_time() || session.should_extract_by_size()
                 };
 
                 // Sensors use time-based extraction primarily
                 if should_extract {
-                    return self.extract_memories(session_id, memory_system).await;
+                    return self.extract_memories(&handle, memory_system).await;
                 }
 
                 ExtractionResult::Ack {
@@ -944,10 +943,7 @@ impl StreamingMemoryExtractor {
                 }
             }
 
-            StreamMessage::Flush => {
-                drop(sessions);
-                self.extract_memories(session_id, memory_system).await
-            }
+            StreamMessage::Flush => self.extract_memories(&handle, memory_system).await,
 
             StreamMessage::Ping => ExtractionResult::Ack {
                 message_type: "ping".to_string(),
@@ -956,16 +952,11 @@ impl StreamingMemoryExtractor {
 
             StreamMessage::Close => {
                 // Final extraction before closing
-                drop(sessions);
-                let final_result = self.extract_memories(session_id, memory_system).await;
+                let final_result = self.extract_memories(&handle, memory_system).await;
 
                 // Get total count and remove session
-                let mut sessions = self.sessions.write().await;
-                let total = sessions
-                    .get(session_id)
-                    .map(|s| s.total_memories_created)
-                    .unwrap_or(0);
-                sessions.remove(session_id);
+                let total = handle.lock().total_memories_created;
+                self.sessions.remove(session_id);
 
                 ExtractionResult::Closed {
                     reason: "client_requested".to_string(),
@@ -982,35 +973,28 @@ impl StreamingMemoryExtractor {
         }
     }
 
-    /// Extract memories from buffered messages
+    /// Extract memories from buffered messages.
+    ///
+    /// The buffer is drained under the session lock, then the lock is released before
+    /// any NER or storage work. That work is synchronous (ONNX/HTTP embedding
+    /// lookups, RocksDB, tantivy) so it runs on the blocking pool, with the user's
+    /// memory read lock taken once for the whole batch.
     async fn extract_memories(
         &self,
-        session_id: &str,
+        handle: &SessionHandle,
         memory_system: SharedUserMemory,
     ) -> ExtractionResult {
         let start = std::time::Instant::now();
 
-        // Get session and drain buffer
         let (messages, config, user_metadata, mode) = {
-            let mut sessions = self.sessions.write().await;
-            let session = match sessions.get_mut(session_id) {
-                Some(s) => s,
-                None => {
-                    return ExtractionResult::Error {
-                        code: "SESSION_NOT_FOUND".to_string(),
-                        message: format!("Session {} not found", session_id),
-                        fatal: true,
-                        timestamp: Utc::now(),
-                    }
-                }
-            };
-
+            let mut session = handle.lock();
             let messages = session.drain_buffer();
-            let config = session.config.clone();
-            let metadata = session.metadata.clone();
-            let mode = session.mode;
-
-            (messages, config, metadata, mode)
+            (
+                messages,
+                session.config.clone(),
+                session.metadata.clone(),
+                session.mode,
+            )
         };
 
         if messages.is_empty() {
@@ -1024,40 +1008,114 @@ impl StreamingMemoryExtractor {
             };
         }
 
-        let mut memory_ids = Vec::new();
-        let mut all_entities = Vec::new();
-        let mut dedupe_skipped = 0;
+        let ner = self.neural_ner.clone();
+        let memory_for_batch = memory_system.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            Self::process_batch(
+                &ner,
+                &memory_for_batch,
+                messages,
+                mode,
+                &config,
+                &user_metadata,
+            )
+        })
+        .await;
 
-        // Process each buffered message
-        for msg in messages {
-            // Calculate importance
-            let importance = msg
-                .importance
-                .unwrap_or_else(|| Self::calculate_importance(&msg.content, mode, &config));
-
-            // Skip low importance content
-            if importance < config.min_importance {
-                dedupe_skipped += 1;
-                continue;
+        let BatchOutcome {
+            memory_ids,
+            pending_index,
+            entities,
+            dedupe_skipped,
+        } = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!("Streaming extraction task failed: {e}");
+                return ExtractionResult::Error {
+                    code: "EXTRACTION_FAILED".to_string(),
+                    message: "Streaming extraction task failed".to_string(),
+                    fatal: false,
+                    timestamp: Utc::now(),
+                };
             }
+        };
 
-            // Extract entities if enabled
-            let entities: Vec<NerEntity> = if config.extract_entities {
-                match self.neural_ner.extract(&msg.content) {
-                    Ok(ents) => ents,
-                    Err(e) => {
-                        tracing::debug!("NER extraction failed: {}", e);
-                        Vec::new()
+        handle.lock().total_memories_created += memory_ids.len();
+
+        // The memories are already persisted and keyword-searchable; embedding and
+        // vector indexing finish in the background, as on the HTTP remember path.
+        if !pending_index.is_empty() {
+            let embed = move || {
+                for id in pending_index {
+                    let guard = memory_system.read();
+                    if let Err(e) = guard.embed_and_index(&id) {
+                        tracing::warn!(memory_id = %id.0, "Background embed_and_index failed: {e}");
                     }
                 }
-            } else {
-                Vec::new()
             };
-
-            // Add to detected entities list
-            for ent in &entities {
-                all_entities.push(DetectedEntity::from(ent));
+            match &self.task_tracker {
+                Some(tracker) => {
+                    tracker.spawn_blocking(embed);
+                }
+                None => {
+                    tokio::task::spawn_blocking(embed);
+                }
             }
+        }
+
+        ExtractionResult::Extraction {
+            memories_created: memory_ids.len(),
+            memory_ids,
+            entities_detected: entities,
+            dedupe_skipped,
+            processing_time_ms: start.elapsed().as_millis() as u64,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Run a drained buffer through importance filtering, one batched NER pass and
+    /// the deferred write path. Blocking: call from `spawn_blocking`.
+    fn process_batch(
+        ner: &NeuralNer,
+        memory_system: &SharedUserMemory,
+        messages: Vec<BufferedMessage>,
+        mode: StreamMode,
+        config: &ExtractionConfig,
+        user_metadata: &HashMap<String, serde_json::Value>,
+    ) -> BatchOutcome {
+        let mut dedupe_skipped = 0;
+        let kept: Vec<BufferedMessage> = messages
+            .into_iter()
+            .filter(|msg| {
+                let importance = msg
+                    .importance
+                    .unwrap_or_else(|| Self::calculate_importance(&msg.content, mode, config));
+                let keep = importance >= config.min_importance;
+                if !keep {
+                    dedupe_skipped += 1;
+                }
+                keep
+            })
+            .collect();
+
+        let entity_sets = if config.extract_entities {
+            Self::extract_entities_batch(ner, &kept)
+        } else {
+            vec![Vec::new(); kept.len()]
+        };
+
+        let mut outcome = BatchOutcome {
+            memory_ids: Vec::with_capacity(kept.len()),
+            pending_index: Vec::with_capacity(kept.len()),
+            entities: Vec::new(),
+            dedupe_skipped,
+        };
+
+        let memory_sys = memory_system.read();
+        for (msg, entities) in kept.into_iter().zip(entity_sets) {
+            outcome
+                .entities
+                .extend(entities.iter().map(DetectedEntity::from));
 
             // Determine experience type based on mode and content
             let experience_type = Self::determine_experience_type(mode, &msg);
@@ -1070,8 +1128,7 @@ impl StreamingMemoryExtractor {
             for (k, v) in msg.metadata {
                 string_metadata.insert(k, v.to_string());
             }
-            // Clone tags before they're consumed (needed for Experience.tags)
-            let tags: Vec<String> = msg.tags.clone();
+            let tags = msg.tags;
 
             // Add tags as metadata
             for tag in &tags {
@@ -1087,24 +1144,24 @@ impl StreamingMemoryExtractor {
                 }
             }
 
-            // Create experience with proper fields including tags
             let experience = Experience {
                 content: msg.content,
                 experience_type,
                 entities: all_entity_names,
                 metadata: string_metadata,
-                embeddings: None, // Will be computed by MemorySystem
+                embeddings: None, // Computed by the background embed_and_index pass
                 tags,
                 ..Default::default()
             };
 
-            // Store memory using remember() method
-            let memory_sys = memory_system.read();
-            match memory_sys.remember(experience, Some(msg.timestamp)) {
-                // Use message timestamp
-                Ok(memory_id) => {
-                    // MemoryId is a newtype around Uuid - access inner uuid for string
-                    memory_ids.push(memory_id.0.to_string());
+            // Message timestamp is the memory's creation time
+            match memory_sys.remember_deferred_detailed(experience, Some(msg.timestamp), None) {
+                Ok(stored) => {
+                    outcome.memory_ids.push(stored.id.0.to_string());
+                    // A merged duplicate already has its embedding and index entry.
+                    if !stored.deduped {
+                        outcome.pending_index.push(stored.id);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to store streaming memory: {}", e);
@@ -1112,21 +1169,29 @@ impl StreamingMemoryExtractor {
             }
         }
 
-        // Update session stats
-        {
-            let mut sessions = self.sessions.write().await;
-            if let Some(session) = sessions.get_mut(session_id) {
-                session.total_memories_created += memory_ids.len();
-            }
-        }
+        outcome
+    }
 
-        ExtractionResult::Extraction {
-            memories_created: memory_ids.len(),
-            memory_ids,
-            entities_detected: all_entities,
-            dedupe_skipped,
-            processing_time_ms: start.elapsed().as_millis() as u64,
-            timestamp: Utc::now(),
+    /// One NER pass over the whole batch; falls back to per-message extraction when
+    /// the batch call fails so a single bad input cannot drop the batch's entities.
+    fn extract_entities_batch(ner: &NeuralNer, messages: &[BufferedMessage]) -> Vec<Vec<NerEntity>> {
+        let texts: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+        match ner.extract_batch(&texts) {
+            Ok(sets) if sets.len() == texts.len() => sets,
+            result => {
+                if let Err(e) = result {
+                    tracing::debug!("Batch NER extraction failed, extracting per message: {}", e);
+                }
+                texts
+                    .iter()
+                    .map(|text| {
+                        ner.extract(text).unwrap_or_else(|e| {
+                            tracing::debug!("NER extraction failed: {}", e);
+                            Vec::new()
+                        })
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -1206,10 +1271,9 @@ impl StreamingMemoryExtractor {
 
     /// Close session and cleanup
     pub async fn close_session(&self, session_id: &str) -> Option<usize> {
-        let mut sessions = self.sessions.write().await;
-        sessions
+        self.sessions
             .remove(session_id)
-            .map(|s| s.total_memories_created)
+            .map(|(_, handle)| handle.lock().total_memories_created)
     }
 
     /// Get session stats
@@ -1228,8 +1292,8 @@ impl StreamingMemoryExtractor {
 
         // Get session config and check if injection is enabled
         let (config, _user_id) = {
-            let sessions = self.sessions.read().await;
-            let session = sessions.get(session_id)?;
+            let handle = self.session(session_id)?;
+            let session = handle.lock();
             if !session.config.enable_context_injection {
                 return None;
             }
@@ -1241,9 +1305,8 @@ impl StreamingMemoryExtractor {
 
         // Check if we recently injected for similar context
         {
-            let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(session_id) {
-                if session.recent_context_hashes.contains(&context_hash) {
+            if let Some(handle) = self.session(session_id) {
+                if handle.lock().recent_context_hashes.contains(&context_hash) {
                     return None; // Skip - already injected for this context
                 }
             }
@@ -1275,8 +1338,8 @@ impl StreamingMemoryExtractor {
         // Snapshot injection cooldowns BEFORE spawn_blocking to avoid
         // nested block_on() inside blocking thread (thread pool starvation risk)
         let cooldown_snapshot: HashSet<String> = {
-            let sessions_guard = self.sessions.read().await;
-            if let Some(session) = sessions_guard.get(session_id) {
+            if let Some(handle) = self.session(session_id) {
+                let session = handle.lock();
                 session
                     .injection_cooldowns
                     .iter()
@@ -1376,8 +1439,8 @@ impl StreamingMemoryExtractor {
 
         // Update session state: mark memories as injected and track context hash
         {
-            let mut sessions = self.sessions.write().await;
-            if let Some(session) = sessions.get_mut(session_id) {
+            if let Some(handle) = self.session(session_id) {
+                let mut session = handle.lock();
                 for mem in &surfaced {
                     session.mark_injected(&mem.id);
                 }
@@ -1398,8 +1461,9 @@ impl StreamingMemoryExtractor {
     }
 
     pub async fn get_session_stats(&self, session_id: &str) -> Option<SessionStats> {
-        let sessions = self.sessions.read().await;
-        sessions.get(session_id).map(|s| SessionStats {
+        let handle = self.session(session_id)?;
+        let s = handle.lock();
+        Some(SessionStats {
             session_id: s.session_id.clone(),
             user_id: s.user_id.clone(),
             mode: s.mode,
@@ -1586,5 +1650,99 @@ mod tests {
         assert_eq!(detected.entity_type, "ORG");
         assert_eq!(detected.confidence, 0.95);
         assert!(!detected.existing);
+    }
+
+    fn test_ner() -> NeuralNer {
+        NeuralNer::new_fallback(crate::embeddings::NerConfig::default())
+    }
+
+    fn buffered(content: &str) -> BufferedMessage {
+        BufferedMessage {
+            content: content.to_string(),
+            source: Some("test".to_string()),
+            timestamp: Utc::now(),
+            importance: Some(0.9),
+            tags: vec!["batch".to_string()],
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn handshake() -> StreamHandshake {
+        StreamHandshake {
+            user_id: "stream-user".to_string(),
+            mode: StreamMode::Conversation,
+            extraction_config: ExtractionConfig::default(),
+            session_id: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_process_batch_stores_every_message_on_deferred_path() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config = crate::memory::MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory: SharedUserMemory = Arc::new(parking_lot::RwLock::new(
+            crate::user_memory::UserMemory::new(config, None).expect("memory system"),
+        ));
+
+        let mut messages: Vec<BufferedMessage> = (0..5)
+            .map(|i| {
+                buffered(&format!(
+                    "Deployment {i} of the billing service finished in region zone-{i}"
+                ))
+            })
+            .collect();
+        let mut low = buffered("ignored");
+        low.importance = Some(0.0);
+        messages.push(low);
+
+        let outcome = StreamingMemoryExtractor::process_batch(
+            &test_ner(),
+            &memory,
+            messages,
+            StreamMode::Conversation,
+            &ExtractionConfig::default(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(outcome.memory_ids.len(), 5);
+        assert_eq!(outcome.pending_index.len(), 5);
+        assert_eq!(outcome.dedupe_skipped, 1);
+        let unique: HashSet<&String> = outcome.memory_ids.iter().collect();
+        assert_eq!(unique.len(), 5);
+    }
+
+    #[test]
+    fn test_extract_entities_batch_aligns_with_messages() {
+        let ner = test_ner();
+        let messages = vec![
+            buffered("Satya Nadella leads Microsoft in Redmond"),
+            buffered(""),
+            buffered("nothing notable here"),
+        ];
+        let sets = StreamingMemoryExtractor::extract_entities_batch(&ner, &messages);
+        assert_eq!(sets.len(), messages.len());
+        assert!(sets[1].is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sessions_are_independent_and_stale_ones_swept() {
+        let extractor = StreamingMemoryExtractor::new(Arc::new(test_ner()));
+        let a = extractor.create_session(handshake()).await.expect("a");
+        let b = extractor.create_session(handshake()).await.expect("b");
+        assert_ne!(a, b);
+        assert_eq!(extractor.session_count().await, 2);
+
+        let stale = extractor.session(&b).expect("b handle");
+        stale.lock().last_activity =
+            Utc::now() - chrono::Duration::seconds(SESSION_TIMEOUT_SECS + 1);
+
+        assert_eq!(extractor.cleanup_stale_sessions().await, 1);
+        assert!(extractor.session(&a).is_some());
+        assert!(extractor.session(&b).is_none());
+        assert!(extractor.get_session_stats("missing").await.is_none());
     }
 }
