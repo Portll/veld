@@ -1306,7 +1306,7 @@ impl MultiUserMemoryManager {
     /// BEFORE it is joined — `user_id` arrives from HTTP/MCP/CLI callers, and `../` or an
     /// absolute path in it would escape `base_path` at every join below. Every user-scoped path
     /// in this manager goes through here.
-    fn user_dir(&self, user_id: &str) -> Result<std::path::PathBuf> {
+    pub(crate) fn user_dir(&self, user_id: &str) -> Result<std::path::PathBuf> {
         Ok(self
             .base_path
             .join(crate::path_guard::sanitize_component(user_id, "user id")?))

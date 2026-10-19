@@ -39,6 +39,11 @@ fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
+/// What a caller is told about a latched store. Reaches the client, because the
+/// status is 503 rather than 500 — so it names the condition and no paths.
+const WRITE_LATCHED_CLIENT_MESSAGE: &str =
+    "Storage is not accepting writes (no space left on device); retry later";
+
 /// Application error types with proper categorization
 #[derive(Debug)]
 pub enum AppError {
@@ -97,6 +102,10 @@ pub enum AppError {
     // Service Errors (503)
     ServiceUnavailable(String),
 
+    /// RocksDB has stopped accepting writes for want of disk space. Retryable
+    /// from the caller's side, which `INTERNAL_ERROR` never said.
+    StorageWriteLatched(anyhow::Error),
+
     // Generic wrapper for external errors
     Internal(anyhow::Error),
 }
@@ -118,8 +127,23 @@ impl AppError {
         }
     }
 
+    /// Whether this error is a RocksDB write latch, whichever variant carried
+    /// it. 386 call sites build `Internal` directly rather than going through
+    /// `From<anyhow::Error>`, so classifying only in the conversion would leave
+    /// a latched upsert still answering `INTERNAL_ERROR`.
+    fn is_write_latched(&self) -> bool {
+        match self {
+            Self::StorageWriteLatched(_) => true,
+            Self::Internal(err) => crate::storage::write_latch::chain_is_enospc(err),
+            _ => false,
+        }
+    }
+
     /// Get error code for client identification
     pub fn code(&self) -> &'static str {
+        if self.is_write_latched() {
+            return "STORAGE_WRITE_LATCHED";
+        }
         match self {
             Self::InvalidInput { .. } => "INVALID_INPUT",
             Self::InvalidUserId(_) => "INVALID_USER_ID",
@@ -141,12 +165,16 @@ impl AppError {
             Self::LockPoisoned { .. } => "LOCK_POISONED",
             Self::LockAcquisitionFailed { .. } => "LOCK_ACQUISITION_FAILED",
             Self::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",
+            Self::StorageWriteLatched(_) => "STORAGE_WRITE_LATCHED",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
     }
 
     /// Get HTTP status code
     pub fn status_code(&self) -> StatusCode {
+        if self.is_write_latched() {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
         match self {
             Self::InvalidInput { .. }
             | Self::InvalidUserId(_)
@@ -165,7 +193,9 @@ impl AppError {
 
             Self::MemoryAlreadyExists(_) => StatusCode::CONFLICT,
 
-            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ServiceUnavailable(_) | Self::StorageWriteLatched(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
 
             Self::StorageError(_)
             | Self::DatabaseError(_)
@@ -179,6 +209,16 @@ impl AppError {
 
     /// Get detailed error message
     pub fn message(&self) -> String {
+        if self.is_write_latched() {
+            // The 503 body reaches the client, so the chain goes to the log and
+            // the caller gets the one fact it can act on.
+            let chain = match self {
+                Self::StorageWriteLatched(err) | Self::Internal(err) => format!("{err:#}"),
+                _ => String::new(),
+            };
+            tracing::error!(error = %chain, "Storage write latched");
+            return WRITE_LATCHED_CLIENT_MESSAGE.to_string();
+        }
         match self {
             Self::InvalidInput { field, reason } => {
                 format!("Invalid input for field '{field}': {reason}")
@@ -232,6 +272,10 @@ impl AppError {
                 "Internal server error".to_string()
             }
             Self::ServiceUnavailable(msg) => format!("Service unavailable: {msg}"),
+            // Unreachable: `is_write_latched()` above answers for this variant.
+            // The arm exists so the match stays exhaustive and so removing that
+            // early return cannot silently change the answer.
+            Self::StorageWriteLatched(_) => WRITE_LATCHED_CLIENT_MESSAGE.to_string(),
             Self::Internal(err) => {
                 // `{:#}` prints the whole anyhow context chain; `%err` alone
                 // prints only the outermost context, which is how the
@@ -275,6 +319,12 @@ impl std::error::Error for AppError {}
 /// Convert from anyhow::Error to AppError
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
+        // Classified over the whole chain: the production message arrives inside
+        // `Failed to put memory <uuid> in RocksDB: …`, so the outer string alone
+        // sees only the wrapper.
+        if crate::storage::write_latch::chain_is_enospc(&err) {
+            return Self::StorageWriteLatched(err);
+        }
         Self::Internal(err)
     }
 }
@@ -358,6 +408,50 @@ mod tests {
             AppError::StorageError("failed".to_string()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn an_enospc_chain_becomes_a_503_write_latch_not_a_500() {
+        let err = anyhow::anyhow!(
+            "IO error: No space left on device: While open a file for appending: /store/000585.log"
+        )
+        .context("Failed to put memory 00000000-0000-0000-0000-000000000000 in RocksDB");
+
+        let app_error = AppError::from(err);
+        assert_eq!(app_error.code(), "STORAGE_WRITE_LATCHED");
+        assert_eq!(
+            app_error.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a latched store is retryable, which a 500 never said"
+        );
+    }
+
+    /// The handlers build `AppError::Internal` directly far more often than they
+    /// let `?` convert an `anyhow::Error`, so this is the path a real upsert
+    /// against a latched store takes.
+    #[test]
+    fn a_directly_constructed_internal_also_answers_503_when_latched() {
+        let err = AppError::Internal(
+            anyhow::anyhow!("IO error: No space left on device: While open a file for appending: /store/000585.log")
+                .context("Failed to put memory 00000000-0000-0000-0000-000000000000 in RocksDB"),
+        );
+
+        assert_eq!(err.code(), "STORAGE_WRITE_LATCHED");
+        assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !err.message().contains("000585.log"),
+            "a 503 body reaches the client and must not carry store paths"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_chain_stays_an_internal_error() {
+        let err = anyhow::anyhow!("Corruption: block checksum mismatch")
+            .context("Failed to put memory 00000000-0000-0000-0000-000000000000 in RocksDB");
+
+        let app_error = AppError::from(err);
+        assert_eq!(app_error.code(), "INTERNAL_ERROR");
+        assert_eq!(app_error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

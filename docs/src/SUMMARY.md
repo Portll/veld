@@ -21,6 +21,7 @@
 - [Epistemic hygiene](architecture/epistemic-hygiene.md)
 - [Cognitive dials](architecture/dials.md)
 - [Instance registry](architecture/instance-registry.md)
+- [Live replication](architecture/replication.md)
 - [Module index](architecture/module-index.md)
 
 ---

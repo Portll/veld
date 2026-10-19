@@ -812,6 +812,7 @@ fn handle_init() -> Result<()> {
              host = \"127.0.0.1\"\n\
              port = 3030\n\
              # storage = \"{}\"  # Uncomment to override default\n\
+             # storage_backend = \"rocksdb\"  # or \"redb\"; the backend the next start serves\n\
              # mcp = true  # Set to false to disable the Veld MCP component (`veld serve`)\n",
             storage.display()
         );

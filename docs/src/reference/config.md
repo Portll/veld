@@ -6,7 +6,7 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **115** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **119** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
@@ -112,6 +112,10 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_WIKI_RENDER` | — | `src/wiki/mod.rs` |
 | `VELD_WIKI_WATCH` | — | `src/wiki/watcher.rs` |
 | `VELD_WRITE_BASELINE` | — | `src/recall_harness/runner.rs` |
+| `VELD_WRITE_LATCH_COOLDOWN_SECS` | — | `src/storage/write_latch.rs` |
+| `VELD_WRITE_LATCH_MAX_ATTEMPTS` | — | `src/storage/write_latch.rs` |
+| `VELD_WRITE_LATCH_MIN_FREE_BYTES` | — | `src/storage/write_latch.rs` |
+| `VELD_WRITE_LATCH_RESTART` | — | `src/storage/write_latch.rs` |
 | `VELD_WRITE_MODE` | — | `src/memory/storage.rs` |
 | `VELD_ZENOH_API_KEY` | — | `src/embeddings/zenoh_embedder.rs` |
 | `VELD_ZENOH_AUTO_TOPICS` | — | `src/zenoh_transport/config.rs` |

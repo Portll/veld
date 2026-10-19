@@ -36,6 +36,7 @@ Each instance writes one JSON file named `<instance_id>.json` containing:
 | `last_heartbeat` | Updated by the heartbeat task |
 | `version` | The veld version string |
 | `feature_flags` | Optional list of compile-time features for filtering |
+| `launch` | Optional: `exe`, `args`, `cwd` and the *names* of the `VELD_*` variables the server started with. Lets the Veld Monitor's "Restart server" relaunch it the same way; values are never written |
 
 Writes are atomic (`write-to-tempfile + rename`) so a reader never sees a
 half-written entry.

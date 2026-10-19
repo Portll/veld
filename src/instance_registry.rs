@@ -64,6 +64,45 @@ pub struct InstanceInfo {
     pub label: String,
     pub started_at: DateTime<Utc>,
     pub last_heartbeat: DateTime<Utc>,
+    /// How this process was started, so a relauncher (the Veld Monitor's "Restart
+    /// server") can start it the same way. Absent on entries from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchRecipe>,
+}
+
+/// The command line and working directory a server was started with. Environment
+/// values are never written here (several are secrets); only the names of the
+/// `VELD_*` variables the process was started with (not those it set on itself,
+/// from `config.toml` or its own arguments), so a relauncher that cannot read the
+/// live environment can say which ones the new process will lack.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchRecipe {
+    pub exe: String,
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env_names: Vec<String>,
+}
+
+fn capture_launch() -> Option<LaunchRecipe> {
+    let exe = std::env::current_exe().ok()?;
+    let mut env_names: Vec<String> = match crate::config::veld_env_names_at_start() {
+        Some(names) => names.to_vec(),
+        None => std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .filter(|k| k.starts_with("VELD_"))
+            .collect(),
+    };
+    env_names.sort();
+    Some(LaunchRecipe {
+        exe: exe.to_string_lossy().to_string(),
+        args: std::env::args().skip(1).collect(),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string()),
+        env_names,
+    })
 }
 
 impl InstanceInfo {
@@ -262,6 +301,7 @@ pub fn register(host: &str, port: u16, data_path: &Path) -> Option<RegistryGuard
         label: derive_label(data_path),
         started_at: now,
         last_heartbeat: now,
+        launch: capture_launch(),
     };
 
     let path = match write_atomic(&dir, &info) {
@@ -323,7 +363,38 @@ mod tests {
             label: "veld".to_string(),
             started_at: heartbeat,
             last_heartbeat: heartbeat,
+            launch: None,
         }
+    }
+
+    #[test]
+    fn entries_without_a_launch_recipe_still_deserialize() {
+        let mut info = sample(7, 3030, Utc::now());
+        info.launch = Some(LaunchRecipe {
+            exe: "/usr/local/bin/veld".into(),
+            args: vec!["server".into(), "--port".into(), "3030".into()],
+            cwd: Some("/home/me".into()),
+            env_names: vec!["VELD_PORT".into()],
+        });
+        let json = serde_json::to_string(&info).unwrap();
+        let back: InstanceInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.launch, info.launch);
+
+        let legacy: InstanceInfo =
+            serde_json::from_str(&serde_json::to_string(&sample(8, 3031, Utc::now())).unwrap())
+                .unwrap();
+        assert_eq!(legacy.launch, None);
+    }
+
+    #[test]
+    fn launch_recipe_names_veld_variables_without_their_values() {
+        std::env::set_var("VELD_REGISTRY_TEST_SECRET", "hunter2");
+        let recipe = capture_launch().expect("current_exe is known in tests");
+        std::env::remove_var("VELD_REGISTRY_TEST_SECRET");
+        assert!(recipe.env_names.iter().any(|n| n == "VELD_REGISTRY_TEST_SECRET"));
+        let json = serde_json::to_string(&recipe).unwrap();
+        assert!(!json.contains("hunter2"));
+        assert!(!recipe.exe.is_empty());
     }
 
     #[test]

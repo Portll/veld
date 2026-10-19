@@ -5,6 +5,8 @@
 // fresh 2FA code (step-up); every key change also asks for something that opens the
 // keyring: the passphrase, a recovery code, or Touch ID on this Mac.
 
+import { h, when, makeDialogs } from "./ui.js";
+
 const { invoke } = window.__TAURI__.core;
 
 const state = { session: null, me: null, view: "keys", enclave: null };
@@ -12,23 +14,7 @@ const state = { session: null, me: null, view: "keys", enclave: null };
 const base = () => (window.veldActiveBaseUrl?.() || "").replace(/\/+$/, "");
 const $ = (id) => document.getElementById(id);
 
-function h(tag, attrs = {}, ...children) {
-  const el = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (v === undefined || v === null || v === false) continue;
-    if (k === "class") el.className = v;
-    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
-    else if (v === true) el.setAttribute(k, "");
-    else el.setAttribute(k, v);
-  }
-  for (const c of children.flat()) {
-    if (c === undefined || c === null || c === false) continue;
-    el.append(c instanceof Node ? c : document.createTextNode(String(c)));
-  }
-  return el;
-}
-
-const when = (iso) => (iso ? new Date(iso).toLocaleString() : "—");
+const { ask, show, confirmAction, flash } = makeDialogs({ modalId: "sec-modal", flashId: "sec-flash" });
 
 class ApiError extends Error {
   constructor(status, body) {
@@ -53,77 +39,6 @@ async function api(method, path, { body, stepUp } = {}) {
     throw err;
   }
   return res.body;
-}
-
-// ── Modals ──────────────────────────────────────────────────────────────
-
-function modal(title, body, actions) {
-  const root = $("sec-modal");
-  root.replaceChildren(
-    h("div", { class: "sec-modal-card", role: "dialog", "aria-modal": "true", "aria-label": title },
-      h("h3", {}, title), body, h("div", { class: "sec-modal-actions" }, actions)),
-  );
-  root.classList.remove("hidden");
-  const first = root.querySelector("input, select, button");
-  first?.focus();
-  return () => root.classList.add("hidden");
-}
-
-// Ask for some values. Resolves to an object keyed by field name, or null if cancelled.
-function ask(title, fields, { submit = "Continue", note } = {}) {
-  return new Promise((resolve) => {
-    const inputs = {};
-    const form = h("form", { class: "sec-form" },
-      note ? h("p", { class: "sec-note" }, note) : null,
-      fields.map((f) => {
-        const input = f.options
-          ? h("select", { name: f.name }, f.options.map((o) => h("option", { value: o.value }, o.label)))
-          : h("input", {
-              name: f.name, type: f.type || "text", placeholder: f.placeholder || "",
-              autocomplete: f.autocomplete || "off", inputmode: f.inputmode, required: f.optional ? false : true,
-            });
-        if (f.value !== undefined) input.value = f.value;
-        inputs[f.name] = input;
-        return h("label", {}, h("span", {}, f.label), input);
-      }));
-    let close;
-    const done = (value) => { close(); resolve(value); };
-    form.addEventListener("submit", (e) => {
-      e.preventDefault();
-      done(Object.fromEntries(Object.entries(inputs).map(([k, el]) => [k, el.value])));
-    });
-    close = modal(title, form, [
-      h("button", { type: "button", class: "sec-secondary", onclick: () => done(null) }, "Cancel"),
-      h("button", { type: "button", onclick: () => form.requestSubmit() }, submit),
-    ]);
-  });
-}
-
-function show(title, ...content) {
-  return new Promise((resolve) => {
-    let close;
-    close = modal(title, h("div", {}, content), [
-      h("button", { type: "button", onclick: () => { close(); resolve(); } }, "Done"),
-    ]);
-  });
-}
-
-function confirmAction(title, text, verb) {
-  return new Promise((resolve) => {
-    let close;
-    close = modal(title, h("p", {}, text), [
-      h("button", { type: "button", class: "sec-secondary", onclick: () => { close(); resolve(false); } }, "Cancel"),
-      h("button", { type: "button", class: "sec-danger", onclick: () => { close(); resolve(true); } }, verb),
-    ]);
-  });
-}
-
-function flash(text, kind = "info") {
-  const el = $("sec-flash");
-  el.textContent = text;
-  el.className = "sec-flash " + kind;
-  clearTimeout(flash.timer);
-  flash.timer = setTimeout(() => (el.className = "sec-flash hidden"), 6000);
 }
 
 // Run a change behind step-up. A session stepped up in the last few minutes passes
