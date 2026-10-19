@@ -29,7 +29,7 @@ export function formatTokenStatusText(
   const percentUsed = Math.round(status.percent * 100);
   const bar = buildProgressBar(percentUsed);
 
-  let response = `🐘 Token Status\n`;
+  let response = `🌾 Token Status\n`;
   response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
   response += `${bar} ${percentUsed}%\n`;
   response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -48,7 +48,7 @@ export function formatResetTokenSessionText(
   previousTokens: number,
   budget: number,
 ): string {
-  let response = `🐘 Token Session Reset\n`;
+  let response = `🌾 Token Session Reset\n`;
   response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
   response += `Previous: ${previousTokens.toLocaleString()} tokens\n`;
   response += `Current: 0 tokens\n`;

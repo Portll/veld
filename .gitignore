@@ -152,3 +152,7 @@ evaluations/
 
 # Swift build output of the Touch ID helper
 /packaging/macos/veld-enclave/.build
+
+# Generated terminal captures; regenerate with scripts/screenshots/shoot.mjs
+scripts/screenshots/out/
+scripts/screenshots/*.log

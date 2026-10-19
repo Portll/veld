@@ -3139,6 +3139,13 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
 
 #[tokio::test]
 async fn a_declared_file_path_is_recalled_by_its_file_name() {
+    let reranker = veld::embeddings::cross_encoder::default_cross_encoder();
+    assert!(
+        reranker.is_cached(),
+        "this ranking needs the reranker, and it is not cached at {:?}; \
+         fetch it with `cargo run --bin model-fetch -- --cross-encoder`",
+        reranker.cache_dir()
+    );
     let h = Harness::new();
     let user = "recall-declared";
     let distractors = [

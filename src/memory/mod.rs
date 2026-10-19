@@ -1107,18 +1107,39 @@ impl MemorySystem {
         // SECONDARY embedder (optional): a remote / cluster model for dual-index
         // competitive retrieval. The local Nomic ONNX model is the PRIMARY now,
         // so it is not re-used here — the secondary slot is for HTTP / Zenoh peers.
-        let secondary: Option<Arc<dyn crate::embeddings::Embedder>> = {
-            // HTTP-backed embedder via any declared host (see crate::llm_hosts). Shared, so its
-            // cached availability answer is too: a tenant open does not re-ask the endpoint.
-            let http_embedder = crate::embeddings::shared::http_embedder(
-                &crate::embeddings::http_embedder::HttpEmbedderConfig::from_env(),
-            );
+        // `VELD_SECONDARY_EMBEDDER` decides the slot: `off` runs the primary alone, `auto`
+        // (the default, unset) takes the declared HTTP host when it answers and is not the
+        // primary, and an `http(s)://` URL (optionally `#model`) names the second opinion
+        // outright. Fusion is a fourth RRF leg at `secondary_rrf_ratio` of the semantic
+        // weight; on LOCOMO-20 (2026-10-19) MiniLM primary with nomic-embed secondary scored
+        // MRR 0.9625 against 0.9375 for MiniLM alone, at one extra embedding call per write
+        // and per query.
+        let secondary_choice = std::env::var("VELD_SECONDARY_EMBEDDER")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "auto".to_string());
+        let secondary: Option<Arc<dyn crate::embeddings::Embedder>> = if secondary_choice == "off" {
+            tracing::info!("Secondary embedder: off (VELD_SECONDARY_EMBEDDER=off)");
+            None
+        } else {
+            let http_config = if secondary_choice == "auto" {
+                crate::embeddings::http_embedder::HttpEmbedderConfig::from_env()
+            } else if secondary_choice.starts_with("http://") || secondary_choice.starts_with("https://") {
+                crate::embeddings::http_embedder::HttpEmbedderConfig::from_id(&secondary_choice)
+            } else {
+                anyhow::bail!(
+                    "VELD_SECONDARY_EMBEDDER={secondary_choice:?} not understood: use off, auto, or an http(s):// URL"
+                )
+            };
+            // Shared, so its cached availability answer is too: a tenant open does not
+            // re-ask the endpoint.
+            let http_embedder = crate::embeddings::shared::http_embedder(&http_config);
             // The same endpoint and model as the primary is not a second opinion.
             if http_embedder.id() != primary.id() && http_embedder.is_available() {
                 tracing::info!(
-                    "Secondary embedder: HTTP API at {}",
-                    std::env::var("VELD_EMBEDDING_API_URL")
-                        .unwrap_or_else(|_| "http://127.0.0.1:1234".into())
+                    "Secondary embedder: {} (VELD_SECONDARY_EMBEDDER={secondary_choice})",
+                    http_embedder.id()
                 );
                 Some(http_embedder)
             } else {
@@ -5400,6 +5421,51 @@ impl MemorySystem {
         }
 
         Ok(())
+    }
+
+    /// [`update_memory`](Self::update_memory) over many memories with one BM25 commit
+    /// at the end. Replication applies pages of snapshots; a Tantivy commit and reader
+    /// reload per memory made each frame cost an fsync round trip.
+    pub fn upsert_memories(&self, memories: &[Memory]) -> Result<usize> {
+        for memory in memories {
+            self.long_term_memory.update(memory)?;
+            if let Err(e) = self.retriever.reindex_memory(memory) {
+                tracing::warn!(
+                    "Failed to reindex memory {} in vector DB: {}",
+                    memory.id.0,
+                    e
+                );
+            }
+            if let Err(e) = self.hybrid_search.index_memory(
+                &memory.id,
+                &memory.experience.content,
+                &memory.experience.tags,
+                &memory.experience.entities,
+            ) {
+                tracing::warn!("Failed to reindex memory {} in BM25: {}", memory.id.0, e);
+            }
+            let shared = std::sync::Arc::new(memory.clone());
+            {
+                let mut working = self.working_memory.write();
+                if working.contains(&memory.id) {
+                    let _ = working.remove(&memory.id);
+                    let _ = working.add_shared(std::sync::Arc::clone(&shared));
+                }
+            }
+            {
+                let mut session = self.session_memory.write();
+                if session.contains(&memory.id) {
+                    let _ = session.remove(&memory.id);
+                    let _ = session.add_shared(shared);
+                }
+            }
+        }
+        if !memories.is_empty() {
+            if let Err(e) = self.hybrid_search.commit_and_reload() {
+                tracing::warn!("Failed to commit/reload BM25 index: {}", e);
+            }
+        }
+        Ok(memories.len())
     }
 
     /// Set or update the parent of a memory for hierarchical organization

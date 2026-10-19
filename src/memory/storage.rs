@@ -5,7 +5,8 @@ use bincode;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "rocksdb")]
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB,
+    Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions,
+    DB,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "rocksdb")]
@@ -1382,7 +1383,7 @@ impl MemoryStorage {
     /// If `shared_cache` is provided, all block-cache reads are charged against
     /// the shared LRU cache (recommended for multi-tenant server mode). When
     /// `None`, a small per-instance cache is created (standalone / test use).
-    pub fn new(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
+    pub fn new(path: &Path, shared_cache: Option<&Cache>) -> Result<Self> {
         Self::open(path, shared_cache, true)
     }
 
@@ -1779,6 +1780,27 @@ impl MemoryStorage {
         &self.storage_path
     }
 
+    /// Run a write, clearing the write latch on success and making one bounded
+    /// flush+retry attempt when RocksDB refused it for want of disk space.
+    ///
+    /// `op` is called at most twice, so it must be replayable.
+    fn guarded_write<T>(&self, op: impl Fn() -> Result<T>) -> Result<T> {
+        let latch = crate::storage::write_latch::global();
+        match op() {
+            Ok(value) => {
+                latch.note_write_ok(&self.storage_path);
+                Ok(value)
+            }
+            Err(err) => crate::storage::write_latch::recover_write(
+                latch,
+                &self.db,
+                &self.storage_path,
+                err,
+                op,
+            ),
+        }
+    }
+
     /// Store a memory with configurable write durability
     ///
     /// ROBOTICS OPTIMIZATION: Write mode is configurable via VELD_WRITE_MODE env var.
@@ -2042,8 +2064,14 @@ impl MemoryStorage {
     fn write_batch_with_mode(&self, batch: WriteBatch) -> Result<()> {
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db.write_opt(batch, &write_opts)?;
-        Ok(())
+        // The write latch may replay the write once after a disk-full flush, and a
+        // WriteBatch is consumed by the write, so each attempt rebuilds it from bytes.
+        let data = batch.data();
+        self.guarded_write(|| {
+            self.db
+                .write_opt(WriteBatch::from_data(data), &write_opts)
+                .context("Failed to write batch to RocksDB")
+        })
     }
 
     /// `inbound_ref:{blinded(target)}:{holder}`, the reverse-index entry recording that
@@ -3838,14 +3866,18 @@ impl MemoryStorage {
         flush_opts.set_wait(true); // Block until flush is complete
 
         // Single DB flush covers both default and index CFs
-        self.db
-            .flush_opt(&flush_opts)
-            .map_err(|e| anyhow::anyhow!("Failed to flush memory storage: {e}"))?;
+        self.guarded_write(|| {
+            self.db
+                .flush_opt(&flush_opts)
+                .map_err(|e| anyhow::anyhow!("Failed to flush memory storage: {e}"))
+        })?;
 
         // Explicitly flush the index CF (RocksDB flush_opt only flushes default CF)
-        self.db
-            .flush_cf_opt(self.index_cf(), &flush_opts)
-            .map_err(|e| anyhow::anyhow!("Failed to flush index CF: {e}"))?;
+        self.guarded_write(|| {
+            self.db
+                .flush_cf_opt(self.index_cf(), &flush_opts)
+                .map_err(|e| anyhow::anyhow!("Failed to flush index CF: {e}"))
+        })?;
 
         Ok(())
     }

@@ -6428,7 +6428,7 @@ checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 
 [[package]]
 name = "veld"
-version = "0.7.39"
+version = "0.8.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -6456,6 +6456,7 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
+ "libc",
  "lru 0.16.4",
  "lz4",
  "memmap2",

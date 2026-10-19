@@ -688,6 +688,11 @@ impl SlowStore {
         Some(MirrorSyncToken { store: self })
     }
 
+    /// True until the first mirror rebuild starts.
+    pub fn never_synced(&self) -> bool {
+        self.last_sync.lock().is_none()
+    }
+
     /// Rebuild the entity/edge mirror from a full graph snapshot, unless a
     /// rebuild is already in flight (then `skipped` is set and the existing
     /// mirror stands). No TTL: callers that want one use
@@ -733,6 +738,7 @@ impl SlowStore {
         .entered();
 
         let start = std::time::Instant::now();
+        *self.last_sync.lock() = Some(start);
         let mut stats = SyncStats::default();
         let mut guard = self.mirror_conn.lock();
         if guard.is_none() {
@@ -1946,5 +1952,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fk_violations, 0, "edges reference the swapped-in entities");
+    }
+
+    #[test]
+    fn never_synced_flips_when_the_first_rebuild_starts() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+        assert!(store.never_synced());
+        store.sync_from_graph(&[], &[]).unwrap();
+        assert!(!store.never_synced());
     }
 }

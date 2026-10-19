@@ -41,6 +41,46 @@ pub struct HealthResponse {
     /// Tenants holding data on each backend at boot. `users_count` over an empty
     /// store is the 2026-09-10 outage; this is what tells the two apart.
     pub tenants_with_data: crate::storage::boot_guard::BackendCensus,
+    /// One entry per store currently refusing writes; absent when none is.
+    /// Measured 2026-10-11: this endpoint served `healthy` through 11,088
+    /// consecutive failed writes.
+    ///
+    /// An array rather than one object because this process runs one RocksDB per
+    /// tenant: one latched store out of twelve is `degraded`, and the response
+    /// has to say which. It says so by opaque `store` id — this route is
+    /// unauthenticated, and `LatchSnapshot` documents why no path ships.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub write_latch: Vec<crate::storage::write_latch::LatchSnapshot>,
+}
+
+/// `status` and the latch detail from one rule, so the handler and its tests
+/// cannot disagree about what "degraded" means.
+fn write_latch_fields(
+    latch: &crate::storage::write_latch::WriteLatch,
+) -> (String, Vec<crate::storage::write_latch::LatchSnapshot>) {
+    let latched = latch.snapshot();
+    let status = if latched.is_empty() {
+        "healthy"
+    } else {
+        "degraded"
+    };
+    (status.to_string(), latched)
+}
+
+/// Readiness under the write latch. 503 when ANY store is hard-latched; a soft
+/// latch is still inside its bounded recovery and the next write may land.
+/// Returns the hard-latched store count, which the status code cannot carry and
+/// which is the difference between one tenant affected and all of them.
+fn ready_decision(
+    ready: bool,
+    latch: &crate::storage::write_latch::WriteLatch,
+) -> (StatusCode, &'static str, usize) {
+    let hard_stores = latch.hard_count();
+    if ready && hard_stores == 0 {
+        (StatusCode::OK, "ready", 0)
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not_ready", hard_stores)
+    }
 }
 
 /// Main health check endpoint
@@ -48,9 +88,10 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let users_in_cache = state.users_in_cache();
     let user_evictions = state.user_evictions();
     let config = state.server_config();
+    let (status, write_latch) = write_latch_fields(crate::storage::write_latch::global());
 
     Json(HealthResponse {
-        status: "healthy".to_string(),
+        status,
         version: env!("VELD_VERSION_FULL").to_string(),
         build: env!("VELD_BUILD_NUMBER").to_string(),
         built_at: env!("VELD_BUILD_TIMESTAMP").to_string(),
@@ -62,6 +103,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         max_cache_size: config.max_users_in_memory,
         embedder: crate::embeddings::primary_embedder_info(),
         tenants_with_data: state.backend_census.clone(),
+        write_latch,
     })
 }
 
@@ -88,25 +130,30 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
 /// router reads `?user_id=` for per-tenant data — see `PUBLIC_PATHS` in
 /// `router.rs` and the `public_router_has_no_per_user_handlers` test.
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let ready = state.is_ready();
-    let status_code = if ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    let status_str = if ready { "ready" } else { "not_ready" };
+    let (status_code, status_str, hard_stores) =
+        ready_decision(state.is_ready(), crate::storage::write_latch::global());
 
     let users_in_cache = state.users_in_cache();
-    (
-        status_code,
-        Json(serde_json::json!({
-            "status": status_str,
-            "version": env!("VELD_VERSION_FULL"),
-            "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
-            "users_in_cache": users_in_cache,
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        })),
-    )
+    let mut body = serde_json::json!({
+        "status": status_str,
+        "version": env!("VELD_VERSION_FULL"),
+        "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
+        "users_in_cache": users_in_cache,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    });
+    if hard_stores > 0 {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "reason".to_string(),
+                serde_json::json!("storage_write_latched"),
+            );
+            object.insert(
+                "hard_latched_stores".to_string(),
+                serde_json::json!(hard_stores),
+            );
+        }
+    }
+    (status_code, Json(body))
 }
 
 /// Per-user readiness probe — **authenticated**. Tenant binding is enforced
@@ -501,4 +548,193 @@ pub async fn get_context_status(State(state): State<AppState>) -> Json<Vec<Conte
         .collect();
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Json(sessions)
+}
+
+#[cfg(test)]
+mod write_latch_reporting {
+    use super::*;
+    use crate::storage::write_latch::WriteLatch;
+    use std::path::Path;
+
+    const PRODUCTION_MESSAGE: &str =
+        "IO error: No space left on device: While open a file for appending: /store/000585.log";
+
+    /// Every field but `status` / `write_latch` is filler — the assertions are
+    /// about the two the latch decides.
+    fn response_json(latch: &WriteLatch) -> serde_json::Value {
+        let (status, write_latch) = write_latch_fields(latch);
+        let response = HealthResponse {
+            status,
+            version: "test".to_string(),
+            build: "0".to_string(),
+            built_at: "test".to_string(),
+            requested_storage_backend: "rocksdb".to_string(),
+            effective_storage_backend: "rocksdb".to_string(),
+            users_count: 0,
+            users_in_cache: 0,
+            user_evictions: 0,
+            max_cache_size: 0,
+            embedder: None,
+            tenants_with_data: crate::storage::boot_guard::BackendCensus {
+                rocksdb: 0,
+                redb: None,
+                measured_at: chrono::Utc::now(),
+            },
+            write_latch,
+        };
+        serde_json::to_value(&response).expect("HealthResponse serializes")
+    }
+
+    fn latch_at(latch: &WriteLatch, path: &str) {
+        latch.note_write_error(Path::new(path), &anyhow::anyhow!("{PRODUCTION_MESSAGE}"));
+    }
+
+    #[test]
+    fn an_unlatched_store_serializes_as_healthy_with_no_latch_field() {
+        let body = response_json(&WriteLatch::new());
+        assert_eq!(body["status"], "healthy");
+        assert!(body.get("write_latch").is_none());
+    }
+
+    #[test]
+    fn a_latched_store_serializes_as_degraded_and_carries_the_latch() {
+        let latch = WriteLatch::new();
+        latch_at(&latch, "/var/lib/veld/users/tenant-a/storage");
+
+        let body = response_json(&latch);
+        assert_eq!(body["status"], "degraded");
+        let reported = body["write_latch"]
+            .as_array()
+            .expect("write_latch is an array");
+        assert_eq!(reported.len(), 1);
+        assert_eq!(
+            reported[0]["store"],
+            crate::storage::write_latch::store_id(Path::new(
+                "/var/lib/veld/users/tenant-a/storage"
+            ))
+        );
+        assert_eq!(reported[0]["condition"], "no_space_left_on_device");
+        assert_eq!(reported[0]["failed_writes"], 1);
+        assert_eq!(reported[0]["hard"], false);
+    }
+
+    #[test]
+    fn two_latched_stores_both_appear_and_clearing_one_leaves_the_other() {
+        let latch = WriteLatch::new();
+        let a = "/var/lib/veld/users/tenant-a/storage";
+        let b = "/var/lib/veld/users/tenant-b/storage";
+        latch_at(&latch, a);
+        latch_at(&latch, b);
+
+        let body = response_json(&latch);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(
+            body["write_latch"].as_array().expect("array").len(),
+            2,
+            "one process runs one store per tenant; the response must name both"
+        );
+
+        latch.note_write_ok(Path::new(a));
+        let body = response_json(&latch);
+        assert_eq!(
+            body["status"], "degraded",
+            "a write landing on one store says nothing about the other"
+        );
+        let remaining = body["write_latch"].as_array().expect("array");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0]["store"],
+            crate::storage::write_latch::store_id(Path::new(b))
+        );
+    }
+
+    /// `/health` is on the unauthenticated probe router (`PROBE_PATHS`), and
+    /// every per-user store directory is `base.join(user_id)`
+    /// (`path_guard.rs:3`). The absence is asserted over the real serialized
+    /// body rather than by checking that a redaction step ran.
+    #[test]
+    fn the_public_body_discloses_no_store_path_and_no_tenant_id() {
+        const BASE: &str = "/var/lib/veld/users";
+        const TENANT: &str = "tenant-7f3a9c2b";
+        let store = format!("{BASE}/{TENANT}/storage");
+
+        let latch = WriteLatch::new();
+        latch.note_write_error(
+            Path::new(&store),
+            &anyhow::anyhow!(
+                "IO error: No space left on device: While open a file for appending: {store}/000585.log"
+            )
+            .context("Failed to put memory 4c1f0b9e-77a2-4d35-9f10-8e2b6d4a1c33 in RocksDB"),
+        );
+
+        let body = response_json(&latch);
+        let latch_field = serde_json::to_string(&body["write_latch"]).expect("serializes");
+        let whole_body = serde_json::to_string(&body).expect("serializes");
+
+        // Floor first: without this the absences below pass over an empty array.
+        assert_eq!(body["status"], "degraded");
+        assert!(latch_field.contains(&crate::storage::write_latch::store_id(Path::new(&store))));
+        assert!(latch_field.contains("\"failed_writes\":1"));
+
+        assert!(
+            !whole_body.contains(TENANT),
+            "the tenant id reached an unauthenticated body: {whole_body}"
+        );
+        assert!(
+            !whole_body.contains(BASE),
+            "the host filesystem layout reached an unauthenticated body: {whole_body}"
+        );
+        assert!(
+            !whole_body.contains("000585.log"),
+            "the failing file reached an unauthenticated body: {whole_body}"
+        );
+        assert!(
+            !whole_body.contains("4c1f0b9e"),
+            "the failing memory's id reached an unauthenticated body: {whole_body}"
+        );
+        assert!(
+            !latch_field.contains('/'),
+            "a path separator survived in the published latch: {latch_field}"
+        );
+    }
+
+    #[test]
+    fn ready_stays_200_through_a_soft_latch() {
+        let latch = WriteLatch::new();
+        latch_at(&latch, "/var/lib/veld/users/tenant-a/storage");
+
+        let (code, status, hard_stores) = ready_decision(true, &latch);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(status, "ready");
+        assert_eq!(hard_stores, 0);
+    }
+
+    #[test]
+    fn ready_returns_503_when_any_store_is_hard_latched() {
+        let latch = WriteLatch::new();
+        let a = "/var/lib/veld/users/tenant-a/storage";
+        let b = "/var/lib/veld/users/tenant-b/storage";
+        latch_at(&latch, a);
+        latch_at(&latch, b);
+        latch.mark_hard(Path::new(b));
+
+        let (code, status, hard_stores) = ready_decision(true, &latch);
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, "not_ready");
+        assert_eq!(
+            hard_stores, 1,
+            "one of the two is hard, and that is the count"
+        );
+    }
+
+    #[test]
+    fn ready_is_unaffected_when_nothing_is_latched() {
+        let latch = WriteLatch::new();
+        assert_eq!(ready_decision(true, &latch).0, StatusCode::OK);
+        assert_eq!(
+            ready_decision(false, &latch).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(ready_decision(false, &latch).2, 0);
+    }
 }

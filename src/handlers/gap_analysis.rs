@@ -874,7 +874,10 @@ pub struct GapStatsResponse {
     pub edge_count: usize,
 }
 
-/// Get lightweight graph stats without running detection.
+/// Get lightweight graph stats without running detection. Serves the counts
+/// the last sync left in the slow store, up to `graph_mirror_sync_secs` stale; rebuilds
+/// only when the store has never been synced, so a fresh store does not report
+/// zero until another handler happens to sync it.
 ///
 /// POST /api/gap/stats
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
@@ -889,7 +892,9 @@ pub async fn gap_stats(
 
     let result = tokio::task::spawn_blocking(move || -> Result<GapStatsResponse, anyhow::Error> {
         let store = get_or_create_slow_store(&state_clone, &user_id)?;
-        sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
+        if store.never_synced() {
+            sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
+        }
         Ok(GapStatsResponse {
             entity_count: store.entity_count()?,
             edge_count: store.edge_count()?,
