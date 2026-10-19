@@ -21,6 +21,16 @@ changes nothing — every retrieval dial is `None` so the engine uses its
 learned-weight default; every plasticity dial is `false`/zero so
 reconsolidation behaves exactly as it did pre-dials.
 
+### Candidate-generation switches
+
+| Dial | Env | Default | What it switches |
+|---|---|---|---|
+| `date_window_leg` | `VELD_DIALS_DATE_WINDOW_LEG` | `None` (on) | The date window candidate leg (recall Layer 3.7). When a query names a calendar day ("1 May, 2022") or month-year ("April 2022"), the memories whose `created_at` falls in that window — a day widened by one day either side, a month as written — enter RRF fusion as their own list, ranked by similarity to the query and capped at `candidate_count` (or `max_results × 8`). Year-only mentions never fire it. `Some(false)` leaves dated queries to the Layer 4.55 temporal boost alone. |
+
+The recall gate records the overrides a run was measured under
+(`retrieval_dials` in `tests/recall/locomo-gate-baseline.json`) and refuses to
+diff two runs that overrode them differently.
+
 ## Lifecycle
 
 ```mermaid
