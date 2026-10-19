@@ -135,6 +135,25 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub turn_context_embedding: Option<bool>,
 
+    /// Whether recall runs neighbour expansion: for each of the top
+    /// `neighbour_expansion_top` fused candidates that is a conversation turn, the turn
+    /// recorded as following it (`memory::turn_successors`) joins the pre-rerank pool at
+    /// the parent's fused score times a decay, so the cross-encoder judges it on its own
+    /// text. `None` keeps the engine default, which is on.
+    #[serde(default)]
+    pub neighbour_expansion: Option<bool>,
+
+    /// How many of the top fused candidates neighbour expansion reads. `None` keeps the
+    /// engine default, [`crate::constants::NEIGHBOUR_EXPANSION_TOP_DEFAULT`]; sanitised
+    /// to `1..=NEIGHBOUR_EXPANSION_TOP_MAX`.
+    #[serde(default)]
+    pub neighbour_expansion_top: Option<usize>,
+
+    /// Whether neighbour expansion also brings in the turn each ranked turn follows (its
+    /// `preceding_memory_id`). `None` keeps the engine default, which is off.
+    #[serde(default)]
+    pub neighbour_expansion_predecessor: Option<bool>,
+
     /// Override the RRF fusion weights `(bm25, vector, graph)`. `None` keeps the
     /// engine/learned weights.
     #[serde(default)]
@@ -413,6 +432,9 @@ impl Default for CognitiveDials {
             rerank_count: None,
             turn_context: None,
             turn_context_embedding: None,
+            neighbour_expansion: None,
+            neighbour_expansion_top: None,
+            neighbour_expansion_predecessor: None,
             rrf_weights: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
@@ -448,6 +470,10 @@ impl CognitiveDials {
         }
         if let Some(r) = self.rerank_count {
             self.rerank_count = Some(r.clamp(1, 200));
+        }
+        if let Some(n) = self.neighbour_expansion_top {
+            self.neighbour_expansion_top =
+                Some(n.clamp(1, crate::constants::NEIGHBOUR_EXPANSION_TOP_MAX));
         }
         if let Some((b, v, g)) = self.rrf_weights {
             self.rrf_weights = Some((b.clamp(0.0, 1.0), v.clamp(0.0, 1.0), g.clamp(0.0, 1.0)));
@@ -506,13 +532,37 @@ impl CognitiveDials {
         self.turn_context_enabled() && self.turn_context_embedding.unwrap_or(false)
     }
 
+    /// Whether recall runs neighbour expansion (`neighbour_expansion`; the engine
+    /// default is on).
+    #[inline]
+    pub fn neighbour_expansion_enabled(&self) -> bool {
+        self.neighbour_expansion.unwrap_or(true)
+    }
+
+    /// How many top fused candidates neighbour expansion reads (`neighbour_expansion_top`).
+    #[inline]
+    pub fn neighbour_expansion_top_n(&self) -> usize {
+        self.neighbour_expansion_top
+            .unwrap_or(crate::constants::NEIGHBOUR_EXPANSION_TOP_DEFAULT)
+            .clamp(1, crate::constants::NEIGHBOUR_EXPANSION_TOP_MAX)
+    }
+
+    /// Whether neighbour expansion also brings in each ranked turn's predecessor
+    /// (`neighbour_expansion_predecessor`; the engine default is off).
+    #[inline]
+    pub fn neighbour_expansion_predecessor_enabled(&self) -> bool {
+        self.neighbour_expansion_enabled() && self.neighbour_expansion_predecessor.unwrap_or(false)
+    }
+
     /// Seed dials from process environment (`VELD_*`), overlaying [`Default`]. Used at
     /// `MemorySystem` construction. Unset vars keep the (inert) default. Result is
     /// [`sanitized`](Self::sanitized). Recognized vars:
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
-    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT}`.
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,TURN_CONTEXT,
+    /// TURN_CONTEXT_EMBEDDING,NEIGHBOUR_EXPANSION,NEIGHBOUR_EXPANSION_TOP,
+    /// NEIGHBOUR_EXPANSION_PREDECESSOR}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -567,6 +617,15 @@ impl CognitiveDials {
         if let Some(v) = env_bool("VELD_DIALS_TURN_CONTEXT_EMBEDDING") {
             d.turn_context_embedding = Some(v);
         }
+        if let Some(v) = env_bool("VELD_DIALS_NEIGHBOUR_EXPANSION") {
+            d.neighbour_expansion = Some(v);
+        }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_NEIGHBOUR_EXPANSION_TOP") {
+            d.neighbour_expansion_top = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_NEIGHBOUR_EXPANSION_PREDECESSOR") {
+            d.neighbour_expansion_predecessor = Some(v);
+        }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
         d.rrf_k_decomp = env_parse::<f32>("VELD_TUNE_RRF_K_DECOMP").or(d.rrf_k_decomp);
@@ -619,6 +678,14 @@ mod tests {
         assert!(d.turn_context_enabled());
         assert!(d.turn_context_embedding.is_none());
         assert!(!d.turn_context_embedding_enabled());
+        assert!(d.neighbour_expansion.is_none());
+        assert!(d.neighbour_expansion_enabled());
+        assert_eq!(
+            d.neighbour_expansion_top_n(),
+            crate::constants::NEIGHBOUR_EXPANSION_TOP_DEFAULT
+        );
+        assert!(d.neighbour_expansion_predecessor.is_none());
+        assert!(!d.neighbour_expansion_predecessor_enabled());
         assert!(d.candidate_count.is_none());
         assert!(d.rrf_weights.is_none());
         assert_eq!(
@@ -750,6 +817,38 @@ mod tests {
         assert_eq!(d.candidate_count, Some(1000));
         assert_eq!(d.rerank_count, Some(1));
         assert_eq!(d.rrf_weights, Some((1.0, 0.0, 0.5)));
+
+        let none = CognitiveDials {
+            neighbour_expansion_top: Some(0),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(none.neighbour_expansion_top, Some(1));
+        let wide = CognitiveDials {
+            neighbour_expansion_top: Some(10_000),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(
+            wide.neighbour_expansion_top,
+            Some(crate::constants::NEIGHBOUR_EXPANSION_TOP_MAX)
+        );
+    }
+
+    #[test]
+    fn the_predecessor_leg_needs_neighbour_expansion_on() {
+        let d = CognitiveDials {
+            neighbour_expansion: Some(false),
+            neighbour_expansion_predecessor: Some(true),
+            ..Default::default()
+        };
+        assert!(!d.neighbour_expansion_enabled());
+        assert!(!d.neighbour_expansion_predecessor_enabled());
+        let on = CognitiveDials {
+            neighbour_expansion_predecessor: Some(true),
+            ..Default::default()
+        };
+        assert!(on.neighbour_expansion_predecessor_enabled());
     }
 
     #[test]
