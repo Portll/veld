@@ -96,6 +96,12 @@ pub async fn records(
     if let Err(e) = crate::validation::validate_user_id(&q.user_id) {
         return bad_request(e);
     }
+    if !replication::has_log(&state, &q.user_id) {
+        return respond(
+            StatusCode::NOT_FOUND,
+            json!({"error": "no_such_log", "detail": format!("no intent log for tenant '{}'", q.user_id)}),
+        );
+    }
     let limit = q.limit.unwrap_or(replication::FEED_LIMIT).clamp(1, 5000);
     let page = tokio::task::spawn_blocking(move || {
         replication::feed(&state, &q.user_id, q.after_lsn, limit)
@@ -133,7 +139,8 @@ pub async fn follow(State(state): State<AppState>, headers: HeaderMap, body: Byt
         Err(e) => return bad_request(e),
     };
     let me = own_base_url(&state);
-    if source == me {
+    let cfg = state.server_config();
+    if source == me || replication::is_same_instance(&source, &cfg.host, cfg.port) {
         return respond(
             StatusCode::CONFLICT,
             json!({"error": "would_loop", "detail": format!("{source} is this instance")}),
@@ -143,10 +150,14 @@ pub async fn follow(State(state): State<AppState>, headers: HeaderMap, body: Byt
         .api_key
         .clone()
         .filter(|k| !k.trim().is_empty())
-        .or_else(replication::own_api_key)
+        .or_else(|| replication::default_api_key_for(&source))
     {
         Some(k) => k,
-        None => return bad_request("no API key for the leader: pass api_key"),
+        None => {
+            return bad_request(
+                "pass the leader's api_key: this server's own key is only offered to a leader on this host",
+            )
+        }
     };
     match replication::source_follows(&source, &req.admin_key, &api_key).await {
         Ok(Some(upstream)) if upstream == me => {

@@ -200,20 +200,44 @@ fn capture_env(_pid: u32) -> Option<Vec<(String, String)>> {
     None
 }
 
-/// The command line of a live process: `ps -o command=` without `-E`, so the
-/// environment is not in it. Arguments containing spaces come back split.
+/// The command line of a live process, executable first. `ps -o comm=` gives the
+/// executable path whole, so a path with spaces (`/Applications/Veld Desktop.app/…`)
+/// survives; the arguments come from `ps -o command=` after that prefix, and an
+/// argument containing spaces comes back split.
 #[cfg(target_os = "macos")]
 fn capture_cmdline(pid: u32) -> Option<Vec<String>> {
-    let out = Command::new("ps")
-        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let words: Vec<String> = text.split_whitespace().map(str::to_string).collect();
-    (!words.is_empty()).then_some(words)
+    let ps = |field: &str| -> Option<String> {
+        let out = Command::new("ps")
+            .args(["-ww", "-o", field, "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let command = ps("command=")?;
+    let exe = ps("comm=").filter(|e| !e.is_empty());
+    split_cmdline(&command, exe.as_deref())
+}
+
+/// `command` split into executable and arguments, taking `exe` whole when the
+/// command line starts with it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn split_cmdline(command: &str, exe: Option<&str>) -> Option<Vec<String>> {
+    let (first, rest) = match exe.and_then(|e| command.strip_prefix(e).map(|r| (e, r))) {
+        Some((e, r)) => (e.to_string(), r),
+        None => {
+            let trimmed = command.trim_start();
+            let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+            if end == 0 {
+                return None;
+            }
+            (trimmed[..end].to_string(), &trimmed[end..])
+        }
+    };
+    let mut words = vec![first];
+    words.extend(rest.split_whitespace().map(str::to_string));
+    Some(words)
 }
 
 #[cfg(target_os = "macos")]
@@ -539,6 +563,20 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_cmdline_keeps_an_executable_path_with_spaces() {
+        let exe = "/Applications/Veld Desktop.app/Contents/MacOS/veld";
+        assert_eq!(
+            split_cmdline(&format!("{exe} server --port 3031"), Some(exe)).unwrap(),
+            vec![exe.to_string(), "server".into(), "--port".into(), "3031".into()]
+        );
+        assert_eq!(
+            split_cmdline("veld server", Some("/other/path")).unwrap(),
+            vec!["veld".to_string(), "server".into()]
+        );
+        assert!(split_cmdline("   ", None).is_none());
+    }
 
     #[test]
     fn only_veld_configuration_is_carried() {
