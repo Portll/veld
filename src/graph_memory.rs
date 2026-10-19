@@ -6,7 +6,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "rocksdb")]
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
@@ -2193,7 +2193,22 @@ impl GraphMemory {
     /// a small per-instance cache is created (standalone / test use).
     #[cfg(feature = "rocksdb")]
     pub fn new(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
+        Self::new_with_tuning(path, shared_cache, crate::config::StorageTuning::process())
+    }
+
+    /// [`Self::new`] with an explicit durability class and standalone block cache in
+    /// place of the process's. Every write the graph makes, the pre-column-family
+    /// import included, syncs as `tuning` says.
+    #[cfg(feature = "rocksdb")]
+    pub fn new_with_tuning(
+        path: &Path,
+        shared_cache: Option<&crate::storage::SharedBlockCache>,
+        tuning: crate::config::StorageTuning,
+    ) -> Result<Self> {
         use crate::constants::ROCKSDB_GRAPH_WRITE_BUFFER_BYTES;
+        /// The graph's own default when `VELD_ROCKSDB_BLOCK_CACHE_BYTES` is unset: a
+        /// standalone graph is read far less than the memory store beside it.
+        const STANDALONE_GRAPH_BLOCK_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
         let graph_path = path.join("graph");
         std::fs::create_dir_all(&graph_path)?;
@@ -2211,7 +2226,11 @@ impl GraphMemory {
         let cache = match shared_cache {
             Some(c) => c,
             None => {
-                local_cache = Cache::new_lru_cache(8 * 1024 * 1024); // 8MB standalone
+                local_cache = Cache::new_lru_cache(
+                    tuning
+                        .rocksdb_block_cache_bytes
+                        .unwrap_or(STANDALONE_GRAPH_BLOCK_CACHE_BYTES),
+                );
                 &local_cache
             }
         };
@@ -2253,7 +2272,8 @@ impl GraphMemory {
         let db = Arc::new(DB::open_cf_descriptors(&opts, &graph_path, cf_descriptors)?);
 
         // Migrate data from old separate-DB layout if needed
-        let migrated = Self::migrate_from_separate_dbs(path, &db)?;
+        let sync_writes = tuning.rocksdb_sync_writes();
+        let migrated = Self::migrate_from_separate_dbs(path, &db, sync_writes)?;
         if migrated > 0 {
             tracing::info!(
                 "Migrated {} entries from separate graph DBs to column families",
@@ -2262,7 +2282,10 @@ impl GraphMemory {
         }
 
         let store: Arc<dyn crate::storage::ColumnStore> = Arc::new(
-            crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db)),
+            crate::storage::legacy_rocksdb::RocksDbColumnStore::with_sync_writes(
+                Arc::clone(&db),
+                sync_writes,
+            ),
         );
         Self::from_store(store, Some(db))
     }
@@ -2375,7 +2398,8 @@ impl GraphMemory {
     /// Detects old `graph_*` subdirectories, opens them read-only, copies all KV
     /// pairs into the corresponding CF, then renames the old directory for rollback safety.
     #[cfg(feature = "rocksdb")]
-    fn migrate_from_separate_dbs(base_path: &Path, db: &DB) -> Result<usize> {
+    fn migrate_from_separate_dbs(base_path: &Path, db: &DB, sync_writes: bool) -> Result<usize> {
+        let write_opts = crate::storage::rocksdb_write_options(sync_writes);
         let old_dirs: &[(&str, &str)] = &[
             ("graph_entities", CF_ENTITIES),
             ("graph_relationships", CF_RELATIONSHIPS),
@@ -2426,8 +2450,7 @@ impl GraphMemory {
                                 count += 1;
                                 // Flush in chunks to limit memory usage
                                 if count.is_multiple_of(10_000) {
-                                    db.write(std::mem::take(&mut batch))?;
-                                    batch = WriteBatch::default();
+                                    db.write_opt(std::mem::take(&mut batch), &write_opts)?;
                                 }
                             }
                             Err(e) => {
@@ -2438,7 +2461,7 @@ impl GraphMemory {
                     }
 
                     if count > 0 {
-                        db.write(batch)?;
+                        db.write_opt(batch, &write_opts)?;
                     }
 
                     drop(old_db);
@@ -2766,6 +2789,24 @@ impl GraphMemory {
             is_new_entity = true;
         }
 
+        self.persist_entity(&entity, is_new_entity)?;
+        Ok(entity.uuid)
+    }
+
+    /// Store `entity` exactly as given, under `entity.uuid`, and point its names at it:
+    /// persistence only, which is what `GraphStore::put_entity` means on every engine.
+    /// The dedup, merging and mention counting of [`Self::add_entity`] are the graph
+    /// engine's, and a caller that names the uuid has already decided which node this is.
+    pub fn put_entity_record(&self, entity: &EntityNode) -> Result<()> {
+        let is_new_entity = self
+            .store
+            .get_cf(CF_ENTITIES, entity.uuid.as_bytes())?
+            .is_none();
+        self.persist_entity(entity, is_new_entity)
+    }
+
+    /// Index `entity`'s names and write it under its uuid, counting it when it is new.
+    fn persist_entity(&self, entity: &EntityNode, is_new_entity: bool) -> Result<()> {
         // BUG-002 FIX: Write index FIRST, then entity
         let lowercase_name = entity.name.to_lowercase();
         let stemmer = Stemmer::create(Algorithm::English);
@@ -2828,7 +2869,7 @@ impl GraphMemory {
 
         // Store entity in database
         let key = entity.uuid.as_bytes();
-        let value = bincode::serde::encode_to_vec(&entity, bincode::config::standard())?;
+        let value = bincode::serde::encode_to_vec(entity, bincode::config::standard())?;
         self.store.put_cf(CF_ENTITIES, key, &value)?;
 
         // Increment counter only for truly new entities
@@ -2836,7 +2877,7 @@ impl GraphMemory {
             self.entity_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        Ok(entity.uuid)
+        Ok(())
     }
 
     /// Get entity by UUID
@@ -2973,7 +3014,7 @@ impl GraphMemory {
         // 7. Remove entity_episodes entries (prefix scan)
         //
         // This step did not exist. The inverted index is keyed
-        // `{entity_uuid}:{episode_uuid}` (index_entity_episode) and was only ever
+        // `{entity_uuid}:{episode_uuid}` (entity_episode_key) and was only ever
         // cleaned per-EPISODE, so deleting an entity that episodes still referenced
         // left its rows behind forever. Orphan cleanup runs repeatedly, so the
         // residue accumulates: a slow leak in index space that nothing reports and
@@ -3410,90 +3451,194 @@ impl GraphMemory {
     /// instead of creating a duplicate. This implements proper Hebbian learning:
     /// "neurons that fire together, wire together" - repeated co-occurrence
     /// strengthens the same synapse rather than creating parallel connections.
-    pub fn add_relationship(&self, mut edge: RelationshipEdge) -> Result<Uuid> {
+    pub fn add_relationship(&self, edge: RelationshipEdge) -> Result<Uuid> {
+        self.add_relationships(vec![edge])?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("add_relationships returned no id for its one edge"))
+    }
+
+    /// [`Self::add_relationship`] for many edges: one lock acquisition and ONE atomic
+    /// write, which carries every strengthened edge and, for each new edge, the edge,
+    /// both entity->edge index rows and the pair-index row — so no new edge can exist
+    /// without its index rows, and the batch costs one commit rather than four per edge.
+    /// Edges sharing an entity pair and relation type collapse onto one synapse exactly
+    /// as successive calls would. Returns each edge's id, in input order.
+    pub fn add_relationships(&self, edges: Vec<RelationshipEdge>) -> Result<Vec<Uuid>> {
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
         // Acquire synapse lock to prevent TOCTOU race: two concurrent callers can both
         // pass find_relationship_between_typed (both see None) and then both insert a new
         // edge, creating duplicates. Serializing here ensures find+create is atomic.
         let _guard = self
             .synapse_update_lock
             .try_lock_for(std::time::Duration::from_secs(5))
-            .ok_or_else(|| anyhow::anyhow!("synapse_update_lock timeout in add_relationship"))?;
+            .ok_or_else(|| anyhow::anyhow!("synapse_update_lock timeout in add_relationships"))?;
 
-        // Check for existing relationship between these entities WITH SAME TYPE
-        // Different relation types (e.g. WorksWith vs PartOf) are distinct edges
-        if let Some(mut existing) = self.find_relationship_between_typed(
-            &edge.from_entity,
-            &edge.to_entity,
-            &edge.relation_type,
-        )? {
-            // Strengthen existing edge instead of creating duplicate
-            let source = edge
-                .source_episode_id
-                .map(|id| format!("episode:{id}"))
-                .unwrap_or_else(|| crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE.to_string());
-            let _ = existing.strengthen_from(&source);
-
-            // Update context if new context is more informative
-            if edge.context.len() > existing.context.len() {
-                existing.context = edge.context;
+        // Every edge this call writes, strengthened or new, once each: an edge touched
+        // twice in one batch is strengthened twice on the same copy.
+        let mut pending: Vec<RelationshipEdge> = Vec::new();
+        let mut created: Vec<usize> = Vec::new();
+        let mut ids = Vec::with_capacity(edges.len());
+        for mut edge in edges {
+            // Different relation types (e.g. WorksWith vs PartOf) are distinct edges.
+            let in_batch = pending.iter().position(|p| {
+                p.relation_type == edge.relation_type
+                    && ((p.from_entity == edge.from_entity && p.to_entity == edge.to_entity)
+                        || (p.from_entity == edge.to_entity && p.to_entity == edge.from_entity))
+            });
+            let existing = match in_batch {
+                Some(slot) => Some(slot),
+                None => self
+                    .find_relationship_between_typed(
+                        &edge.from_entity,
+                        &edge.to_entity,
+                        &edge.relation_type,
+                    )?
+                    .map(|stored| {
+                        pending.push(stored);
+                        pending.len() - 1
+                    }),
+            };
+            match existing {
+                Some(slot) => {
+                    // Strengthen existing edge instead of creating duplicate
+                    let synapse = &mut pending[slot];
+                    let source = edge
+                        .source_episode_id
+                        .map(|id| format!("episode:{id}"))
+                        .unwrap_or_else(|| {
+                            crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE.to_string()
+                        });
+                    let _ = synapse.strengthen_from(&source);
+                    // Update context if new context is more informative
+                    if edge.context.len() > synapse.context.len() {
+                        synapse.context = edge.context;
+                    }
+                    ids.push(synapse.uuid);
+                }
+                None => {
+                    edge.uuid = Uuid::new_v4();
+                    edge.created_at = Utc::now();
+                    ids.push(edge.uuid);
+                    created.push(pending.len());
+                    pending.push(edge);
+                }
             }
-
-            // Persist the strengthened edge
-            let key = existing.uuid.as_bytes();
-            let value = bincode::serde::encode_to_vec(&existing, bincode::config::standard())?;
-            self.store.put_cf(CF_RELATIONSHIPS, key, &value)?;
-
-            return Ok(existing.uuid);
         }
 
-        // No existing edge - create new one
-        edge.uuid = Uuid::new_v4();
-        edge.created_at = Utc::now();
-
-        // Store relationship
-        let key = edge.uuid.as_bytes();
-        let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
-        self.store.put_cf(CF_RELATIONSHIPS, key, &value)?;
-
-        // Increment relationship counter
-        self.relationship_count.fetch_add(1, Ordering::Relaxed);
-
-        // Update entity->edges index for both entities.
-        // Rollback the relationship write if indexing fails to prevent ghost edges.
-        if let Err(e) = self
-            .index_entity_edge(&edge.from_entity, &edge.uuid)
-            .and_then(|_| self.index_entity_edge(&edge.to_entity, &edge.uuid))
-            .and_then(|_| self.index_entity_pair(&edge.from_entity, &edge.to_entity, &edge.uuid))
-        {
-            tracing::warn!(
-                "Rolling back relationship {} due to index failure: {}",
-                edge.uuid,
-                e
+        let mut batch = crate::storage::WriteBatch::new();
+        for edge in &pending {
+            batch.put_cf(
+                CF_RELATIONSHIPS,
+                edge.uuid.as_bytes().to_vec(),
+                bincode::serde::encode_to_vec(edge, bincode::config::standard())?,
             );
-            if let Err(del_err) = self.store.delete_cf(CF_RELATIONSHIPS, edge.uuid.as_bytes()) {
-                tracing::warn!(
-                    "Rollback delete failed for relationship {}: {del_err}",
-                    edge.uuid
+        }
+        for &slot in &created {
+            let edge = &pending[slot];
+            for entity in [edge.from_entity, edge.to_entity] {
+                batch.put_cf(
+                    CF_ENTITY_EDGES,
+                    Self::entity_edge_key(&entity, &edge.uuid).into_bytes(),
+                    b"1".to_vec(),
                 );
             }
-            self.relationship_count.fetch_sub(1, Ordering::Relaxed);
-            return Err(e);
+            batch.put_cf(
+                CF_ENTITY_PAIR_INDEX,
+                Self::pair_key(&edge.from_entity, &edge.to_entity).into_bytes(),
+                edge.uuid.as_bytes().to_vec(),
+            );
         }
+        self.store.write_batch(&batch)?;
+        self.relationship_count
+            .fetch_add(created.len(), Ordering::Relaxed);
 
         // Insert-time degree pruning: cap edges per entity to prevent O(n²) explosion.
         // If either entity exceeds MAX_ENTITY_DEGREE, prune the weakest edges.
         // This is the primary defense against graph bloat (132MB for 600KB of content).
-        self.prune_entity_if_over_degree(&edge.from_entity)?;
-        self.prune_entity_if_over_degree(&edge.to_entity)?;
+        // Pruning after the whole batch keeps the same edges as pruning after each one:
+        // both keep the strongest MAX_ENTITY_DEGREE under one total order.
+        let mut touched: Vec<Uuid> = Vec::new();
+        for &slot in &created {
+            for entity in [pending[slot].from_entity, pending[slot].to_entity] {
+                if !touched.contains(&entity) {
+                    touched.push(entity);
+                }
+            }
+        }
+        for entity in &touched {
+            self.prune_entity_if_over_degree(entity)?;
+        }
 
-        Ok(edge.uuid)
+        Ok(ids)
     }
 
-    /// Index an edge for an entity
-    fn index_entity_edge(&self, entity_uuid: &Uuid, edge_uuid: &Uuid) -> Result<()> {
-        let key = format!("{entity_uuid}:{edge_uuid}");
-        self.store.put_cf(CF_ENTITY_EDGES, key.as_bytes(), b"1")?;
+    /// Store `edge` exactly as given, under `edge.uuid`, with its entity and pair index
+    /// rows, in one atomic write: persistence only, which is what
+    /// `GraphStore::put_relationship` means on every engine. The Hebbian merge of
+    /// [`Self::add_relationships`] — strengthen the existing synapse for a pair, mint a
+    /// uuid for a new one, prune by degree — is the graph engine's.
+    pub fn put_relationship_record(&self, edge: &RelationshipEdge) -> Result<()> {
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in put_relationship_record")
+            })?;
+        let previous = self
+            .store
+            .get_cf(CF_RELATIONSHIPS, edge.uuid.as_bytes())?
+            .map(|bytes| RelationshipEdge::decode(&bytes).ok());
+
+        let mut batch = crate::storage::WriteBatch::new();
+        if let Some(Some(previous)) = &previous {
+            for entity in [previous.from_entity, previous.to_entity] {
+                if entity != edge.from_entity && entity != edge.to_entity {
+                    batch.delete_cf(
+                        CF_ENTITY_EDGES,
+                        Self::entity_edge_key(&entity, &edge.uuid).into_bytes(),
+                    );
+                }
+            }
+            let previous_pair = Self::pair_key(&previous.from_entity, &previous.to_entity);
+            let pair_still_names_this_edge = self
+                .store
+                .get_cf(CF_ENTITY_PAIR_INDEX, previous_pair.as_bytes())?
+                .is_some_and(|holder| holder.as_slice() == edge.uuid.as_bytes());
+            if previous_pair != Self::pair_key(&edge.from_entity, &edge.to_entity)
+                && pair_still_names_this_edge
+            {
+                batch.delete_cf(CF_ENTITY_PAIR_INDEX, previous_pair.into_bytes());
+            }
+        }
+        batch.put_cf(
+            CF_RELATIONSHIPS,
+            edge.uuid.as_bytes().to_vec(),
+            bincode::serde::encode_to_vec(edge, bincode::config::standard())?,
+        );
+        for entity in [edge.from_entity, edge.to_entity] {
+            batch.put_cf(
+                CF_ENTITY_EDGES,
+                Self::entity_edge_key(&entity, &edge.uuid).into_bytes(),
+                b"1".to_vec(),
+            );
+        }
+        batch.put_cf(
+            CF_ENTITY_PAIR_INDEX,
+            Self::pair_key(&edge.from_entity, &edge.to_entity).into_bytes(),
+            edge.uuid.as_bytes().to_vec(),
+        );
+        self.store.write_batch(&batch)?;
+        if previous.is_none() {
+            self.relationship_count.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
+    }
+
+    /// The entity->edge index key: `{entity_uuid}:{edge_uuid}`.
+    fn entity_edge_key(entity_uuid: &Uuid, edge_uuid: &Uuid) -> String {
+        format!("{entity_uuid}:{edge_uuid}")
     }
 
     /// Prune an entity's edges if degree exceeds MAX_ENTITY_DEGREE
@@ -4264,27 +4409,60 @@ impl GraphMemory {
         Ok((entity_count, relationship_count, episode_count))
     }
 
-    /// Add an episodic node
+    /// Add an episodic node, or rewrite the one stored under its uuid.
+    ///
+    /// The episode, its entity->episode index rows, and the removal of the rows for
+    /// entities a rewrite no longer references are one atomic write. `episode_count`
+    /// counts episodes, not writes: it rises only when the uuid was not stored, as it
+    /// is recounted from the stored rows on the next open.
     pub fn add_episode(&self, episode: EpisodicNode) -> Result<Uuid> {
         let key = episode.uuid.as_bytes();
-        let entity_count = episode.entity_refs.len();
         tracing::debug!(
             "add_episode: {} with {} entity_refs",
             &episode.uuid.to_string()[..8],
-            entity_count
+            episode.entity_refs.len()
         );
 
-        let value = bincode::serde::encode_to_vec(&episode, bincode::config::standard())?;
+        let stored = self.store.get_cf(CF_EPISODES, key)?;
+        let previous: Option<EpisodicNode> = stored.as_deref().and_then(|bytes| {
+            bincode::serde::decode_from_slice::<EpisodicNode, _>(bytes, bincode::config::standard())
+                .ok()
+                .map(|(previous, _)| previous)
+        });
 
-        // The record and both inverted indexes (entity -> episode, and the recency-ordered
-        // one) land in one batch, so a reader never sees an index row without its episode.
+        // The record, both inverted indexes (entity -> episode, and the recency-ordered one),
+        // and the removal of a rewrite's stale rows land in one batch, so a reader never sees
+        // an index row without its episode.
         let mut batch = crate::storage::WriteBatch::new();
-        batch.put_cf(CF_EPISODES, key.as_slice(), value);
+        batch.put_cf(
+            CF_EPISODES,
+            key.to_vec(),
+            bincode::serde::encode_to_vec(&episode, bincode::config::standard())?,
+        );
+        if let Some(previous) = &previous {
+            for entity_uuid in &previous.entity_refs {
+                if !episode.entity_refs.contains(entity_uuid) {
+                    batch.delete_cf(
+                        CF_ENTITY_EPISODES,
+                        Self::entity_episode_key(entity_uuid, &episode.uuid).into_bytes(),
+                    );
+                }
+                if previous.created_at != episode.created_at
+                    || !episode.entity_refs.contains(entity_uuid)
+                {
+                    batch.delete_cf(
+                        CF_ENTITY_EPISODES,
+                        Self::episode_recency_key(entity_uuid, previous.created_at, &episode.uuid)
+                            .into_bytes(),
+                    );
+                }
+            }
+        }
         for entity_uuid in &episode.entity_refs {
             batch.put_cf(
                 CF_ENTITY_EPISODES,
-                format!("{entity_uuid}:{}", episode.uuid).into_bytes(),
-                b"1".as_slice(),
+                Self::entity_episode_key(entity_uuid, &episode.uuid).into_bytes(),
+                b"1".to_vec(),
             );
             batch.put_cf(
                 CF_ENTITY_EPISODES,
@@ -4295,11 +4473,15 @@ impl GraphMemory {
         }
         self.store.write_batch(&batch)?;
 
-        // Increment episode counter
-        let prev = self.episode_count.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!("add_episode: count {} -> {}", prev, prev + 1);
-
+        if stored.is_none() {
+            self.episode_count.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(episode.uuid)
+    }
+
+    /// The entity->episode inverted-index key: `{entity_uuid}:{episode_uuid}`.
+    fn entity_episode_key(entity_uuid: &Uuid, episode_uuid: &Uuid) -> String {
+        format!("{entity_uuid}:{episode_uuid}")
     }
 
     /// Key of the recency-ordered entity -> episode index:
@@ -5826,6 +6008,7 @@ impl GraphMemory {
         let mut batch = crate::storage::WriteBatch::new();
         let mut strengthened = 0;
         let mut promotion_boosts = Vec::new();
+        let mut entities_to_prune = Vec::new();
 
         for (from_id_str, to_id_str, _boost) in edge_boosts {
             // Parse UUIDs
@@ -5931,6 +6114,18 @@ impl GraphMemory {
                         idx_key_rev.as_bytes(),
                         edge.uuid.as_bytes(),
                     );
+                    // Index new replay edges in entity_edges CF so they're visible to
+                    // traversal and degree-cap enforcement (GQ-11 fix), in the same
+                    // batch as the edge so neither can exist without the other.
+                    for entity in [from_uuid, to_uuid] {
+                        batch.put_cf(
+                            CF_ENTITY_EDGES,
+                            Self::entity_edge_key(&entity, &edge.uuid).into_bytes(),
+                            b"1".to_vec(),
+                        );
+                    }
+                    entities_to_prune.push(from_uuid);
+                    entities_to_prune.push(to_uuid);
 
                     strengthened += 1;
                 }
@@ -5941,34 +6136,6 @@ impl GraphMemory {
             self.store.write_batch(&batch)?;
             self.total_activations
                 .fetch_add(strengthened as u64, Ordering::Relaxed);
-
-            // Index new replay edges in entity_edges CF so they're visible to
-            // traversal and degree-cap enforcement (GQ-11 fix)
-            let mut entities_to_prune = Vec::new();
-            for (from_id_str, to_id_str, _boost) in edge_boosts {
-                let from_uuid = match Uuid::parse_str(from_id_str) {
-                    Ok(u) => u,
-                    Err(_) => continue,
-                };
-                let to_uuid = match Uuid::parse_str(to_id_str) {
-                    Ok(u) => u,
-                    Err(_) => continue,
-                };
-                // Only index edges that we actually wrote (find_edge_between_entities returns
-                // the edge if it existed before, so new edges are the ones that didn't exist)
-                if let Ok(Some(edge)) = self.find_edge_between_entities(&from_uuid, &to_uuid) {
-                    if edge.context == "replay_strengthened" && edge.activation_count <= 1 {
-                        if let Err(e) = self.index_entity_edge(&from_uuid, &edge.uuid) {
-                            tracing::debug!("Failed to index replay edge for entity: {}", e);
-                        }
-                        if let Err(e) = self.index_entity_edge(&to_uuid, &edge.uuid) {
-                            tracing::debug!("Failed to index replay edge for entity: {}", e);
-                        }
-                        entities_to_prune.push(from_uuid);
-                        entities_to_prune.push(to_uuid);
-                    }
-                }
-            }
 
             // Enforce degree cap on affected entities
             for entity_uuid in &entities_to_prune {
@@ -6620,7 +6787,7 @@ impl GraphMemory {
         }
 
         // Sort by mention count (most mentioned first)
-        entities.sort_by(|a, b| b.mention_count.cmp(&a.mention_count));
+        entities.sort_by_key(|entity| std::cmp::Reverse(entity.mention_count));
 
         Ok(entities)
     }
@@ -9470,6 +9637,94 @@ mod tests {
         assert_eq!(graph.get_entity_relationships(&b_id).unwrap().len(), 1);
         assert_eq!(graph.get_entity_relationships(&c_id).unwrap().len(), 1);
         assert!(graph.get_entity_relationships(&a_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_batch_of_edges_lands_as_successive_adds_would_on_both_engines() {
+        let entity = |name: &str| EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        };
+        let edge = |from: Uuid, to: Uuid, context: &str| RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::CoOccurs,
+            strength: 0.3,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: Some(Uuid::new_v4()),
+            context: context.to_string(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L1Working,
+            created_by: EdgeSource::CoOccurrence,
+            entity_confidence: None,
+            forward_strength: 0.3,
+            backward_strength: 0.3,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
+        };
+
+        let stores = crate::storage::test_support::column_stores(GRAPH_CF_NAMES);
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (backend, store, _tmp) in stores {
+            let batched = GraphMemory::with_store(store).unwrap();
+            let [a, b, c] =
+                ["Alder", "Beech", "Cherry"].map(|name| batched.add_entity(entity(name)).unwrap());
+            let ids = batched
+                .add_relationships(vec![
+                    edge(a, b, "first"),
+                    edge(b, a, "the longer context"),
+                    edge(a, c, "other"),
+                ])
+                .unwrap();
+            assert_eq!(
+                ids[0], ids[1],
+                "{backend:?}: a reversed pair in one batch made a second synapse"
+            );
+            assert_ne!(ids[0], ids[2]);
+
+            let ab = batched.get_relationship(&ids[0]).unwrap().unwrap();
+            assert_eq!(ab.context, "the longer context");
+            assert_eq!(
+                ab.activation_count, 2,
+                "{backend:?}: the repeat was not strengthened"
+            );
+            assert_eq!(batched.get_all_relationships().unwrap().len(), 2);
+            assert_eq!(batched.get_stats().unwrap().relationship_count, 2);
+            // Each new edge's index rows came with it in the same write.
+            assert_eq!(batched.get_entity_relationships(&a).unwrap().len(), 2);
+            assert_eq!(batched.get_entity_relationships(&b).unwrap().len(), 1);
+            assert_eq!(
+                batched
+                    .find_relationship_between(&b, &a)
+                    .unwrap()
+                    .map(|e| e.uuid),
+                Some(ids[0])
+            );
+
+            // A later batch strengthens the stored synapse rather than adding one.
+            assert_eq!(
+                batched.add_relationships(vec![edge(a, b, "x")]).unwrap(),
+                vec![ids[0]]
+            );
+            assert_eq!(batched.get_stats().unwrap().relationship_count, 2);
+            assert!(batched.add_relationships(Vec::new()).unwrap().is_empty());
+        }
     }
 
     #[test]

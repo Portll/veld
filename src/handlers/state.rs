@@ -569,10 +569,12 @@ impl MultiUserMemoryManager {
         // 256MB pool with LRU eviction of the coldest blocks across all users.
         #[cfg(feature = "rocksdb")]
         let shared_rocksdb_cache = {
-            let cache = rocksdb::Cache::new_lru_cache(crate::constants::ROCKSDB_SHARED_CACHE_BYTES);
+            let cache_bytes =
+                crate::config::StorageTuning::process().rocksdb_shared_block_cache_bytes();
+            let cache = rocksdb::Cache::new_lru_cache(cache_bytes);
             info!(
                 "Shared RocksDB block cache initialized ({}MB)",
-                crate::constants::ROCKSDB_SHARED_CACHE_BYTES / (1024 * 1024)
+                cache_bytes / (1024 * 1024)
             );
             Some(cache)
         };
@@ -1091,6 +1093,9 @@ impl MultiUserMemoryManager {
         let old_db = rocksdb::DB::open_for_read_only(&old_opts, &old_dir, false)
             .context("Failed to open old audit_logs DB for migration")?;
 
+        let write_opts = crate::storage::legacy_rocksdb::write_options(
+            crate::config::StorageTuning::process().rocksdb_sync_writes(),
+        );
         let mut batch = rocksdb::WriteBatch::default();
         let mut count = 0usize;
         const BATCH_SIZE: usize = 10_000;
@@ -1104,15 +1109,14 @@ impl MultiUserMemoryManager {
 
             if count.is_multiple_of(BATCH_SIZE) {
                 shared_db
-                    .write(std::mem::take(&mut batch))
+                    .write_opt(std::mem::take(&mut batch), &write_opts)
                     .map_err(|e| anyhow::anyhow!("audit migration batch write error: {e}"))?;
-                batch = rocksdb::WriteBatch::default();
             }
         }
 
         if !count.is_multiple_of(BATCH_SIZE) {
             shared_db
-                .write(batch)
+                .write_opt(batch, &write_opts)
                 .map_err(|e| anyhow::anyhow!("audit migration final batch error: {e}"))?;
         }
 
@@ -3634,7 +3638,7 @@ impl MultiUserMemoryManager {
                     backup_engine
                         .list_backups(user_id)
                         .ok()
-                        .and_then(|backups| backups.last().map(|metadata| metadata.backup_id))
+                        .and_then(|backups| backups.first().map(|metadata| metadata.backup_id))
                         .unwrap_or(0)
                 });
                 let graph_checkpoint = backup_engine
@@ -4622,8 +4626,10 @@ mod shared_store_bootstrap_tests {
         base: &std::path::Path,
         backend: crate::config::StorageBackend,
     ) -> Result<SharedStoreBootstrap> {
-        let mut config = ServerConfig::default();
-        config.effective_storage_backend = backend;
+        let config = ServerConfig {
+            effective_storage_backend: backend,
+            ..ServerConfig::default()
+        };
         #[cfg(feature = "rocksdb")]
         let cache = Some(rocksdb::Cache::new_lru_cache(1024));
         #[cfg(not(feature = "rocksdb"))]
@@ -5250,7 +5256,7 @@ pub(crate) fn purge_user_from_shared_store(
         "files",
         "audit",
     ] {
-        total += purge_family(store, cf, user_id, &[prefix.clone()], false)?;
+        total += purge_family(store, cf, user_id, std::slice::from_ref(&prefix), false)?;
     }
     let todo_index: Vec<String> = [
         "user",

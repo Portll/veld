@@ -2,7 +2,7 @@
 
 > Product: **Veld — Agentic Memory**. Crate / package IDs remain `veld`.
 > Repository: https://github.com/Portll/veld • License: Veld Evaluation Licence (PolyForm Internal Use by agreement; AGPL-3.0-or-later intended at 2.0 — see LICENSING.md) • Cargo version: see `Cargo.toml` (`0.7.x` line at time of writing).
-> Branch status (per [PROGRESS.md](PROGRESS.md)): first packaged release cut (repo moved to `Portll/veld`, CI added); the `0.7.x` line on `main` is stabilizing toward a clean `v0.8`. `v0.9` is the public-release / redb-runtime-cutover target.
+> Branch status (per [PROGRESS.md](PROGRESS.md)): first packaged release cut (repo moved to `Portll/veld`, CI added); the `0.7.x` line on `main` is stabilizing toward a clean `v0.8`. `v0.9` is the public-release target; redb stays a second engine until the gates in [ADR 0007](docs/src/decisions/0007-rocksdb-default-engine.md) hold.
 
 ---
 
@@ -55,7 +55,7 @@ The TypeScript MCP server ([mcp-server/index.ts](mcp-server/index.ts), published
 
 | Command | Purpose |
 |---|---|
-| `veld server` | Start the HTTP API server (defaults: `127.0.0.1:3030`, `redb` backend) |
+| `veld server` | Start the HTTP API server (defaults: `127.0.0.1:3030`, `rocksdb` backend when the build has it; see Storage) |
 | `veld tui` | Launch the terminal dashboard |
 | `veld serve` | Run as MCP server (stdio transport) — note: *not* the HTTP daemon |
 | `veld init` | First-time setup — config, API key, ONNX runtime |
@@ -105,8 +105,10 @@ The retrieval pipeline is **multi-layer hybrid search**, not a single algorithm.
 
 Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `PrimaryMemoryStore`, `GraphStore`, `KeyValueStore` traits with `StorageCapabilities` per backend.
 
-- **Default-requested backend**: Redb (single-file embedded). Feature flag: `storage-redb` (default).
-- **Effective runtime backend during current build**: still **RocksDB** ([src/storage/legacy_rocksdb.rs](src/storage/legacy_rocksdb.rs)). The redb primary/graph/audit stores are now *implemented* in [src/storage/](src/storage/), but `effective_storage_backend_for_current_build` in [src/config.rs](src/config.rs:65) still maps `Redb → RocksDb`. The runtime *flip* is the remaining v0.9 step — the engine is built, not yet switched on.
+- **Two engines, both built by default** (`default = ["rocksdb", "storage-redb"]` in [Cargo.toml](Cargo.toml)). **RocksDB is the default engine** ([ADR 0007](docs/src/decisions/0007-rocksdb-default-engine.md)); **redb** (single-file embedded) is selected at runtime with `VELD_STORAGE_BACKEND=redb` (or `--storage-backend redb`). `legacy-rocksdb` is an alias of the `rocksdb` feature.
+- **Redb-only build**: `--no-default-features --features storage-redb` carries no RocksDB code; a request for the rocksdb backend then refuses at boot and names the feature.
+- **Selection logic**: `default_requested_storage_backend()` returns RocksDb whenever the `rocksdb` feature is on, and `effective_storage_backend_for_current_build(Redb)` returns Redb when `storage-redb` is compiled in ([src/config.rs](src/config.rs)). Engine implementations: [src/storage/legacy_rocksdb.rs](src/storage/legacy_rocksdb.rs) and [src/storage/redb.rs](src/storage/redb.rs).
+- **Canonical reference**: [src/storage/README.md](src/storage/README.md) (file map, engine layout, `veld migrate`, what only RocksDB does).
 - **Default data path**:
   - Linux: `~/.local/share/veld/`
   - macOS: `~/Library/Application Support/veld/`
@@ -150,7 +152,7 @@ Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `Pri
 - **Metrics** ([src/metrics.rs](src/metrics.rs), 989 lines): Prometheus metric registrations (`veld_*` prefix). `/metrics` route in [src/handlers/router.rs](src/handlers/router.rs); visibility controlled by `VELD_METRICS_PUBLIC`.
 - **Visualization / graph viewer** ([src/handlers/visualization.rs](src/handlers/visualization.rs), 405 lines + [src/handlers/graph_view.html](src/handlers/graph_view.html)): in-browser knowledge-graph viewer. Routes: `GET /graph/view` (public HTML shell), `GET /api/brain/{user_id}`, `/api/visualization/*`.
 - **LLM-Wiki** ([src/wiki/](src/wiki/)): wiki render as an **intent-log projection** (`WikiProjection`), exposed via authed `` `POST /api/wiki/render` `` ([src/handlers/router.rs:272](src/handlers/router.rs#L272)). Bidirectional **edit-back**: Obsidian edits flow back to the canonical store, with an optional default-off live watcher ([src/wiki/watcher.rs](src/wiki/watcher.rs)). Consumes the facet page-type taxonomy in [src/memory/facets.rs](src/memory/facets.rs). Now shipped — was the "LLM-Wiki Phase 3" plan.
-- **Veld GUI / monitor** ([monitor/](monitor/), Tauri desktop app): first-run setup panel, multi-instance discovery + tabs, runtime **dials** panel (`get_dials`/`set_dials`), the server graph viewer embedded in-window, a **Security** overlay (keys, logins) and a **Data** overlay ([monitor/src/data.js](monitor/src/data.js)): backups (`/api/backup/*`), MIF export/import to and from files, and a backend swap (dry-run + `/api/admin/storage/migrate`, then `storage_backend` written to `config.toml` for the next start). **Restart server** (Data › Backend, and the tray menu) stops the instance, waits for a supervisor to bring it back (a new registry entry on the port), else relaunches it from a saved recipe or the registry's `launch` recipe, layering the operator's `~/.config/veld/server.env`, the live process's `VELD_*` environment and the recipe's variables ([status-core/src/restart.rs](status-core/src/restart.rs)). Saved recipes live in `<config>/veld/monitor/launch-recipes.json`. On this machine Veld Desktop supervises the server and respawns it 2 s after exit; its `server.env` pins `VELD_STORAGE_BACKEND`, which beats `config.toml`, so "Set next start" rewrites both. Companion crates: [status-core/](status-core/), [status-tui/](status-tui/), [status-widget/](status-widget/).
+- **Veld GUI / monitor** ([monitor/](monitor/), Tauri desktop app): first-run setup panel, multi-instance discovery + tabs, runtime **dials** panel (`get_dials`/`set_dials`), the server graph viewer embedded in-window, a **Security** overlay (keys, logins) and a **Data** overlay ([monitor/src/data.js](monitor/src/data.js)): backups (`/api/backup/*`), MIF export/import to and from files, and a backend swap (dry-run + `/api/admin/storage/migrate`, then `storage_backend` written to `config.toml` for the next start). **Restart server** (Data › Backend, and the tray menu) stops the instance; a server that is a launchd job's main process is started again with `launchctl kickstart` (never `-k`, which kills it after the job's exit timeout, mid-flush); otherwise it waits for a supervisor to bring it back (a new registry entry on the port), else relaunches it from a saved recipe or the registry's `launch` recipe, layering the operator's `~/.config/veld/server.env`, the live process's `VELD_*` environment and the recipe's variables ([status-core/src/restart.rs](status-core/src/restart.rs)). Saved recipes live in `<config>/veld/monitor/launch-recipes.json`. On this machine Veld Desktop supervises the server and respawns it 2 s after exit; its `server.env` pins `VELD_STORAGE_BACKEND`, which beats `config.toml`, so "Set next start" rewrites both. Companion crates: [status-core/](status-core/), [status-tui/](status-tui/), [status-widget/](status-widget/).
 - **Live replication** ([src/replication.rs](src/replication.rs), routes in [src/handlers/replication.rs](src/handlers/replication.rs)): a follower tails a leader's per-user intent logs over `` `GET /api/admin/replication/records` `` (admin key + API key) and applies each frame to its store, then journals it locally; one direction, memories only (todos, reminders, projects are not journaled). Follow at boot with `VELD_REPLICATE_FROM` + `VELD_REPLICATE_ADMIN_KEY`, or at runtime via `` `POST /api/admin/replication/follow` `` (the monitor's Data › Replication view). Cursor per source under `<data>/replication/`. Verified 2026-10-19 with two scratch servers: ids preserved, forgets propagate, lag one poll interval.
 - **Instance registry** ([src/instance_registry.rs](src/instance_registry.rs)): **server-authored** registry of live veld instances (replaces port-guessing). Consumed by the monitor, the statusline hook, and Claude session wiring. See [docs/src/architecture/instance-registry.md](docs/src/architecture/instance-registry.md).
 - **Epistemic hygiene / injection boundary**: source-trust is surfaced at recall, and `injection_suspected` is flagged for non-trusted-source content (W-006). See [docs/src/architecture/epistemic-hygiene.md](docs/src/architecture/epistemic-hygiene.md).
@@ -228,14 +230,15 @@ Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (be
 
 ## Storage Backend Reality (read before touching storage)
 
-The codebase contains the *abstraction* for Redb (default-requested), but the *runtime engine* during current builds is still RocksDB. Specifically:
+Both engines are real and built by default. The canonical description is [src/storage/README.md](src/storage/README.md); read it first. Specifically:
 
-- `default_requested_storage_backend()` → `Redb` in [src/config.rs](src/config.rs:57).
-- `effective_storage_backend_for_current_build(Redb)` currently returns `RocksDb` ([src/config.rs](src/config.rs:65)).
-- The redb primary/graph/audit stores are now **implemented** in [src/storage/](src/storage/) (committed). The match arm above means the *runtime* still loads RocksDB regardless — the v0.9 work is the cutover (flip that arm + first-boot re-index), not new store code.
-- The redb runtime flip lands as part of `v0.9` work (per [PROGRESS.md](PROGRESS.md)).
+- `default_requested_storage_backend()` returns `RocksDb` whenever the `rocksdb` feature is on ([src/config.rs](src/config.rs)); redb only when that feature is off.
+- `effective_storage_backend_for_current_build(Redb)` returns `Redb` when `storage-redb` is compiled in. A rocksdb request in a build without the `rocksdb` feature is refused at boot, by name.
+- Boot guard ([src/storage/boot_guard.rs](src/storage/boot_guard.rs)): veld refuses to serve an empty store while the other engine holds data for that user, and names `VELD_STORAGE_BACKEND=redb` or `veld migrate` in the refusal.
+- Only RocksDB has the BackupEngine ([src/backup.rs](src/backup.rs)) and the RocksDB `MemoryStorage` ([src/memory/storage.rs](src/memory/storage.rs)). redb backups go through export and import (VELDPORT dumps). Encryption-v2 and the semantic merge pass run on both engines.
+- redb becomes the default only when the gates in [ADR 0007](docs/src/decisions/0007-rocksdb-default-engine.md) hold. Closed: merge pass and tombstone GC on redb, encryption-v2 on redb. Open: backup/restore equality, recall-gate equality on both engines, and a 14-day live soak on redb with no boot-guard refusal and no decode failure.
 
-When writing new storage code: target the trait surface (`PrimaryMemoryStore`, `GraphStore`, `KeyValueStore`) in [src/storage/mod.rs](src/storage/mod.rs), not the legacy concrete types. New code lands ready for the redb cutover.
+When writing new storage code: target the trait surface (`PrimaryMemoryStore`, `GraphStore`, `KeyValueStore`) in [src/storage/mod.rs](src/storage/mod.rs), not the legacy concrete types. A capability added for RocksDB needs a redb implementation or a named refusal (ADR 0007).
 
 ---
 
@@ -322,11 +325,19 @@ How veld behaves as data grows, and the migration paths between tiers / backends
 
 `Working → Session → LongTerm → Archive`. Promotion is `age × importance × access_count` against the `TIER_PROMOTION_*` constants in [src/constants.rs](src/constants.rs). Archive-tier memories stay indexed in HNSW but are excluded from default `/api/recall`; surface them explicitly with `/api/recall?include_archived=true`.
 
-### Storage backend migration (RocksDB → Redb, v0.9 target)
+### Storage backend migration (RocksDB and redb, on demand)
 
-No `veld migrate` subcommand today. The trait abstraction (`PrimaryMemoryStore` / `GraphStore` / `KeyValueStore`) means new write code lands ready for the cutover. The runtime flip happens via `effective_storage_backend_for_current_build` in [src/config.rs](src/config.rs). Once the redb path passes acceptance benchmarks, that function returns `Redb` and the cold-start re-indexing happens on first boot. Backup via `POST /api/backup/create` before the flip; restore via `/api/backup/restore` if you need to roll back to the legacy backend.
+`veld migrate` copies one engine's stores into the other inside the same data directory and never modifies the source. Each unit is verified by frame count and SHA-256 digest. It needs a build with both engines (the default build). Try it first with a dry run, which writes nothing:
 
-See [decision 0001](docs/src/decisions/0001-redb-migration.md) for context.
+```bash
+veld migrate --from rocksdb --to redb --user all --dry-run
+```
+
+`veld export` and `veld import` use the same VELDPORT codec ([src/storage/portable.rs](src/storage/portable.rs)). Migrating an encrypted tenant needs `VELD_MASTER_PASSPHRASE` (or `VELD_KMS_WRAP_KEY`), including for the dry run. The boot guard ([src/storage/boot_guard.rs](src/storage/boot_guard.rs)) refuses to serve an empty store while the other engine holds data, so a forgotten migration fails loudly instead of serving nothing. Back up before migrating: `POST /api/backup/create` covers RocksDB; for redb use `veld export`.
+
+Engine speed is unmeasured in this document. The comparison benches are [benches/storage_engine_benchmarks.rs](benches/storage_engine_benchmarks.rs), being added on the redb-parity branch; do not quote a figure until they have run.
+
+See [decision 0001](docs/src/decisions/0001-redb-migration.md) (amended) and [decision 0007](docs/src/decisions/0007-rocksdb-default-engine.md) for context; src/storage/README.md is canonical.
 
 ### Record-schema migration
 

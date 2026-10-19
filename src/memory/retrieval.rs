@@ -1111,18 +1111,36 @@ impl RetrievalEngine {
     }
 
     pub fn index_memory(&self, memory: &Memory) -> Result<()> {
-        match self.index_memory_inner(memory) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Counted at the boundary, not at the seven call sites.
-                self.vector_index_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err(e)
-            }
-        }
+        self.counting_index_failures(|| {
+            let vector_ids = self.insert_vectors(memory)?;
+            // ATOMIC: Store vector mapping in RocksDB
+            // This ensures the mapping survives restarts and can't become orphaned
+            self.storage
+                .update_vector_mapping(&memory.id, vector_ids)
+                .context("Failed to persist vector mapping to RocksDB")
+        })
     }
 
-    fn index_memory_inner(&self, memory: &Memory) -> Result<()> {
+    /// [`Self::index_memory`] without persisting the mapping: returns the text vector
+    /// ids, for a caller that writes them in the same storage transaction as the
+    /// memory itself (`PrimaryMemoryStore::store_with_vectors`).
+    pub fn index_vectors(&self, memory: &Memory) -> Result<Vec<u32>> {
+        self.counting_index_failures(|| self.insert_vectors(memory))
+    }
+
+    /// Counted at the boundary, not at the seven call sites.
+    fn counting_index_failures<T>(&self, index: impl FnOnce() -> Result<T>) -> Result<T> {
+        let outcome = index();
+        if outcome.is_err() {
+            self.vector_index_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// Embed `memory` into the in-memory primary and secondary indexes and return its
+    /// primary vector ids; nothing is persisted.
+    fn insert_vectors(&self, memory: &Memory) -> Result<Vec<u32>> {
         use crate::embeddings::chunking::{chunk_text, ChunkConfig};
 
         let text = Self::extract_searchable_text(memory);
@@ -1187,12 +1205,6 @@ impl RetrievalEngine {
             vec![vector_id]
         };
 
-        // ATOMIC: Store vector mapping in RocksDB
-        // This ensures the mapping survives restarts and can't become orphaned
-        self.storage
-            .update_vector_mapping(&memory.id, vector_ids)
-            .context("Failed to persist vector mapping to RocksDB")?;
-
         // Index into secondary Vamana if available and memory has secondary embeddings
         if let (Some(ref sec_index), Some(ref sec_mapping)) =
             (&self.secondary_vector_index, &self.secondary_id_mapping)
@@ -1211,7 +1223,7 @@ impl RetrievalEngine {
             }
         }
 
-        Ok(())
+        Ok(vector_ids)
     }
 
     /// Re-index an existing memory with updated embeddings
