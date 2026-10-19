@@ -1,0 +1,65 @@
+# Weekly version updates for the workflows' actions, every Cargo lockfile, the Node integrations and
+# the Python package. Minor and patch bumps arrive as one pull request per ecosystem; a major bump
+# arrives alone. Spine's bin/dependabot-sync.mjs files each pull request and alert as a task in the
+# veld-dependencies plan. A release younger than seven days is not proposed.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(ci)"
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /status-core
+      - /status-tui
+      - /status-widget
+      - /tui
+      - /monitor/src-tauri
+      - /docs/generators
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "chore(deps)"
+  - package-ecosystem: npm
+    directories:
+      - /mcp-server
+      - /veld-telegram
+      - /veld-todoist
+      - /veld-whatsapp
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "chore(deps)"
+  - package-ecosystem: pip
+    directories:
+      - /
+      - /python
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      pip-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "chore(deps)"
