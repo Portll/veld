@@ -141,6 +141,20 @@ If you expose veld beyond localhost, put it behind a reverse proxy with TLS:
 Veld checks the bind host via `is_local_bind_host()`; binding to
 `0.0.0.0` is a deliberate choice that disables some safety defaults.
 
+## Readiness while a tenant opens
+
+A tenant's stores open on its first request, not at boot, and a large one takes a
+while: 11.7 s for the live server's largest tenant on 2026-10-19, and 10 min for the
+same tenant on a redb replica that had to rebuild its Vamana index. Requests for that
+tenant wait for the open. The remember, recall, upsert, list and memory CRUD routes
+and the streaming websockets wait on the blocking pool, so `/health`, `/health/live`
+and requests for other tenants keep answering while it runs.
+
+`GET /health/ready` answers `503 not_ready` with `reason: "tenant_opening"` while any
+request is waiting on an open, and reports how many in `tenant_open_waiters`. It goes
+back to `200 ready` when the open finishes. A hard write latch (below) takes precedence
+in `reason`.
+
 ## Disk full: the write latch
 
 RocksDB stops accepting writes after a background IO error. For "no space left on
