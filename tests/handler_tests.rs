@@ -2997,7 +2997,7 @@ async fn a_write_without_entities_behaves_as_before() {
 
 #[tokio::test]
 async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
-    use veld::constants::MAX_ENTITY_DEGREE;
+    use veld::constants::{ENTITY_DEGREE_PRUNE_TARGET, MAX_ENTITY_DEGREE};
     use veld::graph_memory::{EntityLabel, EntityNode, RelationType, RelationshipEdge};
 
     let h = Harness::new();
@@ -3122,8 +3122,8 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
     let bash_edges = edges_of(&h, user, &bash);
     assert_eq!(
         bash_edges.len(),
-        MAX_ENTITY_DEGREE,
-        "the declared hub stays at the cap"
+        ENTITY_DEGREE_PRUNE_TARGET,
+        "the declared hub's new edge cut it back below the cap"
     );
     assert!(
         bash_edges
