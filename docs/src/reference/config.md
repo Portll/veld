@@ -6,12 +6,11 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **117** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **116** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
 | `VELD_ACTIVATION_DECAY` | — | `src/config.rs` |
-| `VELD_ADMIN_KEY` | — | `src/handlers/users.rs` |
 | `VELD_AGENT_ID` | — | `src/memory/session_detect.rs` |
 | `VELD_ALIGNMENT_AUTOFIT` | — | `src/memory/alignment_onboarding.rs` |
 | `VELD_ALIGNMENT_PAIRS` | — | `src/memory/alignment_onboarding.rs` |

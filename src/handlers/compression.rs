@@ -3,12 +3,14 @@
 //! Handlers for memory compression and decompression operations.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     response::Json,
 };
 use serde::Deserialize;
 
 use super::state::MultiUserMemoryManager;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{self, MemoryId};
 use crate::validation;
@@ -110,12 +112,17 @@ pub struct StorageStatsRequest {
 /// GET /api/storage/stats - Get storage statistics
 pub async fn get_storage_stats(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(req): Query<StorageStatsRequest>,
 ) -> Result<Json<memory::storage::StorageStats>, AppError> {
-    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&req.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();

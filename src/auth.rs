@@ -322,6 +322,22 @@ fn bound_user_mismatch_response() -> Response {
     (StatusCode::FORBIDDEN, Json(body)).into_response()
 }
 
+/// The binding must cover every body a handler's `Json` extractor will parse, and axum accepts
+/// `application/*+json` as well as `application/json`, case-insensitively.
+#[cfg(feature = "multi-tenant")]
+fn is_json_content_type(value: &str) -> bool {
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match essence.split_once('/') {
+        Some(("application", subtype)) => subtype == "json" || subtype.ends_with("+json"),
+        _ => false,
+    }
+}
+
 #[cfg(feature = "multi-tenant")]
 async fn attach_bound_user_to_request(
     request: Request,
@@ -331,7 +347,7 @@ async fn attach_bound_user_to_request(
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.starts_with("application/json"))
+        .map(is_json_content_type)
         .unwrap_or(false);
 
     let (parts, body) = request.into_parts();
@@ -1176,5 +1192,28 @@ mod tests {
         );
 
         clear_auth_env();
+    }
+
+    #[cfg(feature = "multi-tenant")]
+    #[test]
+    fn the_binding_rewrite_covers_every_json_body_axum_parses() {
+        for json in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "Application/JSON",
+            "application/cloudevents+json",
+            "application/vnd.api+json; charset=utf-8",
+        ] {
+            assert!(is_json_content_type(json), "{json}");
+        }
+        for other in [
+            "text/plain",
+            "application/x-www-form-urlencoded",
+            "application/jsonp",
+            "text/json",
+            "",
+        ] {
+            assert!(!is_json_content_type(other), "{other}");
+        }
     }
 }

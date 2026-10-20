@@ -34,6 +34,7 @@ pub const RESERVED_DATA_DIRS: &[&str] = &[
     "shared",
     "instances",
     "replication",
+    "collective",
 ];
 
 /// Case-insensitive, because the default macOS filesystem is.
