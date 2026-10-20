@@ -638,6 +638,55 @@ fn build_ner_lookup(
         .collect()
 }
 
+/// Entity lookups for the edges of one write. Each distinct name resolves once, through
+/// the strict tiers only (exact, case, stem: the in-memory name indexes, no scan), and each
+/// entity is read once. `find_entity_by_name`'s substring tier walks every entity name on a
+/// miss and reads each candidate, and sentence co-occurrence looks up every content word, so
+/// most of its lookups were misses that bound a word to whichever hub contained it.
+struct WriteEntityResolver<'g> {
+    graph: &'g crate::graph_memory::GraphMemory,
+    names: std::collections::HashMap<String, Option<Arc<crate::graph_memory::EntityNode>>>,
+    entities: std::collections::HashMap<Uuid, Option<Arc<crate::graph_memory::EntityNode>>>,
+}
+
+impl<'g> WriteEntityResolver<'g> {
+    fn new(graph: &'g crate::graph_memory::GraphMemory) -> Self {
+        Self {
+            graph,
+            names: std::collections::HashMap::new(),
+            entities: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Bind `name`, as written and lowercased, to the entity `add_entity` returned for it,
+    /// which may be another entity it was merged into.
+    fn seed(&mut self, name: &str, uuid: Uuid) {
+        let entity = self.entity(uuid);
+        self.names.insert(name.to_lowercase(), entity.clone());
+        self.names.insert(name.to_string(), entity);
+    }
+
+    fn resolve(&mut self, name: &str) -> Option<Arc<crate::graph_memory::EntityNode>> {
+        if let Some(known) = self.names.get(name) {
+            return known.clone();
+        }
+        let found = self
+            .graph
+            .find_entity_uuid_strict(name)
+            .and_then(|uuid| self.entity(uuid));
+        self.names.insert(name.to_string(), found.clone());
+        found
+    }
+
+    fn entity(&mut self, uuid: Uuid) -> Option<Arc<crate::graph_memory::EntityNode>> {
+        let graph = self.graph;
+        self.entities
+            .entry(uuid)
+            .or_insert_with(|| graph.get_entity(&uuid).ok().flatten().map(Arc::new))
+            .clone()
+    }
+}
+
 /// The BM25 index for a standalone system: in memory when the store seals its
 /// records, since on disk it would hold their content in plaintext.
 fn open_standalone_bm25(path: &std::path::Path, sealed: bool) -> Result<hybrid_search::BM25Index> {
@@ -3061,193 +3110,8 @@ impl MemorySystem {
             tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
         }
 
-        // Add entities to knowledge graph with co-occurrence edges
-        // PERF: Build entity structs and extract co-occurrences OUTSIDE the lock
-        // GraphMemory is internally thread-safe; read lock allows concurrent graph access
-        if let Some(graph) = &self.graph_memory {
-            let now = chrono::Utc::now();
-
-            // Phase 1: Build entity structs with proper labels from NER
-            let ner_lookup = build_ner_lookup(&memory.experience.ner_entities);
-
-            // Batch-encode entity names for concept-level dedup
-            // When defer_embedding=true, skip ONNX batch encoding — graph still works,
-            // entities are created without embeddings (semantic edge weighting falls back to 1.0)
-            let entity_names: Vec<&str> = memory
-                .experience
-                .entities
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let entity_embeddings: Vec<Option<Vec<f32>>> = if entity_names.is_empty() {
-                Vec::new()
-            } else if defer_embedding {
-                vec![None; entity_names.len()]
-            } else {
-                match self.embedder.encode_batch(&entity_names) {
-                    Ok(embs) => embs.into_iter().map(Some).collect(),
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            "Entity name embedding failed, concept merge disabled for this batch"
-                        );
-                        vec![None; entity_names.len()]
-                    }
-                }
-            };
-
-            let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
-                .experience
-                .entities
-                .iter()
-                .zip(entity_embeddings)
-                .map(|(entity_name, embedding)| {
-                    let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
-                    let labels = vec![label];
-                    crate::graph_memory::EntityNode {
-                        uuid: Uuid::new_v4(),
-                        name: entity_name.clone(),
-                        labels: labels.clone(),
-                        created_at: now,
-                        last_seen_at: now,
-                        mention_count: 1,
-                        summary: String::new(),
-                        attributes: std::collections::HashMap::new(),
-                        name_embedding: embedding,
-                        salience,
-                        is_proper_noun: entity_name
-                            .chars()
-                            .next()
-                            .map(|c| c.is_uppercase())
-                            .unwrap_or(false),
-                        pii_classification: crate::graph_memory::PiiClassification::default(),
-                    }
-                })
-                .collect();
-
-            // Phase 2: Use pre-extracted co-occurrence pairs or extract fresh
-            let cooccurrence_pairs = if !memory.experience.cooccurrence_pairs.is_empty() {
-                memory.experience.cooccurrence_pairs.clone()
-            } else {
-                let entity_extractor = crate::graph_memory::EntityExtractor::new();
-                entity_extractor.extract_cooccurrence_pairs(&memory.experience.content)
-            };
-
-            let edge_context = format!("Co-occurred in memory {}", memory.id.0);
-
-            // Phase 3: Acquire read lock for graph insertions (GraphMemory is internally thread-safe)
-            let graph_guard = graph.read();
-
-            for entity in entities_to_add {
-                if let Err(e) = graph_guard.add_entity(entity.clone()) {
-                    tracing::debug!("Failed to add entity '{}' to graph: {}", entity.name, e);
-                }
-            }
-
-            // Every co-occurrence and causal edge goes to the graph in one batch: one
-            // commit for the memory rather than one per edge, and none half-indexed.
-            let mut edges = Vec::new();
-
-            // Semantic edge weighting
-            let l1_base_weight = crate::graph_memory::EdgeTier::L1Working.initial_weight();
-            for (entity1, entity2) in cooccurrence_pairs {
-                if let (Ok(Some(e1)), Ok(Some(e2))) = (
-                    graph_guard.find_entity_by_name(&entity1),
-                    graph_guard.find_entity_by_name(&entity2),
-                ) {
-                    let entity_confidence = Some((e1.salience + e2.salience) / 2.0);
-
-                    let semantic_weight = match (&e1.name_embedding, &e2.name_embedding) {
-                        (Some(emb1), Some(emb2)) => {
-                            let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
-                            EDGE_SEMANTIC_WEIGHT_FLOOR + (1.0 - EDGE_SEMANTIC_WEIGHT_FLOOR) * sim
-                        }
-                        _ => 1.0,
-                    };
-
-                    let cooccurs_init = l1_base_weight * semantic_weight;
-                    let edge = crate::graph_memory::RelationshipEdge {
-                        uuid: Uuid::new_v4(),
-                        from_entity: e1.uuid,
-                        to_entity: e2.uuid,
-                        relation_type: crate::graph_memory::RelationType::CoOccurs,
-                        strength: cooccurs_init,
-                        created_at: now,
-                        valid_at: now,
-                        invalidated_at: None,
-                        source_episode_id: Some(memory.id.0),
-                        context: edge_context.clone(),
-                        last_activated: now,
-                        activation_count: 1,
-                        ltp_status: crate::graph_memory::LtpStatus::None,
-                        tier: crate::graph_memory::EdgeTier::L1Working,
-                        activation_timestamps: None,
-                        entity_confidence,
-                        created_by: crate::graph_memory::EdgeSource::CoOccurrence,
-                        forward_strength: cooccurs_init,
-                        backward_strength: cooccurs_init,
-                        strengthening_sources: Default::default(),
-                        last_corroborated: None,
-                    };
-                    edges.push(edge);
-                }
-            }
-
-            // Phase 4: Extract causal edges from content
-            // Detect causal language patterns (because, therefore, as a result, etc.)
-            // and create directed Causes/ResultsIn edges between co-occurring entities.
-            let causal_pairs =
-                extract_causal_pairs(&memory.experience.content, &memory.experience.entities);
-            if !causal_pairs.is_empty() {
-                let causal_context = format!("Causal relation in memory {}", memory.id.0);
-                for (cause_entity, effect_entity, relation) in &causal_pairs {
-                    if let (Ok(Some(e1)), Ok(Some(e2))) = (
-                        graph_guard.find_entity_by_name(cause_entity),
-                        graph_guard.find_entity_by_name(effect_entity),
-                    ) {
-                        let edge = crate::graph_memory::RelationshipEdge {
-                            uuid: Uuid::new_v4(),
-                            from_entity: e1.uuid,
-                            to_entity: e2.uuid,
-                            relation_type: relation.clone(),
-                            strength: l1_base_weight * 0.8, // slightly below CoOccurs until confirmed
-                            created_at: now,
-                            valid_at: now,
-                            invalidated_at: None,
-                            source_episode_id: Some(memory.id.0),
-                            context: causal_context.clone(),
-                            last_activated: now,
-                            activation_count: 1,
-                            ltp_status: crate::graph_memory::LtpStatus::None,
-                            tier: crate::graph_memory::EdgeTier::L1Working,
-                            activation_timestamps: None,
-                            entity_confidence: None,
-                            created_by: crate::graph_memory::EdgeSource::CoOccurrence,
-                            forward_strength: l1_base_weight * 0.8,
-                            backward_strength: l1_base_weight * 0.8,
-                            strengthening_sources: Default::default(),
-                            last_corroborated: None,
-                        };
-                        edges.push(edge);
-                    }
-                }
-                tracing::debug!(
-                    "Extracted {} causal edges from memory {}",
-                    causal_pairs.len(),
-                    memory.id.0
-                );
-            }
-
-            let edge_count = edges.len();
-            if let Err(e) = graph_guard.add_relationships(edges) {
-                tracing::trace!(
-                    "Failed to add {} co-occurrence and causal edges for memory {}: {}",
-                    edge_count,
-                    memory.id.0,
-                    e
-                );
-            }
-        }
+        // Entities and their co-occurrence and causal edges; GraphMemory synchronises itself.
+        self.add_memory_to_graph(&memory, !defer_embedding, true);
 
         self.bm25_index_direct(&memory, bm25);
 
@@ -3276,6 +3140,194 @@ impl MemorySystem {
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         Ok(RememberOutcome::created(memory_id))
+    }
+
+    /// Add `memory`'s entities to the graph, then, in one batch, an edge for every pair of
+    /// its content words that co-occur in a sentence and resolve to entities, and, when
+    /// `causal_edges`, the causal pairs its wording states. `embed_names` encodes the entity
+    /// names for concept merging; without it they are added unembedded.
+    fn add_memory_to_graph(&self, memory: &Memory, embed_names: bool, causal_edges: bool) {
+        let Some(graph) = &self.graph_memory else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let ner_lookup = build_ner_lookup(&memory.experience.ner_entities);
+
+        let entity_names: Vec<&str> = memory
+            .experience
+            .entities
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let entity_embeddings: Vec<Option<Vec<f32>>> = if entity_names.is_empty() {
+            Vec::new()
+        } else if !embed_names {
+            vec![None; entity_names.len()]
+        } else {
+            match self.embedder.encode_batch(&entity_names) {
+                Ok(embs) => embs.into_iter().map(Some).collect(),
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "Entity name embedding failed, concept merge disabled for this batch"
+                    );
+                    vec![None; entity_names.len()]
+                }
+            }
+        };
+
+        let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
+            .experience
+            .entities
+            .iter()
+            .zip(entity_embeddings)
+            .map(|(entity_name, embedding)| {
+                let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
+                crate::graph_memory::EntityNode {
+                    uuid: Uuid::new_v4(),
+                    name: entity_name.clone(),
+                    labels: vec![label],
+                    created_at: now,
+                    last_seen_at: now,
+                    mention_count: 1,
+                    summary: String::new(),
+                    attributes: std::collections::HashMap::new(),
+                    name_embedding: embedding,
+                    salience,
+                    is_proper_noun: entity_name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false),
+                    pii_classification: crate::graph_memory::PiiClassification::default(),
+                }
+            })
+            .collect();
+
+        let cooccurrence_pairs = if !memory.experience.cooccurrence_pairs.is_empty() {
+            memory.experience.cooccurrence_pairs.clone()
+        } else {
+            crate::graph_memory::EntityExtractor::new()
+                .extract_cooccurrence_pairs(&memory.experience.content)
+        };
+        let edge_context = format!("Co-occurred in memory {}", memory.id.0);
+
+        let graph_guard = graph.read();
+        let mut resolver = WriteEntityResolver::new(&graph_guard);
+        for entity in entities_to_add {
+            let name = entity.name.clone();
+            match graph_guard.add_entity(entity) {
+                Ok(uuid) => resolver.seed(&name, uuid),
+                Err(e) => tracing::debug!("Failed to add entity '{}' to graph: {}", name, e),
+            }
+        }
+
+        // Every co-occurrence and causal edge goes to the graph in one batch: one commit
+        // for the memory rather than one per edge, and none half-indexed. Two words that
+        // resolve to one entity make no edge.
+        let mut edges = Vec::new();
+        let l1_base_weight = crate::graph_memory::EdgeTier::L1Working.initial_weight();
+        for (entity1, entity2) in cooccurrence_pairs {
+            let (Some(e1), Some(e2)) = (resolver.resolve(&entity1), resolver.resolve(&entity2))
+            else {
+                continue;
+            };
+            if e1.uuid == e2.uuid {
+                continue;
+            }
+            let semantic_weight = match (&e1.name_embedding, &e2.name_embedding) {
+                (Some(emb1), Some(emb2)) => {
+                    let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
+                    EDGE_SEMANTIC_WEIGHT_FLOOR + (1.0 - EDGE_SEMANTIC_WEIGHT_FLOOR) * sim
+                }
+                _ => 1.0,
+            };
+            let cooccurs_init = l1_base_weight * semantic_weight;
+            edges.push(crate::graph_memory::RelationshipEdge {
+                uuid: Uuid::new_v4(),
+                from_entity: e1.uuid,
+                to_entity: e2.uuid,
+                relation_type: crate::graph_memory::RelationType::CoOccurs,
+                strength: cooccurs_init,
+                created_at: now,
+                valid_at: now,
+                invalidated_at: None,
+                source_episode_id: Some(memory.id.0),
+                context: edge_context.clone(),
+                last_activated: now,
+                activation_count: 1,
+                ltp_status: crate::graph_memory::LtpStatus::None,
+                tier: crate::graph_memory::EdgeTier::L1Working,
+                activation_timestamps: None,
+                entity_confidence: Some((e1.salience + e2.salience) / 2.0),
+                created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+                forward_strength: cooccurs_init,
+                backward_strength: cooccurs_init,
+                strengthening_sources: Default::default(),
+                last_corroborated: None,
+            });
+        }
+
+        // Causal language (because, therefore, as a result, ...) between co-occurring
+        // entities makes directed Causes/ResultsIn edges.
+        if causal_edges {
+            let causal_pairs =
+                extract_causal_pairs(&memory.experience.content, &memory.experience.entities);
+            let causal_context = format!("Causal relation in memory {}", memory.id.0);
+            for (cause_entity, effect_entity, relation) in &causal_pairs {
+                let (Some(e1), Some(e2)) = (
+                    resolver.resolve(cause_entity),
+                    resolver.resolve(effect_entity),
+                ) else {
+                    continue;
+                };
+                if e1.uuid == e2.uuid {
+                    continue;
+                }
+                // Slightly below CoOccurs until confirmed.
+                let causal_init = l1_base_weight * 0.8;
+                edges.push(crate::graph_memory::RelationshipEdge {
+                    uuid: Uuid::new_v4(),
+                    from_entity: e1.uuid,
+                    to_entity: e2.uuid,
+                    relation_type: relation.clone(),
+                    strength: causal_init,
+                    created_at: now,
+                    valid_at: now,
+                    invalidated_at: None,
+                    source_episode_id: Some(memory.id.0),
+                    context: causal_context.clone(),
+                    last_activated: now,
+                    activation_count: 1,
+                    ltp_status: crate::graph_memory::LtpStatus::None,
+                    tier: crate::graph_memory::EdgeTier::L1Working,
+                    activation_timestamps: None,
+                    entity_confidence: None,
+                    created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+                    forward_strength: causal_init,
+                    backward_strength: causal_init,
+                    strengthening_sources: Default::default(),
+                    last_corroborated: None,
+                });
+            }
+            if !causal_pairs.is_empty() {
+                tracing::debug!(
+                    "Extracted {} causal edges from memory {}",
+                    causal_pairs.len(),
+                    memory.id.0
+                );
+            }
+        }
+
+        let edge_count = edges.len();
+        if let Err(e) = graph_guard.add_relationships(edges) {
+            tracing::trace!(
+                "Failed to add {} co-occurrence and causal edges for memory {}: {}",
+                edge_count,
+                memory.id.0,
+                e
+            );
+        }
     }
 
     // ==========================================================================
@@ -6180,6 +6232,7 @@ impl MemorySystem {
             None => return,
         };
         let graph_guard = graph.read();
+        let mut resolver = WriteEntityResolver::new(&graph_guard);
         let now = chrono::Utc::now();
         let mut entities_added = 0;
         let mut edges_added = 0;
@@ -6235,7 +6288,8 @@ impl MemorySystem {
                         .unwrap_or(false),
                     pii_classification: crate::graph_memory::PiiClassification::default(),
                 };
-                if graph_guard.add_entity(entity).is_ok() {
+                if let Ok(uuid) = graph_guard.add_entity(entity) {
+                    resolver.seed(entity_name, uuid);
                     entities_added += 1;
                 }
             }
@@ -6245,10 +6299,13 @@ impl MemorySystem {
             let l2_base_weight = crate::graph_memory::EdgeTier::L2Episodic.initial_weight();
             for i in 0..entities.len() {
                 for j in (i + 1)..entities.len() {
-                    if let (Ok(Some(e1)), Ok(Some(e2))) = (
-                        graph_guard.find_entity_by_name(&entities[i]),
-                        graph_guard.find_entity_by_name(&entities[j]),
+                    if let (Some(e1), Some(e2)) = (
+                        resolver.resolve(&entities[i]),
+                        resolver.resolve(&entities[j]),
                     ) {
+                        if e1.uuid == e2.uuid {
+                            continue;
+                        }
                         let semantic_weight = match (&e1.name_embedding, &e2.name_embedding) {
                             (Some(emb1), Some(emb2)) => {
                                 let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
@@ -6475,7 +6532,7 @@ impl MemorySystem {
 
         // C1: the find-then-create below must be atomic, or two concurrent upserts of one
         // external_id both miss the lookup and both create. Same per-user lock as remember_impl.
-        let _write_guard = self.write_lock.lock();
+        let write_guard = self.write_lock.lock();
 
         // Try to find existing memory with this external_id
         if let Some(mut existing) = self.long_term_memory.find_by_external_id(&external_id)? {
@@ -6673,143 +6730,9 @@ impl MemorySystem {
                 }
             }
 
-            // Add entities to knowledge graph with co-occurrence edges
-            // PERF: Build entity structs and extract co-occurrences OUTSIDE the lock
-            if let Some(graph) = &self.graph_memory {
-                let now = chrono::Utc::now();
-
-                // Phase 1: Build entity structs with proper labels from NER
-                let ner_lookup = build_ner_lookup(&memory.experience.ner_entities);
-
-                // Batch-encode entity names for concept-level dedup
-                let entity_names: Vec<&str> = memory
-                    .experience
-                    .entities
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
-                let entity_embeddings: Vec<Option<Vec<f32>>> = if entity_names.is_empty() {
-                    Vec::new()
-                } else {
-                    match self.embedder.encode_batch(&entity_names) {
-                        Ok(embs) => embs.into_iter().map(Some).collect(),
-                        Err(e) => {
-                            tracing::debug!(
-                                error = %e,
-                                "Entity name embedding failed, concept merge disabled for this batch"
-                            );
-                            vec![None; entity_names.len()]
-                        }
-                    }
-                };
-
-                let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
-                    .experience
-                    .entities
-                    .iter()
-                    .zip(entity_embeddings)
-                    .map(|(entity_name, embedding)| {
-                        let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
-                        let labels = vec![label];
-                        crate::graph_memory::EntityNode {
-                            uuid: Uuid::new_v4(),
-                            name: entity_name.clone(),
-                            labels: labels.clone(),
-                            created_at: now,
-                            last_seen_at: now,
-                            mention_count: 1,
-                            summary: String::new(),
-                            attributes: std::collections::HashMap::new(),
-                            name_embedding: embedding,
-                            salience,
-                            is_proper_noun: entity_name
-                                .chars()
-                                .next()
-                                .map(|c| c.is_uppercase())
-                                .unwrap_or(false),
-                            pii_classification: crate::graph_memory::PiiClassification::default(),
-                        }
-                    })
-                    .collect();
-
-                // Phase 2: Use pre-extracted co-occurrence pairs or extract fresh
-                let cooccurrence_pairs = if !memory.experience.cooccurrence_pairs.is_empty() {
-                    memory.experience.cooccurrence_pairs.clone()
-                } else {
-                    let entity_extractor = crate::graph_memory::EntityExtractor::new();
-                    entity_extractor.extract_cooccurrence_pairs(&memory.experience.content)
-                };
-
-                let edge_context = format!("Co-occurred in memory {}", memory.id.0);
-
-                // Phase 3: Acquire read lock for graph insertions (GraphMemory is internally thread-safe)
-                let graph_guard = graph.read();
-
-                for entity in entities_to_add {
-                    if let Err(e) = graph_guard.add_entity(entity.clone()) {
-                        tracing::debug!("Failed to add entity '{}' to graph: {}", entity.name, e);
-                    }
-                }
-
-                // One batch, one commit, for every co-occurrence edge of the memory.
-                let mut edges = Vec::new();
-
-                // Semantic edge weighting
-                let l1_base_weight = crate::graph_memory::EdgeTier::L1Working.initial_weight();
-                for (entity1, entity2) in cooccurrence_pairs {
-                    if let (Ok(Some(e1)), Ok(Some(e2))) = (
-                        graph_guard.find_entity_by_name(&entity1),
-                        graph_guard.find_entity_by_name(&entity2),
-                    ) {
-                        let entity_confidence = Some((e1.salience + e2.salience) / 2.0);
-
-                        let semantic_weight = match (&e1.name_embedding, &e2.name_embedding) {
-                            (Some(emb1), Some(emb2)) => {
-                                let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
-                                EDGE_SEMANTIC_WEIGHT_FLOOR
-                                    + (1.0 - EDGE_SEMANTIC_WEIGHT_FLOOR) * sim
-                            }
-                            _ => 1.0,
-                        };
-
-                        let cooccurs_init2 = l1_base_weight * semantic_weight;
-                        let edge = crate::graph_memory::RelationshipEdge {
-                            uuid: Uuid::new_v4(),
-                            from_entity: e1.uuid,
-                            to_entity: e2.uuid,
-                            relation_type: crate::graph_memory::RelationType::CoOccurs,
-                            strength: cooccurs_init2,
-                            created_at: now,
-                            valid_at: now,
-                            invalidated_at: None,
-                            source_episode_id: Some(memory.id.0),
-                            context: edge_context.clone(),
-                            last_activated: now,
-                            activation_count: 1,
-                            ltp_status: crate::graph_memory::LtpStatus::None,
-                            tier: crate::graph_memory::EdgeTier::L1Working,
-                            activation_timestamps: None,
-                            entity_confidence,
-                            created_by: crate::graph_memory::EdgeSource::CoOccurrence,
-                            forward_strength: cooccurs_init2,
-                            backward_strength: cooccurs_init2,
-                            strengthening_sources: Default::default(),
-                            last_corroborated: None,
-                        };
-                        edges.push(edge);
-                    }
-                }
-
-                let edge_count = edges.len();
-                if let Err(e) = graph_guard.add_relationships(edges) {
-                    tracing::trace!(
-                        "Failed to add {} co-occurrence edges for memory {}: {}",
-                        edge_count,
-                        memory.id.0,
-                        e
-                    );
-                }
-            }
+            // The external_id is bound to this memory now; the graph needs no write lock.
+            drop(write_guard);
+            self.add_memory_to_graph(&memory, true, false);
 
             self.bm25_index_direct(&memory, bm25);
             self.bm25_commit_direct(bm25);
