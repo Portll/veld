@@ -274,6 +274,14 @@ impl CompetitiveEmbedder {
         Ok(())
     }
 
+    /// Remove the map from `from` into `to`. Returns whether there was one.
+    pub fn remove_bridge(&self, from: &SpaceId, to: &SpaceId) -> bool {
+        self.bridges
+            .write()
+            .remove(&(from.clone(), to.clone()))
+            .is_some()
+    }
+
     /// The map from `from` into `to`, when one is installed.
     pub fn alignment_between(&self, from: &SpaceId, to: &SpaceId) -> Option<Bridge> {
         self.bridges

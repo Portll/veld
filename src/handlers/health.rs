@@ -49,6 +49,10 @@ pub struct HealthResponse {
     /// indexed, vectors waiting. Any makes `status` degraded. A count, never a tenant id.
     #[serde(skip_serializing_if = "is_zero")]
     pub orphaned_corpora: usize,
+    /// Space migrations under way for users in cache: a change of embedder re-embedding in the
+    /// background, or the one-time stamp of spaces. Absent when none is running.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub space_migrations: Vec<crate::memory::space_migration::MigrationProgress>,
     /// One entry per store currently refusing writes; absent when none is.
     /// Measured 2026-10-11: this endpoint served `healthy` through 11,088
     /// consecutive failed writes.
@@ -97,7 +101,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let user_evictions = state.user_evictions();
     let config = state.server_config();
     let (status, write_latch) = write_latch_fields(crate::storage::write_latch::global());
-    let (embedding_spaces, orphaned_corpora) = embedding_spaces(&state);
+    let (embedding_spaces, orphaned_corpora, space_migrations) = embedding_spaces(&state);
     let status = if orphaned_corpora > 0 {
         "degraded".to_string()
     } else {
@@ -119,6 +123,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         tenants_with_data: state.backend_census.clone(),
         embedding_spaces,
         orphaned_corpora,
+        space_migrations,
         write_latch,
     })
 }
@@ -128,12 +133,18 @@ fn is_zero(n: &usize) -> bool {
 }
 
 /// Cached users only, and only those not busy: a probe must neither load a tenant nor wait on
-/// one. Returns the summed spaces and how many corpora are cut off from vector search.
+/// one. Returns the summed spaces, how many corpora are cut off from vector search, and the
+/// migrations under way.
 fn embedding_spaces(
     state: &MultiUserMemoryManager,
-) -> (Vec<crate::embeddings::space::SpaceSummary>, usize) {
+) -> (
+    Vec<crate::embeddings::space::SpaceSummary>,
+    usize,
+    Vec<crate::memory::space_migration::MigrationProgress>,
+) {
     let mut summaries = Vec::new();
     let mut orphaned = 0usize;
+    let mut migrations = Vec::new();
     for user_id in state.list_cached_users() {
         // The cache itself, not get_user_memory: a user evicted since the listing is skipped,
         // never loaded.
@@ -150,10 +161,14 @@ fn embedding_spaces(
             }
             Err(e) => tracing::debug!("embedding spaces unreadable for a cached user: {e}"),
         }
+        if let Some(m) = guard.space_migration().filter(|m| !m.is_finished()) {
+            migrations.push((&m).into());
+        }
     }
     (
         crate::embeddings::space::merge_summaries(summaries),
         orphaned,
+        migrations,
     )
 }
 
@@ -634,6 +649,7 @@ mod write_latch_reporting {
             },
             embedding_spaces: Vec::new(),
             orphaned_corpora: 0,
+            space_migrations: Vec::new(),
             write_latch,
         };
         serde_json::to_value(&response).expect("HealthResponse serializes")

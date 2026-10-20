@@ -60,7 +60,8 @@ The TypeScript MCP server ([mcp-server/index.ts](mcp-server/index.ts), published
 | `veld serve` | Run as MCP server (stdio transport) — note: *not* the HTTP daemon |
 | `veld init` | First-time setup — config, API key, ONNX runtime |
 | `veld status` | Check server health |
-| `veld doctor` | Diagnose common issues (storage, ONNX, port) |
+| `veld doctor` | Diagnose common issues (storage, ONNX, port, embedding spaces) |
+| `veld spaces list \| align \| retire` | A tenant's embedding spaces, maps and migration, through the running server |
 | `veld hook session-start \| prompt \| commit` | Output Claude Code hook JSON |
 | `veld claude [args...]` | Launch Claude Code with the Veld proxy wired up |
 | `veld version` | Print version and build info | Representative tools:

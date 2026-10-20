@@ -402,6 +402,34 @@ async function renderLaunchCard(body) {
       } }, "Start server…") : null)));
 }
 
+// The embedding spaces the cached corpora hold and any migration between them, from /health.
+// A migration is a change of embedder re-embedding in the background, or the one-time stamp of
+// spaces onto older vectors; its progress moves on the server's backlog tick.
+function renderSpacesCard(body, health) {
+  const spaces = health.embedding_spaces || [];
+  const migrations = health.space_migrations || [];
+  if (!spaces.length && !migrations.length) return;
+  const card = h("section", { class: "sec-card" },
+    h("h3", {}, "Embedding spaces"),
+    table(["Space", "Indexed", "Waiting", "Refused", "Kept"], spaces.map((s) => h("tr", {},
+      h("td", { class: "sec-mono" }, s.id),
+      h("td", {}, String(s.memories)),
+      h("td", {}, String(s.backlog)),
+      h("td", {}, String(s.stranded)),
+      h("td", {}, String(s.kept ?? 0))))),
+    h("p", { class: "sec-note" }, "Across the users in the server's cache. Waiting: memories queued for a vector in the space. Refused: memories stored in it that an index in another space turned away. Kept: memories keeping a vector in it that no index here holds."));
+  if (health.orphaned_corpora) {
+    card.append(h("p", { class: "sec-flash warn" }, `${health.orphaned_corpora} corpus(es) have no memory any index here can search by vector: recall is keyword-only there.`));
+  }
+  for (const m of migrations) {
+    const share = m.total ? Math.min(100, Math.round((100 * m.walked) / m.total)) : 0;
+    const what = m.kind === "reembed" ? `Re-embedding ${m.from || "unrecorded vectors"} → ${m.to}` : `Recording spaces on older vectors (${m.to})`;
+    card.append(h("p", {}, what + `: ${m.walked} of ${m.total} (${share}%), ${m.changed} changed, ${m.failed} failed, since ${when(m.started_at)}.` +
+      (m.stalled ? " Stalled: the embedder did not answer the last batch." : "")));
+  }
+  body.append(card);
+}
+
 async function renderBackend(body) {
   let health;
   try {
@@ -433,6 +461,7 @@ async function renderBackend(body) {
         if (await restartServer()) render();
       } }, "Restart server…"))));
 
+  renderSpacesCard(body, health);
   await renderLaunchCard(body);
 
   const target = h("select", {}, BACKENDS.map((b) => h("option", { value: b }, b)));

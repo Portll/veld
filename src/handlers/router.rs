@@ -443,6 +443,7 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         )
         .route("/api/spaces", get(spaces::list_spaces))
         .route("/api/spaces/align", post(spaces::align_spaces))
+        .route("/api/spaces/retire", post(spaces::retire_space))
         .route(
             "/api/storage/cleanup",
             post(consolidation::cleanup_corrupted),

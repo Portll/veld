@@ -35,17 +35,39 @@ follower stay compatible.
 The intent-log snapshot is the memory record, so the space travels in every journaled write and
 in every replication frame without further work.
 
-## The stamp pass
+## Migrations run in the background
 
-At engine start, `RetrievalEngine::reconcile_corpus_spaces` reads the corpus markers before
-anything moves them and walks the store once:
+At engine start, `RetrievalEngine::reconcile_corpus_spaces` reads the corpus markers and decides;
+it rewrites nothing except in one case. The work is a `SpaceMigration` record in the tenant's
+own store, which the embedding backlog's tick drains (`src/memory/space_migration.rs`):
 
-- **Stamp.** A vector with no space gets the space the markers name, when the widths agree, and
-  `unrecorded@<width>` when they do not. This runs once per corpus and records
-  `.veld_spaces_stamped`.
-- **Migrate.** When the active embedder is not the one the markers name, every primary vector in
-  another space is re-embedded, or promoted from a secondary vector already in the new space.
-  The markers advance only after a pass with no failed write, so an interrupted pass resumes.
+- **Stamp.** On a corpus never stamped, every vector with no space gets the space the markers
+  name when the widths agree, else `unrecorded@<width>`. Until the drain reaches a vector, it
+  reads as the index's at the index's width, as every vector did before spaces were recorded.
+  The finished stamp writes `.veld_spaces_stamped`.
+- **Re-embed.** When the active embedder writes another space than the markers name, every
+  primary vector not in the new space is re-embedded, batched, or promoted from a secondary
+  already in it. The vector it replaces is kept. The markers advance at start: the record, not
+  the markers, says what is pending, so a restart resumes the migration rather than starting
+  another. A change of model at the same width over a corpus never stamped is stamped at start
+  first, since at one width a vector with no space would otherwise read as the new model's.
+
+Each tick runs batches of `VELD_SPACE_MIGRATION_BATCH` memories (default 128) for up to
+`VELD_SPACE_MIGRATION_TICK_SECS` (default 20). The cursor, the last memory id finished, is saved
+after every batch, so a kill or a full disk costs at most one batch, which is idempotent to redo.
+An embedder that does not answer stops the batch without moving the cursor. While a re-embed is
+under way, the start-up repair and the backlog reconcile leave its memories alone.
+
+Once 256 memories hold vectors in both spaces, the drain fits the map from the new space back
+into the old one. The old space then gets an index from the kept vectors, and the memories not
+yet migrated stay searchable through the map. Until a memory is migrated, a cosine taken
+directly against its primary slot compares the old model's vector with the new one's. The
+window lasts as long as the migration.
+
+`/health` and `GET /api/spaces` report the migration's progress. A space no embedder here writes
+is retired with `veld spaces retire <space>`, or `POST /api/spaces/retire`, which drops its kept
+vectors, index and maps. The command is refused for a space this server writes, for the space a
+running migration is leaving, and while any memory's only vector is in it.
 
 ## One index per space
 

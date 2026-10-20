@@ -50,6 +50,7 @@ pub mod sessions;
 pub mod sleep_time;
 pub mod slow_store;
 pub mod space_index;
+pub mod space_migration;
 pub mod storage;
 pub mod tag_sources;
 pub mod temporal_facts;
@@ -1164,8 +1165,18 @@ impl MemorySystem {
             .unwrap_or(0);
         let indexed_count = retriever.len();
         let orphaned_count = storage_count.saturating_sub(indexed_count);
+        // A re-embed migration owns its memories' indexing: repairing them here is the
+        // blocking pass at start the migration exists to replace.
+        let migrating = retriever.is_migrating();
+        if migrating && orphaned_count > 0 {
+            tracing::info!(
+                storage_count,
+                indexed_count,
+                "Embedding space migration under way — the drain indexes memories as it re-embeds them"
+            );
+        }
 
-        if orphaned_count > 0 {
+        if orphaned_count > 0 && !migrating {
             tracing::warn!(
                 storage_count = storage_count,
                 indexed_count = indexed_count,
@@ -5645,6 +5656,11 @@ impl MemorySystem {
     /// Bring the backlog in line with what is stored and what is indexed. A live memory the
     /// index lacks gets a row whatever path lost it; a row for an indexed or deleted memory goes.
     pub fn reconcile_embedding_backlog(&self) -> Result<embedding_backlog::ReconcileReport> {
+        // Mid-migration every memory not yet re-embedded is unindexed by design; the
+        // migration, not the backlog, is giving them vectors.
+        if self.retriever.is_migrating() {
+            return Ok(embedding_backlog::ReconcileReport::default());
+        }
         let indexed = self.retriever.get_indexed_memory_ids();
         let mut stored = Vec::new();
         for id in self.long_term_memory.get_all_ids()? {
@@ -5736,8 +5752,75 @@ impl MemorySystem {
         }
     }
 
-    /// Embed and index up to `limit` backlogged memories, oldest first.
+    /// Run the corpus's space migration for up to `budget`, a batch at a time. Returns what it
+    /// did; `None` when no migration is pending.
+    pub fn run_space_migration(
+        &self,
+        batch: usize,
+        budget: std::time::Duration,
+    ) -> Result<Option<space_migration::MigrationStep>> {
+        let started = std::time::Instant::now();
+        let mut total: Option<space_migration::MigrationStep> = None;
+        while let Some(step) = self.retriever.run_space_migration(batch)? {
+            let t = total.get_or_insert_with(Default::default);
+            t.walked += step.walked;
+            t.changed += step.changed;
+            t.failed += step.failed;
+            t.finished = step.finished;
+            t.stopped = step.stopped.clone();
+            if step.finished || step.stopped.is_some() || started.elapsed() >= budget {
+                break;
+            }
+        }
+        if total.as_ref().is_some_and(|t| t.changed > 0) {
+            if let Err(e) = self.retriever.save() {
+                tracing::warn!("space migration: index save failed: {e}");
+            }
+        }
+        Ok(total)
+    }
+
+    /// Retire an embedding space; see [`retrieval::RetrievalEngine::retire_space`].
+    pub fn retire_space(&self, space: &SpaceId) -> Result<retrieval::RetireReport> {
+        let report = self.retriever.retire_space(space)?;
+        *self.kept_census.lock() = None;
+        if let Err(e) = self.refresh_space_registry() {
+            tracing::warn!("space registry: could not write: {e}");
+        }
+        Ok(report)
+    }
+
+    /// The corpus's space migration, when one was ever recorded.
+    pub fn space_migration(&self) -> Option<space_migration::SpaceMigration> {
+        self.retriever.space_migration()
+    }
+
+    /// Embed and index up to `limit` backlogged memories, oldest first, after a time-boxed run
+    /// of any pending space migration.
     pub fn drain_embedding_backlog(&self, limit: usize) -> Result<embedding_backlog::DrainReport> {
+        let batch = std::env::var("VELD_SPACE_MIGRATION_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(128);
+        let budget = std::time::Duration::from_secs(
+            std::env::var("VELD_SPACE_MIGRATION_TICK_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(20),
+        );
+        match self.run_space_migration(batch, budget) {
+            Ok(Some(step)) => tracing::info!(
+                walked = step.walked,
+                changed = step.changed,
+                failed = step.failed,
+                finished = step.finished,
+                stopped = step.stopped.as_deref().unwrap_or(""),
+                "Embedding space migration tick"
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Embedding space migration tick failed: {e:#}"),
+        }
         let report = self
             .embedding_backlog
             .drain_with(limit, |key| self.embed_backlog_outcome(key))?;
