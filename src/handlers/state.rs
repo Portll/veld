@@ -359,6 +359,13 @@ pub struct MultiUserMemoryManager {
     pub task_tracker: tokio_util::task::TaskTracker,
 }
 
+/// Written into a tenant's directory by a backup restore and removed by the C2
+/// reconcile that follows. A backup stages the journal before checkpointing the
+/// primary store, so a memory deleted between the two is live in the restored log
+/// but absent from the restored store; for a restored tenant that is an
+/// acknowledged delete, not a lost write.
+const RESTORED_FROM_BACKUP_MARKER: &str = ".restored-from-backup";
+
 /// User directories under the data root. An unreadable entry is an error, not a
 /// skipped user: the boot guard must see every tenant or refuse.
 pub(crate) fn list_user_dirs(base_path: &std::path::Path) -> std::io::Result<Vec<String>> {
@@ -2539,16 +2546,24 @@ impl MultiUserMemoryManager {
     /// scan the log, find store records the log never recorded, and
     /// backfill a `Remember` frame for each.
     ///
-    /// The store is canonical in BOTH directions — this never mutates the
-    /// store, only the log:
+    /// Each direction follows what the client was last told:
     /// - store-ahead-of-log (crashed before a `Remember`/`Update` frame
     ///   landed): backfill a `Remember` frame from the store snapshot.
-    /// - log-ahead-of-store (crashed after a RocksDB delete but before its
-    ///   `Forget` frame landed): backfill a `Forget` frame. Without this,
-    ///   any replay — including restore-from-backup — resurrects the
-    ///   deleted memory into every projection.
+    /// - log-ahead-of-store: the log holds a live memory the store lacks.
+    ///   Either a store write whose log frame was synced was lost (storage
+    ///   durability is `eventual` by default, so an OS crash can drop it
+    ///   after the remember was acknowledged), or a crash fell between a
+    ///   store delete and its `Forget` frame, and every delete path responds
+    ///   only after journaling, so that delete was never acknowledged. Both
+    ///   ways the memory should exist: restore it into the store from its
+    ///   last logged snapshot, with any later anchor applied, and journal
+    ///   nothing. Only a memory with no snapshot in the log (stored before
+    ///   the journal existed, then anchored) cannot be restored; it gets a
+    ///   `Forget` frame so replay agrees with the store. On a tenant just
+    ///   restored from a backup ([`RESTORED_FROM_BACKUP_MARKER`]) the store
+    ///   is authoritative instead: every log-ahead memory gets a `Forget`.
     ///
-    /// Returns the number of frames backfilled. Non-fatal — the caller
+    /// Returns the number of memories reconciled. Non-fatal — the caller
     /// logs and continues on error.
     fn reconcile_store_with_intent_log(
         &self,
@@ -2628,41 +2643,172 @@ impl MultiUserMemoryManager {
                 backfilled += 1;
             }
         }
-        // log-ahead-of-store: the log says live, the store has no such
-        // memory — a crash landed between the RocksDB delete and its
-        // `Forget` frame. Backfill the `Forget` so replay (including
-        // restore-from-backup) cannot resurrect it into projections.
+        let missing: std::collections::HashSet<String> = covered
+            .iter()
+            .filter(|id| !store_id_strings.contains(*id))
+            .cloned()
+            .collect();
+        let mut restored = 0usize;
         let mut forget_backfilled = 0usize;
-        for id_str in &covered {
-            if store_id_strings.contains(id_str) {
-                continue;
-            }
-            let payload = crate::intent_log::IntentPayload::Forget {
-                user_id: user_id.to_string(),
-                memory_id: id_str.clone(),
-                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
-            };
-            if let Err(e) = self.journal_and_apply(user_id, &payload) {
-                tracing::warn!(
+        let marker = self.user_dir(user_id)?.join(RESTORED_FROM_BACKUP_MARKER);
+        let restored_from_backup = marker.exists();
+        let mut snapshots = if missing.is_empty() || restored_from_backup {
+            HashMap::new()
+        } else {
+            self.last_logged_snapshots(user_id, &missing)?
+        };
+        let mut restore = Vec::new();
+        for id_str in &missing {
+            match snapshots.remove(id_str) {
+                Some(Ok(memory)) => restore.push(memory),
+                Some(Err(e)) => tracing::warn!(
                     user_id = %user_id,
                     memory_id = %id_str,
                     error = %e,
-                    "C2 reconcile: Forget backfill journal_and_apply failed",
-                );
-            } else {
-                forget_backfilled += 1;
+                    "C2 reconcile: logged snapshot of a memory missing from the store does not decode; left unrestored",
+                ),
+                None => {
+                    let payload = crate::intent_log::IntentPayload::Forget {
+                        user_id: user_id.to_string(),
+                        memory_id: id_str.clone(),
+                        schema_version: Some(
+                            crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION,
+                        ),
+                    };
+                    if let Err(e) = self.journal_and_apply(user_id, &payload) {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            memory_id = %id_str,
+                            error = %e,
+                            "C2 reconcile: Forget backfill journal_and_apply failed",
+                        );
+                    } else {
+                        forget_backfilled += 1;
+                    }
+                }
             }
         }
+        if !restore.is_empty() {
+            for memory in &restore {
+                tracing::warn!(
+                    user_id = %user_id,
+                    memory_id = %memory.id.0,
+                    "C2 reconcile: memory live in the intent log but missing from the store; restored from its logged snapshot",
+                );
+            }
+            restored = user_mem.read().upsert_memories(&restore)?;
+        }
 
-        if backfilled > 0 || forget_backfilled > 0 {
+        if restored_from_backup {
+            std::fs::remove_file(&marker).with_context(|| {
+                format!("reconcile: removing the backup-restore marker {marker:?}")
+            })?;
+        }
+        if backfilled + restored + forget_backfilled > 0 {
             tracing::warn!(
                 user_id = %user_id,
                 backfilled,
+                restored,
                 forget_backfilled,
-                "C2 store↔log reconcile backfilled the intent log (Remember frames for store-ahead, Forget frames for log-ahead)",
+                "C2 store↔log reconcile: Remember frames for store-ahead, restores and Forget frames for log-ahead",
             );
         }
-        Ok(backfilled + forget_backfilled)
+        Ok(backfilled + restored + forget_backfilled)
+    }
+
+    /// The last `Remember`/`Update` snapshot of each of `ids` in `user_id`'s log, with
+    /// any later anchor frame applied, decoded. An id the log holds no snapshot for is
+    /// absent from the result. Reads the log once, under the writer lock.
+    fn last_logged_snapshots(
+        &self,
+        user_id: &str,
+        ids: &std::collections::HashSet<String>,
+    ) -> Result<HashMap<String, Result<crate::memory::types::Memory>>> {
+        use crate::intent_log::IntentPayload;
+        enum Anchoring {
+            Inferred(f32),
+            Set(bool, f32),
+        }
+        let mut last: HashMap<String, (Vec<u8>, Option<Anchoring>)> = HashMap::new();
+        {
+            let writer = self.get_user_journaled_writer(user_id)?;
+            let guard = writer.lock();
+            for record in guard
+                .log()
+                .iter()
+                .map_err(|e| anyhow::anyhow!("reconcile: reading intent log: {e}"))?
+            {
+                let record =
+                    record.map_err(|e| anyhow::anyhow!("reconcile: reading intent log: {e}"))?;
+                let (_, payload) = crate::intent_log::payload::decode_record(&record)
+                    .map_err(|e| anyhow::anyhow!("reconcile: decoding intent log: {e}"))?;
+                if !ids.contains(payload.memory_id()) {
+                    continue;
+                }
+                match payload {
+                    IntentPayload::Remember {
+                        memory_id,
+                        memory_bincode,
+                        ..
+                    }
+                    | IntentPayload::Update {
+                        memory_id,
+                        memory_bincode,
+                        ..
+                    } => {
+                        last.insert(memory_id, (memory_bincode, None));
+                    }
+                    IntentPayload::Forget { memory_id, .. } => {
+                        last.remove(&memory_id);
+                    }
+                    IntentPayload::Anchor {
+                        memory_id,
+                        importance,
+                        ..
+                    } => {
+                        if let Some(entry) = last.get_mut(&memory_id) {
+                            entry.1 = Some(Anchoring::Inferred(importance));
+                        }
+                    }
+                    IntentPayload::SetAnchored {
+                        memory_id,
+                        anchored,
+                        importance,
+                        ..
+                    } => {
+                        if let Some(entry) = last.get_mut(&memory_id) {
+                            entry.1 = Some(Anchoring::Set(anchored, importance));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(last
+            .into_iter()
+            .map(|(id, (bytes, anchoring))| {
+                let memory =
+                    crate::memory::storage::decode_memory_snapshot(&bytes).inspect(|memory| {
+                        match anchoring {
+                            // Same reading the replication follower gives an `Anchor` frame,
+                            // which carries only the importance after the change.
+                            Some(Anchoring::Inferred(importance)) => {
+                                if importance > memory.importance() {
+                                    memory.set_anchored(true);
+                                } else if importance < memory.importance() {
+                                    memory.set_anchored(false);
+                                }
+                                memory.set_importance(importance);
+                            }
+                            Some(Anchoring::Set(anchored, importance)) => {
+                                memory.set_anchored(anchored);
+                                memory.set_importance(importance);
+                            }
+                            None => {}
+                        }
+                    });
+                (id, memory)
+            })
+            .collect())
     }
 
     /// Get graph statistics for a user
@@ -3567,6 +3713,24 @@ impl MultiUserMemoryManager {
         let _graph_guard = graph_lock.lock();
         self.evict_user_and_wait_for_release(user_id, RELEASE_WAIT)?;
 
+        let restored = self.restore_user_stores(user_id, backup_id, max_lsn)?;
+        std::fs::write(
+            self.user_dir(user_id)?.join(RESTORED_FROM_BACKUP_MARKER),
+            b"",
+        )
+        .with_context(|| format!("marking '{user_id}' as restored from a backup"))?;
+        self.reconciled_users.remove(user_id);
+        Ok(restored)
+    }
+
+    /// The store swap of [`Self::restore_user_backup_with_options`], run with the
+    /// tenant evicted and its open locks held.
+    fn restore_user_stores(
+        &self,
+        user_id: &str,
+        backup_id: Option<u32>,
+        max_lsn: Option<u64>,
+    ) -> Result<Vec<String>> {
         match self.server_config.effective_storage_backend {
             #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => {
@@ -5552,7 +5716,10 @@ mod reserved_dir_tests {
         for dir in ["alice", "instances", "replication", "todos"] {
             std::fs::create_dir(root.path().join(dir)).unwrap();
         }
-        assert_eq!(list_user_dirs(root.path()).unwrap(), vec!["alice".to_string()]);
+        assert_eq!(
+            list_user_dirs(root.path()).unwrap(),
+            vec!["alice".to_string()]
+        );
     }
 
     #[test]
@@ -5569,5 +5736,190 @@ mod reserved_dir_tests {
         assert!(manager.get_user_memory("instances").is_err());
         assert!(!root.path().join("instances").exists());
         assert!(manager.user_dir("alice").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod reconcile_restore_tests {
+    use super::*;
+    use crate::intent_log::payload::{live_memory_ids, CURRENT_PAYLOAD_SCHEMA_VERSION};
+    use crate::intent_log::IntentPayload;
+    use crate::memory::types::Experience;
+
+    fn manager(root: &std::path::Path) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: root.to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(root.to_path_buf(), config).unwrap()
+    }
+
+    /// Remember `content` and journal its snapshot, as the remember handler does.
+    fn remember_journaled(manager: &MultiUserMemoryManager, content: &str) -> MemoryId {
+        let user_mem = manager.get_user_memory("u").unwrap();
+        let id = user_mem
+            .read()
+            .remember(
+                Experience {
+                    content: content.into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let mem = user_mem.read().get_memory(&id).unwrap();
+        let memory_bincode =
+            bincode::serde::encode_to_vec(&mem, bincode::config::standard()).unwrap();
+        manager
+            .journal_and_apply(
+                "u",
+                &IntentPayload::Remember {
+                    user_id: "u".into(),
+                    memory_id: id.0.to_string(),
+                    memory_bincode,
+                    schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+                },
+            )
+            .unwrap();
+        id
+    }
+
+    fn live(manager: &MultiUserMemoryManager) -> std::collections::HashSet<String> {
+        let writer = manager.get_user_journaled_writer("u").unwrap();
+        let guard = writer.lock();
+        live_memory_ids(guard.log()).unwrap()
+    }
+
+    #[test]
+    fn a_memory_the_store_lost_is_restored_from_its_logged_snapshot() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        let id = remember_journaled(&manager, "the backup key lives in the second safe");
+        let user_mem = manager.get_user_memory("u").unwrap();
+        user_mem
+            .read()
+            .forget(crate::memory::ForgetCriteria::ById(id.clone()))
+            .unwrap();
+        assert!(
+            user_mem.read().get_memory(&id).is_err(),
+            "the store lost the write"
+        );
+
+        assert_eq!(
+            manager
+                .reconcile_store_with_intent_log("u", &user_mem)
+                .unwrap(),
+            1
+        );
+
+        let restored = user_mem
+            .read()
+            .get_memory(&id)
+            .expect("restored into the store");
+        assert_eq!(
+            restored.experience.content,
+            "the backup key lives in the second safe"
+        );
+        assert!(
+            live(&manager).contains(&id.0.to_string()),
+            "a restore journals no Forget"
+        );
+    }
+
+    #[test]
+    fn a_restore_applies_the_anchor_logged_after_the_snapshot() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        let id = remember_journaled(&manager, "rotate the signing key every ninety days");
+        manager
+            .journal_and_apply(
+                "u",
+                &IntentPayload::SetAnchored {
+                    user_id: "u".into(),
+                    memory_id: id.0.to_string(),
+                    anchored: true,
+                    importance: 0.9,
+                    schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+                },
+            )
+            .unwrap();
+        let user_mem = manager.get_user_memory("u").unwrap();
+        user_mem
+            .read()
+            .forget(crate::memory::ForgetCriteria::ById(id.clone()))
+            .unwrap();
+
+        manager
+            .reconcile_store_with_intent_log("u", &user_mem)
+            .unwrap();
+
+        let restored = user_mem.read().get_memory(&id).expect("restored");
+        assert!(restored.is_anchored());
+        assert!((restored.importance() - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_tenant_restored_from_a_backup_forgets_what_its_store_lacks() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        let id = remember_journaled(&manager, "deleted after the journal was captured");
+        let user_mem = manager.get_user_memory("u").unwrap();
+        user_mem
+            .read()
+            .forget(crate::memory::ForgetCriteria::ById(id.clone()))
+            .unwrap();
+        let marker = manager
+            .user_dir("u")
+            .unwrap()
+            .join(RESTORED_FROM_BACKUP_MARKER);
+        std::fs::write(&marker, b"").unwrap();
+
+        assert_eq!(
+            manager
+                .reconcile_store_with_intent_log("u", &user_mem)
+                .unwrap(),
+            1
+        );
+
+        assert!(
+            user_mem.read().get_memory(&id).is_err(),
+            "the restored store is authoritative for deletes in the backup window"
+        );
+        assert!(!live(&manager).contains(&id.0.to_string()));
+        assert!(!marker.exists(), "the marker is spent by the reconcile");
+    }
+
+    #[test]
+    fn a_memory_with_no_logged_snapshot_is_forgotten() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        let user_mem = manager.get_user_memory("u").unwrap();
+        let orphan = uuid::Uuid::new_v4().to_string();
+        manager
+            .journal_and_apply(
+                "u",
+                &IntentPayload::SetAnchored {
+                    user_id: "u".into(),
+                    memory_id: orphan.clone(),
+                    anchored: true,
+                    importance: 0.8,
+                    schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+                },
+            )
+            .unwrap();
+        assert!(live(&manager).contains(&orphan));
+
+        assert_eq!(
+            manager
+                .reconcile_store_with_intent_log("u", &user_mem)
+                .unwrap(),
+            1
+        );
+
+        assert!(
+            !live(&manager).contains(&orphan),
+            "nothing to restore from, so replay is made to agree with the store"
+        );
     }
 }
