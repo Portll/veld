@@ -141,6 +141,10 @@ pub struct SignalAttribution {
     pub temporal_match: bool,
     /// Whether entity overlap boosted this memory's score
     pub entity_overlap: bool,
+    /// The embedding spaces whose vector search returned this memory, the primary index's
+    /// first. Empty when only keyword or graph search found it.
+    #[serde(default)]
+    pub spaces: Vec<SpaceId>,
 }
 
 /// Full unified-scoring feature vector for one retrieved memory (R2 / LTR).

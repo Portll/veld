@@ -98,6 +98,9 @@ pub struct RetrievalEngine {
     secondary_index_space: Option<SpaceId>,
     /// Where a refusal is recorded: the ledger the memory system drains, over the same store.
     backlog: EmbeddingBacklogStore,
+    /// The distribution of each space's best search similarity, learned from its searches and
+    /// seeded from the space registry at start.
+    score_stats: RwLock<std::collections::HashMap<SpaceId, space::ScoreStats>>,
     /// Storage path for persisting vector index and ID mapping
     storage_path: PathBuf,
     /// Lock order: 5 - Acquire last
@@ -247,6 +250,19 @@ impl RetrievalEngine {
             vector_index: Arc::new(RwLock::new(vector_index)),
             id_mapping: Arc::new(RwLock::new(id_mapping)),
             space_indexes: RwLock::new(space_indexes),
+            score_stats: RwLock::new(
+                space::SpaceRegistry::read(&storage_path)
+                    .ok()
+                    .flatten()
+                    .map(|registry| {
+                        registry
+                            .spaces
+                            .into_iter()
+                            .filter_map(|s| s.scores.map(|stats| (s.id, stats)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
             index_space,
             secondary_index_space,
             backlog,
@@ -1765,6 +1781,7 @@ impl RetrievalEngine {
         // Tie-break by MemoryId for deterministic rank order across runs (RH-10).
         memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         memory_ids.truncate(limit);
+        self.observe_scores(&self.index_space, &memory_ids);
 
         Ok(memory_ids)
     }
@@ -1782,6 +1799,34 @@ impl RetrievalEngine {
         }
     }
 
+    /// Fold a search's best similarity into its space's statistics.
+    fn observe_scores(&self, space: &SpaceId, results: &[(MemoryId, f32)]) {
+        if let Some((_, best)) = results.first() {
+            let mut stats = self.score_stats.write();
+            let current = stats.get(space).copied();
+            stats.insert(space.clone(), space::ScoreStats::observe(current, *best));
+        }
+    }
+
+    /// Each space's learned score statistics.
+    pub fn score_stats(&self) -> std::collections::HashMap<SpaceId, space::ScoreStats> {
+        self.score_stats.read().clone()
+    }
+
+    /// `similarity`, from `space`, on the primary space's scale, so a raw cosine from another
+    /// space can be compared with the primary's. Unchanged until both spaces have seen enough
+    /// searches to say what their scales are.
+    pub fn calibrated_similarity(&self, space: &SpaceId, similarity: f32) -> f32 {
+        if *space == self.index_space {
+            return similarity;
+        }
+        let stats = self.score_stats.read();
+        match (stats.get(space), stats.get(&self.index_space)) {
+            (Some(from), Some(to)) if from.ready() && to.ready() => from.onto(to, similarity),
+            _ => similarity,
+        }
+    }
+
     /// Search `space`'s index with a query vector in that space: one score per memory (its
     /// best vector), best first, ties broken by id. Empty when no index here holds the space.
     /// The primary space searches the primary index, chunk aggregation included.
@@ -1791,15 +1836,18 @@ impl RetrievalEngine {
         query: &[f32],
         limit: usize,
     ) -> Result<Vec<(MemoryId, f32)>> {
-        if *space == self.index_space {
-            return self.search_by_embedding(query, limit, None);
-        }
-        match self.space_index(space) {
-            Some(index) => {
-                index.search(query, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2, limit)
+        let results = if *space == self.index_space {
+            self.search_by_embedding(query, limit, None)?
+        } else {
+            match self.space_index(space) {
+                Some(index) => {
+                    index.search(query, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2, limit)?
+                }
+                None => Vec::new(),
             }
-            None => Ok(Vec::new()),
-        }
+        };
+        self.observe_scores(space, &results);
+        Ok(results)
     }
 
     /// Search the *primary* Vamana index using a query text encoded with the

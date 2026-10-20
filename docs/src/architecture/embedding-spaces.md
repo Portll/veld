@@ -80,6 +80,25 @@ The intent-log Vamana projection (`/api/query`) binds its text-primary index to 
 active space when it opens. It skips any vector of another width or recorded space, so a log
 replayed from the start across an embedder change no longer builds the index in the old space.
 
+## Fusion across spaces
+
+Fusion is by rank (RRF), so two spaces' different cosine scales do not bias it. Two things are
+per space:
+
+- **Weights.** The `space_weights` dial (`/api/dials`) multiplies a non-primary space's RRF
+  contribution, keyed by space id; a space with no entry weighs 1. A leg reached through a map
+  is also weighed by the map's confidence. The primary space's vector weight stays in
+  `rrf_weights`.
+- **Calibration.** Where raw cosines from two spaces are compared, the max over recent memories'
+  vectors in Layer 3.5, each space's similarity is first moved onto the primary space's scale by
+  matching z-scores. A sharper model's near-misses would otherwise outrank the primary's hits on
+  scale alone. Each space learns its scale from its own searches: a moving mean and variance of
+  the best similarity each search returns, used after 30 searches and kept in the space registry
+  across restarts.
+
+Every hit's signal attribution lists the spaces whose vector search returned it, the primary
+index's first, so which space won a hit is visible per result.
+
 ## Every boundary a vector crosses
 
 A slot holds a vector in the space it is read in, or nothing. A write that brings a vector in

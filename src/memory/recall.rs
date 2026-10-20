@@ -1434,12 +1434,16 @@ impl super::MemorySystem {
                     }
                 }
 
-                // Every other space a query vector exists for — take the max
+                // Every other space a query vector exists for — take the max, each similarity
+                // moved onto the primary's scale first, so a sharper model's near-misses do
+                // not outrank the primary's hits on scale alone
                 for (space, q_sec) in &space_queries {
                     if let Some(m_sec) = self.retriever.stored_vector(mem, space) {
                         if !m_sec.is_empty() {
-                            let sim_sec =
-                                crate::memory::hybrid_search::cosine_similarity_pub(q_sec, m_sec);
+                            let sim_sec = self.retriever.calibrated_similarity(
+                                space,
+                                crate::memory::hybrid_search::cosine_similarity_pub(q_sec, m_sec),
+                            );
                             best = Some(best.map_or(sim_sec, |b| b.max(sim_sec)));
                         }
                     }
@@ -1539,6 +1543,22 @@ impl super::MemorySystem {
             // contributed to each memory's ranking for adaptive weight learning.
             let mut attr: std::collections::HashMap<MemoryId, SignalAttribution> =
                 std::collections::HashMap::new();
+            let primary_vector_hits: Vec<MemoryId> =
+                vector_results.iter().map(|(id, _)| id.clone()).collect();
+            let space_weights = self.cognitive_dials.read().space_weights.clone();
+            let space_weight = |space: &SpaceId| -> f32 {
+                space_weights.get(space.as_str()).copied().unwrap_or(1.0)
+            };
+            fn mark_space(
+                attr: &mut std::collections::HashMap<MemoryId, SignalAttribution>,
+                id: &MemoryId,
+                space: &SpaceId,
+            ) {
+                let spaces = &mut attr.entry(id.clone()).or_default().spaces;
+                if !spaces.contains(space) {
+                    spaces.push(space.clone());
+                }
+            }
 
             // ---------------------------------------------------------------
             // BM25 CONCEPT EXPANSION: Expand abstract/meta-reasoning query
@@ -1579,6 +1599,9 @@ impl super::MemorySystem {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or(vector_results);
+            for id in &primary_vector_hits {
+                mark_space(&mut attr, id, &index_space);
+            }
 
             // ===========================================================================
             // LAYER 4: RRF FUSION WITH DENSITY-BASED WEIGHTS (PIPE-11)
@@ -1690,6 +1713,7 @@ impl super::MemorySystem {
                         let sec_w = semantic_w * sec_ratio;
                         for (r, (id, _)) in aligned.iter().enumerate() {
                             *fused.entry(id.clone()).or_insert(0.0) += sec_w / (k + (r + 1) as f32);
+                            mark_space(&mut attr, id, &index_space);
                         }
                         tracing::debug!(
                             "Layer 4 RRF: aligned secondary (projected→primary) added {} results (w={:.2})",
@@ -1712,10 +1736,11 @@ impl super::MemorySystem {
                                     .read()
                                     .secondary_rrf_ratio
                                     .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
-                                let sec_w = semantic_w * sec_ratio;
+                                let sec_w = semantic_w * sec_ratio * space_weight(space);
                                 for (r, (id, _)) in sec_results.iter().enumerate() {
                                     *fused.entry(id.clone()).or_insert(0.0) +=
                                         sec_w / (k + (r + 1) as f32);
+                                    mark_space(&mut attr, id, space);
                                 }
                                 tracing::debug!(
                                     "Layer 4 RRF: {} index added {} results (w={:.2})",
@@ -1763,9 +1788,10 @@ impl super::MemorySystem {
                         .search_bridged(&from, &to, q, query.max_results * 8)
                     {
                         Ok((hits, confidence)) if !hits.is_empty() => {
-                            let w = semantic_w * bridge_ratio * confidence;
+                            let w = semantic_w * bridge_ratio * confidence * space_weight(&to);
                             for (r, (id, _)) in hits.iter().enumerate() {
                                 *fused.entry(id.clone()).or_insert(0.0) += w / (k + (r + 1) as f32);
+                                mark_space(&mut attr, id, &to);
                             }
                             tracing::debug!(
                                 "Layer 4 RRF: {} reached from {} added {} results (w={:.2})",

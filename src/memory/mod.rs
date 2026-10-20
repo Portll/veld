@@ -3630,6 +3630,11 @@ impl MemorySystem {
                 at(&mut by_space, space).kept += n;
             }
         }
+        for (space, stats) in self.retriever.score_stats() {
+            if stats.ready() {
+                at(&mut by_space, &space).scores = Some(stats);
+            }
+        }
         Ok(by_space.into_values().collect())
     }
 
@@ -9798,6 +9803,48 @@ mod lifecycle_tests {
 mod space_registry_tests {
     use super::*;
     use crate::embeddings::space::{SpaceId, SpaceRegistry};
+
+    /// Which space found each hit is on its attribution.
+    #[test]
+    fn a_vector_hit_names_the_space_that_found_it() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let system = MemorySystem::new(config, None).expect("memory system");
+        for content in [
+            "the tide left a strandline of kelp along the whole beach",
+            "a heron stood in the shallows at dawn",
+            "the ferry timetable changes in winter",
+        ] {
+            system
+                .remember(
+                    Experience {
+                        content: content.to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        let hits = system
+            .recall(&Query {
+                query_text: Some("kelp washed up on the beach".into()),
+                max_results: 3,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!hits.is_empty());
+        let index_space = system.index_space();
+        let attributions = system.last_signal_attributions.read();
+        assert!(
+            attributions
+                .values()
+                .any(|a| a.spaces.first() == Some(&index_space)),
+            "a vector hit names {index_space}"
+        );
+    }
 
     /// An import from an instance with another embedder: the vector is kept in its own space,
     /// and the memory is embedded in this corpus's.
