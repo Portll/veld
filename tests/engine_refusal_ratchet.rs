@@ -144,10 +144,10 @@ const KNOWN_REFUSALS: &[Refusal] = &[
         reason: "redb-only build: the rocksdb backup engine is not compiled in",
     },
     Refusal {
-        site: "handlers/state.rs::restore_user_backup_with_options",
+        site: "handlers/state.rs::restore_user_stores",
         engine: "rocksdb",
         interface: "MultiUserMemoryManager",
-        method: "restore_user_backup_with_options",
+        method: "restore_user_stores",
         reason: "redb-only build: the rocksdb backup engine is not compiled in",
     },
     Refusal {
@@ -195,7 +195,7 @@ const REFUSAL_PHRASES: &[&str] = &[
 /// Counted exactly, like `tests/rocksdb_ratchet.rs`: a module that removes a
 /// `#[cfg(feature = "rocksdb")]`-only item must lower its number, or the slack
 /// would readmit growth unnoticed.
-const ROCKSDB_ONLY_ITEMS: &[(&str, usize)] = &[("backup.rs", 20), ("handlers", 22)];
+const ROCKSDB_ONLY_ITEMS: &[(&str, usize)] = &[("backup.rs", 20), ("handlers", 16)];
 
 const ROCKSDB_ONLY_ATTRIBUTE: &str = "#[cfg(feature = \"rocksdb\")]";
 
@@ -416,14 +416,27 @@ fn every_engine_refusal_is_named_and_none_has_gone_stale() {
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
 }
 
+/// Runtime items only: a rocksdb-only test module is not an engine divergence, so test
+/// modules are skipped as the refusal scan skips them.
 fn count_rocksdb_only_items(root: &Path, entry: &str) -> usize {
     rust_files(root, entry)
         .iter()
         .map(|(_, path)| {
-            read(path)
-                .lines()
-                .filter(|line| line.trim() == ROCKSDB_ONLY_ATTRIBUTE)
-                .count()
+            let source = read(path);
+            let lines: Vec<&str> = source.lines().collect();
+            let mut count = 0;
+            let mut index = 0;
+            while index < lines.len() {
+                if let Some(after_module) = end_of_test_module(&lines, index) {
+                    index = after_module;
+                    continue;
+                }
+                if lines[index].trim() == ROCKSDB_ONLY_ATTRIBUTE {
+                    count += 1;
+                }
+                index += 1;
+            }
+            count
         })
         .sum()
 }

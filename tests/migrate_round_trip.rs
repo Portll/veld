@@ -161,6 +161,9 @@ fn encrypted_origin(base: &Path, backend: StorageBackend) -> Vec<Memory> {
     let before = batch(SEALED_PER_EPOCH, SECRET_BEFORE, SECRET_TAG);
     let after = batch(SEALED_PER_EPOCH, SECRET_AFTER, "after");
 
+    // A caller that built another origin first leaves the passphrase set, which
+    // would seal the rows this fixture means to write in plaintext.
+    env::remove_var("VELD_MASTER_PASSPHRASE");
     write_memories(backend, &dir, &plain);
     env::set_var("VELD_MASTER_PASSPHRASE", PASSPHRASE);
     write_memories(backend, &dir, &before);
@@ -446,7 +449,9 @@ fn a_dry_run_of_an_encrypted_tenant_changes_no_byte_of_the_data_directory() {
         );
         assert_eq!(
             plan.units[0].source.as_ref().unwrap().sealed_records,
-            SEALED_COUNT
+            SEALED_COUNT,
+            "{from} -> {to}: {:?}",
+            plan.units[0].source
         );
         assert!(plan.imported.is_empty());
 
