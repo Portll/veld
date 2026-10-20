@@ -159,8 +159,9 @@ pub struct CognitiveDials {
     /// Ontological rerank mismatch penalty (negative). Default -0.08.
     #[serde(default)]
     pub onto_rerank_penalty: Option<f32>,
-    /// Cross-encoder share of the Layer 5.3 blend for every query shape at once. `None`
-    /// lets the per-shape dials and `constants::CE_BLEND_*` decide. See `ce_share`.
+    /// Cross-encoder share of the Layer 5.3 blend for every query shape at once, except that
+    /// Abstract (decomposed) never drops below its own share. `None` lets the per-shape dials
+    /// and `constants::CE_BLEND_*` decide. See `ce_share`.
     #[serde(default)]
     pub ce_blend: Option<f32>,
     /// Temporal-fact source-memory boost. Default 0.20.
@@ -572,8 +573,15 @@ impl CognitiveDials {
     pub fn ce_share(&self, shape: crate::memory::query_parser::RerankShape) -> f32 {
         use crate::constants as c;
         use crate::memory::query_parser::RerankShape as S;
+        // A global share overrides every shape except Abstract (decomposed), which keeps its
+        // own share as a floor: the reranker is what reads abstract membership ("is a Redis
+        // fix a performance improvement?"), so lowering every shape must not lower that one.
+        // Only `ce_blend_abstract` lowers it.
         if let Some(all) = self.ce_blend {
-            return all;
+            return match shape {
+                S::Abstract => all.max(self.ce_blend_abstract.unwrap_or(c::CE_BLEND_ABSTRACT)),
+                _ => all,
+            };
         }
         let (dial, default) = match shape {
             S::Identifier => (self.ce_blend_identifier, c::CE_BLEND_IDENTIFIER),
@@ -740,6 +748,12 @@ mod tests {
         d.ce_blend = Some(0.2);
         assert_eq!(d.ce_share(S::Relational), 0.2);
         assert_eq!(d.ce_share(S::Identifier), 0.2);
+        assert_eq!(d.ce_share(S::Abstract), crate::constants::CE_BLEND_ABSTRACT);
+        d.ce_blend = Some(0.6);
+        assert_eq!(d.ce_share(S::Abstract), 0.6);
+        d.ce_blend = Some(0.2);
+        d.ce_blend_abstract = Some(0.3);
+        assert_eq!(d.ce_share(S::Abstract), 0.3);
     }
 
     /// SD-1: With empty disabled_signals, signal_enabled returns true for every

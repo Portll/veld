@@ -2707,7 +2707,8 @@ pub const RECENTLY_FLOOR_MULTIPLIER: f32 = 0.5;
 ///   lexical leg saw stems; only the reranker reads that one passage answers the other.
 /// - Abstract (decomposed): the 0.45 these queries already had.
 ///
-/// The `ce_blend` dial overrides every shape; the per-shape dials override one.
+/// The `ce_blend` dial overrides every shape except Abstract, which takes the larger of it and
+/// its own share; the per-shape dials override one shape each.
 pub const CE_BLEND_IDENTIFIER: f32 = 0.0;
 pub const CE_BLEND_ORDINAL: f32 = 0.05;
 pub const CE_BLEND_KEYWORD: f32 = 0.10;
