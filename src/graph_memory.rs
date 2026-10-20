@@ -31,10 +31,18 @@ const CF_ENTITY_EPISODES: &str = "entity_episodes";
 const CF_NAME_INDEX: &str = "name_index";
 const CF_LOWERCASE_INDEX: &str = "lowercase_index";
 const CF_STEMMED_INDEX: &str = "stemmed_index";
+/// Edge lookups that would otherwise read a whole family: `e:{episode}:{edge}` lists the
+/// edges an episode sourced, `t:{lo}:{hi}:{relation:?}` names the edge joining an entity
+/// pair under one relation type. Rows may outlive their edge; readers check the edge.
+const CF_EDGE_INDEX: &str = "edge_index";
 
 /// Row in `entity_episodes` recording that the recency-ordered index has been backfilled.
 /// `~` sorts after every hex digit, so no `{uuid}:` or `{uuid}#` prefix scan reaches it.
 const EPISODE_RECENCY_INDEX_MARKER: &[u8] = b"~episode_recency_index_v1";
+
+/// Row in `edge_index` recording that every stored edge has its rows. Until it is written,
+/// a miss in the index proves nothing and readers fall back to scanning.
+const EDGE_INDEX_MARKER: &[u8] = b"~edge_index_v1";
 
 /// Maximum number of retrieval IDs held in the idempotency guard (S-R4).
 /// Oldest entries are evicted FIFO once this cap is reached.
@@ -51,6 +59,14 @@ fn upper_median(values: &mut [f64]) -> Option<f64> {
     Some(*median)
 }
 
+/// What the open-time pass over the relationships family found.
+#[derive(Default)]
+struct RelationshipCensus {
+    /// Rows in the family, `mem_edge:` lookup rows included, as `relationship_count` counts.
+    rows: usize,
+    total_activations: u64,
+}
+
 const GRAPH_CF_NAMES: &[&str] = &[
     CF_ENTITIES,
     CF_RELATIONSHIPS,
@@ -61,6 +77,7 @@ const GRAPH_CF_NAMES: &[&str] = &[
     CF_NAME_INDEX,
     CF_LOWERCASE_INDEX,
     CF_STEMMED_INDEX,
+    CF_EDGE_INDEX,
 ];
 
 /// Entity node in the knowledge graph
@@ -933,6 +950,12 @@ pub fn ambient_evidence_source() -> String {
 // - LTP_WEEKLY_MIN_WEEKS (2): Minimum weeks of consistent activation
 
 impl RelationshipEdge {
+    /// Whether this edge connects `a` and `b`, in either direction.
+    pub fn joins(&self, a: &Uuid, b: &Uuid) -> bool {
+        (self.from_entity == *a && self.to_entity == *b)
+            || (self.from_entity == *b && self.to_entity == *a)
+    }
+
     /// Strengthen this synapse (Hebbian learning)
     ///
     /// Called when both connected entities are accessed together.
@@ -2249,6 +2272,7 @@ impl GraphMemory {
             CF_RELATIONSHIPS,
             CF_ENTITY_EDGES,
             CF_ENTITY_PAIR_INDEX,
+            CF_EDGE_INDEX,
         ];
         let mut bloom_opts = opts.clone();
         let mut bloom_block_opts = BlockBasedOptions::default();
@@ -2341,14 +2365,12 @@ impl GraphMemory {
 
         Self::ensure_episode_recency_index(store.as_ref())?;
 
-        // Count relationships and episodes during startup (one-time cost)
-        // This is O(n) at startup, but get_stats() will be O(1) at runtime
-        let relationship_count = Self::count_cf_entries(store.as_ref(), CF_RELATIONSHIPS);
+        // Counted once at open, then kept by the write paths, so get_stats() is O(1).
+        let RelationshipCensus {
+            rows: relationship_count,
+            total_activations,
+        } = Self::relationship_census_and_edge_index(store.as_ref())?;
         let episode_count = Self::count_cf_entries(store.as_ref(), CF_EPISODES);
-
-        // Sum total activation_count across all edges (one-time O(n) at startup).
-        // Used as N_s denominator in NPMI computation for Hebbian edge pruning.
-        let total_activations = Self::sum_activation_counts(store.as_ref(), CF_RELATIONSHIPS);
 
         // Load entity embedding cache for concept merging
         // Only entities with pre-computed name_embeddings are cached
@@ -2623,28 +2645,131 @@ impl GraphMemory {
             .join(" ")
     }
 
-    /// Count entries in a column family (one-time startup cost)
-    fn count_cf_entries(store: &dyn crate::storage::ColumnStore, cf: &str) -> usize {
-        store.scan_cf(cf, None, None).map(|r| r.len()).unwrap_or(0)
-    }
-
-    /// Sum activation_count across all relationships (one-time startup cost).
-    ///
-    /// Used to initialize `total_activations` for NPMI computation.
-    /// Follows the same pattern as `count_cf_entries` — O(n) scan at startup,
-    /// then the atomic counter is maintained incrementally.
-    fn sum_activation_counts(store: &dyn crate::storage::ColumnStore, cf: &str) -> u64 {
-        let mut total: u64 = 0;
-        let rows = match store.scan_cf(cf, None, None) {
-            Ok(rows) => rows,
-            Err(_) => return 0,
-        };
-        for (_, value) in rows {
-            if let Ok(edge) = RelationshipEdge::decode(&value) {
-                total += edge.activation_count as u64;
+    /// Visit every row of `cf`, one first-key-byte page at a time: `scan_cf` returns a
+    /// `Vec`, and a whole family of a large graph (866k relationships on one live tenant)
+    /// would otherwise be held in memory at once.
+    fn visit_cf_paged(
+        store: &dyn crate::storage::ColumnStore,
+        cf: &str,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        for first in 0..=u8::MAX {
+            for (key, value) in store.scan_cf(cf, Some(&[first]), None)? {
+                visit(&key, &value)?;
             }
         }
-        total
+        Ok(())
+    }
+
+    /// Count entries in a column family (one-time startup cost)
+    fn count_cf_entries(store: &dyn crate::storage::ColumnStore, cf: &str) -> usize {
+        let mut count = 0usize;
+        match Self::visit_cf_paged(store, cf, |_, _| {
+            count += 1;
+            Ok(())
+        }) {
+            Ok(()) => count,
+            Err(e) => {
+                tracing::warn!(cf, error = %e, "could not count graph family at open");
+                0
+            }
+        }
+    }
+
+    /// One pass over the relationships family at open: its row count, the activation total
+    /// (the NPMI denominator, kept incrementally afterwards), and, for a graph written
+    /// before `edge_index` existed, that index's rows for every edge.
+    fn relationship_census_and_edge_index(
+        store: &dyn crate::storage::ColumnStore,
+    ) -> Result<RelationshipCensus> {
+        const BATCH_ROWS: usize = 10_000;
+        let backfill = store.get_cf(CF_EDGE_INDEX, EDGE_INDEX_MARKER)?.is_none();
+        let mut census = RelationshipCensus::default();
+        let mut batch = crate::storage::WriteBatch::new();
+        let mut indexed = 0usize;
+        Self::visit_cf_paged(store, CF_RELATIONSHIPS, |key, value| {
+            census.rows += 1;
+            // The family also holds `mem_edge:` lookup rows; edges are keyed by their uuid.
+            if key.len() != 16 {
+                return Ok(());
+            }
+            let Ok(edge) = RelationshipEdge::decode(value) else {
+                return Ok(());
+            };
+            census.total_activations += edge.activation_count as u64;
+            if backfill {
+                Self::stage_edge_index_rows(&mut batch, &edge);
+                indexed += 1;
+                if batch.len() >= BATCH_ROWS {
+                    store.write_batch(&std::mem::take(&mut batch))?;
+                }
+            }
+            Ok(())
+        })?;
+        if backfill {
+            batch.put_cf(CF_EDGE_INDEX, EDGE_INDEX_MARKER, b"1".as_slice());
+            store.write_batch(&batch)?;
+            if indexed > 0 {
+                tracing::info!(edges = indexed, "Backfilled the graph edge index");
+            }
+        }
+        Ok(census)
+    }
+
+    /// `e:{episode}:{edge}`: `edge` was created by `episode`.
+    fn episode_edge_key(episode: &Uuid, edge: &Uuid) -> String {
+        format!("e:{episode}:{edge}")
+    }
+
+    fn episode_edge_prefix(episode: &Uuid) -> String {
+        format!("e:{episode}:")
+    }
+
+    /// `t:{lo}:{hi}:{relation:?}`: the edge joining `a` and `b`, in either direction,
+    /// under `relation`. Debug form, so `Custom("RelatedTo")` and `RelatedTo` differ.
+    fn typed_pair_key(a: &Uuid, b: &Uuid, relation: &RelationType) -> String {
+        format!("t:{}:{relation:?}", Self::pair_key(a, b))
+    }
+
+    /// Add `edge`'s `edge_index` rows to `batch`.
+    fn stage_edge_index_rows(batch: &mut crate::storage::WriteBatch, edge: &RelationshipEdge) {
+        batch.put_cf(
+            CF_EDGE_INDEX,
+            Self::typed_pair_key(&edge.from_entity, &edge.to_entity, &edge.relation_type)
+                .into_bytes(),
+            edge.uuid.as_bytes().to_vec(),
+        );
+        if let Some(episode) = edge.source_episode_id {
+            batch.put_cf(
+                CF_EDGE_INDEX,
+                Self::episode_edge_key(&episode, &edge.uuid).into_bytes(),
+                Vec::<u8>::new(),
+            );
+        }
+    }
+
+    /// Add to `batch` the removal of `edge`'s `edge_index` rows. The typed-pair row goes
+    /// only while it still names this edge: another edge may have taken the slot.
+    fn stage_edge_index_removals(
+        &self,
+        batch: &mut crate::storage::WriteBatch,
+        edge: &RelationshipEdge,
+    ) -> Result<()> {
+        let typed = Self::typed_pair_key(&edge.from_entity, &edge.to_entity, &edge.relation_type);
+        if self
+            .store
+            .get_cf(CF_EDGE_INDEX, typed.as_bytes())?
+            .is_some_and(|holder| holder.as_slice() == edge.uuid.as_bytes())
+        {
+            batch.delete_cf(CF_EDGE_INDEX, typed.into_bytes());
+        }
+        if let Some(episode) = edge.source_episode_id {
+            batch.delete_cf(
+                CF_EDGE_INDEX,
+                Self::episode_edge_key(&episode, &edge.uuid).into_bytes(),
+            );
+        }
+        Ok(())
     }
 
     /// Load entity embedding cache from persisted entities.
@@ -3427,22 +3552,49 @@ impl GraphMemory {
     /// this method only matches edges with the same `RelationType`. This allows
     /// multiple semantically distinct edges (e.g. WorksWith + PartOf) between
     /// the same entity pair.
+    ///
+    /// One point read in the edge index, and one for the edge it names. A row whose edge is
+    /// gone or no longer matches falls back to scanning `entity_a`'s edges, and the index
+    /// is repaired from what that scan finds.
     pub fn find_relationship_between_typed(
         &self,
         entity_a: &Uuid,
         entity_b: &Uuid,
         relation_type: &RelationType,
     ) -> Result<Option<RelationshipEdge>> {
-        let edges = self.get_entity_relationships(entity_a)?;
-        for edge in edges {
-            if edge.relation_type == *relation_type
-                && ((edge.from_entity == *entity_a && edge.to_entity == *entity_b)
-                    || (edge.from_entity == *entity_b && edge.to_entity == *entity_a))
-            {
-                return Ok(Some(edge));
+        let typed = Self::typed_pair_key(entity_a, entity_b, relation_type);
+        let Some(holder) = self.store.get_cf(CF_EDGE_INDEX, typed.as_bytes())? else {
+            return Ok(None);
+        };
+        if let Ok(edge_uuid) = Uuid::from_slice(&holder) {
+            if let Some(edge) = self.get_relationship(&edge_uuid)? {
+                if edge.relation_type == *relation_type && edge.joins(entity_a, entity_b) {
+                    return Ok(Some(edge));
+                }
             }
         }
-        Ok(None)
+        let found = self.scan_for_typed_relationship(entity_a, entity_b, relation_type)?;
+        match &found {
+            Some(edge) => {
+                self.store
+                    .put_cf(CF_EDGE_INDEX, typed.as_bytes(), edge.uuid.as_bytes())?
+            }
+            None => self.store.delete_cf(CF_EDGE_INDEX, typed.as_bytes())?,
+        }
+        Ok(found)
+    }
+
+    /// The edge joining the pair under `relation_type`, found among `entity_a`'s edges.
+    fn scan_for_typed_relationship(
+        &self,
+        entity_a: &Uuid,
+        entity_b: &Uuid,
+        relation_type: &RelationType,
+    ) -> Result<Option<RelationshipEdge>> {
+        Ok(self
+            .get_entity_relationships(entity_a)?
+            .into_iter()
+            .find(|edge| edge.relation_type == *relation_type && edge.joins(entity_a, entity_b)))
     }
 
     /// Add a relationship edge (or strengthen existing one)
@@ -3549,6 +3701,7 @@ impl GraphMemory {
                 Self::pair_key(&edge.from_entity, &edge.to_entity).into_bytes(),
                 edge.uuid.as_bytes().to_vec(),
             );
+            Self::stage_edge_index_rows(&mut batch, edge);
         }
         self.store.write_batch(&batch)?;
         self.relationship_count
@@ -3557,8 +3710,7 @@ impl GraphMemory {
         // Insert-time degree pruning: cap edges per entity to prevent O(n²) explosion.
         // If either entity exceeds MAX_ENTITY_DEGREE, prune the weakest edges.
         // This is the primary defense against graph bloat (132MB for 600KB of content).
-        // Pruning after the whole batch keeps the same edges as pruning after each one:
-        // both keep the strongest MAX_ENTITY_DEGREE under one total order.
+        // Pruned once per touched entity after the whole batch, not after each edge.
         let mut touched: Vec<Uuid> = Vec::new();
         for &slot in &created {
             for entity in [pending[slot].from_entity, pending[slot].to_entity] {
@@ -3611,7 +3763,9 @@ impl GraphMemory {
             {
                 batch.delete_cf(CF_ENTITY_PAIR_INDEX, previous_pair.into_bytes());
             }
+            self.stage_edge_index_removals(&mut batch, previous)?;
         }
+        Self::stage_edge_index_rows(&mut batch, edge);
         batch.put_cf(
             CF_RELATIONSHIPS,
             edge.uuid.as_bytes().to_vec(),
@@ -3641,17 +3795,18 @@ impl GraphMemory {
         format!("{entity_uuid}:{edge_uuid}")
     }
 
-    /// Prune an entity's edges if degree exceeds MAX_ENTITY_DEGREE
+    /// Prune an entity's edges once its degree exceeds MAX_ENTITY_DEGREE, back down to
+    /// ENTITY_DEGREE_PRUNE_TARGET.
     ///
     /// Loads all edges for the entity, sorts by effective strength, and deletes
-    /// the weakest edges that exceed the cap. LTP-protected edges are preserved
-    /// preferentially (sorted last, so they survive pruning).
+    /// the weakest. LTP-protected edges are preserved preferentially (sorted last,
+    /// so they survive pruning).
     ///
-    /// This is called at insert time to prevent unbounded edge growth.
-    /// Amortized cost: O(1) for most insertions (only triggers when over cap),
-    /// O(d log d) when pruning is needed (d = entity degree).
+    /// This is called at insert time to prevent unbounded edge growth. The count is a
+    /// key-only scan; the load and sort run once per prune, and a prune leaves room for
+    /// the next MAX_ENTITY_DEGREE - ENTITY_DEGREE_PRUNE_TARGET edges.
     fn prune_entity_if_over_degree(&self, entity_uuid: &Uuid) -> Result<()> {
-        use crate::constants::MAX_ENTITY_DEGREE;
+        use crate::constants::{ENTITY_DEGREE_PRUNE_TARGET, MAX_ENTITY_DEGREE};
 
         // Fast path: count edges without loading them
         let edge_count = self.entity_degree(entity_uuid)?;
@@ -3660,10 +3815,13 @@ impl GraphMemory {
             return Ok(());
         }
 
-        // Over cap — load all edges, sort, prune weakest
+        // Over cap — load all edges, sort, prune weakest. The count includes edges the
+        // load leaves out as decayed (queued for the next maintenance flush), so the live
+        // set can be within the cap; it is still cut to the target, or every insert until
+        // that flush would pay this load again.
         let all_edges = self.get_entity_relationships(entity_uuid)?;
-        if all_edges.len() <= MAX_ENTITY_DEGREE {
-            return Ok(()); // Race condition guard
+        if all_edges.len() <= ENTITY_DEGREE_PRUNE_TARGET {
+            return Ok(());
         }
 
         // Sort by pruning priority: LTP-protected edges last (survive pruning), then by
@@ -3720,7 +3878,7 @@ impl GraphMemory {
         });
 
         // Prune excess: first N edges in sorted order are weakest/unprotected
-        let prune_count = scored.len() - MAX_ENTITY_DEGREE;
+        let prune_count = scored.len() - ENTITY_DEGREE_PRUNE_TARGET;
         let to_prune: Vec<Uuid> = scored.iter().take(prune_count).map(|s| s.0.uuid).collect();
 
         for edge_uuid in &to_prune {
@@ -3742,7 +3900,7 @@ impl GraphMemory {
             tracing::debug!(
                 entity = %entity_uuid,
                 pruned = to_prune.len(),
-                remaining = MAX_ENTITY_DEGREE,
+                remaining = ENTITY_DEGREE_PRUNE_TARGET,
                 "Pruned edges exceeding degree cap"
             );
         }
@@ -4267,8 +4425,12 @@ impl GraphMemory {
             None => return Ok(false),
         };
 
-        // Delete from main storage
-        self.store.delete_cf(CF_RELATIONSHIPS, key)?;
+        // The record and its edge-index rows go together: a lookup that found a row
+        // without its edge would have to fall back to a scan.
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.delete_cf(CF_RELATIONSHIPS, key.to_vec());
+        self.stage_edge_index_removals(&mut batch, &edge)?;
+        self.store.write_batch(&batch)?;
         self.relationship_count.fetch_sub(1, Ordering::Relaxed);
         // Decrement total activations by the edge's count (NPMI denominator)
         let edge_acts = edge.activation_count as u64;
@@ -4330,26 +4492,37 @@ impl GraphMemory {
             }
         }
 
-        // Delete edges sourced from this episode
-        // Scan all relationships for matching source_episode_id
-        let iter = self
-            .store
-            .scan_cf(CF_RELATIONSHIPS, None, None)?
-            .into_iter()
-            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
+        // Delete the edges this episode sourced, as the edge index lists them. A row whose
+        // edge is gone, or now names another source, is dropped without touching an edge.
+        let prefix = Self::episode_edge_prefix(episode_uuid);
         let mut edges_to_delete = Vec::new();
-        for (_, value) in iter.flatten() {
-            if let Ok(edge) = RelationshipEdge::decode(&value) {
-                if edge.source_episode_id == Some(*episode_uuid) {
-                    edges_to_delete.push(edge.uuid);
+        let mut rows = crate::storage::WriteBatch::new();
+        for (key, _) in self
+            .store
+            .scan_cf(CF_EDGE_INDEX, Some(prefix.as_bytes()), None)?
+        {
+            let edge_uuid = std::str::from_utf8(&key)
+                .ok()
+                .and_then(|k| k.strip_prefix(prefix.as_str()))
+                .and_then(|id| Uuid::parse_str(id).ok());
+            if let Some(edge_uuid) = edge_uuid {
+                if self
+                    .get_relationship(&edge_uuid)?
+                    .is_some_and(|edge| edge.source_episode_id == Some(*episode_uuid))
+                {
+                    edges_to_delete.push(edge_uuid);
                 }
             }
+            rows.delete_cf(CF_EDGE_INDEX, key);
         }
 
         for edge_uuid in &edges_to_delete {
             if let Err(e) = self.delete_relationship(edge_uuid) {
                 tracing::debug!("Failed to delete orphan edge {}: {}", edge_uuid, e);
             }
+        }
+        if !rows.is_empty() {
+            self.store.write_batch(&rows)?;
         }
 
         tracing::debug!(
@@ -4383,6 +4556,7 @@ impl GraphMemory {
         // An empty graph has nothing to backfill; keep the next open from rescanning.
         self.store
             .put_cf(CF_ENTITY_EPISODES, EPISODE_RECENCY_INDEX_MARKER, b"1")?;
+        self.store.put_cf(CF_EDGE_INDEX, EDGE_INDEX_MARKER, b"1")?;
 
         // Clear in-memory indices
         self.entity_name_index.write().clear();
@@ -5720,6 +5894,7 @@ impl GraphMemory {
                 if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
                     batch.put_cf(CF_RELATIONSHIPS, key, value);
+                    Self::stage_edge_index_rows(&mut batch, &edge);
 
                     // Index both directions for lookup
                     let idx_key_fwd = format!("mem_edge:{}:{}", trigger_id, coact_id);
@@ -5804,6 +5979,7 @@ impl GraphMemory {
                         bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                     {
                         batch.put_cf(CF_RELATIONSHIPS, key, value);
+                        Self::stage_edge_index_rows(&mut batch, &edge);
 
                         let idx_key_fwd = format!("mem_edge:{mem_a}:{mem_b}");
                         let idx_key_rev = format!("mem_edge:{mem_b}:{mem_a}");
@@ -6100,6 +6276,7 @@ impl GraphMemory {
                 if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
                     batch.put_cf(CF_RELATIONSHIPS, key, value);
+                    Self::stage_edge_index_rows(&mut batch, &edge);
 
                     // Index both directions
                     let idx_key_fwd = format!("mem_edge:{from_uuid}:{to_uuid}");
@@ -6633,10 +6810,16 @@ impl GraphMemory {
         let orphan_candidates: std::collections::HashSet<Uuid> =
             orphan_candidates.into_iter().collect();
 
-        // 3. Batch delete pruned edges
+        // 3. Batch delete pruned edges. An edge strengthened since it was queued (a new
+        // co-occurrence finds it through the edge index) is above its threshold now and stays.
+        let now = crate::memory::scoring_now();
         let mut pruned_count = 0;
         for edge_uuid in &to_prune {
-            if self.delete_relationship(edge_uuid)? {
+            let still_prunable = self.get_relationship(edge_uuid)?.is_some_and(|edge| {
+                edge.effective_strength_at(now) < edge.tier.prune_threshold()
+                    && !edge.ltp_status.is_potentiated()
+            });
+            if still_prunable && self.delete_relationship(edge_uuid)? {
                 pruned_count += 1;
             }
         }
@@ -10919,7 +11102,7 @@ mod tests {
 
     #[test]
     fn degree_cap_pruning_removes_unpotentiated_edges_before_declared_ones() {
-        use crate::constants::MAX_ENTITY_DEGREE;
+        use crate::constants::{ENTITY_DEGREE_PRUNE_TARGET, MAX_ENTITY_DEGREE};
         let temp_dir = tempfile::tempdir().unwrap();
         let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
         let hub = graph.add_entity(named_entity("hub")).unwrap();
@@ -10938,7 +11121,11 @@ mod tests {
                 graph.add_relationship(edge).unwrap();
             }
         }
-        assert_eq!(graph.entity_degree(&hub).unwrap(), MAX_ENTITY_DEGREE);
+        // Edge MAX + 1 cut the hub back to the target; the four after it were kept.
+        assert_eq!(
+            graph.entity_degree(&hub).unwrap(),
+            ENTITY_DEGREE_PRUNE_TARGET + 4
+        );
         let remaining: std::collections::HashSet<Uuid> = graph
             .get_entity_relationships(&hub)
             .unwrap()
@@ -11690,5 +11877,245 @@ mod repeat_stable_order_tests {
         assert_eq!(graph.get_all_entities().unwrap().len(), 10);
         let found = graph.find_entity_by_name("rok").unwrap().unwrap();
         assert_eq!(found.name, "Brokea");
+    }
+}
+
+#[cfg(test)]
+mod edge_index_tests {
+    use super::*;
+
+    fn named_entity(name: &str) -> EntityNode {
+        EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: Default::default(),
+        }
+    }
+
+    fn typed_edge(
+        from: Uuid,
+        to: Uuid,
+        relation_type: RelationType,
+        strength: f32,
+    ) -> RelationshipEdge {
+        RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type,
+            strength,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            created_by: EdgeSource::CoOccurrence,
+            entity_confidence: None,
+            forward_strength: strength,
+            backward_strength: strength,
+            strengthening_sources: Default::default(),
+            last_corroborated: None,
+        }
+    }
+
+    fn episode_over(uuid: Uuid, entity_refs: Vec<Uuid>) -> EpisodicNode {
+        EpisodicNode {
+            uuid,
+            name: "episode".to_string(),
+            content: "content".to_string(),
+            valid_at: Utc::now(),
+            created_at: Utc::now(),
+            entity_refs,
+            source: EpisodeSource::Message,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn sourced(mut edge: RelationshipEdge, episode: Option<Uuid>) -> RelationshipEdge {
+        edge.source_episode_id = episode;
+        edge
+    }
+
+    fn edge_index_rows(graph: &GraphMemory, prefix: &str) -> usize {
+        graph
+            .store
+            .scan_cf(CF_EDGE_INDEX, Some(prefix.as_bytes()), None)
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn deleting_an_episode_removes_the_edges_it_sourced_and_no_others_on_both_engines() {
+        let stores = crate::storage::test_support::column_stores(GRAPH_CF_NAMES);
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (backend, store, _tmp) in stores {
+            let graph = GraphMemory::with_store(store).unwrap();
+            let [a, b, c] = ["Alder", "Beech", "Cherry"]
+                .map(|name| graph.add_entity(named_entity(name)).unwrap());
+            let (gone, kept) = (Uuid::new_v4(), Uuid::new_v4());
+            graph.add_episode(episode_over(gone, vec![a, b])).unwrap();
+            graph.add_episode(episode_over(kept, vec![b, c])).unwrap();
+            let ids = graph
+                .add_relationships(vec![
+                    sourced(typed_edge(a, b, RelationType::RelatedTo, 0.5), Some(gone)),
+                    sourced(typed_edge(b, c, RelationType::CoOccurs, 0.5), Some(kept)),
+                    sourced(typed_edge(a, c, RelationType::RelatedTo, 0.5), None),
+                ])
+                .unwrap();
+
+            assert!(graph.delete_episode(&gone).unwrap(), "{backend:?}");
+
+            assert!(
+                graph.get_relationship(&ids[0]).unwrap().is_none(),
+                "{backend:?}"
+            );
+            assert!(
+                graph.get_relationship(&ids[1]).unwrap().is_some(),
+                "{backend:?}"
+            );
+            assert!(
+                graph.get_relationship(&ids[2]).unwrap().is_some(),
+                "{backend:?}"
+            );
+            assert_eq!(
+                edge_index_rows(&graph, &GraphMemory::episode_edge_prefix(&gone)),
+                0,
+                "{backend:?}: the deleted episode's rows remain"
+            );
+            assert!(graph
+                .find_relationship_between_typed(&a, &b, &RelationType::RelatedTo)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                graph
+                    .find_relationship_between_typed(&c, &b, &RelationType::CoOccurs)
+                    .unwrap()
+                    .map(|e| e.uuid),
+                Some(ids[1]),
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_graph_written_before_the_edge_index_backfills_it_on_open() {
+        let stores = crate::storage::test_support::column_stores(GRAPH_CF_NAMES);
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (backend, store, _tmp) in stores {
+            let episode = Uuid::new_v4();
+            let (a, b, id) = {
+                let graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
+                let a = graph.add_entity(named_entity("Larch")).unwrap();
+                let b = graph.add_entity(named_entity("Maple")).unwrap();
+                graph
+                    .add_episode(episode_over(episode, vec![a, b]))
+                    .unwrap();
+                let id = graph
+                    .add_relationship(sourced(
+                        typed_edge(a, b, RelationType::PartOf, 0.5),
+                        Some(episode),
+                    ))
+                    .unwrap();
+                (a, b, id)
+            };
+            let mut erase = crate::storage::WriteBatch::new();
+            for (key, _) in store.scan_cf(CF_EDGE_INDEX, None, None).unwrap() {
+                erase.delete_cf(CF_EDGE_INDEX, key);
+            }
+            store.write_batch(&erase).unwrap();
+
+            let graph = GraphMemory::with_store(store).unwrap();
+            assert!(
+                graph
+                    .store
+                    .get_cf(CF_EDGE_INDEX, EDGE_INDEX_MARKER)
+                    .unwrap()
+                    .is_some(),
+                "{backend:?}"
+            );
+            assert_eq!(
+                graph
+                    .find_relationship_between_typed(&b, &a, &RelationType::PartOf)
+                    .unwrap()
+                    .map(|e| e.uuid),
+                Some(id),
+                "{backend:?}"
+            );
+            graph.delete_episode(&episode).unwrap();
+            assert!(
+                graph.get_relationship(&id).unwrap().is_none(),
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_typed_pair_row_falls_back_to_the_scan_and_is_repaired() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let a = graph.add_entity(named_entity("Rowan")).unwrap();
+        let b = graph.add_entity(named_entity("Spruce")).unwrap();
+        let id = graph
+            .add_relationship(typed_edge(a, b, RelationType::Uses, 0.5))
+            .unwrap();
+        let typed = GraphMemory::typed_pair_key(&a, &b, &RelationType::Uses);
+        graph
+            .store
+            .put_cf(CF_EDGE_INDEX, typed.as_bytes(), Uuid::new_v4().as_bytes())
+            .unwrap();
+
+        let found = graph
+            .find_relationship_between_typed(&a, &b, &RelationType::Uses)
+            .unwrap();
+        assert_eq!(found.map(|e| e.uuid), Some(id));
+        assert_eq!(
+            graph.store.get_cf(CF_EDGE_INDEX, typed.as_bytes()).unwrap(),
+            Some(id.as_bytes().to_vec()),
+            "the stale row was not repointed at the edge the scan found"
+        );
+        assert_eq!(
+            graph
+                .add_relationship(typed_edge(b, a, RelationType::Uses, 0.5))
+                .unwrap(),
+            id,
+            "a repeat made a second synapse"
+        );
+    }
+
+    #[test]
+    fn a_queued_prune_spares_an_edge_strengthened_since() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let [a, b, c] =
+            ["Willow", "Hazel", "Holly"].map(|name| graph.add_entity(named_entity(name)).unwrap());
+        let mut revived = typed_edge(a, b, RelationType::RelatedTo, 0.0001);
+        revived.tier = EdgeTier::L1Working;
+        let mut decayed = typed_edge(a, c, RelationType::RelatedTo, 0.0001);
+        decayed.tier = EdgeTier::L1Working;
+        let ids = graph.add_relationships(vec![revived, decayed]).unwrap();
+        graph.pending_prune.lock().extend(ids.iter().copied());
+
+        let mut strengthened = graph.get_relationship(&ids[0]).unwrap().unwrap();
+        strengthened.strength = 0.9;
+        strengthened.last_activated = Utc::now();
+        graph.put_relationship_record(&strengthened).unwrap();
+
+        graph.flush_pending_maintenance().unwrap();
+        assert!(graph.get_relationship(&ids[0]).unwrap().is_some());
+        assert!(graph.get_relationship(&ids[1]).unwrap().is_none());
     }
 }

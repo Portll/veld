@@ -155,6 +155,11 @@ pub const EDGE_MIN_STRENGTH: f32 = 0.05;
 /// Reference: Chechik et al. (1998) "Synaptic Pruning in Development"
 pub const MAX_ENTITY_DEGREE: usize = 500;
 
+/// Degree an entity is pruned back to once it passes [`MAX_ENTITY_DEGREE`]. Pruning only to
+/// the cap left a hub one edge below the next prune, so every new edge on it paid a full
+/// load, sort and delete over ~500 edges; the gap spreads one prune over the next 50 edges.
+pub const ENTITY_DEGREE_PRUNE_TARGET: usize = MAX_ENTITY_DEGREE - MAX_ENTITY_DEGREE / 10;
+
 /// Edge half-life base in hours (for time-based decay)
 ///
 /// Associations decay exponentially with this half-life.
