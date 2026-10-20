@@ -20,6 +20,7 @@ use super::embedding_backlog::{BacklogKey, EmbeddingBacklogStore};
 use super::introspection::ConsolidationEventBuffer;
 pub(crate) use super::space_index::IdMapping;
 use super::space_index::{SpaceIndex, SpaceIndexHealth};
+use super::space_migration::{MigrationKind, MigrationStep, SpaceMigration, SpaceMigrationStore};
 use super::storage::SearchCriteria;
 use super::types::*;
 use crate::constants::{
@@ -107,6 +108,27 @@ pub struct RetrievalEngine {
     /// Shared consolidation event buffer for introspection
     /// Records edge formation, strengthening, and pruning events
     consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,
+}
+
+/// What retiring a space removed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetireReport {
+    pub space: SpaceId,
+    pub vectors_dropped: usize,
+    pub maps_removed: usize,
+}
+
+/// Put `vector` in the memory's primary slot, keeping the vector it replaces beside it.
+fn replace_primary(memory: &mut Memory, vector: Vec<f32>, space: SpaceId) {
+    let displaced = memory
+        .experience
+        .embeddings
+        .take()
+        .zip(memory.experience.primary_space(None));
+    memory.experience.set_primary_vector(vector, space);
+    if let Some((old, old_space)) = displaced {
+        memory.experience.keep_vector(old_space, old);
+    }
 }
 
 /// What a corpus needs, decided from the two markers alone.
@@ -325,25 +347,21 @@ impl RetrievalEngine {
         Ok(engine)
     }
 
-    /// Bring every stored vector's space in line with the corpus markers and the active
-    /// embedder, in one pass over the store.
+    /// Decide at start what the corpus's spaces need, and leave the work to the drain.
     ///
-    /// Two jobs share the pass because both must read the markers as they were before this
-    /// boot moves them:
+    /// - **Current and stamped**: O(1), nothing to do.
+    /// - **Never stamped**: a `Stamp` migration names the space of every vector that has none,
+    ///   in the background. Until it reaches a vector, that vector reads as the index's at the
+    ///   index's width, as every vector did before spaces were recorded.
+    /// - **Embedder changed**: a `Reembed` migration re-embeds every primary vector not in the
+    ///   active space, in the background, keeping the vector it replaces. The markers advance
+    ///   now: the migration record says what is pending, so a restart resumes it rather than
+    ///   starting another. A change of model at the SAME width over a corpus never stamped is
+    ///   stamped here first, before the markers move, because at one width a vector with no
+    ///   space would otherwise read as the new model's.
     ///
-    /// - **Stamp.** A vector stored before spaces were named gets the space the corpus markers
-    ///   name, the embedder that wrote the corpus, when the widths agree, else a width-only
-    ///   space. Runs once per corpus (`.veld_spaces_stamped`), and again inside any migration.
-    /// - **Migrate.** When the active embedder is not the one the markers name, every primary
-    ///   vector in another space than the active one is re-embedded, or promoted from a
-    ///   secondary already in it.
-    ///
-    /// Properties:
-    /// - **Idempotent**: current markers and a stamp marker short-circuit in O(1).
-    /// - **Crash-resumable**: markers advance only after a pass without a failed write; a
-    ///   stamped record keeps its space, so a resumed pass reads what the first one recorded.
-    /// - **Never names a model it was not told**: a width the markers do not explain is
-    ///   recorded as `unrecorded@<width>`.
+    /// Never names a model it was not told: a width the markers do not explain is recorded as
+    /// `unrecorded@<width>`.
     fn reconcile_corpus_spaces(&self) -> Result<()> {
         let target = self.embedder.primary_dimension();
         let target_id = self.embedder.primary_id().to_string();
@@ -370,6 +388,8 @@ impl RetrievalEngine {
             return Ok(());
         }
 
+        let migrations = SpaceMigrationStore::with_kv(self.storage.key_value_store());
+        let pending = migrations.load()?.filter(|m| !m.is_finished());
         let ids = self.storage.get_all_ids()?;
         if ids.is_empty() {
             // Fresh / empty store — record everything; nothing to stamp or migrate.
@@ -404,32 +424,19 @@ impl RetrievalEngine {
             action,
             CorpusAction::MigrateChangedLength | CorpusAction::MigrateAll
         );
-        // A primary vector already at the target width in a corpus whose width changed was
-        // written by an earlier, interrupted run of this migration.
-        let resumed = (action == CorpusAction::MigrateChangedLength).then(|| target_space.clone());
-        let primary_assumption = |len: usize| -> Option<SpaceId> {
-            corpus
-                .clone()
-                .filter(|c| c.dimension() == len)
-                .or_else(|| resumed.clone().filter(|t| t.dimension() == len))
-        };
-        // A secondary at the live secondary's width was written by it. One at the target width
-        // during a migration is the old Nomic secondary this migration promotes.
-        let secondary_assumption = |len: usize| -> Option<SpaceId> {
-            self.secondary_index_space
-                .clone()
-                .filter(|s| s.dimension() == len)
-                .or_else(|| Some(target_space.clone()).filter(|t| migrate && t.dimension() == len))
-        };
 
         if migrate {
             info!(
-                "Embedding space change detected (corpus {:?} at {:?}d, now {}) — checking {} memories",
+                "Embedding space change detected (corpus {:?} at {:?}d, now {}) — {} memories \
+                 will be re-embedded in the background",
                 recorded_id,
                 recorded,
                 target_space,
                 ids.len()
             );
+            if action == CorpusAction::MigrateAll && !stamped {
+                self.stamp_now(corpus.as_ref(), &ids);
+            }
             // A stale primary index must not be loaded against the new space. Other spaces'
             // indexes are bound to their own space and stay valid.
             let _ = std::fs::remove_file(
@@ -437,147 +444,281 @@ impl RetrievalEngine {
                     .join("vector_index")
                     .join(VAMANA_INDEX_FILE),
             );
+            let resumes = pending
+                .as_ref()
+                .is_some_and(|m| m.kind == MigrationKind::Reembed && m.to == target_space);
+            if !resumes {
+                migrations.save(&SpaceMigration::new(
+                    MigrationKind::Reembed,
+                    corpus,
+                    target_space.clone(),
+                    ids.len(),
+                ))?;
+            }
+            // Both markers advance together. The migration record carries what is pending.
+            let _ = std::fs::write(&marker, target.to_string());
+            let _ = std::fs::write(&id_marker, &target_id);
+            return Ok(());
         }
 
-        let mut reembedded = 0usize;
-        let mut reused = 0usize;
-        let mut stamped_now = 0usize;
-        let mut unchanged = 0usize;
-        let mut unreadable = 0usize;
-        let mut failed = 0usize;
+        if pending.is_none() {
+            info!(
+                memories = ids.len(),
+                space = %target_space,
+                "Embedding spaces not yet recorded on this corpus — stamping in the background"
+            );
+            migrations.save(&SpaceMigration::new(
+                MigrationKind::Stamp,
+                corpus.or_else(|| Some(target_space.clone())),
+                target_space,
+                ids.len(),
+            ))?;
+        }
+        Ok(())
+    }
 
-        for id in &ids {
-            let mut memory = match self.storage.get(id) {
-                Ok(m) => m,
-                Err(e) => {
-                    // Named, because a count of failures cannot be acted on and an id can:
-                    // 24 of these blocked the marker on the 2026-09-13 deploy.
-                    warn!("Embedding space pass cannot load {}: {}", id.0, e);
-                    unreadable += 1;
-                    continue;
-                }
+    /// Stamp every vector that has no space, now: the one case a stamp cannot wait for the
+    /// drain. No embedding, a rewrite of each record that changes.
+    fn stamp_now(&self, corpus: Option<&SpaceId>, ids: &[MemoryId]) {
+        let mut stamped = 0usize;
+        for id in ids {
+            let Ok(mut memory) = self.storage.get(id) else {
+                continue;
             };
-
-            let primary_assumed = memory
+            let primary = memory
                 .experience
                 .embeddings
                 .as_ref()
-                .and_then(|v| primary_assumption(v.len()));
-            let secondary_assumed = memory
+                .and_then(|v| corpus.filter(|c| c.dimension() == v.len()).cloned());
+            let secondary = memory
                 .experience
                 .embeddings_secondary
                 .as_ref()
-                .and_then(|v| secondary_assumption(v.len()));
-            let mut dirty = memory
-                .experience
-                .stamp_vector_spaces(primary_assumed.as_ref(), secondary_assumed.as_ref());
-            if dirty {
-                stamped_now += 1;
-            }
-
-            let stale = migrate
-                && memory
-                    .experience
-                    .primary_space(None)
-                    .is_some_and(|s| s != target_space);
-            if stale {
-                // The vector a re-embed replaces stays stored beside the new one, until its
-                // space is retired.
-                let displaced = memory
-                    .experience
-                    .embeddings
-                    .clone()
-                    .zip(memory.experience.primary_space(None));
-                let promoted = memory.experience.embeddings_secondary.clone().filter(|_| {
-                    memory.experience.secondary_space(None).as_ref() == Some(&target_space)
+                .and_then(|v| {
+                    self.secondary_index_space
+                        .clone()
+                        .filter(|s| s.dimension() == v.len())
                 });
-                let replaced = match promoted {
-                    Some(vector) => {
-                        reused += 1;
-                        memory
-                            .experience
-                            .set_primary_vector(vector, target_space.clone());
-                        true
-                    }
-                    None => match self.embedder.encode(&memory.experience.content) {
-                        Ok(e) if e.len() == target => {
-                            reembedded += 1;
-                            let space = self.embedder.primary_space_for(&e);
-                            memory.experience.set_primary_vector(e, space);
-                            true
-                        }
-                        Ok(e) => {
-                            warn!(
-                                "Re-embed for {} produced {}d, expected {}d — skipping",
-                                id.0,
-                                e.len(),
-                                target
-                            );
-                            failed += 1;
-                            false
-                        }
-                        Err(e) => {
-                            warn!("Re-embed failed for {}: {}", id.0, e);
-                            failed += 1;
-                            false
-                        }
-                    },
-                };
-                if replaced {
-                    if let Some((vector, space)) = displaced {
-                        memory.experience.keep_vector(space, vector);
-                    }
-                    dirty = true;
-                } else {
-                    // Not re-embedded this time: the old vector still leaves the slot, so no
-                    // cosine against the primary slot compares it with the new space's vectors.
-                    // The memory waits, unindexed, for the backlog to embed it.
-                    dirty |= memory.experience.move_foreign_to_kept(&target_space, None);
+            if memory
+                .experience
+                .stamp_vector_spaces(primary.as_ref(), secondary.as_ref())
+            {
+                match self.storage.update(&memory) {
+                    Ok(()) => stamped += 1,
+                    Err(e) => warn!("Failed to stamp embedding spaces for {}: {}", id.0, e),
                 }
-            }
-
-            if dirty {
-                if let Err(e) = self.storage.update(&memory) {
-                    warn!("Failed to persist embedding spaces for {}: {}", id.0, e);
-                    failed += 1;
-                }
-            } else {
-                unchanged += 1;
             }
         }
+        info!(stamped, "Stamped embedding spaces before the markers moved");
+    }
 
-        // Advance the markers only after a clean pass — a crash or failure leaves them stale
-        // so the next startup resumes the remaining memories. A record that cannot be read
-        // cannot be stamped either, so it holds back the migration markers but not the stamp.
-        if failed == 0 && !(migrate && unreadable > 0) {
-            if migrate {
-                // Both markers advance together, or neither does. Advancing the dimension
-                // alone would leave the corpus recorded as unverified forever and re-run the
-                // whole pass on every startup.
-                let _ = std::fs::write(&marker, target.to_string());
-                let _ = std::fs::write(&id_marker, &target_id);
-            }
-            let _ = std::fs::write(&stamp_marker, target_space.as_str());
-        } else {
-            warn!(
-                failed,
-                unreadable,
-                "Embedding space pass incomplete — markers not advanced, will retry next startup"
+    /// The corpus's space migration, finished or not, when one was ever recorded.
+    pub fn space_migration(&self) -> Option<SpaceMigration> {
+        SpaceMigrationStore::with_kv(self.storage.key_value_store())
+            .load()
+            .ok()
+            .flatten()
+    }
+
+    /// Whether a re-embed migration is under way: its memories are the migration's to index,
+    /// not the start-up repair's or the backlog's.
+    pub fn is_migrating(&self) -> bool {
+        self.space_migration()
+            .is_some_and(|m| m.kind == MigrationKind::Reembed && !m.is_finished())
+    }
+
+    /// One batch of the corpus's space migration: at most `limit` memories after the cursor,
+    /// embedded in one call. `None` when no migration is pending. The cursor is saved after the
+    /// batch, so a kill anywhere costs at most this batch, which is idempotent to redo; an
+    /// embedder that does not answer stops the batch without moving the cursor.
+    pub fn run_space_migration(&self, limit: usize) -> Result<Option<MigrationStep>> {
+        let migrations = SpaceMigrationStore::with_kv(self.storage.key_value_store());
+        let Some(mut m) = migrations.load()? else {
+            return Ok(None);
+        };
+        if m.is_finished() {
+            return Ok(None);
+        }
+        if m.kind == MigrationKind::Reembed && m.to != self.index_space {
+            info!(
+                "The embedder changed again ({} → {}) before the migration finished; re-walking",
+                m.to, self.index_space
             );
+            m.to = self.index_space.clone();
+            m.cursor = None;
+        }
+        let mut ids = self.storage.get_all_ids()?;
+        ids.sort();
+        let start = m
+            .cursor
+            .as_ref()
+            .map_or(0, |cursor| ids.partition_point(|id| id <= cursor));
+        let batch: Vec<MemoryId> = ids[start..].iter().take(limit.max(1)).cloned().collect();
+        let mut step = MigrationStep::default();
+        if batch.is_empty() {
+            m.finished_at = Some(chrono::Utc::now());
+            migrations.save(&m)?;
+            let _ = std::fs::write(self.storage_path.join(space::STAMP_MARKER), m.to.as_str());
+            info!(
+                kind = ?m.kind,
+                to = %m.to,
+                walked = m.walked,
+                changed = m.changed,
+                failed = m.failed,
+                "Embedding space migration finished"
+            );
+            step.finished = true;
+            return Ok(Some(step));
         }
 
-        info!(
-            stamped = stamped_now,
-            reembedded,
-            reused_from_secondary = reused,
-            unchanged,
-            unreadable,
-            failed,
-            space = %target_space,
-            "Embedding space pass"
-        );
+        let to = m.to.clone();
+        let from = m.from.clone();
+        let reembed = m.kind == MigrationKind::Reembed;
+        let mut loaded: Vec<(Memory, bool)> = Vec::with_capacity(batch.len());
+        for id in &batch {
+            let mut memory = match self.storage.get(id) {
+                Ok(memory) if memory.is_forgotten() => continue,
+                Ok(memory) => memory,
+                Err(e) => {
+                    warn!("Space migration cannot load {}: {}", id.0, e);
+                    step.failed += 1;
+                    continue;
+                }
+            };
+            let primary = memory
+                .experience
+                .embeddings
+                .as_ref()
+                .and_then(|v| from.clone().filter(|f| f.dimension() == v.len()));
+            let secondary = memory
+                .experience
+                .embeddings_secondary
+                .as_ref()
+                .and_then(|v| {
+                    self.secondary_index_space
+                        .clone()
+                        .filter(|s| s.dimension() == v.len())
+                        .or_else(|| {
+                            Some(to.clone()).filter(|t| reembed && t.dimension() == v.len())
+                        })
+                });
+            let stamped = memory
+                .experience
+                .stamp_vector_spaces(primary.as_ref(), secondary.as_ref());
+            loaded.push((memory, stamped));
+        }
 
-        Ok(())
+        // Which memories need a vector in `to`: a secondary already in it is promoted, the rest
+        // are embedded in one call.
+        let mut to_embed: Vec<usize> = Vec::new();
+        if reembed {
+            for (i, (memory, dirty)) in loaded.iter_mut().enumerate() {
+                if memory.experience.primary_space(None).as_ref() == Some(&to) {
+                    continue;
+                }
+                let promoted = memory
+                    .experience
+                    .embeddings_secondary
+                    .clone()
+                    .filter(|_| memory.experience.secondary_space(None).as_ref() == Some(&to));
+                match promoted {
+                    Some(vector) => {
+                        replace_primary(memory, vector, to.clone());
+                        *dirty = true;
+                        step.changed += 1;
+                    }
+                    None => to_embed.push(i),
+                }
+            }
+        }
+        let mut reindex: Vec<usize> = Vec::new();
+        if !to_embed.is_empty() {
+            let texts: Vec<&str> = to_embed
+                .iter()
+                .map(|&i| loaded[i].0.experience.content.as_str())
+                .collect();
+            match self.embedder.encode_batch(&texts) {
+                Ok(vectors) => {
+                    for (&i, vector) in to_embed.iter().zip(vectors) {
+                        if vector.len() != to.dimension() {
+                            step.failed += 1;
+                            continue;
+                        }
+                        let space = self.embedder.primary_space_for(&vector);
+                        replace_primary(&mut loaded[i].0, vector, space);
+                        loaded[i].1 = true;
+                        step.changed += 1;
+                        reindex.push(i);
+                    }
+                }
+                Err(e) => {
+                    m.last_error = Some(format!("{e:#}"));
+                    migrations.save(&m)?;
+                    step.stopped = Some(format!("{e:#}"));
+                    return Ok(Some(step));
+                }
+            }
+        }
+        if !reembed {
+            step.changed = loaded.iter().filter(|(_, dirty)| *dirty).count();
+        }
+
+        for (i, (memory, dirty)) in loaded.iter().enumerate() {
+            if !*dirty {
+                continue;
+            }
+            if let Err(e) = self.storage.update(memory) {
+                warn!("Space migration cannot persist {}: {}", memory.id.0, e);
+                step.failed += 1;
+                continue;
+            }
+            if reindex.contains(&i) || (reembed && !self.is_indexed(&memory.id)) {
+                if let Err(e) = self.reindex_memory(memory) {
+                    if !is_space_mismatch(&e) {
+                        warn!("Space migration cannot index {}: {e}", memory.id.0);
+                    }
+                }
+            }
+        }
+
+        step.walked = batch.len();
+        m.cursor = batch.last().cloned();
+        m.walked += step.walked;
+        m.changed += step.changed;
+        m.failed += step.failed;
+        m.last_error = None;
+        migrations.save(&m)?;
+
+        if reembed {
+            self.bridge_back(&mut m, &migrations);
+        }
+        Ok(Some(step))
+    }
+
+    /// Once enough memories hold vectors in both spaces, fit the map from the new space back
+    /// into the old one, so a query reaches the memories the migration has not yet re-embedded
+    /// through the old space's index. Tried once per migration.
+    fn bridge_back(&self, m: &mut SpaceMigration, migrations: &SpaceMigrationStore) {
+        const PAIRS_BEFORE_BRIDGE: usize = 256;
+        let Some(from) = m.from.clone() else {
+            return;
+        };
+        if m.bridge_tried || from == m.to || m.changed < PAIRS_BEFORE_BRIDGE {
+            return;
+        }
+        m.bridge_tried = true;
+        if self.embedder.alignment_between(&m.to, &from).is_none() {
+            match self.fit_bridge(&m.to, &from) {
+                Ok(report) => info!(
+                    held_out_cosine = report.held_out_cosine,
+                    "Mapped {} back into {} for the memories not yet migrated", m.to, from
+                ),
+                Err(e) => warn!("Could not map {} back into {}: {e:#}", m.to, from),
+            }
+        }
+        if let Err(e) = migrations.save(m) {
+            warn!("Could not record the migration's bridge attempt: {e}");
+        }
     }
 
     /// Initialize Vamana index from persisted file or rebuild from RocksDB
@@ -1463,6 +1604,102 @@ impl RetrievalEngine {
             "Fitted a map between spaces"
         );
         Ok(fit.report)
+    }
+
+    /// Retire `space`: drop every memory's kept vector in it, its index and the maps into and
+    /// out of it. Refused for a space this engine writes, for the space a running migration
+    /// is leaving, and while any memory's only vector is in it: retiring would leave that
+    /// memory with no vector at all.
+    pub fn retire_space(&self, space: &SpaceId) -> Result<RetireReport> {
+        if *space == self.index_space || self.secondary_index_space.as_ref() == Some(space) {
+            anyhow::bail!("{space} is a space this server writes; change the embedder first");
+        }
+        if let Some(m) = self.space_migration().filter(|m| !m.is_finished()) {
+            if m.from.as_ref() == Some(space) {
+                anyhow::bail!(
+                    "the migration out of {space} has re-embedded {} of {} memories; retire it once it finishes",
+                    m.walked, m.total
+                );
+            }
+        }
+        let mut holders = Vec::new();
+        let mut sole = 0usize;
+        for memory_id in self.storage.get_all_ids()? {
+            let Ok(memory) = self.storage.get(&memory_id) else {
+                continue;
+            };
+            if memory.is_forgotten() || self.stored_vector(&memory, space).is_none() {
+                continue;
+            }
+            let elsewhere = memory
+                .experience
+                .primary_space(Some(&self.index_space))
+                .into_iter()
+                .chain(
+                    memory
+                        .experience
+                        .secondary_space(self.secondary_index_space.as_ref()),
+                )
+                .chain(
+                    memory
+                        .experience
+                        .other_vectors
+                        .iter()
+                        .map(|v| v.space.clone()),
+                )
+                .any(|s| s != *space);
+            if elsewhere {
+                holders.push(memory);
+            } else {
+                sole += 1;
+            }
+        }
+        if sole > 0 {
+            anyhow::bail!(
+                "{sole} memories hold a vector only in {space}; they need a vector in another space before it can be retired"
+            );
+        }
+        let mut dropped = 0usize;
+        for mut memory in holders {
+            let experience = &mut memory.experience;
+            if experience.primary_space(Some(&self.index_space)).as_ref() == Some(space) {
+                experience.clear_primary_vector();
+            }
+            if experience
+                .secondary_space(self.secondary_index_space.as_ref())
+                .as_ref()
+                == Some(space)
+            {
+                experience.clear_secondary_vector();
+            }
+            experience.forget_kept_vector(space);
+            match self.storage.update(&memory) {
+                Ok(()) => dropped += 1,
+                Err(e) => warn!("Retiring {space}: cannot persist {}: {e}", memory.id.0),
+            }
+        }
+        let mut maps_removed = 0usize;
+        for (from, to, _) in self.embedder.bridges() {
+            if from == *space || to == *space {
+                self.embedder.remove_bridge(&from, &to);
+                let _ =
+                    fs::remove_file(crate::embeddings::alignment_spaces::corpus_alignment_path(
+                        &self.storage_path,
+                        &from,
+                        &to,
+                    ));
+                maps_removed += 1;
+            }
+        }
+        if self.space_indexes.write().remove(space).is_some() {
+            let _ = fs::remove_dir_all(super::space_index::dir_for(&self.storage_path, space));
+        }
+        info!(space = %space, dropped, maps_removed, "Retired an embedding space");
+        Ok(RetireReport {
+            space: space.clone(),
+            vectors_dropped: dropped,
+            maps_removed,
+        })
     }
 
     /// Search `to`'s index with a query vector in `from`, mapped through the installed map.
@@ -3665,6 +3902,18 @@ mod space_tests {
         )
     }
 
+    /// Run the space migration to its end, one batch of `batch` at a time.
+    fn migrate(engine: &RetrievalEngine, batch: usize) -> usize {
+        let mut ticks = 0;
+        while let Some(step) = engine.run_space_migration(batch).unwrap() {
+            ticks += 1;
+            if step.finished || step.stopped.is_some() {
+                break;
+            }
+        }
+        ticks
+    }
+
     fn markers(dir: &Path, embedder_id: &str, dim: usize) {
         std::fs::write(dir.join(space::EMBEDDER_MARKER), embedder_id).unwrap();
         std::fs::write(dir.join(space::DIMENSION_MARKER), dim.to_string()).unwrap();
@@ -3682,6 +3931,15 @@ mod space_tests {
         markers(tmp.path(), &a.id, DIM);
 
         let engine = engine(&store, tmp.path(), a, None);
+        assert!(
+            !tmp.path().join(space::STAMP_MARKER).exists(),
+            "an ordinary start rewrites nothing; the stamp runs in the drain"
+        );
+        assert!(
+            engine.is_indexed(&legacy.id),
+            "searchable before it is stamped"
+        );
+        migrate(&engine, 1);
 
         let model_a = SpaceId::new("model-a", DIM);
         assert_eq!(engine.index_space(), &model_a);
@@ -3715,6 +3973,16 @@ mod space_tests {
 
         // Same width, another model, and down: the migration cannot re-embed.
         let b = engine(&store, tmp.path(), Stub::failing("model-b", DIM), None);
+        let step = b
+            .run_space_migration(10)
+            .unwrap()
+            .expect("a migration is pending");
+        assert!(step.stopped.is_some(), "a down embedder stops the batch");
+        assert_eq!(
+            b.space_migration().unwrap().cursor,
+            None,
+            "and does not move the cursor"
+        );
         let read = store.get(&written.id).unwrap();
         assert_eq!(
             read.experience.embedding_space,
@@ -3740,8 +4008,8 @@ mod space_tests {
         );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join(space::EMBEDDER_MARKER)).unwrap(),
-            "http://stub#model-a",
-            "a failed migration does not advance the marker"
+            "http://stub#model-b",
+            "the markers advance at once; the migration record says what is pending"
         );
     }
 
@@ -3841,6 +4109,12 @@ mod space_tests {
         drop(engine(&store, tmp.path(), a, None));
 
         let b = engine(&store, tmp.path(), Stub::new("model-b", DIM), None);
+        assert!(
+            !b.is_indexed(&written.id),
+            "the start-up pass no longer re-embeds"
+        );
+        migrate(&b, 10);
+        assert!(b.space_migration().unwrap().is_finished());
         let read = store.get(&written.id).unwrap();
         assert_eq!(
             read.experience.embedding_space,
@@ -3915,6 +4189,105 @@ mod space_tests {
         );
         assert_eq!(reopened.bridges().len(), 1);
         assert!(reopened.is_indexed_in(&model_b, &ids[7].0));
+    }
+
+    /// write-latch task 4: a kill mid-migration resumes at the cursor, not at the start.
+    #[test]
+    fn a_migration_killed_mid_way_resumes_at_its_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let mut ids = Vec::new();
+        for n in 0..9 {
+            let content = format!("memory {n} written under model a");
+            let mut m = memory(&content, None);
+            m.experience
+                .set_primary_vector(a.encode(&content).unwrap(), SpaceId::new("model-a", DIM));
+            store.store(&m).unwrap();
+            ids.push(m.id.clone());
+        }
+        markers(tmp.path(), &a.id, DIM);
+        drop(engine(&store, tmp.path(), a, None));
+
+        let b = engine(&store, tmp.path(), Stub::new("model-b", DIM), None);
+        let first = b.run_space_migration(4).unwrap().unwrap();
+        assert_eq!((first.walked, first.changed), (4, 4));
+        let cursor = b.space_migration().unwrap().cursor.expect("cursor saved");
+        drop(b);
+
+        let resumed = engine(&store, tmp.path(), Stub::new("model-b", DIM), None);
+        let migration = resumed.space_migration().unwrap();
+        assert_eq!(migration.cursor, Some(cursor), "a restart keeps the cursor");
+        assert_eq!(migration.walked, 4);
+        migrate(&resumed, 4);
+        let done = resumed.space_migration().unwrap();
+        assert!(done.is_finished());
+        assert_eq!(done.changed, 9, "each memory re-embedded once");
+        for id in &ids {
+            assert!(resumed.is_indexed(id));
+        }
+    }
+
+    #[test]
+    fn a_space_is_retired_only_when_no_memory_depends_on_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let engine = engine(&store, tmp.path(), a.clone(), None);
+        let old = SpaceId::new("model-old", 4);
+
+        let mut only_old = memory("held only in the old space", None);
+        only_old.experience.keep_vector(old.clone(), vec![0.5; 4]);
+        store.store(&only_old).unwrap();
+        let err = engine.retire_space(&old).unwrap_err();
+        assert!(format!("{err:#}").contains("only in"), "{err:#}");
+
+        let mut both = memory("held in both", None);
+        both.experience
+            .set_primary_vector(a.encode("both").unwrap(), SpaceId::new("model-a", DIM));
+        both.experience.keep_vector(old.clone(), vec![0.5; 4]);
+        store.store(&both).unwrap();
+        store.delete(&only_old.id).unwrap();
+
+        let report = engine.retire_space(&old).unwrap();
+        assert_eq!(report.vectors_dropped, 1);
+        assert!(store
+            .get(&both.id)
+            .unwrap()
+            .experience
+            .vector_in(&old, None, None)
+            .is_none());
+        assert!(
+            engine.retire_space(&SpaceId::new("model-a", DIM)).is_err(),
+            "the space this engine writes cannot be retired"
+        );
+    }
+
+    /// Mid-migration, the memories not yet re-embedded stay searchable: once enough hold both
+    /// vectors, the new space is mapped back into the old one.
+    #[test]
+    fn a_long_migration_maps_the_new_space_back_into_the_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        for n in 0..300 {
+            let content = format!("long migration memory {n} about topic {}", n % 13);
+            let mut m = memory(&content, None);
+            m.experience
+                .set_primary_vector(a.encode(&content).unwrap(), SpaceId::new("model-a", DIM));
+            store.store(&m).unwrap();
+        }
+        markers(tmp.path(), &a.id, DIM);
+        drop(engine(&store, tmp.path(), a, None));
+
+        let b = engine(&store, tmp.path(), Stub::new("model-b", DIM), None);
+        migrate(&b, 64);
+        let back = b
+            .embedder
+            .alignment_between(&SpaceId::new("model-b", DIM), &SpaceId::new("model-a", DIM));
+        assert!(back.is_some(), "the map back was fitted");
+        assert!(b.space_migration().unwrap().bridge_tried);
+        assert!(b.spaces().contains(&SpaceId::new("model-a", DIM)));
     }
 
     #[test]

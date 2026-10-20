@@ -34,6 +34,9 @@ pub struct SpacesResponse {
     pub index_space: SpaceId,
     pub spaces: Vec<SpaceSummary>,
     pub alignments: Vec<RegisteredAlignment>,
+    /// The corpus's space migration, finished or under way, when one was ever recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration: Option<crate::memory::space_migration::SpaceMigration>,
 }
 
 /// GET /api/spaces?user_id= — the tenant's spaces and maps.
@@ -50,12 +53,13 @@ pub async fn list_spaces(
     let memory = state
         .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
-    let (index_space, spaces, alignments) = tokio::task::spawn_blocking(move || {
+    let (index_space, spaces, alignments, migration) = tokio::task::spawn_blocking(move || {
         let guard = memory.read();
         anyhow::Ok((
             guard.index_space(),
             guard.embedding_spaces()?,
             guard.alignments(),
+            guard.space_migration(),
         ))
     })
     .await
@@ -66,7 +70,40 @@ pub async fn list_spaces(
         index_space,
         spaces,
         alignments,
+        migration,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RetireRequest {
+    pub user_id: Option<String>,
+    pub space: String,
+}
+
+/// POST /api/spaces/retire — drop a space's kept vectors, index and maps. Refused while any
+/// memory's only vector is in it.
+pub async fn retire_space(
+    State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
+    Json(req): Json<RetireRequest>,
+) -> Result<Json<crate::memory::retrieval::RetireReport>, AppError> {
+    let user_id = resolve_request_user_id(
+        req.user_id.as_deref(),
+        authenticated_user.as_ref().map(|e| &e.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
+    let space = parse_space("space", &req.space)?;
+    let memory = state
+        .get_user_memory(&user_id)
+        .map_err(AppError::Internal)?;
+    let report = tokio::task::spawn_blocking(move || memory.read().retire_space(&space))
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("retire task failed: {e}")))?
+        .map_err(|e| AppError::InvalidInput {
+            field: "space".to_string(),
+            reason: format!("{e:#}"),
+        })?;
+    Ok(Json(report))
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,7 +163,11 @@ mod tests {
         let protected_at = src
             .find("pub fn build_protected_routes")
             .expect("build_protected_routes must exist");
-        for handler in ["get(spaces::list_spaces)", "post(spaces::align_spaces)"] {
+        for handler in [
+            "get(spaces::list_spaces)",
+            "post(spaces::align_spaces)",
+            "post(spaces::retire_space)",
+        ] {
             let at = src.find(handler).expect("route must be mounted");
             assert!(at > protected_at, "{handler} must be behind auth");
         }
