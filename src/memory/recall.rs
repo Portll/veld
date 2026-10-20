@@ -4773,6 +4773,7 @@ impl super::MemorySystem {
         let mut competitions_detected = 0;
         let mut pair_count = 0;
         let check_limit = memories.len().min(20);
+        let similarity_floor = competition_similarity_floor(&memories[..check_limit]);
 
         for left_idx in 0..check_limit {
             if eliminated.contains(&left_idx) {
@@ -4817,7 +4818,7 @@ impl super::MemorySystem {
                     }
                 };
 
-                if similarity < crate::constants::INTERFERENCE_SIMILARITY_THRESHOLD {
+                if similarity < similarity_floor {
                     continue;
                 }
 
@@ -5443,6 +5444,35 @@ pub(crate) fn query_token_matches_entity(token: &str, entity: &str) -> bool {
     })
 }
 
+/// The cosine two candidates must reach to compete: the pool's median pair cosine plus
+/// [`COMPETITION_POOL_HEADROOM`] of the way to 1, never below the absolute
+/// [`INTERFERENCE_SIMILARITY_THRESHOLD`]. Fewer than three comparable pairs keep the absolute bar.
+///
+/// [`COMPETITION_POOL_HEADROOM`]: crate::constants::COMPETITION_POOL_HEADROOM
+/// [`INTERFERENCE_SIMILARITY_THRESHOLD`]: crate::constants::INTERFERENCE_SIMILARITY_THRESHOLD
+fn competition_similarity_floor(pool: &[SharedMemory]) -> f32 {
+    use crate::constants::{COMPETITION_POOL_HEADROOM, INTERFERENCE_SIMILARITY_THRESHOLD};
+    let vectors: Vec<&[f32]> = pool
+        .iter()
+        .filter_map(|m| m.experience.embeddings.as_deref())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let mut sims: Vec<f32> = Vec::new();
+    for (i, left) in vectors.iter().enumerate() {
+        for right in &vectors[i + 1..] {
+            if left.len() == right.len() {
+                sims.push(crate::similarity::cosine_similarity(left, right));
+            }
+        }
+    }
+    if sims.len() < 3 {
+        return INTERFERENCE_SIMILARITY_THRESHOLD;
+    }
+    sims.sort_by(|a, b| a.total_cmp(b));
+    let median = sims[sims.len() / 2];
+    (median + COMPETITION_POOL_HEADROOM * (1.0 - median)).max(INTERFERENCE_SIMILARITY_THRESHOLD)
+}
+
 /// Orders each run of exactly equal scores in a score-sorted list by content, then id.
 ///
 /// Fused scores tie often, and the map they come from iterates in a per-instance hash order.
@@ -5793,6 +5823,63 @@ mod signal_disable_gate_tests {
         assert!(
             (base_enabled - base_disabled).abs() > 1e-6,
             "disabling hebbian must change base_score"
+        );
+    }
+}
+
+#[cfg(test)]
+mod competition_floor_tests {
+    use super::*;
+    use crate::constants::INTERFERENCE_SIMILARITY_THRESHOLD;
+    use crate::memory::types::{Experience, Memory, MemoryId};
+
+    fn embedded(v: Vec<f32>) -> SharedMemory {
+        let experience = Experience {
+            content: "turn".into(),
+            embeddings: Some(v),
+            ..Default::default()
+        };
+        Arc::new(Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            experience,
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    fn pool_at(angles: &[f32]) -> Vec<SharedMemory> {
+        angles
+            .iter()
+            .map(|a| embedded(vec![a.cos(), a.sin()]))
+            .collect()
+    }
+
+    #[test]
+    fn a_pool_of_unrelated_candidates_keeps_the_absolute_bar() {
+        let pool = pool_at(&[0.0, 1.2, 2.4, 3.6]);
+        assert_eq!(
+            competition_similarity_floor(&pool),
+            INTERFERENCE_SIMILARITY_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn a_pool_whose_pairs_all_score_high_must_be_beaten_by_its_own_background() {
+        // Pair cosines 0.955 x3, 0.825 x2, 0.622: the median is 0.955, so the bar sits above it.
+        let pool = pool_at(&[0.0, 0.3, 0.6, 0.9]);
+        let floor = competition_similarity_floor(&pool);
+        assert!(floor > 0.955 && floor < 1.0, "{floor}");
+    }
+
+    #[test]
+    fn too_few_embedded_candidates_keep_the_absolute_bar() {
+        let pool = pool_at(&[0.0, 0.1]);
+        assert_eq!(
+            competition_similarity_floor(&pool),
+            INTERFERENCE_SIMILARITY_THRESHOLD
         );
     }
 }
