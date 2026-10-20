@@ -5459,6 +5459,23 @@ mod background_task_tests {
 }
 
 impl MultiUserMemoryManager {
+    /// Embed one batch of every cached user's embed queue. Returns how many memories were
+    /// taken off the queues. Users not in the cache have nothing queued: the queue lives in
+    /// the user's memory system.
+    pub fn drain_embed_queues(&self, batch: usize) -> usize {
+        let mut drained = 0;
+        for user_id in self.list_cached_users() {
+            let Some(memory) = self.user_memories.get(&user_id) else {
+                continue;
+            };
+            let guard = memory.read();
+            if guard.embed_queue_len() > 0 {
+                drained += guard.drain_embed_queue(batch);
+            }
+        }
+        drained
+    }
+
     /// Drain every cached user's embedding backlog, reconciling first when asked. Only users
     /// already in the cache: loading a cold user is seconds of work that a tick must not do.
     pub fn drain_embedding_backlogs(

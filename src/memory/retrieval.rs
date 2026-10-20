@@ -1321,15 +1321,11 @@ impl RetrievalEngine {
         let vector_ids = if chunk_result.was_chunked {
             // Long content: embed each chunk separately
             // Pre-compute all embeddings OUTSIDE the write lock to avoid blocking searches
-            let embeddings: Vec<Vec<f32>> = chunk_result
-                .chunks
-                .iter()
-                .map(|chunk| {
-                    self.embedder
-                        .encode(chunk)
-                        .context("Failed to generate chunk embedding")
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let chunks: Vec<&str> = chunk_result.chunks.iter().map(String::as_str).collect();
+            let embeddings: Vec<Vec<f32>> = self
+                .embedder
+                .encode_batch(&chunks)
+                .context("Failed to generate chunk embedding")?;
 
             // Insert pre-computed vectors under a short write lock
             let mut ids = Vec::with_capacity(embeddings.len());

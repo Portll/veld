@@ -15,6 +15,7 @@ pub mod compression;
 pub mod context;
 pub mod context_blocks;
 pub mod dials;
+pub mod embed_queue;
 pub mod embedding_backlog;
 pub mod embedding_cache;
 pub mod facets;
@@ -437,6 +438,9 @@ pub struct MemorySystem {
 
     /// Memories stored without a vector, drained when the embedder answers again.
     embedding_backlog: embedding_backlog::EmbeddingBacklogStore,
+
+    /// Memories a request stored without embedding, waiting for the next batch.
+    embed_queue: parking_lot::Mutex<embed_queue::EmbedQueue>,
 
     /// The space registry last written beside the corpus markers, so an unchanged corpus is
     /// not rewritten on every drain tick.
@@ -1472,6 +1476,7 @@ impl MemorySystem {
                 primary_store.key_value_store(),
             ),
             space_registry_written: parking_lot::Mutex::new(None),
+            embed_queue: parking_lot::Mutex::new(Default::default()),
             kept_census: parking_lot::Mutex::new(None),
             // R3a (F3): per-user persistent learned-weight store over this user's
             // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
@@ -1917,6 +1922,7 @@ impl MemorySystem {
                 true
             }
         } else {
+            self.enqueue_embedding(&memory.id);
             false
         };
 
@@ -2370,6 +2376,15 @@ impl MemorySystem {
     /// Safe to call from a background thread (e.g. `tokio::task::spawn_blocking`).
     /// All errors are non-fatal — the memory remains searchable via BM25 regardless.
     pub fn embed_and_index(&self, memory_id: &MemoryId) -> Result<()> {
+        self.embed_and_index_with(memory_id, None)
+    }
+
+    /// [`Self::embed_and_index`] with the primary vector already computed, by a batch call.
+    fn embed_and_index_with(
+        &self,
+        memory_id: &MemoryId,
+        precomputed: Option<(Vec<f32>, SpaceId)>,
+    ) -> Result<()> {
         let _span = tracing::info_span!("embed_and_index", memory_id = %memory_id.0).entered();
         let start = std::time::Instant::now();
 
@@ -2386,6 +2401,13 @@ impl MemorySystem {
         // index refuses it, and the backlog row that brought this memory here waits for this.
         let index_space = self.retriever.index_space().clone();
         let stored_space = memory.experience.primary_space(Some(&index_space));
+        // Indexed with its own vector already: a second pass would add a duplicate vector.
+        if stored_space.as_ref() == Some(&index_space) && self.retriever.is_indexed(memory_id) {
+            if let Err(e) = self.embedding_backlog.delete(memory_id) {
+                tracing::error!("embedding backlog: could not clear {}: {e}", memory_id.0);
+            }
+            return Ok(());
+        }
         if stored_space.as_ref() != Some(&index_space) {
             let displaced = memory.experience.embeddings.clone().zip(stored_space);
             // Use enriched searchable text (with context prefix) for consistency
@@ -2394,7 +2416,11 @@ impl MemorySystem {
             // scores than the Vamana index, breaking Layer 3.5 brute-force cosine.
             let searchable_text =
                 crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
-            match self.embed_primary_cached(&searchable_text) {
+            let embedded = match precomputed {
+                Some(vector) => Ok(vector),
+                None => self.embed_primary_cached(&searchable_text),
+            };
+            match embedded {
                 Ok((embedding, space)) => memory.experience.set_primary_vector(embedding, space),
                 Err(e) => {
                     tracing::warn!("Background embedding generation failed: {e}");
@@ -2780,11 +2806,13 @@ impl MemorySystem {
             .write()
             .add_shared(Arc::clone(&memory))?;
 
-        // Index for semantic search (skipped when deferred — embed_and_index handles it)
+        // Index for semantic search; a deferred write joins the embed queue instead
         if !defer_embedding {
             if let Err(e) = self.retriever.index_memory(&memory) {
                 self.note_index_failure(&memory.id, &e, "memory");
             }
+        } else {
+            self.enqueue_embedding(&memory.id);
         }
 
         // Add entities to knowledge graph with co-occurrence edges
@@ -5752,6 +5780,103 @@ impl MemorySystem {
         }
     }
 
+    /// Queue a memory stored without a vector for the next embedding batch.
+    pub fn enqueue_embedding(&self, memory_id: &MemoryId) {
+        self.embed_queue.lock().push(memory_id.clone());
+    }
+
+    /// Memories waiting for the next embedding batch.
+    pub fn embed_queue_len(&self) -> usize {
+        self.embed_queue.lock().len()
+    }
+
+    /// Embed and index up to `max` queued memories with one embedder call. Returns how many it
+    /// took off the queue.
+    pub fn drain_embed_queue(&self, max: usize) -> usize {
+        let batch = self.embed_queue.lock().take(max);
+        if batch.is_empty() {
+            return 0;
+        }
+        for (id, result) in self.embed_and_index_batch(&batch) {
+            if let Err(e) = result {
+                tracing::warn!(memory_id = %id.0, "Queued embed_and_index failed: {e}");
+            }
+        }
+        batch.len()
+    }
+
+    /// Embed and index several memories: the primary vectors their memories lack come from one
+    /// embedder call (after the content cache), then each memory finishes as
+    /// [`Self::embed_and_index`] does. When the call fails, every memory it was for is
+    /// recorded in the backlog instead of being retried one by one against a host that is down.
+    pub fn embed_and_index_batch(&self, ids: &[MemoryId]) -> Vec<(MemoryId, Result<()>)> {
+        let index_space = self.retriever.index_space().clone();
+        let mut precomputed: std::collections::HashMap<MemoryId, (Vec<f32>, SpaceId)> =
+            Default::default();
+        let mut misses: Vec<(MemoryId, String, [u8; 32])> = Vec::new();
+        for id in ids {
+            let Ok(memory) = self.long_term_memory.get(id) else {
+                continue;
+            };
+            if memory.is_forgotten()
+                || memory.experience.primary_space(Some(&index_space)).as_ref()
+                    == Some(&index_space)
+            {
+                continue;
+            }
+            let text = crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
+            let hash = Self::sha256_hash(&text);
+            match self.content_cache.get(&hash) {
+                Some(cached) => {
+                    EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
+                    let space = self.embedder.primary_space_for(&cached);
+                    precomputed.insert(id.clone(), (cached, space));
+                }
+                None => misses.push((id.clone(), text, hash)),
+            }
+        }
+        let mut refused: std::collections::HashSet<MemoryId> = Default::default();
+        if !misses.is_empty() {
+            EMBEDDING_CACHE_CONTENT
+                .with_label_values(&["miss"])
+                .inc_by(misses.len() as u64);
+            let texts: Vec<&str> = misses.iter().map(|(_, text, _)| text.as_str()).collect();
+            match self.embedder.encode_batch(&texts) {
+                Ok(vectors) => {
+                    for ((id, _, hash), vector) in misses.into_iter().zip(vectors) {
+                        self.content_cache.insert(hash, vector.clone());
+                        let space = self.embedder.primary_space_for(&vector);
+                        precomputed.insert(id, (vector, space));
+                    }
+                    EMBEDDING_CACHE_CONTENT_SIZE.set(self.content_cache.entry_count() as i64);
+                }
+                Err(e) => {
+                    tracing::warn!("Batch embedding of {} memories failed: {e}", misses.len());
+                    for (id, _, _) in misses {
+                        if let Err(record_err) = self.embedding_backlog.record(
+                            &id,
+                            embedding_backlog::EnqueueReason::EmbedFailed,
+                            Some(&e.to_string()),
+                        ) {
+                            tracing::error!(
+                                "embedding backlog: could not record {}: {record_err}",
+                                id.0
+                            );
+                        }
+                        refused.insert(id);
+                    }
+                }
+            }
+        }
+        ids.iter()
+            .filter(|id| !refused.contains(*id))
+            .map(|id| {
+                let vector = precomputed.remove(id);
+                (id.clone(), self.embed_and_index_with(id, vector))
+            })
+            .collect()
+    }
+
     /// Run the corpus's space migration for up to `budget`, a batch at a time. Returns what it
     /// did; `None` when no migration is pending.
     pub fn run_space_migration(
@@ -5820,6 +5945,19 @@ impl MemorySystem {
             ),
             Ok(None) => {}
             Err(e) => tracing::warn!("Embedding space migration tick failed: {e:#}"),
+        }
+        // The primary rows this drain will reach, embedded in one call first; each row then
+        // finds its memory indexed and is cleared.
+        let mut primary: Vec<(chrono::DateTime<chrono::Utc>, MemoryId)> = self
+            .embedding_backlog
+            .all()?
+            .into_iter()
+            .map(|(id, row)| (row.enqueued_at, id))
+            .collect();
+        primary.sort();
+        let ids: Vec<MemoryId> = primary.into_iter().take(limit).map(|(_, id)| id).collect();
+        if !ids.is_empty() {
+            let _ = self.embed_and_index_batch(&ids);
         }
         let report = self
             .embedding_backlog
@@ -6211,6 +6349,7 @@ impl MemorySystem {
             // === UPDATE PATH ===
             let memory_id = existing.id.clone();
 
+            let content_changed = existing.experience.content != experience.content;
             // Push old content to history and update
             existing.update_content(
                 experience.content.clone(),
@@ -6244,15 +6383,12 @@ impl MemorySystem {
                 existing.experience.tags = experience.tags;
             }
 
-            // Regenerate embeddings for new content. When that fails the old vector goes too:
-            // it describes the content this upsert replaced, and the backlog row the reindex
-            // below records gets the new content its own vector.
-            match self.embed_primary_cached(&existing.experience.content) {
-                Ok((embedding, space)) => existing.experience.set_primary_vector(embedding, space),
-                Err(e) => {
-                    tracing::warn!("Failed to regenerate embedding during upsert: {}", e);
-                    existing.experience.clear_primary_vector();
-                }
+            // New content gets its vectors from the embed queue, not this request: the old
+            // vectors describe the content this upsert replaced, so they go now, and the memory
+            // leaves the vector indexes until its new vectors arrive.
+            if content_changed {
+                existing.experience.clear_primary_vector();
+                existing.experience.clear_secondary_vector();
             }
 
             // TEMPORAL EXTRACTION: Re-extract dates when content changes
@@ -6269,9 +6405,9 @@ impl MemorySystem {
             // Persist updated memory
             self.long_term_memory.update(&existing)?;
 
-            // Re-index in vector DB with new embeddings
-            if let Err(e) = self.retriever.reindex_memory(&existing) {
-                self.note_index_failure(&memory_id, &e, "upserted memory");
+            if content_changed {
+                self.retriever.remove_memory(&memory_id);
+                self.enqueue_embedding(&memory_id);
             }
 
             // Re-index in BM25 with updated content
@@ -6316,25 +6452,7 @@ impl MemorySystem {
             let memory_id = MemoryId(Uuid::new_v4());
             let importance = self.calculate_importance(&experience);
 
-            // Generate embeddings if not provided
-            if experience.embeddings.is_none() {
-                match self.embed_primary_cached(&experience.content) {
-                    Ok((embedding, space)) => experience.set_primary_vector(embedding, space),
-                    Err(e) => {
-                        tracing::warn!("Failed to generate embedding: {}", e);
-                        if let Err(record_err) = self.embedding_backlog.record(
-                            &memory_id,
-                            embedding_backlog::EnqueueReason::EmbedFailed,
-                            Some(&e.to_string()),
-                        ) {
-                            tracing::error!(
-                                "embedding backlog: could not record {}: {record_err}",
-                                &memory_id.0
-                            );
-                        }
-                    }
-                }
-            }
+            // The vector comes from the embed queue, not this request.
             self.stamp_supplied_vectors(&mut experience);
 
             // TEMPORAL EXTRACTION: Extract dates from content for temporal filtering
@@ -6379,9 +6497,14 @@ impl MemorySystem {
                 .write()
                 .add_shared(Arc::clone(&memory))?;
 
-            // Index in vector DB
-            if let Err(e) = self.retriever.index_memory(&memory) {
-                self.note_index_failure(&memory.id, &e, "memory");
+            // A supplied vector in this corpus's space is indexed now; anything else waits for
+            // the embed queue.
+            if memory.experience.embeddings.is_some() {
+                if let Err(e) = self.retriever.index_memory(&memory) {
+                    self.note_index_failure(&memory.id, &e, "memory");
+                }
+            } else {
+                self.enqueue_embedding(&memory.id);
             }
 
             // Add entities to knowledge graph with co-occurrence edges
@@ -9886,6 +10009,112 @@ mod lifecycle_tests {
 mod space_registry_tests {
     use super::*;
     use crate::embeddings::space::{SpaceId, SpaceRegistry};
+
+    /// A request's write waits on nothing: deferred writes queue, and one drain embeds them in
+    /// one batch.
+    #[test]
+    fn deferred_writes_queue_and_one_drain_embeds_them_together() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let system = MemorySystem::new(config, None).expect("memory system");
+        let mut ids = Vec::new();
+        for content in [
+            "the lighthouse keeper logged the storm at midnight",
+            "gulls followed the trawler back into harbour",
+            "the tide tables were reprinted for the new season",
+        ] {
+            ids.push(
+                system
+                    .remember_deferred(
+                        Experience {
+                            content: content.to_string(),
+                            ..Default::default()
+                        },
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(system.embed_queue_len(), 3);
+        assert!(ids.iter().all(|id| !system.retriever.is_indexed(id)));
+        assert_eq!(system.drain_embed_queue(64), 3);
+        assert_eq!(system.embed_queue_len(), 0);
+        for id in &ids {
+            assert!(system.retriever.is_indexed(id));
+            assert_eq!(
+                system
+                    .long_term_memory
+                    .get(id)
+                    .unwrap()
+                    .experience
+                    .embedding_space,
+                Some(system.index_space())
+            );
+        }
+        assert_eq!(system.drain_embed_queue(64), 0, "nothing is embedded twice");
+    }
+
+    #[test]
+    fn an_upsert_with_new_content_leaves_the_index_until_its_vector_arrives() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let system = MemorySystem::new(config, None).expect("memory system");
+        let (id, _) = system
+            .upsert(
+                "ticket:1".to_string(),
+                Experience {
+                    content: "the ferry is cancelled".to_string(),
+                    ..Default::default()
+                },
+                ChangeType::Created,
+                None,
+                None,
+            )
+            .unwrap();
+        system.drain_embed_queue(64);
+        assert!(system.retriever.is_indexed(&id));
+        let first = system
+            .long_term_memory
+            .get(&id)
+            .unwrap()
+            .experience
+            .embeddings;
+
+        system
+            .upsert(
+                "ticket:1".to_string(),
+                Experience {
+                    content: "the ferry runs again from Monday".to_string(),
+                    ..Default::default()
+                },
+                ChangeType::ContentUpdated,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !system.retriever.is_indexed(&id),
+            "the old content's vector is gone at once"
+        );
+        assert_eq!(system.drain_embed_queue(64), 1);
+        assert!(system.retriever.is_indexed(&id));
+        assert_ne!(
+            system
+                .long_term_memory
+                .get(&id)
+                .unwrap()
+                .experience
+                .embeddings,
+            first
+        );
+    }
 
     /// Which space found each hit is on its attribution.
     #[test]

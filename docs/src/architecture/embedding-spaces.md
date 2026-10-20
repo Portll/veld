@@ -102,6 +102,26 @@ The intent-log Vamana projection (`/api/query`) binds its text-primary index to 
 active space when it opens. It skips any vector of another width or recorded space, so a log
 replayed from the start across an embedder change no longer builds the index in the old space.
 
+## Writes do not wait on the embedder
+
+`POST /api/remember`, `/api/remember/batch` and `/api/upsert` store the memory, index it for
+keyword search and return. The memory joins its tenant's embed queue
+(`src/memory/embed_queue.rs`). The request then starts a background drain, and the server's own
+drainer ticks every 250 ms (`VELD_EMBED_QUEUE_INTERVAL_MS`). A drain takes up to 64 memories
+(`VELD_EMBED_BATCH`, at most 256), finds their vectors in the content cache or in one
+`encode_batch` call, and finishes each memory as before: vector index, interference detection,
+write gate. A chunked memory's chunk vectors come from one call too. Concurrent writes coalesce:
+a drain that finds the queue already taken returns at once.
+
+An upsert that changes content drops the old vectors and leaves the vector indexes until its new
+vectors arrive. Until then a queued memory is found by keyword and graph search, as during an
+embedder outage. When the batch call fails, every memory it was for becomes a backlog row,
+rather than being retried one at a time against a host that is down. The queue is in memory: a
+memory still queued at a crash is stored but unindexed, and the backlog reconcile finds it.
+
+`MemorySystem::remember` stays synchronous for library callers and the recall harness, which
+recall what they just wrote. Bulk imports (seed, ingest, MIF) still embed as they write.
+
 ## Fusion across spaces
 
 Fusion is by rank (RRF), so two spaces' different cosine scales do not bias it. Two things are

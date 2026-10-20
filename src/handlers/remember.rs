@@ -914,18 +914,10 @@ pub async fn remember(
     )
     .await;
 
-    // Background: complete embedding + vector indexing.
-    // The memory is already searchable via BM25; vector search follows in ~150ms.
-    {
-        let memory_for_bg = memory.clone();
-        let mid = memory_id.clone();
-        state.task_tracker.spawn_blocking(move || {
-            let guard = memory_for_bg.read();
-            if let Err(e) = guard.embed_and_index(&mid) {
-                tracing::warn!(memory_id = %mid.0, "Background embed_and_index failed: {e}");
-            }
-        });
-    }
+    // The memory is already searchable via BM25. The deferred write queued it; this drain
+    // embeds the queue in one batch, so concurrent writes share an embedder call and vector
+    // search follows within one batch.
+    spawn_embed_queue_drain(&state, &memory);
 
     // W5: journal the write to the intent log + SQLite projection.
     //
@@ -1638,7 +1630,8 @@ pub async fn batch_remember(
             let mut errors: Vec<BatchErrorItem> = Vec::new();
 
             for (index, experience, created_at) in experiences {
-                match memory_guard.remember_detailed(experience.clone(), created_at) {
+                match memory_guard.remember_deferred_detailed(experience.clone(), created_at, None)
+                {
                     Ok(outcome) => {
                         let rebuild = outcome.needs_graph_rebuild();
                         let effective = outcome.merged_experience.unwrap_or(experience);
@@ -1989,6 +1982,7 @@ pub async fn batch_remember(
             .inc();
     }
 
+    spawn_embed_queue_drain(&state, &memory);
     Ok(Json(BatchRememberResponse {
         created,
         failed,
@@ -2152,6 +2146,8 @@ pub async fn upsert_memory(
         .map_err(AppError::Internal)?
     };
 
+    spawn_embed_queue_drain(&state, &memory_system);
+
     let (version, stored_tags) = {
         let memory = memory_system.clone();
         let mid = memory_id.clone();
@@ -2309,6 +2305,17 @@ pub async fn upsert_memory(
         was_update,
         version,
     }))
+}
+
+/// Embed the user's queue in the background, a batch at a time, without holding up the
+/// response. A drain that finds the queue empty, because a concurrent one took it, returns at
+/// once; the server's own drainer catches anything a request did not.
+fn spawn_embed_queue_drain(state: &AppState, memory: &crate::user_memory::SharedUserMemory) {
+    let memory = memory.clone();
+    state.task_tracker.spawn_blocking(move || {
+        let guard = memory.read();
+        while guard.drain_embed_queue(64) > 0 {}
+    });
 }
 
 #[cfg(test)]
