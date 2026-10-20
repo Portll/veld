@@ -172,7 +172,7 @@ impl WikiProjection {
                 let mid = parse_memory_id(memory_id)?;
                 self.remove_page(&mid)?;
             }
-            IntentPayload::Anchor { .. } => {
+            IntentPayload::Anchor { .. } | IntentPayload::SetAnchored { .. } => {
                 // Anchoring changes decay resistance only — not page
                 // eligibility (by experience type) or content. No
                 // re-render; the checkpoint still advances below so the

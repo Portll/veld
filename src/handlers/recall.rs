@@ -465,7 +465,8 @@ pub async fn recall(
     validation::validate_max_results(req.limit).map_validation_err("limit")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let _graph = state
@@ -1138,7 +1139,8 @@ pub async fn context_summary(
     validation::validate_max_results(req.max_items).map_validation_err("max_items")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let max_items = req.max_items;
@@ -1279,7 +1281,8 @@ pub async fn proactive_context(
     let op_start = std::time::Instant::now();
 
     let memory_system = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let graph_memory = state
@@ -2589,7 +2592,8 @@ pub async fn surface_relevant(
     validation::validate_max_results(req.config.max_results).map_validation_err("max_results")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let graph_memory = state
         .get_user_graph(&req.user_id)
@@ -2667,7 +2671,8 @@ pub async fn recall_tracked(
     validation::validate_max_results(req.limit).map_validation_err("limit")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let query_text = req.query.clone();
@@ -2853,7 +2858,8 @@ pub async fn reinforce_feedback(
     }
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     // Run reinforcement in blocking task (involves RocksDB writes)
@@ -2924,7 +2930,8 @@ pub async fn recall_by_tags(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -2990,7 +2997,8 @@ pub async fn recall_by_date(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();

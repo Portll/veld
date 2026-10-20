@@ -173,6 +173,10 @@ pub struct PlantedRepetitionRow {
     pub planted_edge_strength_mean: f64,
     pub planted_edge_distinct_sources_mean: f64,
     pub planted_edge_activations_mean: f64,
+    /// The larger of the edge's forward and backward strengths, which only a new
+    /// source moves, like strength.
+    #[serde(default)]
+    pub planted_edge_direction_mean: f64,
 }
 
 /// E6c planted-repetition report: does recall traffic from ONE source move a

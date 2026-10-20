@@ -437,6 +437,8 @@ const REMEMBER_TAG: u32 = 0;
 const FORGET_TAG: u32 = 1;
 const UPDATE_TAG: u32 = 2;
 const ANCHOR_TAG: u32 = 3;
+const SET_ANCHORED_TAG: u32 = 4;
+const LAST_TAG: u32 = SET_ANCHORED_TAG;
 
 fn variant_tag(payload: &IntentPayload) -> u32 {
     match payload {
@@ -444,6 +446,7 @@ fn variant_tag(payload: &IntentPayload) -> u32 {
         IntentPayload::Forget { .. } => FORGET_TAG,
         IntentPayload::Update { .. } => UPDATE_TAG,
         IntentPayload::Anchor { .. } => ANCHOR_TAG,
+        IntentPayload::SetAnchored { .. } => SET_ANCHORED_TAG,
     }
 }
 
@@ -453,7 +456,7 @@ fn variant_tag(payload: &IntentPayload) -> u32 {
 /// cross-checked against a full decode for the first frame of each variant.
 #[derive(Default)]
 struct PrefixReader {
-    checked: [bool; ANCHOR_TAG as usize + 1],
+    checked: [bool; LAST_TAG as usize + 1],
     disabled: bool,
 }
 
@@ -500,7 +503,7 @@ fn peek_memory_ref(bytes: &[u8]) -> Option<(u32, &str)> {
         ))
     }
     let tag = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
-    if tag > ANCHOR_TAG {
+    if tag > LAST_TAG {
         return None;
     }
     let user_len = usize::try_from(read_u64(bytes, 4)?).ok()?;
@@ -1056,10 +1059,17 @@ mod tests {
                 memory_bincode: vec![7; 16],
                 schema_version,
             },
-            _ => IntentPayload::Anchor {
+            ANCHOR_TAG => IntentPayload::Anchor {
                 user_id,
                 memory_id,
                 importance: 0.9,
+                schema_version,
+            },
+            _ => IntentPayload::SetAnchored {
+                user_id,
+                memory_id,
+                anchored: false,
+                importance: 0.4,
                 schema_version,
             },
         }
@@ -1067,7 +1077,13 @@ mod tests {
 
     #[test]
     fn the_payload_prefix_names_the_same_variant_and_memory_as_a_full_decode() {
-        for kind in [REMEMBER_TAG, FORGET_TAG, UPDATE_TAG, ANCHOR_TAG] {
+        for kind in [
+            REMEMBER_TAG,
+            FORGET_TAG,
+            UPDATE_TAG,
+            ANCHOR_TAG,
+            SET_ANCHORED_TAG,
+        ] {
             let original = payload(kind, "4a1f0c3e-0000-4000-8000-00000000abcd");
             let bytes = super::super::payload::encode(&original).unwrap();
             let (tag, id) = peek_memory_ref(&bytes).expect("prefix parses");
@@ -1096,6 +1112,7 @@ mod tests {
             (FORGET_TAG, "m1"),
             (UPDATE_TAG, "m2"),
             (ANCHOR_TAG, "m3"),
+            (SET_ANCHORED_TAG, "m3"),
         ] {
             append(&mut log, &payload(kind, id)).unwrap();
         }

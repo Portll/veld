@@ -62,6 +62,10 @@ pub struct RestartRequest {
     /// Set on the new process over every other layer, e.g.
     /// `VELD_STORAGE_BACKEND` after a backend swap.
     pub env_overrides: Vec<(String, String)>,
+    /// Names the new process does not inherit from the caller; a layer may still
+    /// set them. `veld restart` drops what it read from `config.toml`, so the new
+    /// server reads that file itself instead of starting with its values pinned.
+    pub env_remove: Vec<String>,
     /// Appended with the new process's stdout and stderr.
     pub log_path: PathBuf,
 }
@@ -471,6 +475,109 @@ fn reap_in_background(mut child: std::process::Child) {
     });
 }
 
+/// `~/.config/veld/server.env`: the `KEY=VALUE` file Veld Desktop hands to the
+/// server it spawns, on every platform under `~/.config` (its own convention).
+pub fn server_env_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config").join("veld").join("server.env")
+}
+
+/// `<config>/veld`: the directory of `config.toml` and the instance registry.
+fn veld_config_dir() -> PathBuf {
+    crate::default_config_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// Where a relaunched server's output goes: `<config>/veld/logs/veld-<port>.log`.
+pub fn server_log_path(port: u16) -> PathBuf {
+    veld_config_dir()
+        .join("logs")
+        .join(format!("veld-{port}.log"))
+}
+
+/// Launch recipes saved from the monitor, keyed by base URL without a trailing
+/// slash: `<config>/veld/monitor/launch-recipes.json`, owner-readable only since a
+/// recipe's variables can hold keys.
+pub fn launch_recipes_path() -> PathBuf {
+    veld_config_dir()
+        .join("monitor")
+        .join("launch-recipes.json")
+}
+
+/// The saved launch recipes; empty when none were ever saved.
+pub fn load_launch_recipes() -> Result<BTreeMap<String, LaunchSpec>> {
+    let path = launch_recipes_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| StatusError::LaunchRecipes(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(StatusError::LaunchRecipes(format!(
+            "read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// The port in `base_url`, else the server's default.
+fn port_of(base_url: &str) -> u16 {
+    base_url
+        .trim_end_matches('/')
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(3030)
+}
+
+/// The restart the monitor and `veld restart` both make of `base_url`: the recipe
+/// saved for it, else the registry's; the operator's `server.env` as the base
+/// environment layer; output appended to [`server_log_path`] for its port.
+pub fn restart_request(
+    base_url: &str,
+    instance: Option<DiscoveredInstance>,
+    recipes: &BTreeMap<String, LaunchSpec>,
+    env_overrides: Vec<(String, String)>,
+) -> RestartRequest {
+    request_with_env_file(
+        base_url,
+        instance,
+        recipes,
+        &server_env_path(),
+        env_overrides,
+    )
+}
+
+fn request_with_env_file(
+    base_url: &str,
+    instance: Option<DiscoveredInstance>,
+    recipes: &BTreeMap<String, LaunchSpec>,
+    env_file: &Path,
+    env_overrides: Vec<(String, String)>,
+) -> RestartRequest {
+    let base_url = base_url.trim_end_matches('/').to_string();
+    let port = instance
+        .as_ref()
+        .map(|i| i.port)
+        .unwrap_or_else(|| port_of(&base_url));
+    let env_files = if env_file.is_file() {
+        vec![env_file.to_path_buf()]
+    } else {
+        Vec::new()
+    };
+    RestartRequest {
+        recipe: recipes.get(&base_url).cloned(),
+        base_url,
+        instance,
+        env_files,
+        env_overrides,
+        env_remove: Vec::new(),
+        log_path: server_log_path(port),
+    }
+}
+
 /// Stop the instance, if one is running, and bring it back. Resolves once
 /// `/health` answers again or with the reason it did not.
 pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
@@ -575,6 +682,9 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
     if let Some(cwd) = recipe.cwd.as_deref().filter(|d| Path::new(d).is_dir()) {
         cmd.current_dir(cwd);
     }
+    for key in &req.env_remove {
+        cmd.env_remove(key);
+    }
     let mut given: Vec<String> = Vec::new();
     let mut layer = |cmd: &mut Command, key: &str, value: &str| {
         if !value.is_empty() {
@@ -605,7 +715,9 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
         .map(|r| r.env_names.clone())
         .unwrap_or_default()
         .into_iter()
-        .filter(|n| !given.contains(n) && std::env::var_os(n).is_none())
+        .filter(|n| {
+            !given.contains(n) && (req.env_remove.contains(n) || std::env::var_os(n).is_none())
+        })
         .collect();
     let mut carried_env = given;
     carried_env.sort();
@@ -712,6 +824,94 @@ mod tests {
         assert_eq!(deduped, "A=3\n");
     }
 
+    fn instance_on(port: u16) -> DiscoveredInstance {
+        DiscoveredInstance {
+            base_url: format!("http://127.0.0.1:{port}"),
+            label: String::new(),
+            pid: 4242,
+            host: "127.0.0.1".into(),
+            port,
+            version: String::new(),
+            data_path: String::new(),
+            started_at: None,
+            last_heartbeat: chrono::Utc::now(),
+            launch: None,
+        }
+    }
+
+    #[test]
+    fn restart_request_takes_the_recipe_saved_for_the_base_url() {
+        let saved = LaunchSpec {
+            exe: "/usr/local/bin/veld".into(),
+            args: vec!["server".into()],
+            ..LaunchSpec::default()
+        };
+        let mut recipes = BTreeMap::new();
+        recipes.insert("http://127.0.0.1:3031".to_string(), saved.clone());
+        recipes.insert("http://127.0.0.1:3030".to_string(), LaunchSpec::default());
+        let env_file = std::env::temp_dir().join(format!(
+            "veld-status-core-restart-request-{}.env",
+            std::process::id()
+        ));
+        std::fs::write(&env_file, "VELD_EMBEDDER=http\n").unwrap();
+        let overrides = vec![("VELD_STORAGE_BACKEND".to_string(), "redb".to_string())];
+
+        let req = request_with_env_file(
+            "http://127.0.0.1:3031/",
+            Some(instance_on(3031)),
+            &recipes,
+            &env_file,
+            overrides.clone(),
+        );
+        let _ = std::fs::remove_file(&env_file);
+
+        assert_eq!(req.base_url, "http://127.0.0.1:3031");
+        assert_eq!(req.recipe, Some(saved));
+        assert_eq!(req.instance.map(|i| i.pid), Some(4242));
+        assert_eq!(req.env_files, vec![env_file]);
+        assert_eq!(req.env_overrides, overrides);
+        assert!(req.env_remove.is_empty());
+        assert_eq!(req.log_path, server_log_path(3031));
+        assert!(req
+            .log_path
+            .ends_with(Path::new("veld").join("logs").join("veld-3031.log")));
+    }
+
+    #[test]
+    fn restart_request_without_an_instance_logs_by_the_base_url_port() {
+        let missing = std::env::temp_dir().join("veld-status-core-no-such-server.env");
+        let req = request_with_env_file(
+            "http://localhost:3040",
+            None,
+            &BTreeMap::new(),
+            &missing,
+            Vec::new(),
+        );
+        assert!(req.recipe.is_none());
+        assert!(req.instance.is_none());
+        assert!(
+            req.env_files.is_empty(),
+            "an absent server.env is not a layer"
+        );
+        assert_eq!(req.log_path, server_log_path(3040));
+        assert_eq!(port_of("http://localhost"), 3030);
+        assert_eq!(port_of("http://127.0.0.1:3032/"), 3032);
+    }
+
+    #[test]
+    fn shared_paths_sit_beside_the_registry() {
+        let veld_dir = crate::instances_dir().parent().unwrap().to_path_buf();
+        assert_eq!(
+            launch_recipes_path(),
+            veld_dir.join("monitor").join("launch-recipes.json")
+        );
+        assert_eq!(
+            server_log_path(3030),
+            veld_dir.join("logs").join("veld-3030.log")
+        );
+        assert!(server_env_path().ends_with(Path::new(".config").join("veld").join("server.env")));
+    }
+
     // Live run against a scratch server named by VELD_RESTART_E2E_BASE_URL: inspect
     // it, stop it, relaunch it from its registry recipe, and leave the new one up.
     //   cargo test -- --ignored e2e_restart --nocapture
@@ -742,6 +942,7 @@ mod tests {
             recipe: None,
             env_files: if env_file.is_file() { vec![env_file] } else { vec![] },
             env_overrides: vec![],
+            env_remove: vec![],
             log_path: std::env::temp_dir().join("veld-restart-e2e.log"),
         })
         .await

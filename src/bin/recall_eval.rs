@@ -723,14 +723,14 @@ fn run(args: &Args) -> Result<i32> {
             report.suite, report.groups
         );
         println!(
-            "| arm | recalls/group | sources | recall@10 | ndcg@10 | mrr | planted rank | planted top-10 | access | importance | edges present | edge strength | edge sources | edge activations |"
+            "| arm | recalls/group | sources | recall@10 | ndcg@10 | mrr | planted rank | planted top-10 | access | importance | edges present | edge strength | edge sources | edge activations | edge direction |"
         );
         println!(
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         );
         for r in &report.rows {
             println!(
-                "| {} | {} | {} | {:.4} | {:.4} | {:.4} | {:.2} | {} | {:.1} | {:.3} | {} | {:.3} | {:.1} | {:.1} |",
+                "| {} | {} | {} | {:.4} | {:.4} | {:.4} | {:.2} | {} | {:.1} | {:.3} | {} | {:.3} | {:.1} | {:.1} | {:.3} |",
                 r.arm,
                 r.recalls_per_group,
                 r.distinct_sources,
@@ -745,6 +745,7 @@ fn run(args: &Args) -> Result<i32> {
                 r.planted_edge_strength_mean,
                 r.planted_edge_distinct_sources_mean,
                 r.planted_edge_activations_mean,
+                r.planted_edge_direction_mean,
             );
         }
         println!("\nA repeat arm that ranks the planted memory above control is a recall-feeds-rank loop; a corroborate arm that moves it is evidence doing its job.");

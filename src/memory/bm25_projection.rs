@@ -245,7 +245,7 @@ impl Bm25Projection {
                     .delete(&mid)
                     .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
             }
-            IntentPayload::Anchor { .. } => {
+            IntentPayload::Anchor { .. } | IntentPayload::SetAnchored { .. } => {
                 // Anchoring changes importance / decay resistance only.
                 // The BM25 corpus has no concept of importance, so the
                 // text index is unaffected. We still advance the

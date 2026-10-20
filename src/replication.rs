@@ -39,6 +39,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::intent_log::{payload, IntentPayload, LogMode};
@@ -134,9 +135,13 @@ pub struct UserProgress {
     pub journaled_records: u64,
     /// Leader log length at the last poll that found nothing new.
     pub source_bytes: u64,
-    /// The leader's next LSN at the last page; lag is `leader_head_lsn - 1 - applied_lsn`.
+    /// The leader's next LSN when this tenant was last read.
     #[serde(default)]
     pub leader_head_lsn: Option<u64>,
+    /// Leader frames not yet applied here: `leader_head_lsn - 1 - applied_lsn`, or the
+    /// whole leader log when nothing is applied.
+    #[serde(default)]
+    pub lag: Option<u64>,
     /// The leader log identity this cursor belongs to (see [`FeedPage::log_created`]).
     #[serde(default)]
     pub log_created: Option<u64>,
@@ -152,14 +157,30 @@ pub struct UserProgress {
     pub retry_at: Option<Instant>,
 }
 
+impl UserProgress {
+    fn refresh_lag(&mut self) {
+        self.lag = match (self.leader_head_lsn, self.applied_lsn) {
+            (Some(head), Some(applied)) => Some(head.saturating_sub(1).saturating_sub(applied)),
+            (Some(head), None) => Some(head),
+            (None, _) => None,
+        };
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FollowStatus {
     pub target: Option<FollowTarget>,
     /// Bumped by every follow and unfollow; a poll started under an older value
     /// stops at its next page and writes nothing.
     pub generation: u64,
+    /// Passes over every tenant that finished. An initial sync is one pass that can
+    /// run for hours: `pass_started`, `syncing` and `pages` show it moving.
     pub polls: u64,
     pub pages: u64,
+    /// When the pass in progress, or the last one, began.
+    pub pass_started: Option<DateTime<Utc>>,
+    /// The tenant the pass in progress is syncing.
+    pub syncing: Option<String>,
     pub last_poll: Option<DateTime<Utc>>,
     pub last_applied: Option<DateTime<Utc>>,
     /// The last failure to reach the leader at all; per-tenant failures are on the tenant.
@@ -188,6 +209,7 @@ impl FollowStatus {
         entry.journaled_records += journaled;
         entry.leader_head_lsn = Some(page.head_lsn);
         entry.log_created = Some(page.log_created);
+        entry.refresh_lag();
         self.pages += 1;
         self.last_applied = Some(Utc::now());
         Some(self.users.clone())
@@ -324,22 +346,7 @@ pub fn feed(
         (guard.log().iter()?, guard.log().next_lsn().0, log_created)
     };
     let floor = after_lsn.map(|l| l + 1).unwrap_or(0);
-    let mut records = Vec::new();
-    let mut more = false;
-    for frame in iter {
-        let record = frame.context("reading the intent log")?;
-        if record.lsn.0 < floor {
-            continue;
-        }
-        if records.len() >= limit {
-            more = true;
-            break;
-        }
-        records.push(FeedRecord {
-            lsn: record.lsn.0,
-            frame_b64: base64::engine::general_purpose::STANDARD.encode(&record.payload),
-        });
-    }
+    let (records, more) = page_below_head(iter, floor, head_lsn, limit)?;
     Ok(FeedPage {
         user_id: user_id.to_string(),
         records,
@@ -347,6 +354,45 @@ pub fn feed(
         more,
         log_created,
     })
+}
+
+/// Frames from `floor` up to `limit`, ending at the last frame below `head_lsn`.
+/// The file is read after the writer lock is released, so anything at or past the
+/// head was appended later: it may still be partly flushed (and read as torn) or be
+/// rolled back by a failed sync, after which its LSN names a different frame. LSNs
+/// are contiguous, so the frame at `head_lsn - 1` is the last one read.
+fn page_below_head<E>(
+    frames: impl Iterator<Item = std::result::Result<crate::intent_log::IntentRecord, E>>,
+    floor: u64,
+    head_lsn: u64,
+    limit: usize,
+) -> Result<(Vec<FeedRecord>, bool)>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut records = Vec::new();
+    if floor >= head_lsn {
+        return Ok((records, false));
+    }
+    for frame in frames {
+        let record = frame.context("reading the intent log")?;
+        if record.lsn.0 >= head_lsn {
+            break;
+        }
+        if record.lsn.0 >= floor {
+            if records.len() >= limit {
+                return Ok((records, true));
+            }
+            records.push(FeedRecord {
+                lsn: record.lsn.0,
+                frame_b64: base64::engine::general_purpose::STANDARD.encode(&record.payload),
+            });
+        }
+        if record.lsn.0 + 1 == head_lsn {
+            break;
+        }
+    }
+    Ok((records, false))
 }
 
 /// Why a tenant's cursor no longer fits the leader's log, or None when it does.
@@ -466,7 +512,7 @@ pub fn apply_replicated_page(
     Ok(journaled)
 }
 
-/// The store-side effect of a `Forget` or `Anchor` frame; snapshots are handled in
+/// The store-side effect of a `Forget`, `Anchor` or `SetAnchored` frame; snapshots are handled in
 /// bulk by [`apply_replicated_page`].
 fn apply_non_snapshot(
     manager: &MultiUserMemoryManager,
@@ -498,6 +544,20 @@ fn apply_non_snapshot(
                 } else if *importance < memory.importance() {
                     memory.set_anchored(false);
                 }
+                memory.set_importance(*importance);
+                guard.update_memory(&memory)?;
+            }
+        }
+        IntentPayload::SetAnchored {
+            memory_id,
+            anchored,
+            importance,
+            ..
+        } => {
+            let id = MemoryId(uuid::Uuid::parse_str(memory_id)?);
+            let guard = memory_sys.read();
+            if let Ok(memory) = guard.get_memory(&id) {
+                memory.set_anchored(*anchored);
                 memory.set_importance(*importance);
                 guard.update_memory(&memory)?;
             }
@@ -746,10 +806,12 @@ async fn sync_user(
     generation: u64,
     cursor: &Path,
     info: &UserLogInfo,
+    shutdown: &CancellationToken,
 ) -> Result<u64> {
     let mut consumed = 0u64;
+    let mut head: u64;
     loop {
-        if !is_current(generation) {
+        if shutdown.is_cancelled() || !is_current(generation) {
             return Ok(consumed);
         }
         let progress = FOLLOW
@@ -763,7 +825,11 @@ async fn sync_user(
             percent_encode(&info.user_id),
             progress.applied_lsn.map(|l| l.to_string()).unwrap_or_default()
         );
-        let page: FeedPage = get_json(http, target, &path).await?;
+        let page: FeedPage = tokio::select! {
+            page = get_json(http, target, &path) => page?,
+            () = shutdown.cancelled() => return Ok(consumed),
+        };
+        head = page.head_lsn;
         if let Some(reason) = divergence(&progress, &page) {
             mark_diverged(generation, cursor, &info.user_id, &reason)?;
             return Ok(consumed);
@@ -812,6 +878,8 @@ async fn sync_user(
         }
         let entry = status.users.entry(info.user_id.clone()).or_default();
         entry.source_bytes = info.log_bytes;
+        entry.leader_head_lsn = Some(head);
+        entry.refresh_lag();
         status.users.clone()
     };
     save_cursor(cursor, &users)?;
@@ -827,12 +895,28 @@ async fn poll_once(
     target: &FollowTarget,
     generation: u64,
     interval: Duration,
+    shutdown: &CancellationToken,
 ) -> Result<u64> {
-    let leader: LeaderStatus = get_json(http, target, "/api/admin/replication/status").await?;
+    let leader: LeaderStatus = tokio::select! {
+        leader = get_json(http, target, "/api/admin/replication/status") => leader?,
+        () = shutdown.cancelled() => return Ok(0),
+    };
     let cursor = cursor_path(&manager.base_path, &target.source);
+    let set_syncing = |tenant: Option<&str>| {
+        let mut status = FOLLOW.write();
+        if status.generation == generation {
+            status.syncing = tenant.map(str::to_string);
+        }
+    };
+    {
+        let mut status = FOLLOW.write();
+        if status.generation == generation {
+            status.pass_started = Some(Utc::now());
+        }
+    }
     let mut consumed = 0u64;
     for info in &leader.users {
-        if !is_current(generation) {
+        if shutdown.is_cancelled() || !is_current(generation) {
             break;
         }
         let progress = FOLLOW
@@ -864,7 +948,8 @@ async fn poll_once(
                 continue;
             }
         }
-        match sync_user(manager, http, target, generation, &cursor, info).await {
+        set_syncing(Some(&info.user_id));
+        match sync_user(manager, http, target, generation, &cursor, info, shutdown).await {
             Ok(n) => {
                 consumed += n;
                 let mut status = FOLLOW.write();
@@ -894,13 +979,16 @@ async fn poll_once(
             }
         }
     }
+    set_syncing(None);
     Ok(consumed)
 }
 
 /// The follower loop: idle until something is followed, then poll the leader
-/// every interval, backing off while the leader cannot be reached. Runs for the
-/// life of the server.
-pub async fn run_follower(manager: Arc<MultiUserMemoryManager>) {
+/// every interval, backing off while the leader cannot be reached. Returns once
+/// `shutdown` is cancelled: a page already being applied finishes and saves its
+/// cursor, and no request or page starts after the cancel, so the store flush and
+/// the vector-index save at shutdown see no later writes.
+pub async fn run_follower(manager: Arc<MultiUserMemoryManager>, shutdown: CancellationToken) {
     let interval = interval_from_env();
     let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -920,7 +1008,11 @@ pub async fn run_follower(manager: Arc<MultiUserMemoryManager>) {
         };
         let mut wait = interval;
         if let Some(target) = target {
-            let outcome = poll_once(&manager, &http, &target, generation, interval).await;
+            let outcome =
+                poll_once(&manager, &http, &target, generation, interval, &shutdown).await;
+            if shutdown.is_cancelled() {
+                break;
+            }
             let mut status = FOLLOW.write();
             if status.generation == generation {
                 status.polls += 1;
@@ -949,8 +1041,12 @@ pub async fn run_follower(manager: Arc<MultiUserMemoryManager>) {
                 failures = 0;
             }
         }
-        tokio::time::sleep(wait).await;
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = shutdown.cancelled() => break,
+        }
     }
+    tracing::info!("replication: follower stopped for shutdown");
 }
 
 #[cfg(test)]
@@ -983,6 +1079,7 @@ mod tests {
                 journaled_records: 7,
                 source_bytes: 1234,
                 leader_head_lsn: Some(90),
+                lag: Some(48),
                 log_created: Some(1_700_000_000),
                 diverged: Some("rolled back".into()),
                 last_error: None,
@@ -1123,6 +1220,41 @@ mod tests {
         assert_eq!(echo("  short  "), "short");
     }
 
+    fn record(lsn: u64) -> std::result::Result<crate::intent_log::IntentRecord, std::io::Error> {
+        Ok(crate::intent_log::IntentRecord {
+            lsn: crate::intent_log::Lsn(lsn),
+            payload: vec![lsn as u8],
+        })
+    }
+
+    fn lsns(page: &[FeedRecord]) -> Vec<u64> {
+        page.iter().map(|r| r.lsn).collect()
+    }
+
+    #[test]
+    fn the_feed_ends_below_the_head_it_captured() {
+        let torn = || std::iter::once(Err(std::io::Error::other("truncated frame")));
+
+        let appended_after_capture = (0..5).map(record).chain(torn());
+        let (page, more) = page_below_head(appended_after_capture, 0, 4, 500).unwrap();
+        assert_eq!(lsns(&page), vec![0, 1, 2, 3], "frame 4 came after the head was read");
+        assert!(!more);
+
+        let (page, _) = page_below_head((0..4).map(record).chain(torn()), 2, 4, 500)
+            .expect("a frame being flushed past the head is never read");
+        assert_eq!(lsns(&page), vec![2, 3]);
+
+        let (page, more) = page_below_head((0..4).map(record), 0, 4, 2).unwrap();
+        assert_eq!(lsns(&page), vec![0, 1]);
+        assert!(more);
+        let (page, more) = page_below_head((0..2).map(record), 0, 2, 2).unwrap();
+        assert_eq!(lsns(&page), vec![0, 1]);
+        assert!(!more, "the page that reaches the head is the last");
+
+        let (page, more) = page_below_head((0..4).map(record).chain(torn()), 4, 4, 500).unwrap();
+        assert!(page.is_empty() && !more);
+    }
+
     fn frame(lsn: u64, id: &str, kind: &str) -> (u64, IntentPayload) {
         frame_for("u", lsn, id, kind)
     }
@@ -1137,6 +1269,85 @@ mod tests {
             _ => IntentPayload::Anchor { user_id, memory_id: id.into(), importance: 0.9, schema_version: sv },
         };
         (lsn, p)
+    }
+
+    #[test]
+    fn lag_counts_the_leader_frames_not_yet_applied() {
+        let mut p = UserProgress {
+            leader_head_lsn: Some(41_000),
+            applied_lsn: Some(16_499),
+            ..Default::default()
+        };
+        p.refresh_lag();
+        assert_eq!(p.lag, Some(24_500));
+        p.applied_lsn = Some(40_999);
+        p.refresh_lag();
+        assert_eq!(p.lag, Some(0), "caught up: the leader's last LSN is head - 1");
+        p.applied_lsn = None;
+        p.refresh_lag();
+        assert_eq!(p.lag, Some(41_000), "nothing applied: the whole log");
+        p.leader_head_lsn = None;
+        p.refresh_lag();
+        assert_eq!(p.lag, None);
+    }
+
+    #[tokio::test]
+    async fn the_follower_returns_once_shutdown_is_cancelled() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let shutdown = CancellationToken::new();
+        let follower = tokio::spawn(run_follower(Arc::new(manager), shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!follower.is_finished(), "the follower runs until cancelled");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), follower)
+            .await
+            .expect("the follower returns within a second of the cancel, not after its interval")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_release_that_keeps_importance_reaches_the_follower() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let memory_sys = manager.get_user_memory("u").unwrap();
+        let id = memory_sys
+            .read()
+            .remember(
+                crate::memory::types::Experience {
+                    content: "the deploy key rotates on the first of the month".into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let memory = memory_sys.read().get_memory(&id).unwrap();
+        memory.set_anchored(true);
+        memory_sys.read().update_memory(&memory).unwrap();
+        let importance = memory.importance();
+        let anchored = || memory_sys.read().get_memory(&id).unwrap().is_anchored();
+        let sv = Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
+
+        let legacy = IntentPayload::Anchor {
+            user_id: "u".into(),
+            memory_id: id.0.to_string(),
+            importance,
+            schema_version: sv,
+        };
+        apply_non_snapshot(&manager, "u", &legacy).unwrap();
+        assert!(anchored(), "a legacy frame cannot say the anchor was released");
+
+        let release = IntentPayload::SetAnchored {
+            user_id: "u".into(),
+            memory_id: id.0.to_string(),
+            anchored: false,
+            importance,
+            schema_version: sv,
+        };
+        apply_non_snapshot(&manager, "u", &release).unwrap();
+        assert!(!anchored());
+        assert_eq!(
+            memory_sys.read().get_memory(&id).unwrap().importance(),
+            importance
+        );
     }
 
     #[test]

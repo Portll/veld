@@ -92,11 +92,13 @@ pub struct BackupMetadata {
     /// Highest LSN in the main journal at the moment the intent log was
     /// captured — the backup's consistency cut. The journal is captured
     /// *before* the primary DB is checkpointed, and every primary write
-    /// precedes its journal frame, so the primary snapshot always
-    /// contains at least everything up to this LSN; anything the primary
-    /// holds beyond it is re-journalled by the C2 reconcile on first
-    /// access after restore. `None` for backups taken before this field
-    /// existed, or when no journal file was present.
+    /// precedes its journal frame, so the primary snapshot holds every
+    /// memory written up to this LSN unless it was deleted in between;
+    /// anything the primary holds beyond it is re-journalled by the C2
+    /// reconcile on first access after restore, and the restore marks the
+    /// tenant so that reconcile forgets, rather than restores, a memory
+    /// deleted between the capture and the checkpoint. `None` for backups
+    /// taken before this field existed, or when no journal file was present.
     #[serde(default)]
     pub journal_cut_lsn: Option<u64>,
     /// Column families that the main memories DB actually contained at
@@ -530,8 +532,10 @@ impl VeldBackupEngine {
     ///
     /// Capture order matters: the journal is staged BEFORE the primary DB
     /// is checkpointed. Every primary write precedes its journal frame, so
-    /// this order guarantees the primary snapshot is a superset of the
-    /// staged journal — the direction the C2 reconcile can heal. The old
+    /// this order makes the primary snapshot a superset of the staged
+    /// journal's writes — the direction the C2 reconcile can heal. A delete
+    /// between the two is the exception; the restore marks the tenant so
+    /// the reconcile forgets that memory instead of restoring it. The old
     /// order (journal copied after the checkpoint) allowed frames for
     /// memories the primary snapshot never saw, which replay would
     /// resurrect into projections.
@@ -845,10 +849,10 @@ impl VeldBackupEngine {
     ///    `intent_log_target.source_dir`, verifying its SHA-256 against
     ///    the manifest. A mismatch aborts the restore (no partial state
     ///    on disk — files written so far are removed).
-    /// 4. Open the journal file via [`IntentLog::open`] and **iterate
-    ///    every frame**. A CRC mismatch or torn frame aborts the restore
-    ///    with a clear error — half-restoring a corrupt log is
-    ///    catastrophic and we refuse to do it.
+    /// 4. Open the journal file via [`IntentLog::open`], which cuts a torn
+    ///    tail, and **iterate every frame**. Any other CRC mismatch or
+    ///    truncated frame aborts the restore with a clear error —
+    ///    half-restoring a corrupt log is catastrophic and we refuse to do it.
     /// 5. If `options.max_lsn` is set, call
     ///    [`IntentLog::truncate_to_lsn`] on the freshly-restored journal
     ///    so that the final on-disk log ends at exactly that LSN.

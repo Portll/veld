@@ -219,6 +219,12 @@ impl SqliteProjection {
                 memory_id,
                 importance,
                 ..
+            }
+            | IntentPayload::SetAnchored {
+                user_id,
+                memory_id,
+                importance,
+                ..
             } => {
                 if let Some(rel) = &self.relational {
                     rel.anchor_memory_importance_blocking(user_id, memory_id, lsn.0, *importance)
