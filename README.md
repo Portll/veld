@@ -21,7 +21,7 @@
 ---
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Portll/veld/main/assets/Veld_preview.gif" width="800" alt="Veld - Agentic Memory Demo — Claude Code with persistent memory and TUI dashboard">
+  <img src="https://raw.githubusercontent.com/Portll/veld/main/assets/dashboard.png" width="800" alt="Veld TUI dashboard — memory and edge counts, todos, and a live activity feed">
 </p>
 
 AI agents forget everything between sessions. Robots lose context between missions. They repeat mistakes, miss patterns, and treat every interaction like the first one.
@@ -222,14 +222,17 @@ Single binary. No GPU required. Content-hash dedup ensures identical memories ar
 veld tui
 ```
 
+The screenshots below are captured from the `demo` profile, which is seeded from this repository's
+own documentation: `node scripts/seed-demo.mjs --reset`, then `node scripts/screenshots/shoot.mjs`.
+
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Portll/veld/main/assets/recall.png" width="700" alt="Veld Recall">
+  <img src="https://raw.githubusercontent.com/Portll/veld/main/assets/recall.png" width="700" alt="Semantic recall over the demo profile, ranked by relevance">
 </p>
 
-<p align="center"><i>Semantic recall with hybrid search — relevance scores, memory tiers, and activity feed</i></p>
+<p align="center"><i>Semantic recall with hybrid search — relevance scores, memory types, tags and ages</i></p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Portll/veld/main/assets/projects-todos.jpg" width="700" alt="Veld Projects & Todos">
+  <img src="https://raw.githubusercontent.com/Portll/veld/main/assets/projects-todos.png" width="700" alt="Projects and todos with per-project progress and causal lineage">
 </p>
 
 <p align="center"><i>GTD task management — projects, todos, comments, and causal lineage</i></p>
