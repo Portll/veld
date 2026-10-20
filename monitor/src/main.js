@@ -393,7 +393,7 @@ const DIAL_RECALL = [
   { key: "onto_rerank_penalty", group: "Rerank", label: "Ontological mismatch penalty", def: -0.08, recLo: -0.20, recHi: 0, min: -1, max: 0, step: 0.01,
     desc: "Demotion when entities match none of the expected types.", info: "-0.08 default; only applied at high confidence." },
   { key: "ce_blend", group: "Rerank", label: "Cross-encoder blend (all shapes)", def: 0.18, recLo: 0, recHi: 0.6, min: 0, max: 1, step: 0.05,
-    desc: "Cross-encoder share for every query shape at once; unset lets the per-shape shares below decide.", info: "Set 0 if the cross-encoder model is unavailable (token_type_ids)." },
+    desc: "Cross-encoder share for every query shape at once; decomposed queries keep at least their own share. Unset lets the per-shape shares below decide.", info: "Set 0 if the cross-encoder model is unavailable (token_type_ids); decomposed queries then need CE share · abstract set to 0 too." },
   { key: "ce_blend_identifier", group: "Rerank", label: "CE share · identifier", def: 0.0, recLo: 0, recHi: 0.1, min: 0, max: 1, step: 0.05,
     desc: "Queries naming paths, tickets, versions or hashes.", info: "The reranker fragments identifiers; BM25 exact match decides. Under 0.05 the reranker is not called." },
   { key: "ce_blend_ordinal", group: "Rerank", label: "CE share · ordinal", def: 0.05, recLo: 0, recHi: 0.2, min: 0, max: 1, step: 0.05,
