@@ -26,6 +26,19 @@ use std::time::Duration;
 /// Backstop timeout for model downloads (10 minutes).
 const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 
+/// Connect timeout for model downloads.
+const DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// The HTTP client every model download uses. A download runs under a per-directory lock
+/// that scorers wait on, so one with no deadline would stall every caller behind it.
+pub(crate) fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)))
+        .timeout_connect(Some(Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS)))
+        .build()
+        .new_agent()
+}
+
 /// URLs for MiniLM model files (hosted on HuggingFace)
 /// Full model is 90MB, quantized is 23MB - we download quantized for edge devices
 /// Pinned to commit c9745ed1 to prevent checksum drift when HuggingFace updates models
@@ -367,12 +380,7 @@ fn download_to(
         fs::create_dir_all(parent).context("Failed to create cache directory")?;
     }
 
-    // Use ureq for simple HTTP downloads (blocking, no async runtime needed)
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)))
-        .build()
-        .new_agent();
-    let response = agent
+    let response = download_agent()
         .get(url)
         .call()
         .context(format!("Failed to download from {url}"))?;
