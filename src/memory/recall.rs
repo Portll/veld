@@ -1641,6 +1641,45 @@ impl super::MemorySystem {
                 *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
             }
 
+            // PSEUDO-RELEVANCE FEEDBACK: a second lexical pass whose query adds the terms the
+            // first pass's top documents share, fused as its own leg. Dials: use_prf,
+            // prf_docs, prf_terms, prf_weight (constants::PRF_*).
+            let prf_wanted = early_dials_snapshot
+                .use_prf
+                .unwrap_or(crate::constants::PRF_ENABLED_DEFAULT)
+                && early_dials_snapshot.signal_enabled("prf");
+            if prf_wanted && hybrid_ids.len() >= 2 {
+                let prf_docs = early_dials_snapshot.prf_docs.unwrap_or(crate::constants::PRF_DOCS);
+                let prf_term_count =
+                    early_dials_snapshot.prf_terms.unwrap_or(crate::constants::PRF_TERMS);
+                let prf_weight =
+                    early_dials_snapshot.prf_weight.unwrap_or(crate::constants::PRF_WEIGHT);
+                let doc_texts: Vec<String> = hybrid_ids
+                    .iter()
+                    .take(prf_docs)
+                    .filter_map(|(id, _)| get_content(id))
+                    .collect();
+                let doc_refs: Vec<&str> = doc_texts.iter().map(String::as_str).collect();
+                let terms = query_parser::prf_terms(&doc_refs, query_text, prf_term_count);
+                if !terms.is_empty() && prf_weight > 0.0 {
+                    let expanded = format!("{} {}", bm25_query_ref, terms.join(" "));
+                    let prf_hits = self
+                        .hybrid_search
+                        .bm25_index()
+                        .search(&expanded, query.max_results * 5)
+                        .unwrap_or_default();
+                    let prf_w = hybrid_w * prf_weight;
+                    for (r, (id, _)) in prf_hits.iter().enumerate() {
+                        *fused.entry(id.clone()).or_insert(0.0) += prf_w / (k + (r + 1) as f32);
+                    }
+                    tracing::debug!(
+                        terms = terms.join(" "),
+                        hits = prf_hits.len(),
+                        "Layer 4: pseudo-relevance feedback leg"
+                    );
+                }
+            }
+
             // Secondary Vamana (768d) results: 4th RRF signal
             // RRF is rank-based, so score scale differences between 384d/768d spaces
             // don't matter. Weight is split from semantic_w to avoid inflating total.
@@ -2656,9 +2695,11 @@ impl super::MemorySystem {
             // Helper to apply unified scoring (recency + arousal + credibility + temporal)
             // Amplify recency when query explicitly asks for recent items
             let query_lower_recency = query_text.to_lowercase();
+            // "recently" / "recent" is graded by Layer 5.87's stepped multiplier instead of
+            // amplified here: at 5x this term lifts the last three days above everything
+            // regardless of relevance, which is not what the word asks for.
             let wants_recent = query_lower_recency.contains("last week")
                 || query_lower_recency.contains("most recent")
-                || query_lower_recency.contains("recent")
                 || query_lower_recency.contains("latest")
                 || query_lower_recency.contains("yesterday")
                 || query_lower_recency.contains("today");
@@ -3197,11 +3238,20 @@ impl super::MemorySystem {
         // Dial gate: VELD_DIALS_USE_RERANKING=false (or cognitive_dials.use_reranking =
         // Some(false)) fully skips this layer. The `rerank_count` dial caps the
         // candidate budget; absent that, the hardcoded ce_cap applies.
-        let (layer53_use_reranking, layer53_rerank_count_dial) = {
+        let rerank_shape = query_parser::classify_rerank_shape(query_text, decomposed, &query_type);
+        let (layer53_use_reranking, layer53_rerank_count_dial, ce_w) = {
             let d = self.cognitive_dials.read();
-            (d.use_reranking, d.rerank_count)
+            (d.use_reranking, d.rerank_count, d.ce_share(rerank_shape))
         };
+        if ce_w < crate::constants::CE_BLEND_SKIP_BELOW {
+            tracing::debug!(
+                shape = rerank_shape.as_str(),
+                share = format!("{ce_w:.2}"),
+                "Layer 5.3: cross-encoder skipped for this query shape"
+            );
+        }
         if memories.len() > 1
+            && ce_w >= crate::constants::CE_BLEND_SKIP_BELOW
             && layer53_use_reranking.unwrap_or(true)
             && query
                 .layer_mode()
@@ -3273,15 +3323,9 @@ impl super::MemorySystem {
                         let ce_scores: std::collections::HashMap<MemoryId, f32> =
                             reranked.into_iter().collect();
 
-                        // Adaptive blend: decomposed queries shift weight toward
-                        // cross-encoder (55/45) because the CE can reason about abstract
-                        // membership ("is a Redis fix a performance improvement?") that
-                        // dot-product similarity cannot. Standard queries keep 82/18.
-                        let (base_w, ce_w) = if decomposed {
-                            (0.55, 0.45)
-                        } else {
-                            (0.82, 0.18)
-                        };
+                        // The share comes from the dials by query shape (see
+                        // CognitiveDials::ce_share and constants::CE_BLEND_*).
+                        let base_w = 1.0 - ce_w;
                         for mem in memories.iter_mut().take(rerank_budget) {
                             if let Some(&ce_score) = ce_scores.get(&mem.id) {
                                 // Signal attribution: record cross-encoder contribution
@@ -3304,6 +3348,8 @@ impl super::MemorySystem {
 
                         tracing::info!(
                             reranked = rerank_budget,
+                            shape = rerank_shape.as_str(),
+                            share = format!("{ce_w:.2}"),
                             "recall [layer:5.3] cross-encoder reranking"
                         );
                     }
@@ -3344,6 +3390,83 @@ impl super::MemorySystem {
         }
 
         // =====================================================================
+        // LAYER 5.36: QUERY-TERM COVERAGE  /  LAYER 5.37: PERSON DENSITY
+        // =====================================================================
+        // Both multiplicative, on the full candidate list before truncation, so they can
+        // reorder the top results and pull a candidate in from below the cut. Coverage
+        // multiplies by `1 - w * (1 - coverage)` (constants::QUERY_COVERAGE_WEIGHT); person
+        // density multiplies by `1 + max * intent * people_score` on people questions
+        // (constants::PEOPLE_BOOST_MAX). Person names come from the same rule-based extractor
+        // the write path falls back to, run on candidates only and only for people
+        // questions, so stored records are read as they are.
+        let coverage_weight = dials_snapshot
+            .query_coverage_weight
+            .unwrap_or(crate::constants::QUERY_COVERAGE_WEIGHT);
+        let coverage_terms: Vec<(String, f32)> = {
+            let mut seen: HashSet<String> = HashSet::new();
+            query_analysis
+                .focal_entities
+                .iter()
+                .filter(|e| !e.negated)
+                .map(|e| (e.stem.clone(), e.ic_weight))
+                .chain(
+                    query_analysis
+                        .discriminative_modifiers
+                        .iter()
+                        .filter(|m| !m.negated)
+                        .map(|m| (m.stem.clone(), m.ic_weight)),
+                )
+                .filter(|(stem, w)| !stem.is_empty() && *w > 0.0 && seen.insert(stem.clone()))
+                .collect()
+        };
+        let coverage_total: f32 = coverage_terms.iter().map(|(_, w)| w).sum();
+        let query_coverage_active = coverage_weight > 0.0
+            && dials_snapshot.signal_enabled("query_coverage")
+            && coverage_terms.len() >= crate::constants::QUERY_COVERAGE_MIN_TERMS
+            && coverage_total > 0.0;
+        let people_max = dials_snapshot
+            .people_boost_max
+            .unwrap_or(crate::constants::PEOPLE_BOOST_MAX);
+        let people_intent = query_parser::people_intent(query_text);
+        let people_active = people_max > 0.0
+            && people_intent > 0.0
+            && dials_snapshot.signal_enabled("people_density");
+        if (query_coverage_active || people_active) && !memories.is_empty() {
+            for mem in memories.iter_mut() {
+                let mut factor = 1.0_f32;
+                if query_coverage_active {
+                    let mut text = mem.experience.content.clone();
+                    for tag in &mem.experience.tags {
+                        text.push(' ');
+                        text.push_str(tag);
+                    }
+                    let stems = query_parser::content_stems(&text);
+                    let covered: f32 = coverage_terms
+                        .iter()
+                        .filter(|(stem, _)| stems.contains(stem))
+                        .map(|(_, w)| w)
+                        .sum();
+                    factor *= 1.0 - coverage_weight * (1.0 - covered / coverage_total);
+                }
+                if people_active {
+                    factor *= 1.0 + people_max * people_intent * people_score(&mem.experience.content);
+                }
+                if (factor - 1.0).abs() > f32::EPSILON {
+                    let base = mem.score.unwrap_or(0.0);
+                    let mut cloned: Memory = mem.as_ref().clone();
+                    cloned.set_score(base * factor);
+                    *mem = Arc::new(cloned);
+                }
+            }
+            memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+            tracing::debug!(
+                coverage = query_coverage_active,
+                people_intent = format!("{people_intent:.1}"),
+                "Layer 5.36/5.37: query-term coverage and person density"
+            );
+        }
+
+        // =====================================================================
         // LAYER 5.4: MMR DIVERSIFICATION (FIX-R3)
         // =====================================================================
         // After cross-encoder reranking and fragment demotion, apply Maximal
@@ -3353,8 +3476,13 @@ impl super::MemorySystem {
         // - Temporal queries: lambda=0.7 (moderate diversity)
         // Reference: Berntsen (2021) — pattern separation prevents similar
         // memories from co-activating (dentate gyrus analog).
-        // [signal: mmr] Gated by disabled_signals dial; default = always on (skip = no diversification).
-        if dials_snapshot.signal_enabled("mmr") {
+        // [signal: mmr] Off unless the `use_mmr` dial (or `VELD_DIALS_USE_MMR`) turns it on; see
+        // `MMR_ENABLED_DEFAULT` for the measurement behind the default. The `disabled_signals`
+        // dial still vetoes it.
+        let mmr_wanted = dials_snapshot
+            .use_mmr
+            .unwrap_or(crate::constants::MMR_ENABLED_DEFAULT);
+        if mmr_wanted && dials_snapshot.signal_enabled("mmr") {
             let mmr_lambda = match &query_type {
                 query_parser::QueryType::Attribute(_) => None,
                 query_parser::QueryType::Exploratory => {
@@ -3519,6 +3647,7 @@ impl super::MemorySystem {
             enum TemporalRange {
                 LastWeek,
                 Window { hours: f64 },
+                Stepped,
             }
             let temporal_range = if ql.contains("last week") {
                 Some(TemporalRange::LastWeek)
@@ -3529,7 +3658,7 @@ impl super::MemorySystem {
             } else if ql.contains("today") {
                 Some(TemporalRange::Window { hours: 24.0 })
             } else if ql.contains("recently") || ql.contains("recent ") {
-                Some(TemporalRange::Window { hours: 14.0 * 24.0 })
+                Some(TemporalRange::Stepped)
             } else {
                 None
             };
@@ -3593,6 +3722,25 @@ impl super::MemorySystem {
                                     *mem = Arc::new(cloned);
                                     demoted += 1;
                                 }
+                            }
+                        }
+                    }
+                    TemporalRange::Stepped => {
+                        let step_for = |age_days: i64| -> f32 {
+                            crate::constants::RECENTLY_STEPS
+                                .iter()
+                                .find(|(upper, _)| age_days <= *upper)
+                                .map(|(_, factor)| *factor)
+                                .unwrap_or(crate::constants::RECENTLY_FLOOR_MULTIPLIER)
+                        };
+                        for mem in memories.iter_mut() {
+                            let factor = step_for((now - mem.created_at).num_days().max(0));
+                            if factor < 1.0 {
+                                let base = mem.score.unwrap_or(0.0);
+                                let mut cloned: Memory = mem.as_ref().clone();
+                                cloned.set_score(base * factor);
+                                *mem = Arc::new(cloned);
+                                demoted += 1;
                             }
                         }
                     }
@@ -3986,7 +4134,11 @@ impl super::MemorySystem {
                 .collect();
             let entity_count = query_entities.len() as f32;
 
-            for mem in memories.iter_mut() {
+            // Layer 5.36 already scored coverage on stems before truncation; scoring it again
+            // here on surface text would count the same evidence twice. The fact supplement
+            // below still runs.
+            let sufficiency_scoring = if query_coverage_active { 0 } else { memories.len() };
+            for mem in memories.iter_mut().take(sufficiency_scoring) {
                 let content_lower = mem.experience.content.to_lowercase();
                 let covered = query_entities
                     .iter()
@@ -5341,6 +5493,25 @@ impl super::MemorySystem {
             .map(|m| m.experience.embeddings.as_deref())
             .collect();
 
+        // The pool's mean pairwise cosine is the anisotropy baseline: redundancy is how far a
+        // pair sits above it, on the way to identity. See MMR_REDUNDANCY_THRESHOLD.
+        let (pair_sum, pair_count) = (0..embeddings.len())
+            .flat_map(|i| (i + 1..embeddings.len()).map(move |j| (i, j)))
+            .filter_map(|(i, j)| match (embeddings[i], embeddings[j]) {
+                (Some(a), Some(b)) => Some(crate::similarity::cosine_similarity(a, b)),
+                _ => None,
+            })
+            .fold((0.0_f32, 0usize), |(s, n), v| (s + v, n + 1));
+        let baseline = if pair_count > 0 { (pair_sum / pair_count as f32).clamp(0.0, 0.99) } else { 0.0 };
+        let redundancy = |sim: f32| -> f32 {
+            let centred = ((sim - baseline) / (1.0 - baseline)).clamp(0.0, 1.0);
+            if centred >= crate::constants::MMR_REDUNDANCY_THRESHOLD {
+                centred
+            } else {
+                0.0
+            }
+        };
+
         // Normalize scores to [0, 1] for MMR
         let max_score = memories
             .iter()
@@ -5369,7 +5540,7 @@ impl super::MemorySystem {
                         .iter()
                         .filter_map(|&sel_idx| {
                             embeddings[sel_idx].map(|sel_emb| {
-                                crate::similarity::cosine_similarity(cand_emb, sel_emb)
+                                redundancy(crate::similarity::cosine_similarity(cand_emb, sel_emb))
                             })
                         })
                         .fold(0.0_f32, f32::max)
@@ -5390,6 +5561,27 @@ impl super::MemorySystem {
         // Rebuild result preserving MMR order but keeping original scores
         selected.iter().map(|&idx| memories[idx].clone()).collect()
     }
+}
+
+/// Person-name evidence in a memory for Layer 5.37, in `[0, 1]`: half the share of its
+/// extracted entities that are people, half the number of distinct people capped at four.
+/// Uses the rule-based extractor the write path falls back to when neural NER is off, which
+/// is how production runs.
+fn people_score(content: &str) -> f32 {
+    static EXTRACTOR: std::sync::LazyLock<crate::graph_memory::EntityExtractor> =
+        std::sync::LazyLock::new(crate::graph_memory::EntityExtractor::new);
+    let entities = EXTRACTOR.extract_with_salience(content);
+    if entities.is_empty() {
+        return 0.0;
+    }
+    let people: HashSet<String> = entities
+        .iter()
+        .filter(|e| matches!(e.label, crate::graph_memory::EntityLabel::Person))
+        .map(|e| e.name.to_lowercase())
+        .collect();
+    let share = people.len() as f32 / entities.len() as f32;
+    let count = people.len().min(4) as f32 / 4.0;
+    0.5 * share + 0.5 * count
 }
 
 /// Punctuation kept inside a query token besides alphanumerics. Canonical entity names and file

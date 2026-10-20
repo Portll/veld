@@ -7,6 +7,7 @@ so the runs are independent retrieval measurements against the same instance.
 """
 
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -96,7 +97,7 @@ def main() -> None:
         "per_run": [r["metrics"] for r in runs],
         "user_ids": [r["user_id"] for r in runs],
     }
-    out = HERE / "locomo_10run_summary.json"
+    out = HERE / os.environ.get("LOCOMO_SUMMARY_FILE", "locomo_10run_summary.json")
     out.write_text(json.dumps(summary, indent=2))
     print(f"\nSummary saved to: {out}")
 
