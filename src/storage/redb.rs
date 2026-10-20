@@ -89,14 +89,20 @@ impl BatchWriter for RedbBatchWriter {
         // resolves every name first and an unknown one fails before the write
         // transaction is ever opened.
         {
-            let read = self.database.begin_read()?;
+            let read = self
+                .database
+                .begin_read()
+                .map_err(|e| super::redb_latch::refused(&self.database, e.into()))?;
             for name in batch.column_families() {
                 let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(name);
                 read.open_table(def).map_err(|e| {
-                    anyhow!(
-                        "write_batch names table '{}', which this database does not have \
-                         ({e}) — nothing was written",
-                        name
+                    super::redb_latch::refused(
+                        &self.database,
+                        anyhow!(
+                            "write_batch names table '{}', which this database does not have \
+                             ({e}) — nothing was written",
+                            name
+                        ),
                     )
                 })?;
             }
@@ -287,10 +293,9 @@ pub(crate) fn create_redb_database(
         std::fs::create_dir_all(parent)?;
     }
 
-    let database = redb::Builder::new()
-        .set_cache_size(tuning.redb_cache_bytes)
-        .create(path)?;
-    Ok(Arc::new(database))
+    let mut builder = redb::Builder::new();
+    builder.set_cache_size(tuning.redb_cache_bytes);
+    super::redb_latch::open(path, &builder)
 }
 
 /// redb's durability for a configured class.
@@ -303,12 +308,15 @@ fn redb_durability(durability: StorageDurability) -> redb::Durability {
 
 /// A write transaction that commits at `durability`. Every write transaction this
 /// module opens starts here: redb begins each one at `Immediate`, so a class set
-/// anywhere else would not reach the transactions that bypass it.
+/// anywhere else would not reach the transactions that bypass it. On a handle that
+/// a full disk has poisoned it is refused with the write latch.
 pub(crate) fn begin_write(
     database: &redb::Database,
     durability: StorageDurability,
 ) -> Result<redb::WriteTransaction> {
-    let mut txn = database.begin_write()?;
+    let mut txn = database
+        .begin_write()
+        .map_err(|err| super::redb_latch::refused(database, err.into()))?;
     txn.set_durability(redb_durability(durability));
     Ok(txn)
 }

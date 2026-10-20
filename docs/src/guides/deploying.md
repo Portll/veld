@@ -205,6 +205,18 @@ to the options, for which the C API has no setter (`db/error_handler.cc:541`).
 same process cannot work either: RocksDB holds a directory lock and live handles are
 still outstanding.
 
+**On redb a NoSpace write latches hard at once.** redb poisons a database handle on
+its first I/O error: from then on every write, and every read its page cache cannot
+answer, fails with `PreviousIo` until the file is closed and reopened (redb 2.6.3,
+`tree_store/page_store/cached_file.rs:129-180`). There is nothing to retry, so the
+failing write latches its `.redb` file hard, and later writes to that file answer
+`503 STORAGE_WRITE_LATCHED`. Veld does not reopen the file in place: every store over
+it holds the same handle, and redb's file lock refuses a second open while any of them
+does. With `VELD_WRITE_LATCH_RESTART=1` the process exits for a restart once space is
+back, as it does for RocksDB. A tenant's files are also reopened when the tenant is
+evicted from the cache and used again, and the first commit on the new handle clears
+the latch.
+
 | Variable | Default | Effect |
 |---|---|---|
 | `VELD_WRITE_LATCH_MIN_FREE_BYTES` | `268435456` (256 MiB) | Below this, the disk is treated as genuinely full and the write is not retried |
