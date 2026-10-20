@@ -539,7 +539,7 @@ impl GraphStore for RocksDbGraphStore {
         &self,
         entity_uuid: &uuid::Uuid,
     ) -> Result<Vec<RelationshipEdge>> {
-        self.inner.get_entity_relationships(entity_uuid)
+        self.inner.stored_entity_relationships(entity_uuid)
     }
 
     fn get_episode(&self, uuid: &uuid::Uuid) -> Result<Option<EpisodicNode>> {
@@ -1761,9 +1761,11 @@ mod engine_parity_tests {
         for (engine, store, _dir) in engines() {
             let stored = memory("a memory to find by key", 0.5);
             store.put_memory(&stored).unwrap();
+            // Never 16 bytes: RocksDB shares its default keyspace with memories and
+            // takes every unprefixed 16-byte key there for a memory id.
             store
                 .default_key_value_store()
-                .put_bytes(b"dkv:not-a-memory", b"1")
+                .put_bytes(b"dkv:not-a-memory-row", b"1")
                 .unwrap();
             store
                 .put_vector_mapping(&stored.id, &VectorMappingEntry::default())
