@@ -3,13 +3,15 @@
 //! CRUD endpoints for agent-editable context blocks (Letta-style mutable state).
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::validation;
 
@@ -69,12 +71,16 @@ fn block_to_response(block: &crate::memory::ContextBlock) -> BlockResponse {
 #[tracing::instrument(skip(state), fields(user_id = %query.user_id))]
 pub async fn list_context_blocks(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(query): Query<BlockQuery>,
 ) -> Result<Json<BlockListResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let store = state.context_block_store.clone();
-    let user_id = query.user_id.clone();
 
     let blocks = tokio::task::spawn_blocking(move || store.list(&user_id))
         .await
@@ -93,13 +99,17 @@ pub async fn list_context_blocks(
 #[tracing::instrument(skip(state), fields(user_id = %query.user_id, key = %key))]
 pub async fn get_context_block(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(key): Path<String>,
     Query(query): Query<BlockQuery>,
 ) -> Result<Json<BlockResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let store = state.context_block_store.clone();
-    let user_id = query.user_id.clone();
     let block_key = key.clone();
 
     let block = tokio::task::spawn_blocking(move || store.get(&user_id, &block_key))
@@ -141,13 +151,17 @@ pub async fn set_context_block(
 #[tracing::instrument(skip(state), fields(user_id = %query.user_id, key = %key))]
 pub async fn delete_context_block(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(key): Path<String>,
     Query(query): Query<BlockQuery>,
 ) -> Result<Json<BlockDeleteResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let store = state.context_block_store.clone();
-    let user_id = query.user_id.clone();
     let block_key = key;
 
     let deleted = tokio::task::spawn_blocking(move || store.delete(&user_id, &block_key))
