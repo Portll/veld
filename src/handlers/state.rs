@@ -1022,14 +1022,15 @@ impl MultiUserMemoryManager {
     }
 
     #[cfg(feature = "rocksdb")]
-    fn shared_store_cf_options(cache: Option<&rocksdb::Cache>) -> rocksdb::Options {
+    fn shared_store_cf_options(
+        cache: Option<&crate::storage::SharedBlockCache>,
+    ) -> rocksdb::Options {
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
         options.set_compression_type(rocksdb::DBCompressionType::Lz4);
         if let Some(cache) = cache {
-            options.set_block_based_table_factory(&crate::memory::storage::block_based_options(
-                cache,
-            ));
+            options
+                .set_block_based_table_factory(&crate::memory::storage::block_based_options(cache));
         }
         options
     }

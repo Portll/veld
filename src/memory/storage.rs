@@ -5,8 +5,8 @@ use bincode;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "rocksdb")]
 use rocksdb::{
-    Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions,
-    DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBCompressionType,
+    IteratorMode, Options, ReadOptions, WriteBatch, WriteBufferManager, WriteOptions, DB,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "rocksdb")]
@@ -1404,8 +1404,8 @@ const PROCESS_WRITE_BUFFER_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 /// length, and the scans over it seek with arbitrary-length bounds; with a prefix bloom
 /// RocksDB may skip SST files for a seek whose bound is not the extractor's prefix,
 /// silently dropping rows. The whole-key bloom serves the point lookups that dominate.
-pub fn block_based_options(cache: &rocksdb::Cache) -> rocksdb::BlockBasedOptions {
-    let mut block_opts = rocksdb::BlockBasedOptions::default();
+pub fn block_based_options(cache: &Cache) -> BlockBasedOptions {
+    let mut block_opts = BlockBasedOptions::default();
     block_opts.set_bloom_filter(10.0, false);
     block_opts.set_block_cache(cache);
     block_opts.set_cache_index_and_filter_blocks(true);
@@ -1416,10 +1416,10 @@ pub fn block_based_options(cache: &rocksdb::Cache) -> rocksdb::BlockBasedOptions
 #[cfg(feature = "rocksdb")]
 /// Options for a secondary column family (index, KV): Lz4, two memtables of
 /// `write_buffer_bytes`, and [`block_based_options`] over `cache`.
-pub fn column_family_options(cache: &rocksdb::Cache, write_buffer_bytes: usize) -> Options {
+pub fn column_family_options(cache: &Cache, write_buffer_bytes: usize) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.create_if_missing(true);
-    cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    cf_opts.set_compression_type(DBCompressionType::Lz4);
     cf_opts.set_max_write_buffer_number(2);
     cf_opts.set_write_buffer_size(write_buffer_bytes);
     cf_opts.set_block_based_table_factory(&block_based_options(cache));
@@ -1432,10 +1432,10 @@ pub fn column_family_options(cache: &rocksdb::Cache, write_buffer_bytes: usize) 
 /// 256 MiB and charging it to the cache. Writers are not stalled at the limit; RocksDB
 /// flushes instead. The first caller's cache is the one charged, so every caller must
 /// pass the same process-wide cache.
-pub fn shared_write_buffer_manager(cache: &rocksdb::Cache) -> &'static rocksdb::WriteBufferManager {
-    static MANAGER: std::sync::OnceLock<rocksdb::WriteBufferManager> = std::sync::OnceLock::new();
+pub fn shared_write_buffer_manager(cache: &Cache) -> &'static WriteBufferManager {
+    static MANAGER: std::sync::OnceLock<WriteBufferManager> = std::sync::OnceLock::new();
     MANAGER.get_or_init(|| {
-        rocksdb::WriteBufferManager::new_write_buffer_manager_with_cache(
+        WriteBufferManager::new_write_buffer_manager_with_cache(
             PROCESS_WRITE_BUFFER_LIMIT_BYTES,
             false,
             cache.clone(),
@@ -1507,7 +1507,7 @@ impl MemoryStorage {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
 
         // ========================================================================
         // DURABILITY SETTINGS - Critical for data persistence across restarts
@@ -1533,7 +1533,7 @@ impl MemoryStorage {
         opts.set_level_compaction_dynamic_level_bytes(true);
 
         // Read performance — shared block cache for multi-tenant, small local for standalone
-        use rocksdb::Cache;
+        use Cache;
         let local_cache;
         let cache = match shared_cache {
             Some(c) => c,
@@ -2763,7 +2763,7 @@ impl MemoryStorage {
         let idx = self.index_cf();
         let holder_suffix = format!(":{}", holder.0);
         let scan_prefix = b"inbound_ref:";
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let iter = self.db.iterator_cf_opt(
             idx,
@@ -3441,7 +3441,7 @@ impl MemoryStorage {
     /// individual memories in batches to avoid OOM on large datasets.
     pub fn get_all_ids(&self) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
         for (key, _) in iter.flatten() {
@@ -3467,7 +3467,7 @@ impl MemoryStorage {
 
         // fill_cache(false) prevents this maintenance scan from polluting
         // the block cache with cold data, reducing C++ peak memory
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
         for (key, value) in iter.flatten() {
@@ -3495,7 +3495,7 @@ impl MemoryStorage {
 
         let idx = self.index_cf();
         let prefix = UNCOMPRESSED_INDEX_PREFIX.as_bytes();
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         read_opts.set_iterate_upper_bound(format!(
             "{UNCOMPRESSED_INDEX_PREFIX}{:020}",
@@ -3549,7 +3549,7 @@ impl MemoryStorage {
     /// Read and decode one record without filling the block cache or rewriting legacy
     /// encodings: for maintenance passes that visit records nobody asked for.
     fn get_uncached(&self, id: &MemoryId) -> Result<Option<Memory>> {
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let key = id.0.as_bytes();
         match self.db.get_opt(key, &read_opts)? {
@@ -3568,7 +3568,7 @@ impl MemoryStorage {
             return Ok(());
         }
 
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let mut batch = WriteBatch::default();
         let mut indexed = 0usize;
@@ -3758,7 +3758,7 @@ impl MemoryStorage {
         let mut deserialize_errors = 0;
         let stats_prefix = b"stats:";
 
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
         for item in iter {
@@ -6721,7 +6721,7 @@ mod tests {
     #[cfg(feature = "rocksdb")]
     #[test]
     fn shared_cache_and_write_buffer_manager_open_round_trips_data() {
-        let cache = rocksdb::Cache::new_lru_cache(8 * 1024 * 1024);
+        let cache = Cache::new_lru_cache(8 * 1024 * 1024);
         let dir = tempfile::TempDir::new().unwrap();
         let m = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
         {
