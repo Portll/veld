@@ -108,8 +108,7 @@ pub(crate) fn snapshot_payload(
     memory: &crate::memory::Memory,
     kind: SnapshotKind,
 ) -> Option<crate::intent_log::IntentPayload> {
-    let memory_bincode = match bincode::serde::encode_to_vec(memory, bincode::config::standard())
-    {
+    let memory_bincode = match bincode::serde::encode_to_vec(memory, bincode::config::standard()) {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::warn!(
@@ -1687,129 +1686,155 @@ pub async fn batch_remember(
 
     let create_edges = req.options.create_edges;
 
-    // Build experiences
-    let mut experiences_with_index: Vec<(
-        usize,
-        Experience,
-        Option<chrono::DateTime<chrono::Utc>>,
-    )> = Vec::with_capacity(valid_items.len());
-    let mut parent_ids: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-    let mut labelled_by_index: std::collections::HashMap<usize, TagSources> =
-        std::collections::HashMap::new();
-    let mut declared_by_index: std::collections::HashMap<usize, Vec<DeclaredEntity>> =
-        std::collections::HashMap::new();
-
+    // NER and YAKE inference for every item, and the entity cap's graph reads: CPU-bound
+    // and blocking, so the whole pass runs off the async workers.
     let extract_start = std::time::Instant::now();
-    for (index, item, experience_type, mut declared) in valid_items {
-        if let Some(ref pid) = item.parent_id {
-            parent_ids.insert(index, pid.clone());
-        }
+    let (experiences_with_index, parent_ids, mut labelled_by_index, declared_by_index) = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        tokio::task::spawn_blocking(move || {
+            // Build experiences
+            let mut experiences_with_index: Vec<(
+                usize,
+                Experience,
+                Option<chrono::DateTime<chrono::Utc>>,
+            )> = Vec::with_capacity(valid_items.len());
+            let mut parent_ids: std::collections::HashMap<usize, String> =
+                std::collections::HashMap::new();
+            let mut labelled_by_index: std::collections::HashMap<usize, TagSources> =
+                std::collections::HashMap::new();
+            let mut declared_by_index: std::collections::HashMap<usize, Vec<DeclaredEntity>> =
+                std::collections::HashMap::new();
 
-        let (merged_entities, ner_records, labelled_tags) = if extract_entities {
-            // NER for named entities (Person, Org, Location, Misc)
-            let ner_records: Vec<NerEntityRecord> = match neural_ner.extract(&item.content) {
-                Ok(entities) => entities
-                    .into_iter()
-                    .map(|e| NerEntityRecord {
-                        text: e.text,
-                        entity_type: e.entity_type.as_str().to_string(),
-                        confidence: e.confidence,
-                        start_char: Some(e.start),
-                        end_char: Some(e.end),
-                    })
-                    .collect(),
-                Err(e) => {
-                    tracing::debug!("NER extraction failed for batch item {}: {}", index, e);
-                    Vec::new()
+            for (index, item, experience_type, mut declared) in valid_items {
+                if let Some(ref pid) = item.parent_id {
+                    parent_ids.insert(index, pid.clone());
                 }
-            };
-            let ner_records = drop_person_location_in_code(ner_records, None, &item.content);
 
-            // YAKE for common nouns, verbs, concepts
-            let extracted_keywords: Vec<String> = keyword_extractor.extract_texts(&item.content);
+                let (merged_entities, ner_records, labelled_tags) = if extract_entities {
+                    // NER for named entities (Person, Org, Location, Misc)
+                    let ner_records: Vec<NerEntityRecord> = match neural_ner.extract(&item.content)
+                    {
+                        Ok(entities) => entities
+                            .into_iter()
+                            .map(|e| NerEntityRecord {
+                                text: e.text,
+                                entity_type: e.entity_type.as_str().to_string(),
+                                confidence: e.confidence,
+                                start_char: Some(e.start),
+                                end_char: Some(e.end),
+                            })
+                            .collect(),
+                        Err(e) => {
+                            tracing::debug!(
+                                "NER extraction failed for batch item {}: {}",
+                                index,
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
+                    let ner_records =
+                        drop_person_location_in_code(ner_records, None, &item.content);
 
-            let (mut merged, mut sources) = authored_tags(&declared, &item.tags);
-            // Derived from here on — see crate::entity_cap.
-            let authored_batch_count = merged.len();
-            let mut seen: HashSet<String> = merged.iter().map(|t| t.to_lowercase()).collect();
-            for record in &ner_records {
-                if seen.insert(record.text.to_lowercase()) {
-                    merged.push(record.text.clone());
-                    sources.push(TagSource::Ner);
-                }
-            }
-            for keyword in extracted_keywords {
-                if seen.insert(keyword.to_lowercase()) {
-                    merged.push(keyword);
-                    sources.push(TagSource::Yake);
-                }
-            }
-            let assembled = merged.clone();
-            let redaction = crate::redaction::redact_entities(&mut merged);
-            crate::declared_entities::retain_unredacted(&mut declared);
-            let redacted = merged.clone();
-            if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
-                tracing::debug!(
-                    batch_index = index,
-                    count = merged.len(),
-                    max = validation::MAX_ENTITIES_PER_MEMORY,
-                    "Capping entities to maximum allowed in batch item"
+                    // YAKE for common nouns, verbs, concepts
+                    let extracted_keywords: Vec<String> =
+                        keyword_extractor.extract_texts(&item.content);
+
+                    let (mut merged, mut sources) = authored_tags(&declared, &item.tags);
+                    // Derived from here on — see crate::entity_cap.
+                    let authored_batch_count = merged.len();
+                    let mut seen: HashSet<String> =
+                        merged.iter().map(|t| t.to_lowercase()).collect();
+                    for record in &ner_records {
+                        if seen.insert(record.text.to_lowercase()) {
+                            merged.push(record.text.clone());
+                            sources.push(TagSource::Ner);
+                        }
+                    }
+                    for keyword in extracted_keywords {
+                        if seen.insert(keyword.to_lowercase()) {
+                            merged.push(keyword);
+                            sources.push(TagSource::Yake);
+                        }
+                    }
+                    let assembled = merged.clone();
+                    let redaction = crate::redaction::redact_entities(&mut merged);
+                    crate::declared_entities::retain_unredacted(&mut declared);
+                    let redacted = merged.clone();
+                    if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
+                        tracing::debug!(
+                            batch_index = index,
+                            count = merged.len(),
+                            max = validation::MAX_ENTITIES_PER_MEMORY,
+                            "Capping entities to maximum allowed in batch item"
+                        );
+                        let mentions = mention_counts_for(&state, &user_id, &merged);
+                        let (kept, report) = crate::entity_cap::cap_by_selectivity(
+                            std::mem::take(&mut merged),
+                            authored_batch_count,
+                            validation::MAX_ENTITIES_PER_MEMORY,
+                            &mentions,
+                        );
+                        merged = kept;
+                        tracing::debug!(
+                            considered = report.considered,
+                            dropped = report.dropped,
+                            rescued_by_ordering = report.rescued_by_ordering,
+                            "Capped batch entities by selectivity"
+                        );
+                    }
+                    let labelled =
+                        TagSources::label(&sources, &assembled, &redacted, &merged, &redaction);
+                    (merged, ner_records, labelled)
+                } else {
+                    // The extraction branch is skipped here, so this path would otherwise reach the graph
+                    // with no redaction at all — a bypass that exists precisely when the cheap path is
+                    // taken. Submitted tags are still tags, and a caller can put a key in one.
+                    let (mut plain, sources) = authored_tags(&declared, &item.tags);
+                    let before = plain.clone();
+                    let redaction = crate::redaction::redact_entities(&mut plain);
+                    crate::declared_entities::retain_unredacted(&mut declared);
+                    let labelled = TagSources::label(&sources, &before, &plain, &plain, &redaction);
+                    (plain, Vec::new(), labelled)
+                };
+                labelled_by_index.insert(index, labelled_tags);
+                declared_by_index.insert(index, declared);
+
+                let context = build_rich_context(
+                    item.emotional_valence,
+                    item.emotional_arousal,
+                    item.emotion.clone(),
+                    item.source_type.clone(),
+                    item.credibility,
+                    item.episode_id.clone(),
+                    item.sequence_number,
+                    item.preceding_memory_id.clone(),
+                    item.writer.clone(),
                 );
-                let mentions = mention_counts_for(&state, &req.user_id, &merged);
-                let (kept, report) = crate::entity_cap::cap_by_selectivity(
-                    std::mem::take(&mut merged),
-                    authored_batch_count,
-                    validation::MAX_ENTITIES_PER_MEMORY,
-                    &mentions,
-                );
-                merged = kept;
-                tracing::debug!(
-                    considered = report.considered,
-                    dropped = report.dropped,
-                    rescued_by_ordering = report.rescued_by_ordering,
-                    "Capped batch entities by selectivity"
-                );
+
+                let experience = Experience {
+                    content: item.content,
+                    experience_type,
+                    entities: merged_entities.clone(),
+                    tags: merged_entities,
+                    context,
+                    ner_entities: ner_records,
+                    ..Default::default()
+                };
+
+                experiences_with_index.push((index, experience, item.created_at));
             }
-            let labelled = TagSources::label(&sources, &assembled, &redacted, &merged, &redaction);
-            (merged, ner_records, labelled)
-        } else {
-            // The extraction branch is skipped here, so this path would otherwise reach the graph
-            // with no redaction at all — a bypass that exists precisely when the cheap path is
-            // taken. Submitted tags are still tags, and a caller can put a key in one.
-            let (mut plain, sources) = authored_tags(&declared, &item.tags);
-            let before = plain.clone();
-            let redaction = crate::redaction::redact_entities(&mut plain);
-            crate::declared_entities::retain_unredacted(&mut declared);
-            let labelled = TagSources::label(&sources, &before, &plain, &plain, &redaction);
-            (plain, Vec::new(), labelled)
-        };
-        labelled_by_index.insert(index, labelled_tags);
-        declared_by_index.insert(index, declared);
-
-        let context = build_rich_context(
-            item.emotional_valence,
-            item.emotional_arousal,
-            item.emotion.clone(),
-            item.source_type.clone(),
-            item.credibility,
-            item.episode_id.clone(),
-            item.sequence_number,
-            item.preceding_memory_id.clone(),
-            item.writer.clone(),
-        );
-
-        let experience = Experience {
-            content: item.content,
-            experience_type,
-            entities: merged_entities.clone(),
-            tags: merged_entities,
-            context,
-            ner_entities: ner_records,
-            ..Default::default()
-        };
-
-        experiences_with_index.push((index, experience, item.created_at));
-    }
+            (
+                experiences_with_index,
+                parent_ids,
+                labelled_by_index,
+                declared_by_index,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Extraction task panicked: {e}")))?
+    };
     stage_timer.record("extract", extract_start);
 
     // Store memories
@@ -1955,11 +1980,7 @@ pub async fn batch_remember(
                     })
                     .await
                     .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")));
-                    metrics::observe_write_stage(
-                        "batch_remember",
-                        "graph",
-                        graph_start.elapsed(),
-                    );
+                    metrics::observe_write_stage("batch_remember", "graph", graph_start.elapsed());
                     if let Err(e) = graph_result {
                         tracing::debug!(
                             "Graph processing failed for {} (non-fatal): {}",
@@ -2270,28 +2291,40 @@ pub async fn upsert_memory(
     };
     let mut declared = crate::declared_entities::validate(&req.entities)?;
 
+    // NER and YAKE are CPU-bound inference: off the async workers, and run side by side.
     let extract_start = std::time::Instant::now();
-    // Extract entities via NER (preserve full records for graph label propagation)
-    let ner_entities: Vec<NerEntityRecord> = match state.get_neural_ner().extract(&req.content) {
-        Ok(entities) => entities
-            .into_iter()
-            .map(|e| NerEntityRecord {
-                text: e.text,
-                entity_type: e.entity_type.as_str().to_string(),
-                confidence: e.confidence,
-                start_char: Some(e.start),
-                end_char: Some(e.end),
-            })
-            .collect(),
-        Err(e) => {
-            tracing::debug!("NER extraction failed in upsert: {}", e);
-            Vec::new()
-        }
-    };
+    let ner = state.get_neural_ner();
+    let yake = state.get_keyword_extractor();
+    let content_for_ner = req.content.clone();
+    let content_for_yake = req.content.clone();
+    let (ner_result, yake_result) = tokio::join!(
+        tokio::task::spawn_blocking(move || match ner.extract(&content_for_ner) {
+            Ok(entities) => entities
+                .into_iter()
+                .map(|e| NerEntityRecord {
+                    text: e.text,
+                    entity_type: e.entity_type.as_str().to_string(),
+                    confidence: e.confidence,
+                    start_char: Some(e.start),
+                    end_char: Some(e.end),
+                })
+                .collect::<Vec<NerEntityRecord>>(),
+            Err(e) => {
+                tracing::debug!("NER extraction failed in upsert: {}", e);
+                Vec::new()
+            }
+        }),
+        tokio::task::spawn_blocking(move || yake.extract_texts(&content_for_yake))
+    );
+    let ner_entities = ner_result.unwrap_or_else(|e| {
+        tracing::error!("NER extraction task failed in upsert: {e}");
+        Vec::new()
+    });
     let ner_entities = drop_person_location_in_code(ner_entities, None, &req.content);
-
-    // Extract keywords via YAKE for common nouns, verbs, concepts
-    let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
+    let extracted_keywords: Vec<String> = yake_result.unwrap_or_else(|e| {
+        tracing::error!("YAKE extraction task failed in upsert: {e}");
+        Vec::new()
+    });
 
     let (mut merged_entities, mut tag_sources) = authored_tags(&declared, &req.tags);
     // Derived from here on — see crate::entity_cap.
@@ -2314,8 +2347,19 @@ pub async fn upsert_memory(
     crate::declared_entities::retain_unredacted(&mut declared);
     let redacted_tags = merged_entities.clone();
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        // Selectivity-ordered, same as the store path. See crate::entity_cap.
-        let mentions = mention_counts_for(&state, &req.user_id, &merged_entities);
+        // Selectivity-ordered, same as the store path. See crate::entity_cap. The mention
+        // counts are graph reads, so they are taken off the async workers too.
+        let mentions = {
+            let state = state.clone();
+            let user_id = req.user_id.clone();
+            let candidates = merged_entities.clone();
+            tokio::task::spawn_blocking(move || mention_counts_for(&state, &user_id, &candidates))
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("entity cap: mention count task failed: {e}");
+                    std::collections::HashMap::new()
+                })
+        };
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,
@@ -2508,15 +2552,19 @@ pub async fn upsert_memory(
     // Build episodic graph for multi-hop retrieval. An update rebuilds the episode, so the
     // graph does not keep the old entity set.
     let graph_start = std::time::Instant::now();
-    let graph_result = if was_update {
-        state.rebuild_experience_graph_declared(&req.user_id, &experience, &memory_id, &declared)
-    } else {
-        state.process_experience_into_graph_declared(
-            &req.user_id,
-            &experience,
-            &memory_id,
-            &declared,
-        )
+    let graph_result = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        let mid = memory_id.clone();
+        tokio::task::spawn_blocking(move || {
+            if was_update {
+                state.rebuild_experience_graph_declared(&user_id, &experience, &mid, &declared)
+            } else {
+                state.process_experience_into_graph_declared(&user_id, &experience, &mid, &declared)
+            }
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")))
     };
     stage_timer.record("graph", graph_start);
     if let Err(e) = graph_result {
