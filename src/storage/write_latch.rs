@@ -67,6 +67,7 @@ pub fn cooldown() -> Duration {
     ))
 }
 
+#[cfg(feature = "rocksdb")]
 fn restart_on_hard_latch() -> bool {
     matches!(
         std::env::var("VELD_WRITE_LATCH_RESTART").as_deref(),
@@ -586,6 +587,7 @@ pub fn recover_write<T>(
     }
 }
 
+#[cfg(feature = "rocksdb")]
 fn report_hard(latch: &WriteLatch, path: &Path, detail: &str) {
     // `reason_at` before `claim_hard_notice`: the notice is claimable once, and
     // a clear racing in between would leave the one ERROR line without a cause.
@@ -610,6 +612,7 @@ fn report_hard(latch: &WriteLatch, path: &Path, detail: &str) {
 }
 
 /// Opt-in, default off: exiting is a behaviour change an operator chooses.
+#[cfg(feature = "rocksdb")]
 fn maybe_restart(path: &Path) {
     if !restart_on_hard_latch() {
         return;
