@@ -1601,7 +1601,9 @@ mod tests {
         let store = SlowStore::open(&dir.path().join("slow.db")).unwrap();
         assert!(store.never_synced());
 
-        let first = store.begin_sync(0).expect("nothing in flight, never synced");
+        let first = store
+            .begin_sync(0)
+            .expect("nothing in flight, never synced");
         assert!(
             store.begin_sync(0).is_none(),
             "a second caller must skip while a rebuild is running"
