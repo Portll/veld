@@ -760,12 +760,14 @@ pub struct RelationshipEdge {
     // When memory A triggers recall of B (but not vice versa), the edge
     // should reflect this asymmetry for spreading activation.
     /// Forward activation strength (from_entity triggered, to_entity co-retrieved)
-    /// Increases when from_entity is the query match and to_entity is co-retrieved.
+    /// Increases when from_entity is the query match and to_entity is co-retrieved,
+    /// once per strengthening source, as `strength` does.
     #[serde(default)]
     pub forward_strength: f32,
 
     /// Backward activation strength (to_entity triggered, from_entity co-retrieved)
-    /// Increases when to_entity is the query match and from_entity is co-retrieved.
+    /// Increases when to_entity is the query match and from_entity is co-retrieved,
+    /// once per strengthening source, as `strength` does.
     #[serde(default)]
     pub backward_strength: f32,
 
@@ -862,6 +864,11 @@ pub struct Strengthening {
     pub evidence: Evidence,
     /// `Some((old_tier, new_tier))` when the event promoted the edge.
     pub promotion: Option<(String, String)>,
+    /// The fraction of a new source's step this event earned: 1 for a new source;
+    /// for a repeat, `HEBBIAN_REPEAT_SOURCE_BOOST` over the edge's full step rate, so
+    /// 0 by default. The directional components take this same fraction of their
+    /// own step, so one source counts once in every component of the edge.
+    pub step: f32,
 }
 
 /// Evidence record for an edge created by a strengthening event from `source`.
@@ -954,6 +961,14 @@ impl RelationshipEdge {
         crate::metrics::HEBBIAN_STRENGTHEN_EVENTS_TOTAL
             .with_label_values(&[evidence.label()])
             .inc();
+        // Hebbian strengthening with tier-specific boost
+        let tier_boost = match self.tier {
+            EdgeTier::L1Working => TIER_CO_ACCESS_BOOST,
+            EdgeTier::L2Episodic => TIER_CO_ACCESS_BOOST * 0.8,
+            EdgeTier::L3Semantic => TIER_CO_ACCESS_BOOST * 0.5,
+        };
+        let full_step_rate = LTP_LEARNING_RATE + tier_boost;
+
         if evidence == Evidence::RepeatSource {
             if HEBBIAN_REPEAT_SOURCE_BOOST > 0.0 {
                 let boost = HEBBIAN_REPEAT_SOURCE_BOOST * (1.0 - self.strength);
@@ -962,6 +977,7 @@ impl RelationshipEdge {
             return Strengthening {
                 evidence,
                 promotion: None,
+                step: (HEBBIAN_REPEAT_SOURCE_BOOST / full_step_rate).min(1.0),
             };
         }
 
@@ -971,13 +987,7 @@ impl RelationshipEdge {
         // PIPE-4: Record activation timestamp for L2+ edges
         self.record_activation_timestamp(now);
 
-        // Hebbian strengthening with tier-specific boost
-        let tier_boost = match self.tier {
-            EdgeTier::L1Working => TIER_CO_ACCESS_BOOST,
-            EdgeTier::L2Episodic => TIER_CO_ACCESS_BOOST * 0.8,
-            EdgeTier::L3Semantic => TIER_CO_ACCESS_BOOST * 0.5,
-        };
-        let boost = (LTP_LEARNING_RATE + tier_boost) * (1.0 - self.strength);
+        let boost = full_step_rate * (1.0 - self.strength);
         self.strength = (self.strength + boost).min(1.0);
 
         // PIPE-4: Multi-scale LTP detection (only upgrade, never downgrade)
@@ -1066,6 +1076,7 @@ impl RelationshipEdge {
         Strengthening {
             evidence: Evidence::NewSource,
             promotion: promotion_result,
+            step: 1.0,
         }
     }
 
@@ -1565,10 +1576,17 @@ impl RelationshipEdge {
     /// Note: Does NOT modify `self.strength` — the undirected strength is managed
     /// independently by `strengthen()` and represents overall edge health.
     /// Directional fields track asymmetry only.
-    pub(crate) fn strengthen_forward(&mut self) {
+    ///
+    /// `step` is [`Strengthening::step`] from the same event: a repeat from a source
+    /// already on the edge moves direction by the same fraction as strength, 0 by
+    /// default, so repetition cannot build asymmetry the evidence does not support.
+    pub(crate) fn strengthen_forward(&mut self, step: f32) {
         use crate::constants::COACTIVATION_FORWARD_BOOST;
+        if step <= 0.0 {
+            return;
+        }
         self.ensure_directional();
-        let delta = COACTIVATION_FORWARD_BOOST * (1.0 - self.forward_strength);
+        let delta = COACTIVATION_FORWARD_BOOST * step * (1.0 - self.forward_strength);
         self.forward_strength = (self.forward_strength + delta).min(1.0);
     }
 
@@ -1579,11 +1597,14 @@ impl RelationshipEdge {
     ///
     /// Note: Does NOT modify `self.strength` — the undirected strength is managed
     /// independently by `strengthen()` and represents overall edge health.
-    /// Directional fields track asymmetry only.
-    pub(crate) fn strengthen_backward(&mut self) {
+    /// Directional fields track asymmetry only. `step` as for [`Self::strengthen_forward`].
+    pub(crate) fn strengthen_backward(&mut self, step: f32) {
         use crate::constants::COACTIVATION_BACKWARD_BOOST;
+        if step <= 0.0 {
+            return;
+        }
         self.ensure_directional();
-        let delta = COACTIVATION_BACKWARD_BOOST * (1.0 - self.backward_strength);
+        let delta = COACTIVATION_BACKWARD_BOOST * step * (1.0 - self.backward_strength);
         self.backward_strength = (self.backward_strength + delta).min(1.0);
     }
 
@@ -5356,18 +5377,19 @@ impl GraphMemory {
 
             if let Some(mut edge) = existing_edge {
                 // Strengthen existing edge with directional awareness
-                if edge.strengthen_from(source).evidence == Evidence::NewSource {
+                let strengthening = edge.strengthen_from(source);
+                if strengthening.evidence == Evidence::NewSource {
                     activations += 1;
                 }
 
                 // Apply directional boost based on which entity is the trigger
                 if edge.from_entity == *trigger_id {
                     // Edge stored as trigger→coactivated: boost forward
-                    edge.strengthen_forward();
+                    edge.strengthen_forward(strengthening.step);
                 } else {
                     // Edge stored as coactivated→trigger: boost backward
                     // (backward from edge's perspective = forward from trigger's perspective)
-                    edge.strengthen_backward();
+                    edge.strengthen_backward(strengthening.step);
                 }
 
                 let key = edge.uuid.as_bytes();
@@ -5398,9 +5420,11 @@ impl GraphMemory {
                     tier: EdgeTier::L1Working,
                     entity_confidence: None,
                     created_by: EdgeSource::Coactivation,
-                    // Directional: forward (trigger→coact) gets initial boost
-                    // Both start at initial_weight; forward gets the first directional nudge
-                    forward_strength: (initial_weight + COACTIVATION_FORWARD_BOOST).min(1.0),
+                    // Directional: both start at initial_weight and the creating source's
+                    // trigger→coact event takes one forward step, in the same delta form as
+                    // every later step.
+                    forward_strength: initial_weight
+                        + COACTIVATION_FORWARD_BOOST * (1.0 - initial_weight),
                     backward_strength: initial_weight,
                     strengthening_sources: evidence_from(source),
                     last_corroborated: Some(Utc::now()),
@@ -10762,6 +10786,46 @@ mod tests {
         assert_eq!(edge.strength, at_cap);
         assert_eq!(edge.distinct_sources(), HEBBIAN_EVIDENCE_SOURCES_CAP);
         assert!(!edge.strengthening_sources.contains_key("late"));
+        assert_eq!(
+            edge.strengthen_from("later").step,
+            0.0,
+            "past the cap a new source earns no directional step either"
+        );
+    }
+
+    #[test]
+    fn direction_moves_once_per_source_by_exactly_one_step() {
+        use crate::constants::{COACTIVATION_BACKWARD_BOOST, COACTIVATION_FORWARD_BOOST};
+        let mut edge = create_test_edge_with_tier(0.4, 0, EdgeTier::L1Working);
+        edge.forward_strength = 0.4;
+        edge.backward_strength = 0.4;
+
+        let first = edge.strengthen_from("session-a");
+        assert_eq!(first.step, 1.0);
+        edge.strengthen_forward(first.step);
+        let forward = 0.4 + COACTIVATION_FORWARD_BOOST * (1.0 - 0.4);
+        assert!((edge.forward_strength - forward).abs() < 1e-6);
+
+        for _ in 0..50 {
+            let repeat = edge.strengthen_from("session-a");
+            assert_eq!(repeat.step, 0.0);
+            edge.strengthen_forward(repeat.step);
+            edge.strengthen_backward(repeat.step);
+        }
+        assert!(
+            (edge.forward_strength - forward).abs() < 1e-6,
+            "fifty repeats from one session must not move direction"
+        );
+        assert_eq!(edge.backward_strength, 0.4);
+
+        let corroboration = edge.strengthen_from("session-b");
+        edge.strengthen_backward(corroboration.step);
+        let backward = 0.4 + COACTIVATION_BACKWARD_BOOST * (1.0 - 0.4);
+        assert!((edge.backward_strength - backward).abs() < 1e-6);
+        assert!(
+            (edge.forward_strength - forward).abs() < 1e-6,
+            "only the direction the new source triggered moves"
+        );
     }
 
     #[test]
@@ -10865,6 +10929,11 @@ mod tests {
         assert_eq!(repeated.activation_count, created.activation_count);
         assert_eq!(repeated.distinct_sources(), 1);
         assert_eq!(repeated.strengthening_sources["session-a"], 11);
+        assert_eq!(
+            (repeated.forward_strength, repeated.backward_strength),
+            (created.forward_strength, created.backward_strength),
+            "nor direction"
+        );
 
         graph
             .apply_reinforcement(Uuid::new_v4(), "session-b", &a, &[b])
@@ -10872,6 +10941,15 @@ mod tests {
         let corroborated = graph.find_edge_between_entities(&a, &b).unwrap().unwrap();
         assert!(corroborated.strength > repeated.strength);
         assert_eq!(corroborated.distinct_sources(), 2);
+        let one_step = crate::constants::COACTIVATION_FORWARD_BOOST
+            * (1.0 - repeated.forward_strength);
+        assert!(
+            (corroborated.forward_strength - (repeated.forward_strength + one_step)).abs() < 1e-6,
+            "a new session moves the triggered direction by one step: {} -> {}",
+            repeated.forward_strength,
+            corroborated.forward_strength
+        );
+        assert_eq!(corroborated.backward_strength, repeated.backward_strength);
         assert!(corroborated.last_corroborated >= created.last_corroborated);
     }
 }
