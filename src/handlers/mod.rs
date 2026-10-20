@@ -61,6 +61,9 @@ pub mod files;
 // Background processing
 pub mod consolidation;
 
+// Embedding spaces and the maps between them
+pub mod spaces;
+
 // Admin operational endpoints (rate-limit reset, etc.)
 pub mod admin;
 

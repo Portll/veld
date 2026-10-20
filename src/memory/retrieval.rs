@@ -66,8 +66,9 @@ pub fn is_space_mismatch(error: &anyhow::Error) -> bool {
 ///
 /// 1. `vector_index` - Primary vector similarity search index (384d)
 /// 2. `id_mapping` - Primary memory ID ↔ vector ID mapping
-/// 3. `space_indexes` - one index per non-primary space, each locking its index before its
-///    mapping; never two spaces at once
+/// 3. `space_indexes` - one index per non-primary space. The map's own lock is held only to
+///    clone an index out (or, rarely, to add one); each index then locks its index before its
+///    mapping, never two spaces at once
 /// 5. `consolidation_events` - Introspection event buffer
 ///
 /// **Rules:**
@@ -89,7 +90,7 @@ pub struct RetrievalEngine {
     id_mapping: Arc<RwLock<IdMapping>>,
     /// Lock order: 3 - One index per space other than the primary's, by space. Today the
     /// secondary embedder's space; any space a query can reach has one.
-    space_indexes: std::collections::BTreeMap<SpaceId, SpaceIndex>,
+    space_indexes: RwLock<std::collections::BTreeMap<SpaceId, Arc<SpaceIndex>>>,
     /// The space every vector in `vector_index` is in.
     index_space: SpaceId,
     /// The space the secondary embedder writes, a key of `space_indexes` when configured. The
@@ -207,10 +208,36 @@ impl RetrievalEngine {
         if let Some(space) = &secondary_index_space {
             space_indexes.insert(
                 space.clone(),
-                SpaceIndex::open(&storage_path, space.clone())
-                    .with_context(|| format!("Failed to initialize the {space} index"))?,
+                Arc::new(
+                    SpaceIndex::open(&storage_path, space.clone())
+                        .with_context(|| format!("Failed to initialize the {space} index"))?,
+                ),
             );
             info!("Space index initialized: {space}");
+        }
+        // A space a fitted map reaches from a space this engine writes is searchable too: its
+        // index holds the memories' stored vectors in it, and queries arrive through the map.
+        let corpus_bridges = crate::embeddings::alignment_spaces::corpus_alignments(&storage_path);
+        let producible: Vec<SpaceId> = std::iter::once(index_space.clone())
+            .chain(secondary_index_space.clone())
+            .collect();
+        for (from, to, path, _) in &corpus_bridges {
+            if producible.contains(from)
+                && !producible.contains(to)
+                && !space_indexes.contains_key(to)
+            {
+                space_indexes.insert(
+                    to.clone(),
+                    Arc::new(
+                        SpaceIndex::open(&storage_path, to.clone())
+                            .with_context(|| format!("Failed to initialize the {to} index"))?,
+                    ),
+                );
+                info!(
+                    "Space index initialized: {to}, reached from {from} through {}",
+                    path.display()
+                );
+            }
         }
         let backlog = EmbeddingBacklogStore::with_kv(storage.key_value_store());
         let engine = Self {
@@ -219,7 +246,7 @@ impl RetrievalEngine {
             embedder,
             vector_index: Arc::new(RwLock::new(vector_index)),
             id_mapping: Arc::new(RwLock::new(id_mapping)),
-            space_indexes,
+            space_indexes: RwLock::new(space_indexes),
             index_space,
             secondary_index_space,
             backlog,
@@ -230,6 +257,17 @@ impl RetrievalEngine {
         // ATOMIC STARTUP: Rebuild Vamana from RocksDB (single source of truth)
         engine.rebuild_from_rocksdb()?;
 
+        for (from, to, path, alignment) in corpus_bridges {
+            let confidence = crate::embeddings::alignment_spaces::confidence_of(alignment.as_ref());
+            match engine
+                .embedder
+                .install_bridge(from.clone(), to.clone(), alignment, confidence)
+            {
+                Ok(()) => info!("Installed the {from} → {to} map from {}", path.display()),
+                Err(e) => warn!("{}: {e}", path.display()),
+            }
+        }
+
         // Alignment onboarding: load (or autofit, if VELD_ALIGNMENT_AUTOFIT=1)
         // a learned projection from secondary→primary space. No-op for
         // primary-only installs. Errors are downgraded to a warning so an
@@ -238,10 +276,17 @@ impl RetrievalEngine {
             engine.embedder.secondary_embedder(),
             engine.embedder.has_alignment(),
         ) {
-            let pair_id = crate::embeddings::AlignmentPairId::new(
-                engine.embedder.primary_embedder().model_id(),
-                secondary.model_id(),
-            );
+            // Keyed by the spaces the map joins, not the models' names: two widths of one
+            // model are two spaces, and a map fitted for one is wrong for the other.
+            let pair_id = match engine.embedder.secondary_space() {
+                Some(from) => {
+                    crate::embeddings::alignment_spaces::pair_id_between(&from, &engine.index_space)
+                }
+                None => crate::embeddings::AlignmentPairId::new(
+                    engine.embedder.primary_embedder().model_id(),
+                    secondary.model_id(),
+                ),
+            };
             // Hand the LIVE secondary instance to onboarding so auto-fit aligns
             // the SAME vectors the secondary produces at ingest, and never tries
             // to re-load an HTTP/runtime-only secondary by its (non-loadable)
@@ -562,12 +607,21 @@ impl RetrievalEngine {
         Ok(())
     }
 
+    /// Every non-primary space's index, cloned out of the map so no caller holds its lock.
+    fn space_index_list(&self) -> Vec<Arc<SpaceIndex>> {
+        self.space_indexes.read().values().cloned().collect()
+    }
+
+    fn space_index(&self, space: &SpaceId) -> Option<Arc<SpaceIndex>> {
+        self.space_indexes.read().get(space).cloned()
+    }
+
     /// Load every space index saved cleanly with its mapping; rebuild the rest from the memories
     /// holding a vector in their space, in one pass over the store. A secondary slot holding a
     /// vector in another space than the secondary index's is refused and queued.
     fn load_or_rebuild_space_indexes(&self) -> Result<()> {
-        let mut to_rebuild: Vec<&SpaceIndex> = Vec::new();
-        for index in self.space_indexes.values() {
+        let mut to_rebuild: Vec<Arc<SpaceIndex>> = Vec::new();
+        for index in self.space_index_list() {
             match index.load() {
                 Ok(true) => {}
                 Ok(false) => to_rebuild.push(index),
@@ -577,6 +631,11 @@ impl RetrievalEngine {
                 }
             }
         }
+        self.rebuild_space_indexes(to_rebuild)
+    }
+
+    /// Rebuild `indexes` from every memory holding a vector in their spaces, in one pass.
+    fn rebuild_space_indexes(&self, to_rebuild: Vec<Arc<SpaceIndex>>) -> Result<()> {
         if to_rebuild.is_empty() {
             return Ok(());
         }
@@ -958,7 +1017,7 @@ impl RetrievalEngine {
         drop(vector_index);
 
         // LOCK ORDERING: each space index after the primary's, one at a time.
-        for index in self.space_indexes.values() {
+        for index in self.space_index_list() {
             if let Err(e) = index.save() {
                 warn!(
                     "Failed to save the {} index (will rebuild on restart): {e}",
@@ -1183,8 +1242,8 @@ impl RetrievalEngine {
     /// Add the memory's vector in every other space that has an index, recording any space
     /// whose index refused it.
     fn index_other_spaces(&self, memory: &Memory) {
-        for index in self.space_indexes.values() {
-            if let Err(e) = self.add_in_space(memory, index) {
+        for index in self.space_index_list() {
+            if let Err(e) = self.add_in_space(memory, &index) {
                 if is_space_mismatch(&e) {
                     continue;
                 }
@@ -1233,11 +1292,10 @@ impl RetrievalEngine {
     /// drain of a row targeting that space.
     pub fn reindex_space(&self, memory: &Memory, space: &SpaceId) -> Result<()> {
         let index = self
-            .space_indexes
-            .get(space)
+            .space_index(space)
             .with_context(|| format!("no index here holds {space}"))?;
         index.remove(&memory.id);
-        self.add_in_space(memory, index)
+        self.add_in_space(memory, &index)
     }
 
     /// Whether `space`'s index holds the memory. The primary space reads the primary index.
@@ -1245,15 +1303,14 @@ impl RetrievalEngine {
         if *space == self.index_space {
             return self.is_indexed(memory_id);
         }
-        self.space_indexes
-            .get(space)
+        self.space_index(space)
             .is_some_and(|index| index.contains(memory_id))
     }
 
     /// The spaces this engine can search: the primary index's, then every other index's.
     pub fn spaces(&self) -> Vec<SpaceId> {
         std::iter::once(self.index_space.clone())
-            .chain(self.space_indexes.keys().cloned())
+            .chain(self.space_indexes.read().keys().cloned())
             .collect()
     }
 
@@ -1261,11 +1318,113 @@ impl RetrievalEngine {
     pub fn indexed_by_space(&self) -> Vec<(SpaceId, usize)> {
         std::iter::once((self.index_space.clone(), self.len()))
             .chain(
-                self.space_indexes
-                    .values()
+                self.space_index_list()
+                    .iter()
                     .map(|index| (index.space().clone(), index.len())),
             )
             .collect()
+    }
+
+    /// Every installed map between spaces, with where the corpus keeps it.
+    pub fn bridges(&self) -> Vec<crate::embeddings::space::RegisteredAlignment> {
+        self.embedder
+            .bridges()
+            .into_iter()
+            .map(|(from, to, bridge)| {
+                let path = crate::embeddings::alignment_spaces::corpus_alignment_path(
+                    &self.storage_path,
+                    &from,
+                    &to,
+                );
+                crate::embeddings::space::RegisteredAlignment {
+                    method: bridge.alignment.method().to_string(),
+                    residual: Some(1.0 - bridge.confidence),
+                    path: path.display().to_string(),
+                    from,
+                    to,
+                }
+            })
+            .collect()
+    }
+
+    /// Fit the map from `from` into `to` on every memory holding a vector in both, save it
+    /// beside the corpus and install it. A target space this engine does not index yet gets an
+    /// index, built from the memories' stored vectors in it, when the map starts from a space
+    /// this engine writes: that is the space queries arrive in.
+    pub fn fit_bridge(
+        &self,
+        from: &SpaceId,
+        to: &SpaceId,
+    ) -> Result<crate::embeddings::alignment_spaces::BridgeReport> {
+        use crate::embeddings::alignment_spaces as bridging;
+        if from == to {
+            anyhow::bail!("a map from {from} to itself bridges nothing");
+        }
+        let mut pairs = Vec::new();
+        for memory_id in self.storage.get_all_ids()? {
+            let Ok(memory) = self.storage.get(&memory_id) else {
+                continue;
+            };
+            if memory.is_forgotten() {
+                continue;
+            }
+            if let (Some(f), Some(t)) = (
+                self.stored_vector(&memory, from),
+                self.stored_vector(&memory, to),
+            ) {
+                pairs.push((f.clone(), t.clone()));
+            }
+        }
+        let fit = bridging::fit_bridge(
+            from,
+            to,
+            &pairs,
+            &crate::embeddings::AlignmentConfig::from_env(),
+        )?;
+        let path = bridging::corpus_alignment_path(&self.storage_path, from, to);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        crate::embeddings::save_alignment(&path, &fit.alignment)?;
+        self.embedder.install_bridge(
+            from.clone(),
+            to.clone(),
+            Arc::new(fit.alignment),
+            fit.report.held_out_cosine,
+        )?;
+        let writes_from =
+            *from == self.index_space || self.secondary_index_space.as_ref() == Some(from);
+        let reaches_new_space = writes_from && !self.spaces().contains(to);
+        if reaches_new_space {
+            let index = Arc::new(SpaceIndex::open(&self.storage_path, to.clone())?);
+            self.space_indexes.write().insert(to.clone(), index.clone());
+            self.rebuild_space_indexes(vec![index])?;
+        }
+        info!(
+            from = %from,
+            to = %to,
+            pairs = fit.report.pairs,
+            held_out_cosine = fit.report.held_out_cosine,
+            recall_at_1 = fit.report.held_out_recall_at_1,
+            "Fitted a map between spaces"
+        );
+        Ok(fit.report)
+    }
+
+    /// Search `to`'s index with a query vector in `from`, mapped through the installed map.
+    /// Returns the results and the map's confidence; empty when no map or no index exists.
+    pub fn search_bridged(
+        &self,
+        from: &SpaceId,
+        to: &SpaceId,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<(Vec<(MemoryId, f32)>, f32)> {
+        let Some(bridge) = self.embedder.alignment_between(from, to) else {
+            return Ok((Vec::new(), 0.0));
+        };
+        let mapped = bridge.alignment.project(query)?;
+        Ok((self.search_space(to, &mapped, limit)?, bridge.confidence))
     }
 
     /// Re-index an existing memory with updated embeddings
@@ -1306,7 +1465,7 @@ impl RetrievalEngine {
         }
 
         // Every other space's index drops the memory too; index_memory adds back what it holds.
-        for index in self.space_indexes.values() {
+        for index in self.space_index_list() {
             index.remove(&memory.id);
         }
 
@@ -1326,7 +1485,7 @@ impl RetrievalEngine {
         // Every other space first, whether or not the primary index held the memory: a memory
         // the primary refused can still be in another space's index.
         let mut removed_elsewhere = false;
-        for index in self.space_indexes.values() {
+        for index in self.space_index_list() {
             removed_elsewhere |= index.remove(memory_id);
         }
 
@@ -1597,7 +1756,7 @@ impl RetrievalEngine {
         if *space == self.index_space {
             return self.search_by_embedding(query, limit, None);
         }
-        match self.space_indexes.get(space) {
+        match self.space_index(space) {
             Some(index) => {
                 index.search(query, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2, limit)
             }
@@ -2344,7 +2503,7 @@ impl RetrievalEngine {
         let secondary = self
             .secondary_index_space
             .as_ref()
-            .and_then(|space| self.space_indexes.get(space))
+            .and_then(|space| self.space_index(space))
             .map(|index| {
                 let h = index.health();
                 SecondaryIndexHealth {
@@ -2357,9 +2516,9 @@ impl RetrievalEngine {
                 }
             });
         let spaces = self
-            .space_indexes
-            .values()
-            .map(SpaceIndex::health)
+            .space_index_list()
+            .iter()
+            .map(|index| index.health())
             .collect();
         IndexHealth {
             spaces,
@@ -3608,6 +3767,68 @@ mod space_tests {
             "the stored vector in the old space stays until that space is retired"
         );
         assert!(b.is_indexed(&written.id));
+    }
+
+    /// The space a migration left behind, or another instance wrote: no embedder here writes it,
+    /// and queries reach it only through a fitted map.
+    #[test]
+    fn a_fitted_map_reaches_a_space_no_embedder_here_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let model_a = SpaceId::new("model-a", DIM);
+        let model_b = SpaceId::new("model-b", 6);
+        let truncated = |v: &[f32]| {
+            let head: Vec<f32> = v[..6].to_vec();
+            let n = head.iter().map(|x| x * x).sum::<f32>().sqrt();
+            head.into_iter().map(|x| x / n).collect::<Vec<f32>>()
+        };
+        let mut ids = Vec::new();
+        {
+            let engine = engine(&store, tmp.path(), a.clone(), None);
+            for n in 0..150 {
+                let content = format!("bridged memory {n} about topic {}", n % 11);
+                let va = a.encode(&content).unwrap();
+                let vb = truncated(&va);
+                let mut m = memory(&content, None);
+                m.experience.set_primary_vector(va, model_a.clone());
+                m.experience.keep_vector(model_b.clone(), vb);
+                store.store(&m).unwrap();
+                engine.index_memory(&m).unwrap();
+                ids.push((m.id.clone(), content));
+            }
+            assert!(!engine.spaces().contains(&model_b));
+            let report = engine.fit_bridge(&model_a, &model_b).unwrap();
+            assert!(
+                report.held_out_cosine > 0.9,
+                "held-out cosine {}",
+                report.held_out_cosine
+            );
+            assert!(
+                engine.spaces().contains(&model_b),
+                "the map's target got an index"
+            );
+            let (id, content) = &ids[42];
+            let (hits, confidence) = engine
+                .search_bridged(&model_a, &model_b, &a.encode(content).unwrap(), 5)
+                .unwrap();
+            assert!(hits.iter().any(|(h, _)| h == id), "{hits:?}");
+            assert!((confidence - report.held_out_cosine).abs() < 1e-5);
+            assert!(crate::embeddings::alignment_spaces::corpus_alignment_path(
+                tmp.path(),
+                &model_a,
+                &model_b
+            )
+            .exists());
+            engine.save().unwrap();
+        }
+        let reopened = engine(&store, tmp.path(), a, None);
+        assert!(
+            reopened.spaces().contains(&model_b),
+            "the map survives a restart"
+        );
+        assert_eq!(reopened.bridges().len(), 1);
+        assert!(reopened.is_indexed_in(&model_b, &ids[7].0));
     }
 
     #[test]

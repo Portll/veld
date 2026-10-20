@@ -163,7 +163,7 @@ Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `Pri
 
 ### Alignment (recent work)
 
-Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (beyond the original Procrustes + Ridge fitters), with payload hardening, conditioning, and perf-flag config. Fit/eval bins, retrieval integration. Binaries: `alignment-collect`, `alignment-fit`, `alignment-eval` (see [src/bin/](src/bin/)). Evaluations at [evaluations/alignment/](evaluations/alignment/).
+Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (beyond the original Procrustes + Ridge fitters), with payload hardening, conditioning, and perf-flag config. Maps are keyed by **embedding space** (`<model>@<dimension>`, [src/embeddings/space.rs](src/embeddings/space.rs)), fitted from the corpus's own memories that hold vectors in both spaces (`` `POST /api/spaces/align` ``), kept in `<tenant>/alignments/`, and searched through by recall weighed by their held-out confidence. See [docs/src/architecture/embedding-spaces.md](docs/src/architecture/embedding-spaces.md) and [docs/src/architecture/alignment.md](docs/src/architecture/alignment.md). Binaries: `alignment-collect`, `alignment-fit`, `alignment-eval` (see [src/bin/](src/bin/)). Evaluations at [evaluations/alignment/](evaluations/alignment/).
 
 ---
 

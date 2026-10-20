@@ -1,70 +1,79 @@
 # Alignment
 
-Veld runs dual-embedder competition — MiniLM (384d) and Nomic (768d). To
-max-merge similarity scores across both spaces, the spaces must be made
-comparable. That's what alignment does.
+A vector is comparable by cosine only with vectors in its own
+[embedding space](embedding-spaces.md). Alignment is the bridge between two spaces: a fitted
+linear map that takes a vector in one space to a vector in another, so a query embedded in a
+space this server writes can search an index in a space it does not.
 
-## The problem
+The stored vector is always the truth. A mapped vector is a read-side bridge: it is never written
+back as a memory's vector, and what it finds is weighed by how well the map fits.
 
-A vector in MiniLM's 384d space and a vector in Nomic's 768d space are not
-in the same coordinate system. Their cosine similarities to a given query
-are not directly comparable: a 0.8 in MiniLM-space might mean something
-different than a 0.8 in Nomic-space.
+## Maps between spaces
 
-Without alignment, `max(sim_minilm, sim_nomic)` would consistently favour
-whichever embedder happens to produce higher absolute scores — not whichever
-is *more relevant*. Alignment fixes this by mapping one space into the
-other so absolute scores become comparable.
+A map is keyed by `(from, to)` space ids, for example
+`nomic-embed-text-v1.5@768 → minilm-l6-v2@384`
+(`src/embeddings/alignment_spaces.rs`). On disk the pair is an `AlignmentPairId` whose
+`secondary` is `from` and `primary` is `to`. A corpus keeps its maps in `alignments/` beside its
+store and lists them in the space registry (`.veld_spaces.json`).
 
-## The approach
+At start the retrieval engine installs every map in `alignments/` whose `from` space it writes.
+A map whose `to` space no index here holds gives that space an index, built from the vectors
+the memories keep in it. That is how a corpus searches the space a migration left behind, or the
+vectors another instance wrote.
 
-Two fitters live in [`src/bin/`](https://github.com/Portll/veld/tree/main/src/bin):
+## Fitting from the corpus
 
-- **`alignment-fit` Procrustes:** orthogonal linear transformation rotating
-  the source space to best-fit the target space in least-squares. Fast,
-  preserves angles and distances.
-- **`alignment-fit` Ridge:** L2-regularized linear regression. Used when
-  Procrustes is insufficient — non-square dimensions (384 → 768), or when a
-  bias term is needed.
+A map needs pairs: the same memory's vector in both spaces. The corpus already holds them for
+every memory that has vectors in both, after a migration (the replaced vector is kept), with a
+secondary embedder, or after replication from an instance with another embedder. So a map no
+longer needs a curated pairs file or a second embedding pass:
 
-The fitter learns a linear map M such that for paired (source, target) embeddings,
-`source @ M ≈ target` minimises the residual.
-
-## Pipeline
-
-```
-alignment-collect → pairs.vec → alignment-fit → fitted.npz → alignment-eval
-                                                                  ↓
-                                                          metrics + retrieval integration
+```http
+POST /api/spaces/align
+{"user_id": "claude-code", "from": "nomic-embed-text-v1.5@768", "to": "minilm-l6-v2@384"}
 ```
 
-1. **`alignment-collect`** — gather paired embeddings from a corpus (the
-   same text embedded by both embedders).
-2. **`alignment-fit`** — learn Procrustes or Ridge map. Multi-lambda sweep
-   for Ridge (`feat(alignment): corpus expansion tooling + multi-lambda
-   Ridge sweep` was a recent commit).
-3. **`alignment-eval`** — measure retrieval quality with and without
-   alignment.
+The fit reads every memory once, holds out every fifth pair, fits whitened Procrustes (alignment
+v2: centre, whiten, rotate, fold back into one affine map), saves the map, installs it, and
+answers with what it measured on the held-out pairs:
 
-Recent work (commit `22bac68`): paths in TOML specs are now CWD-relative;
-pairs.vec is cached; the corpus has been expanded with MDN, cpython, Rust,
-React, TypeScript documentation.
+| Field | Meaning |
+|---|---|
+| `held_out_cosine` | Mean cosine between a mapped vector and its own pair: the map's confidence |
+| `held_out_recall_at_1` | Share of mapped vectors whose nearest held-out target is their own pair |
+| `held_out_csls_recall_at_1` | The same with CSLS hubness correction |
 
-## Evaluation artifacts
+At least 64 usable pairs are required. `GET /api/spaces` lists the corpus's spaces and maps.
+Both routes are authenticated and tenant-bound.
 
-Alignment evaluation outputs live in [`evaluations/alignment/`](https://github.com/Portll/veld/tree/main/evaluations/alignment).
-The most recent eval pairs file is
-`pairs.nomic-embed-text-v1.5__minilm-l6-v2.doc.vec`.
+## Recall
 
-## Why this matters for retrieval
+Recall searches every space it has a query vector in. For each installed map from such a space
+into an indexed space it does not write, it maps the query, searches that index and fuses the
+results by RRF. The weight is the secondary leg's (`secondary_rrf_ratio`) times the map's
+confidence. The secondary-to-primary map, when installed, keeps its older role: the aligned
+secondary leg searches the primary index through it.
 
-With alignment landed, the dual-embedder max-merge in Layer 3.5 of the
-[retrieval pipeline](retrieval.md) is meaningful. Without it, dual-embedder
-would have been theatre — one embedder would have dominated regardless of
-relevance.
+## The command-line tools
+
+`alignment-collect`, `alignment-fit` and `alignment-eval` (`src/bin/`) fit and measure a map
+from a curated text corpus instead of the store, for a pair no corpus holds yet:
+
+- `alignment-fit --method whitened` (the default) fits v2; `procrustes` and `ridge` remain.
+- The pair id names the two spaces, as the server keys its maps, so a fitted file can be copied
+  into a tenant's `alignments/` directory as is.
+- `alignment-eval` loads a map of any method.
+
+`VELD_ALIGNMENT_AUTOFIT=1` with a pairs file still fits the secondary-to-primary map from text
+at engine start. The store-seeded fit above is the path that needs nothing prepared.
+
+## Not measured yet
+
+The LoCoMo gate runs one embedder in CI, so it cannot measure cross-space recall through a map.
+The held-out numbers above are the measurement until a two-space gate configuration exists.
 
 ## See also
 
-- [Retrieval pipeline](retrieval.md) — where the aligned scores are consumed
-- `ALIGNMENT_IMPLEMENTATION.md`, `EMBEDDING_ALIGNMENT.md` in the repo root
-  for deeper history
+- [Embedding spaces](embedding-spaces.md) — what a space is and how indexes are kept per space
+- [Retrieval pipeline](retrieval.md) — where the bridged results are fused
+- `ALIGNMENT_IMPLEMENTATION.md`, `EMBEDDING_ALIGNMENT.md` in the repo root for the history
