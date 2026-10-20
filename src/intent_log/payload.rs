@@ -453,7 +453,11 @@ mod tests {
             schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
         };
         let bytes = encode(&release).unwrap();
-        assert_eq!(&bytes[..4], &4u32.to_le_bytes(), "variant index after Anchor");
+        assert_eq!(
+            &bytes[..4],
+            &4u32.to_le_bytes(),
+            "variant index after Anchor"
+        );
         assert_eq!(decode(&bytes).unwrap(), release);
     }
 
