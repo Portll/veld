@@ -734,6 +734,20 @@ enum VectorIndexing {
     Failed(anyhow::Error),
 }
 
+/// Whether every word of `incoming` already appears in `existing`, compared
+/// case-insensitively over alphanumeric runs. The write gate's test that a memory is
+/// redundant and not merely similar: a number, name or date the neighbour lacks is a
+/// word it lacks, so the memory is kept.
+fn adds_no_new_words(incoming: &str, existing: &str) -> bool {
+    fn words(text: &str) -> std::collections::HashSet<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    }
+    words(incoming).is_subset(&words(existing))
+}
+
 impl MemorySystem {
     /// Persist a NEW memory and, unless `defer_embedding`, its vector mapping in one
     /// storage write. The vectors enter the in-memory index first because their ids
@@ -2526,9 +2540,10 @@ impl MemorySystem {
                         .collect();
 
                     // ── Write gate: absorption ──────────────────────────────
-                    // If nearest neighbor exceeds absorption threshold AND we
-                    // have enough memories to trust the index, absorb this
-                    // memory into the existing one rather than keeping both.
+                    // A nearest neighbour above the absorption threshold is only a
+                    // candidate: similar vectors can carry different facts, and
+                    // the caller already holds this memory's id. It is absorbed
+                    // only when its text adds nothing the neighbour lacks.
                     let total_memories = self.stats.read().total_memories;
                     if total_memories >= crate::constants::WRITE_GATE_COLD_START_BYPASS {
                         if let Some((best_id, best_sim, _, _, _)) =
@@ -2536,43 +2551,24 @@ impl MemorySystem {
                                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                             })
                         {
-                            if *best_sim >= crate::constants::WRITE_GATE_ABSORPTION_THRESHOLD {
-                                // Boost existing memory's importance
-                                if let Ok(best_uuid) = uuid::Uuid::parse_str(best_id) {
-                                    if let Ok(existing) =
-                                        self.long_term_memory.get(&MemoryId(best_uuid))
-                                    {
-                                        existing.boost_importance(
-                                            crate::constants::WRITE_GATE_ABSORPTION_BOOST,
-                                        );
-                                        let _ = self.long_term_memory.update(&existing);
-                                    }
-                                }
-                                // Remove the redundant new memory
-                                let _ = self.long_term_memory.delete(memory_id);
-                                self.retriever.remove_memory(memory_id);
-                                self.record_consolidation_event(
-                                    ConsolidationEvent::MemoryWeakened {
-                                        memory_id: memory_id.0.to_string(),
-                                        content_preview: memory_arc
-                                            .experience
-                                            .content
-                                            .chars()
-                                            .take(50)
-                                            .collect(),
-                                        activation_before: importance,
-                                        activation_after: 0.0,
-                                        interfering_memory_id: best_id.clone(),
-                                        interference_type: InterferenceType::Retroactive,
-                                        timestamp: chrono::Utc::now(),
-                                    },
-                                );
-                                crate::metrics::WRITE_GATE_ABSORBED.inc();
-                                tracing::info!(
-                                    memory_id = %memory_id.0,
-                                    absorbed_by = %best_id,
-                                    similarity = %best_sim,
-                                    "Write gate: absorbed redundant memory"
+                            let survivor = (*best_sim
+                                >= crate::constants::WRITE_GATE_ABSORPTION_THRESHOLD)
+                                .then(|| uuid::Uuid::parse_str(best_id).ok())
+                                .flatten()
+                                .and_then(|id| self.long_term_memory.get(&MemoryId(id)).ok())
+                                .filter(|existing| {
+                                    !existing.is_forgotten()
+                                        && adds_no_new_words(
+                                            &memory_arc.experience.content,
+                                            &existing.experience.content,
+                                        )
+                                });
+                            if let Some(survivor) = survivor {
+                                self.absorb_redundant_memory(
+                                    &memory_arc,
+                                    survivor,
+                                    importance,
+                                    *best_sim,
                                 );
                                 let elapsed = start.elapsed();
                                 crate::metrics::EMBED_BACKGROUND_DURATION
@@ -2652,6 +2648,65 @@ impl MemorySystem {
         crate::metrics::EMBED_BACKGROUND_DURATION.observe(elapsed.as_secs_f64());
 
         Ok(())
+    }
+
+    /// Fold a redundant new memory into `survivor`: the survivor gains importance and
+    /// any tag it lacked, and the redundant memory is soft-forgotten rather than
+    /// deleted. Its id was returned when it was remembered, so the record stays
+    /// readable, marked `absorbed_by`, while recall, listing and the indexes drop it.
+    fn absorb_redundant_memory(
+        &self,
+        absorbed: &Memory,
+        mut survivor: Memory,
+        importance_before: f32,
+        similarity: f32,
+    ) {
+        survivor.boost_importance(crate::constants::WRITE_GATE_ABSORPTION_BOOST);
+        for tag in &absorbed.experience.tags {
+            if !survivor.experience.tags.contains(tag) {
+                survivor.experience.tags.push(tag.clone());
+            }
+        }
+        if let Err(e) = self.long_term_memory.update(&survivor) {
+            tracing::warn!(
+                survivor = %survivor.id.0,
+                "Write gate: could not update the surviving memory: {e}"
+            );
+        }
+
+        let mut forgotten = absorbed.clone();
+        let metadata = &mut forgotten.experience.metadata;
+        metadata.insert("forgotten".to_string(), "true".to_string());
+        metadata.insert("forgotten_at".to_string(), chrono::Utc::now().to_rfc3339());
+        metadata.insert("absorbed_by".to_string(), survivor.id.0.to_string());
+        if let Err(e) = self.long_term_memory.update(&forgotten) {
+            tracing::warn!(
+                memory_id = %absorbed.id.0,
+                "Write gate: could not mark the absorbed memory forgotten, so it stays: {e}"
+            );
+            return;
+        }
+        self.retriever.remove_memory(&absorbed.id);
+        let _ = self.hybrid_search.remove_memory(&absorbed.id);
+        let _ = self.working_memory.write().remove(&absorbed.id);
+        let _ = self.session_memory.write().remove(&absorbed.id);
+
+        self.record_consolidation_event(ConsolidationEvent::MemoryWeakened {
+            memory_id: absorbed.id.0.to_string(),
+            content_preview: absorbed.experience.content.chars().take(50).collect(),
+            activation_before: importance_before,
+            activation_after: 0.0,
+            interfering_memory_id: survivor.id.0.to_string(),
+            interference_type: InterferenceType::Retroactive,
+            timestamp: chrono::Utc::now(),
+        });
+        crate::metrics::WRITE_GATE_ABSORBED.inc();
+        tracing::info!(
+            memory_id = %absorbed.id.0,
+            absorbed_by = %survivor.id.0,
+            similarity = %similarity,
+            "Write gate: absorbed redundant memory"
+        );
     }
 
     /// Remember with agent context for multi-agent systems
@@ -9692,6 +9747,85 @@ mod lifecycle_tests {
             .insert("forgotten".to_string(), "true".to_string());
         system.long_term_memory.store(&forgotten).unwrap();
         forgotten.id
+    }
+
+    #[test]
+    fn the_write_gate_counts_only_text_that_adds_no_word_as_redundant() {
+        assert!(adds_no_new_words(
+            "Deploy failed, rolled back.",
+            "rolled back: the deploy FAILED"
+        ));
+        assert!(adds_no_new_words(
+            "the deploy failed",
+            "the deploy failed at 3pm on Tuesday"
+        ));
+        assert!(!adds_no_new_words(
+            "Item 10: the deploy failed",
+            "Item 11: the deploy failed"
+        ));
+        assert!(!adds_no_new_words(
+            "the deploy succeeded",
+            "the deploy failed"
+        ));
+        assert!(!adds_no_new_words("alice owns billing", "bob owns billing"));
+    }
+
+    #[test]
+    fn an_absorbed_memory_stays_readable_by_id_and_leaves_listing_on_every_engine() {
+        for (backend, system, _tmp) in systems() {
+            let mut survivor = memory(
+                ExperienceType::Observation,
+                "the nightly batch stalled on a stale lock file",
+            );
+            survivor.experience.tags = vec!["batch".to_string()];
+            system.long_term_memory.store(&survivor).unwrap();
+            let mut redundant = memory(
+                ExperienceType::Observation,
+                "The nightly batch stalled: stale lock file.",
+            );
+            redundant.experience.tags = vec!["batch".to_string(), "incident".to_string()];
+            system.long_term_memory.store(&redundant).unwrap();
+            system
+                .working_memory
+                .write()
+                .add_shared(Arc::new(redundant.clone()))
+                .unwrap();
+
+            let stored_survivor = system.long_term_memory.get(&survivor.id).unwrap();
+            system.absorb_redundant_memory(&redundant, stored_survivor, 0.5, 0.97);
+
+            let absorbed = system
+                .get_memory(&redundant.id)
+                .unwrap_or_else(|e| panic!("{backend}: the acknowledged id must resolve: {e}"));
+            assert!(absorbed.is_forgotten(), "{backend}");
+            assert_eq!(
+                absorbed.experience.metadata.get("absorbed_by"),
+                Some(&survivor.id.0.to_string()),
+                "{backend}"
+            );
+            let kept = system.get_memory(&survivor.id).unwrap();
+            assert!(
+                kept.importance() > 0.5,
+                "{backend}: the survivor gains importance"
+            );
+            assert_eq!(
+                kept.experience.tags,
+                vec!["batch".to_string(), "incident".to_string()],
+                "{backend}: the survivor gains the tag it lacked"
+            );
+            let listed: Vec<MemoryId> = system
+                .long_term_memory
+                .get_all()
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(listed, vec![survivor.id.clone()], "{backend}");
+            assert!(
+                system.working_memory.read().get(&redundant.id).is_none(),
+                "{backend}: the working cache no longer serves it"
+            );
+        }
     }
 
     #[test]
