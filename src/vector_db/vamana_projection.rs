@@ -596,7 +596,7 @@ impl VamanaProjection {
                 }
                 // Else: nothing to delete — checkpoint advance below.
             }
-            IntentPayload::Anchor { .. } => {
+            IntentPayload::Anchor { .. } | IntentPayload::SetAnchored { .. } => {
                 // Anchors are an importance bump on the memory, not a
                 // vector-state change. Vamana doesn't care.
             }

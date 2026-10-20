@@ -366,7 +366,8 @@ pub async fn get_memory(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
@@ -444,7 +445,8 @@ pub async fn list_memories(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -531,7 +533,8 @@ pub async fn count_memories(
     validation::validate_user_id(&params.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&params.user_id)
+        .get_user_memory_async(&params.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -559,7 +562,8 @@ async fn list_memories_inner(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -614,7 +618,8 @@ pub async fn update_memory(
     }
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -681,7 +686,8 @@ pub async fn delete_memory(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
@@ -751,7 +757,8 @@ pub async fn forget_by_id(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
@@ -815,7 +822,8 @@ pub async fn patch_memory(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -918,7 +926,8 @@ pub async fn forget_by_age(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -962,7 +971,8 @@ pub async fn forget_by_importance(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1013,7 +1023,8 @@ pub async fn forget_by_pattern(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1057,7 +1068,8 @@ pub async fn forget_by_tags(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1113,7 +1125,8 @@ pub async fn forget_by_date(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1170,7 +1183,8 @@ pub async fn bulk_delete_memories(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let mut criteria = Vec::new();
@@ -1249,7 +1263,8 @@ pub async fn clear_all_memories(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1356,7 +1371,8 @@ pub async fn get_memory_health(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let mem = {
@@ -1460,7 +1476,8 @@ pub async fn anchor_memory(
     let memory_id = memory::MemoryId(uuid);
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let anchor_value = req.anchor;
@@ -1479,12 +1496,15 @@ pub async fn anchor_memory(
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     .map_err(AppError::Internal)?;
 
-    // W5: journal the anchor as an `Anchor` payload so the SQLite
+    // W5: journal the anchor as a `SetAnchored` payload so the SQLite
     // projection updates its `importance` column without rewriting the
-    // memory blob. See `handlers::remember` for the broader contract.
-    let journal_payload = crate::intent_log::IntentPayload::Anchor {
+    // memory blob, and a follower learns the flag itself: a release can
+    // leave importance unchanged. See `handlers::remember` for the broader
+    // contract.
+    let journal_payload = crate::intent_log::IntentPayload::SetAnchored {
         user_id: req.user_id.clone(),
         memory_id: req.memory_id.clone(),
+        anchored: anchor_value,
         importance: final_importance,
         schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
     };
@@ -1629,7 +1649,8 @@ pub async fn move_memory_tier(
     let target_tier = parse_memory_tier(&req.target_tier)?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let mid = memory_id.clone();

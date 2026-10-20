@@ -727,7 +727,8 @@ pub async fn file_answer(
     // Anti-autophagy guard (W-022): refuse to cite a derived memory.
     if !req.cited_sources.is_empty() {
         let user_mem = state
-            .get_user_memory(&req.user_id)
+            .get_user_memory_async(&req.user_id)
+            .await
             .map_err(AppError::Internal)?;
         let guard = user_mem.read();
         for src in &req.cited_sources {
@@ -1047,7 +1048,8 @@ pub async fn remember(
     };
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let store_start = std::time::Instant::now();
@@ -1677,7 +1679,8 @@ pub async fn batch_remember(
     }
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let extract_entities = req.options.extract_entities;
@@ -2409,7 +2412,8 @@ pub async fn upsert_memory(
     };
 
     let memory_system = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let external_id = req.external_id.clone();

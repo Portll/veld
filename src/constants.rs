@@ -41,7 +41,8 @@ pub const HEBBIAN_DECAY_MISLEADING: f32 = 0.10;
 /// Repeated recall from one source is one piece of evidence, so the default is zero:
 /// the repeat refreshes `last_activated` and nothing else moves. A non-zero value is
 /// applied as `boost × (1 − strength)` without counting as an activation, so repeats
-/// alone cannot reach LTP or a tier promotion.
+/// alone cannot reach LTP or a tier promotion. The directional components take the
+/// same fraction of their own step: `boost / (LTP_LEARNING_RATE + tier boost)`.
 pub const HEBBIAN_REPEAT_SOURCE_BOOST: f32 = 0.0;
 
 /// Upper bound on the distinct strengthening sources one edge records.
@@ -112,7 +113,12 @@ pub const EDGE_INITIAL_STRENGTH: f32 = 0.5;
 /// the trigger, not the target).
 ///
 /// Justification:
-/// - 1.5% per activation: ~67 co-activations to saturate from 0.25 → 1.0
+/// - Closes 1.5% of the remaining gap to 1.0 per activation, so it approaches 1.0
+///   and never reaches it: from 0.25, 67 activations (one e-folding) give 0.73 and
+///   ~198 close 95% of the gap
+/// - An activation is one strengthening source (a session), not one recall: a
+///   repeat from a source already on the edge earns `HEBBIAN_REPEAT_SOURCE_BOOST`'s
+///   fraction of the step, zero by default
 /// - Higher than backward (1.0%) because trigger→target is the user's intent
 /// - Moderate enough to require repeated evidence, not single-shot
 /// - Hebbian delta form: δ = boost × (1 - current), asymptotic to 1.0
@@ -125,7 +131,9 @@ pub const COACTIVATION_FORWARD_BOOST: f32 = 0.015;
 /// directional relevance than being the trigger.
 ///
 /// Justification:
-/// - 1.0% per activation: ~100 co-activations to saturate from 0.25 → 1.0
+/// - Closes 1.0% of the remaining gap per activation: from 0.25, 100 activations
+///   give 0.72 and ~298 close 95% of the gap; counted per strengthening source as
+///   for the forward boost
 /// - 2/3 of forward boost, matching the intuition that co-retrieval is
 ///   weaker directional evidence than triggering
 /// - Still allows backward edges to strengthen with sufficient evidence

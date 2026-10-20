@@ -817,11 +817,16 @@ fn test_hebbian_edge_strength_persists() {
             .remember(create_experience("Edge strength test B"), None)
             .unwrap();
 
-        // Strengthen many times to increase edge strength
+        // One source strengthens an edge once, so the strength has to come from
+        // distinct sessions corroborating the pair, not one caller repeating it.
         let ids = vec![id1.clone(), id2.clone()];
-        for _ in 0..10 {
+        for session in 0..10 {
             memory
-                .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+                .reinforce_recall_from(
+                    &ids,
+                    RetrievalOutcome::Helpful,
+                    &format!("session-{session}"),
+                )
                 .unwrap();
         }
 
@@ -848,6 +853,37 @@ fn test_hebbian_edge_strength_persists() {
             avg_strength_before,
             (avg_strength_after - avg_strength_before).abs()
         );
+
+        // The sources behind the strength persist with it, so a session that
+        // strengthened the edge before the restart is still a repeat after it.
+        let graph = memory
+            .graph_memory()
+            .expect("graph memory is wired")
+            .clone();
+        let edge = || {
+            graph
+                .read()
+                .memory_edge_between(&id1.0, &id2.0)
+                .unwrap()
+                .expect("co-retrieval edge should persist")
+        };
+        let persisted = edge();
+        assert_eq!(persisted.distinct_sources(), 10);
+
+        memory
+            .reinforce_recall_from(
+                &[id1.clone(), id2.clone()],
+                RetrievalOutcome::Helpful,
+                "session-0",
+            )
+            .unwrap();
+        let repeated = edge();
+        assert_eq!(
+            repeated.strength, persisted.strength,
+            "A source recorded before restart must not strengthen the edge again"
+        );
+        assert_eq!(repeated.activation_count, persisted.activation_count);
+        assert_eq!(repeated.strengthening_sources["session-0"], 2);
     }
 }
 
@@ -914,11 +950,16 @@ fn test_ltp_persists_across_restart() {
             .remember(create_experience("LTP persistence test B"), None)
             .unwrap();
 
-        // Reinforce many times to trigger LTP (threshold typically 5-10)
+        // Reinforce from many distinct sessions to trigger LTP (threshold typically
+        // 5-10); repetition from a single source never reaches it.
         let ids = vec![id1.clone(), id2.clone()];
-        for _ in 0..15 {
+        for session in 0..15 {
             memory
-                .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+                .reinforce_recall_from(
+                    &ids,
+                    RetrievalOutcome::Helpful,
+                    &format!("session-{session}"),
+                )
                 .unwrap();
         }
 

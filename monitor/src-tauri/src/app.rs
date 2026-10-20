@@ -11,22 +11,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use std::collections::BTreeMap;
 
 use veld_status_core::{
-    discover_instances, inspect_process, parse_env_file, restart_instance, rewrite_env_var,
-    LaunchSpec, RestartRequest, StatusClient, StatusClientConfig, StatusSnapshot,
+    discover_instances, inspect_process, launch_recipes_path, load_launch_recipes, parse_env_file,
+    restart_instance, restart_request, rewrite_env_var, server_env_path, LaunchSpec, StatusClient,
+    StatusClientConfig, StatusSnapshot,
 };
 
-use crate::tray;
+use crate::{replica, tray};
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:3030";
 const DEFAULT_DEV_API_KEY: &str = "sk-veld-dev-local-testing-key";
 const DEFAULT_USER_ID: &str = "claude-code";
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
+const REPLICATION_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Exports, restores and migrations walk whole stores.
 const DATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const CONFIG_BACKEND_KEY: &str = "storage_backend";
@@ -38,6 +41,8 @@ struct FleetEntry {
     snapshot: Arc<RwLock<StatusSnapshot>>,
     label: String,
     pinned: bool,
+    /// The registry's `started_at`; None while the instance is not in the registry.
+    started_at: Option<DateTime<Utc>>,
 }
 
 /// Tab metadata handed to the frontend.
@@ -47,6 +52,7 @@ struct InstanceMeta {
     label: String,
     pinned: bool,
     online: bool,
+    started_at: Option<DateTime<Utc>>,
 }
 
 /// App-wide state: connection params + the live fleet.
@@ -156,6 +162,7 @@ pub fn run() {
                     snapshot: Arc::clone(&snapshot),
                     label: url_short(&base_url),
                     pinned: true,
+                    started_at: None,
                 },
             );
             let fleet = Arc::new(Mutex::new(map));
@@ -164,15 +171,24 @@ pub fn run() {
                 api_key: api_key.clone(),
                 user_id: user_id.clone(),
                 request_timeout: timeout,
-                admin_key,
+                admin_key: admin_key.clone(),
                 pinned_base_url: pinned_key.clone(),
                 fleet: Arc::clone(&fleet),
             });
 
-            // Tray + live event stream follow the pinned instance.
-            tray::build(app, Arc::clone(&snapshot))?;
+            // Tray + live event stream follow the pinned instance; the tray's
+            // replication line covers every instance that follows a leader.
+            let replication = Arc::new(RwLock::new(None));
+            tray::build(app, Arc::clone(&snapshot), Arc::clone(&replication))?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(emit_snapshots(handle, snapshot));
+            tauri::async_runtime::spawn(poll_replication(
+                Arc::clone(&fleet),
+                api_key.clone(),
+                admin_key,
+                timeout,
+                replication,
+            ));
 
             // Reconcile the fleet against the registry in the background.
             tauri::async_runtime::spawn(reconcile_fleet(
@@ -261,6 +277,7 @@ fn list_instances(state: State<'_, MonitorState>) -> Vec<InstanceMeta> {
                 label: e.label.clone(),
                 pinned: e.pinned,
                 online: snap.server.state.is_reachable(),
+                started_at: e.started_at,
             }
         })
         .collect();
@@ -661,18 +678,8 @@ struct ConfigBackend {
     server_env_backend: Option<String>,
 }
 
-/// `~/.config/veld/server.env`: the `KEY=VALUE` file Veld Desktop hands to the
-/// server it spawns, on every platform under `~/.config` (its own convention).
-fn desktop_server_env_path() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".config").join("veld").join("server.env")
-}
-
 fn server_env_vars() -> Vec<(String, String)> {
-    std::fs::read_to_string(desktop_server_env_path())
+    std::fs::read_to_string(server_env_path())
         .map(|t| parse_env_file(&t))
         .unwrap_or_default()
 }
@@ -713,7 +720,7 @@ fn config_backend() -> ConfigBackend {
     ConfigBackend {
         path: path.display().to_string(),
         backend,
-        server_env_path: desktop_server_env_path().display().to_string(),
+        server_env_path: server_env_path().display().to_string(),
         server_env_backend: server_env_backend(),
     }
 }
@@ -760,7 +767,7 @@ fn set_config_backend(backend: String) -> Result<ConfigBackend, String> {
     }
     write_private_file(&path, &text)?;
 
-    let env_path = desktop_server_env_path();
+    let env_path = server_env_path();
     let mut server_env_backend = server_env_backend();
     if server_env_backend.is_some() {
         let current = std::fs::read_to_string(&env_path)
@@ -797,37 +804,12 @@ fn open_in_browser(url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Where a relaunched server's output goes: `<config>/veld/logs/veld-<port>.log`.
-fn server_log_path(port: u16) -> std::path::PathBuf {
-    veld_status_core::instances_dir()
-        .parent()
-        .map(|p| p.join("logs"))
-        .unwrap_or_else(|| std::path::PathBuf::from("logs"))
-        .join(format!("veld-{port}.log"))
-}
-
-/// Launch recipes the user saved, keyed by normalized base URL:
-/// `<config>/veld/monitor/launch-recipes.json`, owner-readable only since a
-/// recipe's variables can hold keys.
-fn recipes_path() -> std::path::PathBuf {
-    veld_status_core::instances_dir()
-        .parent()
-        .map(|p| p.join("monitor"))
-        .unwrap_or_else(|| std::path::PathBuf::from("monitor"))
-        .join("launch-recipes.json")
-}
-
 fn load_recipes() -> Result<BTreeMap<String, LaunchSpec>, String> {
-    let path = recipes_path();
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(format!("read {}: {e}", path.display())),
-    }
+    load_launch_recipes().map_err(|e| e.to_string())
 }
 
 fn save_recipes(recipes: &BTreeMap<String, LaunchSpec>) -> Result<(), String> {
-    let path = recipes_path();
+    let path = launch_recipes_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
@@ -840,14 +822,6 @@ fn find_instance(base_url: &str) -> Option<veld_status_core::DiscoveredInstance>
     discover_instances()
         .into_iter()
         .find(|i| norm(&i.base_url) == key)
-}
-
-fn port_of(base_url: &str) -> u16 {
-    base_url
-        .trim_end_matches('/')
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .unwrap_or(3030)
 }
 
 /// What a restart of `base_url` would use, for the Launch card.
@@ -877,8 +851,8 @@ fn launch_recipe(base_url: String) -> Result<LaunchInfo, String> {
         pid: instance.as_ref().map(|i| i.pid).filter(|p| *p != 0),
         registry,
         saved,
-        recipes_path: recipes_path().display().to_string(),
-        server_env_path: desktop_server_env_path().display().to_string(),
+        recipes_path: launch_recipes_path().display().to_string(),
+        server_env_path: server_env_path().display().to_string(),
         server_env_names: server_env_vars().into_iter().map(|(k, _)| k).collect(),
     })
 }
@@ -916,34 +890,23 @@ async fn capture_launch_recipe(base_url: String) -> Result<LaunchSpec, String> {
         .ok_or_else(|| format!("could not read process {pid}: it may be gone, or this platform does not expose it"))
 }
 
-/// Stop the instance at `base_url`, if it runs, and bring it back. The recipe is
-/// the one saved for it, else the registry's. The operator's `server.env` is the
-/// base environment layer. `storage_backend`, when given, is set as
-/// `VELD_STORAGE_BACKEND` on the new process (a swap just performed).
+/// Stop the instance at `base_url`, if it runs, and bring it back the way
+/// `veld restart` does (`restart_request`). `storage_backend`, when given, is set
+/// as `VELD_STORAGE_BACKEND` on the new process (a swap just performed).
 async fn restart_at(
     base_url: &str,
     storage_backend: Option<String>,
 ) -> Result<veld_status_core::RestartOutcome, String> {
     let key = norm(base_url);
     let instance = find_instance(&key);
-    let recipe = load_recipes()?.remove(&key);
+    let recipes = load_recipes()?;
     let mut env_overrides = Vec::new();
     if let Some(backend) = storage_backend.filter(|b| !b.trim().is_empty()) {
         env_overrides.push(("VELD_STORAGE_BACKEND".to_string(), backend));
     }
-    let env_path = desktop_server_env_path();
-    let env_files = if env_path.is_file() { vec![env_path] } else { Vec::new() };
-    let port = instance.as_ref().map(|i| i.port).unwrap_or_else(|| port_of(&key));
-    restart_instance(RestartRequest {
-        base_url: key,
-        instance,
-        recipe,
-        env_files,
-        env_overrides,
-        log_path: server_log_path(port),
-    })
-    .await
-    .map_err(|e| e.to_string())
+    restart_instance(restart_request(&key, instance, &recipes, env_overrides))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -987,6 +950,7 @@ async fn reconcile_fleet(
         // Desired set: the pinned instance plus every freshly-heartbeating one.
         let mut desired: HashMap<String, String> = HashMap::new();
         desired.insert(pinned_key.clone(), String::new());
+        let mut started: HashMap<String, DateTime<Utc>> = HashMap::new();
         for inst in discover_instances() {
             let key = norm(&inst.base_url);
             let label = if inst.label.trim().is_empty() {
@@ -994,6 +958,14 @@ async fn reconcile_fleet(
             } else {
                 inst.label.clone()
             };
+            // A killed server's entry outlives it until its heartbeat goes stale,
+            // so beside its successor on the same port the newer start wins.
+            if let Some(at) = inst.started_at {
+                started
+                    .entry(key.clone())
+                    .and_modify(|t| *t = (*t).max(at))
+                    .or_insert(at);
+            }
             desired.insert(key, label);
         }
 
@@ -1010,6 +982,7 @@ async fn reconcile_fleet(
             if let Some((client, snap)) = spawn_client(&key, &api_key, &user_id, timeout) {
                 let pinned = key == pinned_key;
                 let lbl = if label.is_empty() { url_short(&key) } else { label };
+                let started_at = started.get(&key).copied();
                 fleet.lock().insert(
                     key,
                     FleetEntry {
@@ -1017,6 +990,7 @@ async fn reconcile_fleet(
                         snapshot: snap,
                         label: lbl,
                         pinned,
+                        started_at,
                     },
                 );
             }
@@ -1037,9 +1011,13 @@ async fn reconcile_fleet(
             }
         }
 
-        // Refresh discovered labels on existing non-pinned entries.
+        // Refresh discovered labels on existing non-pinned entries, and every
+        // entry's start time (a restart writes a new one).
         {
             let mut f = fleet.lock();
+            for (key, e) in f.iter_mut() {
+                e.started_at = started.get(key).copied();
+            }
             for (key, label) in &desired {
                 if label.is_empty() {
                     continue;
@@ -1053,6 +1031,78 @@ async fn reconcile_fleet(
         }
 
         tokio::time::sleep(RECONCILE_INTERVAL).await;
+    }
+}
+
+fn is_loopback(base_url: &str) -> bool {
+    let Some(url) = tauri::Url::parse(base_url).ok() else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or("");
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Ask every reachable instance in the fleet whether it follows a leader and keep
+/// the tray's line on those that do. The status route is admin-gated: the key is
+/// this process's `VELD_ADMIN_API_KEY`, else the one in the operator's
+/// `server.env`. Either is sent to loopback instances only: an admin key reads
+/// every tenant's memories through the replication feed, and a remote instance in
+/// the fleet is not known to share it.
+async fn poll_replication(
+    fleet: Arc<Mutex<HashMap<String, FleetEntry>>>,
+    api_key: String,
+    admin_key: Option<String>,
+    timeout: Duration,
+    line: Arc<RwLock<Option<String>>>,
+) {
+    loop {
+        let targets: Vec<(String, String)> = fleet
+            .lock()
+            .iter()
+            .filter(|(_, e)| e.snapshot.read().server.state.is_reachable())
+            .map(|(key, e)| (key.clone(), e.label.clone()))
+            .collect();
+        let env_key = server_env_vars()
+            .into_iter()
+            .find(|(k, v)| k == "VELD_ADMIN_API_KEY" && !v.trim().is_empty())
+            .map(|(_, v)| v);
+        let mut replicas = Vec::new();
+        for (base_url, label) in targets {
+            if !is_loopback(&base_url) {
+                continue;
+            }
+            let Some(key) = admin_key.as_deref().or(env_key.as_deref()) else {
+                continue;
+            };
+            match StatusClient::data_request(
+                &base_url,
+                &api_key,
+                "GET",
+                "/api/admin/replication/status",
+                Some(key),
+                None,
+                timeout,
+            )
+            .await
+            {
+                Ok((200, body)) => {
+                    if let Some(summary) = replica::summarize(&body) {
+                        replicas.push((label, summary));
+                    }
+                }
+                Ok((status, _)) => {
+                    tracing::debug!(%base_url, status, "replication status refused");
+                }
+                Err(e) => tracing::debug!(%base_url, error = %e, "replication status unavailable"),
+            }
+        }
+        replicas.sort_by(|a, b| a.0.cmp(&b.0));
+        *line.write() = replica::tray_line(&replicas);
+        tokio::time::sleep(REPLICATION_POLL_INTERVAL).await;
     }
 }
 

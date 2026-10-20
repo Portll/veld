@@ -141,6 +141,21 @@ If you expose veld beyond localhost, put it behind a reverse proxy with TLS:
 Veld checks the bind host via `is_local_bind_host()`; binding to
 `0.0.0.0` is a deliberate choice that disables some safety defaults.
 
+## Readiness while a tenant opens
+
+A tenant's stores open on its first request, not at boot, and a large one takes a
+while: 11.7 s for the live server's largest tenant on 2026-10-19, and 10 min for the
+same tenant on a redb replica that had to rebuild its Vamana index. Requests for that
+tenant wait for the open. The remember, recall, upsert, list and memory CRUD routes
+and the streaming websockets wait on the blocking pool, so `/health`, `/health/live`
+and requests for other tenants keep answering while it runs.
+
+`GET /health/ready` stays `200 ready` during an open and reports how many requests are
+waiting on one in `tenant_open_waiters`. Readiness is about the process: an open delays
+only its own tenant, and a 503 would make a load balancer pull every tenant off the
+instance on each reopen after an idle eviction. Readiness fails for conditions that
+affect every tenant: shared stores that did not open, and a hard write latch (below).
+
 ## Disk full: the write latch
 
 RocksDB stops accepting writes after a background IO error. For "no space left on
@@ -158,10 +173,13 @@ Veld now notices and says so:
 | `GET /health/live` | `200 alive` | `200 alive` — the process is alive either way |
 | Write API calls | — | `503 STORAGE_WRITE_LATCHED` instead of `500 INTERNAL_ERROR` |
 
-**The latch is per store, not per process.** Veld runs one RocksDB per tenant
-(`base/<user_id>`) and RocksDB's own latch is per database, so a write landing on
-one tenant's store says nothing about another's. One latched store out of twelve is
-`degraded`, and the array names which.
+**The latch is per store, not per process.** RocksDB's own latch is per database,
+and veld runs several: each tenant's memory store and graph under `base/<user_id>`,
+and one shared store (`base/shared`) holding todos, reminders, files, feedback,
+context blocks and the audit log. Every write to any of them goes through the
+latch, keyed by that database's directory, so a write landing on one store says
+nothing about another. One latched store out of twelve is `degraded`, and the
+array names which.
 
 **`/health` and `/health/ready` are unauthenticated** (`PROBE_PATHS`), so they
 carry no store paths. Each entry names its store by `store` — the first 16 hex

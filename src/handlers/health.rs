@@ -67,16 +67,21 @@ fn write_latch_fields(
     (status.to_string(), latched)
 }
 
-/// Readiness under the write latch. 503 when ANY store is hard-latched; a soft
-/// latch is still inside its bounded recovery and the next write may land.
-/// Returns the hard-latched store count, which the status code cannot carry and
-/// which is the difference between one tenant affected and all of them.
+/// Readiness of the process, not of one tenant: 503 while the shared stores are
+/// unusable or when ANY store is hard-latched. A soft latch is still inside its
+/// bounded recovery and the next write may land; a tenant still opening delays
+/// only that tenant's requests (they wait on the blocking pool, not on a worker),
+/// so it is reported as `tenant_open_waiters` without failing readiness, which a
+/// load balancer would otherwise apply to every tenant on every reopen after an
+/// idle eviction. Returns the hard-latched store count, which the status code
+/// cannot carry and which is the difference between one tenant affected and all
+/// of them.
 fn ready_decision(
-    ready: bool,
+    shared_stores_ready: bool,
     latch: &crate::storage::write_latch::WriteLatch,
 ) -> (StatusCode, &'static str, usize) {
     let hard_stores = latch.hard_count();
-    if ready && hard_stores == 0 {
+    if shared_stores_ready && hard_stores == 0 {
         (StatusCode::OK, "ready", 0)
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not_ready", hard_stores)
@@ -130,6 +135,7 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
 /// router reads `?user_id=` for per-tenant data — see `PUBLIC_PATHS` in
 /// `router.rs` and the `public_router_has_no_per_user_handlers` test.
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let tenant_open_waiters = state.tenant_open_waiters();
     let (status_code, status_str, hard_stores) =
         ready_decision(state.is_ready(), crate::storage::write_latch::global());
 
@@ -139,6 +145,7 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<se
         "version": env!("VELD_VERSION_FULL"),
         "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
         "users_in_cache": users_in_cache,
+        "tenant_open_waiters": tenant_open_waiters,
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
     if hard_stores > 0 {
@@ -287,7 +294,9 @@ pub async fn health_index(State(state): State<AppState>) -> (StatusCode, Json<se
     let mut users_needing_rebuild: usize = 0;
     let mut users_with_shortfall: usize = 0;
     for user_id in state.list_cached_users() {
-        if let Ok(memory) = state.get_user_memory(&user_id) {
+        // The cache itself, not get_user_memory: a tenant evicted since the listing
+        // would otherwise be reopened by this probe, on the worker serving it.
+        if let Some(memory) = state.user_memories.get(&user_id) {
             let guard = memory.read();
             let h = guard.index_health();
             total_vectors += h.total_vectors;
@@ -736,5 +745,338 @@ mod write_latch_reporting {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(ready_decision(false, &latch).2, 0);
+    }
+
+    /// Every kind of store driven through its real write paths into a NoSpace
+    /// refusal: the database the write targeted latches and `/health` names it.
+    ///
+    /// The latch these sites record into is the process-global one, so another
+    /// test's store may be in the body too; each assertion looks for its own.
+    #[cfg(feature = "rocksdb")]
+    mod write_sites {
+        use super::*;
+        use crate::graph_memory::EntityNode;
+        use crate::memory::storage::wire_fixtures::memory_with_session;
+        use crate::memory::storage::{MemoryStorage, Modality};
+        use crate::storage::legacy_rocksdb::{
+            RocksDbAuditStore, RocksDbColumnFamilyStore, RocksDbColumnStore,
+            RocksDbDefaultKeyValueStore, RocksDbGraphStore,
+        };
+        use crate::storage::write_latch::{chain_is_enospc, global, injected, store_id};
+        use crate::storage::{AuditLogEntry, AuditStore, ColumnStore, GraphStore, KeyValueStore};
+        use std::sync::Arc;
+
+        fn assert_reported(store: &Path, site: &str) {
+            let latch = global();
+            let snapshot = latch
+                .snapshot_at(store)
+                .unwrap_or_else(|| panic!("{site}: the refusal did not latch its store"));
+
+            let body = response_json(latch);
+            assert_eq!(body["status"], "degraded", "{site}");
+            let entry = body["write_latch"]
+                .as_array()
+                .expect("write_latch is an array")
+                .iter()
+                .find(|entry| entry["store"] == store_id(store))
+                .unwrap_or_else(|| panic!("{site}: /health does not name the store: {body}"));
+            assert_eq!(entry["condition"], "no_space_left_on_device", "{site}");
+            assert!(entry["failed_writes"].as_u64() >= Some(1), "{site}");
+
+            // Hard only when the disk had room for the flush+retry, which then
+            // met the same refusal; a full disk leaves it soft and ready.
+            if snapshot.hard {
+                let (code, _, hard_stores) = ready_decision(true, latch);
+                assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{site}");
+                assert!(hard_stores >= 1, "{site}");
+            }
+        }
+
+        /// Refuse `write` for want of space and check the latch and the report;
+        /// then let the same write through and check that it clears the store.
+        fn drive(store: &Path, site: &str, write: impl Fn() -> anyhow::Result<()>) {
+            injected::arm(store);
+            let refused = write();
+            injected::disarm(store);
+
+            let err = refused
+                .err()
+                .unwrap_or_else(|| panic!("{site}: the refusal never reached the caller"));
+            assert!(
+                chain_is_enospc(&err),
+                "{site}: the caller lost the NoSpace cause, so it answers 500, not 503: {err:#}"
+            );
+            assert_reported(store, site);
+
+            write().unwrap_or_else(|e| panic!("{site}: the write after the refusal failed: {e:#}"));
+            assert!(
+                !global().is_latched_at(store),
+                "{site}: a write that landed left the latch standing"
+            );
+        }
+
+        #[test]
+        fn index_delete_and_multimodal_writes_latch_the_memory_database() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = MemoryStorage::new(dir.path(), None).expect("open storage");
+            let db = storage.db();
+            let store = db.path();
+            let memory = memory_with_session("a memory the disk refuses");
+            storage.store(&memory).expect("seed the memory");
+            let facts = RocksDbDefaultKeyValueStore::new(Arc::clone(&db));
+            let holder = memory.id.0.to_string();
+
+            drive(store, "multimodal store", || {
+                storage.store_with_multimodal_vectors(&memory, Modality::Text, vec![7])
+            });
+            drive(store, "modality vectors", || {
+                storage.update_modality_vectors(&memory.id, Modality::Image, vec![8])
+            });
+            drive(store, "index rebuild", || {
+                storage.rebuild_index().map(|_| ())
+            });
+            drive(store, "retrieval counter", || {
+                storage.increment_retrieval_count().map(|_| ())
+            });
+            drive(store, "interference records", || {
+                storage.save_interference_records(&holder, &[])
+            });
+            drive(store, "default-keyspace view", || {
+                facts.put_bytes(b"facts:latch", b"1")
+            });
+            drive(store, "delete", || storage.delete_with_vectors(&memory.id));
+        }
+
+        /// The double key: `store` once latched the tenant directory while the
+        /// batch writer over the same database cleared `<tenant>/storage`, so a
+        /// latch raised by one stood after the other had written.
+        #[test]
+        fn a_write_through_any_adapter_clears_the_latch_on_its_database() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = MemoryStorage::new(dir.path(), None).expect("open storage");
+            let db = storage.db();
+            let memory = memory_with_session("refused by the record write");
+
+            injected::arm(db.path());
+            let refused = storage.store(&memory);
+            injected::disarm(db.path());
+            assert!(chain_is_enospc(
+                &refused.expect_err("the armed refusal reaches the caller")
+            ));
+            assert_reported(db.path(), "store");
+
+            let mut batch = crate::storage::WriteBatch::new();
+            batch.put_cf("kv", b"dials".to_vec(), b"1".to_vec());
+            storage.write_batch(&batch).expect("the batch lands");
+            assert!(
+                !global().is_latched_at(db.path()),
+                "the batch writer cleared a different key than the record write latched"
+            );
+        }
+
+        #[test]
+        fn graph_writes_latch_the_graph_database() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let graph = RocksDbGraphStore::open(dir.path(), None).expect("open graph");
+            let store = graph
+                .inner()
+                .rocksdb_for_backup()
+                .expect("a rocksdb graph")
+                .path()
+                .to_path_buf();
+            let now = chrono::Utc::now();
+            let entity = EntityNode {
+                uuid: uuid::Uuid::new_v4(),
+                name: "harbour".to_string(),
+                labels: Vec::new(),
+                created_at: now,
+                last_seen_at: now,
+                mention_count: 1,
+                summary: String::new(),
+                attributes: Default::default(),
+                name_embedding: None,
+                salience: 0.4,
+                is_proper_noun: true,
+                pii_classification: Default::default(),
+            };
+
+            drive(&store, "entity put", || graph.put_entity(&entity));
+            drive(&store, "entity delete", || {
+                graph.inner().delete_entity(&entity.uuid).map(|_| ())
+            });
+            drive(&store, "graph flush", || graph.flush());
+        }
+
+        /// One database behind todos, reminders, files, feedback, context
+        /// blocks and audit, as `bootstrap_shared_stores` opens it.
+        #[test]
+        fn shared_store_writes_latch_the_shared_database() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let db = Arc::new(
+                rocksdb::DB::open_cf(&opts, dir.path(), ["default", "audit", "todos", "feedback"])
+                    .expect("open the shared database"),
+            );
+            let store = db.path().to_path_buf();
+            let columns = RocksDbColumnStore::new(Arc::clone(&db));
+            let feedback = RocksDbColumnFamilyStore::new(Arc::clone(&db), "feedback");
+            let audit = RocksDbAuditStore::new(Arc::clone(&db), "audit");
+            let event = AuditLogEntry {
+                timestamp: chrono::Utc::now(),
+                event_type: "remember".to_string(),
+                memory_id: "m-1".to_string(),
+                details: String::new(),
+            };
+
+            drive(&store, "todo put", || columns.put_cf("todos", b"t-1", b"1"));
+            drive(&store, "todo delete", || columns.delete_cf("todos", b"t-1"));
+            drive(&store, "feedback put", || feedback.put_bytes(b"f-1", b"1"));
+            drive(&store, "audit append", || {
+                audit.append_event("tenant", &event)
+            });
+            drive(&store, "audit rotation", || {
+                audit
+                    .rotate_events("tenant", 0, chrono::Utc::now())
+                    .map(|_| ())
+            });
+            drive(&store, "shared flush", || columns.flush_cf("todos"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod probes_while_a_tenant_opens {
+    //! Each first request for a tenant still opening used to park a tokio worker on the
+    //! tenant's init lock. On 2026-10-19 the live server took 11.7 s to open its largest
+    //! tenant, and six websocket handshakes that had waited for a worker all logged within
+    //! 0.4 ms of the open finishing; the redb replica's open of the same tenant took 10 min.
+    use super::*;
+    use crate::handlers::router::build_probe_routes;
+    use crate::handlers::test_helpers::{get, get_unauthenticated, post_json, send, TestHarness};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const WORKERS: usize = 2;
+    const TENANT: &str = "tenant-mid-open";
+
+    /// Sends `uri` from a spawned task, which needs a free worker as a real connection's
+    /// does, and waits on this thread, which is not a worker.
+    fn probe(app: &axum::Router, uri: &str) -> Option<(StatusCode, serde_json::Value)> {
+        let (tx, rx) = mpsc::channel();
+        let app = app.clone();
+        let request = get_unauthenticated(uri);
+        tokio::spawn(async move {
+            let _ = tx.send(send(app, request).await);
+        });
+        rx.recv_timeout(Duration::from_secs(5)).ok()
+    }
+
+    fn wait_for_open_waiters(manager: &MultiUserMemoryManager, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while manager.tenant_open_waiters() < count {
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {count} requests reached the tenant open",
+                manager.tenant_open_waiters()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probes_answer_while_first_requests_wait_on_a_tenant_open() {
+        let harness = TestHarness::new();
+        let app = harness.router().merge(build_probe_routes(harness.state()));
+
+        // An open holds the tenant's init lock until it is done. Hold it the same way.
+        let init_lock = harness.manager.user_memory_init_lock(TENANT);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let opener = std::thread::spawn(move || {
+            let _open = init_lock.lock();
+            held_tx.send(()).expect("test waits for the hold");
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().expect("init lock held");
+
+        // Twice as many first requests as the runtime has workers, one per hot path.
+        let requests = vec![
+            post_json(
+                "/api/remember",
+                &serde_json::json!({"user_id": TENANT, "content": "written while the tenant opened"}),
+            ),
+            post_json(
+                "/api/recall",
+                &serde_json::json!({"user_id": TENANT, "query": "tenant opened"}),
+            ),
+            post_json(
+                "/api/upsert",
+                &serde_json::json!({"user_id": TENANT, "external_id": "probe:1", "content": "upserted while the tenant opened"}),
+            ),
+            get(&format!("/api/list/{TENANT}")),
+        ];
+        assert_eq!(requests.len(), WORKERS * 2);
+        let waiters: Vec<_> = requests
+            .into_iter()
+            .map(|request| tokio::spawn(send(app.clone(), request)))
+            .collect();
+        wait_for_open_waiters(&harness.manager, WORKERS * 2);
+
+        let health = probe(&app, "/health");
+        let ready = probe(&app, "/health/ready");
+
+        release_tx.send(()).expect("opener waits for release");
+        opener.join().expect("opener thread");
+        for waiter in waiters {
+            let (status, body) = waiter.await.expect("request task");
+            assert!(status.is_success(), "{status}: {body}");
+        }
+        let ready_after = probe(&app, "/health/ready");
+
+        let (status, _) =
+            health.expect("/health did not answer while requests waited on a tenant open");
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) =
+            ready.expect("/health/ready did not answer while requests waited on a tenant open");
+        assert_eq!(status, StatusCode::OK, "an open delays its tenant, not the process: {body}");
+        assert_eq!(body["tenant_open_waiters"], WORKERS * 2);
+
+        let (status, body) = ready_after.expect("/health/ready answers after the open");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["tenant_open_waiters"], 0);
+        assert!(body.get("reason").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_async_accessor_hands_back_the_one_cached_tenant() {
+        let harness = TestHarness::new();
+        let opened = harness
+            .manager
+            .get_user_memory_async("tenant-a")
+            .await
+            .expect("first open");
+        let cached = harness
+            .manager
+            .get_user_memory_async("tenant-a")
+            .await
+            .expect("cached");
+        let sync = harness.manager.get_user_memory("tenant-a").expect("sync");
+        assert!(std::sync::Arc::ptr_eq(&opened, &cached));
+        assert!(std::sync::Arc::ptr_eq(&opened, &sync));
+        assert_eq!(harness.manager.tenant_open_waiters(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_is_not_left_counted_as_opening() {
+        let harness = TestHarness::new();
+        assert!(harness
+            .manager
+            .get_user_memory_async("../escape")
+            .await
+            .is_err());
+        assert_eq!(harness.manager.tenant_open_waiters(), 0);
     }
 }

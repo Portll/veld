@@ -404,6 +404,105 @@ pub fn available_bytes(path: &Path) -> Option<u64> {
     best.map(|(_, free)| free)
 }
 
+/// Run one write against `db` through the [`global`] latch: a success clears
+/// this store's latch, a refusal goes to [`recover_write`].
+///
+/// Keyed by `db.path()` and nothing else. Several adapters write to one
+/// database — the memory store, its batch writer and its key-value views share
+/// a tenant's `storage` directory — and a key chosen per call site let a write
+/// through one of them leave the latch another had raised standing for good.
+///
+/// `op` is called at most twice, so it must be replayable.
+#[cfg(feature = "rocksdb")]
+pub fn guard<T>(db: &rocksdb::DB, op: impl Fn() -> Result<T>) -> Result<T> {
+    let path = db.path();
+    let attempt = || {
+        #[cfg(test)]
+        injected::refuse_if_armed(path)?;
+        op()
+    };
+    let latch = global();
+    match attempt() {
+        Ok(value) => {
+            latch.note_write_ok(path);
+            Ok(value)
+        }
+        Err(err) => recover_write(latch, db, path, err, attempt),
+    }
+}
+
+/// [`guard`] for a batch already built. `DB::write_opt` consumes its batch, so
+/// each attempt writes a copy and the retry still has the original to copy.
+#[cfg(feature = "rocksdb")]
+pub fn guard_batch(
+    db: &rocksdb::DB,
+    batch: &rocksdb::WriteBatch,
+    opts: &rocksdb::WriteOptions,
+) -> Result<()> {
+    guard(db, || {
+        db.write_opt(rocksdb::WriteBatch::from_data(batch.data()), opts)
+            .map_err(anyhow::Error::new)
+    })
+}
+
+/// Per-thread NoSpace refusals for [`guard`], so a test can drive a real write
+/// site into the latch. RocksDB will not mint an ENOSPC error on demand (see the
+/// witness tests below), and a thread-local keeps one test's refusals out of
+/// every other test's writes.
+#[cfg(all(test, feature = "rocksdb"))]
+pub(crate) mod injected {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    /// The production log line [`super::is_enospc`] is pinned to.
+    const NO_SPACE: &str =
+        "IO error: No space left on device: While open a file for appending: /store/000585.log";
+
+    thread_local! {
+        /// Refusals left per store path; `None` refuses until disarmed.
+        static ARMED: RefCell<HashMap<PathBuf, Option<u32>>> = RefCell::new(HashMap::new());
+    }
+
+    /// Refuse every write to `path` on this thread until [`disarm`].
+    pub(crate) fn arm(path: &Path) {
+        ARMED.with(|armed| armed.borrow_mut().insert(path.to_path_buf(), None));
+    }
+
+    /// Refuse the next `count` writes to `path` on this thread.
+    pub(crate) fn arm_times(path: &Path, count: u32) {
+        if count > 0 {
+            ARMED.with(|armed| armed.borrow_mut().insert(path.to_path_buf(), Some(count)));
+        }
+    }
+
+    pub(crate) fn disarm(path: &Path) {
+        ARMED.with(|armed| armed.borrow_mut().remove(path));
+    }
+
+    pub(super) fn refuse_if_armed(path: &Path) -> anyhow::Result<()> {
+        let refuse = ARMED.with(|armed| {
+            let mut armed = armed.borrow_mut();
+            match armed.get_mut(path) {
+                None => false,
+                Some(None) => true,
+                Some(Some(left)) => {
+                    *left -= 1;
+                    if *left == 0 {
+                        armed.remove(path);
+                    }
+                    true
+                }
+            }
+        });
+        if refuse {
+            Err(anyhow::anyhow!("{NO_SPACE}"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Run `retry` once if `err` latched the store and the filesystem looks
 /// writable again; otherwise return the error that got us here.
 ///
@@ -926,5 +1025,45 @@ mod tests {
         assert!(!retried, "a non-NoSpace error must not be retried");
         assert!(!latch.is_latched());
         assert!(latch.snapshot().is_empty());
+    }
+
+    /// The retry writes a copy rebuilt from the batch's serialized form, which
+    /// names its families by id; the copy has to land where the original would.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn guard_batch_retries_a_refused_batch_into_the_same_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let db = rocksdb::DB::open_cf(&opts, dir.path(), ["default", "rows"]).expect("open");
+        let rows = db.cf_handle("rows").expect("family");
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(rows, b"k", b"v");
+
+        injected::arm_times(db.path(), 1);
+        let outcome = guard_batch(&db, &batch, &rocksdb::WriteOptions::default());
+        injected::disarm(db.path());
+
+        // recover_write retries only past the free-space floor, or when free
+        // space cannot be measured.
+        let retried = available_bytes(db.path()).is_none_or(|free| free >= min_free_bytes());
+        if retried {
+            outcome.expect("the retry writes the copy");
+            assert_eq!(
+                db.get_cf(rows, b"k").expect("read").as_deref(),
+                Some(&b"v"[..])
+            );
+            assert!(
+                db.get(b"k").expect("read").is_none(),
+                "the copy landed outside its family"
+            );
+            assert!(!global().is_latched_at(db.path()));
+        } else {
+            let err = outcome.expect_err("a full disk is not retried");
+            assert!(chain_is_enospc(&err));
+            assert!(global().is_latched_at(db.path()));
+            global().note_write_ok(db.path());
+        }
     }
 }
