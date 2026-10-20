@@ -179,6 +179,11 @@ pub struct SpaceSummary {
     pub backlog: usize,
     /// Memories whose stored vector is in this space and was refused by an index in another.
     pub stranded: usize,
+    /// Memories keeping a vector in this space that no index here holds: a vector a re-embed
+    /// replaced, or one another instance wrote. Counted by a census over the store, at most
+    /// hourly, so it may lag the store by that much.
+    #[serde(default)]
+    pub kept: usize,
 }
 
 impl SpaceSummary {
@@ -191,6 +196,7 @@ impl SpaceSummary {
             memories: 0,
             backlog: 0,
             stranded: 0,
+            kept: 0,
         }
     }
 
@@ -198,6 +204,7 @@ impl SpaceSummary {
         self.memories += other.memories;
         self.backlog += other.backlog;
         self.stranded += other.stranded;
+        self.kept += other.kept;
     }
 }
 
@@ -256,6 +263,19 @@ impl SpaceRegistry {
     }
 }
 
+/// Whether a corpus holding `stored` memories is cut off from vector search: no index here holds
+/// any of them, and the backlog shows vectors waiting that nothing has supplied. A corpus whose
+/// every vector is in a space this server neither writes nor reaches through a map ends here;
+/// so does one whose embedder has been down since its first write. Serving it as healthy hides
+/// that recall is keyword-only.
+pub fn corpus_orphaned(stored: usize, summaries: &[SpaceSummary]) -> bool {
+    stored > 0
+        && summaries.iter().all(|s| s.memories == 0)
+        && summaries
+            .iter()
+            .any(|s| s.backlog > 0 || s.stranded > 0 || s.kept > 0)
+}
+
 /// Sum summaries by space id, in id order.
 pub fn merge_summaries(summaries: impl IntoIterator<Item = SpaceSummary>) -> Vec<SpaceSummary> {
     let mut merged: std::collections::BTreeMap<SpaceId, SpaceSummary> = Default::default();
@@ -292,6 +312,27 @@ mod tests {
         assert!(back.same_content(&registry));
         assert_eq!(back.spaces[1].stranded, 56);
         assert_eq!(back.spaces[0].codec, CODEC_F32);
+    }
+
+    #[test]
+    fn a_corpus_no_index_reaches_is_orphaned_only_with_work_waiting() {
+        let nomic = SpaceId::new("nomic-embed-text-v1.5", 768);
+        let mut waiting = SpaceSummary::empty(nomic.clone());
+        waiting.backlog = 3;
+        let mut stranded = SpaceSummary::empty(SpaceId::new("minilm-l6-v2", 384));
+        stranded.stranded = 3;
+        assert!(corpus_orphaned(3, &[waiting.clone(), stranded.clone()]));
+        assert!(
+            !corpus_orphaned(0, &[waiting.clone()]),
+            "an empty corpus is not orphaned"
+        );
+        assert!(
+            !corpus_orphaned(3, &[SpaceSummary::empty(nomic.clone())]),
+            "nothing failed yet: a write waiting for its first vector"
+        );
+        let mut searchable = SpaceSummary::empty(nomic);
+        searchable.memories = 1;
+        assert!(!corpus_orphaned(3, &[searchable, stranded]));
     }
 
     #[test]

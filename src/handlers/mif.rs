@@ -56,9 +56,12 @@ pub async fn export_mif(
     // unwrap_or_default) let an export "succeed" while silently omitting memories, todos,
     // projects or reminders — the worst shape of loss, because the caller holds a backup with
     // no sign it is partial. A failed read fails the export (shodh-memory 9233dcd).
-    let memories = {
+    let (memories, index_space) = {
         let guard = memory_sys.read();
-        guard.get_all_memories().map_err(AppError::Internal)?
+        (
+            guard.get_all_memories().map_err(AppError::Internal)?,
+            guard.index_space(),
+        )
     };
 
     let graph = if req.include_graph {
@@ -94,6 +97,7 @@ pub async fn export_mif(
         include_graph: req.include_graph,
         redact_pii: req.redact_pii,
         since,
+        index_space: Some(index_space),
     };
 
     let graph_ref = graph.as_ref().map(|g| g.read());

@@ -80,6 +80,28 @@ The intent-log Vamana projection (`/api/query`) binds its text-primary index to 
 active space when it opens. It skips any vector of another width or recorded space, so a log
 replayed from the start across an embedder change no longer builds the index in the old space.
 
+## Every boundary a vector crosses
+
+A slot holds a vector in the space it is read in, or nothing. A write that brings a vector in
+another space keeps it among `other_vectors` and leaves the slot empty, so the memory is embedded
+in the corpus's space and every cosine against a slot compares one space. The start-up pass does
+the same for a vector it cannot re-embed.
+
+| Surface | What carries the space |
+|---|---|
+| Intent log and replication frames | The memory record itself, whose last fields are the spaces |
+| Portable dump, redb backup, `veld migrate` | The record bytes, carried as stored |
+| RocksDB backup | The store's files, copied as they are |
+| MIF export | `embeddings.model` and `embeddings.dimensions` name the vector's space, not a fixed `minilm-l6-v2` |
+| MIF import | Reads the space back; a vector in another space is kept, and the memory is embedded anew (or queued when the embedder is down) |
+| Zenoh, Python, MCP | Carry no vectors: memories cross as text and are embedded on arrival |
+
+`/health` reports `orphaned_corpora` and turns `degraded` when a cached corpus stores memories,
+no index here holds any of them, and the backlog or a kept vector shows vectors waiting. That is
+a corpus whose every vector is in a space this server neither writes nor reaches through a map,
+or one whose embedder has been down since its first write. Serving it as healthy would hide that
+recall is keyword-only. Kept vectors are counted by a census over the store, at most hourly.
+
 ## Refusals become backlog rows
 
 An index holds one space. A stored vector in another space is refused, never inserted, because
@@ -123,12 +145,13 @@ vector was taken to be before spaces were recorded.
 ```json
 "embedding_spaces": [
   {"id": "nomic-embed-text-v1.5@768", "model": "nomic-embed-text-v1.5", "dimension": 768,
-   "codec": "f32", "memories": 9874, "backlog": 12, "stranded": 0},
+   "codec": "f32", "memories": 9874, "backlog": 12, "stranded": 0, "kept": 0},
   {"id": "unrecorded@384", "model": "unrecorded", "dimension": 384,
-   "codec": "f32", "memories": 0, "backlog": 0, "stranded": 56}
+   "codec": "f32", "memories": 0, "backlog": 0, "stranded": 56, "kept": 120}
 ]
 ```
 
-`memories` is what an index in the space holds, `backlog` the rows waiting for a vector in it, and
-`stranded` the memories stored in it that an index in another space refused. Space ids name
+`memories` is what an index in the space holds, `backlog` the rows waiting for a vector in it,
+`stranded` the memories stored in it that an index in another space refused, and `kept` the
+memories keeping a vector in it that no index here holds. Space ids name
 models and widths, never a tenant, so the field is safe on the unauthenticated probe.

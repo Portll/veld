@@ -512,6 +512,11 @@ impl RetrievalEngine {
                         memory.experience.keep_vector(space, vector);
                     }
                     dirty = true;
+                } else {
+                    // Not re-embedded this time: the old vector still leaves the slot, so no
+                    // cosine against the primary slot compares it with the new space's vectors.
+                    // The memory waits, unindexed, for the backlog to embed it.
+                    dirty |= memory.experience.move_foreign_to_kept(&target_space, None);
                 }
             }
 
@@ -1323,6 +1328,39 @@ impl RetrievalEngine {
                     .map(|index| (index.space().clone(), index.len())),
             )
             .collect()
+    }
+
+    /// Memories keeping a vector in a space no index here holds, by that space. One pass over
+    /// the store.
+    pub fn census_kept(&self) -> Result<std::collections::BTreeMap<SpaceId, usize>> {
+        let indexed = self.spaces();
+        let mut kept = std::collections::BTreeMap::new();
+        for memory_id in self.storage.get_all_ids()? {
+            let Ok(memory) = self.storage.get(&memory_id) else {
+                continue;
+            };
+            if memory.is_forgotten() {
+                continue;
+            }
+            let mut spaces: Vec<SpaceId> = memory
+                .experience
+                .other_vectors
+                .iter()
+                .map(|v| v.space.clone())
+                .collect();
+            spaces.extend(memory.experience.primary_space(Some(&self.index_space)));
+            spaces.extend(
+                memory
+                    .experience
+                    .secondary_space(self.secondary_index_space.as_ref()),
+            );
+            spaces.sort();
+            spaces.dedup();
+            for space in spaces.into_iter().filter(|s| !indexed.contains(s)) {
+                *kept.entry(space).or_insert(0) += 1;
+            }
+        }
+        Ok(kept)
     }
 
     /// Every installed map between spaces, with where the corpus keeps it.
