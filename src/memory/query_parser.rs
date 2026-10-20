@@ -1493,6 +1493,206 @@ pub fn classify_query(query: &str) -> QueryType {
     QueryType::Exploratory
 }
 
+/// The shape of a query as far as the Layer 5.3 cross-encoder blend is concerned. Each
+/// shape has its own share in `constants::CE_BLEND_*` and its own dial.
+///
+/// - Grounding shapes (`Identifier`, `Ordinal`, `Keyword`) describe questions whose answer
+///   is decided by exact tokens or position in time, where the reranker adds nothing. They
+///   take precedence over everything else, lowest share first.
+/// - Reasoning shapes (`Attribute`, `Relational`, `Abstract`) describe questions whose
+///   answer needs query-to-passage reading.
+/// - Labels (`Temporal`, `People`) mark a plain question of that kind so its share can be
+///   tuned on its own. They apply only when no other shape does: a date in "what filling
+///   did she use in the cake she made in May 2022" filters, it does not answer, and the
+///   reranker still has to match "filling" to "cake".
+///
+/// Declaration order is default-share order, lowest first; [`classify_rerank_shape`] takes
+/// the minimum among grounding shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RerankShape {
+    Identifier,
+    Ordinal,
+    Keyword,
+    Temporal,
+    People,
+    Exploratory,
+    Attribute,
+    Relational,
+    Abstract,
+}
+
+impl RerankShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Identifier => "identifier",
+            Self::Ordinal => "ordinal",
+            Self::Temporal => "temporal",
+            Self::People => "people",
+            Self::Keyword => "keyword",
+            Self::Exploratory => "exploratory",
+            Self::Attribute => "attribute",
+            Self::Relational => "relational",
+            Self::Abstract => "abstract",
+        }
+    }
+}
+
+/// A "who" / "whom" / "who's" question. "Whose" is not one: "whose config file" asks
+/// about a thing.
+pub fn is_people_question(query: &str) -> bool {
+    let lower = query.trim_start().to_lowercase();
+    ["who ", "whom ", "who's ", "who\u{2019}s ", "who're "]
+        .iter()
+        .any(|p| lower.starts_with(p))
+}
+
+/// How strongly a query asks about people, in `[0, 1]`. A who-question or an explicit
+/// ownership phrase is 1.0; a whole-word people noun ("people", "colleagues") is 0.6. Whole
+/// words only: "owner" and "contact" were left out because "file owner" and "contact form"
+/// are technical, and substring matching is how "recent" inside "recently" once amplified
+/// recency fivefold.
+pub fn people_intent(query: &str) -> f32 {
+    if is_people_question(query) {
+        return 1.0;
+    }
+    let lower = query.to_lowercase();
+    if ["who is responsible", "who owns", "who worked on", "assigned to", "point of contact"]
+        .iter()
+        .any(|p| lower.contains(p))
+    {
+        return 1.0;
+    }
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has_word = |w: &str| words.contains(&w);
+    let has_pair = |a: &str, b: &str| words.windows(2).any(|p| p[0] == a && p[1] == b);
+    if ["people", "colleagues", "stakeholders", "teammates", "staff"]
+        .iter()
+        .any(|w| has_word(w))
+        || has_pair("team", "members")
+    {
+        return 0.6;
+    }
+    0.0
+}
+
+/// English stems of the non-stopword tokens in `text`, for query-term coverage.
+pub fn content_stems(text: &str) -> HashSet<String> {
+    let stemmer = Stemmer::create(Algorithm::English);
+    tokenize(text)
+        .into_iter()
+        .filter(|w| !is_stop_word(w))
+        .map(|w| stemmer.stem(&w).into_owned())
+        .collect()
+}
+
+/// Pseudo-relevance feedback terms: words shared by at least two of the first pass's top
+/// documents (all of them when only one is given), not stopwords, not already in the query
+/// by stem, alphabetic and at least four letters. Ranked by how many documents share them,
+/// then by total frequency, then alphabetically so the choice is deterministic. Requiring
+/// two documents keeps one off-topic hit from steering the expansion.
+pub fn prf_terms(docs: &[&str], query: &str, n: usize) -> Vec<String> {
+    if docs.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    let stemmer = Stemmer::create(Algorithm::English);
+    let query_stems = content_stems(query);
+    let mut doc_freq: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for doc in docs {
+        let mut seen_here: HashSet<String> = HashSet::new();
+        for word in tokenize(doc) {
+            if word.len() < 4 || !word.chars().all(char::is_alphabetic) || is_stop_word(&word) {
+                continue;
+            }
+            if query_stems.contains(stemmer.stem(&word).as_ref()) {
+                continue;
+            }
+            let entry = doc_freq.entry(word.clone()).or_insert((0, 0));
+            entry.1 += 1;
+            if seen_here.insert(word) {
+                entry.0 += 1;
+            }
+        }
+    }
+    let min_docs = docs.len().min(2);
+    let mut ranked: Vec<(String, usize, usize)> = doc_freq
+        .into_iter()
+        .filter(|(_, (df, _))| *df >= min_docs)
+        .map(|(w, (df, tf))| (w, df, tf))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+    ranked.into_iter().take(n).map(|(w, _, _)| w).collect()
+}
+
+/// Classify a query for the cross-encoder blend. Grounding shapes win, lowest share first;
+/// then reasoning shapes; then the `Temporal` and `People` labels; then `Exploratory`.
+/// `decomposed` is Layer 2's multi-query flag; `query_type` is [`classify_query`]'s result.
+pub fn classify_rerank_shape(query: &str, decomposed: bool, query_type: &QueryType) -> RerankShape {
+    let lower = query.to_lowercase();
+    let mut shapes: Vec<RerankShape> = Vec::with_capacity(3);
+
+    if has_lexical_identifiers(query)
+        || query.split_whitespace().any(|w| w.contains('/') || w.contains("::") || w.contains('_'))
+    {
+        shapes.push(RerankShape::Identifier);
+    }
+    // Same trigger as Layer 5.9's ordinal pin, so the share follows what the pipeline does.
+    if lower.contains("first ")
+        || lower.contains("most recent")
+        || lower.contains("latest")
+        || lower.contains("last ")
+    {
+        shapes.push(RerankShape::Ordinal);
+    }
+    let content_tokens = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !is_stop_word(w))
+        .count();
+    if content_tokens < 3 {
+        shapes.push(RerankShape::Keyword);
+    }
+    if let Some(grounding) = shapes.iter().min() {
+        return *grounding;
+    }
+
+    if decomposed {
+        return RerankShape::Abstract;
+    }
+    let trimmed = lower.trim_start();
+    if trimmed.starts_with("how did ")
+        || trimmed.starts_with("how does ")
+        || trimmed.starts_with("how do ")
+        || trimmed.starts_with("how was ")
+        || trimmed.starts_with("why ")
+    {
+        return RerankShape::Relational;
+    }
+    if matches!(query_type, QueryType::Attribute(_)) {
+        return RerankShape::Attribute;
+    }
+    // Labels, not grounding shapes. Measured 2026-10-19: as grounding shapes at 0.10, the
+    // temporal share cost the recall gate a gold document on a dated content question and
+    // the people share overrode the abstract share on decomposed who-questions (LOCOMO-20
+    // Q20 lost a top-5 answer, gate q121 lost rank).
+    if ["last week", "last month", "yesterday", "today", "recently", "recent "]
+        .iter()
+        .any(|kw| lower.contains(kw))
+        || matches!(
+            detect_temporal_intent(query),
+            TemporalIntent::SpecificTime | TemporalIntent::Ordering
+        )
+    {
+        return RerankShape::Temporal;
+    }
+    if is_people_question(query) {
+        return RerankShape::People;
+    }
+    RerankShape::Exploratory
+}
+
 /// Detect whether a query contains lexical identifiers that score poorly on
 /// vector similarity (ticket IDs, version strings, error codes, UUIDs, etc.).
 ///
@@ -5965,5 +6165,99 @@ mod tests {
         assert!(!asks_for_temporal_answer(
             "What did Melanie think about camping?"
         ));
+    }
+
+    fn shape(q: &str, decomposed: bool) -> RerankShape {
+        classify_rerank_shape(q, decomposed, &classify_query(q))
+    }
+
+    #[test]
+    fn rerank_shape_grounding_shapes_win() {
+        assert_eq!(shape("where is admin/serve.mjs loaded", false), RerankShape::Identifier);
+        assert_eq!(shape("what was the first bug we hit", false), RerankShape::Ordinal);
+        assert_eq!(shape("redis cache", false), RerankShape::Keyword);
+        assert_eq!(shape("who fixed the EU checkout last week", false), RerankShape::Ordinal);
+        assert_eq!(shape("how did we fix the latest checkout bug", false), RerankShape::Ordinal);
+        assert_eq!(shape("what was the first bug we hit", true), RerankShape::Ordinal);
+    }
+
+    #[test]
+    fn rerank_shape_labels_apply_only_when_nothing_else_does() {
+        assert_eq!(shape("what did we decide recently about the API", false), RerankShape::Temporal);
+        assert_eq!(shape("who fixed the EU checkout yesterday", false), RerankShape::Temporal);
+        assert_eq!(shape("who are the key people on the team", false), RerankShape::People);
+        assert_eq!(shape("who are the key people on the team", true), RerankShape::Abstract);
+        assert_eq!(
+            shape("what filling did Joanna use in the cake she made recently", true),
+            RerankShape::Abstract
+        );
+        assert_eq!(
+            shape("how did the migration recently change checkout latency", false),
+            RerankShape::Relational
+        );
+    }
+
+    #[test]
+    fn rerank_shape_reasoning_shapes_only_without_grounding() {
+        assert_eq!(shape("how did Sarah's Stripe migration fix the EU checkout delay", false), RerankShape::Relational);
+        assert_eq!(shape("why did the analytics database run out of disk space", false), RerankShape::Relational);
+        assert_eq!(shape("what performance improvements have we achieved across the product", true), RerankShape::Abstract);
+        assert_eq!(shape("what caching problems did we have and how were they resolved", false), RerankShape::Exploratory);
+        assert_eq!(shape("how did we deploy SHO-72 to staging", false), RerankShape::Identifier);
+    }
+
+    #[test]
+    fn people_intent_grades_and_rejects_technical_words() {
+        assert_eq!(people_intent("Who are the key people on the team?"), 1.0);
+        assert_eq!(people_intent("which tasks are assigned to the platform group"), 1.0);
+        assert_eq!(people_intent("what did the team members decide"), 0.6);
+        assert_eq!(people_intent("what happened to the people counter"), 0.6);
+        assert_eq!(people_intent("whose fault was the outage"), 0.0);
+        assert_eq!(people_intent("who's on call this week"), 1.0);
+        assert_eq!(people_intent("change the file owner and the contact form"), 0.0);
+    }
+
+    #[test]
+    fn content_stems_match_across_inflections() {
+        let query = content_stems("what caching problems did we have");
+        let memory = content_stems("Raj found the Redis cache invalidation bug");
+        assert!(query.contains("cach"));
+        assert!(memory.contains("cach"));
+        assert!(!query.contains("what"));
+    }
+
+    #[test]
+    fn prf_terms_need_two_documents_and_skip_query_words() {
+        let docs = [
+            "Redis cache invalidation race in the pub/sub listener",
+            "Added distributed locking with Redlock to the Redis listener",
+            "Team lunch at Sakura Sushi",
+        ];
+        let terms = prf_terms(&docs, "what caching problems did we have", 5);
+        assert!(terms.contains(&"redis".to_string()));
+        assert!(terms.contains(&"listener".to_string()));
+        assert!(!terms.contains(&"sushi".to_string()));
+        assert!(!terms.iter().any(|t| t.starts_with("cach")));
+        assert_eq!(prf_terms(&docs, "q", 5), prf_terms(&docs, "q", 5));
+    }
+
+    #[test]
+    fn rerank_shape_is_ordered_by_default_share() {
+        use crate::constants as c;
+        let shares = [
+            (RerankShape::Identifier, c::CE_BLEND_IDENTIFIER),
+            (RerankShape::Ordinal, c::CE_BLEND_ORDINAL),
+            (RerankShape::Keyword, c::CE_BLEND_KEYWORD),
+            (RerankShape::Temporal, c::CE_BLEND_TEMPORAL),
+            (RerankShape::People, c::CE_BLEND_PEOPLE),
+            (RerankShape::Exploratory, c::CE_BLEND_EXPLORATORY),
+            (RerankShape::Attribute, c::CE_BLEND_ATTRIBUTE),
+            (RerankShape::Relational, c::CE_BLEND_RELATIONAL),
+            (RerankShape::Abstract, c::CE_BLEND_ABSTRACT),
+        ];
+        for pair in shares.windows(2) {
+            assert!(pair[0].0 < pair[1].0);
+            assert!(pair[0].1 <= pair[1].1, "{:?} share above {:?}", pair[0].0, pair[1].0);
+        }
     }
 }
