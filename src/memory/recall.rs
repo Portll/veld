@@ -1663,11 +1663,15 @@ impl super::MemorySystem {
                 .unwrap_or(crate::constants::PRF_ENABLED_DEFAULT)
                 && early_dials_snapshot.signal_enabled("prf");
             if prf_wanted && hybrid_ids.len() >= 2 {
-                let prf_docs = early_dials_snapshot.prf_docs.unwrap_or(crate::constants::PRF_DOCS);
-                let prf_term_count =
-                    early_dials_snapshot.prf_terms.unwrap_or(crate::constants::PRF_TERMS);
-                let prf_weight =
-                    early_dials_snapshot.prf_weight.unwrap_or(crate::constants::PRF_WEIGHT);
+                let prf_docs = early_dials_snapshot
+                    .prf_docs
+                    .unwrap_or(crate::constants::PRF_DOCS);
+                let prf_term_count = early_dials_snapshot
+                    .prf_terms
+                    .unwrap_or(crate::constants::PRF_TERMS);
+                let prf_weight = early_dials_snapshot
+                    .prf_weight
+                    .unwrap_or(crate::constants::PRF_WEIGHT);
                 let doc_texts: Vec<String> = hybrid_ids
                     .iter()
                     .take(prf_docs)
@@ -3470,7 +3474,8 @@ impl super::MemorySystem {
                     factor *= 1.0 - coverage_weight * (1.0 - covered / coverage_total);
                 }
                 if people_active {
-                    factor *= 1.0 + people_max * people_intent * people_score(&mem.experience.content);
+                    factor *=
+                        1.0 + people_max * people_intent * people_score(&mem.experience.content);
                 }
                 if (factor - 1.0).abs() > f32::EPSILON {
                     let base = mem.score.unwrap_or(0.0);
@@ -4164,7 +4169,11 @@ impl super::MemorySystem {
             // Layer 5.36 already scored coverage on stems before truncation; scoring it again
             // here on surface text would count the same evidence twice. The fact supplement
             // below still runs.
-            let sufficiency_scoring = if query_coverage_active { 0 } else { memories.len() };
+            let sufficiency_scoring = if query_coverage_active {
+                0
+            } else {
+                memories.len()
+            };
             for mem in memories.iter_mut().take(sufficiency_scoring) {
                 let content_lower = mem.experience.content.to_lowercase();
                 let covered = query_entities
@@ -4666,7 +4675,11 @@ impl super::MemorySystem {
     /// Put the Layer 5.9 ordinal pin back at rank 1 after the layers that re-sort by score,
     /// re-inserting it if a later truncation dropped it. Its score is raised just above the
     /// new second place so the list stays monotonic and a caller that re-sorts keeps the pin.
-    fn reassert_ordinal_pin(memories: &mut Vec<SharedMemory>, pinned: SharedMemory, max_results: usize) {
+    fn reassert_ordinal_pin(
+        memories: &mut Vec<SharedMemory>,
+        pinned: SharedMemory,
+        max_results: usize,
+    ) {
         let pinned = match memories.iter().position(|m| m.id == pinned.id) {
             Some(pos) => memories.remove(pos),
             None => pinned,
@@ -5557,7 +5570,11 @@ impl super::MemorySystem {
                 _ => None,
             })
             .fold((0.0_f32, 0usize), |(s, n), v| (s + v, n + 1));
-        let baseline = if pair_count > 0 { (pair_sum / pair_count as f32).clamp(0.0, 0.99) } else { 0.0 };
+        let baseline = if pair_count > 0 {
+            (pair_sum / pair_count as f32).clamp(0.0, 0.99)
+        } else {
+            0.0
+        };
         let redundancy = |sim: f32| -> f32 {
             let centred = ((sim - baseline) / (1.0 - baseline)).clamp(0.0, 1.0);
             if centred >= crate::constants::MMR_REDUNDANCY_THRESHOLD {
@@ -6080,7 +6097,10 @@ mod ordinal_pin_tests {
     fn scored(content: &str, score: f32) -> SharedMemory {
         let mut m = Memory::new(
             MemoryId(uuid::Uuid::new_v4()),
-            Experience { content: content.to_string(), ..Default::default() },
+            Experience {
+                content: content.to_string(),
+                ..Default::default()
+            },
             0.5,
             None,
             None,

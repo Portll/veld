@@ -1260,7 +1260,11 @@ mod probes_while_a_tenant_opens {
 
         let (status, body) =
             ready.expect("/health/ready did not answer while requests waited on a tenant open");
-        assert_eq!(status, StatusCode::OK, "an open delays its tenant, not the process: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an open delays its tenant, not the process: {body}"
+        );
         assert_eq!(body["tenant_open_waiters"], WORKERS * 2);
 
         let (status, body) = ready_after.expect("/health/ready answers after the open");
