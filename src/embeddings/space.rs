@@ -166,7 +166,7 @@ fn default_codec() -> String {
 }
 
 /// What one corpus, or a fleet of them, holds in a space.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpaceSummary {
     pub id: SpaceId,
     pub model: String,
@@ -184,6 +184,58 @@ pub struct SpaceSummary {
     /// hourly, so it may lag the store by that much.
     #[serde(default)]
     pub kept: usize,
+    /// How this space's search similarities are distributed, learned from its own searches;
+    /// see [`ScoreStats`]. Absent until enough searches have run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scores: Option<ScoreStats>,
+}
+
+/// The distribution of the best similarities a space's searches return, as an exponential
+/// moving mean and variance. Two models' cosines are not on one scale: a sharper model's
+/// near-misses can outscore a flatter model's hits. A similarity is moved onto another space's
+/// scale by matching z-scores, which is what any comparison of raw cosines across spaces needs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ScoreStats {
+    pub mean: f32,
+    pub variance: f32,
+    pub samples: u64,
+}
+
+impl ScoreStats {
+    /// Weight of a new search in the moving statistics.
+    const ALPHA: f32 = 0.02;
+    /// Searches before the statistics are used: too few, and the scale is noise.
+    pub const MIN_SAMPLES: u64 = 30;
+
+    pub fn observe(stats: Option<Self>, value: f32) -> Self {
+        match stats {
+            None => Self {
+                mean: value,
+                variance: 0.0,
+                samples: 1,
+            },
+            Some(s) => {
+                let delta = value - s.mean;
+                let mean = s.mean + Self::ALPHA * delta;
+                let variance = (1.0 - Self::ALPHA) * (s.variance + Self::ALPHA * delta * delta);
+                Self {
+                    mean,
+                    variance,
+                    samples: s.samples.saturating_add(1),
+                }
+            }
+        }
+    }
+
+    pub fn ready(&self) -> bool {
+        self.samples >= Self::MIN_SAMPLES && self.variance > f32::EPSILON
+    }
+
+    /// `value`, a similarity on this scale, moved onto `target`'s by matching z-scores.
+    pub fn onto(&self, target: &Self, value: f32) -> f32 {
+        let z = (value - self.mean) / self.variance.sqrt();
+        target.mean + z * target.variance.sqrt()
+    }
 }
 
 impl SpaceSummary {
@@ -197,6 +249,7 @@ impl SpaceSummary {
             backlog: 0,
             stranded: 0,
             kept: 0,
+            scores: None,
         }
     }
 
@@ -333,6 +386,26 @@ mod tests {
         let mut searchable = SpaceSummary::empty(nomic);
         searchable.memories = 1;
         assert!(!corpus_orphaned(3, &[searchable, stranded]));
+    }
+
+    #[test]
+    fn a_score_moves_onto_another_space_by_matching_z_scores() {
+        let mut sharp = None;
+        let mut flat = None;
+        for i in 0..200 {
+            let wobble = if i % 2 == 0 { 1.0 } else { -1.0 };
+            sharp = Some(ScoreStats::observe(sharp, 0.80 + 0.10 * wobble));
+            flat = Some(ScoreStats::observe(flat, 0.50 + 0.02 * wobble));
+        }
+        let (sharp, flat) = (sharp.unwrap(), flat.unwrap());
+        assert!(sharp.ready() && flat.ready());
+        let flat_hit = flat.mean + 2.0 * flat.variance.sqrt();
+        let on_sharp = flat.onto(&sharp, flat_hit);
+        assert!(
+            (on_sharp - (sharp.mean + 2.0 * sharp.variance.sqrt())).abs() < 1e-4,
+            "two deviations above the mean stay two deviations above it"
+        );
+        assert!(!ScoreStats::observe(None, 0.5).ready());
     }
 
     #[test]

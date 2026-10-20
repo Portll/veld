@@ -142,6 +142,11 @@ pub struct CognitiveDials {
     /// Weight ratio of the secondary (768d) vector index signal. Default 0.5.
     #[serde(default)]
     pub secondary_rrf_ratio: Option<f32>,
+    /// Per-space multiplier on a non-primary space's RRF contribution, keyed by space id
+    /// (`<model>@<dimension>`); a space with no entry weighs 1.0. The primary space's vector
+    /// weight is `rrf_weights`' second term.
+    #[serde(default)]
+    pub space_weights: std::collections::BTreeMap<String, f32>,
     /// BM25 minimum-score floor for lexical candidates. Default 0.1.
     #[serde(default)]
     pub bm25_min_score: Option<f32>,
@@ -402,6 +407,7 @@ impl Default for CognitiveDials {
             rrf_k_decomp: None,
             rrf_k_inner: None,
             secondary_rrf_ratio: None,
+            space_weights: Default::default(),
             bm25_min_score: None,
             onto_rerank_boost: None,
             onto_rerank_max: None,
@@ -446,6 +452,11 @@ impl CognitiveDials {
         cl(&mut self.rrf_k_decomp, 5.0, 100.0);
         cl(&mut self.rrf_k_inner, 5.0, 100.0);
         cl(&mut self.secondary_rrf_ratio, 0.0, 2.0);
+        self.space_weights
+            .retain(|space, _| crate::embeddings::space::SpaceId::parse(space).is_some());
+        for weight in self.space_weights.values_mut() {
+            *weight = weight.clamp(0.0, 2.0);
+        }
         cl(&mut self.bm25_min_score, 0.0, 1.0);
         cl(&mut self.onto_rerank_boost, 0.0, 1.0);
         cl(&mut self.onto_rerank_max, 0.0, 1.0);
@@ -565,6 +576,23 @@ impl CognitiveDials {
                 .collect();
         }
         d.sanitized()
+    }
+}
+
+#[cfg(test)]
+mod space_weight_tests {
+    use super::*;
+
+    #[test]
+    fn space_weights_keep_valid_spaces_and_clamp() {
+        let mut dials = CognitiveDials::default();
+        dials
+            .space_weights
+            .insert("minilm-l6-v2@384".to_string(), 7.0);
+        dials.space_weights.insert("not a space".to_string(), 1.0);
+        let dials = dials.sanitized();
+        assert_eq!(dials.space_weights.len(), 1);
+        assert_eq!(dials.space_weights["minilm-l6-v2@384"], 2.0);
     }
 }
 
