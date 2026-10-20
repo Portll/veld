@@ -23,6 +23,7 @@ pub mod alignment_config;
 pub mod alignment_csls;
 pub mod alignment_procrustes;
 pub mod alignment_ridge;
+pub mod alignment_spaces;
 pub mod chunking;
 pub mod circuit_breaker;
 pub mod competitive;

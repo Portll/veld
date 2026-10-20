@@ -1733,6 +1733,56 @@ impl super::MemorySystem {
                 }
             }
 
+            // Spaces reached through a fitted map: a query vector in a space the embedder
+            // writes, mapped into an indexed space no embedder here writes — a space kept through
+            // a migration, or another instance's. Each map's results are weighed by its
+            // confidence, its held-out paired cosine.
+            if use_dual {
+                let bridge_ratio = self
+                    .cognitive_dials
+                    .read()
+                    .secondary_rrf_ratio
+                    .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
+                for (from, to, _) in self.embedder.bridges() {
+                    if to == index_space || space_queries.iter().any(|(s, _)| *s == to) {
+                        continue;
+                    }
+                    let query_vec: Option<&Vec<f32>> = if from == index_space {
+                        Some(&query_embedding)
+                    } else {
+                        space_queries
+                            .iter()
+                            .find(|(s, _)| *s == from)
+                            .map(|(_, q)| *q)
+                    };
+                    let Some(q) = query_vec else {
+                        continue;
+                    };
+                    match self
+                        .retriever
+                        .search_bridged(&from, &to, q, query.max_results * 8)
+                    {
+                        Ok((hits, confidence)) if !hits.is_empty() => {
+                            let w = semantic_w * bridge_ratio * confidence;
+                            for (r, (id, _)) in hits.iter().enumerate() {
+                                *fused.entry(id.clone()).or_insert(0.0) += w / (k + (r + 1) as f32);
+                            }
+                            tracing::debug!(
+                                "Layer 4 RRF: {} reached from {} added {} results (w={:.2})",
+                                to,
+                                from,
+                                hits.len(),
+                                w
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("{from} → {to} search failed (non-fatal): {e}");
+                        }
+                    }
+                }
+            }
+
             // ===========================================================================
             // LAYER 4.5: ATTRIBUTE QUERY BOOST
             // ===========================================================================

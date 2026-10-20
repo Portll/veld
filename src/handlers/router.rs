@@ -14,10 +14,9 @@ use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, keys,
-    lineage, memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions,
-    replication, sleep_time, storage_migration, todos, ui, user_admin, user_auth, users,
-    visualization,
-    webhooks,
+    lineage, memory_ops, mif, prompt_gen, query, recall, remember, replication, search, seed,
+    sessions, sleep_time, spaces, storage_migration, todos, ui, user_admin, user_auth, users,
+    visualization, webhooks,
 };
 
 /// Application state type alias
@@ -412,7 +411,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/admin/replication/status", get(replication::status))
         .route("/api/admin/replication/records", get(replication::records))
         .route("/api/admin/replication/follow", post(replication::follow))
-        .route("/api/admin/replication/unfollow", post(replication::unfollow))
+        .route(
+            "/api/admin/replication/unfollow",
+            post(replication::unfollow),
+        )
         // =================================================================
         // ADVANCED SEARCH
         // =================================================================
@@ -439,6 +441,8 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             "/api/embeddings/backlog/drain",
             post(consolidation::drain_embedding_backlog),
         )
+        .route("/api/spaces", get(spaces::list_spaces))
+        .route("/api/spaces/align", post(spaces::align_spaces))
         .route(
             "/api/storage/cleanup",
             post(consolidation::cleanup_corrupted),

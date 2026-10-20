@@ -1,8 +1,10 @@
 //! Fit a global alignment from a pairs file.
 //!
 //! Encodes `pairs.jsonl` with both embedders, splits 90/10 (deterministic by
-//! text hash), fits Procrustes (default) or Ridge, evaluates on the held-out
-//! 10%, and persists to `evaluations/alignment/fitted/<pair_id>.bin`.
+//! text hash), fits whitened Procrustes (default), orthogonal Procrustes or
+//! Ridge, evaluates on the held-out 10%, and persists to
+//! `evaluations/alignment/fitted/<pair_id>.bin`. The pair id names the two
+//! embedding spaces, `<model>@<dimension>`, as the server keys its maps.
 //!
 //! The `--side` flag controls which face of an asymmetric embedder is used:
 //! `doc` (default) calls `encode()`, `query` calls `encode_for_query()`. For
@@ -19,8 +21,11 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use veld::embeddings::alignment_spaces::pair_id_between;
+use veld::embeddings::space::SpaceId;
 use veld::embeddings::{
-    save_alignment, Alignment, AlignmentPairId, Embedder, ProcrustesAlignment, RidgeAlignment,
+    save_alignment, AffineAlignment, Alignment, AlignmentConfig, AlignmentPairId, Embedder,
+    ProcrustesAlignment, RidgeAlignment,
 };
 
 /// Magic for the encoded-vector cache file (`pairs.<pair>.<side>.vec`).
@@ -34,6 +39,8 @@ enum Side {
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum Method {
+    /// Whitened Procrustes (alignment v2): conditions both spaces, so their widths may differ.
+    Whitened,
     Procrustes,
     Ridge,
 }
@@ -81,7 +88,7 @@ struct Args {
     side: Side,
 
     /// Fit method (procrustes | ridge).
-    #[arg(long, value_enum, default_value_t = Method::Procrustes)]
+    #[arg(long, value_enum, default_value_t = Method::Whitened)]
     method: Method,
 
     /// Ridge regularisation strength (only used with `--method ridge`).
@@ -129,9 +136,8 @@ fn main() -> Result<()> {
             mid.to_string()
         }
     });
-    let pair_id = AlignmentPairId::new(args.primary_id.clone(), secondary_canonical.clone());
     tracing::info!(
-        "pair_id.secondary = {} (loading id = {})",
+        "secondary model = {} (loading id = {})",
         secondary_canonical,
         args.secondary_id
     );
@@ -157,6 +163,13 @@ fn main() -> Result<()> {
             Side::Query => e.encode_for_query(t),
         }
     };
+
+    // The spaces are named from what each embedder returns: an HTTP embedder reports a default
+    // width until it has answered once.
+    let primary_space = SpaceId::for_vector(primary.as_ref(), &encode(&primary, texts[0])?);
+    let secondary_space = SpaceId::new(&secondary_canonical, encode(&secondary, texts[0])?.len());
+    let pair_id: AlignmentPairId = pair_id_between(&secondary_space, &primary_space);
+    tracing::info!("fitting the map from {secondary_space} to {primary_space}");
 
     // Try the encoded-vector cache first. Cache key is the SHA-256 of
     // pairs.jsonl bytes + the embedder pair-id + side; the cache invalidates
@@ -222,6 +235,29 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.out_dir)?;
 
     match args.method {
+        Method::Whitened => {
+            let config = AlignmentConfig::from_env();
+            let mut alignment = AffineAlignment::fit_whitened_procrustes(
+                pair_id.clone(),
+                &train_p,
+                &train_s,
+                config.whiten,
+                config.variance_target,
+                config.whiten_eps,
+            )
+            .context("whitened Procrustes fit")?;
+            cos = mean_paired_cosine(&alignment, &hold_p, &hold_s)?;
+            tracing::info!("held-out mean paired cosine: {:.4}", cos);
+            alignment.set_eval(cos);
+            if cos < args.min_cosine {
+                bail!(
+                    "alignment quality {:.4} below acceptance threshold {:.4} — refusing to install",
+                    cos,
+                    args.min_cosine
+                );
+            }
+            save_alignment(&out_path, &alignment)?;
+        }
         Method::Procrustes => {
             let mut alignment = ProcrustesAlignment::fit(pair_id.clone(), &train_p, &train_s)
                 .context("Procrustes fit")?;

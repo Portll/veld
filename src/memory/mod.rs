@@ -5535,6 +5535,25 @@ impl MemorySystem {
         self.embedding_backlog.report()
     }
 
+    /// Every installed map between spaces.
+    pub fn alignments(&self) -> Vec<crate::embeddings::space::RegisteredAlignment> {
+        self.retriever.bridges()
+    }
+
+    /// Fit, save and install the map from `from` into `to` on the memories holding vectors in
+    /// both, and record it in the registry.
+    pub fn fit_alignment(
+        &self,
+        from: &SpaceId,
+        to: &SpaceId,
+    ) -> Result<crate::embeddings::alignment_spaces::BridgeReport> {
+        let report = self.retriever.fit_bridge(from, to)?;
+        if let Err(e) = self.refresh_space_registry() {
+            tracing::warn!("space registry: could not write: {e}");
+        }
+        Ok(report)
+    }
+
     /// Write the space registry beside the corpus markers when what it would say has changed.
     /// Returns whether a file was written.
     pub fn refresh_space_registry(&self) -> Result<bool> {
@@ -5545,7 +5564,7 @@ impl MemorySystem {
             index_space: self.retriever.index_space().clone(),
             secondary_index_space: self.retriever.secondary_index_space().cloned(),
             spaces: self.embedding_spaces()?,
-            alignments: Vec::new(),
+            alignments: self.alignments(),
         };
         let mut written = self.space_registry_written.lock();
         if written

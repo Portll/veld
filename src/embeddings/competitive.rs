@@ -53,11 +53,18 @@ pub struct CompetitiveEmbedder {
     secondary: Option<Arc<dyn Embedder>>,
     /// Cached secondary dimension (avoids repeated vtable calls).
     secondary_dim: Option<usize>,
-    /// Optional learned projection from secondary-space into primary-space.
-    /// Installed via [`install_alignment`] after construction (the embedder is
-    /// typically held as `Arc<CompetitiveEmbedder>` so the slot must be
-    /// interior-mutable).
-    alignment: RwLock<Option<Arc<dyn Alignment>>>,
+    /// Fitted maps between spaces, by `(from, to)`, each with the confidence recall weighs
+    /// what it reaches by. The secondary→primary map the aligned recall leg uses is one of
+    /// them. Interior-mutable because the embedder is held as `Arc<CompetitiveEmbedder>`.
+    bridges: RwLock<std::collections::HashMap<(SpaceId, SpaceId), Bridge>>,
+}
+
+/// A fitted map from one space into another, and how far to trust it.
+#[derive(Clone)]
+pub struct Bridge {
+    pub alignment: Arc<dyn Alignment>,
+    /// Held-out mean paired cosine of the fit, in `[0, 1]`; 1 for a map that never recorded one.
+    pub confidence: f32,
 }
 
 impl CompetitiveEmbedder {
@@ -71,7 +78,7 @@ impl CompetitiveEmbedder {
             primary,
             secondary,
             secondary_dim,
-            alignment: RwLock::new(None),
+            bridges: RwLock::new(Default::default()),
         }
     }
 
@@ -81,7 +88,7 @@ impl CompetitiveEmbedder {
             primary,
             secondary: None,
             secondary_dim: None,
-            alignment: RwLock::new(None),
+            bridges: RwLock::new(Default::default()),
         }
     }
 
@@ -228,18 +235,75 @@ impl CompetitiveEmbedder {
                 self.primary.dimension()
             );
         }
-        *self.alignment.write() = Some(alignment);
+        let (Some(from), to) = (self.secondary_space(), self.primary_space()) else {
+            anyhow::bail!("cannot install alignment: no secondary embedder configured");
+        };
+        let confidence = super::alignment_spaces::confidence_of(alignment.as_ref());
+        self.bridges.write().insert(
+            (from, to),
+            Bridge {
+                alignment,
+                confidence,
+            },
+        );
         Ok(())
     }
 
-    /// True if an alignment is installed.
-    pub fn has_alignment(&self) -> bool {
-        self.alignment.read().is_some()
+    /// Install a map from `from` into `to`. Refused when its widths are not the spaces'.
+    pub fn install_bridge(
+        &self,
+        from: SpaceId,
+        to: SpaceId,
+        alignment: Arc<dyn Alignment>,
+        confidence: f32,
+    ) -> Result<()> {
+        if alignment.in_dim() != from.dimension() || alignment.out_dim() != to.dimension() {
+            anyhow::bail!(
+                "a {}→{} map cannot bridge {from} to {to}",
+                alignment.in_dim(),
+                alignment.out_dim()
+            );
+        }
+        self.bridges.write().insert(
+            (from, to),
+            Bridge {
+                alignment,
+                confidence: confidence.clamp(0.0, 1.0),
+            },
+        );
+        Ok(())
     }
 
-    /// Snapshot the current alignment (clone of the `Arc`) without holding the lock.
+    /// The map from `from` into `to`, when one is installed.
+    pub fn alignment_between(&self, from: &SpaceId, to: &SpaceId) -> Option<Bridge> {
+        self.bridges
+            .read()
+            .get(&(from.clone(), to.clone()))
+            .cloned()
+    }
+
+    /// Every installed map, in a stable order.
+    pub fn bridges(&self) -> Vec<(SpaceId, SpaceId, Bridge)> {
+        let mut out: Vec<(SpaceId, SpaceId, Bridge)> = self
+            .bridges
+            .read()
+            .iter()
+            .map(|((from, to), b)| (from.clone(), to.clone(), b.clone()))
+            .collect();
+        out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        out
+    }
+
+    /// True if the secondary→primary map is installed.
+    pub fn has_alignment(&self) -> bool {
+        self.alignment_snapshot().is_some()
+    }
+
+    /// The secondary→primary map, when installed.
     pub fn alignment_snapshot(&self) -> Option<Arc<dyn Alignment>> {
-        self.alignment.read().clone()
+        let from = self.secondary_space()?;
+        self.alignment_between(&from, &self.primary_space())
+            .map(|b| b.alignment)
     }
 
     /// Encode with the secondary embedder (selecting query or doc face) and

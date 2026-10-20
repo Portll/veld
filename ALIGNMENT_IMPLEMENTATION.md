@@ -5,6 +5,13 @@
 **Date:** 2026-05-27
 **Target branch:** `feat/alignment-core` (and later `feat/alignment-mcp-experimental`)
 
+> **Status 2026-10-20.** This plan built the alignment machinery. The machinery is now keyed by
+> embedding space and fitted from the corpus itself, with no pairs file
+> (`POST /api/spaces/align`), and the map is a read-side bridge recall searches through,
+> weighed by its held-out confidence. The current design is
+> [docs/src/architecture/alignment.md](docs/src/architecture/alignment.md). The sections below
+> are the history of how the fitters were built.
+
 This document is a copy-paste-into-VS-Code implementation plan. Every code block is meant to be lifted whole into the file path named above it. No TODOs, no stubs, no placeholders — per `CLAUDE.md`.
 
 Work runs in seven phases. Each phase ends with a verification command. Run `cargo check` / `cargo clippy` between phases; the user runs `cargo build` and trunk separately.
