@@ -1367,6 +1367,7 @@ impl MemorySystem {
         let embedder = Arc::new(crate::embeddings::competitive::CompetitiveEmbedder::new(
             primary, secondary,
         ));
+        crate::similarity::scale::set_active_embedder(embedder.id());
 
         // Create consolidation event buffer first so we can share it with retriever
         let consolidation_events = Arc::new(RwLock::new(ConsolidationEventBuffer::new()));
@@ -2848,7 +2849,8 @@ impl MemorySystem {
                             self.retriever.get_from_storage(id).ok().map(|m| {
                                 (
                                     id.0.to_string(),
-                                    *similarity,
+                                    // Interference's bars are MiniLM-tuned; read on that scale.
+                                    crate::similarity::scale::to_reference(*similarity),
                                     m.importance(),
                                     m.created_at,
                                     m.experience.content.chars().take(50).collect::<String>(),

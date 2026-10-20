@@ -5082,7 +5082,9 @@ impl super::MemorySystem {
                     memories[right_idx].experience.embeddings.as_ref(),
                 ) {
                     (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => {
-                        crate::similarity::cosine_similarity(left, right)
+                        crate::similarity::scale::to_reference(
+                            crate::similarity::cosine_similarity(left, right),
+                        )
                     }
                     _ => {
                         let union_count =
