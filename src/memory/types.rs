@@ -3730,6 +3730,28 @@ impl Query {
         true
     }
 
+    /// Whether this query carries a caller filter that [`Self::matches`] applies, beyond the
+    /// default exclusions (forgotten memories, intentions). Recall widens its candidate scan
+    /// when it does, because a selective filter can discard most of a fixed-size pool.
+    pub fn has_selective_filters(&self) -> bool {
+        self.importance_threshold.is_some()
+            || self.experience_types.is_some()
+            || self.time_range.is_some()
+            || self.robot_id.is_some()
+            || self.mission_id.is_some()
+            || self.geo_filter.is_some()
+            || self.action_type.is_some()
+            || self.reward_range.is_some()
+            || self.outcome_type.is_some()
+            || self.failures_only
+            || self.anomalies_only
+            || self.severity.is_some()
+            || self.tags.as_ref().is_some_and(|t| !t.is_empty())
+            || self.pattern_id.is_some()
+            || self.terrain_type.is_some()
+            || self.confidence_range.is_some()
+    }
+
     /// Create a builder for Query
     pub fn builder() -> QueryBuilder {
         QueryBuilder::default()
@@ -6232,5 +6254,21 @@ mod enrichment_merge_tests {
                 .any(|p| matches!(p, Place::Geo { .. }))
         });
         assert!(place_is_geo, "a filled geo fix reaches the WHERE facet too");
+    }
+}
+
+#[cfg(test)]
+mod query_filter_tests {
+    use super::Query;
+
+    #[test]
+    fn has_selective_filters_ignores_defaults_and_empty_tags() {
+        assert!(!Query::default().has_selective_filters());
+        let q = Query { tags: Some(Vec::new()), ..Default::default() };
+        assert!(!q.has_selective_filters());
+        let q = Query { tags: Some(vec!["storage".into()]), ..Default::default() };
+        assert!(q.has_selective_filters());
+        let q = Query { failures_only: true, ..Default::default() };
+        assert!(q.has_selective_filters());
     }
 }

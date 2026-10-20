@@ -86,7 +86,7 @@ impl super::MemorySystem {
 
         // Expand with hierarchy context (parent chain + children)
         // Related memories in hierarchy get a decayed score boost
-        self.expand_with_hierarchy(&mut memories, &mut seen_ids);
+        self.expand_with_hierarchy(query, &mut memories, &mut seen_ids);
 
         // Rank by importance * temporal relevance
         let now = super::scoring_now();
@@ -1439,26 +1439,40 @@ impl super::MemorySystem {
                 best.filter(|&s| s > 0.1)
             };
 
-            // Scan Working tier (dual-embedder max-score)
+            let mut tier_candidates: Vec<(MemoryId, f32)> = Vec::new();
             for mem in self.working_memory.read().all_memories() {
                 if vamana_ids.contains(&mem.id) {
                     continue;
                 }
                 if let Some(sim) = dual_cosine(&mem) {
-                    vector_results.push((mem.id.clone(), sim));
-                    tier_hits += 1;
+                    tier_candidates.push((mem.id.clone(), sim));
                 }
             }
-
-            // Scan Session tier (dual-embedder max-score)
             for mem in self.session_memory.read().all_memories() {
                 if vamana_ids.contains(&mem.id) {
                     continue;
                 }
                 if let Some(sim) = dual_cosine(&mem) {
-                    vector_results.push((mem.id.clone(), sim));
+                    tier_candidates.push((mem.id.clone(), sim));
+                }
+            }
+
+            if decomposed {
+                // The decomposed vector list carries reciprocal-rank scores (at most
+                // weight / (k + 1), about 0.05), not cosine. Pushing raw cosine (above 0.1)
+                // beside it put every tier hit above every Vamana hit, and the truncation
+                // below then evicted the Vamana hits (live: tier_hits=56, total=48). Tier hits
+                // enter as one more ranked list instead, at the strongest list's weight and
+                // the same k, so they interleave with the Vamana hits by rank.
+                let decomp_rrf_k: f32 = self.cognitive_dials.read().rrf_k_decomp.unwrap_or(20.0);
+                tier_candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                for (rank, (id, _)) in tier_candidates.into_iter().enumerate() {
+                    vector_results.push((id, 1.0 / (decomp_rrf_k + (rank + 1) as f32)));
                     tier_hits += 1;
                 }
+            } else {
+                tier_hits = tier_candidates.len();
+                vector_results.extend(tier_candidates);
             }
 
             if tier_hits > 0 {
@@ -2603,7 +2617,14 @@ impl super::MemorySystem {
             // Decomposed queries produce a wider candidate set — widen the budget
             // so more candidates survive into the cross-encoder.
             let rerank_budget = if decomposed { 50_usize } else { 30_usize }.max(query.max_results);
-            res.truncate(rerank_budget);
+            // Query filters are applied in the Layer 5 scan below, which stops once
+            // `rerank_pool` memories pass. Cutting the list here first meant a selective
+            // filter (tags, type, time range) judged only the top 30/50 and could discard
+            // nearly all of them while matching memories sat just below the cut (live:
+            // filtered_out=45 of 50). With filters the full fused list goes to the scan.
+            if !vector_query.has_selective_filters() {
+                res.truncate(rerank_budget);
+            }
             tracing::debug!(
                 "Layer 4: {} fused results (rerank budget={})",
                 res.len(),
@@ -3769,6 +3790,10 @@ impl super::MemorySystem {
         // can't resolve (e.g., "second meeting" with no meeting-to-session mapping),
         // flag low confidence rather than returning noise. The 96.2% LOCOMO ceiling
         // comes from these inherently unanswerable queries.
+        // The memory an ordinal pin put first. Later layers re-sort by score (Layer 5.95 does
+        // whenever the query has focal entities), and a pin that only moved a position was
+        // undone by them; it is re-asserted once at the end of recall.
+        let mut ordinal_pin: Option<SharedMemory> = None;
         {
             let ql = query_text.to_lowercase();
 
@@ -3788,6 +3813,7 @@ impl super::MemorySystem {
                 if let Some(pos) = memories.iter().position(|m| m.id == earliest.id) {
                     memories.remove(pos);
                 }
+                ordinal_pin = Some(earliest.clone());
                 memories.insert(0, earliest);
                 tracing::debug!("Layer 5.9: Ordinal 'first' — pinned earliest memory at rank 1");
             } else if wants_last && !memories.is_empty() {
@@ -3824,6 +3850,7 @@ impl super::MemorySystem {
                     let found_id = found.id.clone();
                     if let Some(pos) = memories.iter().position(|m| m.id == found_id) {
                         let pinned = memories.remove(pos);
+                        ordinal_pin = Some(pinned.clone());
                         memories.insert(0, pinned);
                     }
                     tracing::debug!(
@@ -4390,7 +4417,7 @@ impl super::MemorySystem {
         // Expand with hierarchy context (parent chain + children)
         // This ensures semantic search also surfaces contextually related memories
         let mut seen_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
-        self.expand_with_hierarchy(&mut memories, &mut seen_ids);
+        self.expand_with_hierarchy(&vector_query, &mut memories, &mut seen_ids);
 
         // P4: iterative re-cueing (pattern completion). When the first pass came
         // back thin (fewer than requested), use the strongest hit's embedding as
@@ -4629,7 +4656,31 @@ impl super::MemorySystem {
             }
         }
 
+        if let Some(pinned) = ordinal_pin {
+            Self::reassert_ordinal_pin(&mut memories, pinned, query.max_results);
+        }
+
         Ok(memories)
+    }
+
+    /// Put the Layer 5.9 ordinal pin back at rank 1 after the layers that re-sort by score,
+    /// re-inserting it if a later truncation dropped it. Its score is raised just above the
+    /// new second place so the list stays monotonic and a caller that re-sorts keeps the pin.
+    fn reassert_ordinal_pin(memories: &mut Vec<SharedMemory>, pinned: SharedMemory, max_results: usize) {
+        let pinned = match memories.iter().position(|m| m.id == pinned.id) {
+            Some(pos) => memories.remove(pos),
+            None => pinned,
+        };
+        let runner_up = memories.first().and_then(|m| m.score).unwrap_or(0.0);
+        let pinned = if pinned.score.unwrap_or(0.0) <= runner_up {
+            let mut cloned: Memory = pinned.as_ref().clone();
+            cloned.set_score(runner_up + (runner_up.abs() * 1e-4).max(f32::EPSILON));
+            Arc::new(cloned)
+        } else {
+            pinned
+        };
+        memories.insert(0, pinned);
+        memories.truncate(max_results.max(1));
     }
 
     /// Spreading activation recall: graph-driven memory retrieval (V5 toroid closure)
@@ -5091,8 +5142,12 @@ impl super::MemorySystem {
     /// Hierarchy expansion depth is limited to prevent explosion:
     /// - Parents: Full chain up to root (usually shallow)
     /// - Children: Direct children only (1 level)
+    /// Append each result's ancestors and direct children, subject to the same query filters
+    /// as the results themselves: a tag- or type-filtered recall must not return an unfiltered
+    /// parent because one of its children matched.
     fn expand_with_hierarchy(
         &self,
+        query: &Query,
         memories: &mut Vec<SharedMemory>,
         seen_ids: &mut HashSet<MemoryId>,
     ) {
@@ -5109,7 +5164,7 @@ impl super::MemorySystem {
             // Get parent chain
             if let Ok(ancestors) = self.long_term_memory.get_ancestors(&memory_id) {
                 for ancestor in ancestors {
-                    if seen_ids.insert(ancestor.id.clone()) {
+                    if query.matches(&ancestor) && seen_ids.insert(ancestor.id.clone()) {
                         // Boost ancestor importance slightly (context is valuable)
                         let new_importance = (ancestor.importance() * 1.1).min(1.0);
                         let mut shared = Arc::new(ancestor);
@@ -5122,7 +5177,7 @@ impl super::MemorySystem {
             // Get direct children
             if let Ok(children) = self.long_term_memory.get_children(&memory_id) {
                 for child in children {
-                    if seen_ids.insert(child.id.clone()) {
+                    if query.matches(&child) && seen_ids.insert(child.id.clone()) {
                         // Boost child importance slightly
                         let new_importance = (child.importance() * 1.05).min(1.0);
                         let mut shared = Arc::new(child);
@@ -6013,6 +6068,55 @@ mod score_tie_order_tests {
 
         let order: Vec<&str> = items.iter().map(|(id, _)| content[id].as_str()).collect();
         assert_eq!(order, ["top", "alpha", "charlie", "delta", "bottom"]);
+    }
+}
+
+#[cfg(test)]
+mod ordinal_pin_tests {
+    use crate::memory::types::{Experience, Memory, MemoryId, SharedMemory};
+    use crate::memory::MemorySystem;
+    use std::sync::Arc;
+
+    fn scored(content: &str, score: f32) -> SharedMemory {
+        let mut m = Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience { content: content.to_string(), ..Default::default() },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        m.set_score(score);
+        Arc::new(m)
+    }
+
+    #[test]
+    fn a_pin_undone_by_a_re_sort_returns_to_first_with_a_monotonic_score() {
+        let pinned = scored("earliest", 0.4);
+        let mut list = vec![scored("a", 0.9), pinned.clone(), scored("b", 0.2)];
+        MemorySystem::reassert_ordinal_pin(&mut list, pinned.clone(), 10);
+        assert_eq!(list[0].id, pinned.id);
+        assert_eq!(list.len(), 3);
+        assert!(list[0].score.unwrap() > list[1].score.unwrap());
+    }
+
+    #[test]
+    fn a_pin_truncated_away_is_reinserted_within_the_limit() {
+        let pinned = scored("earliest", 0.3);
+        let mut list = vec![scored("a", 0.9), scored("b", 0.8)];
+        MemorySystem::reassert_ordinal_pin(&mut list, pinned.clone(), 2);
+        assert_eq!(list[0].id, pinned.id);
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn a_pin_already_first_keeps_its_score() {
+        let pinned = scored("earliest", 0.95);
+        let mut list = vec![pinned.clone(), scored("a", 0.9)];
+        MemorySystem::reassert_ordinal_pin(&mut list, pinned.clone(), 10);
+        assert_eq!(list[0].id, pinned.id);
+        assert_eq!(list[0].score, Some(0.95));
     }
 }
 
