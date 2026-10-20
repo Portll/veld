@@ -3766,6 +3766,42 @@ impl GraphMemory {
         self.get_entity_relationships_limited(entity_uuid, None)
     }
 
+    /// Every stored edge that touches `entity_uuid`, in index order, before any
+    /// strength ordering or decay pruning: what the store holds, which is what the
+    /// storage trait's listing answers on every engine.
+    pub fn stored_entity_relationships(&self, entity_uuid: &Uuid) -> Result<Vec<RelationshipEdge>> {
+        let prefix = format!("{entity_uuid}:");
+        let mut edge_uuids: Vec<Uuid> = Vec::with_capacity(256);
+        for (key, _) in self
+            .store
+            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
+        {
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                continue;
+            };
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            if let Some(edge_uuid) = key_str
+                .split(':')
+                .nth(1)
+                .and_then(|id| Uuid::parse_str(id).ok())
+            {
+                edge_uuids.push(edge_uuid);
+            }
+        }
+
+        let mut edges = Vec::with_capacity(edge_uuids.len());
+        for edge_uuid in &edge_uuids {
+            if let Some(bytes) = self.store.get_cf(CF_RELATIONSHIPS, edge_uuid.as_bytes())? {
+                if let Ok(edge) = RelationshipEdge::decode(&bytes) {
+                    edges.push(edge);
+                }
+            }
+        }
+        Ok(edges)
+    }
+
     /// Get relationships for an entity with limit, ordered by effective strength
     ///
     /// Collects ALL edge UUIDs first, batch-reads them, sorts by effective_strength
@@ -3778,49 +3814,9 @@ impl GraphMemory {
         entity_uuid: &Uuid,
         limit: Option<usize>,
     ) -> Result<Vec<RelationshipEdge>> {
-        let prefix = format!("{entity_uuid}:");
-
-        // Phase 1: Collect ALL edge UUIDs from index (fast prefix scan)
-        // We must read all to sort by strength — storage order is arbitrary
-        let mut edge_uuids: Vec<Uuid> = Vec::with_capacity(256);
-        let iter = self
-            .store
-            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
-            .into_iter()
-            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
-
-        for (key, _) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with(&prefix) {
-                    break;
-                }
-
-                if let Some(edge_uuid_str) = key_str.split(':').nth(1) {
-                    if let Ok(edge_uuid) = Uuid::parse_str(edge_uuid_str) {
-                        edge_uuids.push(edge_uuid);
-                    }
-                }
-            }
-        }
-
-        if edge_uuids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Phase 2: Batch read all edges using multi_get (single RocksDB call)
-        let keys: Vec<[u8; 16]> = edge_uuids.iter().map(|u| *u.as_bytes()).collect();
-        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-
-        let results: Vec<anyhow::Result<Option<Vec<u8>>>> = key_refs
-            .iter()
-            .map(|k| self.store.get_cf(CF_RELATIONSHIPS, k))
-            .collect();
-
-        let mut edges = Vec::with_capacity(edge_uuids.len());
-        for value in results.into_iter().flatten().flatten() {
-            if let Ok(edge) = RelationshipEdge::decode(&value) {
-                edges.push(edge);
-            }
+        let mut edges = self.stored_entity_relationships(entity_uuid)?;
+        if edges.is_empty() {
+            return Ok(edges);
         }
 
         // Phase 3: Sort by effective strength descending (strongest first)
