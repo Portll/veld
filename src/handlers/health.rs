@@ -211,7 +211,8 @@ pub async fn health_ready_user(
     }
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let Some(guard) = memory.try_read() else {
         return Ok((
@@ -349,7 +350,8 @@ pub async fn health_index_user(
     )?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let guard = memory.read();
     let health = guard.index_health();
@@ -411,7 +413,7 @@ pub async fn metrics_endpoint(State(state): State<AppState>) -> Result<String, S
     // The take(100) cap is retained from the original: it truncates the aggregate
     // silently, but max_users_in_memory bounds the cache well below it in practice.
     for user_id in state.list_cached_users().iter().take(100) {
-        if let Ok(memory_sys) = state.get_user_memory(user_id) {
+        if let Ok(memory_sys) = state.get_user_memory_async(user_id).await {
             if let Some(guard) = memory_sys.try_read() {
                 let stats = guard.stats();
                 total_working += stats.working_memory_count as i64;
