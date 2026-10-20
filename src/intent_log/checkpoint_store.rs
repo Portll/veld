@@ -100,7 +100,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{FrameIndex, Lsn};
@@ -136,6 +136,11 @@ const SIDE_DATA_COMPACT_MAX_GARBAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// Synced side-data writes between compaction checks. Each check is a
 /// `metadata` call; the rewrite itself only happens past the thresholds.
 pub const SIDE_DATA_COMPACT_EVERY_WRITES: u32 = 64;
+
+/// The checkpoint file is compacted on open once it is this many times its live
+/// records and past [`CHECKPOINT_COMPACT_MIN_BYTES`]: every `set` appends one.
+const CHECKPOINT_COMPACT_RATIO: u64 = 16;
+const CHECKPOINT_COMPACT_MIN_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointStoreError {
@@ -185,12 +190,32 @@ pub struct CheckpointStore {
     side_data_durable_end: u64,
     /// Side-data records written since the last compaction (or open).
     side_data_writes_since_compact: u32,
+    /// The checkpoint map and file end as of the last successful sync (or open, cut or
+    /// compaction). No caller was told a later record is durable, so a failed write or
+    /// sync rolls back to here and cuts the file to `synced_end`.
+    synced_checkpoints: HashMap<String, Lsn>,
+    synced_end: u64,
+    /// A failed write left bytes past `synced_end` that could not be cut yet. Every
+    /// write retries the cut first, so no record lands behind a torn one.
+    cut_pending: bool,
+    /// The side-data file's end as of its last successful sync, and the entries each
+    /// unsynced write replaced, newest last, for the same rollback.
+    side_data_synced_end: u64,
+    side_data_unsynced: Vec<((String, String), Option<SideDataEntry>)>,
+    side_data_cut_pending: bool,
 }
 
 impl CheckpointStore {
     /// Open (create if missing) the checkpoint store at `path`. Scans the
     /// existing file to populate the in-memory map and to compute the
-    /// durable-end offset. A corrupt tail is *not* auto-truncated.
+    /// durable-end offset.
+    ///
+    /// Bytes past the last valid record (a torn tail from a crash or a full
+    /// disk mid-write) are cut, in both files: appends land at the end of the
+    /// file, and behind unreadable bytes no later scan would reach them, so
+    /// every restart would load the pre-tear checkpoints. The cut can only
+    /// drop records a scan already cannot read; a checkpoint is metadata, so
+    /// losing one costs a replay, never data.
     ///
     /// The sibling side-data file at `{path}.sidedata` is also scanned if
     /// it exists. A missing side-data file is not an error — the store
@@ -201,7 +226,12 @@ impl CheckpointStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let checkpoint_tmp = checkpoint_compact_tmp_path(&path);
+        if checkpoint_tmp.exists() {
+            std::fs::remove_file(&checkpoint_tmp)?;
+        }
         let (in_memory, durable_end_offset) = scan(&path)?;
+        cut_torn_tail(&path, durable_end_offset, "checkpoint")?;
         let file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -216,10 +246,12 @@ impl CheckpointStore {
             std::fs::remove_file(&stale_tmp)?;
         }
         let (side_data, side_data_durable_end) = scan_side_data(&side_data_path)?;
+        cut_torn_tail(&side_data_path, side_data_durable_end, "side-data")?;
 
         let mut store = Self {
             path,
             writer: BufWriter::new(file),
+            synced_checkpoints: in_memory.clone(),
             in_memory,
             durable_end_offset,
             side_data_path,
@@ -227,7 +259,21 @@ impl CheckpointStore {
             side_data,
             side_data_durable_end,
             side_data_writes_since_compact: 0,
+            synced_end: durable_end_offset,
+            cut_pending: false,
+            side_data_synced_end: side_data_durable_end,
+            side_data_unsynced: Vec::new(),
+            side_data_cut_pending: false,
         };
+        if store.checkpoints_need_compaction() {
+            if let Err(e) = store.compact() {
+                tracing::warn!(
+                    path = %store.path.display(),
+                    error = %e,
+                    "checkpoint store: compaction failed; the uncompacted file is intact"
+                );
+            }
+        }
         if store.side_data_needs_compaction()? {
             store.compact_side_data_logged("open");
         }
@@ -252,21 +298,17 @@ impl CheckpointStore {
                 cap: MAX_NAME_BYTES,
             });
         }
-        let name_len = name_bytes.len() as u16;
-
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&name_len.to_le_bytes());
-        hasher.update(name_bytes);
-        hasher.update(&lsn.0.to_le_bytes());
-        let crc = hasher.finalize();
-
-        self.writer.write_all(&name_len.to_le_bytes())?;
-        self.writer.write_all(name_bytes)?;
-        self.writer.write_all(&lsn.0.to_le_bytes())?;
-        self.writer.write_all(&crc.to_le_bytes())?;
+        if self.cut_pending {
+            self.cut_unsynced_checkpoints()?;
+        }
+        let record = checkpoint_record(projection_name, lsn);
+        if let Err(e) = self.writer.write_all(&record) {
+            self.roll_back_checkpoints();
+            return Err(e.into());
+        }
 
         self.in_memory.insert(projection_name.to_string(), lsn);
-        self.durable_end_offset += (2 + name_bytes.len() + 8 + 4) as u64;
+        self.durable_end_offset += record.len() as u64;
         Ok(())
     }
 
@@ -336,20 +378,32 @@ impl CheckpointStore {
             });
         }
 
+        if self.side_data_cut_pending {
+            self.cut_unsynced_side_data()?;
+        }
         // Lazy-open the writer on first use so plain-checkpoint workloads
         // don't pay for a second file handle.
         let writer = self.ensure_side_data_writer()?;
-        let record_size = write_side_data_record(writer, projection_name, key, ckpt_lsn, bytes)?;
+        let record_size =
+            match write_side_data_record(writer, projection_name, key, ckpt_lsn, bytes) {
+                Ok(size) => size,
+                Err(e) => {
+                    self.roll_back_side_data();
+                    return Err(e);
+                }
+            };
 
         self.side_data_durable_end += record_size;
         self.side_data_writes_since_compact = self.side_data_writes_since_compact.saturating_add(1);
-        self.side_data.insert(
-            (projection_name.to_string(), key.to_string()),
+        let slot = (projection_name.to_string(), key.to_string());
+        let replaced = self.side_data.insert(
+            slot.clone(),
             SideDataEntry {
                 ckpt_lsn,
                 bytes: bytes.to_vec(),
             },
         );
+        self.side_data_unsynced.push((slot, replaced));
         Ok(())
     }
 
@@ -403,9 +457,56 @@ impl CheckpointStore {
 
     /// Flush + fsync only the checkpoint file, for a caller that has already
     /// made its side data durable (or wrote none).
+    ///
+    /// If it fails, every record `set` since the last successful sync is rolled back,
+    /// in memory and on disk, so a checkpoint the caller was told failed cannot become
+    /// durable with a later sync.
     pub fn sync_checkpoints(&mut self) -> Result<(), CheckpointStoreError> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
+        if self.cut_pending {
+            self.cut_unsynced_checkpoints()?;
+        }
+        let synced = self
+            .writer
+            .flush()
+            .and_then(|()| self.writer.get_ref().sync_data());
+        if let Err(e) = synced {
+            self.roll_back_checkpoints();
+            return Err(e.into());
+        }
+        self.synced_end = self.durable_end_offset;
+        self.synced_checkpoints.clone_from(&self.in_memory);
+        Ok(())
+    }
+
+    /// Forget every checkpoint record since the last successful sync and cut its
+    /// bytes, after a write or sync failed part-way through them.
+    fn roll_back_checkpoints(&mut self) {
+        self.in_memory.clone_from(&self.synced_checkpoints);
+        self.durable_end_offset = self.synced_end;
+        self.cut_pending = true;
+        if let Err(e) = self.cut_unsynced_checkpoints() {
+            tracing::error!(
+                path = %self.path.display(),
+                error = %e,
+                end_offset = self.synced_end,
+                "checkpoint store could not cut a failed write back to the last synced \
+                 record; writes are refused until it can"
+            );
+        }
+    }
+
+    fn cut_unsynced_checkpoints(&mut self) -> Result<(), CheckpointStoreError> {
+        // Swap the handle before cutting so no later flush writes the stale bytes:
+        // `into_parts` discards them, where dropping the BufWriter would flush them.
+        let fresh = BufWriter::new(
+            OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.path)?,
+        );
+        drop(std::mem::replace(&mut self.writer, fresh).into_parts());
+        cut_to(&self.path, self.synced_end)?;
+        self.cut_pending = false;
         Ok(())
     }
 
@@ -414,11 +515,21 @@ impl CheckpointStore {
     /// it. Every [`SIDE_DATA_COMPACT_EVERY_WRITES`] writes it also checks
     /// whether the file is worth compacting; a failed compaction is logged and
     /// leaves the (still valid) uncompacted file in place.
+    ///
+    /// A failed sync rolls back the side data written since the last one, as
+    /// [`sync_checkpoints`](Self::sync_checkpoints) does for checkpoints.
     pub fn sync_side_data(&mut self) -> Result<(), CheckpointStoreError> {
-        if let Some(side) = self.side_data_writer.as_mut() {
-            side.flush()?;
-            side.get_ref().sync_data()?;
+        if self.side_data_cut_pending {
+            self.cut_unsynced_side_data()?;
         }
+        if let Some(side) = self.side_data_writer.as_mut() {
+            if let Err(e) = side.flush().and_then(|()| side.get_ref().sync_data()) {
+                self.roll_back_side_data();
+                return Err(e.into());
+            }
+        }
+        self.side_data_synced_end = self.side_data_durable_end;
+        self.side_data_unsynced.clear();
         if self.side_data_writes_since_compact >= SIDE_DATA_COMPACT_EVERY_WRITES {
             self.side_data_writes_since_compact = 0;
             if self.side_data_needs_compaction()? {
@@ -426,6 +537,56 @@ impl CheckpointStore {
             }
         }
         Ok(())
+    }
+
+    /// Restore the entries the unsynced side-data writes replaced and cut their bytes,
+    /// after a write or sync failed part-way through them.
+    fn roll_back_side_data(&mut self) {
+        for (slot, replaced) in self.side_data_unsynced.drain(..).rev() {
+            match replaced {
+                Some(entry) => {
+                    self.side_data.insert(slot, entry);
+                }
+                None => {
+                    self.side_data.remove(&slot);
+                }
+            }
+        }
+        self.side_data_durable_end = self.side_data_synced_end;
+        self.side_data_cut_pending = true;
+        if let Err(e) = self.cut_unsynced_side_data() {
+            tracing::error!(
+                path = %self.side_data_path.display(),
+                error = %e,
+                end_offset = self.side_data_synced_end,
+                "checkpoint store could not cut a failed side-data write back to the last \
+                 synced record; side-data writes are refused until it can"
+            );
+        }
+    }
+
+    fn cut_unsynced_side_data(&mut self) -> Result<(), CheckpointStoreError> {
+        // The stale buffer is discarded, not flushed; the next write reopens lazily.
+        if let Some(stale) = self.side_data_writer.take() {
+            drop(stale.into_parts());
+        }
+        if self.side_data_path.exists() {
+            cut_to(&self.side_data_path, self.side_data_synced_end)?;
+        }
+        self.side_data_cut_pending = false;
+        Ok(())
+    }
+
+    /// Whether the checkpoint file is mostly superseded records: one is appended per
+    /// `set`, and only the latest per projection is live.
+    fn checkpoints_need_compaction(&self) -> bool {
+        let live: u64 = self
+            .in_memory
+            .keys()
+            .map(|name| checkpoint_record_len(name))
+            .sum();
+        self.durable_end_offset > CHECKPOINT_COMPACT_MIN_BYTES
+            && self.durable_end_offset > live.saturating_mul(CHECKPOINT_COMPACT_RATIO)
     }
 
     /// Bytes the side-data file would occupy holding only the latest record
@@ -486,6 +647,9 @@ impl CheckpointStore {
     /// intact (the temp is removed on the next open), a crash after it leaves
     /// the compacted one.
     pub fn compact_side_data(&mut self) -> Result<(), CheckpointStoreError> {
+        if self.side_data_cut_pending {
+            self.cut_unsynced_side_data()?;
+        }
         if let Some(w) = self.side_data_writer.as_mut() {
             w.flush()?;
         }
@@ -513,7 +677,10 @@ impl CheckpointStore {
         std::fs::rename(&tmp_path, &self.side_data_path)?;
         sync_parent_dir(&self.side_data_path)?;
 
+        // The rewrite made every in-memory entry durable, unsynced ones included.
         self.side_data_durable_end = written;
+        self.side_data_synced_end = written;
+        self.side_data_unsynced.clear();
         self.side_data_writes_since_compact = 0;
         Ok(())
     }
@@ -554,6 +721,8 @@ impl CheckpointStore {
             .append(true)
             .open(&self.path)?;
         self.writer = BufWriter::new(file);
+        self.synced_end = target;
+        self.synced_checkpoints.clone_from(&self.in_memory);
         Ok(target)
     }
 
@@ -581,34 +750,29 @@ impl CheckpointStore {
             .append(true)
             .open(&self.side_data_path)?;
         self.side_data_writer = Some(BufWriter::new(file));
+        self.side_data_synced_end = target;
+        self.side_data_unsynced.clear();
         Ok(target)
     }
 
     /// Rewrite the file as a compacted snapshot — one record per projection,
-    /// in arbitrary order. Useful when a long-lived store has accumulated
-    /// many supersede-records for the same projection. Atomic via
-    /// write-temp-then-rename. After this, `durable_end_offset` is reset.
+    /// in arbitrary order. Runs on open once superseded records dominate the
+    /// file. Atomic: temp file, fsync, rename, directory fsync. After this,
+    /// `durable_end_offset` is reset and every in-memory checkpoint is durable.
     pub fn compact(&mut self) -> Result<(), CheckpointStoreError> {
+        if self.cut_pending {
+            self.cut_unsynced_checkpoints()?;
+        }
         self.writer.flush()?;
 
         // Write the compacted snapshot to a side file, fsync it, then
         // close every handle on the live file before renaming (Windows
         // refuses to rename over a file with an open append handle).
-        let tmp_path = self.path.with_extension("checkpoint.tmp");
+        let tmp_path = checkpoint_compact_tmp_path(&self.path);
         {
             let mut tmp = BufWriter::new(File::create(&tmp_path)?);
             for (name, lsn) in &self.in_memory {
-                let bytes = name.as_bytes();
-                let len = bytes.len() as u16;
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(&len.to_le_bytes());
-                hasher.update(bytes);
-                hasher.update(&lsn.0.to_le_bytes());
-                let crc = hasher.finalize();
-                tmp.write_all(&len.to_le_bytes())?;
-                tmp.write_all(bytes)?;
-                tmp.write_all(&lsn.0.to_le_bytes())?;
-                tmp.write_all(&crc.to_le_bytes())?;
+                tmp.write_all(&checkpoint_record(name, *lsn))?;
             }
             tmp.flush()?;
             tmp.get_ref().sync_data()?;
@@ -620,6 +784,7 @@ impl CheckpointStore {
         self.writer = BufWriter::new(staged);
 
         std::fs::rename(&tmp_path, &self.path)?;
+        sync_parent_dir(&self.path)?;
 
         // Reopen `self.writer` so subsequent appends go to the renamed
         // file by its current path (the staged handle still works on
@@ -633,6 +798,8 @@ impl CheckpointStore {
 
         let (_, end) = scan(&self.path)?;
         self.durable_end_offset = end;
+        self.synced_end = end;
+        self.synced_checkpoints.clone_from(&self.in_memory);
         Ok(())
     }
 
@@ -653,6 +820,63 @@ impl CheckpointStore {
         }
         Ok(self.side_data_writer.as_mut().expect("just initialised"))
     }
+}
+
+/// One encoded checkpoint record. The name's cap is the caller's to enforce.
+fn checkpoint_record(projection_name: &str, lsn: Lsn) -> Vec<u8> {
+    let name_bytes = projection_name.as_bytes();
+    let name_len = (name_bytes.len() as u16).to_le_bytes();
+    let lsn_bytes = lsn.0.to_le_bytes();
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&name_len);
+    hasher.update(name_bytes);
+    hasher.update(&lsn_bytes);
+    let crc = hasher.finalize();
+
+    let mut record = Vec::with_capacity(checkpoint_record_len(projection_name) as usize);
+    record.extend_from_slice(&name_len);
+    record.extend_from_slice(name_bytes);
+    record.extend_from_slice(&lsn_bytes);
+    record.extend_from_slice(&crc.to_le_bytes());
+    record
+}
+
+fn checkpoint_record_len(projection_name: &str) -> u64 {
+    (2 + projection_name.len() + 8 + 4) as u64
+}
+
+/// Temp file a checkpoint-file compaction writes before renaming it into place.
+fn checkpoint_compact_tmp_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".compact.tmp");
+    PathBuf::from(s)
+}
+
+/// Cut `path` back to `end` and make the cut durable.
+fn cut_to(path: &Path, end: u64) -> Result<(), CheckpointStoreError> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    file.set_len(end)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// Cut the bytes a scan could not read past `valid_end`, if the file has any.
+fn cut_torn_tail(path: &Path, valid_end: u64, file_kind: &str) -> Result<(), CheckpointStoreError> {
+    let len = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if len > valid_end {
+        tracing::warn!(
+            path = %path.display(),
+            file_kind,
+            torn_bytes = len - valid_end,
+            "checkpoint store: cutting bytes past the last valid record"
+        );
+        cut_to(path, valid_end)?;
+    }
+    Ok(())
 }
 
 /// Encoded length of one side-data record.
@@ -737,8 +961,7 @@ fn scan(path: &Path) -> Result<(HashMap<String, Lsn>, u64), CheckpointStoreError
     if !path.exists() {
         return Ok((map, 0));
     }
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(0))?;
+    let mut file = io::BufReader::new(File::open(path)?);
 
     let mut offset = 0u64;
     loop {
@@ -803,8 +1026,7 @@ fn scan_side_data(
     if !path.exists() {
         return Ok((map, 0));
     }
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(0))?;
+    let mut file = io::BufReader::new(File::open(path)?);
 
     let mut offset = 0u64;
     loop {
@@ -902,11 +1124,11 @@ fn scan_side_data(
 /// hit before the read completed (either clean — zero bytes read — or
 /// torn — some bytes then EOF). Both forms mean "stop scanning here" for
 /// our purposes, so they are folded into one return value.
-fn read_exact_or_eof(file: &mut File, buf: &mut [u8]) -> Result<bool, CheckpointStoreError> {
+fn read_exact_or_eof(file: &mut impl Read, buf: &mut [u8]) -> Result<bool, CheckpointStoreError> {
     read_exact_full(file, buf)
 }
 
-fn read_exact_full(file: &mut File, buf: &mut [u8]) -> Result<bool, CheckpointStoreError> {
+fn read_exact_full(file: &mut impl Read, buf: &mut [u8]) -> Result<bool, CheckpointStoreError> {
     let mut read = 0;
     while read < buf.len() {
         match file.read(&mut buf[read..]) {
@@ -922,6 +1144,7 @@ fn read_exact_full(file: &mut File, buf: &mut [u8]) -> Result<bool, CheckpointSt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom};
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -1309,5 +1532,139 @@ mod tests {
         drop(s);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&side_path);
+    }
+
+    #[test]
+    fn a_torn_tail_is_cut_on_open_so_later_checkpoints_survive_a_reopen() {
+        let path = tmp_path("torn_cut");
+        {
+            let mut s = CheckpointStore::open(&path).unwrap();
+            s.set("vamana", Lsn(5)).unwrap();
+            s.sync().unwrap();
+        }
+        let valid_end = std::fs::metadata(&path).unwrap().len();
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[6u8, 0, b'v']).unwrap();
+            f.sync_data().unwrap();
+        }
+        {
+            let mut s = CheckpointStore::open(&path).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_end);
+            s.set("vamana", Lsn(9)).unwrap();
+            s.sync().unwrap();
+        }
+        let s = CheckpointStore::open(&path).unwrap();
+        assert_eq!(
+            s.get("vamana"),
+            Some(Lsn(9)),
+            "a checkpoint written after the tear was appended behind it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_torn_side_data_tail_is_cut_on_open() {
+        let path = tmp_path("sd_torn_cut");
+        let side_path;
+        {
+            let mut s = CheckpointStore::open(&path).unwrap();
+            s.set_side_data("p", "k", b"before").unwrap();
+            s.sync().unwrap();
+            side_path = s.side_data_path().to_path_buf();
+        }
+        {
+            let mut f = OpenOptions::new().append(true).open(&side_path).unwrap();
+            f.write_all(&[1u8, 0, b'p']).unwrap();
+            f.sync_data().unwrap();
+        }
+        {
+            let mut s = CheckpointStore::open(&path).unwrap();
+            s.set_side_data("p", "k", b"after").unwrap();
+            s.sync().unwrap();
+        }
+        let s = CheckpointStore::open(&path).unwrap();
+        assert_eq!(s.get_side_data("p", "k"), Some(&b"after"[..]));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&side_path);
+    }
+
+    #[test]
+    fn a_failed_sync_rolls_back_to_the_last_synced_checkpoints() {
+        let path = tmp_path("rollback");
+        let mut s = CheckpointStore::open(&path).unwrap();
+        s.set("a", Lsn(1)).unwrap();
+        s.sync().unwrap();
+        let synced_len = std::fs::metadata(&path).unwrap().len();
+
+        // The record reached the file, then the sync failed: what ENOSPC mid-flush leaves.
+        s.set("a", Lsn(2)).unwrap();
+        s.set("b", Lsn(7)).unwrap();
+        s.writer.flush().unwrap();
+        s.roll_back_checkpoints();
+
+        assert_eq!(s.get("a"), Some(Lsn(1)));
+        assert_eq!(s.get("b"), None);
+        assert_eq!(s.durable_end_offset(), synced_len);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), synced_len);
+
+        s.set("a", Lsn(3)).unwrap();
+        s.sync().unwrap();
+        drop(s);
+        let s = CheckpointStore::open(&path).unwrap();
+        assert_eq!(s.get("a"), Some(Lsn(3)));
+        assert_eq!(s.get("b"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_side_data_sync_restores_the_replaced_entries() {
+        let path = tmp_path("sd_rollback");
+        let mut s = CheckpointStore::open(&path).unwrap();
+        s.set_side_data("p", "kept", b"v1").unwrap();
+        s.sync().unwrap();
+        let side_path = s.side_data_path().to_path_buf();
+        let synced_len = std::fs::metadata(&side_path).unwrap().len();
+
+        s.set_side_data("p", "kept", b"v2").unwrap();
+        s.set_side_data("p", "new", b"n1").unwrap();
+        s.side_data_writer.as_mut().unwrap().flush().unwrap();
+        s.roll_back_side_data();
+
+        assert_eq!(s.get_side_data("p", "kept"), Some(&b"v1"[..]));
+        assert_eq!(s.get_side_data("p", "new"), None);
+        assert_eq!(std::fs::metadata(&side_path).unwrap().len(), synced_len);
+
+        s.set_side_data("p", "kept", b"v3").unwrap();
+        s.sync().unwrap();
+        drop(s);
+        let s = CheckpointStore::open(&path).unwrap();
+        assert_eq!(s.get_side_data("p", "kept"), Some(&b"v3"[..]));
+        assert_eq!(s.get_side_data("p", "new"), None);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&side_path);
+    }
+
+    #[test]
+    fn open_compacts_a_checkpoint_file_of_superseded_records() {
+        let path = tmp_path("ckpt_compact");
+        {
+            let mut s = CheckpointStore::open(&path).unwrap();
+            for lsn in 0..10_000u64 {
+                s.set("vamana-text-primary", Lsn(lsn)).unwrap();
+            }
+            s.set("bm25", Lsn(42)).unwrap();
+            s.sync().unwrap();
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+        let s = CheckpointStore::open(&path).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before / 100, "{before} -> {after}");
+        assert_eq!(s.get("vamana-text-primary"), Some(Lsn(9_999)));
+        assert_eq!(s.get("bm25"), Some(Lsn(42)));
+        drop(s);
+        let s = CheckpointStore::open(&path).unwrap();
+        assert_eq!(s.get("vamana-text-primary"), Some(Lsn(9_999)));
+        let _ = std::fs::remove_file(&path);
     }
 }

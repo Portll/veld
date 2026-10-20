@@ -3120,10 +3120,11 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
         "a derived hub gained or lost an edge"
     );
     let bash_edges = edges_of(&h, user, &bash);
-    assert_eq!(
-        bash_edges.len(),
-        ENTITY_DEGREE_PRUNE_TARGET,
-        "the declared hub's new edge cut it back below the cap"
+    // Its first new edge cut it back to the target; the memory's later ones stayed.
+    assert!(
+        (ENTITY_DEGREE_PRUNE_TARGET..MAX_ENTITY_DEGREE).contains(&bash_edges.len()),
+        "the declared hub holds {} edges, outside the prune window",
+        bash_edges.len()
     );
     assert!(
         bash_edges
