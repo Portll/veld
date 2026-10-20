@@ -1420,7 +1420,8 @@ fn submit_prewarm(job: PrewarmJob) {
 fn download_file(url: &str, path: &PathBuf) -> Result<()> {
     tracing::info!("Downloading cross-encoder file: {url}");
 
-    let resp = ureq::get(url)
+    let resp = super::downloader::download_agent()
+        .get(url)
         .call()
         .with_context(|| format!("HTTP request failed: {url}"))?;
     let status = resp.status().as_u16();
