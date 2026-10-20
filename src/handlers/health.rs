@@ -799,6 +799,7 @@ mod write_latch_reporting {
         /// Refuse `write` for want of space and check the latch and the report;
         /// then let the same write through and check that it clears the store.
         fn drive(store: &Path, site: &str, write: impl Fn() -> anyhow::Result<()>) {
+            let _latching = crate::storage::write_latch::test_serial::latching();
             injected::arm(store);
             let refused = write();
             injected::disarm(store);
@@ -861,6 +862,7 @@ mod write_latch_reporting {
             let db = storage.db();
             let memory = memory_with_session("refused by the record write");
 
+            let _latching = crate::storage::write_latch::test_serial::latching();
             injected::arm(db.path());
             let refused = storage.store(&memory);
             injected::disarm(db.path());
@@ -948,6 +950,218 @@ mod write_latch_reporting {
             drive(&store, "shared flush", || columns.flush_cf("todos"));
         }
     }
+
+    /// Every kind of redb store driven through its real write path into a NoSpace
+    /// failure at its file. redb poisons the handle, so the file latches hard at
+    /// once, `/health` names it, readiness fails, and the next write on the handle
+    /// is refused with the latch (503) rather than redb's `PreviousIo` (500).
+    ///
+    /// Each test ends by dropping the store and opening the file again, which
+    /// clears the latch: it is process-global, and a hard entry left standing
+    /// would fail the readiness assertions of every test after it.
+    #[cfg(feature = "storage-redb")]
+    mod redb_write_sites {
+        use super::*;
+        use crate::errors::AppError;
+        use crate::graph_memory::EntityNode;
+        use crate::memory::types::Experience;
+        use crate::memory::{Memory, MemoryId};
+        use crate::storage::redb::{
+            open_shared_database, RedbAuditStore, RedbBatchWriter, RedbColumnStore, RedbGraphStore,
+            RedbKeyValueStore, RedbPrimaryMemoryStore,
+        };
+        use crate::storage::redb_latch::injected;
+        use crate::storage::write_latch::{chain_is_enospc, global, store_id, test_serial};
+        use crate::storage::{
+            AuditLogEntry, AuditStore, BatchWriter, ColumnStore, GraphStore, KeyValueStore,
+            PrimaryMemoryStore,
+        };
+        use std::sync::Arc;
+
+        /// A write on a poisoned handle answers what a latched RocksDB write does.
+        fn assert_refused_with_the_latch(site: &str, refused: anyhow::Result<()>) {
+            let err = refused
+                .err()
+                .unwrap_or_else(|| panic!("{site}: a poisoned handle took a write"));
+            assert!(
+                chain_is_enospc(&err),
+                "{site}: refused with redb's own error, which answers 500: {err:#}"
+            );
+            let response = AppError::from(err);
+            assert_eq!(
+                response.status_code(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{site}"
+            );
+            assert_eq!(response.code(), "STORAGE_WRITE_LATCHED", "{site}");
+        }
+
+        /// Fail `write` at `file` for want of space and check every reader of the
+        /// latch, then repeat it on the poisoned handle.
+        fn drive(file: &Path, site: &str, write: impl Fn() -> anyhow::Result<()>) {
+            injected::arm(file);
+            let failed = write();
+            injected::disarm(file);
+            let err = failed
+                .err()
+                .unwrap_or_else(|| panic!("{site}: the refusal never reached the caller"));
+            assert!(chain_is_enospc(&err), "{site}: {err:#}");
+
+            let latch = global();
+            let snapshot = latch
+                .snapshot_at(file)
+                .unwrap_or_else(|| panic!("{site}: the failed write did not latch its file"));
+            assert!(
+                snapshot.hard,
+                "{site}: a poisoned redb handle is hard at once"
+            );
+
+            let body = response_json(latch);
+            assert_eq!(body["status"], "degraded", "{site}");
+            let entry = body["write_latch"]
+                .as_array()
+                .expect("write_latch is an array")
+                .iter()
+                .find(|entry| entry["store"] == store_id(file))
+                .unwrap_or_else(|| panic!("{site}: /health does not name the file: {body}"));
+            assert_eq!(entry["condition"], "no_space_left_on_device", "{site}");
+            assert_eq!(entry["hard"], true, "{site}");
+
+            let (code, status, hard_stores) = ready_decision(true, latch);
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{site}");
+            assert_eq!(status, "not_ready", "{site}");
+            assert!(hard_stores >= 1, "{site}");
+
+            assert_refused_with_the_latch(site, write());
+        }
+
+        fn memory(content: &str) -> Memory {
+            let experience = Experience {
+                content: content.to_string(),
+                ..Default::default()
+            };
+            Memory::new(
+                MemoryId(uuid::Uuid::new_v4()),
+                experience,
+                0.5,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+
+        #[test]
+        fn a_memory_write_latches_the_memory_store_file() {
+            let _latching = test_serial::latching();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file = dir.path().join("storage.redb");
+            let store = RedbPrimaryMemoryStore::open(dir.path()).expect("open");
+            store.store(&memory("seed")).expect("seed write");
+            let refused = memory("a memory the disk refuses");
+
+            drive(&file, "memory store", || store.store(&refused));
+            assert_refused_with_the_latch("memory delete", store.delete(&refused.id));
+            assert_refused_with_the_latch("memory flush", store.flush());
+
+            drop(store);
+            RedbPrimaryMemoryStore::open(dir.path()).expect("reopen");
+            assert!(
+                !global().is_latched_at(&file),
+                "the reopen did not clear it"
+            );
+        }
+
+        #[test]
+        fn a_graph_write_latches_the_graph_file() {
+            let _latching = test_serial::latching();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file = dir.path().join("graph.redb");
+            let graph = RedbGraphStore::open(dir.path()).expect("open");
+            let now = chrono::Utc::now();
+            let entity = EntityNode {
+                uuid: uuid::Uuid::new_v4(),
+                name: "harbour".to_string(),
+                labels: Vec::new(),
+                created_at: now,
+                last_seen_at: now,
+                mention_count: 1,
+                summary: String::new(),
+                attributes: Default::default(),
+                name_embedding: None,
+                salience: 0.4,
+                is_proper_noun: true,
+                pii_classification: Default::default(),
+            };
+
+            drive(&file, "entity put", || graph.put_entity(&entity));
+
+            drop(graph);
+            RedbGraphStore::open(dir.path()).expect("reopen");
+            assert!(!global().is_latched_at(&file));
+        }
+
+        #[test]
+        fn key_value_and_audit_writes_latch_their_files() {
+            let _latching = test_serial::latching();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let kv_file = dir.path().join("feedback.redb");
+            let audit_file = dir.path().join("audit.redb");
+            let kv = RedbKeyValueStore::open(dir.path(), "feedback").expect("open kv");
+            let audit = RedbAuditStore::open(dir.path()).expect("open audit");
+            let event = AuditLogEntry {
+                timestamp: chrono::Utc::now(),
+                event_type: "remember".to_string(),
+                memory_id: "m-1".to_string(),
+                details: String::new(),
+            };
+
+            drive(&kv_file, "kv put", || kv.put_bytes(b"f-1", b"1"));
+            assert!(
+                audit.append_event("tenant", &event).is_ok(),
+                "a full disk under one file says nothing about another"
+            );
+            drive(&audit_file, "audit append", || {
+                audit.append_event("tenant", &event)
+            });
+
+            drop(kv);
+            drop(audit);
+            RedbKeyValueStore::open(dir.path(), "feedback").expect("reopen kv");
+            RedbAuditStore::open(dir.path()).expect("reopen audit");
+            assert!(!global().is_latched_at(&kv_file));
+            assert!(!global().is_latched_at(&audit_file));
+        }
+
+        /// One database behind todos, reminders, files, feedback, context blocks
+        /// and audit, and every adapter over it is refused once it is poisoned.
+        #[test]
+        fn shared_store_writes_latch_the_shared_file() {
+            let _latching = test_serial::latching();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file = dir.path().join("shared.redb");
+            let database = open_shared_database(dir.path()).expect("open");
+            let columns = RedbColumnStore::new(Arc::clone(&database));
+            let writer = RedbBatchWriter::new(Arc::clone(&database));
+            columns.put_cf("todos", b"t-0", b"1").expect("seed write");
+
+            drive(&file, "todo put", || columns.put_cf("todos", b"t-1", b"1"));
+            let mut batch = crate::storage::WriteBatch::new();
+            batch.put_cf("todos", b"t-2".to_vec(), b"1".to_vec());
+            assert_refused_with_the_latch("batch", writer.write_batch(&batch));
+            assert_refused_with_the_latch("todo delete", columns.delete_cf("todos", b"t-0"));
+            assert_refused_with_the_latch("shared flush", columns.flush_cf("todos"));
+
+            drop(columns);
+            drop(writer);
+            drop(database);
+            let reopened = open_shared_database(dir.path()).expect("reopen");
+            assert!(!global().is_latched_at(&file));
+            RedbColumnStore::new(reopened)
+                .put_cf("todos", b"t-1", b"1")
+                .expect("the reopened handle writes");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -991,6 +1205,7 @@ mod probes_while_a_tenant_opens {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn probes_answer_while_first_requests_wait_on_a_tenant_open() {
+        let _quiet = crate::storage::write_latch::test_serial::quiet().await;
         let harness = TestHarness::new();
         let app = harness.router().merge(build_probe_routes(harness.state()));
 
