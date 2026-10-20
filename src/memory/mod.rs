@@ -441,6 +441,15 @@ pub struct MemorySystem {
     /// not rewritten on every drain tick.
     space_registry_written: parking_lot::Mutex<Option<crate::embeddings::space::SpaceRegistry>>,
 
+    /// The last census of kept vectors by space and when it ran; refreshed at most hourly
+    /// because it reads every memory.
+    kept_census: parking_lot::Mutex<
+        Option<(
+            std::time::Instant,
+            std::collections::BTreeMap<SpaceId, usize>,
+        )>,
+    >,
+
     /// One row per recall, including empty ones — the question side the trace store lacks.
     recall_event_store: recall_events::RecallEventStore,
 
@@ -1452,6 +1461,7 @@ impl MemorySystem {
                 primary_store.key_value_store(),
             ),
             space_registry_written: parking_lot::Mutex::new(None),
+            kept_census: parking_lot::Mutex::new(None),
             // R3a (F3): per-user persistent learned-weight store over this user's
             // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
             // weights are loaded on init (below) but NOT injected into scoring.
@@ -1666,10 +1676,27 @@ impl MemorySystem {
     ) -> Result<MemoryId> {
         let importance = self.calculate_importance(&experience);
 
+        // Imported vectors in another space are kept beside the memory, never compared as its
+        // own; the slot they leave is filled below in this corpus's space.
+        self.stamp_supplied_vectors(&mut experience);
+
         // Generate embedding if not provided
         if experience.embeddings.is_none() {
-            if let Ok((embedding, space)) = self.embed_primary_cached(&experience.content) {
-                experience.set_primary_vector(embedding, space);
+            match self.embed_primary_cached(&experience.content) {
+                Ok((embedding, space)) => experience.set_primary_vector(embedding, space),
+                Err(e) => {
+                    tracing::warn!("Failed to embed imported memory {}: {e}", memory_id.0);
+                    if let Err(record_err) = self.embedding_backlog.record(
+                        &memory_id,
+                        embedding_backlog::EnqueueReason::EmbedFailed,
+                        Some(&e.to_string()),
+                    ) {
+                        tracing::error!(
+                            "embedding backlog: could not record {}: {record_err}",
+                            memory_id.0
+                        );
+                    }
+                }
             }
         }
 
@@ -1681,7 +1708,6 @@ impl MemorySystem {
                 }
             }
         }
-        self.stamp_supplied_vectors(&mut experience);
 
         let memory = Arc::new(Memory::new(
             memory_id.clone(),
@@ -3534,8 +3560,10 @@ impl MemorySystem {
         Ok((embedding, space))
     }
 
-    /// Name the space of vectors a caller supplied with no space: this corpus's own space at
-    /// its width, as supplied vectors have always been taken to be, else their width alone.
+    /// Name the space of vectors a caller supplied with no space — this corpus's own space at
+    /// its width, as supplied vectors have always been taken to be, else their width alone —
+    /// and keep a vector in another space out of the slot it would be compared from. A vector
+    /// moved out leaves its slot empty, so the write embeds the memory in this corpus's space.
     fn stamp_supplied_vectors(&self, experience: &mut Experience) {
         let primary = self.retriever.index_space().clone();
         let secondary = self
@@ -3544,6 +3572,7 @@ impl MemorySystem {
             .cloned()
             .or_else(|| self.embedder.secondary_space());
         experience.stamp_vector_spaces(Some(&primary), secondary.as_ref());
+        experience.move_foreign_to_kept(&primary, secondary.as_ref());
     }
 
     /// One rule for an index refusal on every write path. A space refusal is already a backlog
@@ -3596,7 +3625,27 @@ impl MemorySystem {
                 at(&mut by_space, &stored).stranded += 1;
             }
         }
+        if let Some((_, kept)) = self.kept_census.lock().as_ref() {
+            for (space, n) in kept {
+                at(&mut by_space, space).kept += n;
+            }
+        }
         Ok(by_space.into_values().collect())
+    }
+
+    /// Re-count kept vectors by space when the last census is older than an hour, or never ran.
+    fn refresh_kept_census(&self) -> Result<()> {
+        const CENSUS_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+        let fresh = self
+            .kept_census
+            .lock()
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < CENSUS_TTL);
+        if !fresh {
+            let kept = self.retriever.census_kept()?;
+            *self.kept_census.lock() = Some((std::time::Instant::now(), kept));
+        }
+        Ok(())
     }
 
     /// Compute a *query* embedding for arbitrary text (retrieval side).
@@ -5535,6 +5584,15 @@ impl MemorySystem {
         self.embedding_backlog.report()
     }
 
+    /// The corpus's spaces, and whether it is cut off from vector search; see
+    /// [`crate::embeddings::space::corpus_orphaned`]. One read for `/health`.
+    pub fn space_health(&self) -> Result<(Vec<crate::embeddings::space::SpaceSummary>, bool)> {
+        let spaces = self.embedding_spaces()?;
+        let stored = self.stats.read().total_memories;
+        let orphaned = crate::embeddings::space::corpus_orphaned(stored, &spaces);
+        Ok((spaces, orphaned))
+    }
+
     /// Every installed map between spaces.
     pub fn alignments(&self) -> Vec<crate::embeddings::space::RegisteredAlignment> {
         self.retriever.bridges()
@@ -5558,6 +5616,7 @@ impl MemorySystem {
     /// Returns whether a file was written.
     pub fn refresh_space_registry(&self) -> Result<bool> {
         use crate::embeddings::space::{SpaceRegistry, REGISTRY_VERSION};
+        self.refresh_kept_census()?;
         let registry = SpaceRegistry {
             version: REGISTRY_VERSION,
             updated_at: chrono::Utc::now(),
@@ -9740,8 +9799,38 @@ mod space_registry_tests {
     use super::*;
     use crate::embeddings::space::{SpaceId, SpaceRegistry};
 
-    /// A vector supplied in another space than the index's is refused, waits in the backlog,
-    /// and the registry beside the markers lists both spaces.
+    /// An import from an instance with another embedder: the vector is kept in its own space,
+    /// and the memory is embedded in this corpus's.
+    #[test]
+    fn an_imported_vector_in_another_space_is_kept_and_the_memory_embedded_anew() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let system = MemorySystem::new(config, None).expect("memory system");
+        let index_space = system.index_space();
+        let foreign = SpaceId::new("nomic-embed-text-v1.5", 768);
+        let mut experience = Experience {
+            content: "imported from an instance that runs nomic".to_string(),
+            ..Default::default()
+        };
+        experience.set_primary_vector(vec![0.036; 768], foreign.clone());
+        let id = MemoryId(uuid::Uuid::new_v4());
+        system
+            .remember_with_id(id.clone(), experience, None)
+            .expect("import");
+        let stored = system.long_term_memory.get(&id).unwrap();
+        assert_eq!(stored.experience.embedding_space, Some(index_space));
+        assert_eq!(
+            stored.experience.vector_in(&foreign, None, None),
+            Some(&vec![0.036; 768])
+        );
+        assert!(system.retriever.is_indexed(&id));
+    }
+
+    /// A vector supplied in another space than the index's is kept beside the memory, the
+    /// memory is embedded in the index's space, and the registry beside the markers lists both.
     #[test]
     fn a_foreign_vector_and_the_index_space_both_reach_the_registry() {
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -9759,7 +9848,7 @@ mod space_registry_tests {
             ..Default::default()
         };
         experience.set_primary_vector(vec![0.036; 768], foreign.clone());
-        let id = system.remember(experience, None).expect("remember");
+        system.remember(experience, None).expect("remember");
         system
             .remember(
                 Experience {
@@ -9770,14 +9859,6 @@ mod space_registry_tests {
             )
             .expect("remember");
 
-        let row = system
-            .embedding_backlog
-            .get(&id)
-            .unwrap()
-            .expect("the refused memory waits for a vector");
-        assert_eq!(row.stored_space, Some(foreign.clone()));
-        assert_eq!(row.target_space, Some(index_space.clone()));
-
         assert!(system.refresh_space_registry().unwrap());
         assert!(
             !system.refresh_space_registry().unwrap(),
@@ -9785,17 +9866,20 @@ mod space_registry_tests {
         );
         let registry = SpaceRegistry::read(tmp.path()).unwrap().expect("registry");
         assert_eq!(registry.index_space, index_space);
-        let listed: Vec<&SpaceId> = registry.spaces.iter().map(|s| &s.id).collect();
-        assert!(listed.contains(&&index_space), "{listed:?}");
-        assert!(listed.contains(&&foreign), "{listed:?}");
-        let stranded = registry.spaces.iter().find(|s| s.id == foreign).unwrap();
-        assert_eq!(stranded.stranded, 1);
         let own = registry
             .spaces
             .iter()
             .find(|s| s.id == index_space)
             .unwrap();
-        assert!(own.memories >= 1);
-        assert_eq!(own.backlog, 1);
+        assert_eq!(
+            own.memories, 2,
+            "both memories are searchable in the index's space"
+        );
+        let kept = registry
+            .spaces
+            .iter()
+            .find(|s| s.id == foreign)
+            .expect("the foreign space is listed");
+        assert_eq!(kept.kept, 1);
     }
 }

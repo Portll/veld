@@ -4808,6 +4808,41 @@ mod tests {
         assert_eq!(decode_memory_snapshot(&old).unwrap().id, original.id);
     }
 
+    /// The portable dump, and so the redb backup and `veld migrate`, carries a record's
+    /// spaces with it.
+    #[test]
+    fn a_portable_dump_carries_the_spaces() {
+        use crate::storage::portable::{read_all, PortableRecord, PortableWriter};
+        let mut original = memory_with_session("dumped and restored");
+        original.experience.embedding_space = SpaceId::parse("minilm-l6-v2@4");
+        original
+            .experience
+            .keep_vector(SpaceId::new("nomic-embed-text-v1.5", 8), vec![0.5; 8]);
+        let value = portable_memory_value(&encode(&original))
+            .unwrap()
+            .into_owned();
+        let mut buf = Vec::new();
+        let mut writer = PortableWriter::new(&mut buf).unwrap();
+        writer
+            .write_record(&PortableRecord {
+                cf: "default".to_string(),
+                key: original.id.0.as_bytes().to_vec(),
+                value,
+            })
+            .unwrap();
+        writer.finish().unwrap();
+        let records = read_all(&buf[..]).unwrap();
+        let back = decode_memory_snapshot(&records[0].value).unwrap();
+        assert_eq!(
+            back.experience.embedding_space,
+            original.experience.embedding_space
+        );
+        assert_eq!(
+            back.experience.other_vectors,
+            original.experience.other_vectors
+        );
+    }
+
     #[test]
     fn a_record_with_its_spaces_is_current_and_keeps_them() {
         let mut original = memory_with_session("written with spaces");

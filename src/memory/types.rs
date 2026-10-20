@@ -1440,6 +1440,35 @@ impl Experience {
         }
     }
 
+    /// Keep the slots to their spaces: a slot holding a vector in another space than the one it
+    /// is read in moves that vector to the kept vectors and empties. Every cosine against a
+    /// slot then compares vectors of one space. The secondary slot is checked only when a
+    /// secondary space is given. Returns whether anything moved.
+    pub fn move_foreign_to_kept(&mut self, primary: &SpaceId, secondary: Option<&SpaceId>) -> bool {
+        let mut moved = false;
+        if let Some(space) = self.primary_space(Some(primary)) {
+            if &space != primary {
+                if let Some(vector) = self.embeddings.take() {
+                    self.embedding_space = None;
+                    self.keep_vector(space, vector);
+                    moved = true;
+                }
+            }
+        }
+        if let Some(secondary) = secondary {
+            if let Some(space) = self.secondary_space(Some(secondary)) {
+                if &space != secondary {
+                    if let Some(vector) = self.embeddings_secondary.take() {
+                        self.embedding_space_secondary = None;
+                        self.keep_vector(space, vector);
+                        moved = true;
+                    }
+                }
+            }
+        }
+        moved
+    }
+
     /// Drop the kept vector in `space`. Returns whether there was one.
     pub fn forget_kept_vector(&mut self, space: &SpaceId) -> bool {
         let before = self.other_vectors.len();
@@ -6312,5 +6341,45 @@ mod enrichment_merge_tests {
                 .any(|p| matches!(p, Place::Geo { .. }))
         });
         assert!(place_is_geo, "a filled geo fix reaches the WHERE facet too");
+    }
+}
+
+#[cfg(test)]
+mod space_vector_tests {
+    use super::*;
+
+    #[test]
+    fn a_vector_in_another_space_leaves_its_slot_and_is_kept() {
+        let nomic = SpaceId::new("nomic-embed-text-v1.5", 4);
+        let minilm = SpaceId::new("minilm-l6-v2", 4);
+        let mut e = Experience::default();
+        e.set_primary_vector(vec![1.0; 4], minilm.clone());
+        assert!(e.move_foreign_to_kept(&nomic, None));
+        assert!(e.embeddings.is_none());
+        assert_eq!(e.vector_in(&minilm, None, None), Some(&vec![1.0; 4]));
+        assert!(
+            !e.move_foreign_to_kept(&nomic, None),
+            "an empty slot has nothing to move"
+        );
+
+        let mut own = Experience::default();
+        own.set_primary_vector(vec![1.0; 4], nomic.clone());
+        assert!(!own.move_foreign_to_kept(&nomic, None));
+        let mut legacy = Experience {
+            embeddings: Some(vec![1.0; 4]),
+            ..Default::default()
+        };
+        assert!(
+            !legacy.move_foreign_to_kept(&nomic, None),
+            "an unrecorded vector at the index width is the index's, as it always was"
+        );
+        let mut narrow = Experience {
+            embeddings: Some(vec![1.0; 2]),
+            ..Default::default()
+        };
+        assert!(narrow.move_foreign_to_kept(&nomic, None));
+        assert!(narrow
+            .vector_in(&SpaceId::unrecorded(2), None, None)
+            .is_some());
     }
 }

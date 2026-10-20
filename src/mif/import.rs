@@ -54,6 +54,17 @@ fn content_hash(content: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// The space an imported vector is in: the model and width its exporter named. A vendor that
+/// names no model leaves only the width known.
+fn imported_space(embedding: &MifEmbedding) -> crate::embeddings::space::SpaceId {
+    use crate::embeddings::space::SpaceId;
+    let width = embedding.vector.len();
+    match embedding.model.trim() {
+        "" | "unknown" => SpaceId::unrecorded(width),
+        model => SpaceId::new(model, width),
+    }
+}
+
 /// Convert MIF memories into Experience structs ready for `remember_with_id()`.
 ///
 /// A prepared memory ready for import: (id, experience, optional creation timestamp).
@@ -85,17 +96,19 @@ pub fn prepare_memories(
 
         let entities: Vec<String> = mem.entities.iter().map(|e| e.name.clone()).collect();
 
-        let embeddings = mem.embeddings.as_ref().map(|e| e.vector.clone());
-
-        let experience = Experience {
+        let mut experience = Experience {
             experience_type: exp_type,
             content: mem.content.clone(),
             entities,
             metadata,
-            embeddings,
             tags: mem.tags.clone(),
             ..Default::default()
         };
+        // The vector carries the space the exporter named. `remember_with_id` keeps one in
+        // another space than this corpus's beside the memory and embeds it anew.
+        if let Some(e) = &mem.embeddings {
+            experience.set_primary_vector(e.vector.clone(), imported_space(e));
+        }
 
         let memory_id = MemoryId(mem.id);
         let created_at = Some(mem.created_at);
