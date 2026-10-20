@@ -698,6 +698,12 @@ fn open_standalone_bm25(path: &std::path::Path, sealed: bool) -> Result<hybrid_s
     .context("Failed to open BM25 index for hybrid search")
 }
 
+/// Whether `stored`'s vectors already describe `content`: they are derived from the
+/// content alone, so a write that leaves it unchanged needs no embedding or reindex.
+fn keeps_vectors(stored: &Memory, content: &str) -> bool {
+    stored.experience.content == content && stored.experience.embeddings.is_some()
+}
+
 /// Whether two versions of a memory index differently in BM25, which reads
 /// content, tags and entities and nothing else.
 fn bm25_text_differs(before: &Memory, after: &Memory) -> bool {
@@ -5541,13 +5547,23 @@ impl MemorySystem {
     /// projection is the only BM25 writer for journaled writes.
     pub fn upsert_memories(&self, memories: &[Memory]) -> Result<usize> {
         for memory in memories {
+            // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
+            // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
+            // them, and a replica applying every snapshot grew 18.7 vectors per memory.
+            let vectors_kept = self.retriever.is_indexed(&memory.id)
+                && self.long_term_memory.get(&memory.id).is_ok_and(|stored| {
+                    keeps_vectors(&stored, &memory.experience.content)
+                        && stored.experience.embeddings == memory.experience.embeddings
+                });
             self.long_term_memory.update(memory)?;
-            if let Err(e) = self.retriever.reindex_memory(memory) {
-                tracing::warn!(
-                    "Failed to reindex memory {} in vector DB: {}",
-                    memory.id.0,
-                    e
-                );
+            if !vectors_kept {
+                if let Err(e) = self.retriever.reindex_memory(memory) {
+                    tracing::warn!(
+                        "Failed to reindex memory {} in vector DB: {}",
+                        memory.id.0,
+                        e
+                    );
+                }
             }
             let shared = std::sync::Arc::new(memory.clone());
             {
@@ -6524,11 +6540,19 @@ impl MemorySystem {
     ) -> Result<(MemoryId, bool)> {
         // The embedding is the slow part (ONNX or an HTTP embedder), so it is computed
         // before the per-user lock. Both paths embed the incoming content, except a create
-        // that already carries a vector.
-        let precomputed = experience
-            .embeddings
-            .is_none()
-            .then(|| self.embed_content(&experience.content));
+        // that already carries a vector and an update whose content is what is stored,
+        // which keeps its vectors (re-checked under the lock).
+        let precomputed = if experience.embeddings.is_some() {
+            None
+        } else {
+            let content_is_stored = self
+                .long_term_memory
+                .find_by_external_id(&external_id)
+                .ok()
+                .flatten()
+                .is_some_and(|stored| keeps_vectors(&stored, &experience.content));
+            (!content_is_stored).then(|| self.embed_content(&experience.content))
+        };
 
         // C1: the find-then-create below must be atomic, or two concurrent upserts of one
         // external_id both miss the lookup and both create. Same per-user lock as remember_impl.
@@ -6538,6 +6562,9 @@ impl MemorySystem {
         if let Some(mut existing) = self.long_term_memory.find_by_external_id(&external_id)? {
             // === UPDATE PATH ===
             let memory_id = existing.id.clone();
+            let vectors_kept = keeps_vectors(&existing, &experience.content)
+                && experience.embeddings.is_none()
+                && self.retriever.is_indexed(&memory_id);
 
             // Push old content to history and update
             existing.update_content(
@@ -6573,18 +6600,21 @@ impl MemorySystem {
             }
 
             // Regenerate embeddings for new content: the vector computed before the lock
-            // when it was computed from this content, otherwise encoded here.
-            let regenerated = match precomputed
-                .as_ref()
-                .and_then(|p| p.for_content(&existing.experience.content))
-            {
-                Some(outcome) => outcome.clone(),
-                None => self.embed_content(&existing.experience.content).outcome,
-            };
-            match regenerated {
-                Ok(embedding) => existing.experience.embeddings = Some(embedding),
-                Err(e) => {
-                    tracing::warn!("Failed to regenerate embedding during upsert: {}", e);
+            // when it was computed from this content, otherwise encoded here. Unchanged
+            // content keeps the stored vectors.
+            if !vectors_kept {
+                let regenerated = match precomputed
+                    .as_ref()
+                    .and_then(|p| p.for_content(&existing.experience.content))
+                {
+                    Some(outcome) => outcome.clone(),
+                    None => self.embed_content(&existing.experience.content).outcome,
+                };
+                match regenerated {
+                    Ok(embedding) => existing.experience.embeddings = Some(embedding),
+                    Err(e) => {
+                        tracing::warn!("Failed to regenerate embedding during upsert: {}", e);
+                    }
                 }
             }
 
@@ -6602,22 +6632,25 @@ impl MemorySystem {
             // Persist updated memory
             self.long_term_memory.update(&existing)?;
 
-            // Re-index in vector DB with new embeddings
-            if let Err(e) = self.retriever.reindex_memory(&existing) {
-                tracing::warn!(
-                    "Failed to reindex memory {} in vector DB: {}",
-                    memory_id.0,
-                    e
-                );
-                if let Err(record_err) = self.embedding_backlog.record(
-                    &memory_id,
-                    embedding_backlog::EnqueueReason::IndexFailed,
-                    Some(&e.to_string()),
-                ) {
-                    tracing::error!(
-                        "embedding backlog: could not record {}: {record_err}",
-                        &memory_id.0
+            // Re-index in vector DB with new embeddings. A reindex soft-deletes the old
+            // vectors and adds new ones, so an unchanged memory would only grow ghosts.
+            if !vectors_kept {
+                if let Err(e) = self.retriever.reindex_memory(&existing) {
+                    tracing::warn!(
+                        "Failed to reindex memory {} in vector DB: {}",
+                        memory_id.0,
+                        e
                     );
+                    if let Err(record_err) = self.embedding_backlog.record(
+                        &memory_id,
+                        embedding_backlog::EnqueueReason::IndexFailed,
+                        Some(&e.to_string()),
+                    ) {
+                        tracing::error!(
+                            "embedding backlog: could not record {}: {record_err}",
+                            &memory_id.0
+                        );
+                    }
                 }
             }
 
@@ -10446,6 +10479,63 @@ mod lifecycle_tests {
                 stored.experience.embeddings,
                 Some(system.compute_embedding(new_content).unwrap()),
                 "{backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_upsert_or_replicated_snapshot_keeps_its_vectors() {
+        for (backend, system, _tmp) in systems() {
+            let experience = |content: &str| Experience {
+                content: content.to_string(),
+                ..Default::default()
+            };
+            let ferry = "The ferry leaves the north quay at six.";
+            let (id, _) = system
+                .upsert(
+                    "linear:VELD-2".to_string(),
+                    experience(ferry),
+                    ChangeType::ContentUpdated,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let vectors = system.retriever.vector_ids_of(&id);
+            assert!(!vectors.is_empty(), "{backend}: the create indexed nothing");
+
+            system
+                .upsert(
+                    "linear:VELD-2".to_string(),
+                    experience(ferry),
+                    ChangeType::StatusChanged,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                system.retriever.vector_ids_of(&id),
+                vectors,
+                "{backend}: an upsert of the stored content reindexed"
+            );
+
+            let mut retagged = system.long_term_memory.get(&id).unwrap();
+            retagged.experience.tags = vec!["ferries".to_string()];
+            system.upsert_memories(&[retagged]).unwrap();
+            assert_eq!(
+                system.retriever.vector_ids_of(&id),
+                vectors,
+                "{backend}: a snapshot with the stored content reindexed"
+            );
+
+            let mut moved = system.long_term_memory.get(&id).unwrap();
+            moved.experience.content = "The ferry leaves the south quay at seven.".to_string();
+            moved.experience.embeddings =
+                Some(system.compute_embedding(&moved.experience.content).unwrap());
+            system.upsert_memories(&[moved]).unwrap();
+            assert_ne!(
+                system.retriever.vector_ids_of(&id),
+                vectors,
+                "{backend}: new content kept the old vectors"
             );
         }
     }
