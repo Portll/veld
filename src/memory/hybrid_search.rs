@@ -602,9 +602,14 @@ impl BM25Index {
             .get_field("stemmed_content")
             .context("BM25 schema missing 'stemmed_content' field")?;
 
-        // 15MB writer heap — sufficient for edge workloads
+        // One indexing thread, 15MB heap. `Index::writer` would spread documents over
+        // a CPU-dependent thread count, and BM25 scores come from per-segment corpus
+        // statistics, so segment layout (and the score of one document) would then
+        // depend on how the work happened to be divided: whole-percent drift between
+        // two ingests of the same corpus. A single thread makes layout a function of
+        // the corpus alone, at the cost of ingest throughput on multi-core machines.
         let writer = index
-            .writer(15_000_000)
+            .writer_with_num_threads(1, 15_000_000)
             .context("Failed to create index writer")?;
 
         let reader = index
