@@ -52,6 +52,9 @@ enum Suite {
     /// conversation's 629-turn corpus. The per-PR recall-regression gate that
     /// replaced the synthetic smoke suite. Fast (~1-2 min), real data.
     LocomoGate,
+    /// Who did what to whom: 240 questions over 60 pairs of role-swapped twin memories made of
+    /// the same words. Chance is 50% p@1. Diagnostic, not gated.
+    Directional,
 }
 
 impl Suite {
@@ -61,6 +64,7 @@ impl Suite {
             Suite::Locomo => "locomo",
             Suite::LocomoHoldout => "locomo-holdout",
             Suite::LocomoGate => "locomo-gate",
+            Suite::Directional => "directional",
         }
     }
 
@@ -81,6 +85,10 @@ impl Suite {
             Suite::LocomoGate => Some((
                 fx::manifest_path(fx::LOCOMO_GATE_CORPUS_PATH),
                 fx::manifest_path(fx::LOCOMO_GATE_CASES_PATH),
+            )),
+            Suite::Directional => Some((
+                fx::manifest_path(fx::DIRECTIONAL_CORPUS_PATH),
+                fx::manifest_path(fx::DIRECTIONAL_CASES_PATH),
             )),
         }
     }
@@ -1315,6 +1323,12 @@ fn summarise(report: &Report) {
         Some(d) => eprintln!("recall-eval: model outputs replayed from tape {d}"),
         None => eprintln!("recall-eval: model outputs computed live"),
     }
+    eprintln!(
+        "recall-eval: kernel_class={} cpu={:?} features={}",
+        report.kernel.class,
+        report.kernel.cpu_model,
+        report.kernel.features.join(",")
+    );
     // Print modes in pipeline order (vamana_only → full), not BTreeMap order.
     // Match against the canonical mode keys so any unknown key just falls
     // through to the BTreeMap iteration at the bottom.

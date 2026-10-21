@@ -344,6 +344,55 @@ def tape_note(baseline: dict[str, Any], current: dict[str, Any]) -> list[str]:
     return lines
 
 
+def kernel_note(baseline: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    """Say which CPU kernel class each side ran on, and warn when that leaves the case list
+    unattributable.
+
+    ONNX Runtime picks its kernels by CPUID, so identical code ranks differently on runners that
+    expose different CPU features. The Rust comparator refuses two recorded classes that differ,
+    and compares a baseline that records none with an `unattributable` note; this says which, so
+    nobody reads the case list below as something the change did. Two replays of one model tape
+    ran no model arithmetic, so their classes change nothing.
+    """
+
+    def describe(report: dict[str, Any]) -> tuple[str, str]:
+        kernel = report.get("kernel")
+        if not isinstance(kernel, dict) or not kernel.get("class"):
+            return "", "not recorded"
+        model = kernel.get("cpu_model") or "unknown CPU"
+        return kernel["class"], f"`{kernel['class']}` ({model})"
+
+    base_class, base_desc = describe(baseline)
+    cur_class, cur_desc = describe(current)
+    lines = [f"CPU kernel class: baseline {base_desc} → current {cur_desc}"]
+    tape = baseline.get("model_tape")
+    if tape and tape == current.get("model_tape"):
+        lines[0] += " (both replayed the same model tape, so the class does not affect results)"
+    elif base_class and cur_class and base_class == cur_class:
+        pass
+    elif not base_class and cur_class:
+        lines += [
+            "",
+            "> [!WARNING]",
+            "> **Unattributable: the baseline does not record its CPU kernel class.** Identical "
+            "code ranks differently across classes, so any case listed below may have moved "
+            "because of the runner, not the change. The gate compares the run anyway. Record "
+            "the baseline again (tests/recall/README.md) so the class is checked.",
+        ]
+    else:
+        lines += [
+            "",
+            "> [!WARNING]",
+            "> **Not comparable: the two runs used different, or unrecorded, CPU kernel "
+            "classes.** Identical code ranks differently across classes, so any case listed "
+            "below may have moved because of the runner, not the change. The gate refuses this "
+            "comparison as infrastructure. Re-run the job until it lands on the baseline's "
+            "class, or replay a pinned model tape.",
+        ]
+    lines.append("")
+    return lines
+
+
 def render(
     baseline: dict[str, Any],
     current: dict[str, Any],
@@ -362,6 +411,7 @@ def render(
     )
     lines.extend(rerank_note(baseline, current))
     lines.extend(tape_note(baseline, current))
+    lines.extend(kernel_note(baseline, current))
     base_repeats = baseline.get("repeats", 1)
     cur_repeats = current.get("repeats", 1)
     lines.append(
@@ -545,6 +595,7 @@ def render(
 
 __all__ = [
     "COMMENT_MARKER",
+    "kernel_note",
     "rerank_note",
     "tape_note",
     "classify_case_moves",

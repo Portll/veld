@@ -16,6 +16,143 @@ use super::metrics::Metrics;
 /// `k` value used by the L1 smoke suite for top-`k` metrics.
 pub const SMOKE_K: usize = 10;
 
+/// The family of kernels the runner's CPU makes ONNX Runtime compute with.
+///
+/// ONNX Runtime's MLAS picks its kernels by CPUID when a session loads, and no environment
+/// variable or session option pins the choice. Where the CPU exposes AVX-512F it swaps the fp32
+/// GEMM and the softmax and LayerNorm reductions for kernels that accumulate in another order,
+/// and the AVX-512 extensions select further variants. So one model on one input gives
+/// different low bits on two classes, which in the cross-encoder is enough to reorder near-ties.
+/// Two machines share a class only if they expose the same set of the features MLAS dispatches
+/// on: splitting too finely costs a re-run, splitting too coarsely reports a runner difference
+/// as a regression.
+///
+/// The class is what the CPU exposes, not what the chip is: a hypervisor that hides AVX-512
+/// puts its runner in the AVX2 class.
+///
+/// `class` is the comparison key. `cpu_model` and `features` are recorded so a mismatch, or a
+/// divergence the class does not explain, can be traced to hardware from the report alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct KernelClass {
+    /// On x86_64, the base level MLAS dispatches on (`x86_64-avx512f`, `x86_64-avx2-fma`,
+    /// `x86_64-avx` or `x86_64-sse`), then `+feature` for every [`KERNEL_CLASS_EXTRAS`] entry
+    /// the CPU exposes, in that order; an AVX2 machine with none of them is plain
+    /// `x86_64-avx2-fma`. On other architectures, the architecture name: the split has not
+    /// been measured there.
+    pub class: String,
+    /// `model name` from `/proc/cpuinfo`, or empty where that file does not exist.
+    pub cpu_model: String,
+    /// The dispatch-relevant CPU features the runner exposes, in probe order.
+    pub features: Vec<String>,
+}
+
+/// Features beyond the base level that name a separate class, in class-name order. Kept in step
+/// with the `Check the runner's CPU kernel class` step in `.github/workflows/recall.yml`, which
+/// derives the same name from `/proc/cpuinfo`, where the spellings differ (`avx512_vnni`,
+/// `amx_int8`, ...). The workflow fails a run whose two names disagree.
+pub const KERNEL_CLASS_EXTRAS: [&str; 10] = [
+    "avx512bw",
+    "avx512dq",
+    "avx512vl",
+    "avx512vnni",
+    "avx512bf16",
+    "avx512fp16",
+    "avxvnni",
+    "amx-tile",
+    "amx-int8",
+    "amx-bf16",
+];
+
+/// The class name for a set of exposed x86_64 features, spelled as `is_x86_feature_detected!`
+/// spells them.
+pub fn class_from_features(features: &[&str]) -> String {
+    let has = |f: &str| features.contains(&f);
+    let mut class = if has("avx512f") {
+        "x86_64-avx512f"
+    } else if has("avx2") && has("fma") {
+        "x86_64-avx2-fma"
+    } else if has("avx") {
+        "x86_64-avx"
+    } else {
+        "x86_64-sse"
+    }
+    .to_string();
+    for extra in KERNEL_CLASS_EXTRAS {
+        if has(extra) {
+            class.push('+');
+            class.push_str(extra);
+        }
+    }
+    class
+}
+
+impl KernelClass {
+    /// The class of the machine this process runs on.
+    pub fn detect() -> Self {
+        let (class, features) = Self::detect_class_and_features();
+        Self {
+            class,
+            cpu_model: Self::cpu_model(),
+            features,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn detect_class_and_features() -> (String, Vec<String>) {
+        // `is_x86_feature_detected!` checks CPUID and that the OS saves the register state
+        // (XGETBV), the condition MLAS applies before taking an AVX or AVX-512 path.
+        let mut probes = vec![
+            ("avx", std::is_x86_feature_detected!("avx")),
+            ("avx2", std::is_x86_feature_detected!("avx2")),
+            ("fma", std::is_x86_feature_detected!("fma")),
+            ("avx512f", std::is_x86_feature_detected!("avx512f")),
+            ("avx512bw", std::is_x86_feature_detected!("avx512bw")),
+            ("avx512dq", std::is_x86_feature_detected!("avx512dq")),
+            ("avx512vl", std::is_x86_feature_detected!("avx512vl")),
+            ("avx512vnni", std::is_x86_feature_detected!("avx512vnni")),
+            ("avx512bf16", std::is_x86_feature_detected!("avx512bf16")),
+            ("avx512fp16", std::is_x86_feature_detected!("avx512fp16")),
+            ("avxvnni", std::is_x86_feature_detected!("avxvnni")),
+        ];
+        // AMX detection is unstable in `is_x86_feature_detected!`, so CPUID leaf 7 is read
+        // directly: EDX bit 22 is AMX-BF16, 24 AMX-TILE, 25 AMX-INT8. This does not check that
+        // the OS enabled the tile state; a kernel that hides AMX the CPU has only splits the
+        // class finer than needed, which costs a re-run and never a false comparison.
+        let edx = if core::arch::x86_64::__cpuid(0).eax >= 7 {
+            core::arch::x86_64::__cpuid_count(7, 0).edx
+        } else {
+            0
+        };
+        probes.push(("amx-tile", edx & (1 << 24) != 0));
+        probes.push(("amx-int8", edx & (1 << 25) != 0));
+        probes.push(("amx-bf16", edx & (1 << 22) != 0));
+        let features: Vec<String> = probes
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        let names: Vec<&str> = features.iter().map(String::as_str).collect();
+        (class_from_features(&names), features)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn detect_class_and_features() -> (String, Vec<String>) {
+        (std::env::consts::ARCH.to_string(), Vec::new())
+    }
+
+    fn cpu_model() -> String {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|info| {
+                info.lines()
+                    .find(|l| l.starts_with("model name"))
+                    .and_then(|l| l.split_once(':'))
+                    .map(|(_, v)| v.trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// Top-level recall-eval report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Report {
@@ -40,6 +177,10 @@ pub struct Report {
     /// [`compare_to_baseline`] refuses them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tape: Option<String>,
+    /// The CPU kernel class the run computed on. A report without the key parses with an empty
+    /// class: nobody can say which class produced it (see [`compare_to_baseline`]).
+    #[serde(default)]
+    pub kernel: KernelClass,
     /// Git SHA of the working tree the run was produced from.
     pub git_sha: String,
     /// RFC3339 timestamp at the start of the run.
@@ -602,9 +743,12 @@ pub const EMBEDDER_UNKNOWN: &str = "unknown";
 
 /// A failure entry in the report.
 ///
-/// Two flavours are emitted:
+/// Flavours:
 /// - `kind = "regression"` when a baseline comparison exceeds the tolerance.
+/// - `kind = "infrastructure"` when the two runs are not comparable, or the run itself failed.
 /// - `kind = "case"` when a single case has zero relevant retrievals at all.
+/// - `kind = "unattributable"` when the comparison ran but cannot tell a runner difference from
+///   a change in the code. It does not fail the gate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Failure {
     pub kind: String,
@@ -740,7 +884,8 @@ pub fn aggregate_category(per_case: &[Metrics]) -> CategoryReport {
 /// Returns the list of regressions where `current < baseline - tolerance_pct%
 /// of baseline` for any of the gating metrics: `ndcg@10`, `recall@10`,
 /// `mrr`, `p@1`. Latency is reported but not gated because per-run hardware
-/// noise dominates.
+/// noise dominates. A baseline that records no CPU kernel class is compared, and an
+/// `unattributable` entry says the result cannot tell the runner from the code.
 pub fn compare_to_baseline(
     baseline: &Report,
     current: &Report,
@@ -788,6 +933,50 @@ pub fn compare_to_baseline(
                 describe(&current.model_tape)
             ),
         }];
+    }
+    // Identical code ranks differently on two CPU kernel classes (see `KernelClass`), so a case
+    // that moved across classes may have moved because of the runner. Two replays of one tape
+    // ran no model arithmetic, so the class had nothing to change. The tapes are equal here.
+    let replayed_same_tape = baseline.model_tape.is_some();
+    let mut notes = Vec::new();
+    if !replayed_same_tape {
+        if current.kernel.class.is_empty() {
+            return vec![Failure {
+                kind: "infrastructure".to_string(),
+                detail: "current report does not record the CPU kernel class it ran on; results \
+                         differ across classes, so a run of unknown class is not diffable"
+                    .to_string(),
+            }];
+        }
+        if baseline.kernel.class.is_empty() {
+            // Compared rather than refused, so the gate keeps measuring until a baseline is
+            // recorded with its class; the note keeps the result from reading as attributable.
+            notes.push(Failure {
+                kind: "unattributable".to_string(),
+                detail: format!(
+                    "baseline does not record the CPU kernel class it ran on, and this run's is \
+                     {:?} ({}). Results differ across classes, so a case that moved may have \
+                     moved because of the runner. Record the baseline again as \
+                     tests/recall/README.md describes, and the class is checked",
+                    current.kernel.class, current.kernel.cpu_model
+                ),
+            });
+        } else if baseline.kernel.class != current.kernel.class {
+            return vec![Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "CPU kernel class differs: baseline {:?} ({}), current {:?} ({}). ONNX \
+                     Runtime picks its kernels by CPUID, so identical code ranks differently \
+                     across classes. Re-run the job until it lands on a {:?} runner, or replay \
+                     a pinned model tape",
+                    baseline.kernel.class,
+                    baseline.kernel.cpu_model,
+                    current.kernel.class,
+                    current.kernel.cpu_model,
+                    baseline.kernel.class
+                ),
+            }];
+        }
     }
     let (base_rerank, cur_rerank) = match (&baseline.rerank, &current.rerank) {
         (Some(b), Some(c)) => (b, c),
@@ -887,6 +1076,7 @@ pub fn compare_to_baseline(
         }
     }
 
+    failures.extend(notes);
     failures
 }
 
@@ -1264,6 +1454,11 @@ mod tests {
             }),
             retrieval_dials: Some(RetrievalDials::default()),
             model_tape: None,
+            kernel: KernelClass {
+                class: "x86_64-avx2-fma".to_string(),
+                cpu_model: "AMD EPYC 7763 64-Core Processor".to_string(),
+                features: vec!["avx".into(), "avx2".into(), "fma".into()],
+            },
             git_sha: "deadbeef".to_string(),
             timestamp: chrono::Utc::now(),
             layers,
@@ -1353,6 +1548,189 @@ mod tests {
         v.as_object_mut().unwrap().remove("model_tape");
         let parsed: Report = serde_json::from_value(v).expect("old report must parse");
         assert_eq!(parsed.model_tape, None);
+    }
+
+    /// Two kernel classes, identical code: refused, and no metric failure rides along. The
+    /// current side would fail every gate, so a comparison that ran would show it.
+    #[test]
+    fn different_kernel_class_refuses_before_any_metric_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+        current.kernel = KernelClass {
+            class: "x86_64-avx512f+avx512bw+avx512dq+avx512vl+avx512vnni".to_string(),
+            cpu_model: "INTEL(R) XEON(R) PLATINUM 8573C".to_string(),
+            features: vec!["avx512f".into()],
+        };
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        let detail = &failures[0].detail;
+        assert!(detail.contains("kernel class differs"), "{detail}");
+        assert!(detail.contains("x86_64-avx2-fma"), "{detail}");
+        assert!(detail.contains("PLATINUM 8573C"), "{detail}");
+    }
+
+    /// The class, not the chip, decides the kernels, so one class on another chip is compared.
+    #[test]
+    fn same_kernel_class_on_a_different_chip_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        current.kernel.cpu_model = "AMD EPYC 9V74 80-Core Processor".to_string();
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// A current run that cannot say which class produced it is refused.
+    #[test]
+    fn current_report_without_a_kernel_class_is_refused() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+        current.kernel = KernelClass::default();
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        assert!(
+            failures[0]
+                .detail
+                .contains("does not record the CPU kernel class"),
+            "{}",
+            failures[0].detail
+        );
+    }
+
+    /// A baseline without a class is compared, not refused: a real drop is still a regression,
+    /// an unchanged run still passes, and either way one `unattributable` entry names the
+    /// current class and says the baseline must be recorded again. That entry does not count
+    /// as a regression or an infrastructure failure.
+    #[test]
+    fn baseline_without_a_kernel_class_is_compared_and_marked_unattributable() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        baseline.kernel = KernelClass::default();
+
+        let unchanged = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let failures = compare_to_baseline(&baseline, &unchanged, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "unattributable");
+        assert!(
+            failures[0].detail.contains("x86_64-avx2-fma"),
+            "{}",
+            failures[0].detail
+        );
+        assert!(
+            failures[0].detail.contains("Record the baseline again"),
+            "{}",
+            failures[0].detail
+        );
+
+        let dropped = report_with_full(0.57, 0.7, 0.5, 0.4);
+        let kinds: Vec<String> = compare_to_baseline(&baseline, &dropped, 2.0)
+            .into_iter()
+            .map(|f| f.kind)
+            .collect();
+        assert_eq!(kinds, ["regression", "unattributable"]);
+    }
+
+    /// Two replays of one tape ran no model arithmetic, so the class does not matter: another
+    /// class, or a baseline with none, is compared without a note, and a real drop is a
+    /// regression.
+    #[test]
+    fn same_tape_on_different_kernel_classes_is_compared() {
+        for baseline_class in ["x86_64-avx2-fma", ""] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.57, 0.7, 0.5, 0.4);
+            baseline.model_tape = Some(TAPE_A.to_string());
+            current.model_tape = Some(TAPE_A.to_string());
+            baseline.kernel.class = baseline_class.to_string();
+            current.kernel = KernelClass {
+                class: "x86_64-avx512f+avx512bw+avx512dq+avx512vl+avx512vnni".to_string(),
+                cpu_model: "Intel(R) Xeon(R) Platinum 8370C".to_string(),
+                features: vec!["avx512f".into()],
+            };
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{baseline_class:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "regression");
+        }
+    }
+
+    /// A report without the `kernel` key parses with an empty class rather than failing.
+    #[test]
+    fn report_without_kernel_key_parses_with_empty_class() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("kernel");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.kernel, KernelClass::default());
+    }
+
+    /// Feature sets GitHub's runner pool exposes, spelled as `is_x86_feature_detected!` spells
+    /// them.
+    const EPYC_7763: &[&str] = &["avx", "avx2", "fma"];
+    /// An EPYC 9V74 whose hypervisor hid AVX-512: it exposes what a 7763 does.
+    const EPYC_9V74_MASKED: &[&str] = &["avx", "avx2", "fma"];
+    const XEON_8573C: &[&str] = &[
+        "avx",
+        "avx2",
+        "fma",
+        "avx512f",
+        "avx512bw",
+        "avx512dq",
+        "avx512vl",
+        "avx512vnni",
+    ];
+    const XEON_6973P_C: &[&str] = &[
+        "avx",
+        "avx2",
+        "fma",
+        "avx512f",
+        "avx512bw",
+        "avx512dq",
+        "avx512vl",
+        "avx512vnni",
+        "avx512bf16",
+        "avx512fp16",
+        "avxvnni",
+        "amx-tile",
+        "amx-int8",
+        "amx-bf16",
+    ];
+
+    /// Two AVX-512 chips with VNNI that rank differently must not share a class.
+    #[test]
+    fn xeon_8573c_and_6973p_c_are_different_classes() {
+        let a = class_from_features(XEON_8573C);
+        let b = class_from_features(XEON_6973P_C);
+        assert_ne!(a, b);
+        assert_eq!(a, "x86_64-avx512f+avx512bw+avx512dq+avx512vl+avx512vnni");
+        assert!(b.ends_with("+amx-tile+amx-int8+amx-bf16"), "{b}");
+    }
+
+    /// AVX2 machines with no extras, masked AVX-512 included, are plain `x86_64-avx2-fma`.
+    #[test]
+    fn avx2_machines_share_the_plain_avx2_class() {
+        assert_eq!(class_from_features(EPYC_7763), "x86_64-avx2-fma");
+        assert_eq!(class_from_features(EPYC_9V74_MASKED), "x86_64-avx2-fma");
+    }
+
+    /// The name follows `KERNEL_CLASS_EXTRAS`, not the order features were probed in.
+    #[test]
+    fn class_name_is_independent_of_feature_order() {
+        let mut reversed: Vec<&str> = XEON_6973P_C.to_vec();
+        reversed.reverse();
+        assert_eq!(
+            class_from_features(&reversed),
+            class_from_features(XEON_6973P_C)
+        );
+    }
+
+    /// On this machine, the detected class is the one its own features name.
+    #[test]
+    fn detected_class_is_named_by_its_features() {
+        let k = KernelClass::detect();
+        assert!(!k.class.is_empty());
+        if cfg!(target_arch = "x86_64") {
+            let names: Vec<&str> = k.features.iter().map(String::as_str).collect();
+            assert_eq!(k.class, class_from_features(&names), "{k:?}");
+        }
     }
 
     /// A run with reranking off against the reranked baseline is two pipelines, not a

@@ -2,11 +2,30 @@ name: Recall Gate
 
 # Measures retrieval quality on the 100-case LoCoMo gate with `recall-eval`, once per storage engine.
 # Each engine's run is gated against tests/recall/locomo-gate-baseline.json, and the two engines'
-# scores must be equal. Weekly and on demand, not per push: the Actions budget (2026-09-27 ruling
-# in ci.yml) cannot carry two release builds on every commit. A retrieval, graph or NER port runs
-# it by dispatch before it lands (docs/upstream/PLAN.md, 1.5).
+# scores must be equal. It gates every pull request that touches a path that can move a ranking,
+# runs weekly, and runs on dispatch for the other suites, recordings and arms.
 
 on:
+  pull_request:
+    branches: [main]
+    # What the gate measures: the retrieval pipeline and what it is built from, the harness and
+    # its fixtures, the scripts that read its reports, and the dependency lock (an ONNX Runtime
+    # or tantivy upgrade moves rankings). Pull requests change none of the dispatch inputs, so
+    # they always run the gated locomo-gate suite at layer full with the shipped dials.
+    paths:
+      - 'src/memory/**'
+      - 'src/embeddings/**'
+      - 'src/vector_db/**'
+      - 'src/graph_memory.rs'
+      - 'src/constants.rs'
+      - 'src/handlers/remember.rs'
+      - 'src/recall_harness/**'
+      - 'src/bin/recall_eval.rs'
+      - 'tests/recall/**'
+      - 'scripts/recall_*.py'
+      - 'scripts/stage_diff.py'
+      - 'Cargo.lock'
+      - '.github/workflows/recall.yml'
   schedule:
     - cron: '17 3 * * 1'
   workflow_dispatch:
@@ -31,11 +50,22 @@ on:
           gate is too coarse to settle: whole-case metrics move in steps of 1/n, 0.01 overall and
           0.04 on multi_hop at n=100, both above a 2% allowance. locomo contains the gate's
           conversation; locomo-holdout leaves it out, and every case someone has examined, and
-          is the number to report. Neither is gated.
+          is the number to report. directional asks who did what to whom over role-swapped twin
+          memories made of the same words (chance is 50% p@1). None but the gate is gated.
         required: false
         default: 'locomo-gate'
         type: choice
-        options: ['locomo-gate', 'locomo', 'locomo-holdout']
+        options: ['locomo-gate', 'locomo', 'locomo-holdout', 'directional']
+      stage_export:
+        description: >-
+          Write every pipeline stage (embedding hashes, NER spans, graph nodes and edges, each
+          stage's ranking and scores, the cross-encoder's scores over its pool) to
+          stages-<engine>.jsonl in the report artifact. scripts/stage_diff.py compares two such
+          files; see tests/recall/README.md.
+        required: false
+        default: 'off'
+        type: choice
+        options: ['off', 'on']
       record:
         description: 'Record a new baseline: run ungated and upload the reports'
         required: false
@@ -102,8 +132,8 @@ permissions:
   actions: read
 
 # A dispatched run is a deliberate measurement and is never redundant with another, so it gets a
-# group of its own: a second arm dispatched on the same branch must not cancel the first. A
-# scheduled run still supersedes the one before it.
+# group of its own: a second arm dispatched on the same branch must not cancel the first. A push to
+# a pull request supersedes that pull request's run, and a scheduled run the one before it.
 concurrency:
   group: recall-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
   cancel-in-progress: true
@@ -113,14 +143,16 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: 0
   TOLERANCE: ${{ github.event.inputs.tolerance || '2.0' }}
   REPEATS: ${{ github.event.inputs.repeats || '5' }}
-  # The schedule always runs the gated `full` rung; only a dispatch widens to every rung. The gate
-  # reads `full` alone, so `all` still gates.
+  # Pull requests and the schedule always run the gated `full` rung; only a dispatch widens to
+  # every rung. The gate reads `full` alone, so `all` still gates.
   LAYER: ${{ github.event.inputs.layer || 'full' }}
-  # The schedule runs the gate suite; only a dispatch reaches the full and held-out sets, which
-  # have no baseline and are never gated.
+  # Pull requests and the schedule run the gate suite; only a dispatch reaches the other suites,
+  # which have no baseline and are never gated.
   SUITE: ${{ github.event.inputs.suite || 'locomo-gate' }}
   RECORD: ${{ github.event.inputs.record || 'false' }}
-  # Scheduled runs replay the pinned tape: the same model outputs on every runner.
+  # Pull requests and the schedule replay the pinned tape, the same model outputs on every runner,
+  # once tests/recall/model-tape.json exists. Until then their models run live, and the kernel
+  # class check below is what keeps two runners' arithmetic apart.
   MODEL_TAPE: ${{ github.event.inputs.model_tape || 'pinned' }}
   # The report's `embedder` field names what produced it. VELD_EMBEDDER selects it explicitly in
   # the eval step, so an arm never reaches its embedder through the fallback order.
@@ -145,38 +177,6 @@ jobs:
             features: '--no-default-features --features storage-redb'
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: recall-eval-${{ matrix.engine }}
-
-      - name: Install LLVM
-        if: matrix.engine == 'rocksdb'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y llvm-dev libclang-dev clang
-
-      # The harness refuses the hash embedder, so the ONNX runtime and the arm's embedder are
-      # fetched, pinned and SHA-256 verified by veld's own downloader. The key names the embedder,
-      # so each arm restores a cache holding its own model.
-      - uses: actions/cache@v4
-        id: models
-        with:
-          path: ~/.cache/veld
-          key: veld-models-${{ runner.os }}-${{ env.EMBEDDER }}-${{ hashFiles('src/embeddings/downloader.rs') }}
-      - name: Fetch the ONNX runtime and the embedder
-        if: steps.models.outputs.cache-hit != 'true'
-        run: >-
-          cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime
-          ${{ env.EMBEDDER == 'arctic-embed-xs' && '--arctic-xs' || env.EMBEDDER == 'nomic-embed-text-v1.5' && '--nomic' || '--minilm' }}
-
-      # The cross-encoder downloads itself on first use; the models cache above is saved only on
-      # a miss, so without this it would download every run, and a failed download in one repeat
-      # makes the repeats diverge.
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/veld/cross-encoder
-          key: veld-cross-encoder-${{ runner.os }}-${{ hashFiles('src/embeddings/cross_encoder.rs') }}
 
       - name: Cache the pinned model tape
         if: env.MODEL_TAPE == 'pinned' && hashFiles('tests/recall/model-tape.json') != ''
@@ -233,6 +233,78 @@ jobs:
           echo "Model tape: mode=$MODEL_TAPE path=${TAPE_PATH:-<none, models run live>}"
           echo "TAPE_PATH=$TAPE_PATH" >> "$GITHUB_ENV"
 
+      # ONNX Runtime picks its kernels by CPUID, so identical code ranks differently on runners
+      # that expose different CPU features (`KernelClass` in src/recall_harness/report.rs).
+      # recall-eval refuses a cross-class comparison as infrastructure, but only after the build
+      # and the run; this applies the same rule from /proc/cpuinfo so a gated run on the wrong
+      # class fails in seconds. recall-eval stays the authority. A dispatch is not stopped: a
+      # recording has to be able to measure on any class. A replayed tape ran no model
+      # arithmetic, so the class does not matter. A baseline that records no class is compared,
+      # and says so.
+      - name: Check the runner's CPU kernel class
+        run: |
+          flags=" $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2) "
+          has() { [[ "$flags" == *" $1 "* ]]; }
+          if has avx512f; then RUNNER_CLASS=x86_64-avx512f
+          elif has avx2 && has fma; then RUNNER_CLASS=x86_64-avx2-fma
+          elif has avx; then RUNNER_CLASS=x86_64-avx
+          else RUNNER_CLASS=x86_64-sse
+          fi
+          # KERNEL_CLASS_EXTRAS in report.rs, in its order, as "<cpuinfo flag>:<class suffix>".
+          # The step after the eval fails the job if this name and recall-eval's disagree.
+          for pair in avx512bw:avx512bw avx512dq:avx512dq avx512vl:avx512vl \
+                      avx512_vnni:avx512vnni avx512_bf16:avx512bf16 avx512_fp16:avx512fp16 \
+                      avx_vnni:avxvnni amx_tile:amx-tile amx_int8:amx-int8 amx_bf16:amx-bf16; do
+            if has "${pair%%:*}"; then RUNNER_CLASS="$RUNNER_CLASS+${pair#*:}"; fi
+          done
+          echo "RUNNER_CLASS=$RUNNER_CLASS" >> "$GITHUB_ENV"
+          CPU_MODEL=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
+          BASELINE_CLASS=$(jq -r '.kernel.class // ""' tests/recall/locomo-gate-baseline.json)
+          echo "Runner: class=$RUNNER_CLASS cpu=$CPU_MODEL; baseline class=${BASELINE_CLASS:-<not recorded>}"
+          if [ -n "$TAPE_PATH" ]; then
+            echo "Replaying a model tape: this runner's CPU class does not affect the result."
+          elif [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] && [ "$SUITE" = "locomo-gate" ] && [ "$RECORD" != "true" ]; then
+            if [ -z "$BASELINE_CLASS" ]; then
+              echo "::warning::The gate baseline records no CPU kernel class, so this run on $RUNNER_CLASS ($CPU_MODEL) is compared on trust: a case that moved may have moved because of the runner. Record the baseline again (tests/recall/README.md)."
+            elif [ "$RUNNER_CLASS" != "$BASELINE_CLASS" ]; then
+              echo "::error::This runner's CPU kernel class is $RUNNER_CLASS ($CPU_MODEL), and the baseline was recorded on $BASELINE_CLASS. Results are not comparable across classes. Re-run this job; GitHub assigns runner hardware per job."
+              exit 1
+            fi
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: recall-eval-${{ matrix.engine }}
+
+      - name: Install LLVM
+        if: matrix.engine == 'rocksdb'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
+      # The harness refuses the hash embedder, so the ONNX runtime and the arm's embedder are
+      # fetched, pinned and SHA-256 verified by veld's own downloader. The key names the embedder,
+      # so each arm restores a cache holding its own model.
+      - uses: actions/cache@v4
+        id: models
+        with:
+          path: ~/.cache/veld
+          key: veld-models-${{ runner.os }}-${{ env.EMBEDDER }}-${{ hashFiles('src/embeddings/downloader.rs') }}
+      - name: Fetch the ONNX runtime and the embedder
+        if: steps.models.outputs.cache-hit != 'true'
+        run: >-
+          cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime
+          ${{ env.EMBEDDER == 'arctic-embed-xs' && '--arctic-xs' || env.EMBEDDER == 'nomic-embed-text-v1.5' && '--nomic' || '--minilm' }}
+
+      # The cross-encoder downloads itself on first use; the models cache above is saved only on
+      # a miss, so without this it would download every run, and a failed download in one repeat
+      # makes the repeats diverge.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/veld/cross-encoder
+          key: veld-cross-encoder-${{ runner.os }}-${{ hashFiles('src/embeddings/cross_encoder.rs') }}
+
       - name: Build recall-eval
         run: cargo build --release --bin recall-eval ${{ matrix.features }}
 
@@ -255,6 +327,7 @@ jobs:
           VELD_TUNE_CE_BLEND: ${{ github.event.inputs.ce_blend || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
+          VELD_STAGE_EXPORT: ${{ github.event.inputs.stage_export == 'on' && format('stages-{0}.jsonl', matrix.engine) || '' }}
           # minilm-l6-v2 is VELD_EMBEDDER=minilm, nomic-embed-text-v1.5 is VELD_EMBEDDER=nomic;
           # arctic-embed-xs is its own id.
           VELD_EMBEDDER: ${{ env.EMBEDDER == 'arctic-embed-xs' && 'arctic-embed-xs' || env.EMBEDDER == 'nomic-embed-text-v1.5' && 'nomic' || 'minilm' }}
@@ -275,10 +348,13 @@ jobs:
             --storage ./recall-storage 2>&1 | tee "recall-eval-${{ matrix.engine }}.log"
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
-      - name: Test the diff renderer
+      - name: Test the report scripts
         if: always()
         working-directory: scripts
-        run: python3 test_recall_diff.py
+        run: |
+          python3 test_recall_diff.py
+          python3 test_recall_engines_equal.py
+          python3 test_stage_diff.py
 
       - name: Render the diff table
         if: always() && env.SUITE == 'locomo-gate' && hashFiles(format('current-{0}.json', matrix.engine)) != ''
@@ -300,6 +376,7 @@ jobs:
             per-case-${{ matrix.engine }}.json
             recall-eval-${{ matrix.engine }}.log
             recall-diff-${{ matrix.engine }}.md
+            stages-${{ matrix.engine }}.jsonl
           if-no-files-found: warn
           retention-days: 30
 
@@ -311,6 +388,18 @@ jobs:
           path: model-tape-${{ matrix.engine }}.jsonl.gz
           if-no-files-found: error
           retention-days: 90
+
+      # The early check and recall-eval derive the class separately, one from /proc/cpuinfo and one
+      # from CPUID. If they disagree, the early check gates on a name recall-eval would not produce.
+      - name: Check both kernel class derivations agree
+        if: always() && env.RUNNER_CLASS != '' && hashFiles(format('current-{0}.json', matrix.engine)) != ''
+        run: |
+          REPORTED=$(jq -r '.kernel.class // ""' "current-${{ matrix.engine }}.json")
+          if [ "$REPORTED" != "$RUNNER_CLASS" ]; then
+            echo "::error::Kernel class derivations disagree: the workflow says $RUNNER_CLASS, recall-eval says $REPORTED. Keep the workflow's extras list in step with KERNEL_CLASS_EXTRAS."
+            exit 1
+          fi
+          echo "Kernel class agrees: $REPORTED"
 
       # Only when the eval step completed: after a timeout or an earlier failure the job is already
       # red for the right reason, and an empty exit code here would add a misleading second error.

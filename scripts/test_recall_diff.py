@@ -19,6 +19,7 @@ from recall_diff import (
     QUANTIZED_METRICS,
     case_counts,
     classify_case_moves,
+    kernel_note,
     load_per_case,
     render,
     render_case_moves,
@@ -286,11 +287,56 @@ class TestTapeNote:
         assert not any("Not comparable" in l for l in lines)
 
 
+class TestKernelNote:
+    AVX2 = {"class": "x86_64-avx2-fma", "cpu_model": "AMD EPYC 7763 64-Core Processor"}
+    AVX512 = {
+        "class": "x86_64-avx512f+avx512bw+avx512dq+avx512vl+avx512vnni",
+        "cpu_model": "INTEL(R) XEON(R) PLATINUM 8573C",
+    }
+
+    def test_same_class_names_both_and_does_not_warn(self):
+        lines = kernel_note({"kernel": self.AVX2}, {"kernel": dict(self.AVX2, cpu_model="AMD EPYC 9V74")})
+        assert "`x86_64-avx2-fma` (AMD EPYC 7763" in lines[0]
+        assert "AMD EPYC 9V74" in lines[0]
+        assert not any("[!WARNING]" in l for l in lines)
+
+    def test_different_class_is_not_comparable(self):
+        lines = kernel_note({"kernel": self.AVX2}, {"kernel": self.AVX512})
+        assert any("Not comparable" in l for l in lines)
+
+    def test_unrecorded_current_class_is_not_comparable(self):
+        for base, cur in (({"kernel": self.AVX2}, {}), ({}, {})):
+            lines = kernel_note(base, cur)
+            assert "not recorded" in lines[0]
+            assert any("Not comparable" in l for l in lines)
+
+    def test_unrecorded_baseline_class_is_compared_but_unattributable(self):
+        # The comparator compares such a pair, so the comment must not say it refused it.
+        lines = kernel_note({}, {"kernel": self.AVX2})
+        assert lines[0].startswith("CPU kernel class: baseline not recorded")
+        assert any("Unattributable" in l for l in lines)
+        assert not any("Not comparable" in l for l in lines)
+
+    def test_one_tape_makes_the_class_irrelevant(self):
+        tape = "a" * 64
+        lines = kernel_note({"kernel": self.AVX2, "model_tape": tape}, {"kernel": self.AVX512, "model_tape": tape})
+        assert "both replayed the same model tape" in lines[0]
+        assert not any("[!WARNING]" in l for l in lines)
+        lines = kernel_note({"model_tape": tape}, {"kernel": self.AVX512, "model_tape": tape})
+        assert not any("[!WARNING]" in l for l in lines)
+
+    def test_render_carries_the_note(self):
+        report = {"layers": {"full": {m: 0.5 for m in ("ndcg@10", "recall@10", "mrr", "p@1")}}}
+        text = render(dict(report, kernel=self.AVX2), dict(report, kernel=self.AVX512), 2.0, None)
+        assert "CPU kernel class: baseline `x86_64-avx2-fma`" in text
+        assert "Not comparable: the two runs used different, or unrecorded, CPU kernel classes" in text
+
+
 if __name__ == "__main__":
     # A plain runner, because this repo ships no python test dependency and a
     # test that cannot be run is documentation.
     failed = 0
-    for cls in (TestCaseCounts, TestResolutionNote, TestCaseMoves, TestRerankNote, TestTapeNote):
+    for cls in (TestCaseCounts, TestResolutionNote, TestCaseMoves, TestRerankNote, TestTapeNote, TestKernelNote):
         instance = cls()
         for name in sorted(n for n in dir(cls) if n.startswith("test_")):
             try:
