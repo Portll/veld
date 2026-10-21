@@ -57,6 +57,7 @@ pub mod types;
 pub mod visualization;
 pub mod voronoi;
 pub mod wavelet_sessions;
+pub mod write_gate;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -469,8 +470,8 @@ pub struct MemorySystem {
     /// through it) is serialized through the shared create path, instead of the
     /// plan's HTTP-only INGEST_LOCKS that streaming/hooks bypassed. Per-user by
     /// construction (MemorySystem is per-user). See the CONSOLIDATION_LOCKS
-    /// per-user-lock discipline (CLAUDE.md).
-    write_lock: parking_lot::Mutex<()>,
+    /// per-user-lock discipline (CLAUDE.md). Closed at shutdown; see `write_gate`.
+    write_lock: write_gate::WriteGate,
 
     /// Drift-adaptive abstention threshold (APP-5).
     /// Calibrated during maintenance by sampling memory importance×confidence scores.
@@ -1708,7 +1709,7 @@ impl MemorySystem {
             // E6: TCM drift state (encode-driven; empty until the first embed)
             tcm_context: Arc::new(parking_lot::RwLock::new(Vec::new())),
             // C1: per-user write-path serialization lock
-            write_lock: parking_lot::Mutex::new(()),
+            write_lock: write_gate::WriteGate::new(),
             // Drift-adaptive abstention: 0 = use static constant
             calibrated_abstention_threshold: std::sync::atomic::AtomicU32::new(0),
             // R1 (J5): per-user prefetch side-state, freed on user eviction.
@@ -2080,7 +2081,7 @@ impl MemorySystem {
         // this lock for the create critical section (store + working_memory +
         // index + BM25) prevents interleaved partial writes / concurrent loss.
         // Released before the deferred embed_and_index background task runs.
-        let _write_guard = self.write_lock.lock();
+        let _write_guard = self.write_lock.enter()?;
 
         // W3.2d: migrate any flat robotics/decision fields into the W3 facets
         // so new memories carry both representations through the transition.
@@ -2689,6 +2690,10 @@ impl MemorySystem {
         bm25: Bm25Sync,
     ) -> Result<EmbedIndexOutcome> {
         let _span = tracing::info_span!("embed_and_index", memory_id = %memory_id.0).entered();
+        // Checked again at the write-back; this one saves an embedding nobody can store.
+        if self.write_lock.is_closed() {
+            return Err(write_gate::WritesClosed.into());
+        }
         let start = std::time::Instant::now();
 
         // Load fresh from storage (owned Memory, so we can mutate experience.embeddings)
@@ -2750,7 +2755,9 @@ impl MemorySystem {
             // writing back the copy read before the (slow) embedding would undo a
             // write made meanwhile, such as a duplicate's merged tags and entities.
             {
-                let _write_guard = self.write_lock.lock();
+                // Closed at shutdown: the store keeps the record without vectors and
+                // the startup re-embed pass picks it up.
+                let _write_guard = self.write_lock.enter()?;
                 let mut fresh = match self.long_term_memory.get(memory_id) {
                     Ok(fresh) => fresh,
                     Err(e) => {
@@ -4819,7 +4826,9 @@ impl MemorySystem {
 
         let mut compressed_count = 0;
         for candidate in candidates {
-            let _write_guard = self.write_lock.lock();
+            let Ok(_write_guard) = self.write_lock.enter() else {
+                break;
+            };
             let Some(memory) = self.long_term_memory.get_memory(&candidate.id)? else {
                 continue;
             };
@@ -5538,6 +5547,18 @@ impl MemorySystem {
         self.logger.read().get_stats()
     }
 
+    /// Refuse every later create, upsert, embedding write-back and compression step with
+    /// [`write_gate::WritesClosed`], after waiting for the one in progress. Shutdown calls
+    /// this before the flush so the flush is the last write. There is no reopen: the
+    /// process is exiting.
+    pub fn close_writes(&self) {
+        self.write_lock.close();
+    }
+
+    pub fn writes_closed(&self) -> bool {
+        self.write_lock.is_closed()
+    }
+
     /// Flush long-term storage to ensure data persistence (critical for graceful shutdown)
     pub fn flush_storage(&self) -> Result<()> {
         // Flush RocksDB storage
@@ -6156,6 +6177,9 @@ impl MemorySystem {
     /// its own merits stays in the queue with its error.
     fn embed_backlog_outcome(&self, memory_id: &MemoryId) -> embedding_backlog::EmbedOutcome {
         use embedding_backlog::EmbedOutcome;
+        if self.writes_closed() {
+            return EmbedOutcome::WritesClosed;
+        }
         match self.long_term_memory.get(memory_id) {
             Ok(memory) if memory.is_forgotten() => return EmbedOutcome::MemoryGone,
             Ok(_) => {}
@@ -6165,6 +6189,9 @@ impl MemorySystem {
             Err(e) => return EmbedOutcome::Failed(e.to_string()),
         }
         if let Err(e) = self.embed_and_index(memory_id) {
+            if write_gate::chain_is_writes_closed(&e) {
+                return EmbedOutcome::WritesClosed;
+            }
             return EmbedOutcome::Failed(e.to_string());
         }
         if self.retriever.is_indexed(memory_id) {
@@ -6672,7 +6699,7 @@ impl MemorySystem {
 
         // C1: the find-then-create below must be atomic, or two concurrent upserts of one
         // external_id both miss the lookup and both create. Same per-user lock as remember_impl.
-        let write_guard = self.write_lock.lock();
+        let write_guard = self.write_lock.enter()?;
 
         // Try to find existing memory with this external_id
         if let Some(mut existing) = self.long_term_memory.find_by_external_id(&external_id)? {
@@ -10824,6 +10851,54 @@ mod lifecycle_tests {
                 system.long_term_memory.get_memory(&kept).unwrap().is_some(),
                 "{backend}: a memory neither criterion names was erased"
             );
+        }
+    }
+
+    /// Shutdown closes the gate before the flush. A create or upsert that reaches it
+    /// afterwards writes nothing and carries `WritesClosed`, which HTTP answers as a 503.
+    #[test]
+    fn a_tenant_closed_to_writes_refuses_remember_and_upsert_and_writes_nothing() {
+        for (backend, system, _tmp) in systems() {
+            remember_text(&system, "Written before the shutdown closed the tenant.");
+            system.close_writes();
+            assert!(system.writes_closed(), "{backend}");
+
+            let refused = system
+                .remember(
+                    Experience {
+                        content: "Arrived after the close.".to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .expect_err("a closed tenant refuses remember");
+            assert!(
+                write_gate::chain_is_writes_closed(&refused),
+                "{backend}: {refused:#}"
+            );
+
+            let refused = system
+                .upsert(
+                    "claude-memory/veld/after-close".to_string(),
+                    Experience {
+                        content: "Upserted after the close.".to_string(),
+                        ..Default::default()
+                    },
+                    ChangeType::Created,
+                    None,
+                    None,
+                )
+                .expect_err("a closed tenant refuses upsert");
+            assert!(
+                write_gate::chain_is_writes_closed(&refused),
+                "{backend}: {refused:#}"
+            );
+
+            assert!(system
+                .find_by_external_id("claude-memory/veld/after-close")
+                .unwrap()
+                .is_none());
+            assert_eq!(stored_truth(&system).0, 1, "{backend}");
         }
     }
 }
