@@ -2265,12 +2265,12 @@ impl MultiUserMemoryManager {
         // embedder is stable for a tenant's corpus), so this is correct
         // by construction.
         //
-        // All five kinds are registered eagerly. The cost of an empty,
-        // un-materialised projection is one in-memory `HashMap` and one
-        // checkpoint-store row — negligible. Kinds that never see a
-        // matching field stay pending and never allocate a Vamana
-        // graph, so there's no I/O penalty for tenants that only ever
-        // store text memories.
+        // The text kinds are always registered. An image, audio or video kind is
+        // registered only for a tenant whose log has already given it a vector: no
+        // write path produces those embeddings, so for every other tenant the
+        // projection would decode each frame's snapshot, on every write and on every
+        // replay, only to skip it. A producer of those embeddings must register its
+        // kind unconditionally.
         let vamana_root = user_path.join("vamana_projection");
         std::fs::create_dir_all(&vamana_root).with_context(|| {
             format!(
@@ -2280,6 +2280,9 @@ impl MultiUserMemoryManager {
         })?;
         let mut vamana_projections: Vec<crate::vector_db::VamanaProjection> = Vec::new();
         for &kind in crate::vector_db::VamanaEmbeddingKind::all() {
+            if !kind.is_text() && !kind.has_persisted_vectors(&checkpoint_store.lock()) {
+                continue;
+            }
             let kind_dir = vamana_root.join(kind.dir_component());
             std::fs::create_dir_all(&kind_dir).with_context(|| {
                 format!(

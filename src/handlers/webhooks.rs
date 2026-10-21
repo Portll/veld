@@ -376,7 +376,7 @@ async fn handle_streaming_socket(
         // Process message
         let result = state
             .streaming_extractor
-            .process_message(&session_id, stream_msg, user_memory.clone())
+            .process_message(&session_id, stream_msg, user_memory.clone(), state.clone())
             .await;
 
         // Send result

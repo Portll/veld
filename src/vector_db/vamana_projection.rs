@@ -215,6 +215,22 @@ impl VamanaEmbeddingKind {
         }
     }
 
+    /// Whether this kind reads a text embedding, which every remembered memory carries.
+    pub fn is_text(self) -> bool {
+        matches!(
+            self,
+            VamanaEmbeddingKind::TextPrimary | VamanaEmbeddingKind::TextSecondary
+        )
+    }
+
+    /// Whether this kind's projection has ever indexed a vector for the tenant whose
+    /// checkpoint store this is: it persists an id map only once the map holds one.
+    pub fn has_persisted_vectors(self, store: &CheckpointStore) -> bool {
+        store
+            .get_side_data(self.projection_name(), SIDE_DATA_KEY_ID_MAP)
+            .is_some()
+    }
+
     /// Enumerate every supported kind in stable order. Used by the
     /// projection registrar to construct one projection per kind per
     /// tenant without hand-listing variants.

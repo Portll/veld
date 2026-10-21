@@ -223,14 +223,35 @@ pub async fn import_mif(
         let memory_sys = state
             .get_user_memory(&req.user_id)
             .map_err(AppError::Internal)?;
-        let guard = memory_sys.read();
-
-        for (memory_id, experience, created_at) in prepared_memories {
-            match guard.remember_with_id(memory_id, experience, created_at) {
-                Ok(_) => result.memories_imported += 1,
-                Err(e) => result.errors.push(format!("Memory: {e}")),
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        // remember_with_id writes no BM25 document: these frames are how the imports reach
+        // keyword search, and replicas.
+        let (imported, errors) = tokio::task::spawn_blocking(move || {
+            let mut imported = Vec::new();
+            let mut errors = Vec::new();
+            {
+                let guard = memory_sys.read();
+                for (memory_id, experience, created_at) in prepared_memories {
+                    match guard.remember_with_id(memory_id, experience, created_at) {
+                        Ok(id) => imported.push(id),
+                        Err(e) => errors.push(format!("Memory: {e}")),
+                    }
+                }
             }
-        }
+            super::remember::journal_stored(
+                &state,
+                &memory_sys,
+                &user_id,
+                &imported,
+                super::remember::SnapshotKind::Remember,
+            );
+            (imported.len(), errors)
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("MIF import task panicked: {e}")))?;
+        result.memories_imported += imported;
+        result.errors.extend(errors);
     }
 
     // Import projects first (todos may reference them)
