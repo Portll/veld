@@ -106,6 +106,8 @@ async fn a_regular_api_key_alone_is_refused_on_every_route() {
     std::env::remove_var(ADMIN_API_KEY_ENV);
 }
 
+// Migrates into redb, which a rocksdb-only build does not have.
+#[cfg(feature = "storage-redb")]
 #[tokio::test]
 async fn a_dry_run_over_http_reports_counts_on_both_backends() {
     let _env = ADMIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

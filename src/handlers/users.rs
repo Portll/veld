@@ -5,10 +5,11 @@
 use axum::{
     extract::{Extension, Path, Query, State},
     http::HeaderMap,
-    response::Json,
+    response::{Json, Response},
 };
 use serde::{Deserialize, Serialize};
 
+use super::admin::require_admin_key;
 use super::state::MultiUserMemoryManager;
 use super::utils::resolve_request_user_id;
 use crate::auth::AuthenticatedUser;
@@ -97,27 +98,17 @@ pub async fn delete_user(
 
 /// GET /api/users - List all users
 ///
-/// This endpoint enumerates all tenant IDs. Access is restricted to requests
-/// presenting the designated admin API key (`VELD_ADMIN_KEY` env var). If
-/// `VELD_ADMIN_KEY` is not configured the endpoint is accessible to any
-/// authenticated caller (development mode).
+/// A key bound to one tenant (multi-tenant mode) must also present the admin key
+/// (`X-Admin-API-Key`, checked as every admin route checks it): enumerating other
+/// tenants is outside its binding. An unbound key already reaches every tenant by
+/// `user_id`, so it may list them.
 pub async fn list_users(
     State(state): State<AppState>,
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     headers: HeaderMap,
-) -> Result<Json<Vec<String>>, AppError> {
-    // Admin gate: if VELD_ADMIN_KEY is set, the request must supply that exact key.
-    if let Ok(admin_key) = std::env::var("VELD_ADMIN_KEY") {
-        let provided_key = headers
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if provided_key != admin_key.as_str() {
-            return Err(AppError::InvalidInput {
-                field: "authorization".to_string(),
-                reason: "Admin access required to enumerate tenants".to_string(),
-            });
-        }
+) -> Result<Json<Vec<String>>, Response> {
+    if authenticated_user.is_some() {
+        require_admin_key(&headers)?;
     }
 
     let caller_id = authenticated_user

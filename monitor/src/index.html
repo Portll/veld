@@ -22,10 +22,12 @@
       <span id="base-url" class="muted"></span>
       <span class="spacer"></span>
       <span id="rtt" class="muted">— ms</span>
-      <span id="uptime" class="muted">—</span>
+      <span id="server-uptime" class="muted">up —</span>
+      <span id="uptime" class="muted" title="Time since this monitor first reached the server">watching —</span>
       <span id="version" class="muted">—</span>
       <button id="open-graph" class="header-btn" title="Open the knowledge-graph viewer">🧠 Graph</button>
       <button id="open-security" class="header-btn" title="Keys, recovery and logins">🔐 Security</button>
+      <button id="open-data" class="header-btn" title="Backups, export / import and the storage backend">💾 Data</button>
     </header>
     <nav id="tabs" class="tabs hidden"></nav>
     <main>
@@ -80,6 +82,16 @@
       <p id="sec-flash" class="sec-flash hidden" role="status"></p>
       <div id="sec-body"></div>
       <div id="sec-modal" class="hidden"></div>
+    </div>
+    <div id="data-overlay" class="hidden">
+      <div id="data-bar">
+        <span>💾 Data <span id="data-where" class="muted"></span></span>
+        <nav id="data-nav"></nav>
+        <button id="data-close" type="button" title="Back to monitor">✕ Close</button>
+      </div>
+      <p id="data-flash" class="sec-flash hidden" role="status"></p>
+      <div id="data-body"></div>
+      <div id="data-modal" class="hidden"></div>
     </div>
     <div id="first-run" class="hidden">
       <div id="first-run-card">

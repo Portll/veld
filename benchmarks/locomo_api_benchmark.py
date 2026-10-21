@@ -12,6 +12,8 @@ then runs 20 retrieval queries across 4 categories:
 Reports per-category MRR, R@5, R@10, and overall MRR.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -22,8 +24,8 @@ from datetime import datetime, timedelta, timezone
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BASE_URL = "http://127.0.0.1:3030"
-API_KEY = "dev-key-local"
+BASE_URL = os.environ.get("VELD_BASE_URL", "http://127.0.0.1:3030")
+API_KEY = os.environ.get("VELD_API_KEY", "dev-key-local")
 USER_ID = f"locomo_bench_{int(time.time())}"
 HEADERS = {"Content-Type": "application/json", "X-API-Key": API_KEY}
 
@@ -75,7 +77,7 @@ MEMORIES = [
         "id_tag": "M04",
         "content": "Personal preference: I strongly prefer dark mode in all development tools. My IDE theme is Dracula, terminal is Catppuccin Mocha, and I use the Fira Code font with ligatures enabled at 14pt.",
         "tags": ["preference", "tooling", "IDE", "theme"],
-        "memory_type": "Preference",
+        "memory_type": "Observation",
         "created_at": ts(3),
         "source_type": "user",
         "emotional_valence": 0.6,

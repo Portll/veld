@@ -236,6 +236,21 @@ async fn auth_graph_data_requires_key() {
     );
 }
 
+#[tokio::test]
+async fn auth_context_status_reads_require_key() {
+    // Regression: GET /api/context/status listed every session's id, model, token
+    // counts and working directory to any caller, cross-origin included.
+    let h = Harness::new();
+    for path in ["/api/context/status", "/api/context_status"] {
+        let status = status_of(h.app(), noauth_get(path)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} must be behind auth"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // health.rs
 // ═══════════════════════════════════════════════════════════════════════
@@ -335,7 +350,6 @@ async fn metrics_endpoint() {
 #[tokio::test]
 async fn context_status_roundtrip() {
     let h = Harness::new();
-    // POST a context status update (public route)
     let (status, _) = json_of(
         h.app(),
         authed_post(
@@ -448,6 +462,113 @@ async fn remember_with_tags_and_type() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn recall_by_tags_returns_the_newest_matches_without_embeddings() {
+    let h = Harness::new();
+    for (content, created_at) in [
+        ("January note on the shared tag.", "2026-01-01T00:00:00Z"),
+        ("March note on the shared tag.", "2026-03-01T00:00:00Z"),
+        ("February note on the shared tag.", "2026-02-01T00:00:00Z"),
+    ] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember",
+                json!({
+                    "user_id": "tag-order-user",
+                    "content": content,
+                    "tags": ["shared-tag"],
+                    "created_at": created_at
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "remember failed: {body}");
+    }
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/recall/tags",
+            json!({"user_id": "tag-order-user", "tags": ["shared-tag"], "limit": 2}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "recall by tags failed: {body}");
+    let memories = body["memories"].as_array().expect("memories array");
+    let contents: Vec<&str> = memories
+        .iter()
+        .map(|m| m["experience"]["content"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        contents,
+        [
+            "March note on the shared tag.",
+            "February note on the shared tag."
+        ]
+    );
+    for memory in memories {
+        assert!(memory["experience"]["embeddings"].is_null(), "{memory}");
+        assert!(
+            memory["experience"]["embeddings_secondary"].is_null(),
+            "{memory}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recall_by_tags_matches_derived_tags_only_when_asked() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({
+                "user_id": "derived-tag-user",
+                "content": "The quokka migration moved the quokka ledger onto the quokka cluster in Wellington.",
+                "tags": ["caller-chosen"]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remember failed: {body}");
+
+    let recall = |tags: Vec<&str>, include_derived: bool| {
+        authed_post(
+            "/api/recall/tags",
+            json!({
+                "user_id": "derived-tag-user",
+                "tags": tags,
+                "include_derived": include_derived
+            }),
+        )
+    };
+    let (_, by_caller_tag) = json_of(h.app(), recall(vec!["caller-chosen"], false)).await;
+    assert_eq!(by_caller_tag["count"], 1, "{by_caller_tag}");
+    let stored_tags: Vec<String> = by_caller_tag["memories"][0]["experience"]["tags"]
+        .as_array()
+        .expect("stored tags")
+        .iter()
+        .filter_map(|t| t.as_str().map(str::to_string))
+        .collect();
+    let derived = stored_tags
+        .iter()
+        .find(|t| !t.eq_ignore_ascii_case("caller-chosen"))
+        .unwrap_or_else(|| panic!("no derived tag was stored: {stored_tags:?}"))
+        .clone();
+
+    let (_, default_match) = json_of(h.app(), recall(vec![derived.as_str()], false)).await;
+    assert_eq!(
+        default_match["count"], 0,
+        "derived `{derived}`: {default_match}"
+    );
+    let (_, derived_match) = json_of(h.app(), recall(vec![derived.as_str()], true)).await;
+    assert_eq!(
+        derived_match["count"], 1,
+        "derived `{derived}`: {derived_match}"
+    );
 }
 
 #[tokio::test]
@@ -921,7 +1042,7 @@ async fn context_summary_empty() {
 #[tokio::test]
 async fn proactive_context() {
     let h = Harness::new();
-    let (status, _) = json_of(
+    let (status, body) = json_of(
         h.app(),
         authed_post(
             "/api/proactive_context",
@@ -933,6 +1054,10 @@ async fn proactive_context() {
     )
     .await;
     assert!(status.is_success());
+    assert!(
+        body.get("ingested_memory_id").is_none(),
+        "a surfacing call stores nothing unless auto_ingest is set: {body}"
+    );
 }
 
 #[tokio::test]
@@ -2997,7 +3122,7 @@ async fn a_write_without_entities_behaves_as_before() {
 
 #[tokio::test]
 async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
-    use veld::constants::MAX_ENTITY_DEGREE;
+    use veld::constants::{ENTITY_DEGREE_PRUNE_TARGET, MAX_ENTITY_DEGREE};
     use veld::graph_memory::{EntityLabel, EntityNode, RelationType, RelationshipEdge};
 
     let h = Harness::new();
@@ -3120,10 +3245,11 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
         "a derived hub gained or lost an edge"
     );
     let bash_edges = edges_of(&h, user, &bash);
-    assert_eq!(
-        bash_edges.len(),
-        MAX_ENTITY_DEGREE,
-        "the declared hub stays at the cap"
+    // Its first new edge cut it back to the target; the memory's later ones stayed.
+    assert!(
+        (ENTITY_DEGREE_PRUNE_TARGET..MAX_ENTITY_DEGREE).contains(&bash_edges.len()),
+        "the declared hub holds {} edges, outside the prune window",
+        bash_edges.len()
     );
     assert!(
         bash_edges
@@ -3195,6 +3321,8 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
     let target = body["id"].as_str().unwrap().to_string();
     let target_uuid = veld::uuid::Uuid::parse_str(&target).unwrap();
     wait_for_episode_entity(&h, user, target_uuid, &SERVE.to_lowercase()).await;
+    // The embedding is deferred too; ranked before it lands, the target has no vector.
+    wait_for_background_work(&h).await;
 
     for query in [
         "what changed in serve.mjs",

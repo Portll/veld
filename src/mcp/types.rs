@@ -34,7 +34,7 @@ pub(crate) struct ProactiveContextParams {
     pub context: String,
     /// Maximum memories to surface (default: 5)
     pub max_results: Option<u32>,
-    /// Auto-store context for feedback (default: true)
+    /// Also store the context as a Conversation memory (default: false)
     pub auto_ingest: Option<bool>,
 }
 

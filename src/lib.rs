@@ -54,6 +54,7 @@ pub mod rate_limit_governance;
 pub mod recall_harness;
 pub mod redaction;
 pub mod relevance;
+pub mod replication;
 pub mod server;
 pub mod server_runtime;
 pub mod similarity;

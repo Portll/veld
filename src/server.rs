@@ -31,6 +31,14 @@ use crate::constants::{
 // Timeout for draining in-flight requests (server-specific, not in constants.rs)
 const SERVER_DRAIN_TIMEOUT_SECS: u64 = 5;
 
+/// How long closing the tenants' write gates may take: one write per tenant, the one
+/// in progress when the gate closes.
+const WRITE_CLOSE_TIMEOUT_SECS: u64 = 10;
+
+/// After the gates close, how long requests that were queued behind them get to send
+/// their 503s before the server task is aborted.
+const CLOSED_WRITES_DRAIN_TIMEOUT_SECS: u64 = 2;
+
 // =============================================================================
 // PUBLIC API
 // =============================================================================
@@ -56,6 +64,7 @@ pub struct ServerRunConfig {
 /// Environment variables are set **before** the tokio runtime is created, so no
 /// threads exist yet. This avoids the `set_var` unsoundness on multi-threaded runtimes.
 pub fn run(config: ServerRunConfig) -> Result<()> {
+    let file_limit = raise_open_file_limit();
     let local_dev_rate_limit_default = !config.production
         && crate::config::is_local_bind_host(&config.host)
         && std::env::var("VELD_RATE_LIMIT").is_err()
@@ -100,11 +109,30 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
     let _ = dotenvy::dotenv();
 
     // Build and enter the tokio runtime
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("Failed to build tokio runtime")
-        .block_on(async_main())
+        .expect("Failed to build tokio runtime");
+    let result = runtime.block_on(async_main(file_limit));
+    // Dropping a runtime waits without limit for blocking work still running. On
+    // 2026-10-18 a SlowStore sync and a gap detection kept the process alive 3 min 23 s
+    // after "Server shutdown complete". Stores are flushed by now; give stragglers a
+    // bounded moment, then exit. RocksDB's WAL and SQLite's journal keep an
+    // interrupted write atomic.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(
+        RUNTIME_SHUTDOWN_TIMEOUT_SECS,
+    ));
+    result
+}
+
+/// How long the runtime waits for blocking work after the shutdown sequence ends.
+const RUNTIME_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+
+/// Set once the shutdown signal arrives; background schedulers start nothing new.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Build the optional relational backend selected by
@@ -186,7 +214,7 @@ async fn build_relational_backend() -> Result<
 // ASYNC MAIN
 // =============================================================================
 
-async fn async_main() -> Result<()> {
+async fn async_main(file_limit: FileLimit) -> Result<()> {
     // Initialize tracing
     #[cfg(feature = "telemetry")]
     {
@@ -196,6 +224,7 @@ async fn async_main() -> Result<()> {
     {
         tracing_subscriber::fmt::init();
     }
+    file_limit.log();
 
     // Print startup banner
     print_banner();
@@ -274,6 +303,23 @@ async fn async_main() -> Result<()> {
 
     // Start active reminder scheduler (checks every 60s for due reminders)
     start_reminder_scheduler(Arc::clone(&manager));
+
+    // Live replication: idle until this instance follows a leader, by
+    // VELD_REPLICATE_FROM at boot or POST /api/admin/replication/follow later.
+    match crate::replication::follow_from_env(&manager.base_path) {
+        Ok(Some(status)) => {
+            if let Some(t) = &status.target {
+                info!("Replication: following {}", t.source);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => error!("Replication: not following at boot: {e:#}"),
+    }
+    let replication_shutdown = tokio_util::sync::CancellationToken::new();
+    manager.task_tracker.spawn(crate::replication::run_follower(
+        Arc::clone(&manager),
+        replication_shutdown.clone(),
+    ));
     start_embedding_backlog_drainer(Arc::clone(&manager));
 
     // Start backup scheduler if enabled
@@ -505,6 +551,8 @@ async fn async_main() -> Result<()> {
 
     // Wait for shutdown signal (Ctrl+C / SIGTERM)
     shutdown_signal_with_drain().await;
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
+    replication_shutdown.cancel();
 
     // Tell the server to stop accepting new connections
     shutdown_notify.notify_one();
@@ -514,20 +562,20 @@ async fn async_main() -> Result<()> {
         "Waiting up to {}s for in-flight requests...",
         SERVER_DRAIN_TIMEOUT_SECS
     );
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(SERVER_DRAIN_TIMEOUT_SECS),
-        &mut server_handle,
-    )
-    .await
-    {
-        Ok(Ok(Ok(()))) => info!("Server stopped gracefully"),
-        Ok(Ok(Err(e))) => error!("Server error: {}", e),
-        Ok(Err(e)) => error!("Server task panicked: {}", e),
-        Err(_) => {
-            info!(
-                "Server drain timed out after {}s, aborting server task",
-                SERVER_DRAIN_TIMEOUT_SECS
-            );
+    let drained = await_server_stop(&mut server_handle, SERVER_DRAIN_TIMEOUT_SECS).await;
+
+    // Requests accepted before the signal can still be queued on a tenant's write gate,
+    // each served in turn. Aborting the server task does not stop them (each connection
+    // is its own task), so on 2026-10-20 they kept writing for ten seconds after the
+    // flush. Closing the gates before the flush makes the flush the last write either way.
+    close_tenant_writes(&manager_for_shutdown).await;
+    if !drained {
+        info!(
+            "Server drain timed out after {}s; writes are closed, waiting up to {}s for the queued requests' 503s",
+            SERVER_DRAIN_TIMEOUT_SECS, CLOSED_WRITES_DRAIN_TIMEOUT_SECS
+        );
+        if !await_server_stop(&mut server_handle, CLOSED_WRITES_DRAIN_TIMEOUT_SECS).await {
+            info!("Connections still open (event streams, websockets); aborting server task");
             server_handle.abort();
         }
     }
@@ -548,6 +596,120 @@ async fn async_main() -> Result<()> {
     run_shutdown_cleanup(manager_for_shutdown).await;
 
     Ok(())
+}
+
+/// Wait up to `secs` for the server task to finish. False when it is still running.
+async fn await_server_stop(
+    server_handle: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    secs: u64,
+) -> bool {
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), server_handle).await {
+        Ok(Ok(Ok(()))) => {
+            info!("Server stopped gracefully");
+            true
+        }
+        Ok(Ok(Err(e))) => {
+            error!("Server error: {}", e);
+            true
+        }
+        Ok(Err(e)) => {
+            error!("Server task panicked: {}", e);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Close every tenant's write gate on the blocking pool; the wait is for the write in
+/// progress in each.
+async fn close_tenant_writes(manager: &AppState) {
+    let manager = Arc::clone(manager);
+    let closing = tokio::task::spawn_blocking(move || manager.close_all_writes());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(WRITE_CLOSE_TIMEOUT_SECS),
+        closing,
+    )
+    .await
+    {
+        Ok(Ok(tenants)) => info!(tenants, "Tenant writes closed"),
+        Ok(Err(e)) => error!("Closing tenant writes panicked: {}", e),
+        Err(_) => error!(
+            "Closing tenant writes timed out after {}s; a write is still running",
+            WRITE_CLOSE_TIMEOUT_SECS
+        ),
+    }
+}
+
+/// Raise the soft open-file limit to the hard limit. Every tenant holds a redb or
+/// RocksDB store, a SQLite projection and two Tantivy indexes (20 to 30 files
+/// each), so sixty tenants need thousands of descriptors. A launchd agent starts
+/// with a soft limit of 256; the redb replica hung on EMFILE under it on
+/// 2026-10-19. Logged, never fatal: a server that cannot raise it still serves
+/// what the limit allows.
+#[cfg(unix)]
+// rlim_t is u64 on macOS and 64-bit Linux but narrower on some targets, so the
+// casts stay.
+#[allow(clippy::unnecessary_cast)]
+fn raise_open_file_limit() -> FileLimit {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit only read and write the struct passed to them.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return FileLimit::Unknown;
+        }
+        let want = if limit.rlim_max == libc::RLIM_INFINITY {
+            65_536
+        } else {
+            limit.rlim_max
+        };
+        if limit.rlim_cur >= want {
+            return FileLimit::Unchanged(limit.rlim_cur as u64);
+        }
+        let before = limit.rlim_cur as u64;
+        limit.rlim_cur = want;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+            FileLimit::Raised {
+                from: before,
+                to: want as u64,
+            }
+        } else {
+            FileLimit::Refused {
+                at: before,
+                wanted: want as u64,
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() -> FileLimit {
+    FileLimit::Unknown
+}
+
+/// The outcome of [`raise_open_file_limit`], which runs before logging starts and
+/// is reported once it has.
+enum FileLimit {
+    Unknown,
+    Unchanged(u64),
+    Raised { from: u64, to: u64 },
+    Refused { at: u64, wanted: u64 },
+}
+
+impl FileLimit {
+    fn log(&self) {
+        match self {
+            FileLimit::Unknown => {}
+            FileLimit::Unchanged(n) => info!("Open-file limit: {n}"),
+            FileLimit::Raised { from, to } => info!("Open-file limit raised from {from} to {to}"),
+            FileLimit::Refused { at, wanted } => warn!(
+                "Open-file limit stays at {at} (could not raise to {wanted}); \
+                 many tenants will exhaust it"
+            ),
+        }
+    }
 }
 
 // =============================================================================
@@ -577,9 +739,13 @@ fn start_maintenance_scheduler(manager: AppState, interval_secs: u64) {
                 tracing::debug!("Ended {} stale user sessions", session_cleaned);
             }
 
-            // Run maintenance in blocking thread pool
+            if shutting_down() {
+                break;
+            }
+            // Tracked, so the shutdown drain waits for a pass in progress instead of
+            // leaving it to hold the process open after the stores are flushed.
             let manager_clone = Arc::clone(&manager);
-            tokio::task::spawn_blocking(move || {
+            manager.task_tracker.spawn_blocking(move || {
                 manager_clone.run_maintenance_all_users();
             });
         }
@@ -821,23 +987,42 @@ async fn run_shutdown_cleanup(manager: AppState) {
         let flush_handle =
             tokio::task::spawn_blocking(move || manager_for_flush.flush_all_databases());
 
-        match tokio::time::timeout(
+        let flushed = match tokio::time::timeout(
             std::time::Duration::from_secs(DATABASE_FLUSH_TIMEOUT_SECS),
             flush_handle,
         )
         .await
         {
-            Ok(Ok(Ok(()))) => info!("Databases flushed successfully"),
-            Ok(Ok(Err(e))) => error!("Failed to flush databases: {}", e),
-            Ok(Err(e)) => error!("Flush task panicked: {}", e),
-            Err(_) => error!(
-                "Database flush timed out after {}s",
-                DATABASE_FLUSH_TIMEOUT_SECS
-            ),
-        }
+            Ok(Ok(Ok(()))) => {
+                info!("Databases flushed successfully");
+                true
+            }
+            Ok(Ok(Err(e))) => {
+                error!("Failed to flush databases: {}", e);
+                false
+            }
+            Ok(Err(e)) => {
+                error!("Flush task panicked: {}", e);
+                false
+            }
+            Err(_) => {
+                error!(
+                    "Database flush timed out after {}s",
+                    DATABASE_FLUSH_TIMEOUT_SECS
+                );
+                false
+            }
+        };
 
-        // Save vector indices (blocking operation, must use spawn_blocking)
-        info!("Persisting vector indices...");
+        // A successful flush already saved every vector index (flush_storage saves the
+        // retriever). Saving again wrote the same 413 MB file a second time on every
+        // stop; it is now only the fallback when the flush did not finish.
+        if flushed {
+            #[cfg(feature = "telemetry")]
+            tracing_setup::shutdown_tracing();
+            return;
+        }
+        info!("Persisting vector indices (the flush did not complete)...");
         let manager_for_save = Arc::clone(&manager);
         let save_handle =
             tokio::task::spawn_blocking(move || manager_for_save.save_all_vector_indices());

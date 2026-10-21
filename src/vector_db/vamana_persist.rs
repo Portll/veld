@@ -163,6 +163,29 @@ fn compute_checksum(data: &[u8]) -> u64 {
     hash
 }
 
+/// Sibling temp file a save writes before renaming it over `path`.
+fn saving_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".saving");
+    std::path::PathBuf::from(name)
+}
+
+/// Make a rename in `path`'s directory durable. Directories cannot be opened as files
+/// on Windows, where the rename is durable on return.
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Align offset to boundary
 fn align_to(offset: usize, alignment: usize) -> usize {
     (offset + alignment - 1) & !(alignment - 1)
@@ -267,106 +290,119 @@ impl VamanaIndex {
     ///
     /// Serializes the entire index (graph + vectors) to a binary file.
     /// Can be loaded back with `load_from_file()`.
+    ///
+    /// The index is copied out under its locks and written without them: writing a
+    /// large index takes tens of seconds (77.7 s measured), and every insert waits on
+    /// these locks. The bytes go to a sibling temp file that is synced, then renamed
+    /// over `path` and the directory synced, so a crash or SIGKILL mid-save leaves the
+    /// previous file whole instead of a truncated one that forces a rebuild on open.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         let start = std::time::Instant::now();
 
-        let graph = self.graph.read();
-        let vectors = self.vectors.read();
-        let deleted_ids = self.deleted_ids.read();
-        let medoid = *self.medoid.read();
-        let num_vectors = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
-        let incremental_inserts = self
-            .incremental_inserts
-            .load(std::sync::atomic::Ordering::Acquire);
-
-        // Extract vectors based on storage type
-        let vector_data: Vec<f32> = match &*vectors {
-            VectorStorage::Memory(vecs) => vecs.iter().flatten().copied().collect(),
-            VectorStorage::Mmap {
-                mmap,
-                dimension,
-                num_vectors,
-            } => {
-                let total_floats = dimension * num_vectors;
-                let bytes = &mmap[..total_floats * 4];
-                bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                    .collect()
-            }
+        let (vector_data, neighbor_counts, neighbors, deleted, medoid, num_vectors, inserts) = {
+            let graph = self.graph.read();
+            let vectors = self.vectors.read();
+            let deleted_ids = self.deleted_ids.read();
+            let vector_data: Vec<f32> = match &*vectors {
+                VectorStorage::Memory(vecs) => vecs.iter().flatten().copied().collect(),
+                VectorStorage::Mmap {
+                    mmap,
+                    dimension,
+                    num_vectors,
+                } => {
+                    let total_floats = dimension * num_vectors;
+                    mmap[..total_floats * 4]
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                        .collect()
+                }
+            };
+            let neighbor_counts: Vec<u16> = graph
+                .iter()
+                .map(|node| node.neighbors.len() as u16)
+                .collect();
+            let neighbors: Vec<u32> = graph
+                .iter()
+                .flat_map(|node| node.neighbors.iter().copied())
+                .collect();
+            let deleted: Vec<u32> = deleted_ids.iter().copied().collect();
+            (
+                vector_data,
+                neighbor_counts,
+                neighbors,
+                deleted,
+                *self.medoid.read(),
+                self.num_vectors.load(std::sync::atomic::Ordering::Acquire),
+                self.incremental_inserts
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
         };
 
-        // Create header
         let mut header = VamanaHeader::new(
             num_vectors,
             self.config.dimension,
             self.config.max_degree,
             medoid,
             self.config.distance_metric,
-            deleted_ids.len(),
-            incremental_inserts,
+            deleted.len(),
+            inserts,
         );
 
-        // Calculate sizes
-        let deleted_section_size = deleted_ids.len() * 4;
-        let mut graph_section_size = 0;
-        for node in graph.iter() {
-            graph_section_size += 2 + node.neighbors.len() * 4; // u16 count + u32 per neighbor
-        }
+        let deleted_section_size = deleted.len() * 4;
+        let graph_section_size = neighbor_counts.len() * 2 + neighbors.len() * 4;
         let vectors_offset = align_to(
             HEADER_SIZE + deleted_section_size + graph_section_size,
             ALIGNMENT,
         );
-        let vectors_section_size = vector_data.len() * 4;
-        let total_size = vectors_offset + vectors_section_size;
+        let total_size = vectors_offset + vector_data.len() * 4;
 
-        // Create file and write
+        let tmp_path = saving_path(path);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)?;
-        file.set_len(total_size as u64)?;
+            .open(&tmp_path)?;
+        let written = (|| -> Result<()> {
+            file.set_len(total_size as u64)?;
+            let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-
-        // Write header (without checksum first)
-        let header_bytes = header.to_bytes();
-        mmap[..HEADER_SIZE].copy_from_slice(&header_bytes);
-
-        // Write deleted IDs
-        let mut offset = HEADER_SIZE;
-        for &id in deleted_ids.iter() {
-            mmap[offset..offset + 4].copy_from_slice(&id.to_le_bytes());
-            offset += 4;
-        }
-
-        // Write graph
-        for node in graph.iter() {
-            let count = node.neighbors.len() as u16;
-            mmap[offset..offset + 2].copy_from_slice(&count.to_le_bytes());
-            offset += 2;
-            for &neighbor in &node.neighbors {
-                mmap[offset..offset + 4].copy_from_slice(&neighbor.to_le_bytes());
+            let mut offset = HEADER_SIZE;
+            for &id in &deleted {
+                mmap[offset..offset + 4].copy_from_slice(&id.to_le_bytes());
                 offset += 4;
             }
+            let mut next = 0usize;
+            for &count in &neighbor_counts {
+                mmap[offset..offset + 2].copy_from_slice(&count.to_le_bytes());
+                offset += 2;
+                for &neighbor in &neighbors[next..next + count as usize] {
+                    mmap[offset..offset + 4].copy_from_slice(&neighbor.to_le_bytes());
+                    offset += 4;
+                }
+                next += count as usize;
+            }
+            offset = vectors_offset;
+            for val in &vector_data {
+                mmap[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+                offset += 4;
+            }
+
+            header.checksum = compute_checksum(&mmap[HEADER_SIZE..]);
+            mmap[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
+            mmap.flush()?;
+            drop(mmap);
+            file.sync_all()?;
+            Ok(())
+        })();
+        drop(file);
+        if let Err(e) = written.and_then(|()| {
+            std::fs::rename(&tmp_path, path)?;
+            sync_parent_dir(path)
+        }) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
         }
-
-        // Write vectors (aligned)
-        offset = vectors_offset;
-        for val in &vector_data {
-            mmap[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
-            offset += 4;
-        }
-
-        // Compute and write checksum
-        let checksum = compute_checksum(&mmap[HEADER_SIZE..]);
-        header.checksum = checksum;
-        let header_bytes = header.to_bytes();
-        mmap[..HEADER_SIZE].copy_from_slice(&header_bytes);
-
-        mmap.flush()?;
 
         info!(
             "Saved Vamana index: {} vectors, {} bytes in {:?}",
@@ -682,5 +718,38 @@ mod tests {
 
         assert!(!VamanaIndex::verify_index_file(&index_path).unwrap());
         assert!(VamanaIndex::load_from_file(&index_path).is_err());
+    }
+    #[test]
+    fn a_save_replaces_the_previous_file_whole_and_leaves_no_temp() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("index.vamana");
+        let config = VamanaConfig {
+            dimension: 4,
+            max_degree: 8,
+            use_mmap: false,
+            ..Default::default()
+        };
+        let axes = |n: usize| -> Vec<Vec<f32>> {
+            (0..n)
+                .map(|i| {
+                    let mut v = vec![0.1; 4];
+                    v[i % 4] = 1.0 + i as f32;
+                    v
+                })
+                .collect()
+        };
+        let mut first = VamanaIndex::new(config.clone()).unwrap();
+        first.build(axes(3)).unwrap();
+        first.save_to_file(&path).unwrap();
+
+        // What a save killed before its rename leaves beside the live file.
+        std::fs::write(saving_path(&path), b"half-written").unwrap();
+        assert_eq!(VamanaIndex::load_from_file(&path).unwrap().len(), 3);
+
+        let mut second = VamanaIndex::new(config).unwrap();
+        second.build(axes(5)).unwrap();
+        second.save_to_file(&path).unwrap();
+        assert_eq!(VamanaIndex::load_from_file(&path).unwrap().len(), 5);
+        assert!(!saving_path(&path).exists());
     }
 }

@@ -54,21 +54,33 @@
 //! a shared [`CheckpointStore`] file. The static `Projection` arm
 //! flushes the checkpoint via `persist_checkpoint`. The dyn
 //! `TypedProjection` arm — used by the journaled writer at live-write
-//! time — also persists after each apply so a crash between live writes
-//! resumes from the most recent durable position, not from the start of
-//! the log.
+//! time — persists on a cadence (see below), so a crash between live
+//! writes resumes at most [`ID_MAP_PERSIST_EVERY`] records behind the
+//! head, never from the start of the log; replay re-applies that tail
+//! idempotently.
 //!
 //! ## `memory_id → vector_id` persistence
 //!
-//! The in-memory map of memory_id → vector_id is also persisted to the
-//! checkpoint store as side data after each apply. On open, the
-//! projection loads its side data and uses it instead of rebuilding from
-//! the log — but only if the side-data's stamped LSN matches the
-//! projection's checkpoint LSN exactly. Any mismatch (corrupt side data,
-//! stale snapshot, replayed log under it) discards the side data and
-//! falls back to a fresh replay. This is defence in depth: the log is
-//! the canonical source of truth; side data is just opportunistic
-//! acceleration that we never let outvote the log.
+//! The in-memory map of memory_id → vector_id is persisted to the
+//! checkpoint store as side data. On open, the projection loads its side
+//! data and uses it instead of rebuilding from the log — but only if the
+//! checkpoint provably describes that snapshot: either the snapshot's
+//! stamped LSN equals the checkpoint, or the snapshot is the one this
+//! projection last vouched for (`{name}#id-map-stamp`) and the checkpoint
+//! is at or past it. Any other combination (corrupt side data, stale
+//! snapshot, a checkpoint that ran ahead of its snapshot) discards the
+//! side data and falls back to replay. The log is the canonical source of
+//! truth; side data is opportunistic acceleration that never outvotes it.
+//!
+//! A snapshot bincodes the WHOLE map, so it is written only when the map
+//! changed: every [`ID_MAP_PERSIST_EVERY`] live applies while it is dirty,
+//! whenever the checkpoint is persisted, and on drop. The snapshot is made
+//! durable BEFORE the checkpoint record that refers to it, so the
+//! checkpoint never names a map that is not on disk. While the map is
+//! clean (no embedding for this kind, an anchor, a stale replay, a forget
+//! of an unknown id) a live apply advances the checkpoint with one small
+//! buffered record and no side-data write or fsync; the vouch record is
+//! what lets the load check accept a snapshot older than that checkpoint.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -189,6 +201,20 @@ impl VamanaEmbeddingKind {
         }
     }
 
+    /// Checkpoint-store name under which this kind records the stamp of the
+    /// id-map snapshot it vouches for: the map has not changed since that
+    /// snapshot up to the projection's persisted checkpoint. Stable on disk,
+    /// like [`projection_name`](Self::projection_name).
+    fn id_map_vouch_name(self) -> &'static str {
+        match self {
+            VamanaEmbeddingKind::TextPrimary => "vamana-text-primary#id-map-stamp",
+            VamanaEmbeddingKind::TextSecondary => "vamana-text-secondary#id-map-stamp",
+            VamanaEmbeddingKind::Image => "vamana-image#id-map-stamp",
+            VamanaEmbeddingKind::Audio => "vamana-audio#id-map-stamp",
+            VamanaEmbeddingKind::Video => "vamana-video#id-map-stamp",
+        }
+    }
+
     /// Enumerate every supported kind in stable order. Used by the
     /// projection registrar to construct one projection per kind per
     /// tenant without hand-listing variants.
@@ -208,6 +234,11 @@ impl VamanaEmbeddingKind {
 /// projection — different kinds use different projection names so
 /// there's no collision.
 const SIDE_DATA_KEY_ID_MAP: &str = "id_map";
+
+/// Live applies between id-map snapshots while the map is dirty: each
+/// snapshot is O(map) bytes plus two fsyncs, and 64 bounds the replay tail
+/// after a crash to 64 idempotent records.
+pub const ID_MAP_PERSIST_EVERY: u32 = 64;
 
 /// Per-`memory_id` bookkeeping kept inside the projection. We need the
 /// `u32` vector-id assigned by Vamana so a later `Forget`/`Update` can
@@ -275,6 +306,25 @@ pub struct VamanaProjection {
     /// LSN of the last record this projection successfully applied. Lives
     /// in memory; `persist_checkpoint` synchronises it to disk.
     checkpoint: Option<Lsn>,
+    /// `memories` differs from the latest durable side-data snapshot, so the
+    /// checkpoint cannot advance on disk until a new snapshot is written.
+    map_dirty: bool,
+    /// Live applies since the map became dirty without a snapshot.
+    dirty_applies: u32,
+    /// Checkpoint last written to the store, so a persist with nothing new
+    /// writes nothing.
+    persisted_checkpoint: Option<Lsn>,
+}
+
+/// What [`load_checkpoint_and_map`] did with the persisted id map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapLoad {
+    /// The snapshot was accepted: the in-memory map equals it.
+    Restored,
+    /// No snapshot exists: the empty map is exactly what a reload yields.
+    Absent,
+    /// A snapshot exists but was refused: the in-memory map differs from it.
+    Discarded,
 }
 
 /// Either an already-open Vamana index or a template waiting to learn
@@ -310,14 +360,19 @@ impl VamanaProjection {
         index: Arc<RwLock<VamanaIndex>>,
         checkpoint_store: Arc<Mutex<CheckpointStore>>,
     ) -> Self {
-        let (checkpoint, memories) = load_checkpoint_and_map(kind, &checkpoint_store);
+        let (checkpoint, memories, load) = load_checkpoint_and_map(kind, &checkpoint_store);
+        let restored = memories.len();
         let memories = reconcile_map_with_index(kind, memories, &index);
+        let map_dirty = load == MapLoad::Discarded || memories.len() != restored;
         Self {
             kind,
             state: IndexState::Ready(index),
             checkpoint_store,
             memories,
             checkpoint,
+            map_dirty,
+            dirty_applies: 0,
+            persisted_checkpoint: checkpoint,
         }
     }
 
@@ -331,13 +386,16 @@ impl VamanaProjection {
         bootstrap: VamanaProjectionBootstrap,
         checkpoint_store: Arc<Mutex<CheckpointStore>>,
     ) -> Self {
-        let (checkpoint, memories) = load_checkpoint_and_map(kind, &checkpoint_store);
+        let (checkpoint, memories, load) = load_checkpoint_and_map(kind, &checkpoint_store);
         Self {
             kind,
             state: IndexState::Pending(bootstrap),
             checkpoint_store,
             memories,
             checkpoint,
+            map_dirty: load == MapLoad::Discarded,
+            dirty_applies: 0,
+            persisted_checkpoint: checkpoint,
         }
     }
 
@@ -517,12 +575,14 @@ impl VamanaProjection {
                         last_applied_lsn: lsn,
                     },
                 );
+                self.map_dirty = true;
             }
             IntentPayload::Forget { memory_id, .. } => {
                 // Already-forgotten memories are a no-op (idempotent).
                 // We still advance the checkpoint so the driver
                 // progresses past this frame.
                 if let Some(existing) = self.memories.remove(memory_id) {
+                    self.map_dirty = true;
                     // Only touch the index if it's been materialised —
                     // a `Forget` on a pending lazy projection means we
                     // saw the create-then-forget pair without ever
@@ -536,7 +596,7 @@ impl VamanaProjection {
                 }
                 // Else: nothing to delete — checkpoint advance below.
             }
-            IntentPayload::Anchor { .. } => {
+            IntentPayload::Anchor { .. } | IntentPayload::SetAnchored { .. } => {
                 // Anchors are an importance bump on the memory, not a
                 // vector-state change. Vamana doesn't care.
             }
@@ -556,21 +616,89 @@ impl VamanaProjection {
         }
     }
 
+    /// Durably persist the checkpoint, snapshotting the id map first when it
+    /// changed since the last snapshot.
     fn persist(&mut self) -> Result<(), VamanaProjectionError> {
-        if let Some(lsn) = self.checkpoint {
-            let mut store = self.checkpoint_store.lock();
-            store.set(self.kind.projection_name(), lsn)?;
-            // Snapshot the id map under the same projection name so a
-            // later open can restore it without replaying the log.
+        let Some(lsn) = self.checkpoint else {
+            return Ok(());
+        };
+        let name = self.kind.projection_name();
+        if self.map_dirty {
             // Encoded with `bincode::config::standard()` to match every
             // other on-disk encoding in this codebase.
             let encoded =
                 bincode::serde::encode_to_vec(&self.memories, bincode::config::standard())
                     .map_err(|e| VamanaProjectionError::Vamana(format!("encode id_map: {e}")))?;
-            store.set_side_data(self.kind.projection_name(), SIDE_DATA_KEY_ID_MAP, &encoded)?;
-            store.sync()?;
+            let mut store = self.checkpoint_store.lock();
+            store.set_side_data_at(name, SIDE_DATA_KEY_ID_MAP, lsn, &encoded)?;
+            store.sync_side_data()?;
+            store.set(name, lsn)?;
+            store.sync_checkpoints()?;
+            self.map_dirty = false;
+        } else if self.persisted_checkpoint != Some(lsn) {
+            let mut store = self.checkpoint_store.lock();
+            advance_clean_checkpoint(&mut store, self.kind, lsn)?;
+            store.sync_checkpoints()?;
+        }
+        self.persisted_checkpoint = Some(lsn);
+        self.dirty_applies = 0;
+        Ok(())
+    }
+
+    /// Live-write persistence. A dirty map is snapshotted every
+    /// [`ID_MAP_PERSIST_EVERY`] applies and the checkpoint waits for it; a
+    /// clean map advances the checkpoint with one buffered record and no
+    /// fsync, since replay recovers an unsynced tail idempotently.
+    fn persist_live(&mut self) -> Result<(), VamanaProjectionError> {
+        let Some(lsn) = self.checkpoint else {
+            return Ok(());
+        };
+        if self.map_dirty {
+            self.dirty_applies += 1;
+            if self.dirty_applies >= ID_MAP_PERSIST_EVERY {
+                self.persist()?;
+            }
+            return Ok(());
+        }
+        if self.persisted_checkpoint != Some(lsn) {
+            let mut store = self.checkpoint_store.lock();
+            advance_clean_checkpoint(&mut store, self.kind, lsn)?;
+            self.persisted_checkpoint = Some(lsn);
         }
         Ok(())
+    }
+}
+
+/// Write `lsn` as `kind`'s checkpoint while its id map equals the latest
+/// snapshot on disk. The first such advance after a snapshot records that
+/// snapshot's stamp as vouched for, which is what lets the load check accept
+/// a snapshot older than the checkpoint. The vouch record precedes the
+/// checkpoint record in the same append-only file, so a torn tail can drop
+/// the checkpoint but never keep it without its vouch.
+fn advance_clean_checkpoint(
+    store: &mut CheckpointStore,
+    kind: VamanaEmbeddingKind,
+    lsn: Lsn,
+) -> Result<(), CheckpointStoreError> {
+    if let Some(stamp) = store.side_data_checkpoint(kind.projection_name(), SIDE_DATA_KEY_ID_MAP) {
+        if store.get(kind.id_map_vouch_name()) != Some(stamp) {
+            store.set(kind.id_map_vouch_name(), stamp)?;
+        }
+    }
+    store.set(kind.projection_name(), lsn)
+}
+
+/// Flush what the cadence has not persisted yet, so a graceful drop does not
+/// leave the next boot a replay tail.
+impl Drop for VamanaProjection {
+    fn drop(&mut self) {
+        if let Err(e) = self.persist() {
+            tracing::warn!(
+                projection = self.kind.projection_name(),
+                error = %e,
+                "vamana projection: final checkpoint persist failed; replay will re-apply the tail",
+            );
+        }
     }
 }
 
@@ -583,29 +711,33 @@ impl VamanaProjection {
 fn load_checkpoint_and_map(
     kind: VamanaEmbeddingKind,
     checkpoint_store: &Arc<Mutex<CheckpointStore>>,
-) -> (Option<Lsn>, HashMap<String, MemoryEntry>) {
+) -> (Option<Lsn>, HashMap<String, MemoryEntry>, MapLoad) {
     let store = checkpoint_store.lock();
     let checkpoint = store.get(kind.projection_name());
-    let map = match (
+    let vouched = store.get(kind.id_map_vouch_name());
+    let (map, load) = match (
         checkpoint,
         store.get_side_data(kind.projection_name(), SIDE_DATA_KEY_ID_MAP),
         store.side_data_checkpoint(kind.projection_name(), SIDE_DATA_KEY_ID_MAP),
     ) {
-        // Side data present AND its stamp matches the projection's
-        // current checkpoint — trust it.
-        (Some(ckpt), Some(bytes), Some(stamp)) if stamp == ckpt => {
+        // Side data present AND the checkpoint describes it: its stamp is
+        // the checkpoint, or it is the snapshot the projection vouched for
+        // when it last advanced the checkpoint over an unchanged map.
+        (Some(ckpt), Some(bytes), Some(stamp))
+            if stamp == ckpt || (vouched == Some(stamp) && stamp <= ckpt) =>
+        {
             match bincode::serde::decode_from_slice::<HashMap<String, MemoryEntry>, _>(
                 bytes,
                 bincode::config::standard(),
             ) {
-                Ok((map, _)) => map,
+                Ok((map, _)) => (map, MapLoad::Restored),
                 Err(e) => {
                     tracing::warn!(
                         projection = kind.projection_name(),
                         error = %e,
                         "vamana projection: id_map side data failed to decode; falling back to replay-rebuild",
                     );
-                    HashMap::new()
+                    (HashMap::new(), MapLoad::Discarded)
                 }
             }
         }
@@ -619,14 +751,14 @@ fn load_checkpoint_and_map(
                 checkpoint_lsn = ckpt.map(|l| l.0 as i128).unwrap_or(-1),
                 "vamana projection: id_map side data stamp != checkpoint; discarding and replaying",
             );
-            HashMap::new()
+            (HashMap::new(), MapLoad::Discarded)
         }
         // No side data at all — first boot of this projection, or it
         // has only ever persisted checkpoints (older binary). Replay
         // will populate.
-        _ => HashMap::new(),
+        _ => (HashMap::new(), MapLoad::Absent),
     };
-    (checkpoint, map)
+    (checkpoint, map, load)
 }
 
 /// A RESTORED ID MAP IS ONLY VALID FOR THE INDEX IT WAS BUILT AGAINST.
@@ -689,9 +821,8 @@ fn decode_memory(bytes: &[u8]) -> Result<Memory, VamanaProjectionError> {
 }
 
 /// Dyn-friendly arm: the [`JournaledWriter`] hands us typed payloads at
-/// live-write time. We immediately persist the checkpoint so a crash
-/// after one successful apply doesn't silently roll back to the start of
-/// the log.
+/// live-write time and the checkpoint is persisted on the live cadence
+/// described in the module docs.
 impl TypedProjection for VamanaProjection {
     fn name(&self) -> &str {
         self.kind.projection_name()
@@ -704,10 +835,7 @@ impl TypedProjection for VamanaProjection {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.apply_typed(lsn, payload)
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-        // Live-write path persists every step. Replay batches use the
-        // static `Projection` arm below which can amortise via
-        // `persist_every`.
-        self.persist()
+        self.persist_live()
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         Ok(())
     }
@@ -1895,6 +2023,205 @@ mod tests {
                 Some(expected_mid),
                 "reverse lookup must survive a persist + reopen via side data",
             );
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Side-data cadence and compaction
+    // ----------------------------------------------------------------
+
+    fn forget_unknown(lsn_tag: usize) -> IntentPayload {
+        IntentPayload::Forget {
+            user_id: "alice".into(),
+            memory_id: format!("never-seen-{lsn_tag}"),
+            schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+        }
+    }
+
+    #[test]
+    fn three_live_applies_write_one_id_map_snapshot() {
+        let (_index, ckpt, mut proj, _log, _ckptp) = open_projection();
+        for lsn in 0..3u64 {
+            let (mid, bytes) = mk_memory_with_embedding(axis_vec(lsn as usize));
+            TypedProjection::apply(&mut proj, Lsn(lsn), &mk_remember(&mid.0.to_string(), bytes))
+                .unwrap();
+        }
+        {
+            let store = ckpt.lock();
+            assert_eq!(
+                store.side_data_durable_end_offset(),
+                0,
+                "no snapshot is written per live apply"
+            );
+            assert_eq!(
+                store.get(VamanaEmbeddingKind::TextPrimary.projection_name()),
+                None,
+                "the checkpoint waits for the snapshot that matches it"
+            );
+        }
+        drop(proj);
+        let store = ckpt.lock();
+        let name = VamanaEmbeddingKind::TextPrimary.projection_name();
+        assert_eq!(
+            store.side_data_durable_end_offset(),
+            store.side_data_live_bytes(),
+            "exactly one snapshot record"
+        );
+        assert_eq!(
+            store.side_data_checkpoint(name, SIDE_DATA_KEY_ID_MAP),
+            Some(Lsn(2))
+        );
+        assert_eq!(store.get(name), Some(Lsn(2)));
+    }
+
+    #[test]
+    fn a_dirty_map_is_snapshotted_every_id_map_persist_every_applies() {
+        let (_index, ckpt, mut proj, _log, _ckptp) = open_projection();
+        let name = VamanaEmbeddingKind::TextPrimary.projection_name();
+        for lsn in 0..u64::from(ID_MAP_PERSIST_EVERY) {
+            let (mid, bytes) = mk_memory_with_embedding(axis_vec(lsn as usize));
+            TypedProjection::apply(&mut proj, Lsn(lsn), &mk_remember(&mid.0.to_string(), bytes))
+                .unwrap();
+        }
+        let store = ckpt.lock();
+        let last = Lsn(u64::from(ID_MAP_PERSIST_EVERY) - 1);
+        assert_eq!(
+            store.side_data_durable_end_offset(),
+            store.side_data_live_bytes(),
+            "one snapshot for the whole cadence window"
+        );
+        assert_eq!(
+            store.side_data_checkpoint(name, SIDE_DATA_KEY_ID_MAP),
+            Some(last)
+        );
+        assert_eq!(store.get(name), Some(last));
+    }
+
+    #[test]
+    fn an_unchanged_map_advances_the_checkpoint_without_side_data() {
+        let (_log_path, ckpt_path) = tmp_paths("clean_advance");
+        let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+        let name = VamanaEmbeddingKind::TextPrimary.projection_name();
+        let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
+        let mut ids = Vec::new();
+        {
+            let mut proj = VamanaProjection::new(
+                VamanaEmbeddingKind::TextPrimary,
+                Arc::clone(&index),
+                ckpt.clone(),
+            );
+            for lsn in 0..2u64 {
+                let (mid, bytes) = mk_memory_with_embedding(axis_vec(lsn as usize));
+                ids.push(mid.0.to_string());
+                TypedProjection::apply(
+                    &mut proj,
+                    Lsn(lsn),
+                    &mk_remember(&mid.0.to_string(), bytes),
+                )
+                .unwrap();
+            }
+            Projection::persist_checkpoint(&mut proj).unwrap();
+            let snapshot_end = ckpt.lock().side_data_durable_end_offset();
+
+            // Forgets of ids the projection never saw leave the map as it is.
+            for lsn in 2..5u64 {
+                TypedProjection::apply(&mut proj, Lsn(lsn), &forget_unknown(lsn as usize)).unwrap();
+            }
+            let mut store = ckpt.lock();
+            assert_eq!(store.side_data_durable_end_offset(), snapshot_end);
+            assert_eq!(store.get(name), Some(Lsn(4)));
+            assert_eq!(
+                store.side_data_checkpoint(name, SIDE_DATA_KEY_ID_MAP),
+                Some(Lsn(1))
+            );
+            store.sync().unwrap();
+        }
+
+        // The checkpoint (4) is past the snapshot's stamp (1), and the vouch
+        // record is what lets the reopen trust the older snapshot.
+        let ckpt2 = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+        let proj2 = VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index, ckpt2);
+        assert_eq!(proj2.checkpoint(), Some(Lsn(4)));
+        assert_eq!(proj2.tracked_memory_count(), 2);
+        for id in &ids {
+            assert!(proj2.vector_id_for(id).is_some());
+        }
+    }
+
+    #[test]
+    fn kinds_without_their_embedding_never_write_side_data() {
+        let (_log_path, ckpt_path) = tmp_paths("clean_kind");
+        let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+        let bootstrap = VamanaProjectionBootstrap {
+            storage_path: None,
+            config_template: test_config(),
+        };
+        let mut proj = VamanaProjection::lazy(VamanaEmbeddingKind::Image, bootstrap, ckpt.clone());
+        for lsn in 0..3u64 {
+            let (mid, bytes) = mk_memory_with_embedding(axis_vec(lsn as usize));
+            TypedProjection::apply(&mut proj, Lsn(lsn), &mk_remember(&mid.0.to_string(), bytes))
+                .unwrap();
+        }
+        drop(proj);
+        let store = ckpt.lock();
+        assert_eq!(
+            store.get(VamanaEmbeddingKind::Image.projection_name()),
+            Some(Lsn(2))
+        );
+        assert!(
+            !store.side_data_path().exists(),
+            "no side data for an always-empty map"
+        );
+    }
+
+    #[test]
+    fn a_compacted_side_data_file_restores_the_same_map() {
+        let (_log_path, ckpt_path) = tmp_paths("compacted_reopen");
+        let name = VamanaEmbeddingKind::TextPrimary.projection_name();
+        let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
+        let saved: Vec<(String, u32)> = {
+            let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+            let mut proj = VamanaProjection::new(
+                VamanaEmbeddingKind::TextPrimary,
+                Arc::clone(&index),
+                ckpt.clone(),
+            );
+            let mut ids = Vec::new();
+            for lsn in 0..5u64 {
+                let (mid, bytes) = mk_memory_with_embedding(axis_vec(lsn as usize));
+                ids.push(mid.0.to_string());
+                TypedProjection::apply(
+                    &mut proj,
+                    Lsn(lsn),
+                    &mk_remember(&mid.0.to_string(), bytes),
+                )
+                .unwrap();
+                // A snapshot per apply, so the file holds superseded records.
+                Projection::persist_checkpoint(&mut proj).unwrap();
+            }
+            let mut store = ckpt.lock();
+            let before = store.side_data_durable_end_offset();
+            store.compact_side_data().unwrap();
+            assert!(store.side_data_durable_end_offset() < before);
+            assert_eq!(
+                store.side_data_checkpoint(name, SIDE_DATA_KEY_ID_MAP),
+                Some(Lsn(4))
+            );
+            drop(store);
+            ids.into_iter()
+                .map(|id| {
+                    let vid = proj.vector_id_for(&id).unwrap();
+                    (id, vid)
+                })
+                .collect()
+        };
+
+        let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+        let proj = VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index, ckpt);
+        assert_eq!(proj.checkpoint(), Some(Lsn(4)));
+        assert_eq!(proj.tracked_memory_count(), saved.len());
+        for (id, vid) in &saved {
+            assert_eq!(proj.vector_id_for(id), Some(*vid));
         }
     }
 }

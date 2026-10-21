@@ -22,9 +22,12 @@ reason to accept or decline a port (`docs/upstream/PLAN.md`, 1.5).
 `.github/workflows/recall.yml` runs the 100-case `locomo-gate` suite and compares each engine's
 run against two checked-in files:
 
-- `locomo-gate-baseline.json`: aggregate metrics and the rerank setting they were measured
-  under. `recall-eval` gates on these, and refuses a run reranked differently; its exit code is
-  the pass or fail.
+- `locomo-gate-baseline.json`: aggregate metrics, the rerank setting they were measured
+  under, and any candidate-generation dial the run overrode (`retrieval_dials`, today
+  `date_window_leg`). `recall-eval` gates on these, and refuses a run reranked differently or
+  run under other dial overrides; its exit code is the pass or fail. A baseline without
+  `retrieval_dials` was recorded with no overrides, which is how the gate workflow runs, so it
+  is compared, and a change to a dial's engine default is measured as code.
 - `locomo-gate-baseline.per-case.json`: the per-case records from the same run.
   `scripts/recall_diff.py` uses them to list every case whose result moved: lost gold, gained
   gold, p@1 flips and rank-only moves.
@@ -74,6 +77,23 @@ A change to what a model is fed (another corpus text, a prefix, another candidat
 model or ONNX Runtime upgrade needs a new tape: replay misses fail the run, and the tape refuses
 model files other than the ones it was recorded from.
 
+## Embedder arms
+
+The workflow's `embedder` input picks the primary embedder: `minilm-l6-v2`, the default and what
+the baseline measures, or `arctic-embed-xs` (snowflake-arctic-embed-xs, see
+`docs/src/guides/deploying.md`). It sets `VELD_EMBEDDER` for the eval, makes `model-fetch` fetch
+that model, and names the models cache, so an arm restores and runs its own model. The report's
+`embedder` field names the model that produced the vectors, and `recall-eval` refuses to gate one
+embedder against another's baseline, so an alternative arm is a recording:
+
+```text
+gh workflow run recall.yml --ref <branch> -f record=true -f embedder=arctic-embed-xs
+```
+
+A pinned tape holds one embedder's outputs, and it refuses to replay under another embedder's
+model files. Once a tape is pinned, run an alternative arm with `model_tape=off` or record a tape
+for it.
+
 ## Files
 
 - `corpora/shodh-smoke.jsonl` — L1 smoke corpus (memories ingested by the runner).
@@ -82,8 +102,38 @@ model files other than the ones it was recorded from.
 - `baseline.json` — frozen per-metric scores for the smoke suite.
 - `corpora/locomo-gate.jsonl`, `locomo-gate-cases.jsonl` — the LOCOMO gate suite;
   `locomo-gate-baseline.json` and `locomo-gate-baseline.per-case.json` — its baseline.
-- `corpora/locomo.jsonl`, `locomo_cases.jsonl` — the 1,531-case held-out LOCOMO set, run ungated by
-  dispatching the gate with `suite=locomo`.
+- `corpora/locomo.jsonl`, `locomo_cases.jsonl` — all 1,531 LOCOMO cases over ten conversations, run
+  ungated by dispatching the gate with `suite=locomo`. They include every gate case, so this set
+  measures fit as well as generalisation.
+- `corpora/locomo-holdout.jsonl`, `locomo-holdout-cases.jsonl` — the same set without the gate's
+  conversation (conv-42) and without the cases in `locomo-holdout-spent.txt`: 5,253 turns in nine
+  conversations, and 1,166 cases on 2026-10-21. Run ungated with `suite=locomo-holdout`. This is
+  the number to report, with its interval.
+- `locomo-holdout-spent.txt` — hold-out cases whose individual results someone has examined.
+
+## The held-out set (`locomo-holdout`)
+
+Nothing is tuned against it: do not diagnose a miss on it and then change recall to fix that case,
+or it stops being held out. Diagnose on the gate, measure on the hold-out.
+
+A case whose individual result you have read (a moved-case list, a miss you looked into) is spent.
+Add its id to `locomo-holdout-spent.txt` under a dated comment naming the source, and regenerate.
+It stays in the corpus, so the retrieval problem is unchanged; it leaves the scored cases. The
+first entries are the 163 hold-out cases in the moved list behind
+`evaluations/recall/2026-10-20-heldout-loss-attribution.md`, which shaped the frame-word and
+short-acronym changes.
+
+- Regenerate it with `python3 scripts/build_locomo_holdout.py` whenever `locomo.jsonl`,
+  `locomo_cases.jsonl`, the gate cases or the spent list change. The fixtures test
+  `locomo_holdout_is_the_full_suite_without_the_gate_conversations_or_spent_cases` fails until
+  you do.
+- Report it with intervals: `python3 scripts/recall_ci.py <per-case.json>` prints each metric's
+  mean and 95% percentile-bootstrap interval, overall and per category. Two runs whose difference
+  lies inside the intervals have not been shown to differ. For an A/B on the same cases pair them:
+  `recall-eval --ablation` reports paired bootstrap intervals per arm, and `scripts/recall_diff.py`
+  lists the cases that moved.
+- These are retrieval metrics (where the gold turn ranks). They are not the LLM-judged answer
+  accuracy that Mem0, Zep and Letta publish for LoCoMo, and do not compare with it.
 
 ## Running the harness
 
