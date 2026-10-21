@@ -25,72 +25,90 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
             "command": "bun run hooks/memory-hook.ts SessionStart",
-            "timeout": 10000
+            "timeout": 15
           }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
             "command": "bun run hooks/memory-hook.ts UserPromptSubmit",
-            "timeout": 5000
+            "timeout": 10
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": "",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Read|Grep|Glob|WebFetch|Agent|Task",
         "hooks": [
           {
             "type": "command",
             "command": "bun run hooks/memory-hook.ts PreToolUse",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Read|Grep|Glob|WebFetch",
         "hooks": [
           {
             "type": "command",
             "command": "bun run hooks/memory-hook.ts PostToolUse",
-            "timeout": 5000
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun run hooks/memory-hook.ts PostToolUse",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun run hooks/memory-hook.ts PostToolUseFailure",
+            "timeout": 5
           }
         ]
       }
     ],
     "SubagentStop": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
             "command": "bun run hooks/memory-hook.ts SubagentStop",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }
     ],
-    "Stop": [
+    "SessionEnd": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "bun run hooks/memory-hook.ts Stop",
-            "timeout": 5000
+            "command": "bun run hooks/memory-hook.ts SessionEnd",
+            "timeout": 2
           }
         ]
       }
