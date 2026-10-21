@@ -230,6 +230,8 @@ jobs:
   test:
     name: Tests (${{ matrix.engines }})
     runs-on: ubuntu-latest
+    # The three-engine job took 72-83 min with the bench rebuild; past this it is hung, not slow.
+    timeout-minutes: 90
     # One job per engine set, so a red RocksDB-and-redb run cannot hide whether either engine alone
     # still builds and passes: the second set used to run only if the first came back green. The
     # default build carries both engines; the redb-only and rocksdb-only builds keep each engine
@@ -281,11 +283,16 @@ jobs:
       # (216 of them on 2026-09-27: ort is load-dynamic and the runner has neither). Fetched by
       # veld's own downloader, pinned and SHA-256 verified, into the cache the tests search, and
       # cached by the file that pins them.
+      # Keyed on the pinned digests alone: keyed on the two source files, every edit to download
+      # logic evicted the cache and cost each job a 6-9 min refetch (2026-10-21).
+      - name: Model pins
+        id: pins
+        run: echo "hash=$(grep -hoE '[0-9a-f]{64}' src/embeddings/downloader.rs src/embeddings/cross_encoder.rs | sort | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
         id: models
         with:
           path: ~/.cache/veld
-          key: veld-models-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs', 'src/embeddings/cross_encoder.rs') }}
+          key: veld-models-${{ runner.os }}-${{ steps.pins.outputs.hash }}
       - name: Fetch the ONNX runtime, MiniLM and the reranker
         if: steps.models.outputs.cache-hit != 'true'
         run: cargo run --quiet --bin model-fetch -- --onnxruntime --minilm --cross-encoder
@@ -299,9 +306,11 @@ jobs:
 
       # Compile-only: benches are timing harnesses, but a bench that no longer builds goes unnoticed
       # until someone wants a number. Covers storage_engine_benchmarks and cold_start_benchmarks
-      # along with the rest of the [[bench]] targets in Cargo.toml.
+      # along with the rest of the [[bench]] targets in Cargo.toml. Built under the test profile so
+      # they reuse the artifacts `cargo test` just made; `cargo bench --no-run` compiled the whole
+      # graph a second time at opt-level 3 with LTO, 39 min of every job (2026-10-21).
       - name: Build the benches (no run)
-        run: cargo bench --no-run ${{ matrix.cargo_features }}
+        run: cargo test --benches --no-run ${{ matrix.cargo_features }}
 
       - name: Generate test summary
         if: always()
