@@ -5,12 +5,16 @@
 //! types in recall, graph traversal, or server orchestration.
 
 pub mod boot_guard;
+#[cfg(test)]
+mod differential_tests;
 #[cfg(feature = "rocksdb")]
 pub mod legacy_rocksdb;
 pub mod migrate;
 pub mod portable;
 #[cfg(feature = "storage-redb")]
 pub mod redb;
+#[cfg(feature = "storage-redb")]
+pub(crate) mod redb_latch;
 pub mod relational;
 #[cfg(test)]
 mod stored_enums;
@@ -40,6 +44,8 @@ pub struct StorageCapabilities {
     pub supports_prefix_scan: bool,
     pub supports_transactional_batch: bool,
     pub supports_snapshots: bool,
+    /// False on both engines: `MigrationStore::migrate_in_place` refuses on each by
+    /// design (R-6d), and `veld migrate` copies a store between engines instead.
     pub supports_migrate_in_place: bool,
     pub supports_shared_multi_tenant_store: bool,
 }
@@ -54,7 +60,7 @@ impl StorageCapabilities {
                 supports_prefix_scan: true,
                 supports_transactional_batch: true,
                 supports_snapshots: true,
-                supports_migrate_in_place: true,
+                supports_migrate_in_place: false,
                 supports_shared_multi_tenant_store: true,
             },
             StorageBackend::RocksDb => Self {
@@ -64,7 +70,7 @@ impl StorageCapabilities {
                 supports_prefix_scan: true,
                 supports_transactional_batch: true,
                 supports_snapshots: true,
-                supports_migrate_in_place: true,
+                supports_migrate_in_place: false,
                 supports_shared_multi_tenant_store: true,
             },
         }
@@ -83,6 +89,10 @@ pub type RocksDbHandle = std::convert::Infallible;
 pub type SharedBlockCache = rocksdb::Cache;
 #[cfg(not(feature = "rocksdb"))]
 pub type SharedBlockCache = std::convert::Infallible;
+
+/// The write options a rocksdb store writes with at a given durability.
+#[cfg(feature = "rocksdb")]
+pub use self::legacy_rocksdb::write_options as rocksdb_write_options;
 
 /// The one shared engine database behind the global stores, carried by ENGINE
 /// rather than erased. The consumers that remain engine-typed — user-auth, the
@@ -326,11 +336,17 @@ pub trait BatchWriter: Send + Sync {
 pub trait ColumnStore: Send + Sync {
     fn backend(&self) -> StorageBackend;
 
+    /// A family the database does not have holds no rows: `None`, on every engine.
+    /// Reading is the one direction where absence is a legitimate answer — a rocksdb
+    /// family exists only if the database was opened with it, a redb table only once
+    /// something wrote it, and a read cannot tell those apart from an empty family.
+    /// Writes name a family that must exist; see [`Self::ensure_cf`].
     fn get_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete_cf(&self, cf: &str, key: &[u8]) -> Result<()>;
 
-    /// One scan for both uses a caller has. `prefix: None` walks the family.
+    /// One scan for both uses a caller has. `prefix: None` walks the family; a family
+    /// the database does not have scans empty, as [`Self::get_cf`] reads it.
     ///
     /// Results are in ASCENDING key order — part of the contract, not an
     /// implementation accident: prospective's due-index scans early-exit at the
@@ -476,6 +492,11 @@ pub trait PrimaryMemoryStore: Send + Sync {
     /// modalities — the write half of the retrieval engine's index maintenance.
     fn update_vector_mapping(&self, memory_id: &MemoryId, vector_ids: Vec<u32>) -> Result<()>;
     fn put_vector_mapping(&self, id: &MemoryId, mapping: &VectorMappingEntry) -> Result<()>;
+    /// Store `memory` and set its TEXT-modality vectors to `vector_ids`, keeping its
+    /// other modalities, as ONE atomic write: a crash between two writes would leave
+    /// a stored memory the vector index cannot reach. Signature is
+    /// `MemoryStorage::store_with_vectors`'s exactly.
+    fn store_with_vectors(&self, memory: &Memory, vector_ids: Vec<u32>) -> Result<()>;
     fn delete_vector_mapping(&self, id: &MemoryId) -> Result<()>;
     fn flush(&self) -> Result<()>;
 
@@ -486,6 +507,11 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn store(&self, memory: &Memory) -> Result<()>;
     fn update(&self, memory: &Memory) -> Result<()>;
     fn delete(&self, id: &MemoryId) -> Result<()>;
+    /// Every LIVE memory: forgotten (soft-deleted, `Memory::is_forgotten`) records are
+    /// left out on every engine. Its callers index, list, repair and merge what recall
+    /// can reach, and a forgotten record handed to them comes back into the vector and
+    /// BM25 indexes. A pass that must reach forgotten records too — erasure — enumerates
+    /// `get_all_ids`, which includes them, and reads each with `get`.
     fn get_all(&self) -> Result<Vec<Memory>>;
     fn get_all_ids(&self) -> Result<Vec<MemoryId>>;
     fn increment_retrieval_count(&self) -> Result<usize>;
@@ -523,14 +549,15 @@ pub trait PrimaryMemoryStore: Send + Sync {
     /// Whether any memory or fact still cites `target`: the merge GC's guard.
     fn has_any_inbound_refs(&self, target: &MemoryId, user_id: &str) -> Result<bool>;
 
-    /// Every key under `prefix`, values not loaded.
+    /// Every MEMORY key under `prefix` — the 16-byte ids `get_all_ids` enumerates —
+    /// values not loaded. Implementations MUST return only matching keys.
     ///
-    /// Replaces `db().prefix_iterator(p)` at the one call site that reached past
-    /// this trait for it. Two differences from the raw iterator, both of which the
-    /// call site was compensating for by hand: rocksdb's prefix iterator may run
-    /// PAST the prefix, so that code carried `if !key.starts_with(prefix) { break }`
-    /// and a missing break would have deleted unrelated keys; and it yields values
-    /// nobody there wanted. Implementations MUST return only matching keys.
+    /// Memory keys only, on every engine. rocksdb keeps memories in its default
+    /// column family beside vector mappings, counters, facts and KV rows, and redb
+    /// keeps them in a table of their own; a scan of "whatever shares the memories'
+    /// keyspace" would answer differently per engine, which is how the GDPR fact
+    /// erasure once found every fact on rocksdb and none on redb. Rows in the default
+    /// keyspace are read through [`Self::default_key_value_store`].
     fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>>;
 
     /// Apply `batch` atomically against this store's database.
@@ -563,6 +590,11 @@ pub trait PrimaryMemoryStore: Send + Sync {
 }
 
 /// Domain interface for graph persistence.
+///
+/// Persistence only, on every engine: each `put_*` stores its record exactly as given,
+/// under the uuid it carries, so a record is readable back by that uuid. Entity dedup
+/// and the Hebbian merge of edges are `GraphMemory`'s, above this trait; `stats`
+/// counts stored records, so rewriting one under its uuid leaves the counts alone.
 pub trait GraphStore: Send + Sync {
     fn backend(&self) -> StorageBackend;
     fn get_entity(&self, uuid: &uuid::Uuid) -> Result<Option<EntityNode>>;
@@ -796,7 +828,7 @@ mod backend_coverage_matrix {
         )
     }
 
-    /// Calls all 45 trait methods and returns (name, outcome), sorted.
+    /// Calls all 46 trait methods and returns (name, outcome), sorted.
     fn matrix(s: &dyn PrimaryMemoryStore) -> Vec<(&'static str, Outcome)> {
         let m = a_memory();
         let id = m.id.clone();
@@ -818,6 +850,10 @@ mod backend_coverage_matrix {
             (
                 "put_vector_mapping",
                 probe(|| s.put_vector_mapping(&id, &Default::default())),
+            ),
+            (
+                "store_with_vectors",
+                probe(|| s.store_with_vectors(&m, vec![3])),
             ),
             (
                 "delete_vector_mapping",
@@ -911,7 +947,10 @@ mod backend_coverage_matrix {
             ),
             (
                 "set_fact_watermark",
-                probe(|| Ok::<_, anyhow::Error>(s.set_fact_watermark("u", 1))),
+                probe(|| {
+                    s.set_fact_watermark("u", 1);
+                    Ok::<_, anyhow::Error>(())
+                }),
             ),
             (
                 "key_value_store",
@@ -949,7 +988,7 @@ mod backend_coverage_matrix {
 
         let r = matrix(&rocks);
         let b = matrix(&redb);
-        assert_eq!(r.len(), 45, "the matrix must cover every trait method");
+        assert_eq!(r.len(), 46, "the matrix must cover every trait method");
         assert_eq!(r.len(), b.len());
 
         let rocks_ok = r.iter().filter(|(_, o)| *o == Outcome::Works).count();
@@ -962,7 +1001,7 @@ mod backend_coverage_matrix {
             .collect();
 
         eprintln!(
-            "COVERAGE  rocksdb {rocks_ok}/45   redb {redb_ok}/45   gap {}",
+            "COVERAGE  rocksdb {rocks_ok}/46   redb {redb_ok}/46   gap {}",
             gap.len()
         );
         for name in &gap {
@@ -977,7 +1016,7 @@ mod backend_coverage_matrix {
         );
         assert_eq!(
             gap.len(),
-            45 - redb_ok,
+            46 - redb_ok,
             "a redb method failed that rocksdb also fails — the gap list is not the whole story"
         );
         // ADR 0007: redb implements every trait method. A capability added for RocksDB alone

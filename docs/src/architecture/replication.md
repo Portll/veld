@@ -3,7 +3,7 @@
 A follower instance tails a leader's per-user intent logs over HTTP and applies every
 frame to its own store, then journals the same frame locally so its projections and its own
 log follow. The intent log holds a full memory snapshot per `Remember`/`Update` and a
-`Forget`/`Anchor` otherwise, so a follower that starts empty converges on the leader's
+`Forget`/`SetAnchored` otherwise (`Anchor` in older logs), so a follower that starts empty converges on the leader's
 memories by replaying from LSN 0 with ids and timestamps intact. Embeddings travel inside
 the snapshot: the follower never re-embeds.
 
@@ -45,7 +45,7 @@ Every interval: `GET status` on the leader; then each tenant is synced on its ow
   its backoff after a failure, or while it is diverged.
 - **Paged** from its cursor through `records`. A page is **coalesced** before it is applied:
   for each memory id, only the last `Remember`/`Update` snapshot in the page and the frames
-  after it (`Forget`, `Anchor`) survive. Logs are Update-heavy because every access and
+  after it (`Forget`, `SetAnchored`, `Anchor`) survive. Logs are Update-heavy because every access and
   consolidation re-journals a memory, so this removes more than half the writes. Surviving
   snapshots are upserted through `MemorySystem::upsert_memories` with one BM25 commit per
   page; then each surviving frame is journaled locally with `journal_and_apply`. A frame
@@ -67,14 +67,23 @@ Every interval: `GET status` on the leader; then each tenant is synced on its ow
   replays from the start.
 - **Leader unreachable.** The loop backs off the same way and logs a warning only when the
   error changes.
+- **Shutdown.** At the shutdown signal the follower starts no request and no page; a page
+  already being applied finishes and saves its cursor. The follower runs on the server's
+  task tracker, so the shutdown drain (up to 10 s) waits for that page before the store
+  flush and the vector-index save. Before this, it kept applying through both: on
+  2026-10-19 the replica applied frames for 51 s after "Server shutdown complete".
 
 A `follow` or `unfollow` bumps a generation number; a poll started under an older
 generation stops at its next page and writes nothing, so switching targets cannot mix
 two leaders' cursors.
 
-Status reports, per tenant: applied LSN, the leader's next LSN (so lag is
-`leader_head_lsn - 1 - applied_lsn`), frames consumed and journaled, failures, last error
-and divergence; and overall: pages applied, polls finished and the last leader error.
+Status reports, per tenant: applied LSN, the leader's next LSN, `lag` (leader frames not
+yet applied: `leader_head_lsn - 1 - applied_lsn`, or the whole log when nothing is
+applied), frames consumed and journaled, failures, last error and divergence; and overall:
+pages applied, polls (passes over every tenant) finished, when the current pass started
+(`pass_started`), the tenant it is syncing (`syncing`) and the last leader error. An
+initial sync is a single pass that can last hours, so `polls` stays at 0 through it;
+`pages`, `syncing` and `last_applied` show it moving.
 
 ## Limits, stated
 
@@ -88,8 +97,12 @@ and divergence; and overall: pages applied, polls finished and the last leader e
   spaces plan (`docs/EXECUTION-embedding-spaces-2026-10-19.md`, step 4) lifts this.
 - **Frames leave the leader decrypted** and are sealed again by the follower's keystore on
   append.
-- **Anchor state is inferred.** The `Anchor` frame carries the importance after the change,
-  not the flag; the follower reads a rise as an anchor and a fall as its release.
+- **Upgrade followers before the leader** when the log gains a frame type. Anchoring now
+  journals `SetAnchored`, which carries the flag and the importance after the change; a
+  follower built before it cannot decode that frame, so the tenant's page fails and retries
+  on its backoff until the follower is upgraded. Older logs carry `Anchor`, with the
+  importance only: for those the follower reads a rise as an anchor and a fall as its
+  release, and a release that leaves importance unchanged is not seen.
 
 ## Measured
 

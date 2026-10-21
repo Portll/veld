@@ -3,7 +3,8 @@
 //! The two engines do not share a physical layout for the primary memory store:
 //! rocksdb keeps memories, vector mappings and a dozen prefixed subsystems in one
 //! default column family plus a derived `memory_index`, while redb splits them into
-//! `memories`, `vector_mappings` and `default` tables and keeps no index. A dump of
+//! `memories`, `vector_mappings` and `default` tables beside its derived `index_*`
+//! tables. A dump of
 //! one engine's physical rows imports into the other as tables nothing reads — a
 //! store that verifies and serves zero records, which is the outage 0006 records.
 //!
@@ -19,8 +20,9 @@
 //! | `audit/audit`             | `shared` family `audit`                  | `audit.redb` `audit`               |
 //! | `shared/<family>`         | `shared` family                          | `shared.redb` table                |
 //!
-//! `memory_index` is derived and is not carried: it is counted, and rebuilt from the
-//! memories on a rocksdb target. Keyspaces are emitted in name order and keys in byte
+//! `memory_index` and redb's `index_*` tables are derived and are not carried: they are
+//! counted, and rebuilt from the memories on the target — by `rebuild_index` on rocksdb,
+//! by the first open on redb. Keyspaces are emitted in name order and keys in byte
 //! order, so an extraction of the target after an import reproduces the dump's frames
 //! exactly — which is how an import proves itself against the trailer.
 //!
@@ -49,26 +51,6 @@ const META: &str = "meta";
 const KEYSTORE: &str = "keystore.json";
 #[cfg(feature = "rocksdb")]
 const VMAPPING: &[u8] = b"vmapping:";
-#[cfg(feature = "rocksdb")]
-/// `MemoryStorage::cleanup_corrupted`'s list: rows in the rocksdb default family that are
-/// not memories even when their key happens to be 16 bytes long.
-const NON_MEMORY_PREFIXES: &[&[u8]] = &[
-    b"stats:",
-    b"vmapping:",
-    b"interference:",
-    b"interference_meta:",
-    b"_watermark:",
-    b"facts:",
-    b"facts_by_entity:",
-    b"facts_by_type:",
-    b"facts_embedding:",
-    b"temporal_facts:",
-    b"temporal_by_time:",
-    b"temporal_by_entity:",
-    b"lineage:",
-    b"learning:",
-    b"geo:",
-];
 #[cfg(feature = "rocksdb")]
 const ROCKS_BATCH_OPS: usize = 10_000;
 
@@ -703,8 +685,7 @@ fn rocks_primary<W: Write>(sink: &mut Sink<W>, dir: &Path) -> Result<()> {
     let default = db
         .cf_handle("default")
         .ok_or_else(|| anyhow!("{} has no default column family", dir.display()))?;
-    let is_memory =
-        |key: &[u8]| key.len() == 16 && !NON_MEMORY_PREFIXES.iter().any(|p| key.starts_with(p));
+    let is_memory = crate::memory::storage::is_memory_key;
     let index = db.cf_handle("memory_index");
     let carries_sentinel = sink.keys().is_some();
     let mut sentinel = match sink.keys() {
@@ -826,6 +807,11 @@ fn rocks_families<W: Write>(
 #[cfg(feature = "storage-redb")]
 type RawTable<'a> = redb::TableDefinition<'a, &'static [u8], &'static [u8]>;
 
+/// The table an import is writing, by name, so consecutive records for one table share
+/// its handle.
+#[cfg(feature = "storage-redb")]
+type OpenRawTable<'name, 'txn> = (&'name str, redb::Table<'txn, &'static [u8], &'static [u8]>);
+
 #[cfg(feature = "storage-redb")]
 fn redb_table_names(read: &redb::ReadTransaction, path: &Path) -> Result<Vec<String>> {
     use redb::{MultimapTableHandle, TableHandle};
@@ -848,13 +834,18 @@ fn redb_primary<W: Write>(sink: &mut Sink<W>, path: &Path) -> Result<()> {
 #[cfg(feature = "storage-redb")]
 fn redb_primary_db<W: Write>(sink: &mut Sink<W>, db: &redb::Database, path: &Path) -> Result<()> {
     use redb::ReadableTable;
+    use redb::ReadableTableMetadata;
     let read = db.begin_read()?;
     let names = redb_table_names(&read, path)?;
-    if let Some(t) = names
-        .iter()
-        .find(|t| !["default", "kv", "memories", "vector_mappings"].contains(&t.as_str()))
-    {
+    let derived = crate::storage::redb::DERIVED_INDEX_TABLES;
+    if let Some(t) = names.iter().find(|t| {
+        !["default", "kv", "memories", "vector_mappings"].contains(&t.as_str())
+            && !derived.contains(&t.as_str())
+    }) {
         bail!("{} has table '{t}', which this migration does not know how to carry — refusing rather than dropping it", path.display());
+    }
+    for table in names.iter().filter(|t| derived.contains(&t.as_str())) {
+        sink.stats.derived_rows_not_carried += read.open_table(RawTable::new(table))?.len()?;
     }
     let has = |table: &str| names.iter().any(|n| n == table);
     let mut sentinel = match sink.keys() {
@@ -1627,11 +1618,10 @@ fn apply_redb<'a>(
     table_for: impl Fn(&'a str) -> Option<&'a str>,
 ) -> Result<()> {
     use redb::{ReadableTableMetadata, TableHandle};
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let db = redb::Database::create(path).with_context(|| format!("opening {}", path.display()))?;
-    let txn = db.begin_write()?;
+    let tuning = crate::config::StorageTuning::process();
+    let db = crate::storage::redb::create_redb_database(path, &tuning)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let txn = crate::storage::redb::begin_write(&db, tuning.durability)?;
     {
         let names: Vec<String> = txn.list_tables()?.map(|t| t.name().to_string()).collect();
         for name in names {
@@ -1642,7 +1632,7 @@ fn apply_redb<'a>(
                 );
             }
         }
-        let mut current: Option<(&str, redb::Table<'_, &'static [u8], &'static [u8]>)> = None;
+        let mut current: Option<OpenRawTable<'_, '_>> = None;
         for rec in records {
             let table = table_for(rec.cf.as_str())
                 .ok_or_else(|| anyhow!("keyspace '{}' has no table on redb", rec.cf))?;
@@ -1655,7 +1645,9 @@ fn apply_redb<'a>(
         }
     }
     txn.commit()?;
-    Ok(())
+    // A migration reports success once, so the copy holds after a power loss at either
+    // class, as the RocksDB import's write-ahead-log sync makes it hold there.
+    crate::storage::redb::make_durable(&db, tuning.durability)
 }
 
 #[cfg(feature = "rocksdb")]

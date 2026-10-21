@@ -184,7 +184,8 @@ pub async fn prompt_gen(
     let op_start = std::time::Instant::now();
 
     let memory_system = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let graph_memory = state

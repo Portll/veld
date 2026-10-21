@@ -145,7 +145,16 @@ function render(snap) {
       Math.floor((Date.now() - new Date(snap.server.first_seen).getTime()) / 1000)
     );
   }
-  document.getElementById("uptime").textContent = fmtUptime(uptimeSecs);
+  document.getElementById("uptime").textContent = "watching " + fmtUptime(uptimeSecs);
+  // The server's own uptime: first_seen restarts with the monitor, not the server.
+  const startedAt = instances.find((i) => i.base_url === snap.base_url)?.started_at;
+  const serverUptime = document.getElementById("server-uptime");
+  serverUptime.textContent = "up " + fmtUptime(
+    startedAt ? Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000)) : null
+  );
+  serverUptime.title = startedAt
+    ? "Server started " + new Date(startedAt).toLocaleString() + " (instance registry)"
+    : "Not in the instance registry: the server's start time is unknown";
   document.getElementById("version").textContent = snap.server.version || "—";
 
   // Memory
@@ -297,6 +306,18 @@ const DIAL_TOGGLES = [
     desc: "Nudges a memory's embedding toward how it has actually been retrieved (semantic drift).",
     info: "On for usage-adaptive recall (heaviest layer). Off to keep embeddings fixed (safest, default).",
   },
+  {
+    key: "use_mmr",
+    label: "MMR diversification",
+    desc: "Penalises a result for resembling one already chosen, measured above the pool's baseline similarity.",
+    info: "Off by default: on LOCOMO-20 it pushed same-topic answers out of the top 10. On only for corpora with many near-duplicate records.",
+  },
+  {
+    key: "use_prf",
+    label: "Pseudo-relevance feedback",
+    desc: "Runs a second keyword pass with terms the top results share, and fuses it as its own leg.",
+    info: "Pulls in siblings of strong hits that share their vocabulary but not the query's. Tune with the Expansion sliders.",
+  },
 ];
 const DIAL_NUMBERS = [
   {
@@ -371,8 +392,36 @@ const DIAL_RECALL = [
     desc: "Cap on total ontological boost.", info: "0.40 = veld · 0.25 = shodh." },
   { key: "onto_rerank_penalty", group: "Rerank", label: "Ontological mismatch penalty", def: -0.08, recLo: -0.20, recHi: 0, min: -1, max: 0, step: 0.01,
     desc: "Demotion when entities match none of the expected types.", info: "-0.08 default; only applied at high confidence." },
-  { key: "ce_blend", group: "Rerank", label: "Cross-encoder blend", def: 0.4, recLo: 0, recHi: 0.6, min: 0, max: 1, step: 0.05,
-    desc: "Cross-encoder contribution to the fused score.", info: "Set 0 if the cross-encoder model is unavailable (token_type_ids)." },
+  { key: "ce_blend", group: "Rerank", label: "Cross-encoder blend (all shapes)", def: 0.18, recLo: 0, recHi: 0.6, min: 0, max: 1, step: 0.05,
+    desc: "Cross-encoder share for every query shape at once; decomposed queries keep at least their own share. Unset lets the per-shape shares below decide.", info: "Set 0 if the cross-encoder model is unavailable (token_type_ids); decomposed queries then need CE share · abstract set to 0 too." },
+  { key: "ce_blend_identifier", group: "Rerank", label: "CE share · identifier", def: 0.0, recLo: 0, recHi: 0.1, min: 0, max: 1, step: 0.05,
+    desc: "Queries naming paths, tickets, versions or hashes.", info: "The reranker fragments identifiers; BM25 exact match decides. Under 0.05 the reranker is not called." },
+  { key: "ce_blend_ordinal", group: "Rerank", label: "CE share · ordinal", def: 0.05, recLo: 0, recHi: 0.2, min: 0, max: 1, step: 0.05,
+    desc: "first / latest / most recent.", info: "Time decides; Layer 5.9 pins the answer." },
+  { key: "ce_blend_temporal", group: "Rerank", label: "CE share · temporal", def: 0.18, recLo: 0, recHi: 0.3, min: 0, max: 1, step: 0.05,
+    desc: "Plain questions with a date or recency word.", info: "Kept at the exploratory share: a date filters, the reranker still matches the content. At 0.10 the recall gate lost a gold document." },
+  { key: "ce_blend_people", group: "Rerank", label: "CE share · people", def: 0.18, recLo: 0, recHi: 0.3, min: 0, max: 1, step: 0.05,
+    desc: "who / whom questions.", info: "Kept at the exploratory share: at 0.10 a correct answer left the top 5 on LOCOMO-20 Q20. Lower it once a person-density signal exists." },
+  { key: "ce_blend_keyword", group: "Rerank", label: "CE share · keyword", def: 0.10, recLo: 0, recHi: 0.3, min: 0, max: 1, step: 0.05,
+    desc: "Fewer than three content words.", info: "A cross-encoder needs a question to interact with." },
+  { key: "ce_blend_exploratory", group: "Rerank", label: "CE share · exploratory", def: 0.18, recLo: 0.1, recHi: 0.4, min: 0, max: 1, step: 0.05,
+    desc: "Everything else.", info: "The long-standing 82/18 blend." },
+  { key: "ce_blend_attribute", group: "Rerank", label: "CE share · attribute", def: 0.30, recLo: 0.2, recHi: 0.5, min: 0, max: 1, step: 0.05,
+    desc: "what is X's Y.", info: "Entity-to-value matching is the reranker's training objective." },
+  { key: "ce_blend_relational", group: "Rerank", label: "CE share · relational", def: 0.35, recLo: 0.2, recHi: 0.6, min: 0, max: 1, step: 0.05,
+    desc: "how did X fix Y / why.", info: "Where the lexical and vector legs disagree and only passage reading settles it." },
+  { key: "ce_blend_abstract", group: "Rerank", label: "CE share · abstract", def: 0.45, recLo: 0.3, recHi: 0.7, min: 0, max: 1, step: 0.05,
+    desc: "Decomposed multi-cluster questions.", info: "The 55/45 blend decomposed queries already had." },
+  { key: "query_coverage_weight", group: "Weights", label: "Query-term coverage", def: 0.25, recLo: 0.1, recHi: 0.4, min: 0, max: 0.9, step: 0.05,
+    desc: "Demotes results that mention few of the query's words, compared on word stems.", info: "0 disables. Needs two or more content words in the query." },
+  { key: "people_boost_max", group: "Weights", label: "People-question boost", def: 0, recLo: 0.05, recHi: 0.3, min: 0, max: 1, step: 0.05,
+    desc: "Lifts results that name people on who-questions and people-noun queries.", info: "Off by default: the rule-based extractor rarely labels a bare name as a person, so it measured no effect. Multiplicative when on." },
+  { key: "prf_docs", group: "Expansion", label: "PRF documents", def: 3, recLo: 2, recHi: 5, min: 1, max: 20, step: 1,
+    desc: "Top first-pass results the feedback terms are drawn from.", info: "Terms must appear in at least two of them." },
+  { key: "prf_terms", group: "Expansion", label: "PRF terms", def: 5, recLo: 3, recHi: 10, min: 1, max: 30, step: 1,
+    desc: "Expansion terms added to the second pass.", info: "More terms widen the pass and raise the risk of drift." },
+  { key: "prf_weight", group: "Expansion", label: "PRF leg weight", def: 0.3, recLo: 0.1, recHi: 0.6, min: 0, max: 2, step: 0.05,
+    desc: "Weight of the feedback leg relative to the hybrid leg.", info: "Only used when pseudo-relevance feedback is on." },
   { key: "temporal_recall_boost", group: "Temporal", label: "Temporal source boost", def: 0.20, recLo: 0.10, recHi: 0.40, min: 0, max: 1, step: 0.01,
     desc: "Boost for memories that source a matching temporal fact.", info: "0.20 default ≈ +2 RRF positions." },
   { key: "mmr_lambda_exploratory", group: "Diversity", label: "MMR λ · exploratory", def: 0.6, recLo: 0.5, recHi: 0.9, min: 0, max: 1, step: 0.05,

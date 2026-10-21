@@ -298,8 +298,9 @@ impl ZenohConfig {
 // INSTANCE CAPABILITIES
 // =============================================================================
 
-/// Capabilities this node advertises to cluster peers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Capabilities this node advertises to cluster peers. The default advertises nothing: no
+/// models, and peer embedding requests refused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceCapabilities {
     /// Embedding models loaded and available for peer requests.
     pub embedding_models: Vec<EmbeddingModelInfo>,
@@ -316,15 +317,6 @@ pub struct EmbeddingModelInfo {
     pub dimension: usize,
     /// Model type: "embedding", "cross-encoder", "ner".
     pub model_type: String,
-}
-
-impl Default for InstanceCapabilities {
-    fn default() -> Self {
-        Self {
-            embedding_models: Vec::new(),
-            accepts_embedding_requests: false,
-        }
-    }
 }
 
 #[cfg(test)]

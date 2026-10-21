@@ -74,6 +74,20 @@ paper/
 
 # Local-only legacy collateral
 /veld-internal/
+/bhashini-authorization-letter.html
+/bhashini_letter.pdf
+/veld_IITD.odt
+/veld_IITD.pdf
+/seeds/overlook-*.json
+
+# Third-party binaries, CI logs and one-off patch artefacts
+/mcp-publisher.exe
+/mcp-publisher.tar.gz
+/job_log.txt
+/full_log.txt
+/macos_log.txt
+/apply_layers.py
+*.rs.patch
 
 # ONNX Runtime binaries (downloaded per-platform during CI wheel builds)
 python/veld/lib/*.dll

@@ -3,7 +3,10 @@
 //! Semantic consolidation for fact extraction, vector index maintenance,
 //! and backup/restore operations.
 
-use axum::{extract::State, response::Json};
+use axum::{
+    extract::{Extension, State},
+    response::Json,
+};
 
 use super::state::MultiUserMemoryManager;
 use super::types::{
@@ -14,6 +17,8 @@ use super::types::{
     RestoreBackupRequest, RestoreBackupResponse, VerifyBackupRequest, VerifyBackupResponse,
     VerifyIndexRequest,
 };
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory;
 use crate::memory::gap_topology::{GapDetectionConfig, GapDetector};
@@ -103,7 +108,8 @@ pub async fn consolidate_memories(
 
     // Validate user exists before spawning background work
     let _ = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
@@ -135,7 +141,7 @@ pub async fn consolidate_memories(
             }
         };
 
-        let memory = match state_clone.get_user_memory(&user_id) {
+        let memory = match state_clone.get_user_memory_async(&user_id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!(user_id = %user_id, "Consolidation: failed to get memory: {e}");
@@ -419,37 +425,43 @@ pub async fn consolidate_memories(
             }
         }
 
-        // Step 4: Gap analysis — sync graph to SQLite, detect structural gaps
-        if let Ok(graph) = state_clone.get_user_graph(&user_id) {
-            if let Ok(store) = state_clone.get_user_slow_store(&user_id) {
-                let graph_guard = graph.read();
-                match (
-                    graph_guard.get_all_entities(),
-                    graph_guard.get_all_relationships(),
-                ) {
-                    (Ok(entities), Ok(edges)) => {
-                        if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
-                            let config = GapDetectionConfig::default();
-                            match GapDetector::detect(store.as_ref(), &config) {
-                                Ok(result) => {
-                                    persist_detected_gaps(&store, &user_id, &result);
-                                    tracing::info!(
-                                        user_id = %user_id,
-                                        gaps = result.gaps.len(),
-                                        types = ?result.type_counts,
-                                        "Gap detection complete + persisted (post-consolidation)"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::debug!("Gap detection failed: {e}");
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        tracing::debug!("Could not load graph data for gap analysis");
-                    }
+        // Step 4: Gap analysis — refresh the SQLite graph mirror, then detect
+        // structural gaps. The refresh is gated inside SlowStore (one rebuild
+        // in flight, TTL since the last); when it is skipped, detection runs
+        // on the existing mirror.
+        if let (Ok(graph), Ok(store)) = (
+            state_clone.get_user_graph(&user_id),
+            state_clone.get_user_slow_store(&user_id),
+        ) {
+            let scope = user_id.clone();
+            let ttl = state_clone.server_config().graph_mirror_sync_ttl();
+            let gap_step = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                if let Some(sync) = store.begin_sync(ttl) {
+                    // Hold the graph read lock only for the snapshot.
+                    let (entities, edges) = {
+                        let graph_guard = graph.read();
+                        (
+                            graph_guard.get_all_entities()?,
+                            graph_guard.get_all_relationships()?,
+                        )
+                    };
+                    sync.rebuild(&entities, &edges)?;
                 }
+                let result = GapDetector::detect(store.as_ref(), &GapDetectionConfig::default())?;
+                persist_detected_gaps(&store, &scope, &result);
+                tracing::info!(
+                    user_id = %scope,
+                    gaps = result.gaps.len(),
+                    types = ?result.type_counts,
+                    "Gap detection complete + persisted (post-consolidation)"
+                );
+                Ok(())
+            })
+            .await;
+            match gap_step {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!("Gap analysis failed: {e}"),
+                Err(e) => tracing::debug!("Gap analysis task panicked: {e}"),
             }
         }
 
@@ -520,7 +532,8 @@ pub async fn sleep_phase_consolidation(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let _ = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
@@ -549,7 +562,7 @@ pub async fn sleep_phase_consolidation(
             }
         };
 
-        let memory = match state_clone.get_user_memory(&user_id) {
+        let memory = match state_clone.get_user_memory_async(&user_id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!(user_id = %user_id, "Sleep-phase: failed to get memory: {e}");
@@ -768,21 +781,44 @@ pub async fn sleep_phase_consolidation(
             }
         }
 
-        // Phase 7: Gap analysis
-        if let Ok(graph) = state_clone.get_user_graph(&user_id) {
-            if let Ok(store) = state_clone.get_user_slow_store(&user_id) {
-                let graph_guard = graph.read();
-                if let (Ok(entities), Ok(edges)) = (
-                    graph_guard.get_all_entities(),
-                    graph_guard.get_all_relationships(),
-                ) {
-                    if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
-                        let config = GapDetectionConfig::default();
-                        if let Ok(result) = GapDetector::detect(store.as_ref(), &config) {
-                            persist_detected_gaps(&store, &user_id, &result);
-                            tracing::info!(user_id = %user_id, gaps = result.gaps.len(), "Sleep-phase gap detection complete + persisted");
-                        }
-                    }
+        // Phase 7: Gap analysis — same gated mirror refresh as the
+        // post-consolidation step: snapshot under the graph lock, rebuild
+        // without it, and detect on the existing mirror when the rebuild is
+        // skipped.
+        if let (Ok(graph), Ok(store)) = (
+            state_clone.get_user_graph(&user_id),
+            state_clone.get_user_slow_store(&user_id),
+        ) {
+            let scope = user_id.clone();
+            let ttl = state_clone.server_config().graph_mirror_sync_ttl();
+            let gap_step = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                if let Some(sync) = store.begin_sync(ttl) {
+                    let (entities, edges) = {
+                        let graph_guard = graph.read();
+                        (
+                            graph_guard.get_all_entities()?,
+                            graph_guard.get_all_relationships()?,
+                        )
+                    };
+                    sync.rebuild(&entities, &edges)?;
+                }
+                let result = GapDetector::detect(store.as_ref(), &GapDetectionConfig::default())?;
+                persist_detected_gaps(&store, &scope, &result);
+                tracing::info!(
+                    user_id = %scope,
+                    gaps = result.gaps.len(),
+                    "Sleep-phase gap detection complete + persisted"
+                );
+                Ok(())
+            })
+            .await;
+            match gap_step {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(user_id = %user_id, "Sleep-phase gap analysis failed: {e}")
+                }
+                Err(e) => {
+                    tracing::warn!(user_id = %user_id, "Sleep-phase gap analysis task panicked: {e}")
                 }
             }
         }
@@ -818,7 +854,8 @@ pub async fn verify_index_integrity(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -837,7 +874,8 @@ pub async fn repair_vector_index(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -863,7 +901,8 @@ pub async fn cleanup_corrupted(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -902,7 +941,8 @@ pub async fn migrate_legacy(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -944,7 +984,8 @@ pub async fn rebuild_index(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -970,7 +1011,8 @@ pub async fn reembed_all(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1177,7 +1219,8 @@ pub async fn get_consolidation_report(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let now = chrono::Utc::now();
@@ -1223,12 +1266,18 @@ pub async fn get_consolidation_report(
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn get_consolidation_events(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     axum::extract::Query(req): axum::extract::Query<ConsolidationEventsRequest>,
 ) -> Result<Json<Vec<memory::ConsolidationEvent>>, AppError> {
-    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&req.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let now = chrono::Utc::now();
@@ -1264,11 +1313,17 @@ pub struct EmbeddingBacklogQuery {
 /// GET /api/embeddings/backlog?user_id= - Memories still without a vector.
 pub async fn get_embedding_backlog(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     axum::extract::Query(q): axum::extract::Query<EmbeddingBacklogQuery>,
 ) -> Result<Json<crate::memory::embedding_backlog::BacklogReport>, AppError> {
-    validation::validate_user_id(&q.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&q.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
     let memory = state
-        .get_user_memory(&q.user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let report = tokio::task::spawn_blocking(move || memory.read().embedding_backlog_report())
         .await
@@ -1299,7 +1354,8 @@ pub async fn drain_embedding_backlog(
         });
     }
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let reconcile = req.reconcile;
     let (reconciled, drained) = tokio::task::spawn_blocking(move || {

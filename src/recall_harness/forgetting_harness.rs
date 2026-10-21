@@ -533,6 +533,7 @@ fn run_planted_arm(
     let mut in_top_10 = 0usize;
     let (mut access_sum, mut importance_sum) = (0.0f64, 0.0f64);
     let (mut strength_sum, mut sources_sum, mut activations_sum) = (0.0f64, 0.0f64, 0.0f64);
+    let mut direction_sum = 0.0f64;
     let mut edges_present = 0usize;
     for g in 0..groups {
         let query = Query {
@@ -580,6 +581,7 @@ fn run_planted_arm(
             strength_sum += edge.strength as f64;
             sources_sum += edge.distinct_sources() as f64;
             activations_sum += edge.activation_count as f64;
+            direction_sum += edge.forward_strength.max(edge.backward_strength) as f64;
         }
     }
     let n = groups.max(1) as f64;
@@ -599,6 +601,7 @@ fn run_planted_arm(
         planted_edge_strength_mean: strength_sum / e,
         planted_edge_distinct_sources_mean: sources_sum / e,
         planted_edge_activations_mean: activations_sum / e,
+        planted_edge_direction_mean: direction_sum / e,
     })
 }
 
@@ -634,7 +637,7 @@ mod planted_tests {
             eprintln!(
                 "  {:<22} recalls={:<3} sources={:<2} r@10={:.3} ndcg@10={:.3} mrr={:.3} \
                  planted_rank={:.2} top10={} access={:.1} importance={:.3} \
-                 edge(present={} strength={:.3} sources={:.1} activations={:.1})",
+                 edge(present={} strength={:.3} sources={:.1} activations={:.1} direction={:.3})",
                 r.arm,
                 r.recalls_per_group,
                 r.distinct_sources,
@@ -649,6 +652,7 @@ mod planted_tests {
                 r.planted_edge_strength_mean,
                 r.planted_edge_distinct_sources_mean,
                 r.planted_edge_activations_mean,
+                r.planted_edge_direction_mean,
             );
         }
         let control = row(&report, "control");
@@ -670,6 +674,19 @@ mod planted_tests {
             corroborate.planted_edge_strength_mean,
             repeat.planted_edge_strength_mean
         );
+
+        // Direction: the source that created the edge took one forward step; fifty
+        // repeats from it add none, and corroboration can only add.
+        use crate::constants::{COACTIVATION_FORWARD_BOOST, L1_INITIAL_WEIGHT};
+        let one_step = L1_INITIAL_WEIGHT as f64
+            + COACTIVATION_FORWARD_BOOST as f64 * (1.0 - L1_INITIAL_WEIGHT as f64);
+        assert!(
+            repeat.planted_edge_direction_mean <= one_step + 1e-6,
+            "repetition from one source built direction: {} > {}",
+            repeat.planted_edge_direction_mean,
+            one_step
+        );
+        assert!(corroborate.planted_edge_direction_mean >= repeat.planted_edge_direction_mean);
 
         // Rank: repetition does not improve on control.
         assert!(

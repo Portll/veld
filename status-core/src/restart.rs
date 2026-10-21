@@ -14,6 +14,12 @@
 //! A supervisor is never guessed from the environment: a process spawned by a
 //! launchd job inherits `XPC_SERVICE_NAME` without being the job. It is observed
 //! instead, as a new registry entry on the same port after the old pid is gone.
+//!
+//! A launchd job is asked rather than observed: when launchd names the pid as a
+//! job's main process, the job is started again with `launchctl kickstart` once
+//! the graceful stop has finished. Relaunching it from a recipe would take it out
+//! of launchd's KeepAlive and resource limits, and launchd itself does not bring it
+//! back after a clean exit when KeepAlive sets `SuccessfulExit` false.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -56,6 +62,10 @@ pub struct RestartRequest {
     /// Set on the new process over every other layer, e.g.
     /// `VELD_STORAGE_BACKEND` after a backend swap.
     pub env_overrides: Vec<(String, String)>,
+    /// Names the new process does not inherit from the caller; a layer may still
+    /// set them. `veld restart` drops what it read from `config.toml`, so the new
+    /// server reads that file itself instead of starting with its values pinned.
+    pub env_remove: Vec<String>,
     /// Appended with the new process's stdout and stderr.
     pub log_path: PathBuf,
 }
@@ -72,8 +82,10 @@ pub struct RestartOutcome {
     pub missing_env: Vec<String>,
     /// The variables that were given to the new process, by name.
     pub carried_env: Vec<String>,
-    /// Where the recipe came from: `registry`, `recipe` or `supervisor`.
+    /// Where the recipe came from: `registry`, `recipe`, `supervisor` or `launchd`.
     pub recipe_source: String,
+    /// The launchd job that was started again, as `gui/<uid>/<label>`.
+    pub supervisor: Option<String>,
 }
 
 fn fail(msg: impl Into<String>) -> StatusError {
@@ -125,10 +137,8 @@ pub fn rewrite_env_var(text: &str, key: &str, value: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
-        let names_key = !line.starts_with('#')
-            && line
-                .split_once('=')
-                .is_some_and(|(k, _)| k.trim() == key);
+        let names_key =
+            !line.starts_with('#') && line.split_once('=').is_some_and(|(k, _)| k.trim() == key);
         if names_key {
             if !replaced {
                 lines.push(format!("{key}={value}"));
@@ -189,7 +199,11 @@ fn capture_env(pid: u32) -> Option<Vec<(String, String)>> {
     Some(
         raw.split(|b| *b == 0)
             .filter_map(|entry| String::from_utf8(entry.to_vec()).ok())
-            .filter_map(|entry| entry.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .filter_map(|entry| {
+                entry
+                    .split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .filter(|(k, _)| carried(k))
             .collect(),
     )
@@ -198,6 +212,59 @@ fn capture_env(pid: u32) -> Option<Vec<(String, String)>> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn capture_env(_pid: u32) -> Option<Vec<(String, String)>> {
     None
+}
+
+/// The label of the job whose main process is `pid`, from `launchctl list` output
+/// (`PID\tStatus\tLabel`); a job that is not running shows `-` as its pid.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn launchd_label(listing: &str, pid: u32) -> Option<String> {
+    let pid = pid.to_string();
+    listing.lines().find_map(|line| {
+        let mut cols = line.split('\t');
+        let (job_pid, _status, label) = (cols.next()?, cols.next()?, cols.next()?);
+        (job_pid == pid).then(|| label.trim().to_string())
+    })
+}
+
+/// The launchd job whose main process is `pid`, as a `gui/<uid>/<label>` or
+/// `user/<uid>/<label>` service target. A process a job's script spawned without
+/// `exec` is not the main process and is not found. Blocking.
+#[cfg(target_os = "macos")]
+fn launchd_job(pid: u32) -> Option<String> {
+    let run = |args: &[&str]| -> Option<String> {
+        let out = Command::new(args[0]).args(&args[1..]).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let label = launchd_label(&run(&["launchctl", "list"])?, pid)?;
+    let uid = run(&["id", "-u"])?.trim().to_string();
+    ["gui", "user"]
+        .iter()
+        .map(|domain| format!("{domain}/{uid}/{label}"))
+        .find(|target| run(&["launchctl", "print", target]).is_some())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_job(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Start a launchd job that is not running. Without `-k`: that flag stops a running
+/// job first and kills it once the job's exit timeout passes, mid-flush for a server.
+fn kickstart(job: &str) -> Result<()> {
+    let out = Command::new("launchctl")
+        .args(["kickstart", job])
+        .output()
+        .map_err(|e| fail(format!("launchctl kickstart {job}: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(fail(format!(
+            "launchctl kickstart {job} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
 }
 
 /// The command line of a live process, executable first. `ps -o comm=` gives the
@@ -410,6 +477,109 @@ fn reap_in_background(mut child: std::process::Child) {
     });
 }
 
+/// `~/.config/veld/server.env`: the `KEY=VALUE` file Veld Desktop hands to the
+/// server it spawns, on every platform under `~/.config` (its own convention).
+pub fn server_env_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config").join("veld").join("server.env")
+}
+
+/// `<config>/veld`: the directory of `config.toml` and the instance registry.
+fn veld_config_dir() -> PathBuf {
+    crate::default_config_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// Where a relaunched server's output goes: `<config>/veld/logs/veld-<port>.log`.
+pub fn server_log_path(port: u16) -> PathBuf {
+    veld_config_dir()
+        .join("logs")
+        .join(format!("veld-{port}.log"))
+}
+
+/// Launch recipes saved from the monitor, keyed by base URL without a trailing
+/// slash: `<config>/veld/monitor/launch-recipes.json`, owner-readable only since a
+/// recipe's variables can hold keys.
+pub fn launch_recipes_path() -> PathBuf {
+    veld_config_dir()
+        .join("monitor")
+        .join("launch-recipes.json")
+}
+
+/// The saved launch recipes; empty when none were ever saved.
+pub fn load_launch_recipes() -> Result<BTreeMap<String, LaunchSpec>> {
+    let path = launch_recipes_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| StatusError::LaunchRecipes(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(StatusError::LaunchRecipes(format!(
+            "read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// The port in `base_url`, else the server's default.
+fn port_of(base_url: &str) -> u16 {
+    base_url
+        .trim_end_matches('/')
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(3030)
+}
+
+/// The restart the monitor and `veld restart` both make of `base_url`: the recipe
+/// saved for it, else the registry's; the operator's `server.env` as the base
+/// environment layer; output appended to [`server_log_path`] for its port.
+pub fn restart_request(
+    base_url: &str,
+    instance: Option<DiscoveredInstance>,
+    recipes: &BTreeMap<String, LaunchSpec>,
+    env_overrides: Vec<(String, String)>,
+) -> RestartRequest {
+    request_with_env_file(
+        base_url,
+        instance,
+        recipes,
+        &server_env_path(),
+        env_overrides,
+    )
+}
+
+fn request_with_env_file(
+    base_url: &str,
+    instance: Option<DiscoveredInstance>,
+    recipes: &BTreeMap<String, LaunchSpec>,
+    env_file: &Path,
+    env_overrides: Vec<(String, String)>,
+) -> RestartRequest {
+    let base_url = base_url.trim_end_matches('/').to_string();
+    let port = instance
+        .as_ref()
+        .map(|i| i.port)
+        .unwrap_or_else(|| port_of(&base_url));
+    let env_files = if env_file.is_file() {
+        vec![env_file.to_path_buf()]
+    } else {
+        Vec::new()
+    };
+    RestartRequest {
+        recipe: recipes.get(&base_url).cloned(),
+        base_url,
+        instance,
+        env_files,
+        env_overrides,
+        env_remove: Vec::new(),
+        log_path: server_log_path(port),
+    }
+}
+
 /// Stop the instance, if one is running, and bring it back. Resolves once
 /// `/health` answers again or with the reason it did not.
 pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
@@ -424,13 +594,36 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
         if pid == 0 {
             return Err(fail("the registry entry carries no pid"));
         }
-        captured = tokio::task::spawn_blocking(move || capture_env(pid))
+        let (env, job) = tokio::task::spawn_blocking(move || (capture_env(pid), launchd_job(pid)))
             .await
-            .map_err(|e| fail(e.to_string()))?
-            .unwrap_or_default();
+            .map_err(|e| fail(e.to_string()))?;
+        captured = env.unwrap_or_default();
 
         terminate(pid)?;
         wait_for_exit(pid).await?;
+
+        if let Some(job) = job {
+            let target = job.clone();
+            tokio::task::spawn_blocking(move || kickstart(&target))
+                .await
+                .map_err(|e| fail(e.to_string()))??;
+            if !wait_for_health(&http, &base_url).await {
+                return Err(fail(format!(
+                    "launchd started {job} again but {base_url} has not answered /health after {}s",
+                    READY_TIMEOUT.as_secs()
+                )));
+            }
+            return Ok(RestartOutcome {
+                base_url,
+                pid: None,
+                supervised: true,
+                log_path: None,
+                missing_env: Vec::new(),
+                carried_env: Vec::new(),
+                recipe_source: "launchd".into(),
+                supervisor: Some(job),
+            });
+        }
 
         let port = inst.port;
         let grace_end = Instant::now() + SUPERVISOR_GRACE;
@@ -454,6 +647,7 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
                     missing_env: Vec::new(),
                     carried_env: Vec::new(),
                     recipe_source: "supervisor".into(),
+                    supervisor: None,
                 });
             }
             tokio::time::sleep(POLL).await;
@@ -490,6 +684,9 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
     if let Some(cwd) = recipe.cwd.as_deref().filter(|d| Path::new(d).is_dir()) {
         cmd.current_dir(cwd);
     }
+    for key in &req.env_remove {
+        cmd.env_remove(key);
+    }
     let mut given: Vec<String> = Vec::new();
     let mut layer = |cmd: &mut Command, key: &str, value: &str| {
         if !value.is_empty() {
@@ -520,7 +717,9 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
         .map(|r| r.env_names.clone())
         .unwrap_or_default()
         .into_iter()
-        .filter(|n| !given.contains(n) && std::env::var_os(n).is_none())
+        .filter(|n| {
+            !given.contains(n) && (req.env_remove.contains(n) || std::env::var_os(n).is_none())
+        })
         .collect();
     let mut carried_env = given;
     carried_env.sort();
@@ -548,6 +747,7 @@ pub async fn restart_instance(req: RestartRequest) -> Result<RestartOutcome> {
                 missing_env,
                 carried_env,
                 recipe_source: recipe_source.into(),
+                supervisor: None,
             });
         }
         tokio::time::sleep(POLL).await;
@@ -565,11 +765,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn launchd_label_is_the_job_whose_main_process_is_the_pid() {
+        let listing = "PID\tStatus\tLabel\n\
+                       -\t0\tnet.portll.veld-upstream-triage\n\
+                       50447\t-9\tnet.portll.veld-redb-replica\n\
+                       4404\t0\tnet.portll.veld-embedder\n";
+        assert_eq!(
+            launchd_label(listing, 50447).as_deref(),
+            Some("net.portll.veld-redb-replica")
+        );
+        assert_eq!(launchd_label(listing, 5044), None);
+        assert_eq!(launchd_label(listing, 0), None);
+        assert_eq!(launchd_label("", 50447), None);
+    }
+
+    #[test]
     fn split_cmdline_keeps_an_executable_path_with_spaces() {
         let exe = "/Applications/Veld Desktop.app/Contents/MacOS/veld";
         assert_eq!(
             split_cmdline(&format!("{exe} server --port 3031"), Some(exe)).unwrap(),
-            vec![exe.to_string(), "server".into(), "--port".into(), "3031".into()]
+            vec![
+                exe.to_string(),
+                "server".into(),
+                "--port".into(),
+                "3031".into()
+            ]
         );
         assert_eq!(
             split_cmdline("veld server", Some("/other/path")).unwrap(),
@@ -604,11 +824,102 @@ mod tests {
     fn rewrite_keeps_every_other_line() {
         let text = "# live store\nVELD_STORAGE_BACKEND=rocksdb\nVELD_EMBEDDER=http\n";
         let out = rewrite_env_var(text, "VELD_STORAGE_BACKEND", "redb");
-        assert_eq!(out, "# live store\nVELD_STORAGE_BACKEND=redb\nVELD_EMBEDDER=http\n");
+        assert_eq!(
+            out,
+            "# live store\nVELD_STORAGE_BACKEND=redb\nVELD_EMBEDDER=http\n"
+        );
         let appended = rewrite_env_var("VELD_EMBEDDER=http", "VELD_STORAGE_BACKEND", "redb");
         assert_eq!(appended, "VELD_EMBEDDER=http\nVELD_STORAGE_BACKEND=redb\n");
         let deduped = rewrite_env_var("A=1\nA=2\n", "A", "3");
         assert_eq!(deduped, "A=3\n");
+    }
+
+    fn instance_on(port: u16) -> DiscoveredInstance {
+        DiscoveredInstance {
+            base_url: format!("http://127.0.0.1:{port}"),
+            label: String::new(),
+            pid: 4242,
+            host: "127.0.0.1".into(),
+            port,
+            version: String::new(),
+            data_path: String::new(),
+            started_at: None,
+            last_heartbeat: chrono::Utc::now(),
+            launch: None,
+        }
+    }
+
+    #[test]
+    fn restart_request_takes_the_recipe_saved_for_the_base_url() {
+        let saved = LaunchSpec {
+            exe: "/usr/local/bin/veld".into(),
+            args: vec!["server".into()],
+            ..LaunchSpec::default()
+        };
+        let mut recipes = BTreeMap::new();
+        recipes.insert("http://127.0.0.1:3031".to_string(), saved.clone());
+        recipes.insert("http://127.0.0.1:3030".to_string(), LaunchSpec::default());
+        let env_file = std::env::temp_dir().join(format!(
+            "veld-status-core-restart-request-{}.env",
+            std::process::id()
+        ));
+        std::fs::write(&env_file, "VELD_EMBEDDER=http\n").unwrap();
+        let overrides = vec![("VELD_STORAGE_BACKEND".to_string(), "redb".to_string())];
+
+        let req = request_with_env_file(
+            "http://127.0.0.1:3031/",
+            Some(instance_on(3031)),
+            &recipes,
+            &env_file,
+            overrides.clone(),
+        );
+        let _ = std::fs::remove_file(&env_file);
+
+        assert_eq!(req.base_url, "http://127.0.0.1:3031");
+        assert_eq!(req.recipe, Some(saved));
+        assert_eq!(req.instance.map(|i| i.pid), Some(4242));
+        assert_eq!(req.env_files, vec![env_file]);
+        assert_eq!(req.env_overrides, overrides);
+        assert!(req.env_remove.is_empty());
+        assert_eq!(req.log_path, server_log_path(3031));
+        assert!(req
+            .log_path
+            .ends_with(Path::new("veld").join("logs").join("veld-3031.log")));
+    }
+
+    #[test]
+    fn restart_request_without_an_instance_logs_by_the_base_url_port() {
+        let missing = std::env::temp_dir().join("veld-status-core-no-such-server.env");
+        let req = request_with_env_file(
+            "http://localhost:3040",
+            None,
+            &BTreeMap::new(),
+            &missing,
+            Vec::new(),
+        );
+        assert!(req.recipe.is_none());
+        assert!(req.instance.is_none());
+        assert!(
+            req.env_files.is_empty(),
+            "an absent server.env is not a layer"
+        );
+        assert_eq!(req.log_path, server_log_path(3040));
+        assert_eq!(port_of("http://localhost"), 3030);
+        assert_eq!(port_of("http://127.0.0.1:3032/"), 3032);
+    }
+
+    #[test]
+    fn shared_paths_sit_beside_the_registry() {
+        let veld_dir = crate::instances_dir().parent().unwrap().to_path_buf();
+        assert_eq!(
+            launch_recipes_path(),
+            veld_dir.join("monitor").join("launch-recipes.json")
+        );
+        assert_eq!(
+            server_log_path(3030),
+            veld_dir.join("logs").join("veld-3030.log")
+        );
+        assert!(server_env_path().ends_with(Path::new(".config").join("veld").join("server.env")));
     }
 
     // Live run against a scratch server named by VELD_RESTART_E2E_BASE_URL: inspect
@@ -628,19 +939,33 @@ mod tests {
             .expect("the scratch server is in the registry");
         let old_pid = inst.pid;
         let spec = inspect_process(old_pid).expect("inspect the scratch server");
-        eprintln!("inspected: {} {:?} cwd={:?} env={:?}", spec.exe, spec.args, spec.cwd, spec.env.keys().collect::<Vec<_>>());
+        eprintln!(
+            "inspected: {} {:?} cwd={:?} env={:?}",
+            spec.exe,
+            spec.args,
+            spec.cwd,
+            spec.env.keys().collect::<Vec<_>>()
+        );
         assert!(spec.exe.ends_with("veld"));
         assert_eq!(spec.args, vec!["server".to_string()]);
         assert!(spec.env.contains_key("VELD_PORT"));
 
         let home = std::env::var("HOME").unwrap_or_default();
-        let env_file = PathBuf::from(home).join(".config").join("veld").join("server.env");
+        let env_file = PathBuf::from(home)
+            .join(".config")
+            .join("veld")
+            .join("server.env");
         let out = restart_instance(RestartRequest {
             base_url: key.clone(),
             instance: Some(inst),
             recipe: None,
-            env_files: if env_file.is_file() { vec![env_file] } else { vec![] },
+            env_files: if env_file.is_file() {
+                vec![env_file]
+            } else {
+                vec![]
+            },
             env_overrides: vec![],
+            env_remove: vec![],
             log_path: std::env::temp_dir().join("veld-restart-e2e.log"),
         })
         .await
@@ -653,7 +978,10 @@ mod tests {
         // Nothing the old process was actually started with may be dropped. Names the
         // server set on itself after exec can show up here from older registry entries.
         for name in &out.missing_env {
-            assert!(!spec.env.contains_key(name), "{name} was in the old environment but not carried");
+            assert!(
+                !spec.env.contains_key(name),
+                "{name} was in the old environment but not carried"
+            );
         }
         assert!(out.carried_env.iter().any(|k| k == "VELD_PORT"));
         let back = discover_instances()
@@ -682,7 +1010,11 @@ mod tests {
         let exe = std::env::current_exe().expect("test binary path");
         let dir = std::env::temp_dir();
         let mut child = Command::new(&exe)
-            .args(["restart::tests::child_waits_for_capture", "--exact", "--ignored"])
+            .args([
+                "restart::tests::child_waits_for_capture",
+                "--exact",
+                "--ignored",
+            ])
             .current_dir(&dir)
             .env("VELD_RESTART_TEST_CHILD", "1")
             .env("VELD_RESTART_TEST_VAR", "two words")
@@ -697,7 +1029,10 @@ mod tests {
         let spec = spec.expect("read the child's command line and environment");
         assert_eq!(spec.exe, exe.to_string_lossy());
         assert_eq!(spec.args[0], "restart::tests::child_waits_for_capture");
-        assert_eq!(spec.env.get("VELD_RESTART_TEST_VAR").map(String::as_str), Some("two words"));
+        assert_eq!(
+            spec.env.get("VELD_RESTART_TEST_VAR").map(String::as_str),
+            Some("two words")
+        );
         assert!(spec.env.keys().all(|k| carried(k)));
         let cwd = spec.cwd.expect("cwd is readable");
         let canonical = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));

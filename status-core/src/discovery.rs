@@ -34,6 +34,10 @@ pub struct DiscoveredInstance {
     pub version: String,
     #[serde(default)]
     pub data_path: String,
+    /// When the server process started: its own uptime, unlike a watcher's
+    /// first successful probe.
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
     pub last_heartbeat: DateTime<Utc>,
     /// How the server was started; absent for entries written by older servers.
     #[serde(default)]
@@ -93,6 +97,10 @@ pub fn discover_instances() -> Vec<DiscoveredInstance> {
             out.push(inst);
         }
     }
-    out.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.base_url.cmp(&b.base_url)));
+    out.sort_by(|a, b| {
+        a.port
+            .cmp(&b.port)
+            .then_with(|| a.base_url.cmp(&b.base_url))
+    });
     out
 }

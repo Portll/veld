@@ -39,6 +39,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::intent_log::{payload, IntentPayload, LogMode};
@@ -109,7 +110,11 @@ pub fn own_api_key() -> Option<String> {
     ["VELD_API_KEYS", "VELD_API_KEY", "VELD_DEV_API_KEY"]
         .iter()
         .filter_map(|k| std::env::var(k).ok())
-        .flat_map(|v| v.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+        .flat_map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        })
         .find(|k| !k.is_empty())
 }
 
@@ -134,9 +139,13 @@ pub struct UserProgress {
     pub journaled_records: u64,
     /// Leader log length at the last poll that found nothing new.
     pub source_bytes: u64,
-    /// The leader's next LSN at the last page; lag is `leader_head_lsn - 1 - applied_lsn`.
+    /// The leader's next LSN when this tenant was last read.
     #[serde(default)]
     pub leader_head_lsn: Option<u64>,
+    /// Leader frames not yet applied here: `leader_head_lsn - 1 - applied_lsn`, or the
+    /// whole leader log when nothing is applied.
+    #[serde(default)]
+    pub lag: Option<u64>,
     /// The leader log identity this cursor belongs to (see [`FeedPage::log_created`]).
     #[serde(default)]
     pub log_created: Option<u64>,
@@ -152,14 +161,30 @@ pub struct UserProgress {
     pub retry_at: Option<Instant>,
 }
 
+impl UserProgress {
+    fn refresh_lag(&mut self) {
+        self.lag = match (self.leader_head_lsn, self.applied_lsn) {
+            (Some(head), Some(applied)) => Some(head.saturating_sub(1).saturating_sub(applied)),
+            (Some(head), None) => Some(head),
+            (None, _) => None,
+        };
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FollowStatus {
     pub target: Option<FollowTarget>,
     /// Bumped by every follow and unfollow; a poll started under an older value
     /// stops at its next page and writes nothing.
     pub generation: u64,
+    /// Passes over every tenant that finished. An initial sync is one pass that can
+    /// run for hours: `pass_started`, `syncing` and `pages` show it moving.
     pub polls: u64,
     pub pages: u64,
+    /// When the pass in progress, or the last one, began.
+    pub pass_started: Option<DateTime<Utc>>,
+    /// The tenant the pass in progress is syncing.
+    pub syncing: Option<String>,
     pub last_poll: Option<DateTime<Utc>>,
     pub last_applied: Option<DateTime<Utc>>,
     /// The last failure to reach the leader at all; per-tenant failures are on the tenant.
@@ -188,6 +213,7 @@ impl FollowStatus {
         entry.journaled_records += journaled;
         entry.leader_head_lsn = Some(page.head_lsn);
         entry.log_created = Some(page.log_created);
+        entry.refresh_lag();
         self.pages += 1;
         self.last_applied = Some(Utc::now());
         Some(self.users.clone())
@@ -281,15 +307,18 @@ pub fn normalize_source(raw: &str) -> Result<String> {
 
 /// Leader side: every user's log length, by `stat` alone.
 pub fn user_logs(manager: &MultiUserMemoryManager) -> Vec<UserLogInfo> {
+    // Only tenants with a log: `records` answers 404 for the others, so listing them
+    // would leave a follower retrying a tenant it can never be fed.
     let mut out: Vec<UserLogInfo> = manager
         .list_users()
         .into_iter()
         .filter_map(|user_id| {
             let dir = manager.user_dir(&user_id).ok()?;
-            let log_bytes = std::fs::metadata(dir.join("intent.log"))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            Some(UserLogInfo { user_id, log_bytes })
+            let log = std::fs::metadata(dir.join("intent.log")).ok()?;
+            log.is_file().then_some(UserLogInfo {
+                user_id,
+                log_bytes: log.len(),
+            })
         })
         .collect();
     out.sort_by(|a, b| a.user_id.cmp(&b.user_id));
@@ -324,22 +353,7 @@ pub fn feed(
         (guard.log().iter()?, guard.log().next_lsn().0, log_created)
     };
     let floor = after_lsn.map(|l| l + 1).unwrap_or(0);
-    let mut records = Vec::new();
-    let mut more = false;
-    for frame in iter {
-        let record = frame.context("reading the intent log")?;
-        if record.lsn.0 < floor {
-            continue;
-        }
-        if records.len() >= limit {
-            more = true;
-            break;
-        }
-        records.push(FeedRecord {
-            lsn: record.lsn.0,
-            frame_b64: base64::engine::general_purpose::STANDARD.encode(&record.payload),
-        });
-    }
+    let (records, more) = page_below_head(iter, floor, head_lsn, limit)?;
     Ok(FeedPage {
         user_id: user_id.to_string(),
         records,
@@ -347,6 +361,45 @@ pub fn feed(
         more,
         log_created,
     })
+}
+
+/// Frames from `floor` up to `limit`, ending at the last frame below `head_lsn`.
+/// The file is read after the writer lock is released, so anything at or past the
+/// head was appended later: it may still be partly flushed (and read as torn) or be
+/// rolled back by a failed sync, after which its LSN names a different frame. LSNs
+/// are contiguous, so the frame at `head_lsn - 1` is the last one read.
+fn page_below_head<E>(
+    frames: impl Iterator<Item = std::result::Result<crate::intent_log::IntentRecord, E>>,
+    floor: u64,
+    head_lsn: u64,
+    limit: usize,
+) -> Result<(Vec<FeedRecord>, bool)>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut records = Vec::new();
+    if floor >= head_lsn {
+        return Ok((records, false));
+    }
+    for frame in frames {
+        let record = frame.context("reading the intent log")?;
+        if record.lsn.0 >= head_lsn {
+            break;
+        }
+        if record.lsn.0 >= floor {
+            if records.len() >= limit {
+                return Ok((records, true));
+            }
+            records.push(FeedRecord {
+                lsn: record.lsn.0,
+                frame_b64: base64::engine::general_purpose::STANDARD.encode(&record.payload),
+            });
+        }
+        if record.lsn.0 + 1 == head_lsn {
+            break;
+        }
+    }
+    Ok((records, false))
 }
 
 /// Why a tenant's cursor no longer fits the leader's log, or None when it does.
@@ -392,7 +445,10 @@ pub fn coalesce(frames: Vec<(u64, IntentPayload)>) -> Vec<(u64, IntentPayload)> 
     for id in order {
         let mut frames = by_id.remove(&id).unwrap_or_default();
         let last_snapshot = frames.iter().rposition(|(_, p)| {
-            matches!(p, IntentPayload::Remember { .. } | IntentPayload::Update { .. })
+            matches!(
+                p,
+                IntentPayload::Remember { .. } | IntentPayload::Update { .. }
+            )
         });
         if let Some(i) = last_snapshot {
             frames.drain(..i);
@@ -414,8 +470,9 @@ fn check_tenant(user_id: &str, frames: &[(u64, IntentPayload)]) -> Result<()> {
 }
 
 /// Follower side: apply a page of leader frames to the canonical store, then
-/// journal each applied frame here so the local projections and log follow. The
-/// page is coalesced first; snapshots are indexed with one BM25 commit. Idempotent:
+/// journal the applied frames here, as one batch, so the local projections and log follow. The
+/// page is coalesced first; the BM25 projection indexes snapshots as their frames
+/// are journaled, on its own commit cadence. Idempotent:
 /// a snapshot is an upsert, a forget of an unknown id is a no-op. Returns the
 /// number of frames journaled. Blocking.
 pub fn apply_replicated_page(
@@ -456,16 +513,17 @@ pub fn apply_replicated_page(
         }
     }
     memory_sys.read().upsert_memories(&snapshots)?;
-    let mut journaled = 0u64;
     for (_, payload) in &frames {
         apply_non_snapshot(manager, user_id, payload)?;
-        manager.journal_and_apply(user_id, payload)?;
-        journaled += 1;
     }
-    Ok(journaled)
+    // One writer lock, append batch and fsync for the page rather than one per frame.
+    // All or nothing: a page that fails journals no frame, and its retry adds no
+    // duplicates of the frames before the failure.
+    let payloads: Vec<IntentPayload> = frames.into_iter().map(|(_, payload)| payload).collect();
+    Ok(manager.journal_and_apply_batch(user_id, &payloads)?.len() as u64)
 }
 
-/// The store-side effect of a `Forget` or `Anchor` frame; snapshots are handled in
+/// The store-side effect of a `Forget`, `Anchor` or `SetAnchored` frame; snapshots are handled in
 /// bulk by [`apply_replicated_page`].
 fn apply_non_snapshot(
     manager: &MultiUserMemoryManager,
@@ -497,6 +555,20 @@ fn apply_non_snapshot(
                 } else if *importance < memory.importance() {
                     memory.set_anchored(false);
                 }
+                memory.set_importance(*importance);
+                guard.update_memory(&memory)?;
+            }
+        }
+        IntentPayload::SetAnchored {
+            memory_id,
+            anchored,
+            importance,
+            ..
+        } => {
+            let id = MemoryId(uuid::Uuid::parse_str(memory_id)?);
+            let guard = memory_sys.read();
+            if let Ok(memory) = guard.get_memory(&id) {
+                memory.set_anchored(*anchored);
                 memory.set_importance(*importance);
                 guard.update_memory(&memory)?;
             }
@@ -671,7 +743,10 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     let resp = http
         .get(&url)
         .header("X-API-Key", &target.api_key)
-        .header(crate::handlers::admin::ADMIN_API_KEY_HEADER, &target.admin_key)
+        .header(
+            crate::handlers::admin::ADMIN_API_KEY_HEADER,
+            &target.admin_key,
+        )
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -680,7 +755,10 @@ async fn get_json<T: serde::de::DeserializeOwned>(
         .await
         .with_context(|| format!("GET {url}"))?;
     if !status.is_success() {
-        bail!("GET {url}: {status}: {}", echo(&String::from_utf8_lossy(&body)));
+        bail!(
+            "GET {url}: {status}: {}",
+            echo(&String::from_utf8_lossy(&body))
+        );
     }
     serde_json::from_slice(&body).with_context(|| format!("GET {url}: decoding the reply"))
 }
@@ -745,10 +823,12 @@ async fn sync_user(
     generation: u64,
     cursor: &Path,
     info: &UserLogInfo,
+    shutdown: &CancellationToken,
 ) -> Result<u64> {
     let mut consumed = 0u64;
+    let mut head: u64;
     loop {
-        if !is_current(generation) {
+        if shutdown.is_cancelled() || !is_current(generation) {
             return Ok(consumed);
         }
         let progress = FOLLOW
@@ -760,9 +840,16 @@ async fn sync_user(
         let path = format!(
             "/api/admin/replication/records?user_id={}&after_lsn={}&limit={FEED_LIMIT}",
             percent_encode(&info.user_id),
-            progress.applied_lsn.map(|l| l.to_string()).unwrap_or_default()
+            progress
+                .applied_lsn
+                .map(|l| l.to_string())
+                .unwrap_or_default()
         );
-        let page: FeedPage = get_json(http, target, &path).await?;
+        let page: FeedPage = tokio::select! {
+            page = get_json(http, target, &path) => page?,
+            () = shutdown.cancelled() => return Ok(consumed),
+        };
+        head = page.head_lsn;
         if let Some(reason) = divergence(&progress, &page) {
             mark_diverged(generation, cursor, &info.user_id, &reason)?;
             return Ok(consumed);
@@ -811,6 +898,8 @@ async fn sync_user(
         }
         let entry = status.users.entry(info.user_id.clone()).or_default();
         entry.source_bytes = info.log_bytes;
+        entry.leader_head_lsn = Some(head);
+        entry.refresh_lag();
         status.users.clone()
     };
     save_cursor(cursor, &users)?;
@@ -826,12 +915,28 @@ async fn poll_once(
     target: &FollowTarget,
     generation: u64,
     interval: Duration,
+    shutdown: &CancellationToken,
 ) -> Result<u64> {
-    let leader: LeaderStatus = get_json(http, target, "/api/admin/replication/status").await?;
+    let leader: LeaderStatus = tokio::select! {
+        leader = get_json(http, target, "/api/admin/replication/status") => leader?,
+        () = shutdown.cancelled() => return Ok(0),
+    };
     let cursor = cursor_path(&manager.base_path, &target.source);
+    let set_syncing = |tenant: Option<&str>| {
+        let mut status = FOLLOW.write();
+        if status.generation == generation {
+            status.syncing = tenant.map(str::to_string);
+        }
+    };
+    {
+        let mut status = FOLLOW.write();
+        if status.generation == generation {
+            status.pass_started = Some(Utc::now());
+        }
+    }
     let mut consumed = 0u64;
     for info in &leader.users {
-        if !is_current(generation) {
+        if shutdown.is_cancelled() || !is_current(generation) {
             break;
         }
         let progress = FOLLOW
@@ -863,7 +968,8 @@ async fn poll_once(
                 continue;
             }
         }
-        match sync_user(manager, http, target, generation, &cursor, info).await {
+        set_syncing(Some(&info.user_id));
+        match sync_user(manager, http, target, generation, &cursor, info, shutdown).await {
             Ok(n) => {
                 consumed += n;
                 let mut status = FOLLOW.write();
@@ -893,13 +999,16 @@ async fn poll_once(
             }
         }
     }
+    set_syncing(None);
     Ok(consumed)
 }
 
 /// The follower loop: idle until something is followed, then poll the leader
-/// every interval, backing off while the leader cannot be reached. Runs for the
-/// life of the server.
-pub async fn run_follower(manager: Arc<MultiUserMemoryManager>) {
+/// every interval, backing off while the leader cannot be reached. Returns once
+/// `shutdown` is cancelled: a page already being applied finishes and saves its
+/// cursor, and no request or page starts after the cancel, so the store flush and
+/// the vector-index save at shutdown see no later writes.
+pub async fn run_follower(manager: Arc<MultiUserMemoryManager>, shutdown: CancellationToken) {
     let interval = interval_from_env();
     let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -919,7 +1028,11 @@ pub async fn run_follower(manager: Arc<MultiUserMemoryManager>) {
         };
         let mut wait = interval;
         if let Some(target) = target {
-            let outcome = poll_once(&manager, &http, &target, generation, interval).await;
+            let outcome =
+                poll_once(&manager, &http, &target, generation, interval, &shutdown).await;
+            if shutdown.is_cancelled() {
+                break;
+            }
             let mut status = FOLLOW.write();
             if status.generation == generation {
                 status.polls += 1;
@@ -948,8 +1061,12 @@ pub async fn run_follower(manager: Arc<MultiUserMemoryManager>) {
                 failures = 0;
             }
         }
-        tokio::time::sleep(wait).await;
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = shutdown.cancelled() => break,
+        }
     }
+    tracing::info!("replication: follower stopped for shutdown");
 }
 
 #[cfg(test)]
@@ -982,6 +1099,7 @@ mod tests {
                 journaled_records: 7,
                 source_bytes: 1234,
                 leader_head_lsn: Some(90),
+                lag: Some(48),
                 log_created: Some(1_700_000_000),
                 diverged: Some("rolled back".into()),
                 last_error: None,
@@ -995,7 +1113,10 @@ mod tests {
         assert_eq!(back["alice"].source_bytes, 1234);
         assert_eq!(back["alice"].log_created, Some(1_700_000_000));
         assert_eq!(back["alice"].diverged.as_deref(), Some("rolled back"));
-        assert!(back["alice"].retry_at.is_none(), "backoff deadlines are not persisted");
+        assert!(
+            back["alice"].retry_at.is_none(),
+            "backoff deadlines are not persisted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1054,7 +1175,11 @@ mod tests {
         assert!(!is_loopback_source("https://leader.example:3030"));
         assert!(is_same_instance("http://localhost:3030", "127.0.0.1", 3030));
         assert!(is_same_instance("http://127.0.0.1:3030", "0.0.0.0", 3030));
-        assert!(!is_same_instance("http://127.0.0.1:3031", "127.0.0.1", 3030));
+        assert!(!is_same_instance(
+            "http://127.0.0.1:3031",
+            "127.0.0.1",
+            3030
+        ));
         assert_eq!(source_port("https://leader.example"), Some(443));
     }
 
@@ -1084,10 +1209,22 @@ mod tests {
             ..UserProgress::default()
         };
         assert!(divergence(&caught_up, &page(100, 7)).is_none());
-        assert!(divergence(&caught_up, &page(100, 8)).is_some(), "log recreated");
-        assert!(divergence(&caught_up, &page(99, 7)).is_some(), "head at the applied lsn");
-        assert!(divergence(&caught_up, &page(40, 7)).is_some(), "rolled back");
-        assert!(divergence(&caught_up, &page(100, 0)).is_none(), "legacy log has no identity");
+        assert!(
+            divergence(&caught_up, &page(100, 8)).is_some(),
+            "log recreated"
+        );
+        assert!(
+            divergence(&caught_up, &page(99, 7)).is_some(),
+            "head at the applied lsn"
+        );
+        assert!(
+            divergence(&caught_up, &page(40, 7)).is_some(),
+            "rolled back"
+        );
+        assert!(
+            divergence(&caught_up, &page(100, 0)).is_none(),
+            "legacy log has no identity"
+        );
     }
 
     #[test]
@@ -1099,7 +1236,9 @@ mod tests {
         let p = page(10, 1);
         assert!(status.record_page(2, "u", &p, 9, 10, 4).is_none());
         assert!(status.users.is_empty());
-        let saved = status.record_page(3, "u", &p, 9, 10, 4).expect("current poll");
+        let saved = status
+            .record_page(3, "u", &p, 9, 10, 4)
+            .expect("current poll");
         assert_eq!(saved["u"].applied_lsn, Some(9));
         assert_eq!(saved["u"].leader_head_lsn, Some(10));
         assert_eq!(status.pages, 1);
@@ -1122,6 +1261,45 @@ mod tests {
         assert_eq!(echo("  short  "), "short");
     }
 
+    fn record(lsn: u64) -> std::result::Result<crate::intent_log::IntentRecord, std::io::Error> {
+        Ok(crate::intent_log::IntentRecord {
+            lsn: crate::intent_log::Lsn(lsn),
+            payload: vec![lsn as u8],
+        })
+    }
+
+    fn lsns(page: &[FeedRecord]) -> Vec<u64> {
+        page.iter().map(|r| r.lsn).collect()
+    }
+
+    #[test]
+    fn the_feed_ends_below_the_head_it_captured() {
+        let torn = || std::iter::once(Err(std::io::Error::other("truncated frame")));
+
+        let appended_after_capture = (0..5).map(record).chain(torn());
+        let (page, more) = page_below_head(appended_after_capture, 0, 4, 500).unwrap();
+        assert_eq!(
+            lsns(&page),
+            vec![0, 1, 2, 3],
+            "frame 4 came after the head was read"
+        );
+        assert!(!more);
+
+        let (page, _) = page_below_head((0..4).map(record).chain(torn()), 2, 4, 500)
+            .expect("a frame being flushed past the head is never read");
+        assert_eq!(lsns(&page), vec![2, 3]);
+
+        let (page, more) = page_below_head((0..4).map(record), 0, 4, 2).unwrap();
+        assert_eq!(lsns(&page), vec![0, 1]);
+        assert!(more);
+        let (page, more) = page_below_head((0..2).map(record), 0, 2, 2).unwrap();
+        assert_eq!(lsns(&page), vec![0, 1]);
+        assert!(!more, "the page that reaches the head is the last");
+
+        let (page, more) = page_below_head((0..4).map(record).chain(torn()), 4, 4, 500).unwrap();
+        assert!(page.is_empty() && !more);
+    }
+
     fn frame(lsn: u64, id: &str, kind: &str) -> (u64, IntentPayload) {
         frame_for("u", lsn, id, kind)
     }
@@ -1130,19 +1308,299 @@ mod tests {
         let sv = Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
         let user_id = user.to_string();
         let p = match kind {
-            "remember" => IntentPayload::Remember { user_id, memory_id: id.into(), memory_bincode: vec![lsn as u8], schema_version: sv },
-            "update" => IntentPayload::Update { user_id, memory_id: id.into(), memory_bincode: vec![lsn as u8], schema_version: sv },
-            "forget" => IntentPayload::Forget { user_id, memory_id: id.into(), schema_version: sv },
-            _ => IntentPayload::Anchor { user_id, memory_id: id.into(), importance: 0.9, schema_version: sv },
+            "remember" => IntentPayload::Remember {
+                user_id,
+                memory_id: id.into(),
+                memory_bincode: vec![lsn as u8],
+                schema_version: sv,
+            },
+            "update" => IntentPayload::Update {
+                user_id,
+                memory_id: id.into(),
+                memory_bincode: vec![lsn as u8],
+                schema_version: sv,
+            },
+            "forget" => IntentPayload::Forget {
+                user_id,
+                memory_id: id.into(),
+                schema_version: sv,
+            },
+            _ => IntentPayload::Anchor {
+                user_id,
+                memory_id: id.into(),
+                importance: 0.9,
+                schema_version: sv,
+            },
         };
         (lsn, p)
+    }
+
+    #[test]
+    fn lag_counts_the_leader_frames_not_yet_applied() {
+        let mut p = UserProgress {
+            leader_head_lsn: Some(41_000),
+            applied_lsn: Some(16_499),
+            ..Default::default()
+        };
+        p.refresh_lag();
+        assert_eq!(p.lag, Some(24_500));
+        p.applied_lsn = Some(40_999);
+        p.refresh_lag();
+        assert_eq!(
+            p.lag,
+            Some(0),
+            "caught up: the leader's last LSN is head - 1"
+        );
+        p.applied_lsn = None;
+        p.refresh_lag();
+        assert_eq!(p.lag, Some(41_000), "nothing applied: the whole log");
+        p.leader_head_lsn = None;
+        p.refresh_lag();
+        assert_eq!(p.lag, None);
+    }
+
+    #[tokio::test]
+    async fn the_follower_returns_once_shutdown_is_cancelled() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let shutdown = CancellationToken::new();
+        let follower = tokio::spawn(run_follower(Arc::new(manager), shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!follower.is_finished(), "the follower runs until cancelled");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), follower)
+            .await
+            .expect("the follower returns within a second of the cancel, not after its interval")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_release_that_keeps_importance_reaches_the_follower() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let memory_sys = manager.get_user_memory("u").unwrap();
+        let id = memory_sys
+            .read()
+            .remember(
+                crate::memory::types::Experience {
+                    content: "the deploy key rotates on the first of the month".into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let memory = memory_sys.read().get_memory(&id).unwrap();
+        memory.set_anchored(true);
+        memory_sys.read().update_memory(&memory).unwrap();
+        let importance = memory.importance();
+        let anchored = || memory_sys.read().get_memory(&id).unwrap().is_anchored();
+        let sv = Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
+
+        let legacy = IntentPayload::Anchor {
+            user_id: "u".into(),
+            memory_id: id.0.to_string(),
+            importance,
+            schema_version: sv,
+        };
+        apply_non_snapshot(&manager, "u", &legacy).unwrap();
+        assert!(
+            anchored(),
+            "a legacy frame cannot say the anchor was released"
+        );
+
+        let release = IntentPayload::SetAnchored {
+            user_id: "u".into(),
+            memory_id: id.0.to_string(),
+            anchored: false,
+            importance,
+            schema_version: sv,
+        };
+        apply_non_snapshot(&manager, "u", &release).unwrap();
+        assert!(!anchored());
+        assert_eq!(
+            memory_sys.read().get_memory(&id).unwrap().importance(),
+            importance
+        );
+    }
+
+    #[test]
+    fn a_page_lands_in_the_store_and_the_local_log_in_one_batch() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let sv = Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
+        let snapshot = |content: &str| {
+            let memory = crate::memory::types::Memory::new(
+                MemoryId(uuid::Uuid::new_v4()),
+                crate::memory::types::Experience {
+                    content: content.to_string(),
+                    ..Default::default()
+                },
+                0.5,
+                None,
+                None,
+                None,
+                None,
+            );
+            let bytes =
+                bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
+            (memory.id, bytes)
+        };
+        let (first, first_bytes) = snapshot("the harbour crane is serviced in spring");
+        let (second, second_bytes) = snapshot("the tide gauge reads high on Thursdays");
+        let frames = vec![
+            (
+                10,
+                IntentPayload::Remember {
+                    user_id: "u".into(),
+                    memory_id: first.0.to_string(),
+                    memory_bincode: first_bytes,
+                    schema_version: sv,
+                },
+            ),
+            (
+                11,
+                IntentPayload::Remember {
+                    user_id: "u".into(),
+                    memory_id: second.0.to_string(),
+                    memory_bincode: second_bytes,
+                    schema_version: sv,
+                },
+            ),
+            (
+                12,
+                IntentPayload::SetAnchored {
+                    user_id: "u".into(),
+                    memory_id: first.0.to_string(),
+                    anchored: true,
+                    importance: 0.9,
+                    schema_version: sv,
+                },
+            ),
+        ];
+
+        assert_eq!(apply_replicated_page(&manager, "u", frames).unwrap(), 3);
+
+        let memory_sys = manager.get_user_memory("u").unwrap();
+        assert!(memory_sys.read().get_memory(&first).unwrap().is_anchored());
+        assert!(memory_sys.read().get_memory(&second).is_ok());
+        let writer = manager.get_user_journaled_writer("u").unwrap();
+        let mut journaled: Vec<String> = writer
+            .lock()
+            .log()
+            .iter()
+            .unwrap()
+            .map(|record| {
+                let (_, payload) = payload::decode_record(&record.unwrap()).unwrap();
+                payload.memory_id().to_string()
+            })
+            .collect();
+        journaled.sort();
+        let mut expected = vec![
+            first.0.to_string(),
+            first.0.to_string(),
+            second.0.to_string(),
+        ];
+        expected.sort();
+        assert_eq!(journaled, expected, "the page's frames, once each");
+    }
+
+    /// An update, a bulk forget and a batch remember on the leader reach a follower
+    /// through the leader's log, with their ids: the paths that did not journal before.
+    #[tokio::test]
+    async fn an_update_a_bulk_forget_and_a_batch_remember_reach_the_follower() {
+        use crate::handlers::test_helpers::{post_json, put_json, send, TestHarness};
+        use axum::http::StatusCode;
+
+        let leader = TestHarness::new();
+        let user = "replica-user";
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/remember/batch",
+                &serde_json::json!({
+                    "user_id": user,
+                    "memories": [
+                        {"content": "the dredger works the channel at night", "tags": ["keep"]},
+                        {"content": "the old pier is closed to walkers", "tags": ["sweep"]},
+                        {"content": "the lighthouse lamp was replaced in May", "tags": ["sweep"]},
+                    ],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<String> = body["memory_ids"]
+            .as_array()
+            .expect("batch remember returns its ids")
+            .iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 3, "{body}");
+
+        let revised = "the dredger works the channel at dawn";
+        let (status, body) = send(
+            leader.router(),
+            put_json(
+                &format!("/api/memory/{}", ids[0]),
+                &serde_json::json!({ "user_id": user, "content": revised }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/memories/bulk",
+                &serde_json::json!({ "user_id": user, "tags": ["sweep"] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let frames: Vec<(u64, IntentPayload)> = {
+            let writer = leader.state().get_user_journaled_writer(user).unwrap();
+            let writer = writer.lock();
+            writer
+                .log()
+                .iter()
+                .unwrap()
+                .map(|record| {
+                    let (lsn, payload) = payload::decode_record(&record.unwrap()).unwrap();
+                    (lsn.0, payload)
+                })
+                .collect()
+        };
+        let (follower, _tmp) = TestHarness::fresh_manager();
+        let follower = Arc::new(follower);
+        let applied = {
+            let follower = Arc::clone(&follower);
+            tokio::task::spawn_blocking(move || apply_replicated_page(&follower, user, frames))
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert!(applied > 0);
+
+        let replica = follower.get_user_memory(user).unwrap();
+        let replica = replica.read();
+        let id = |text: &str| MemoryId(uuid::Uuid::parse_str(text).unwrap());
+        assert_eq!(
+            replica.get_memory(&id(&ids[0])).unwrap().experience.content,
+            revised
+        );
+        for swept in &ids[1..] {
+            assert!(
+                replica.get_memory(&id(swept)).is_err(),
+                "{swept} survived its bulk forget on the follower"
+            );
+        }
     }
 
     #[test]
     fn a_page_naming_another_tenant_is_refused() {
         let ok = vec![frame(0, "a", "remember"), frame(1, "b", "forget")];
         assert!(check_tenant("u", &ok).is_ok());
-        let mixed = vec![frame(0, "a", "remember"), frame_for("other", 1, "b", "forget")];
+        let mixed = vec![
+            frame(0, "a", "remember"),
+            frame_for("other", 1, "b", "forget"),
+        ];
         let err = check_tenant("u", &mixed).unwrap_err().to_string();
         assert!(err.contains("other"));
     }
@@ -1165,9 +1623,26 @@ mod tests {
 
     #[test]
     fn coalesce_lets_a_later_remember_undo_a_forget() {
-        let page = vec![frame(0, "a", "remember"), frame(1, "a", "forget"), frame(2, "a", "remember")];
+        let page = vec![
+            frame(0, "a", "remember"),
+            frame(1, "a", "forget"),
+            frame(2, "a", "remember"),
+        ];
         let out: Vec<u64> = coalesce(page).into_iter().map(|(l, _)| l).collect();
         assert_eq!(out, vec![2]);
+    }
+
+    #[test]
+    fn the_leader_lists_only_tenants_it_can_feed() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        manager.get_user_journaled_writer("journaled").unwrap();
+        std::fs::create_dir_all(manager.user_dir("copied-aside").unwrap()).unwrap();
+        let listed: Vec<String> = user_logs(&manager).into_iter().map(|u| u.user_id).collect();
+        assert!(listed.contains(&"journaled".to_string()));
+        assert!(
+            !listed.contains(&"copied-aside".to_string()),
+            "a directory with no intent log is not a tenant the feed can serve"
+        );
     }
 
     #[test]
@@ -1179,7 +1654,12 @@ mod tests {
         };
         let bytes = payload::encode(&payload).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let back = payload::decode(&base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+        let back = payload::decode(
+            &base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(back.memory_id(), "m");
     }
 }

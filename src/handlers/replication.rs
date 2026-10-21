@@ -185,5 +185,8 @@ pub async fn unfollow(headers: HeaderMap) -> Response {
         return refusal;
     }
     let status = replication::unfollow();
-    respond(StatusCode::OK, json!({"following": null, "users": status.users}))
+    respond(
+        StatusCode::OK,
+        json!({"following": null, "users": status.users}),
+    )
 }
