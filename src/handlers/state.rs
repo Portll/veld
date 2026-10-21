@@ -277,15 +277,14 @@ pub struct MultiUserMemoryManager {
     /// Per-user [`JournaledWriter`]. Created lazily on first journaled
     /// CRUD for that user; holds the open intent log, the per-user
     /// `CheckpointStore`, and the live `SqliteProjection` attached for
-    /// dispatch. Wrapped in `Mutex` because `record_and_apply` mutates
-    /// the underlying log + projections — only one writer at a time per
-    /// tenant.
+    /// dispatch. Shared through a [`crate::intent_log::SharedJournal`]:
+    /// one thread at a time holds the writer, and concurrent writes are
+    /// committed in groups that share one sync.
     ///
     /// Wired up here (and not in the per-user UserMemory) because the
     /// projection list is a runtime construct that may grow over time
     /// (Vamana, BM25, Postgres) and we want one place to register them.
-    pub journaled_writers:
-        DashMap<String, std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>>,
+    pub journaled_writers: DashMap<String, std::sync::Arc<crate::intent_log::SharedJournal>>,
 
     /// One init-lock per tenant for the lazy `JournaledWriter` creation.
     /// Without this, two concurrent first-touch requests for the same
@@ -2238,7 +2237,7 @@ impl MultiUserMemoryManager {
     pub fn get_user_journaled_writer(
         &self,
         user_id: &str,
-    ) -> Result<std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>> {
+    ) -> Result<std::sync::Arc<crate::intent_log::SharedJournal>> {
         // Fast path — cached.
         if let Some(w) = self.journaled_writers.get(user_id) {
             return Ok(w.clone());
@@ -2499,31 +2498,29 @@ impl MultiUserMemoryManager {
             writer.add_projection(Box::new(wiki_projection));
         }
 
-        let writer = std::sync::Arc::new(parking_lot::Mutex::new(writer));
+        let writer = std::sync::Arc::new(crate::intent_log::SharedJournal::new(writer));
         self.journaled_writers
             .insert(user_id.to_string(), writer.clone());
         Ok(writer)
     }
 
     /// Convenience: journal a typed payload through the user's
-    /// `JournaledWriter`. Calls `record_and_apply` under the writer's
-    /// mutex and returns the assigned LSN. Per-projection apply errors
-    /// are *not* propagated as failures — they are logged at warn level
-    /// (the log frame is durable, replay will retry on restart). The
-    /// SQLite projection is deferred: the returned LSN is durable and
-    /// applied to the inline projections, but may not be in SQLite yet.
+    /// `JournaledWriter` and return the assigned LSN. Concurrent calls for
+    /// one user share a sync (see [`crate::intent_log::SharedJournal`]).
+    /// Per-projection apply errors are *not* propagated as failures — they
+    /// are logged at warn level (the log frame is durable, replay will retry
+    /// on restart). The SQLite projection is deferred: the returned LSN is
+    /// durable and applied to the inline projections, but may not be in
+    /// SQLite yet.
     pub fn journal_and_apply(
         &self,
         user_id: &str,
         payload: &crate::intent_log::IntentPayload,
     ) -> Result<crate::intent_log::Lsn> {
         let writer = self.get_user_journaled_writer(user_id)?;
-        let outcome = {
-            let mut writer = writer.lock();
-            writer
-                .record_and_apply(payload)
-                .map_err(|e| anyhow::anyhow!("journal record_and_apply: {e}"))?
-        };
+        let outcome = writer
+            .record_and_apply(payload)
+            .map_err(|e| anyhow::anyhow!("journal record_and_apply: {e}"))?;
         for err in &outcome.apply_errors {
             tracing::warn!(
                 user_id = %user_id,
@@ -2536,9 +2533,9 @@ impl MultiUserMemoryManager {
         Ok(outcome.lsn)
     }
 
-    /// [`Self::journal_and_apply`] for many records: one writer lock, one append
-    /// batch and one fsync, then each record applied to the projections in order. The
-    /// batch is durable whole or not at all.
+    /// [`Self::journal_and_apply`] for many records: one append batch and one
+    /// sync, then each record applied to the projections in order. The batch is
+    /// durable whole or not at all.
     pub fn journal_and_apply_batch(
         &self,
         user_id: &str,
@@ -2546,7 +2543,6 @@ impl MultiUserMemoryManager {
     ) -> Result<Vec<crate::intent_log::Lsn>> {
         let writer = self.get_user_journaled_writer(user_id)?;
         let outcomes = writer
-            .lock()
             .record_and_apply_batch(payloads)
             .map_err(|e| anyhow::anyhow!("journal record_and_apply_batch: {e}"))?;
         for outcome in &outcomes {
@@ -2991,21 +2987,21 @@ impl MultiUserMemoryManager {
             .collect())
     }
 
-    /// Journal reconcile backfill frames in batches, one fsync per batch and
+    /// Journal reconcile backfill frames in batches, one sync per batch and
     /// the writer lock held for one batch at a time. A failed batch is logged
     /// and skipped (the next reconcile finds the same gap). Returns the
     /// number of frames journaled.
     fn journal_reconcile_backfill(
         &self,
         user_id: &str,
-        writer: &parking_lot::Mutex<crate::intent_log::JournaledWriter>,
+        writer: &crate::intent_log::SharedJournal,
         frames: Vec<crate::intent_log::IntentPayload>,
         kind: &str,
     ) -> usize {
         const BATCH: usize = 256;
         let mut journaled = 0usize;
         for batch in frames.chunks(BATCH) {
-            let outcomes = writer.lock().record_and_apply_batch(batch);
+            let outcomes = writer.record_and_apply_batch(batch);
             match outcomes {
                 Ok(outcomes) => {
                     for outcome in &outcomes {

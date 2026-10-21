@@ -98,6 +98,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::config::StorageDurability;
 use crate::metrics::{
     Timer, INTENT_LOG_APPEND_DURATION, INTENT_LOG_APPEND_TOTAL,
     INTENT_LOG_DURABLE_END_OFFSET_BYTES, INTENT_LOG_NEXT_LSN, INTENT_LOG_SYNC_DURATION,
@@ -113,7 +114,9 @@ pub mod projection;
 pub mod reseal;
 pub use checkpoint_store::{CheckpointStore, CheckpointStoreError};
 pub use header::{HeaderError, IntentLogHeader, CURRENT_FORMAT_VERSION, HEADER_BYTES, MAGIC};
-pub use journal::{ApplyError, JournalError, JournaledWriter, TypedProjection, WriteOutcome};
+pub use journal::{
+    ApplyError, JournalError, JournaledWriter, SharedJournal, TypedProjection, WriteOutcome,
+};
 pub use migrations::{migrate_payload, MigrationError};
 pub use payload::{IntentPayload, PayloadError};
 pub use projection::{replay, replay_all, Projection, ReplayError, ReplayTarget};
@@ -480,6 +483,39 @@ fn rotation_tmp_path(log_path: &Path) -> PathBuf {
     log_path.with_file_name(name)
 }
 
+/// Make the bytes written to `file` as durable as `durability` promises.
+///
+/// `Immediate` waits for stable storage: `sync_data`, which on Apple platforms
+/// is `F_FULLFSYNC`, a flush of the drive's whole cache costing milliseconds.
+/// `Eventual` is the class whose stores may lose their latest commits to a
+/// power loss, so the journal need not wait for the drive's cache either:
+/// `F_BARRIERFSYNC` hands the bytes to the drive ordered before every later
+/// write, as redb's `Eventual` commit does, so a power loss can only take a
+/// suffix of the log. Elsewhere `sync_data` is `fdatasync`, which is already
+/// that cost. A filesystem that refuses barriers gets the full sync instead.
+fn sync_file(file: &File, durability: StorageDurability) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    if durability == StorageDurability::Eventual {
+        let fd = std::os::fd::AsRawFd::as_raw_fd(file);
+        loop {
+            // SAFETY: `F_BARRIERFSYNC` takes no argument beyond the descriptor,
+            // which `file` keeps open for the duration of the call.
+            if unsafe { libc::fcntl(fd, libc::F_BARRIERFSYNC) } != -1 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::ENOTSUP | libc::ENOTTY | libc::EINVAL) => break,
+                _ => return Err(error),
+            }
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = durability;
+    file.sync_data()
+}
+
 /// Make a rename in `path`'s directory durable.
 fn sync_parent_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
@@ -554,6 +590,8 @@ pub struct IntentLog {
     /// made, so a lasting failure is retried (and logged) every so often
     /// rather than at every sync.
     retry_rotation_at: u64,
+    /// What `sync` waits for; see [`sync_file`].
+    durability: StorageDurability,
 }
 
 /// The file under the log's `BufWriter`. A newtype rather than a bare `File`
@@ -809,6 +847,7 @@ impl IntentLog {
             base_lsn,
             segment_bytes: None,
             retry_rotation_at: 0,
+            durability: crate::config::StorageTuning::process().durability,
         };
         if actual_len > durable_end {
             if tail_is_torn(&log.path, durable_end, actual_len, next_lsn)? {
@@ -992,8 +1031,9 @@ impl IntentLog {
         Ok(lsn)
     }
 
-    /// Flush the BufWriter and fsync the file. After this returns, every
-    /// frame `append`-ed since the last `sync` is durable. If it fails, those
+    /// Flush the BufWriter and sync the file at the log's durability (see
+    /// [`Self::set_durability`]). After this returns, every frame
+    /// `append`-ed since the last `sync` is durable. If it fails, those
     /// frames are rolled back as for a failed `append`, so a record the
     /// caller was told failed cannot become durable with a later sync.
     #[tracing::instrument(
@@ -1016,7 +1056,7 @@ impl IntentLog {
             self.roll_back_unsynced();
             return Err(IntentLogError::Io(e));
         }
-        if let Err(e) = self.writer.get_ref().file.sync_data() {
+        if let Err(e) = sync_file(&self.writer.get_ref().file, self.durability) {
             INTENT_LOG_SYNC_TOTAL.with_label_values(&["io_error"]).inc();
             tracing::error!(error = %e, "intent log sync failed: fsync error");
             self.roll_back_unsynced();
@@ -1052,6 +1092,27 @@ impl IntentLog {
     /// long; `None` never rotates.
     pub fn set_segment_bytes(&mut self, limit: Option<u64>) {
         self.segment_bytes = limit;
+    }
+
+    /// What every later `sync` waits for. A log opens at the process's
+    /// [`StorageTuning`](crate::config::StorageTuning) durability, the class
+    /// the stores it journals for commit at.
+    pub fn set_durability(&mut self, durability: StorageDurability) {
+        self.durability = durability;
+    }
+
+    /// What `sync` waits for.
+    pub fn durability(&self) -> StorageDurability {
+        self.durability
+    }
+
+    /// Drop every frame appended since the last successful `sync`, as a
+    /// failed append does. Lets a writer that appends several records as one
+    /// unit take back the ones already appended when a later one fails.
+    pub(crate) fn discard_unsynced(&mut self) {
+        if self.next_lsn != self.synced_next_lsn {
+            self.roll_back_unsynced();
+        }
     }
 
     /// The sealed segments before the head file, oldest first.
@@ -2007,6 +2068,30 @@ mod tests {
             .as_nanos();
         p.push(format!("veld-intent-log-{name}-{pid}-{stamp}.log"));
         p
+    }
+
+    #[test]
+    fn sync_makes_frames_durable_at_either_durability() {
+        let path = tmp_log_path("durability");
+        let mut log = IntentLog::open(&path).unwrap();
+        assert_eq!(
+            log.durability(),
+            crate::config::StorageTuning::process().durability
+        );
+        for durability in [StorageDurability::Eventual, StorageDurability::Immediate] {
+            log.set_durability(durability);
+            log.append(durability.as_str().as_bytes()).unwrap();
+            log.sync().unwrap();
+        }
+        drop(log);
+        let payloads: Vec<Vec<u8>> = IntentLog::open(&path)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|r| r.unwrap().payload)
+            .collect();
+        assert_eq!(payloads, vec![b"eventual".to_vec(), b"immediate".to_vec()]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

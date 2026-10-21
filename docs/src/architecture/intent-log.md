@@ -24,7 +24,7 @@ Implementation: [`src/intent_log/`](https://github.com/Portll/veld/tree/main/src
 |---|---|
 | `mod.rs` | Public API; `IntentLog` type; segment rotation and reads across segments |
 | `header.rs` | Log file header with version, base LSN and checksum |
-| `journal.rs` | Journaled writer: append, fsync, apply to projections |
+| `journal.rs` | Journaled writer: append, sync, apply to projections; group commit |
 | `payload.rs` | Typed `IntentPayload` enum with bincode codec |
 | `projection.rs` | Project events back into memory state (replay) |
 | `checkpoint_store.rs` | Periodic snapshot of derived state for fast replay |
@@ -46,6 +46,23 @@ This matters for:
 - **Time-coherent projection (LLM-Wiki):** the wiki's `log.md` is a direct
   projection of the intent log. Time-coherence between veld and the wiki
   is built-in because the log is the canonical timeline.
+
+## Sync and group commit
+
+A write returns once its frame is synced, at `VELD_STORAGE_DURABILITY`, the
+class the stores commit at. `immediate` waits for stable storage
+(`F_FULLFSYNC` on macOS, `fdatasync` on Linux). `eventual`, the default, issues
+`F_BARRIERFSYNC` on macOS, which orders the frame before every later write
+without waiting for the drive's cache, as redb's eventual commit does, so a
+power loss can take only the newest frames; on Linux it is `fdatasync` too.
+
+Concurrent writes to one tenant share a sync. Each write is encoded and queued
+before it takes the tenant's journal lock; whoever holds the lock with its own
+write still queued appends every queued write, syncs once and applies them to
+the projections in LSN order. The writes that arrive during that sync form the
+next group. `veld_intent_log_sync_shared_total` counts the writes another
+writer's sync covered. A write the log refuses fails alone; a failed sync fails
+its whole group.
 
 ## Segments
 
