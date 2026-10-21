@@ -310,7 +310,8 @@ impl TypedProjection for SqliteProjection {
     }
 
     fn flush_checkpoint(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        SqliteProjection::flush_checkpoint(self).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        SqliteProjection::flush_checkpoint(self)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
     }
 }
 

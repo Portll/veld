@@ -3,7 +3,10 @@
 //! Semantic consolidation for fact extraction, vector index maintenance,
 //! and backup/restore operations.
 
-use axum::{extract::State, response::Json};
+use axum::{
+    extract::{Extension, State},
+    response::Json,
+};
 
 use super::state::MultiUserMemoryManager;
 use super::types::{
@@ -14,6 +17,8 @@ use super::types::{
     RestoreBackupRequest, RestoreBackupResponse, VerifyBackupRequest, VerifyBackupResponse,
     VerifyIndexRequest,
 };
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory;
 use crate::memory::gap_topology::{GapDetectionConfig, GapDetector};
@@ -1248,12 +1253,17 @@ pub async fn get_consolidation_report(
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn get_consolidation_events(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     axum::extract::Query(req): axum::extract::Query<ConsolidationEventsRequest>,
 ) -> Result<Json<Vec<memory::ConsolidationEvent>>, AppError> {
-    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&req.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
 
     let now = chrono::Utc::now();
@@ -1289,11 +1299,16 @@ pub struct EmbeddingBacklogQuery {
 /// GET /api/embeddings/backlog?user_id= - Memories still without a vector.
 pub async fn get_embedding_backlog(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     axum::extract::Query(q): axum::extract::Query<EmbeddingBacklogQuery>,
 ) -> Result<Json<crate::memory::embedding_backlog::BacklogReport>, AppError> {
-    validation::validate_user_id(&q.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&q.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
     let memory = state
-        .get_user_memory(&q.user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
     let report = tokio::task::spawn_blocking(move || memory.read().embedding_backlog_report())
         .await

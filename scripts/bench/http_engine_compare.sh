@@ -27,6 +27,10 @@ PASS_THROUGH_ENV=(
   VELD_EMBEDDING_API_MODEL
   VELD_ONNX_THREADS
   VELD_OFFLINE
+  VELD_MODEL_PATH
+  VELD_ALLOW_SIMPLIFIED_EMBEDDINGS
+  VELD_LAZY_CROSS_ENCODER
+  SHODH_ALLOW_FALLBACK_NER
   ORT_DYLIB_PATH
 )
 
@@ -54,12 +58,19 @@ Environment passed through to the server when set:
   VELD_STORAGE_DURABILITY (immediate|eventual), VELD_REDB_CACHE_BYTES,
   VELD_ROCKSDB_WRITE_BUFFER_BYTES, VELD_ROCKSDB_BLOCK_CACHE_BYTES,
   VELD_EMBEDDER, VELD_EMBEDDING_API_URL, VELD_EMBEDDING_API_MODEL,
-  VELD_ONNX_THREADS, VELD_OFFLINE, ORT_DYLIB_PATH
+  VELD_ONNX_THREADS, VELD_OFFLINE, VELD_MODEL_PATH,
+  VELD_ALLOW_SIMPLIFIED_EMBEDDINGS, VELD_LAZY_CROSS_ENCODER,
+  SHODH_ALLOW_FALLBACK_NER, ORT_DYLIB_PATH
 
-Caveat: no deterministic or network-free embedder exists, so remember throughput
-and cold recall include embedding cost. Warm recall hits the server's query
-embedding cache and is the storage-bound number. Use the same embedder for both
-engines and compare the engines with each other, not with other machines.
+Storage-bound run: MiniLM in hash mode embeds without a model or network, so the
+embedder costs microseconds and the numbers measure the engine, the indexes and
+the retrieval pipeline. It is the same embedder the recall parity test uses:
+  VELD_EMBEDDER=minilm VELD_MODEL_PATH=<an empty directory>
+  VELD_ALLOW_SIMPLIFIED_EMBEDDINGS=1 VELD_OFFLINE=true VELD_LAZY_CROSS_ENCODER=1
+  VELD_EMBEDDING_API_URL=http://127.0.0.1:9 SHODH_ALLOW_FALLBACK_NER=1
+With a real embedder, remember and cold recall include embedding cost and warm
+recall is the storage-bound number. Either way, compare the engines with each
+other on one machine, not with other machines.
 EOF
 }
 
@@ -193,7 +204,7 @@ run_engine() {
     fi
   done
 
-  echo "== $engine: starting on port $port"
+  echo "== $engine: starting on port $port, load average $(uptime | sed 's/.*load averages*: //')"
   env "${server_env[@]}" "$BIN" server >"$log" 2>&1 &
   SERVER_PID=$!
   wait_for_live "$port" "$log"

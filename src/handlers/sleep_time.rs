@@ -15,7 +15,7 @@
 //! throughout Veld's existing routes.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -23,7 +23,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::auth::AuthenticatedUser;
 use crate::handlers::state::MultiUserMemoryManager;
+use crate::handlers::utils::resolve_request_user_id;
 use crate::memory::sleep_time::{
     types::{SleepMode, SleepTimeTrigger},
     OrchestratorStatus, SleepTimeOrchestrator,
@@ -202,8 +204,16 @@ pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
 /// `GET /api/sleep_time/status/:user_id`
 pub async fn user_status(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> impl IntoResponse {
+    let user_id = match resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    ) {
+        Ok(user_id) => user_id,
+        Err(e) => return e.into_response(),
+    };
     let orch = match orchestrator_or_503(&state) {
         Ok(o) => o,
         Err(resp) => return resp.into_response(),
