@@ -40,6 +40,27 @@ const BGE_M3: [f32; 14] = [
     0.9284, 0.9983,
 ];
 
+// Short names score unlike whole memories, so entity-name bars read through tables of their own,
+// sampled from 600 single-word names in the same corpus (179,700 pairs). At 0.85 these pairs
+// cross the bar for 0.04% under MiniLM, 0.09% under bge-m3, 0.33% under nomic and 62.5% under
+// arctic-embed-xs.
+const NAME_MINILM: [f32; 14] = [
+    -0.0766, 0.0707, 0.1201, 0.1461, 0.1892, 0.2399, 0.2951, 0.3494, 0.386, 0.4747, 0.5264, 0.7454,
+    0.9751, 0.9909,
+];
+const NAME_NOMIC: [f32; 14] = [
+    0.4968, 0.5955, 0.6346, 0.6541, 0.6833, 0.7112, 0.7375, 0.7618, 0.7778, 0.8144, 0.8341, 0.9173,
+    1.0, 1.0,
+];
+const NAME_ARCTIC_XS: [f32; 14] = [
+    0.6498, 0.7553, 0.7852, 0.802, 0.8319, 0.8653, 0.8981, 0.9321, 0.9503, 0.972, 0.9769, 0.9852,
+    1.0, 1.0,
+];
+const NAME_BGE_M3: [f32; 14] = [
+    0.2479, 0.3448, 0.3935, 0.4202, 0.4622, 0.5052, 0.5468, 0.5872, 0.615, 0.6844, 0.7195, 0.8371,
+    0.9321, 0.9758,
+];
+
 /// Which table a cosine is read through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -81,6 +102,24 @@ impl ScaleModel {
         match self.table() {
             None => cosine,
             Some(table) => interpolate(cosine, table, &MINILM),
+        }
+    }
+
+    fn name_table(self) -> Option<&'static [f32; 14]> {
+        match self {
+            ScaleModel::Reference => None,
+            ScaleModel::Nomic => Some(&NAME_NOMIC),
+            ScaleModel::ArcticXs => Some(&NAME_ARCTIC_XS),
+            ScaleModel::BgeM3 => Some(&NAME_BGE_M3),
+        }
+    }
+
+    /// A cosine between two entity-name embeddings from this model, read on MiniLM's
+    /// name scale.
+    pub fn name_to_reference(self, cosine: f32) -> f32 {
+        match self.name_table() {
+            None => cosine,
+            Some(table) => interpolate(cosine, table, &NAME_MINILM),
         }
     }
 
@@ -149,6 +188,12 @@ pub fn to_reference(cosine: f32) -> f32 {
     active().to_reference(cosine)
 }
 
+/// A cosine between two entity-name embeddings from the active embedder, read on MiniLM's
+/// name scale.
+pub fn name_to_reference(cosine: f32) -> f32 {
+    active().name_to_reference(cosine)
+}
+
 fn disabled_by_env() -> bool {
     std::env::var("VELD_SIMILARITY_SCALE")
         .is_ok_and(|v| matches!(v.trim(), "off" | "0" | "false" | "reference"))
@@ -199,6 +244,27 @@ mod tests {
             for step in 0..=1000 {
                 let x = -0.2 + 1.2 * step as f32 / 1000.0;
                 let y = model.to_reference(x);
+                assert!(y >= previous - 1e-6, "{model:?} not monotone at {x}");
+                previous = y;
+            }
+        }
+    }
+
+    #[test]
+    fn a_typical_arctic_name_pair_reads_far_below_the_concept_merge_bar() {
+        // 0.90 sits between the 75th and 90th percentile of arctic name pairs.
+        let read = ScaleModel::ArcticXs.name_to_reference(0.90);
+        assert!(read < 0.4, "{read}");
+        assert_eq!(ScaleModel::Reference.name_to_reference(0.90), 0.90);
+    }
+
+    #[test]
+    fn name_tables_are_monotone() {
+        for model in [ScaleModel::Nomic, ScaleModel::ArcticXs, ScaleModel::BgeM3] {
+            let mut previous = f32::NEG_INFINITY;
+            for step in 0..=1000 {
+                let x = -0.2 + 1.2 * step as f32 / 1000.0;
+                let y = model.name_to_reference(x);
                 assert!(y >= previous - 1e-6, "{model:?} not monotone at {x}");
                 previous = y;
             }
