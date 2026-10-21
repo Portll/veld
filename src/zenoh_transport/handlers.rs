@@ -19,11 +19,10 @@ use zenoh::query::Query;
 use zenoh::sample::Sample;
 
 use crate::errors::ValidationErrorExt;
+use crate::handlers::recall::recall_memory_view;
 use crate::handlers::remember::{build_rich_context, parse_experience_type};
 use crate::handlers::state::MultiUserMemoryManager;
-use crate::handlers::types::{
-    MemoryEvent, RecallExperience, RecallFact, RecallMemory, RecallResponse, RecallTodo,
-};
+use crate::handlers::types::{MemoryEvent, RecallFact, RecallMemory, RecallResponse, RecallTodo};
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
 use crate::memory::types::{ForgetCriteria, GeoFilter, MemoryId};
 use crate::memory::{Experience, Query as MemoryQuery, RetrievalMode, SessionEvent, TodoStatus};
@@ -173,6 +172,11 @@ pub struct ZenohRememberRequest {
     pub run_id: Option<String>,
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// The publisher's own description of itself, recorded verbatim under
+    /// `session.declared` as on the HTTP path. See
+    /// [`crate::memory::facets::DeclaredWriter`]; nothing here is verified.
+    #[serde(default)]
+    pub writer: Option<crate::memory::facets::DeclaredWriter>,
 
     // === Robotics fields ===
     /// Robot/drone identifier for multi-agent fleet systems
@@ -413,6 +417,7 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
         req.episode_id.clone(),
         req.sequence_number,
         req.preceding_memory_id.clone(),
+        req.writer.clone(),
     );
 
     let experience = Experience {
@@ -444,7 +449,7 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
         ..Default::default()
     };
 
-    let user_mem = match manager.get_user_memory(&req.user_id) {
+    let user_mem = match manager.get_user_memory_async(&req.user_id).await {
         Ok(m) => m,
         Err(e) => {
             error!(user_id = %req.user_id, "Failed to get user memory: {}", e);
@@ -613,7 +618,7 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
         if let Some(ref parent_id_str) = parent_id {
             if let Ok(parent_uuid) = uuid::Uuid::parse_str(parent_id_str) {
                 let parent = MemoryId(parent_uuid);
-                let mem = memory.clone();
+                let mem = user_mem.clone();
                 let mid = memory_id.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let guard = mem.read();
@@ -625,7 +630,7 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
 
         // Temporal fact extraction
         {
-            let mem = memory.clone();
+            let mem = user_mem.clone();
             let mid = memory_id.clone();
             let uid = user_id.clone();
             let content = experience.content.clone();
@@ -659,8 +664,8 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
 /// 3. Augment with todos, facts, reminders, lineage
 /// 4. Reply with RecallResponse JSON
 /// 5. Publish results to `{prefix}/{user_id}/recall/results` for robot subscribers
+#[tracing::instrument(name = "zenoh.recall", skip_all)]
 pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
-    let _span = tracing::info_span!("zenoh.recall").entered();
     let op_start = std::time::Instant::now();
     let key = query.key_expr().as_str().to_string();
 
@@ -686,7 +691,7 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
         return;
     }
 
-    let user_mem = match manager.get_user_memory(&req.user_id) {
+    let user_mem = match manager.get_user_memory_async(&req.user_id).await {
         Ok(m) => m,
         Err(e) => {
             reply_error(&query, &format!("Failed to get user memory: {e}")).await;
@@ -754,36 +759,25 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
         }
     };
 
-    // Record metrics
+    // Record metrics, labelled by the requested mode as `/api/recall` labels them. Both
+    // retrieve vectors carry a `retrieval_mode` label, and the counter a `result` label too.
     let duration = op_start.elapsed().as_secs_f64();
-    crate::metrics::MEMORY_RETRIEVE_DURATION.observe(duration);
+    crate::metrics::MEMORY_RETRIEVE_DURATION
+        .with_label_values(&[req.mode.as_str()])
+        .observe(duration);
     crate::metrics::MEMORY_RETRIEVE_TOTAL
-        .with_label_values(&["success"])
+        .with_label_values(&[req.mode.as_str(), "success"])
         .inc();
-    crate::metrics::MEMORY_RETRIEVE_RESULTS.observe(memories.len() as f64);
+    crate::metrics::MEMORY_RETRIEVE_RESULTS
+        .with_label_values(&[req.mode.as_str()])
+        .observe(memories.len() as f64);
 
     // Convert to response format
     let total = memories.len();
     let recall_memories: Vec<RecallMemory> = memories
         .iter()
         .enumerate()
-        .map(|(rank, m)| {
-            let rank_score = 1.0 - (rank as f32 / total.max(1) as f32);
-            let salience = m.salience_score_with_access();
-            let score = rank_score * 0.7 + salience * 0.3;
-            RecallMemory {
-                id: m.id.0.to_string(),
-                experience: RecallExperience {
-                    content: m.experience.content.clone(),
-                    memory_type: Some(format!("{:?}", m.experience.experience_type)),
-                    tags: m.experience.entities.clone(),
-                },
-                importance: m.importance(),
-                created_at: m.created_at.to_rfc3339(),
-                score,
-                tier: format!("{:?}", m.tier),
-            }
-        })
+        .map(|(rank, m)| recall_memory_view(m, rank, total))
         .collect();
 
     // Search related todos
@@ -854,7 +848,7 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
         }
 
         let entity_list: Vec<String> = all_entities.into_iter().take(10).collect();
-        let memory_for_facts = memory.clone();
+        let memory_for_facts = user_mem.clone();
         let user_for_facts = user_id.clone();
         tokio::task::spawn_blocking(move || {
             let guard = memory_for_facts.read();
@@ -911,6 +905,7 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
         lineage_count: None,
         tokens_estimated: None,
         metacognition: None,
+        derived_answer: None,
     };
 
     match serde_json::to_vec(&response) {
@@ -927,8 +922,8 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
 
     // Store PendingFeedback so subsequent remember() calls with action+reward
     // can attribute outcomes to the memories we just surfaced.
-    if !recall_memories.is_empty() {
-        let memory_for_embed = memory.clone();
+    if !memories.is_empty() {
+        let memory_for_embed = user_mem.clone();
         let query_for_embed = query_text.clone();
         let user_id_for_fb = user_id.clone();
         let feedback_store = manager.feedback_store().clone();
@@ -1022,7 +1017,7 @@ pub async fn handle_forget(sample: Sample, manager: Arc<MultiUserMemoryManager>)
         }
     };
 
-    let user_mem = match manager.get_user_memory(&user_id) {
+    let user_mem = match manager.get_user_memory_async(&user_id).await {
         Ok(m) => m,
         Err(e) => {
             error!(user_id = %user_id, "Failed to get user memory: {}", e);
@@ -1218,7 +1213,7 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
         None => format!("Mission started: {}", req.mission_id),
     };
 
-    let user_mem = match manager.get_user_memory(&user_id) {
+    let user_mem = match manager.get_user_memory_async(&user_id).await {
         Ok(m) => m,
         Err(e) => {
             error!(user_id = %user_id, "Failed to get user memory: {}", e);
@@ -1316,7 +1311,7 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
         ),
     };
 
-    let user_mem = match manager.get_user_memory(&user_id) {
+    let user_mem = match manager.get_user_memory_async(&user_id).await {
         Ok(m) => m,
         Err(e) => {
             error!(user_id = %user_id, "Failed to get user memory: {}", e);
