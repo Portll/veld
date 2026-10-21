@@ -1272,8 +1272,8 @@ pub fn ingest_corpus(
         };
         let AssembledTags {
             entities: merged,
+            labelled,
             ner_entities,
-            ..
         } = assemble_tags(
             manager,
             EVAL_USER,
@@ -1317,12 +1317,18 @@ pub fn ingest_corpus(
             .with_context(|| format!("remembering corpus item {}", item.id))?;
 
         // Pass 2: build the entity graph from this memory (the step the bare
-        // MemorySystem path skipped entirely).
+        // MemorySystem path skipped entirely), with the tag provenance remember
+        // records, so derived keywords are typed as production types them.
         manager
-            // veld's signature takes three: it derives name embeddings inside
-            // rather than accepting them, so the harness cannot hold them
-            // constant across arms the way upstream does.
-            .process_experience_into_graph(EVAL_USER, &experience, &memory_id)
+            // veld derives name embeddings inside rather than accepting them, so
+            // the harness cannot hold them constant across arms the way upstream does.
+            .process_experience_into_graph_declared(
+                EVAL_USER,
+                &experience,
+                &memory_id,
+                &[],
+                Some(&labelled),
+            )
             .with_context(|| format!("graph-processing corpus item {}", item.id))?;
 
         map.insert(item.id.clone(), memory_id.0);
@@ -4062,6 +4068,136 @@ mod tests {
             root_top1, n,
             "a chain's true root is no longer the strongest-scored origin"
         );
+    }
+
+    /// A derived keyword between two event names takes no causal edge. In "A set B in motion."
+    /// the keyword "set" lies outside both mentions and outside the cue, so the fragment guard
+    /// passes it; only the write's tag provenance tells it from a name the writer chose. The
+    /// same writes without provenance are the control: there "set" must weld the chains, or
+    /// the fixture no longer exercises the bridge.
+    #[test]
+    fn derived_keyword_between_event_names_takes_no_causal_edge() {
+        use crate::memory::tag_sources::{SourcedTag, TagSource, TagSources, TAG_SOURCES_SCHEMA};
+
+        let dir = unique_storage_dir("causal-provenance");
+        let manager = build_manager(&dir).expect("manager");
+        let chains = [
+            ("the Morwen incident", "the Talvik incident"),
+            ("the Talvik incident", "the Brask incident"),
+            ("the Ostrel incident", "the Quarn incident"),
+        ];
+        for (user, with_provenance) in [
+            ("causal-provenance-on", true),
+            ("causal-provenance-off", false),
+        ] {
+            for (cause, effect) in chains {
+                let tags = vec![cause.to_string(), effect.to_string(), "set".to_string()];
+                let sources = TagSources {
+                    v: TAG_SOURCES_SCHEMA,
+                    tags: tags
+                        .iter()
+                        .zip([TagSource::Caller, TagSource::Caller, TagSource::Yake])
+                        .map(|(tag, source)| SourcedTag {
+                            tag: tag.clone(),
+                            source,
+                            redacted: false,
+                        })
+                        .collect(),
+                    redacted: Default::default(),
+                };
+                let experience = Experience {
+                    content: format!("{cause} set {effect} in motion."),
+                    entities: tags.clone(),
+                    tags,
+                    ..Default::default()
+                };
+                manager
+                    .process_experience_into_graph_declared(
+                        user,
+                        &experience,
+                        &MemoryId(Uuid::new_v4()),
+                        &[],
+                        with_provenance.then_some(&sources),
+                    )
+                    .expect("graph");
+            }
+        }
+
+        let census = |user: &str| {
+            let graph = manager.get_user_graph(user).expect("graph");
+            let g = graph.read();
+            let uuid_of = |name: &str| {
+                g.find_entity_by_name_strict(name)
+                    .expect("lookup")
+                    .unwrap_or_else(|| panic!("{user}: entity '{name}' missing"))
+                    .uuid
+            };
+            let keyword = uuid_of("set");
+            let keyword_causal = g
+                .get_entity_relationships_limited(&keyword, Some(64))
+                .expect("edges")
+                .iter()
+                .filter(|e| e.relation_type.is_causal())
+                .count();
+            let (morwen, talvik, ostrel, quarn) = (
+                uuid_of("the Morwen incident"),
+                uuid_of("the Talvik incident"),
+                uuid_of("the Ostrel incident"),
+                uuid_of("the Quarn incident"),
+            );
+            let event_pair_causal = g
+                .get_entity_relationships_limited(&morwen, Some(64))
+                .expect("edges")
+                .iter()
+                .any(|e| {
+                    e.from_entity == morwen && e.to_entity == talvik && e.relation_type.is_causal()
+                });
+            let origins: Vec<Uuid> = g
+                .trace_causal_origins(&[quarn], 8)
+                .expect("origin walk")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            (
+                keyword_causal,
+                event_pair_causal,
+                origins.contains(&ostrel),
+                origins.contains(&morwen),
+            )
+        };
+
+        let (keyword_causal, event_pair_causal, own_root, foreign_root) =
+            census("causal-provenance-off");
+        assert!(
+            keyword_causal > 0 && foreign_root,
+            "control: without provenance 'set' must take causal edges ({keyword_causal}) and \
+             weld the Morwen chain into the Quarn chain's origins ({foreign_root}), or the \
+             fixture no longer exercises the bridge"
+        );
+        assert!(
+            event_pair_causal && own_root,
+            "control: the event pairs must still be typed"
+        );
+
+        let (keyword_causal, event_pair_causal, own_root, foreign_root) =
+            census("causal-provenance-on");
+        assert_eq!(
+            keyword_causal, 0,
+            "the YAKE keyword 'set' took a causal edge"
+        );
+        assert!(
+            event_pair_causal,
+            "the caller-tagged pair lost its causal edge"
+        );
+        assert!(
+            own_root,
+            "the Quarn chain's own root left its backward cone"
+        );
+        assert!(
+            !foreign_root,
+            "the Morwen chain reached the Quarn chain's origins through a derived keyword"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
