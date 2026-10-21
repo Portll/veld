@@ -21,6 +21,13 @@ MiniLM embedder and the mxbai-rerank-xsmall-v1 cross-encoder reranking the top 2
 By category, nDCG@10 is 0.551 single-hop (841 questions), 0.593 temporal (320), 0.294
 multi-hop (281) and 0.221 open-domain (89).
 
+These are retrieval metrics: whether the gold turn was ranked, and where. They are not
+end-to-end answer accuracy. Published LoCoMo figures for Mem0, Zep, Letta and others are
+LLM-judged answer accuracy ("J"), so the two are on different scales and do not compare. The
+1,531 questions also include the 100-question gate (conversation conv-42) that recall changes are
+tuned against, so the run is not a fully held-out measurement; a held-out set without conv-42,
+with confidence intervals, is task 7 of plan `veld-review-remediation-20261020`.
+
 ## Withdrawn figures
 
 Earlier pages quoted MRR 0.925 for v0.7.2, and a changelog entry quotes MRR 0.917 (`6dae51f6`).
