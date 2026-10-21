@@ -75,7 +75,12 @@ function httpFetch(url, { method = 'GET', headers = {}, body, signal } = {}) {
 
 const jobs = () => readdirSync(join(ROOT, 'bank')).filter((f) => f.endsWith('.json')).map((f) => readJson(join(ROOT, 'bank', f))).filter(Boolean);
 const stateOf = (id) => readJson(join(ROOT, 'state', `${id}.json`), { status: 'pending' });
-const setState = (id, patch) => writeFileSync(join(ROOT, 'state', `${id}.json`), JSON.stringify({ ...stateOf(id), ...patch, updatedAt: now() }, null, 1));
+// The spine queue (spine-queue.mjs), or null when the store will not open and the files are the queue.
+let SQ = null;
+const setState = (id, patch) => {
+  writeFileSync(join(ROOT, 'state', `${id}.json`), JSON.stringify({ ...stateOf(id), ...patch, updatedAt: now() }, null, 1));
+  if (SQ) try { SQ.mirror(id, stateOf(id)); } catch (e) { log(`spine mirror ${id}: ${e.message}`); }
+};
 const DONE = new Set(['landed', 'dropped']);
 
 // A knowledge-base job needs veld up and its sources ingested; health is asked at most once a minute.
@@ -190,6 +195,10 @@ async function exportLaneLoop(status) {
 function take(job) {
   const lock = join(ROOT, 'state', `${job.id}.lock`);
   try { closeSync(openSync(lock, 'wx')); } catch { return false; }
+  if (SQ && !SQ.claim(job.id, HOST)) {
+    rmSync(lock, { force: true });
+    return false;
+  }
   setState(job.id, { status: 'running', host: HOST, startedAt: now() });
   return true;
 }
@@ -602,6 +611,12 @@ async function once() {
   const { ready, status } = queue();
   writeStatus();
   refillIfLow(status);
+  if (SQ) {
+    try {
+      const filed = SQ.sync(jobs(), stateOf);
+      if (filed) log(`filed ${filed} jobs in spine's queue`);
+    } catch (e) { log(`spine sync failed: ${e.message}`); }
+  }
   const pick = ready.find(({ j }) => mine(j) && take(j));
   if (!pick) return false;
   const job = pick.j;
@@ -660,6 +675,8 @@ const STOP = join(ROOT, 'STOP');
 const RESTART = join(ROOT, 'RESTART');
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   log(`runner up on ${HOST}, pid ${process.pid}`);
+  const { spineQueue } = await import('./spine-queue.mjs');
+  SQ = await spineQueue().catch((e) => { log(`spine queue unavailable, the files are the queue: ${e.message}`); return null; });
   for (;;) {
     if (existsSync(STOP) || existsSync(`${STOP}-${HOST}`)) { log('STOP file present; exiting'); break; }
     if (existsSync(`${RESTART}-${HOST}`)) { rmSync(`${RESTART}-${HOST}`, { force: true }); log('RESTART file present; exiting for the supervisor to restart'); break; }
