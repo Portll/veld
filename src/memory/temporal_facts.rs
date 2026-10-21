@@ -274,52 +274,59 @@ fn is_expired(fact: &TemporalFact) -> bool {
     }
 }
 
+/// Lowercased word frequencies of one text, words of two or more bytes, for word-overlap
+/// cosine. Built once per text, so a caller comparing many pairs tokenizes each text once.
+#[derive(Debug, Clone, Default)]
+pub struct TermVector {
+    freq: std::collections::HashMap<String, u32>,
+    norm_sq: u64,
+}
+
+impl TermVector {
+    pub fn new(text: &str) -> Self {
+        let mut freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for word in text.split(|c: char| !c.is_alphanumeric()) {
+            let w = word.to_lowercase();
+            if w.len() >= 2 {
+                *freq.entry(w).or_insert(0) += 1;
+            }
+        }
+        let norm_sq = freq.values().map(|&c| u64::from(c) * u64::from(c)).sum();
+        Self { freq, norm_sq }
+    }
+
+    /// Cosine of the two frequency vectors, in `[0, 1]`; zero when either text has no word.
+    /// The dot product and norms are integer sums, so the result does not depend on the
+    /// order the words are visited in.
+    pub fn cosine(&self, other: &TermVector) -> f32 {
+        if self.freq.is_empty() || other.freq.is_empty() {
+            return 0.0;
+        }
+        let (small, large) = if self.freq.len() <= other.freq.len() {
+            (&self.freq, &other.freq)
+        } else {
+            (&other.freq, &self.freq)
+        };
+        let dot: u64 = small
+            .iter()
+            .filter_map(|(word, &a)| large.get(word).map(|&b| u64::from(a) * u64::from(b)))
+            .sum();
+        let denom = (self.norm_sq as f32).sqrt() * (other.norm_sq as f32).sqrt();
+        if denom < f32::EPSILON {
+            0.0
+        } else {
+            dot as f32 / denom
+        }
+    }
+}
+
 /// Compute word-overlap cosine similarity between two texts.
 ///
 /// Tokenizes both texts into lowercased words, builds term-frequency vectors,
 /// and returns the cosine similarity (0.0..1.0). Words shorter than 2 chars
 /// are excluded as noise.
 pub fn text_similarity(a: &str, b: &str) -> f32 {
-    use std::collections::HashMap;
-
-    fn term_freq(text: &str) -> HashMap<String, f32> {
-        let mut freq = HashMap::new();
-        for word in text.split(|c: char| !c.is_alphanumeric()) {
-            let w = word.to_lowercase();
-            if w.len() >= 2 {
-                *freq.entry(w).or_insert(0.0) += 1.0;
-            }
-        }
-        freq
-    }
-
-    let tf_a = term_freq(a);
-    let tf_b = term_freq(b);
-
-    if tf_a.is_empty() || tf_b.is_empty() {
-        return 0.0;
-    }
-
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-
-    for (word, &count_a) in &tf_a {
-        norm_a += count_a * count_a;
-        if let Some(&count_b) = tf_b.get(word) {
-            dot += count_a * count_b;
-        }
-    }
-    for &count_b in tf_b.values() {
-        norm_b += count_b * count_b;
-    }
-
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < f32::EPSILON {
-        0.0
-    } else {
-        dot / denom
-    }
+    TermVector::new(a).cosine(&TermVector::new(b))
 }
 
 /// Detect semantic opposition between two text fragments using heuristics.
@@ -2910,6 +2917,73 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap()
             .and_utc()
+    }
+
+    /// The per-pair computation `TermVector` replaced: two fresh frequency maps per call.
+    fn pairwise_similarity(a: &str, b: &str) -> f32 {
+        fn term_freq(text: &str) -> std::collections::HashMap<String, f32> {
+            let mut freq = std::collections::HashMap::new();
+            for word in text.split(|c: char| !c.is_alphanumeric()) {
+                let w = word.to_lowercase();
+                if w.len() >= 2 {
+                    *freq.entry(w).or_insert(0.0) += 1.0;
+                }
+            }
+            freq
+        }
+        let (tf_a, tf_b) = (term_freq(a), term_freq(b));
+        if tf_a.is_empty() || tf_b.is_empty() {
+            return 0.0;
+        }
+        let (mut dot, mut norm_a, mut norm_b) = (0.0f32, 0.0f32, 0.0f32);
+        for (word, &count_a) in &tf_a {
+            norm_a += count_a * count_a;
+            if let Some(&count_b) = tf_b.get(word) {
+                dot += count_a * count_b;
+            }
+        }
+        for &count_b in tf_b.values() {
+            norm_b += count_b * count_b;
+        }
+        let denom = norm_a.sqrt() * norm_b.sqrt();
+        if denom < f32::EPSILON {
+            0.0
+        } else {
+            dot / denom
+        }
+    }
+
+    /// Tokenizing each text once gives the bit-identical score of the per-pair computation,
+    /// in either argument order.
+    #[test]
+    fn term_vectors_score_exactly_as_the_pairwise_computation() {
+        let texts = [
+            "The API is not stable yet; the API was stable last week.",
+            "The API is stable. Deploys go out on Fridays.",
+            "Caroline is single and lives in Sydney",
+            "Caroline isn't single; she married in Sydney in 2023",
+            "a b c",
+            "",
+            "Ünïcode Wörds and ÜNÏCODE wörds repeat repeat repeat",
+        ];
+        let vectors: Vec<TermVector> = texts.iter().map(|t| TermVector::new(t)).collect();
+        for (i, a) in texts.iter().enumerate() {
+            for (j, b) in texts.iter().enumerate() {
+                let expected = pairwise_similarity(a, b);
+                assert_eq!(
+                    vectors[i].cosine(&vectors[j]).to_bits(),
+                    expected.to_bits(),
+                    "{a:?} vs {b:?}"
+                );
+                assert_eq!(text_similarity(a, b).to_bits(), expected.to_bits());
+            }
+        }
+        assert!((vectors[0].cosine(&vectors[0]) - 1.0).abs() < 1e-6);
+        assert_eq!(
+            vectors[4].cosine(&vectors[0]),
+            0.0,
+            "one-letter words are noise"
+        );
     }
 
     /// The precompiled date patterns resolve the same shapes, in the same priority

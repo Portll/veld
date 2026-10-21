@@ -2717,29 +2717,35 @@ impl super::MemorySystem {
             // Uses existing detect_semantic_opposition() from temporal_facts module.
             // Only checks top-K pairs to keep O(k^2) manageable (k = interference_budget).
             {
-                use crate::memory::temporal_facts::{detect_semantic_opposition, text_similarity};
+                use crate::memory::temporal_facts::{detect_semantic_opposition, TermVector};
 
                 let interference_budget = 20.min(res.len());
                 let mut demoted = 0usize;
 
-                // Content and timestamps for the top candidates
-                let views: Vec<Option<Arc<CandidateView>>> = res
+                // Content, timestamps and word vectors for the top candidates, each candidate
+                // tokenized once for all the pairs it is in.
+                let views: Vec<Option<(Arc<CandidateView>, TermVector)>> = res
                     .iter()
                     .take(interference_budget)
-                    .map(|(id, _)| candidates.get(id))
+                    .map(|(id, _)| {
+                        candidates.get(id).map(|view| {
+                            let terms = TermVector::new(&view.memory.experience.content);
+                            (view, terms)
+                        })
+                    })
                     .collect();
 
                 // Check pairwise: only pairs with high text similarity (>0.7)
                 // that also show semantic opposition
                 let mut demote_indices: Vec<(usize, f32)> = Vec::new();
                 for (i, vi) in views.iter().enumerate() {
-                    let Some(vi) = vi else { continue };
+                    let Some((vi, terms_i)) = vi else { continue };
                     let ci = &vi.memory.experience.content;
                     for (j, vj) in views.iter().enumerate().skip(i + 1) {
-                        let Some(vj) = vj else { continue };
+                        let Some((vj, terms_j)) = vj else { continue };
                         let cj = &vj.memory.experience.content;
 
-                        let sim = text_similarity(ci, cj);
+                        let sim = terms_i.cosine(terms_j);
                         if sim < 0.7 {
                             continue;
                         }
