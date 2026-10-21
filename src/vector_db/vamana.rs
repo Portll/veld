@@ -23,7 +23,7 @@
 use super::distance_inline::{
     cosine_similarity_inline, euclidean_squared_inline, normalized_distance_inline,
 };
-use super::vamana_store::VectorStore;
+use super::vamana_store::{DeletedSet, VectorStore, VisitedPool};
 use anyhow::{anyhow, Result};
 use memmap2::MmapMut;
 use parking_lot::RwLock;
@@ -148,7 +148,10 @@ pub struct VamanaIndex {
     /// Soft-deleted vector IDs (filtered from search results)
     /// These vectors remain in the graph but are excluded from results.
     /// Physically removed on next rebuild.
-    pub(crate) deleted_ids: Arc<RwLock<HashSet<u32>>>,
+    pub(crate) deleted_ids: Arc<RwLock<DeletedSet>>,
+
+    /// Visited sets reused across graph walks.
+    pub(crate) visited: VisitedPool,
 
     /// Live-vector count up to which `search` scans every vector instead of walking the graph.
     pub(crate) exact_search_max: usize,
@@ -172,7 +175,8 @@ impl VamanaIndex {
             storage_path,
             incremental_inserts: std::sync::atomic::AtomicUsize::new(0),
             rebuilding: std::sync::atomic::AtomicBool::new(false),
-            deleted_ids: Arc::new(RwLock::new(HashSet::new())),
+            deleted_ids: Arc::new(RwLock::new(DeletedSet::default())),
+            visited: VisitedPool::default(),
             exact_search_max: EXACT_SEARCH_MAX_VECTORS,
         })
     }
@@ -470,7 +474,7 @@ impl VamanaIndex {
         let storage = self.vectors.read(); // Hold lock for entire search (zero-copy access)
 
         let search_cap = self.config.search_list_size;
-        let mut visited = HashSet::with_capacity(search_cap);
+        let mut visited = self.visited.take(graph.len());
         let mut candidates = BinaryHeap::with_capacity(search_cap);
         let mut w = BinaryHeap::with_capacity(search_cap);
 
@@ -508,11 +512,9 @@ impl VamanaIndex {
 
             let node = &graph[current.id as usize];
             for &neighbor_id in &node.neighbors {
-                if visited.contains(&neighbor_id) {
+                if !visited.insert(neighbor_id) {
                     continue;
                 }
-
-                visited.insert(neighbor_id);
 
                 // Zero-copy slice access - no allocation per neighbor
                 let neighbor_slice = Self::get_slice_from_storage(&storage, neighbor_id)?;
@@ -655,7 +657,7 @@ impl VamanaIndex {
         // Filter out deleted vectors and take k results
         let results: Vec<(u32, f32)> = candidates
             .into_iter()
-            .filter(|c| !deleted.contains(&c.id))
+            .filter(|c| !deleted.contains(c.id))
             .take(k)
             .map(|c| (c.id, c.distance))
             .collect();
@@ -669,7 +671,7 @@ impl VamanaIndex {
         query: &[f32],
         k: usize,
         n: usize,
-        deleted: &HashSet<u32>,
+        deleted: &DeletedSet,
     ) -> Result<Vec<(u32, f32)>> {
         let storage = self.vectors.read();
         if storage.len() < n {
@@ -683,7 +685,7 @@ impl VamanaIndex {
         for (first, run) in storage.runs(n) {
             for (offset, vector) in run.chunks_exact(dim).enumerate() {
                 let id = first + offset as u32;
-                if deleted.contains(&id) {
+                if deleted.contains(id) {
                     continue;
                 }
                 scored.push((id, self.distance(query, vector)));
@@ -713,7 +715,7 @@ impl VamanaIndex {
 
     /// Check if a vector is marked as deleted
     pub fn is_deleted(&self, vector_id: u32) -> bool {
-        self.deleted_ids.read().contains(&vector_id)
+        self.deleted_ids.read().contains(vector_id)
     }
 
     /// Get the number of soft-deleted vectors
@@ -1070,7 +1072,7 @@ impl VamanaIndex {
         let deleted = self.deleted_ids.read();
         let storage = self.vectors.read();
         (0..storage.len() as u32)
-            .filter(|id| !deleted.contains(id))
+            .filter(|&id| !deleted.contains(id))
             .filter_map(|id| storage.row(id).map(<[f32]>::to_vec))
             .collect()
     }
@@ -1272,7 +1274,7 @@ impl VamanaIndex {
             vectors,
             medoid: *self.medoid.read(),
             num_vectors: num_vecs,
-            deleted_ids: self.deleted_ids.read().clone(),
+            deleted_ids: self.deleted_ids.read().iter().collect(),
         };
 
         // Save as binary
@@ -1332,7 +1334,7 @@ impl VamanaIndex {
                 "Restoring {} soft-deleted vector IDs from persisted index",
                 data.deleted_ids.len()
             );
-            *self.deleted_ids.write() = data.deleted_ids;
+            *self.deleted_ids.write() = data.deleted_ids.into_iter().collect();
         }
 
         info!("Loaded Vamana index with {} vectors", data.num_vectors);
@@ -1699,6 +1701,92 @@ mod tests {
             heap.set_exact_search_max(exact_max);
             for q in vectors.iter().step_by(37) {
                 assert_eq!(mapped.search(q, 10).unwrap(), heap.search(q, 10).unwrap());
+            }
+        }
+    }
+
+    /// The graph search as it was written before the visited and deleted sets became a stamp
+    /// array and a bitset: std `HashSet`s, the beam sized k plus up to 2k for deleted vectors.
+    fn hash_set_graph_search(index: &VamanaIndex, query: &[f32], k: usize) -> Vec<(u32, f32)> {
+        let graph = index.graph.read();
+        let storage = index.vectors.read();
+        let deleted: HashSet<u32> = index.deleted_ids.read().iter().collect();
+        let search_k = if deleted.is_empty() {
+            k
+        } else {
+            k + deleted.len().min(k * 2)
+        };
+        let beam = search_k.max(index.config.search_list_size);
+        let distance = |id: u32| index.distance(query, storage.row(id).unwrap());
+        let entry = *index.medoid.read();
+        let mut visited = HashSet::new();
+        let mut candidates = BinaryHeap::new();
+        let mut w = BinaryHeap::new();
+        let entry_distance = distance(entry);
+        candidates.push(Reverse(SearchCandidate {
+            id: entry,
+            distance: entry_distance,
+        }));
+        w.push(SearchCandidate {
+            id: entry,
+            distance: entry_distance,
+        });
+        visited.insert(entry);
+        while let Some(Reverse(current)) = candidates.pop() {
+            if w.peek()
+                .is_some_and(|worst: &SearchCandidate| current.distance > worst.distance)
+            {
+                break;
+            }
+            for &neighbor in &graph[current.id as usize].neighbors {
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                let d = distance(neighbor);
+                if w.len() < beam || w.peek().is_some_and(|worst| d < worst.distance) {
+                    candidates.push(Reverse(SearchCandidate {
+                        id: neighbor,
+                        distance: d,
+                    }));
+                    w.push(SearchCandidate {
+                        id: neighbor,
+                        distance: d,
+                    });
+                    if w.len() > beam {
+                        w.pop();
+                    }
+                }
+            }
+        }
+        w.into_sorted_vec()
+            .into_iter()
+            .filter(|c| !deleted.contains(&c.id))
+            .take(k)
+            .map(|c| (c.id, c.distance))
+            .collect()
+    }
+
+    /// The stamp-array visited set and the deleted bitset walk the graph exactly as the hash
+    /// sets did: same ids, same distances, same order, with deletions and incremental inserts.
+    #[test]
+    fn graph_search_matches_the_hash_set_search() {
+        let vectors = clustered_unit_vectors(2500, 32, 25, 9);
+        let mut index = VamanaIndex::new(graph_config(32)).unwrap();
+        index.set_exact_search_max(0);
+        index.build(vectors[..2000].to_vec()).unwrap();
+        for v in &vectors[2000..] {
+            index.add_vector(v.clone()).unwrap();
+        }
+        for id in (0..2500).step_by(41) {
+            index.mark_deleted(id);
+        }
+        for (i, q) in vectors.iter().enumerate().step_by(53) {
+            for k in [1, 10, 60] {
+                assert_eq!(
+                    index.search(q, k).unwrap(),
+                    hash_set_graph_search(&index, q, k),
+                    "query {i}, k {k}"
+                );
             }
         }
     }

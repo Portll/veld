@@ -1,4 +1,4 @@
-//! Vector rows of a [`super::vamana::VamanaIndex`].
+//! Vector rows of a [`super::vamana::VamanaIndex`], and the id sets its searches use.
 
 use anyhow::{anyhow, Result};
 use memmap2::Mmap;
@@ -184,6 +184,163 @@ impl VectorStore {
     }
 }
 
+/// Soft-deleted vector ids, one bit per id below the highest marked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DeletedSet {
+    words: Vec<u64>,
+    count: usize,
+}
+
+impl DeletedSet {
+    #[inline]
+    pub(crate) fn contains(&self, id: u32) -> bool {
+        let id = id as usize;
+        self.words
+            .get(id / 64)
+            .is_some_and(|word| word & (1 << (id % 64)) != 0)
+    }
+
+    /// Mark `id`; false when it already was.
+    pub(crate) fn insert(&mut self, id: u32) -> bool {
+        let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        let fresh = self.words[word] & bit == 0;
+        self.words[word] |= bit;
+        self.count += usize::from(fresh);
+        fresh
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.words.clear();
+        self.count = 0;
+    }
+
+    /// Marked ids, ascending.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter().enumerate().flat_map(|(index, &word)| {
+            let mut bits = word;
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                Some(index as u32 * 64 + bit)
+            })
+        })
+    }
+}
+
+impl FromIterator<u32> for DeletedSet {
+    fn from_iter<I: IntoIterator<Item = u32>>(ids: I) -> Self {
+        let mut set = Self::default();
+        for id in ids {
+            set.insert(id);
+        }
+        set
+    }
+}
+
+/// The nodes one graph walk has reached. A node is reached when its stamp equals the walk's
+/// epoch, so a new walk starts with one increment instead of clearing or allocating a set.
+pub(crate) struct VisitedSet {
+    stamps: Vec<u32>,
+    epoch: u32,
+}
+
+impl VisitedSet {
+    fn new() -> Self {
+        Self {
+            stamps: Vec::new(),
+            epoch: 0,
+        }
+    }
+
+    /// Forget every node, with room for ids below `n`.
+    fn reset(&mut self, n: usize) {
+        if self.stamps.len() < n {
+            self.stamps.resize(n, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamps.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Mark `id` reached; false when it already was.
+    #[inline]
+    pub(crate) fn insert(&mut self, id: u32) -> bool {
+        let id = id as usize;
+        if id >= self.stamps.len() {
+            self.stamps.resize(id + 1, 0);
+        }
+        let stamp = &mut self.stamps[id];
+        if *stamp == self.epoch {
+            false
+        } else {
+            *stamp = self.epoch;
+            true
+        }
+    }
+}
+
+/// Visited sets kept between walks. A set holds four bytes per node, so the pool keeps no more
+/// than this many; a walk beyond them allocates its own and drops it.
+const POOLED_VISITED_SETS: usize = 32;
+
+#[derive(Default)]
+pub(crate) struct VisitedPool {
+    free: parking_lot::Mutex<Vec<VisitedSet>>,
+}
+
+impl VisitedPool {
+    /// An empty visited set with room for ids below `n`, returned to the pool when dropped.
+    pub(crate) fn take(&self, n: usize) -> PooledVisited<'_> {
+        let mut set = self.free.lock().pop().unwrap_or_else(VisitedSet::new);
+        set.reset(n);
+        PooledVisited {
+            pool: self,
+            set: Some(set),
+        }
+    }
+}
+
+pub(crate) struct PooledVisited<'a> {
+    pool: &'a VisitedPool,
+    set: Option<VisitedSet>,
+}
+
+impl std::ops::Deref for PooledVisited<'_> {
+    type Target = VisitedSet;
+    fn deref(&self) -> &VisitedSet {
+        self.set.as_ref().expect("visited set is held until drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledVisited<'_> {
+    fn deref_mut(&mut self) -> &mut VisitedSet {
+        self.set.as_mut().expect("visited set is held until drop")
+    }
+}
+
+impl Drop for PooledVisited<'_> {
+    fn drop(&mut self) {
+        if let Some(set) = self.set.take() {
+            let mut free = self.pool.free.lock();
+            if free.len() < POOLED_VISITED_SETS {
+                free.push(set);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +395,54 @@ mod tests {
         let runs: Vec<(u32, usize)> = store.runs(5).map(|(id, r)| (id, r.len())).collect();
         assert_eq!(runs, vec![(0, 8), (4, 2)]);
         assert_eq!(store.to_flat().len(), 10);
+    }
+
+    #[test]
+    fn deleted_ids_are_a_set() {
+        let mut deleted = DeletedSet::default();
+        assert_eq!(deleted.len(), 0);
+        assert!(deleted.insert(130));
+        assert!(deleted.insert(3));
+        assert!(!deleted.insert(130));
+        assert!(deleted.insert(64));
+        assert_eq!(deleted.len(), 3);
+        assert!(deleted.contains(3) && deleted.contains(64) && deleted.contains(130));
+        assert!(!deleted.contains(4) && !deleted.contains(63) && !deleted.contains(100_000));
+        assert_eq!(deleted.iter().collect::<Vec<_>>(), vec![3, 64, 130]);
+        assert_eq!(deleted.iter().collect::<DeletedSet>(), deleted);
+        deleted.clear();
+        assert_eq!(deleted.len(), 0);
+        assert!(!deleted.contains(3));
+    }
+
+    #[test]
+    fn a_visited_set_forgets_between_walks_and_across_epoch_wrap() {
+        let pool = VisitedPool::default();
+        {
+            let mut walk = pool.take(10);
+            assert!(walk.insert(4));
+            assert!(!walk.insert(4));
+            assert!(walk.insert(25), "an id past the sizing grows the set");
+        }
+        {
+            let mut walk = pool.take(10);
+            assert!(walk.insert(4), "a new walk starts empty");
+            walk.epoch = u32::MAX;
+            walk.stamps[7] = u32::MAX;
+        }
+        let mut walk = pool.take(10);
+        assert_eq!(
+            walk.epoch, 1,
+            "the epoch wrapped and the stamps were cleared"
+        );
+        assert!(walk.insert(7));
+        assert_eq!(
+            pool.free.lock().len(),
+            0,
+            "the set is out of the pool while held"
+        );
+        drop(walk);
+        assert_eq!(pool.free.lock().len(), 1);
     }
 
     #[test]
