@@ -460,7 +460,7 @@ fn check_tenant(user_id: &str, frames: &[(u64, IntentPayload)]) -> Result<()> {
 }
 
 /// Follower side: apply a page of leader frames to the canonical store, then
-/// journal each applied frame here so the local projections and log follow. The
+/// journal the applied frames here, as one batch, so the local projections and log follow. The
 /// page is coalesced first; the BM25 projection indexes snapshots as their frames
 /// are journaled, on its own commit cadence. Idempotent:
 /// a snapshot is an upsert, a forget of an unknown id is a no-op. Returns the
@@ -503,13 +503,14 @@ pub fn apply_replicated_page(
         }
     }
     memory_sys.read().upsert_memories(&snapshots)?;
-    let mut journaled = 0u64;
     for (_, payload) in &frames {
         apply_non_snapshot(manager, user_id, payload)?;
-        manager.journal_and_apply(user_id, payload)?;
-        journaled += 1;
     }
-    Ok(journaled)
+    // One writer lock, append batch and fsync for the page rather than one per frame.
+    // All or nothing: a page that fails journals no frame, and its retry adds no
+    // duplicates of the frames before the failure.
+    let payloads: Vec<IntentPayload> = frames.into_iter().map(|(_, payload)| payload).collect();
+    Ok(manager.journal_and_apply_batch(user_id, &payloads)?.len() as u64)
 }
 
 /// The store-side effect of a `Forget`, `Anchor` or `SetAnchored` frame; snapshots are handled in
@@ -1348,6 +1349,178 @@ mod tests {
             memory_sys.read().get_memory(&id).unwrap().importance(),
             importance
         );
+    }
+
+    #[test]
+    fn a_page_lands_in_the_store_and_the_local_log_in_one_batch() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let sv = Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
+        let snapshot = |content: &str| {
+            let memory = crate::memory::types::Memory::new(
+                MemoryId(uuid::Uuid::new_v4()),
+                crate::memory::types::Experience {
+                    content: content.to_string(),
+                    ..Default::default()
+                },
+                0.5,
+                None,
+                None,
+                None,
+                None,
+            );
+            let bytes =
+                bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
+            (memory.id, bytes)
+        };
+        let (first, first_bytes) = snapshot("the harbour crane is serviced in spring");
+        let (second, second_bytes) = snapshot("the tide gauge reads high on Thursdays");
+        let frames = vec![
+            (
+                10,
+                IntentPayload::Remember {
+                    user_id: "u".into(),
+                    memory_id: first.0.to_string(),
+                    memory_bincode: first_bytes,
+                    schema_version: sv,
+                },
+            ),
+            (
+                11,
+                IntentPayload::Remember {
+                    user_id: "u".into(),
+                    memory_id: second.0.to_string(),
+                    memory_bincode: second_bytes,
+                    schema_version: sv,
+                },
+            ),
+            (
+                12,
+                IntentPayload::SetAnchored {
+                    user_id: "u".into(),
+                    memory_id: first.0.to_string(),
+                    anchored: true,
+                    importance: 0.9,
+                    schema_version: sv,
+                },
+            ),
+        ];
+
+        assert_eq!(apply_replicated_page(&manager, "u", frames).unwrap(), 3);
+
+        let memory_sys = manager.get_user_memory("u").unwrap();
+        assert!(memory_sys.read().get_memory(&first).unwrap().is_anchored());
+        assert!(memory_sys.read().get_memory(&second).is_ok());
+        let writer = manager.get_user_journaled_writer("u").unwrap();
+        let mut journaled: Vec<String> = writer
+            .lock()
+            .log()
+            .iter()
+            .unwrap()
+            .map(|record| {
+                let (_, payload) = payload::decode_record(&record.unwrap()).unwrap();
+                payload.memory_id().to_string()
+            })
+            .collect();
+        journaled.sort();
+        let mut expected = vec![
+            first.0.to_string(),
+            first.0.to_string(),
+            second.0.to_string(),
+        ];
+        expected.sort();
+        assert_eq!(journaled, expected, "the page's frames, once each");
+    }
+
+    /// An update, a bulk forget and a batch remember on the leader reach a follower
+    /// through the leader's log, with their ids: the paths that did not journal before.
+    #[tokio::test]
+    async fn an_update_a_bulk_forget_and_a_batch_remember_reach_the_follower() {
+        use crate::handlers::test_helpers::{post_json, put_json, send, TestHarness};
+        use axum::http::StatusCode;
+
+        let leader = TestHarness::new();
+        let user = "replica-user";
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/remember/batch",
+                &serde_json::json!({
+                    "user_id": user,
+                    "memories": [
+                        {"content": "the dredger works the channel at night", "tags": ["keep"]},
+                        {"content": "the old pier is closed to walkers", "tags": ["sweep"]},
+                        {"content": "the lighthouse lamp was replaced in May", "tags": ["sweep"]},
+                    ],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<String> = body["memory_ids"]
+            .as_array()
+            .expect("batch remember returns its ids")
+            .iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 3, "{body}");
+
+        let revised = "the dredger works the channel at dawn";
+        let (status, body) = send(
+            leader.router(),
+            put_json(
+                &format!("/api/memory/{}", ids[0]),
+                &serde_json::json!({ "user_id": user, "content": revised }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/memories/bulk",
+                &serde_json::json!({ "user_id": user, "tags": ["sweep"] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let frames: Vec<(u64, IntentPayload)> = {
+            let writer = leader.state().get_user_journaled_writer(user).unwrap();
+            let writer = writer.lock();
+            writer
+                .log()
+                .iter()
+                .unwrap()
+                .map(|record| {
+                    let (lsn, payload) = payload::decode_record(&record.unwrap()).unwrap();
+                    (lsn.0, payload)
+                })
+                .collect()
+        };
+        let (follower, _tmp) = TestHarness::fresh_manager();
+        let follower = Arc::new(follower);
+        let applied = {
+            let follower = Arc::clone(&follower);
+            tokio::task::spawn_blocking(move || apply_replicated_page(&follower, user, frames))
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert!(applied > 0);
+
+        let replica = follower.get_user_memory(user).unwrap();
+        let replica = replica.read();
+        let id = |text: &str| MemoryId(uuid::Uuid::parse_str(text).unwrap());
+        assert_eq!(
+            replica.get_memory(&id(&ids[0])).unwrap().experience.content,
+            revised
+        );
+        for swept in &ids[1..] {
+            assert!(
+                replica.get_memory(&id(swept)).is_err(),
+                "{swept} survived its bulk forget on the follower"
+            );
+        }
     }
 
     #[test]
