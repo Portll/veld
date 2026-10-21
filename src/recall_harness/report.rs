@@ -76,7 +76,7 @@ pub const DEFAULT_RERANK_CAP: usize = 20;
 /// Reranking moves p@1 by several points on the gate, so a run with it off, with another
 /// cross-encoder or with another budget measures another pipeline, and a diff against the
 /// baseline would read as a regression no code caused.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RerankSetting {
     /// Whether recall reranks: the `use_reranking` dial is not off and a reranker is configured.
     pub enabled: bool,
@@ -85,6 +85,14 @@ pub struct RerankSetting {
     /// Candidates an undecomposed query hands the cross-encoder at most: the `rerank_count` dial,
     /// or [`DEFAULT_RERANK_CAP`]. Compared only when both runs rerank.
     pub depth: usize,
+    /// The `rerank_pool` dial when set: fused candidates kept for the cross-encoder layer.
+    /// `None` is the shipped width, which is what a report recorded before the dial reads as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<usize>,
+    /// The `ce_blend` dial when set: the cross-encoder's weight in the blend. `None` is the
+    /// shipped weight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blend: Option<f32>,
 }
 
 impl RerankSetting {
@@ -96,12 +104,23 @@ impl RerankSetting {
             enabled,
             model: if enabled { model } else { None },
             depth: dials.rerank_count.unwrap_or(DEFAULT_RERANK_CAP),
+            pool: dials.rerank_pool,
+            blend: dials.ce_blend,
         }
     }
 
     fn describe(&self) -> String {
         match (&self.model, self.enabled) {
-            (Some(m), true) => format!("cross-encoder {m}, cap {}", self.depth),
+            (Some(m), true) => {
+                let mut out = format!("cross-encoder {m}, cap {}", self.depth);
+                if let Some(pool) = self.pool {
+                    out.push_str(&format!(", pool {pool}"));
+                }
+                if let Some(blend) = self.blend {
+                    out.push_str(&format!(", blend {blend:.2}"));
+                }
+                out
+            }
             _ => "cross-encoder off".to_string(),
         }
     }
@@ -110,7 +129,11 @@ impl RerankSetting {
         if self.enabled != other.enabled {
             return false;
         }
-        !self.enabled || (self.model == other.model && self.depth == other.depth)
+        !self.enabled
+            || (self.model == other.model
+                && self.depth == other.depth
+                && self.pool == other.pool
+                && self.blend == other.blend)
     }
 }
 
@@ -1221,6 +1244,8 @@ mod tests {
                 enabled: true,
                 model: Some("mxbai-rerank-xsmall-v1".to_string()),
                 depth: 20,
+                pool: None,
+                blend: None,
             }),
             retrieval_dials: Some(RetrievalDials::default()),
             model_tape: None,
@@ -1325,6 +1350,8 @@ mod tests {
             enabled: false,
             model: None,
             depth: 20,
+            pool: None,
+            blend: None,
         });
         let failures = compare_to_baseline(&baseline, &current, 2.0);
         assert_eq!(failures.len(), 1, "{failures:?}");
@@ -1348,11 +1375,52 @@ mod tests {
                 enabled: true,
                 model: Some(model.to_string()),
                 depth,
+                pool: None,
+                blend: None,
             });
             let failures = compare_to_baseline(&baseline, &current, 2.0);
             assert_eq!(failures.len(), 1, "{failures:?}");
             assert_eq!(failures[0].kind, "infrastructure");
         }
+    }
+
+    /// A wider pool or another blend weight changes what the cross-encoder decides, so a
+    /// run under either is another pipeline and the diff names the setting.
+    #[test]
+    fn different_rerank_pool_or_blend_refuses_when_both_rerank() {
+        for (pool, blend, named) in [
+            (Some(100), None, "pool 100"),
+            (None, Some(0.4), "blend 0.40"),
+        ] {
+            let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            current.rerank = Some(RerankSetting {
+                enabled: true,
+                model: Some("mxbai-rerank-xsmall-v1".to_string()),
+                depth: 20,
+                pool,
+                blend,
+            });
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(failures[0].detail.contains(named), "{}", failures[0].detail);
+        }
+    }
+
+    /// A report recorded before the pool and blend were recorded reads as the shipped
+    /// width and weight, so the checked-in baseline still compares with a default run.
+    #[test]
+    fn a_rerank_setting_without_pool_or_blend_reads_as_the_shipped_pipeline() {
+        let old: RerankSetting =
+            serde_json::from_str(r#"{"enabled":true,"model":"mxbai-rerank-xsmall-v1","depth":20}"#)
+                .expect("an old rerank setting parses");
+        assert_eq!(old.pool, None);
+        assert_eq!(old.blend, None);
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"enabled":true,"model":"mxbai-rerank-xsmall-v1","depth":20}"#
+        );
     }
 
     /// With reranking off on both sides the cap is never read, so a different cap is the same
@@ -1365,11 +1433,15 @@ mod tests {
             enabled: false,
             model: None,
             depth: 20,
+            pool: None,
+            blend: None,
         });
         current.rerank = Some(RerankSetting {
             enabled: false,
             model: None,
             depth: 30,
+            pool: None,
+            blend: None,
         });
         let failures = compare_to_baseline(&baseline, &current, 2.0);
         assert_eq!(failures.len(), 1, "{failures:?}");

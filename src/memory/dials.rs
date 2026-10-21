@@ -126,6 +126,13 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub rerank_count: Option<usize>,
 
+    /// Fused candidates kept for the cross-encoder layer (recall Layer 4's truncation).
+    /// `None` keeps 30, or 50 for a decomposed query; the pool never drops below
+    /// `rerank_count`. Raising `rerank_count` alone cannot reach gold that the truncation
+    /// already cut.
+    #[serde(default)]
+    pub rerank_pool: Option<usize>,
+
     /// Which cross-encoder reranks, by registry id
     /// (`crate::embeddings::cross_encoder::lookup`). `None` keeps the process-wide choice
     /// (`VELD_CROSS_ENCODER`, else mxbai-rerank-xsmall-v1). Set to
@@ -616,6 +623,7 @@ impl Default for CognitiveDials {
             use_mmr: None,
             candidate_count: None,
             rerank_count: None,
+            rerank_pool: None,
             rerank_model: None,
             rrf_weights: None,
             date_window_leg: None,
@@ -668,6 +676,9 @@ impl CognitiveDials {
         }
         if let Some(r) = self.rerank_count {
             self.rerank_count = Some(r.clamp(1, 200));
+        }
+        if let Some(p) = self.rerank_pool {
+            self.rerank_pool = Some(p.clamp(10, 500));
         }
         self.rerank_model = self.rerank_model.take().and_then(|id| {
             let id = id.trim();
@@ -826,6 +837,9 @@ impl CognitiveDials {
         if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_COUNT") {
             d.rerank_count = Some(v);
         }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_POOL") {
+            d.rerank_pool = Some(v);
+        }
         if let Ok(v) = std::env::var("VELD_DIALS_RERANK_MODEL") {
             d.rerank_model = Some(v);
         }
@@ -907,6 +921,7 @@ mod tests {
         assert!(d.use_mmr.is_none());
         assert!(d.candidate_count.is_none());
         assert!(d.rerank_count.is_none());
+        assert!(d.rerank_pool.is_none());
         assert!(d.rerank_model.is_none());
         assert!(d.rrf_weights.is_none());
         assert!(d.date_window_leg.is_none());
@@ -1058,10 +1073,12 @@ mod tests {
             embedding_blend: 0.9,
             candidate_count: Some(100_000),
             rerank_count: Some(0),
+            rerank_pool: Some(5),
             rrf_weights: Some((2.0, -1.0, 0.5)),
             ..Default::default()
         }
         .sanitized();
+        assert_eq!(d.rerank_pool, Some(10));
         assert_eq!(d.reconsolidation_window_secs, 30);
         assert_eq!(d.graph_boost_scale, 1.0);
         assert_eq!(d.embedding_blend, 0.5);
