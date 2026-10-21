@@ -64,15 +64,37 @@ See [Multi-tenant](multi-tenant.md) for the operational model.
 Veld picks its PRIMARY embedder at startup, in this order, and reports the choice on
 `GET /health` as `embedder` (`id`, `model`, `dimension`, `kind`, `reason`):
 
-1. `VELD_EMBEDDER`, when set: `nomic` (local ONNX), `minilm` (local ONNX), `http`
-   (the endpoint below), or an `http(s)://host:port[#model]` URL. An explicit choice
-   that cannot be honoured fails startup with the endpoint named; it never falls back.
+1. `VELD_EMBEDDER`, when set: `nomic` (local ONNX), `minilm` (local ONNX),
+   `arctic-embed-xs` (local ONNX), `http` (the endpoint below), or an
+   `http(s)://host:port[#model]` URL. An explicit choice that cannot be honoured fails
+   startup with the endpoint named; it never falls back. `arctic-embed-xs` is reached only
+   this way, never by the automatic steps below.
 2. Nomic-embed-text-v1.5 ONNX (768d) when its model files are present
    (`VELD_AUTO_DOWNLOAD_MODELS=true` fetches them).
 3. The OpenAI-compatible HTTP endpoint, when it answers a probe for the configured
    model. This is the same nomic model served by a process that already holds it.
 4. MiniLM-L6 ONNX (384d). With no model files at all veld refuses to start rather than
    run on hash vectors (`VELD_ALLOW_SIMPLIFIED_EMBEDDINGS=1` overrides, for tests only).
+
+The local ONNX embedders are downloaded from Hugging Face by `model-fetch --minilm`,
+`--arctic-xs` or `--nomic`, or on first use with `VELD_AUTO_DOWNLOAD_MODELS=true`.
+MiniLM and arctic-embed-xs are fetched at a pinned commit and checked against a SHA-256
+per file; Nomic still follows the repository's `main` branch without checksums.
+
+| `VELD_EMBEDDER` | Model | Licence | Dim | Window | Pooling | Query prefix |
+|---|---|---|---|---|---|---|
+| `minilm` | `sentence-transformers/all-MiniLM-L6-v2` @ `c9745ed1` | Apache-2.0 | 384 | 256 | mean | none |
+| `arctic-embed-xs` | `Snowflake/snowflake-arctic-embed-xs` @ `d8c86521` | Apache-2.0 | 384 | 512 | `[CLS]` | `Represent this sentence for searching relevant passages: ` |
+| `nomic` | `nomic-ai/nomic-embed-text-v1.5` @ `main` | Apache-2.0 | 768 | 512 | mean | `search_query: ` (documents `search_document: `) |
+
+`arctic-embed-xs` is MiniLM-L6's architecture (6 layers, 384 wide, the same vocabulary)
+trained for retrieval, so it costs about what MiniLM does per token. It runs the int8
+export by default, the precision MiniLM runs at; `VELD_ARCTIC_USE_QUANTIZED=false` loads
+the fp32 one, and `VELD_ARCTIC_MODEL_PATH` points at a directory holding the files. Its
+licence is stated in the model card's License section; the card has no `license:` tag,
+so the Hub's licence filter does not show it. Switching the embedder of an existing store
+re-embeds every memory on the next start, because the corpus marker records which model
+wrote the vectors and a match on dimension alone is not accepted.
 
 The HTTP endpoint is any server speaking `/v1/models` and `/v1/embeddings`. Give the
 BASE URL, without `/v1`; the client appends the path:
@@ -151,6 +173,21 @@ If you expose veld beyond localhost, put it behind a reverse proxy with TLS:
 Veld checks the bind host via `is_local_bind_host()`; binding to
 `0.0.0.0` is a deliberate choice that disables some safety defaults.
 
+## Readiness while a tenant opens
+
+A tenant's stores open on its first request, not at boot, and a large one takes a
+while: 11.7 s for the live server's largest tenant on 2026-10-19, and 10 min for the
+same tenant on a redb replica that had to rebuild its Vamana index. Requests for that
+tenant wait for the open. The remember, recall, upsert, list and memory CRUD routes
+and the streaming websockets wait on the blocking pool, so `/health`, `/health/live`
+and requests for other tenants keep answering while it runs.
+
+`GET /health/ready` stays `200 ready` during an open and reports how many requests are
+waiting on one in `tenant_open_waiters`. Readiness is about the process: an open delays
+only its own tenant, and a 503 would make a load balancer pull every tenant off the
+instance on each reopen after an idle eviction. Readiness fails for conditions that
+affect every tenant: shared stores that did not open, and a hard write latch (below).
+
 ## Disk full: the write latch
 
 RocksDB stops accepting writes after a background IO error. For "no space left on
@@ -168,10 +205,13 @@ Veld now notices and says so:
 | `GET /health/live` | `200 alive` | `200 alive` — the process is alive either way |
 | Write API calls | — | `503 STORAGE_WRITE_LATCHED` instead of `500 INTERNAL_ERROR` |
 
-**The latch is per store, not per process.** Veld runs one RocksDB per tenant
-(`base/<user_id>`) and RocksDB's own latch is per database, so a write landing on
-one tenant's store says nothing about another's. One latched store out of twelve is
-`degraded`, and the array names which.
+**The latch is per store, not per process.** RocksDB's own latch is per database,
+and veld runs several: each tenant's memory store and graph under `base/<user_id>`,
+and one shared store (`base/shared`) holding todos, reminders, files, feedback,
+context blocks and the audit log. Every write to any of them goes through the
+latch, keyed by that database's directory, so a write landing on one store says
+nothing about another. One latched store out of twelve is `degraded`, and the
+array names which.
 
 **`/health` and `/health/ready` are unauthenticated** (`PROBE_PATHS`), so they
 carry no store paths. Each entry names its store by `store` — the first 16 hex
@@ -196,6 +236,18 @@ to the options, for which the C API has no setter (`db/error_handler.cc:541`).
 `DB::Resume()` is not exposed by rust-rocksdb 0.24. Reopening the database in the
 same process cannot work either: RocksDB holds a directory lock and live handles are
 still outstanding.
+
+**On redb a NoSpace write latches hard at once.** redb poisons a database handle on
+its first I/O error: from then on every write, and every read its page cache cannot
+answer, fails with `PreviousIo` until the file is closed and reopened (redb 2.6.3,
+`tree_store/page_store/cached_file.rs:129-180`). There is nothing to retry, so the
+failing write latches its `.redb` file hard, and later writes to that file answer
+`503 STORAGE_WRITE_LATCHED`. Veld does not reopen the file in place: every store over
+it holds the same handle, and redb's file lock refuses a second open while any of them
+does. With `VELD_WRITE_LATCH_RESTART=1` the process exits for a restart once space is
+back, as it does for RocksDB. A tenant's files are also reopened when the tenant is
+evicted from the cache and used again, and the first commit on the new handle clears
+the latch.
 
 | Variable | Default | Effect |
 |---|---|---|

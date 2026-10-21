@@ -1,4 +1,4 @@
-//! Single-component path guards for identifiers that come from callers.
+//! Path guards for identifiers and directories that come from callers.
 //!
 //! Every per-user directory in this codebase is `base.join(user_id)` where `user_id` originates
 //! outside the process (HTTP request, CLI argument, MCP call). A value like `../other-user` or an
@@ -22,9 +22,64 @@ pub fn sanitize_component<'a>(value: &'a str, what: &str) -> anyhow::Result<&'a 
     Ok(value)
 }
 
+/// True for a canonical path that is the home directory itself or lies under one of its
+/// credential and application-state roots: a dot-directory directly under home (`.ssh`, `.aws`,
+/// `.config`, `.docker`, …), `Library` (macOS) or `AppData` (Windows). A directory walker that
+/// skips hidden SUBdirectories still reads every file once it is pointed at one of these roots.
+pub fn is_private_home_path(canonical: &std::path::Path) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    is_private_under(canonical, &home.canonicalize().unwrap_or(home))
+}
+
+fn is_private_under(canonical: &std::path::Path, home: &std::path::Path) -> bool {
+    let Ok(rest) = canonical.strip_prefix(home) else {
+        return false;
+    };
+    match rest.components().next() {
+        None => true,
+        Some(std::path::Component::Normal(first)) => {
+            let first = first.to_string_lossy();
+            first.starts_with('.') || first == "Library" || first == "AppData"
+        }
+        Some(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sanitize_component;
+    use super::{is_private_under, sanitize_component};
+
+    #[test]
+    fn private_home_roots_are_refused_and_projects_are_not() {
+        let home = std::path::Path::new("/Users/someone");
+        for private in [
+            "/Users/someone",
+            "/Users/someone/.ssh",
+            "/Users/someone/.config/veld",
+            "/Users/someone/.aws/credentials-dir",
+            "/Users/someone/Library/Application Support/veld",
+            "/Users/someone/AppData/Roaming/veld",
+        ] {
+            assert!(
+                is_private_under(std::path::Path::new(private), home),
+                "{private}"
+            );
+        }
+        for project in [
+            "/Users/someone/Repositories/app",
+            "/Users/someone/Repositories/app/.claude/worktrees/wf-1",
+            "/Users/someone/code/Library",
+            "/tmp/app",
+            "/Users/other/.ssh",
+        ] {
+            assert!(
+                !is_private_under(std::path::Path::new(project), home),
+                "{project}"
+            );
+        }
+    }
 
     /// Everything the API layer accepts, the filesystem guard accepts — including the
     /// unicode alphanumerics the old inline charset refused.

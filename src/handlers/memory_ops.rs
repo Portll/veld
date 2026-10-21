@@ -72,7 +72,8 @@ pub async fn merge_memories(
 
     let (content, tags) = {
         let user_mem = state
-            .get_user_memory(&req.user_id)
+            .get_user_memory_async(&req.user_id)
+            .await
             .map_err(AppError::Internal)?;
         let guard = user_mem.read();
         let mut bodies = Vec::with_capacity(req.ids.len());
@@ -175,7 +176,8 @@ pub async fn split_memory(
 
     let (content, parent_tags) = {
         let user_mem = state
-            .get_user_memory(&req.user_id)
+            .get_user_memory_async(&req.user_id)
+            .await
             .map_err(AppError::Internal)?;
         let guard = user_mem.read();
         let mem = guard

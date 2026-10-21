@@ -6,7 +6,7 @@ redb and RocksDB implementations, and the tools that move data between engines.
 | File | What it holds |
 | :--- | :--- |
 | `mod.rs` | The traits: `ColumnStore`, `KeyValueStore`, `PrimaryMemoryStore`, `GraphStore`, `AuditStore`, `BackupStore`, `MigrationStore`, `BatchWriter`, `StorageFactory`; `SharedEngineDb`. |
-| `redb.rs` | The redb implementation of every trait. |
+| `redb.rs` | The redb implementation of every trait, plus the sixteen `index_*` tables it derives from `memories` (date, type, importance, entity, tag, episode, episode sequence, robot, mission, geo, action type, reward, content hash, external id, parent, inbound ref), written in each memory's own transaction, the `index_memory_rows` ledger of the rows each memory owns, and the `index_meta` schema stamp that rebuilds them on open. |
 | `legacy_rocksdb.rs` | The RocksDB implementation. Compiled with the `rocksdb` feature. |
 | `portable.rs` | The VELDPORT interchange codec used by export, import and migrate. |
 | `migrate/` | `veld export`, `veld import` and `veld migrate`; each unit is verified by frame count and SHA-256 digest. |
@@ -45,5 +45,7 @@ already holds a different keystore is refused. `veld export` still refuses an en
 store, because a dump does not carry a keystore.
 
 The semantic merge pass and its tombstone GC (`memory::merge`) are one implementation over
-`PrimaryMemoryStore` and run on both engines; RocksDB answers the GC's citation check from its
-`inbound_ref:` index, redb by reading the memories and facts.
+`PrimaryMemoryStore` and run on both engines. Both answer the GC's citation check from an
+`inbound_ref` index: RocksDB from its `inbound_ref:` rows, redb from `index_inbound_ref`, whose hits it
+confirms against the holding memory's forward references. redb then scans the facts for a citation,
+as facts are not indexed.

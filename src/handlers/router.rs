@@ -42,13 +42,7 @@ pub const PROBE_PATHS: &[&str] = &["/health", "/health/live", "/health/ready", "
 /// Non-probe public paths (no authentication required). See `PROBE_PATHS` for
 /// the security contract and `public_router_has_no_per_user_handlers` for the
 /// enforcement test.
-pub const PUBLIC_PATHS: &[&str] = &[
-    "/api/context/status",
-    "/api/context_status",
-    "/graph/view",
-    "/docs",
-    "/api/admin/reset-rate-limit",
-];
+pub const PUBLIC_PATHS: &[&str] = &["/graph/view", "/docs", "/api/admin/reset-rate-limit"];
 
 /// `/metrics` is mounted on the public router only when
 /// `ServerConfig::metrics_public` is true; otherwise it lives behind auth.
@@ -82,9 +76,6 @@ pub fn build_probe_routes(state: AppState) -> Router {
 ///   - true: mounted here, rate-limited when `public_rate_limit` is true.
 pub fn build_public_routes(state: AppState, metrics_public: bool) -> Router {
     let r = Router::new()
-        // CONTEXT STATUS (GET only - status reads remain public)
-        .route("/api/context/status", get(health::get_context_status))
-        .route("/api/context_status", get(health::get_context_status)) // TUI GET alias
         // GRAPH VISUALIZATION (HTML viewer only — no memory data in the
         // static shell; dynamic data loads via authenticated API calls).
         .route("/graph/view", get(visualization::graph_view))
@@ -269,11 +260,18 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/health/ready", get(health::health_ready_user))
         .route("/api/health/index", get(health::health_index_user))
         // =================================================================
-        // CONTEXT SSE + STATUS (auth required — SSE leaks session/token/task info)
+        // CONTEXT SSE + STATUS (auth required — every session's id, model, token counts
+        // and working directory, readable cross-origin when it was public)
         // =================================================================
         .route("/api/context/sse", get(webhooks::context_status_sse))
-        .route("/api/context/status", post(health::update_context_status))
-        .route("/api/context_status", post(health::update_context_status)) // TUI POST alias
+        .route(
+            "/api/context/status",
+            get(health::get_context_status).post(health::update_context_status),
+        )
+        .route(
+            "/api/context_status",
+            get(health::get_context_status).post(health::update_context_status),
+        ) // TUI alias
         // =================================================================
         // EXTERNAL WEBHOOKS (auth + rate limited — prevents unauthenticated memory injection)
         // =================================================================

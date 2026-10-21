@@ -366,7 +366,8 @@ pub async fn get_memory(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
@@ -444,7 +445,8 @@ pub async fn list_memories(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -508,10 +510,15 @@ pub struct ListMemoriesQuery {
 #[tracing::instrument(skip(state), fields(user_id = %params.user_id))]
 pub async fn list_memories_get(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<ListMemoriesQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&params.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     let req = ListMemoriesRequest {
-        user_id: params.user_id,
+        user_id,
         limit: params.limit,
         offset: params.offset,
         memory_type: params.memory_type,
@@ -526,12 +533,18 @@ pub async fn list_memories_get(
 #[tracing::instrument(skip(state), fields(user_id = %params.user_id))]
 pub async fn count_memories(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<CountMemoriesQuery>,
 ) -> Result<Json<CountResponse>, AppError> {
-    validation::validate_user_id(&params.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&params.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&params.user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -559,7 +572,8 @@ async fn list_memories_inner(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -614,7 +628,8 @@ pub async fn update_memory(
     }
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -638,8 +653,15 @@ pub async fn update_memory(
 
     // Update in-place instead of creating a duplicate via remember()
     memory_guard
-        .update_memory(&current_memory)
+        .update_memory_journaled(&current_memory)
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
+    super::remember::journal_memory_snapshot(
+        &state,
+        &req.user_id,
+        &current_memory,
+        super::remember::SnapshotKind::Update,
+    );
 
     state.log_event(
         &req.user_id,
@@ -677,7 +699,8 @@ pub async fn delete_memory(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
@@ -686,8 +709,9 @@ pub async fn delete_memory(
     let resolved_id_str = resolved_id.0.to_string();
 
     memory_guard
-        .forget(memory::ForgetCriteria::ById(resolved_id))
+        .forget_journaled(memory::ForgetCriteria::ById(resolved_id))
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
 
     // W5: journal the delete. See `handlers::remember` for the full
     // rationale — RocksDB already holds the canonical removal; the
@@ -746,7 +770,8 @@ pub async fn forget_by_id(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
@@ -755,8 +780,9 @@ pub async fn forget_by_id(
     let resolved_id_str = resolved_id.0.to_string();
 
     memory_guard
-        .forget(memory::ForgetCriteria::ById(resolved_id))
+        .forget_journaled(memory::ForgetCriteria::ById(resolved_id))
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
 
     // W5: journal the delete (see `delete_memory` for rationale).
     let journal_payload = crate::intent_log::IntentPayload::Forget {
@@ -809,7 +835,8 @@ pub async fn patch_memory(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -852,8 +879,15 @@ pub async fn patch_memory(
 
     // Update in-place instead of creating a duplicate via remember()
     memory_guard
-        .update_memory(&current_memory)
+        .update_memory_journaled(&current_memory)
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
+    super::remember::journal_memory_snapshot(
+        &state,
+        &req.user_id,
+        &current_memory,
+        super::remember::SnapshotKind::Update,
+    );
 
     state.log_event(
         &req.user_id,
@@ -878,26 +912,22 @@ pub async fn patch_memory(
 /// these frames keep the intent log — and every projection / PITR replay
 /// built on it — from resurrecting deleted memories. Per-projection apply
 /// errors are swallowed (the frame is durable; replay retries on restart).
+/// Journaled in chunks, one writer lock and one fsync each, so a large forget
+/// does not pay an fsync per id.
 fn journal_bulk_forget(
     state: &AppState,
     user_id: &str,
     removed: impl IntoIterator<Item = memory::MemoryId>,
 ) {
-    for id in removed {
-        let payload = crate::intent_log::IntentPayload::Forget {
+    let payloads: Vec<_> = removed
+        .into_iter()
+        .map(|id| crate::intent_log::IntentPayload::Forget {
             user_id: user_id.to_string(),
             memory_id: id.0.to_string(),
             schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
-        };
-        if let Err(e) = state.journal_and_apply(user_id, &payload) {
-            tracing::warn!(
-                user_id = %user_id,
-                memory_id = %id.0,
-                error = %e,
-                "intent-log journal_and_apply (bulk Forget) failed (RocksDB delete already durable)",
-            );
-        }
-    }
+        })
+        .collect();
+    super::remember::journal_batch(state, user_id, &payloads);
 }
 
 /// POST /api/forget/age - Forget memories older than N days
@@ -909,7 +939,8 @@ pub async fn forget_by_age(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -953,7 +984,8 @@ pub async fn forget_by_importance(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1004,7 +1036,8 @@ pub async fn forget_by_pattern(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1048,7 +1081,8 @@ pub async fn forget_by_tags(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1104,7 +1138,8 @@ pub async fn forget_by_date(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1161,41 +1196,50 @@ pub async fn bulk_delete_memories(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let mut total_count = 0;
-
-    // Delete by tags if specified
+    let mut criteria = Vec::new();
     if let Some(ref tags) = req.tags {
         if !tags.is_empty() {
-            let count = memory_guard
-                .forget(memory::ForgetCriteria::ByTags(tags.clone()))
-                .map_err(AppError::Internal)?;
-            total_count += count;
+            criteria.push(memory::ForgetCriteria::ByTags(tags.clone()));
         }
     }
-
-    // Delete by type if specified
     if let Some(ref type_str) = req.memory_type {
         let exp_type = parse_experience_type(type_str)?;
-        let count = memory_guard
-            .forget(memory::ForgetCriteria::ByType(exp_type))
-            .map_err(AppError::Internal)?;
-        total_count += count;
+        criteria.push(memory::ForgetCriteria::ByType(exp_type));
     }
-
-    // Delete by date range if specified
     if req.created_after.is_some() || req.created_before.is_some() {
         let start = req
             .created_after
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
         let end = req.created_before.unwrap_or(chrono::Utc::now());
-        let count = memory_guard
-            .forget(memory::ForgetCriteria::ByDateRange { start, end })
-            .map_err(AppError::Internal)?;
-        total_count += count;
+        criteria.push(memory::ForgetCriteria::ByDateRange { start, end });
+    }
+
+    let memory_guard = memory_sys.read();
+    let mut total_count = 0;
+    let mut removed = Vec::new();
+    // Each pass's removals are journaled even when a later pass fails: they
+    // are already gone from the store.
+    let mut failure = None;
+    for c in criteria {
+        match memory_guard.forget_collecting_removed(c) {
+            Ok((count, ids)) => {
+                total_count += count;
+                removed.extend(ids);
+            }
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    drop(memory_guard);
+    journal_bulk_forget(&state, &req.user_id, removed);
+    if let Some(e) = failure {
+        return Err(AppError::Internal(e));
     }
 
     state.log_event(
@@ -1232,13 +1276,16 @@ pub async fn clear_all_memories(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
-    let count = memory_guard
-        .forget(memory::ForgetCriteria::All)
+    let (count, removed) = memory_guard
+        .forget_collecting_removed(memory::ForgetCriteria::All)
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
+    journal_bulk_forget(&state, &req.user_id, removed);
 
     state.log_event(
         &req.user_id,
@@ -1337,7 +1384,8 @@ pub async fn get_memory_health(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let mem = {
@@ -1441,7 +1489,8 @@ pub async fn anchor_memory(
     let memory_id = memory::MemoryId(uuid);
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let anchor_value = req.anchor;
@@ -1460,12 +1509,15 @@ pub async fn anchor_memory(
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     .map_err(AppError::Internal)?;
 
-    // W5: journal the anchor as an `Anchor` payload so the SQLite
+    // W5: journal the anchor as a `SetAnchored` payload so the SQLite
     // projection updates its `importance` column without rewriting the
-    // memory blob. See `handlers::remember` for the broader contract.
-    let journal_payload = crate::intent_log::IntentPayload::Anchor {
+    // memory blob, and a follower learns the flag itself: a release can
+    // leave importance unchanged. See `handlers::remember` for the broader
+    // contract.
+    let journal_payload = crate::intent_log::IntentPayload::SetAnchored {
         user_id: req.user_id.clone(),
         memory_id: req.memory_id.clone(),
+        anchored: anchor_value,
         importance: final_importance,
         schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
     };
@@ -1610,7 +1662,8 @@ pub async fn move_memory_tier(
     let target_tier = parse_memory_tier(&req.target_tier)?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let mid = memory_id.clone();
@@ -2063,5 +2116,244 @@ mod tests {
                 .into_iter()
                 .collect()
         ));
+    }
+
+    struct UnusedEmbedder;
+
+    impl crate::embeddings::Embedder for UnusedEmbedder {
+        fn id(&self) -> &str {
+            "unused"
+        }
+
+        // Reranking is off in these engines, so nothing encodes; the trait
+        // still needs a total implementation.
+        fn encode(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; 8])
+        }
+
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
+
+    /// The retrieval-side engine over the tenant's shared BM25 index, as recall
+    /// builds it, with nothing but BM25 contributing.
+    fn keyword_engine(harness: &TestHarness, user_id: &str) -> crate::memory::HybridSearchEngine {
+        crate::memory::HybridSearchEngine::with_bm25_index(
+            harness.manager.get_user_bm25_index(user_id).unwrap(),
+            std::sync::Arc::new(UnusedEmbedder),
+            crate::memory::HybridSearchConfig {
+                use_reranking: false,
+                ..crate::memory::HybridSearchConfig::default()
+            },
+        )
+    }
+
+    fn keyword_hits(engine: &crate::memory::HybridSearchEngine, query: &str) -> Vec<String> {
+        engine
+            .search(query, Vec::new(), |_| None)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.bm25_score.is_some())
+            .map(|r| r.memory_id.0.to_string())
+            .collect()
+    }
+
+    fn journaled_forgets(harness: &TestHarness, user_id: &str) -> Vec<String> {
+        let writer = harness.manager.get_user_journaled_writer(user_id).unwrap();
+        let writer = writer.lock();
+        writer
+            .log()
+            .iter()
+            .unwrap()
+            .map(|record| crate::intent_log::payload::decode_record(&record.unwrap()).unwrap())
+            .filter_map(|(_, payload)| match payload {
+                crate::intent_log::IntentPayload::Forget { memory_id, .. } => Some(memory_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A journaled remember writes nothing to BM25 itself; the document arrives
+    /// through the intent log's projection, and a search right after the
+    /// write sees it without waiting for the projection's batch to close.
+    #[tokio::test]
+    async fn a_journaled_remember_is_keyword_findable_through_the_projection_alone() {
+        let harness = TestHarness::new();
+        let user_id = "bm25-projection-user";
+        let engine = keyword_engine(&harness, user_id);
+
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let unjournaled = memory
+            .read()
+            .remember_detailed_journaled(
+                Experience {
+                    content: "orphanlexeme never reaches the journal".to_string(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert!(
+            keyword_hits(&engine, "orphanlexeme").is_empty(),
+            "a journaled-mode write must not index BM25 directly ({})",
+            unjournaled.id.0
+        );
+
+        let req = test_helpers::post_json(
+            "/api/remember",
+            &serde_json::json!({
+                "user_id": user_id,
+                "content": "The quokkazephyr ledger reconciles every night",
+            }),
+        );
+        let (status, body) = test_helpers::send(harness.router(), req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = body["id"]
+            .as_str()
+            .expect("remember returns an id")
+            .to_string();
+
+        assert_eq!(keyword_hits(&engine, "quokkazephyr"), vec![id]);
+    }
+
+    /// Bulk delete removes keys from the store, so each removal is journaled
+    /// as a Forget; the BM25 projection applies them and the documents leave
+    /// the keyword index.
+    #[tokio::test]
+    async fn bulk_delete_journals_a_forget_per_id_and_the_documents_leave_bm25() {
+        let harness = TestHarness::new();
+        let user_id = "bm25-bulk-delete-user";
+        let engine = keyword_engine(&harness, user_id);
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+
+        let mut ids = Vec::new();
+        for (content, tag) in [
+            ("sweepterm alpha record", "sweep-me"),
+            ("sweepterm beta record", "sweep-me"),
+            ("sweepterm gamma record", "keep-me"),
+        ] {
+            let outcome = memory
+                .read()
+                .remember_detailed_journaled(
+                    Experience {
+                        content: content.to_string(),
+                        tags: vec![tag.to_string()],
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let stored = memory.read().get_memory(&outcome.id).unwrap();
+            crate::handlers::remember::journal_memory_snapshot(
+                &harness.manager,
+                user_id,
+                &stored,
+                crate::handlers::remember::SnapshotKind::Remember,
+            );
+            ids.push(outcome.id.0.to_string());
+        }
+        let mut before = keyword_hits(&engine, "sweepterm");
+        before.sort();
+        let mut all = ids.clone();
+        all.sort();
+        assert_eq!(before, all);
+
+        let req = test_helpers::post_json(
+            "/api/memories/bulk",
+            &serde_json::json!({ "user_id": user_id, "tags": ["sweep-me"] }),
+        );
+        let (status, body) = test_helpers::send(harness.router(), req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let mut forgets = journaled_forgets(&harness, user_id);
+        forgets.sort();
+        let mut swept = vec![ids[0].clone(), ids[1].clone()];
+        swept.sort();
+        assert_eq!(
+            forgets, swept,
+            "one Forget per removed id, none for the kept one"
+        );
+
+        assert_eq!(keyword_hits(&engine, "sweepterm"), vec![ids[2].clone()]);
+    }
+
+    /// `auth_middleware` binds a tenant key only by patching a JSON body and inserting
+    /// `AuthenticatedUser`, so a `user_id` in the query string or path is the handler's to refuse.
+    /// The extension is layered directly: the real binding needs `VELD_MULTI_TENANT` set
+    /// process-wide, which would turn every concurrently running handler test's key away.
+    #[tokio::test]
+    async fn a_bound_key_cannot_name_another_tenant_in_the_query_or_path() {
+        use crate::auth::AuthenticatedUser;
+        use axum::http::Method;
+
+        let harness = TestHarness::new();
+        remember_n(&harness, "bob", &["bob's private note".to_string()]);
+        let app = harness.router().layer(axum::Extension(AuthenticatedUser {
+            user_id: "alice".to_string(),
+        }));
+
+        let session = uuid::Uuid::new_v4();
+        let comment = uuid::Uuid::new_v4();
+        let probes: &[(Method, String)] = &[
+            (Method::GET, "/api/memories?user_id=bob".into()),
+            (Method::GET, "/api/memories/count?user_id=bob".into()),
+            (Method::GET, "/api/storage/stats?user_id=bob".into()),
+            (Method::GET, "/api/consolidation/events?user_id=bob".into()),
+            (Method::GET, "/api/embeddings/backlog?user_id=bob".into()),
+            (Method::GET, "/api/context/blocks?user_id=bob".into()),
+            (
+                Method::GET,
+                "/api/context/blocks/persona?user_id=bob".into(),
+            ),
+            (
+                Method::DELETE,
+                "/api/context/blocks/persona?user_id=bob".into(),
+            ),
+            (Method::GET, "/api/dials?user_id=bob".into()),
+            (Method::GET, "/api/files/stats?user_id=bob".into()),
+            (Method::GET, format!("/api/sessions/{session}?user_id=bob")),
+            (Method::GET, "/api/sleep_time/status/bob".into()),
+            (Method::POST, "/api/reminders/abc/delete?user_id=bob".into()),
+            (Method::GET, "/api/todos/abc?user_id=bob".into()),
+            (Method::DELETE, "/api/todos/abc?user_id=bob".into()),
+            (Method::GET, "/api/todos/abc/subtasks?user_id=bob".into()),
+            (Method::GET, "/api/todos/abc/dependents?user_id=bob".into()),
+            (
+                Method::GET,
+                "/api/todos/abc/dependency_chain?user_id=bob".into(),
+            ),
+            (Method::GET, "/api/todos/abc/comments?user_id=bob".into()),
+            (
+                Method::DELETE,
+                format!("/api/todos/abc/comments/{comment}?user_id=bob"),
+            ),
+            (Method::GET, "/api/projects/work?user_id=bob".into()),
+            (Method::GET, "/api/visualization/bob/stats".into()),
+            (Method::GET, "/api/visualization/bob/dot".into()),
+            (Method::GET, "/api/events/sse?user_id=bob".into()),
+        ];
+        for (method, uri) in probes {
+            let req = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .header("x-api-key", test_helpers::TEST_API_KEY)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, body) = test_helpers::send(app.clone(), req).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {body}");
+            assert_eq!(body["code"], "INVALID_INPUT", "{method} {uri}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("tenant binding")),
+                "{method} {uri}: {body}"
+            );
+        }
+
+        let (status, body) =
+            test_helpers::send(app, test_helpers::get("/api/memories?user_id=alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 0u64, "alice sees her own store, not bob's");
     }
 }

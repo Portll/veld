@@ -31,6 +31,14 @@ use crate::constants::{
 // Timeout for draining in-flight requests (server-specific, not in constants.rs)
 const SERVER_DRAIN_TIMEOUT_SECS: u64 = 5;
 
+/// How long closing the tenants' write gates may take: one write per tenant, the one
+/// in progress when the gate closes.
+const WRITE_CLOSE_TIMEOUT_SECS: u64 = 10;
+
+/// After the gates close, how long requests that were queued behind them get to send
+/// their 503s before the server task is aborted.
+const CLOSED_WRITES_DRAIN_TIMEOUT_SECS: u64 = 2;
+
 // =============================================================================
 // PUBLIC API
 // =============================================================================
@@ -307,7 +315,11 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
         Ok(None) => {}
         Err(e) => error!("Replication: not following at boot: {e:#}"),
     }
-    tokio::spawn(crate::replication::run_follower(Arc::clone(&manager)));
+    let replication_shutdown = tokio_util::sync::CancellationToken::new();
+    manager.task_tracker.spawn(crate::replication::run_follower(
+        Arc::clone(&manager),
+        replication_shutdown.clone(),
+    ));
     start_embedding_backlog_drainer(Arc::clone(&manager));
     start_embed_queue_drainer(Arc::clone(&manager));
 
@@ -541,6 +553,7 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
     // Wait for shutdown signal (Ctrl+C / SIGTERM)
     shutdown_signal_with_drain().await;
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
+    replication_shutdown.cancel();
 
     // Tell the server to stop accepting new connections
     shutdown_notify.notify_one();
@@ -550,20 +563,20 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
         "Waiting up to {}s for in-flight requests...",
         SERVER_DRAIN_TIMEOUT_SECS
     );
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(SERVER_DRAIN_TIMEOUT_SECS),
-        &mut server_handle,
-    )
-    .await
-    {
-        Ok(Ok(Ok(()))) => info!("Server stopped gracefully"),
-        Ok(Ok(Err(e))) => error!("Server error: {}", e),
-        Ok(Err(e)) => error!("Server task panicked: {}", e),
-        Err(_) => {
-            info!(
-                "Server drain timed out after {}s, aborting server task",
-                SERVER_DRAIN_TIMEOUT_SECS
-            );
+    let drained = await_server_stop(&mut server_handle, SERVER_DRAIN_TIMEOUT_SECS).await;
+
+    // Requests accepted before the signal can still be queued on a tenant's write gate,
+    // each served in turn. Aborting the server task does not stop them (each connection
+    // is its own task), so on 2026-10-20 they kept writing for ten seconds after the
+    // flush. Closing the gates before the flush makes the flush the last write either way.
+    close_tenant_writes(&manager_for_shutdown).await;
+    if !drained {
+        info!(
+            "Server drain timed out after {}s; writes are closed, waiting up to {}s for the queued requests' 503s",
+            SERVER_DRAIN_TIMEOUT_SECS, CLOSED_WRITES_DRAIN_TIMEOUT_SECS
+        );
+        if !await_server_stop(&mut server_handle, CLOSED_WRITES_DRAIN_TIMEOUT_SECS).await {
+            info!("Connections still open (event streams, websockets); aborting server task");
             server_handle.abort();
         }
     }
@@ -584,6 +597,48 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
     run_shutdown_cleanup(manager_for_shutdown).await;
 
     Ok(())
+}
+
+/// Wait up to `secs` for the server task to finish. False when it is still running.
+async fn await_server_stop(
+    server_handle: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    secs: u64,
+) -> bool {
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), server_handle).await {
+        Ok(Ok(Ok(()))) => {
+            info!("Server stopped gracefully");
+            true
+        }
+        Ok(Ok(Err(e))) => {
+            error!("Server error: {}", e);
+            true
+        }
+        Ok(Err(e)) => {
+            error!("Server task panicked: {}", e);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Close every tenant's write gate on the blocking pool; the wait is for the write in
+/// progress in each.
+async fn close_tenant_writes(manager: &AppState) {
+    let manager = Arc::clone(manager);
+    let closing = tokio::task::spawn_blocking(move || manager.close_all_writes());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(WRITE_CLOSE_TIMEOUT_SECS),
+        closing,
+    )
+    .await
+    {
+        Ok(Ok(tenants)) => info!(tenants, "Tenant writes closed"),
+        Ok(Err(e)) => error!("Closing tenant writes panicked: {}", e),
+        Err(_) => error!(
+            "Closing tenant writes timed out after {}s; a write is still running",
+            WRITE_CLOSE_TIMEOUT_SECS
+        ),
+    }
 }
 
 /// Raise the soft open-file limit to the hard limit. Every tenant holds a redb or

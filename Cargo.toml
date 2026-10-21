@@ -1,6 +1,6 @@
 [package]
 name = "veld"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 authors = ["Portll <john@portll.net>"]
 description = "Persistent cognitive memory for AI agents and robots — Hebbian learning, knowledge graph, spatial recall. Zenoh/ROS2 native. Single binary, runs offline."
@@ -166,6 +166,7 @@ async-trait = "0.1"  # Object-safe async trait sugar (W4 RelationalStore, W6 que
 thiserror = "2.0"
 dotenvy = "0.15"  # Load .env files
 toml = { version = "0.8", default-features = false, features = ["parse"] }  # Parse veld init's config.toml
+veld-status-core = { path = "status-core" }  # `veld restart`: the monitor's restart path, shared
 
 # Async runtime & web server
 tokio = { version = "1.48", features = ["full"] }
@@ -335,6 +336,7 @@ zenoh = { version = "1.1", default-features = false, features = ["transport_tcp"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 http-body-util = "0.1"
+proptest = "1"
 serde-reflection = "0.6.0"
 tempfile = "3.24"
 
@@ -388,6 +390,14 @@ harness = false
 
 [[bench]]
 name = "embedding_spaces"
+harness = false
+
+[[bench]]
+name = "storage_engine_benchmarks"
+harness = false
+
+[[bench]]
+name = "cold_start_benchmarks"
 harness = false
 
 # =============================================================================
@@ -482,8 +492,8 @@ incremental = false     # Full rebuild every time (no incremental artifacts)
 # The default build carries both engines; RocksDB is the default engine (ADR 0007).
 default = ["rocksdb", "storage-redb"]
 
-# The RocksDB engine and what only it provides today: record-level at-rest encryption, the
-# RocksDB backup engine and the semantic merge pass. Needs libclang and a C++ toolchain. A build
+# The RocksDB engine and what only it provides today: the RocksDB backup engine and the
+# `MemoryStorage` in src/memory/storage.rs. Needs libclang and a C++ toolchain. A build
 # without it refuses those paths and names this feature:
 # `--no-default-features --features storage-redb` is the redb-only build.
 rocksdb = ["dep:rocksdb"]
@@ -559,3 +569,7 @@ rocksdb = { version = "0.24", default-features = false, features = ["lz4"], opti
 
 [workspace]
 # Standalone workspace - not part of parent kalki-v2
+# status-core keeps its own workspace and lockfile, as the monitor and the status
+# TUI and widget that also depend on it do; a path dependency inside this directory
+# would otherwise be drawn in as a member.
+exclude = ["status-core"]

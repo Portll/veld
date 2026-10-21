@@ -51,8 +51,13 @@ This matters for:
 
 `IntentPayload` is the canonical typed enum (see
 [`src/intent_log/payload.rs`](https://github.com/Portll/veld/blob/main/src/intent_log/payload.rs)).
-Bincode encoding gives us compact, forward-compatible serialization with
-schema-version checks on read.
+Bincode encoding gives us compact serialization with schema-version checks on
+read. Bincode is positional (a variant index, then the fields in order), so the
+payload grows only by appending variants: a field added to an existing variant
+makes every older frame of it undecodable, whatever `#[serde(default)]` says. A
+binary that predates a variant cannot decode frames carrying it, so followers
+are upgraded before their leader. Anchoring is journaled as `SetAnchored`
+(flag and importance); `Anchor` (importance only) remains for older logs.
 
 Recent work (commit `3173a16`) made the payload fully typed — previously it
 was a JSON blob. The transition is part of the v0.8 stabilization.

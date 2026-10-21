@@ -1145,46 +1145,34 @@ impl RetrievalEngine {
 
         let vamana_path = index_path.join(VAMANA_INDEX_FILE);
 
-        // LOCK ORDERING: Always acquire vector_index (1) before id_mapping (2)
+        // LOCK ORDERING: Always acquire vector_index (1) before id_mapping (2). The mapping
+        // is only counted: holding it through the save would stall every insert.
         let vector_index = self.vector_index.read();
-        let id_mapping = self.id_mapping.read();
-        let vector_count = id_mapping.len();
+        let vector_count = self.id_mapping.read().len();
         if vector_count > 0 {
-            // Atomic save: write to .tmp file then rename to avoid partial writes
-            let tmp_path = vamana_path.with_extension("vamana.tmp");
-            match vector_index.save_to_file(&tmp_path) {
+            // save_to_file replaces the file atomically: on a crash the old one survives.
+            match vector_index.save_to_file(&vamana_path) {
                 Ok(()) => {
-                    // Atomic rename — on crash, either the old or new file survives
-                    if let Err(e) = fs::rename(&tmp_path, &vamana_path) {
-                        warn!(
-                            "Failed to rename .vamana.tmp to .vamana: {} (removing tmp)",
-                            e
-                        );
-                        let _ = fs::remove_file(&tmp_path);
-                    } else {
-                        if let Err(e) = fs::write(index_path.join(MAPPINGS_MARKER_FILE), b"") {
-                            warn!("Failed to write the vector mappings marker: {}", e);
-                        }
-                        info!(
-                            "Saved Vamana index: {} memories to {} (instant startup enabled)",
-                            vector_count,
-                            vamana_path.display()
-                        );
+                    if let Err(e) = fs::write(index_path.join(MAPPINGS_MARKER_FILE), b"") {
+                        warn!("Failed to write the vector mappings marker: {}", e);
                     }
+                    info!(
+                        "Saved Vamana index: {} memories to {} (instant startup enabled)",
+                        vector_count,
+                        vamana_path.display()
+                    );
                 }
                 Err(e) => {
                     warn!(
                         "Failed to save Vamana index (will rebuild on restart): {}",
                         e
                     );
-                    let _ = fs::remove_file(&tmp_path);
                 }
             }
         } else {
             info!("Vamana index empty, skipping persistence");
         }
         // Release primary locks before acquiring secondary
-        drop(id_mapping);
         drop(vector_index);
 
         // LOCK ORDERING: each space index after the primary's, one at a time.
@@ -1219,6 +1207,16 @@ impl RetrievalEngine {
             .contains_key(memory_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn vector_ids_of(&self, memory_id: &MemoryId) -> Vec<u32> {
+        self.id_mapping
+            .read()
+            .memory_to_vectors
+            .get(memory_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn get_indexed_memory_ids(&self) -> HashSet<MemoryId> {
         self.id_mapping
             .read()
@@ -1245,23 +1243,41 @@ impl RetrievalEngine {
     }
 
     pub fn index_memory(&self, memory: &Memory) -> Result<()> {
-        match self.index_memory_inner(memory) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Counted and recorded at the boundary, not at the seven call sites. A space
-                // refusal is not a loss: it becomes a row the drain fills in the index's space.
-                match e.downcast_ref::<SpaceMismatch>() {
-                    Some(mismatch) => {
-                        self.record_refusal(&BacklogKey::primary(&memory.id), mismatch)
-                    }
-                    None => {
-                        self.vector_index_failures
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+        self.recording_index_failures(memory, || {
+            let vector_ids = self.insert_vectors(memory)?;
+            // ATOMIC: Store vector mapping in RocksDB
+            // This ensures the mapping survives restarts and can't become orphaned
+            self.storage
+                .update_vector_mapping(&memory.id, vector_ids)
+                .context("Failed to persist vector mapping to RocksDB")
+        })
+    }
+
+    /// [`Self::index_memory`] without persisting the mapping: returns the text vector
+    /// ids, for a caller that writes them in the same storage transaction as the
+    /// memory itself (`PrimaryMemoryStore::store_with_vectors`).
+    pub fn index_vectors(&self, memory: &Memory) -> Result<Vec<u32>> {
+        self.recording_index_failures(memory, || self.insert_vectors(memory))
+    }
+
+    /// Counted and recorded at the boundary, not at the seven call sites. A space refusal is
+    /// not a loss: it becomes a row the drain fills in the index's space.
+    fn recording_index_failures<T>(
+        &self,
+        memory: &Memory,
+        index: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let outcome = index();
+        if let Err(e) = &outcome {
+            match e.downcast_ref::<SpaceMismatch>() {
+                Some(mismatch) => self.record_refusal(&BacklogKey::primary(&memory.id), mismatch),
+                None => {
+                    self.vector_index_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                Err(e)
             }
         }
+        outcome
     }
 
     /// The space of the primary index.
@@ -1320,7 +1336,9 @@ impl RetrievalEngine {
         );
     }
 
-    fn index_memory_inner(&self, memory: &Memory) -> Result<()> {
+    /// Embed `memory` into the in-memory primary index and every other space's index and
+    /// return its primary vector ids; nothing is persisted.
+    fn insert_vectors(&self, memory: &Memory) -> Result<Vec<u32>> {
         use crate::embeddings::chunking::{chunk_text, ChunkConfig};
 
         let text = Self::extract_searchable_text(memory);
@@ -1393,17 +1411,11 @@ impl RetrievalEngine {
             vec![vector_id]
         };
 
-        // ATOMIC: Store vector mapping in RocksDB
-        // This ensures the mapping survives restarts and can't become orphaned
-        self.storage
-            .update_vector_mapping(&memory.id, vector_ids)
-            .context("Failed to persist vector mapping to RocksDB")?;
-
         // Other spaces' failures are non-fatal — the primary is authoritative. Each is recorded,
         // so the drain gives that index its vector.
         self.index_other_spaces(memory);
 
-        Ok(())
+        Ok(vector_ids)
     }
 
     /// Add the memory's vector in every other space that has an index, recording any space
@@ -2275,6 +2287,13 @@ impl RetrievalEngine {
     /// Get memory from storage by ID
     pub fn get_from_storage(&self, id: &MemoryId) -> Result<Memory> {
         self.storage.get(id)
+    }
+
+    /// Read `ids` from storage, results in the same order. The one seam recall's candidate
+    /// projection reads through. `PrimaryMemoryStore` has no batch read, so today this is
+    /// one point read per id.
+    pub fn get_many_from_storage(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
+        ids.iter().map(|id| self.storage.get(id)).collect()
     }
 
     /// Search for similar memories by embedding directly (SHO-106)

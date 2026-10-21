@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -493,6 +495,11 @@ pub struct BM25Index {
     stemmed_content_field: Field,
     /// Held in RAM only (an encrypted tenant): nothing of it is on disk.
     in_memory: bool,
+    /// Upserts and deletes buffered in the writer since its last commit. Only
+    /// changed while the writer lock is held, so it agrees with the writer.
+    uncommitted: AtomicU64,
+    /// When the writer last committed, from any caller.
+    last_commit: parking_lot::Mutex<Instant>,
 }
 
 impl BM25Index {
@@ -616,6 +623,8 @@ impl BM25Index {
             entities_field,
             stemmed_content_field,
             in_memory,
+            uncommitted: AtomicU64::new(0),
+            last_commit: parking_lot::Mutex::new(Instant::now()),
         })
     }
 
@@ -642,6 +651,7 @@ impl BM25Index {
         doc.add_text(self.entities_field, entities.join(" "));
 
         writer.add_document(doc)?;
+        self.uncommitted.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -651,14 +661,54 @@ impl BM25Index {
         let writer = self.writer.write();
         let id_term = tantivy::Term::from_field_text(self.id_field, &memory_id.0.to_string());
         writer.delete_term(id_term);
+        self.uncommitted.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Commit pending changes to disk
     pub fn commit(&self) -> Result<()> {
         let mut writer = self.writer.write();
+        Self::commit_locked(&mut writer, &self.uncommitted, &self.last_commit)
+    }
+
+    fn commit_locked(
+        writer: &mut IndexWriter,
+        uncommitted: &AtomicU64,
+        last_commit: &parking_lot::Mutex<Instant>,
+    ) -> Result<()> {
         writer.commit().context("Failed to commit BM25 index")?;
+        uncommitted.store(0, Ordering::Relaxed);
+        *last_commit.lock() = Instant::now();
         Ok(())
+    }
+
+    /// Whether upserts or deletes are buffered in the writer and not yet
+    /// visible to searches.
+    pub fn has_uncommitted(&self) -> bool {
+        self.uncommitted.load(Ordering::Relaxed) > 0
+    }
+
+    /// Time since the writer last committed.
+    pub fn since_last_commit(&self) -> Duration {
+        self.last_commit.lock().elapsed()
+    }
+
+    /// Commit and reload the reader if anything is buffered; returns whether
+    /// a commit ran. The check is repeated under the writer lock so that
+    /// concurrent callers racing on one batch produce a single commit.
+    pub fn commit_pending(&self) -> Result<bool> {
+        if !self.has_uncommitted() {
+            return Ok(false);
+        }
+        {
+            let mut writer = self.writer.write();
+            if self.uncommitted.load(Ordering::Relaxed) == 0 {
+                return Ok(false);
+            }
+            Self::commit_locked(&mut writer, &self.uncommitted, &self.last_commit)?;
+        }
+        self.reload()?;
+        Ok(true)
     }
 
     /// Search using BM25
@@ -949,17 +999,27 @@ impl RRFusion {
     }
 }
 
-/// Cross-encoder reranker using ms-marco-MiniLM-L-6-v2
+/// Cross-encoder reranker over the registry in `crate::embeddings::cross_encoder`.
 ///
 /// Uses a true cross-encoder model that jointly encodes (query, document)
 /// pairs for relevance scoring. Significantly more accurate than bi-encoder
 /// cosine similarity for reranking. Falls back to bi-encoder if cross-encoder
 /// model is unavailable.
 ///
+/// The active model is switchable at runtime ([`Self::select_model`], driven by the
+/// `rerank_model` dial). Models that have been selected once stay loaded, keyed by id, so
+/// turning the dial back does not rebuild an ONNX session.
+///
 /// Blending: 70% cross-encoder + 30% bi-encoder (proven ratio from literature).
 pub struct CrossEncoderReranker {
     embedder: Arc<dyn Embedder>,
-    cross_encoder: Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel>,
+    /// The model that reranks now.
+    cross_encoder: RwLock<Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel>>,
+    /// The process-wide choice (`VELD_CROSS_ENCODER*`, else the built-in default): what a
+    /// `rerank_model` of `None` selects.
+    env_model: Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel>,
+    /// Every model selected so far, by registry id.
+    loaded: RwLock<HashMap<String, Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel>>>,
 }
 
 /// The query and the candidate [`CrossEncoderReranker::probe`] scores.
@@ -981,29 +1041,75 @@ impl CrossEncoderReranker {
     pub fn new(embedder: Arc<dyn Embedder>) -> Self {
         let cross_encoder = crate::embeddings::cross_encoder::load_cross_encoder_from_env();
         crate::embeddings::cross_encoder::prewarm(Arc::clone(&cross_encoder));
-        Self {
-            embedder,
-            cross_encoder,
-        }
+        Self::with_cross_encoder(embedder, cross_encoder)
     }
 
-    /// Create reranker with an existing cross-encoder instance
+    /// Create reranker with an existing cross-encoder instance, which is also what a
+    /// `rerank_model` of `None` selects.
     pub fn with_cross_encoder(
         embedder: Arc<dyn Embedder>,
         cross_encoder: Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel>,
     ) -> Self {
+        let mut loaded: HashMap<
+            String,
+            Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel>,
+        > = HashMap::new();
+        loaded.insert(cross_encoder.id().to_string(), Arc::clone(&cross_encoder));
         Self {
             embedder,
-            cross_encoder,
+            env_model: Arc::clone(&cross_encoder),
+            cross_encoder: RwLock::new(cross_encoder),
+            loaded: RwLock::new(loaded),
         }
+    }
+
+    /// The model that reranks now.
+    pub fn model(&self) -> Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel> {
+        Arc::clone(&self.cross_encoder.read())
+    }
+
+    /// Registry id of the model that reranks now.
+    pub fn model_id(&self) -> String {
+        self.cross_encoder.read().id().to_string()
+    }
+
+    /// Make `selected` the model that reranks: a registry id, or `None` for the
+    /// process-wide choice this reranker was built with. A model selected before is reused;
+    /// a new one is built and its files pre-fetched in the background, so the first rerank
+    /// after the switch pays for the ONNX session and not for the download. An id the
+    /// registry does not know is an error and leaves the active model as it was.
+    pub fn select_model(&self, selected: Option<&str>) -> Result<()> {
+        let model = match selected {
+            None => Arc::clone(&self.env_model),
+            Some(id) => {
+                // Bound first: under edition 2021 a guard taken in an `if let` condition lives
+                // through the else branch, and the write below would wait on it forever.
+                let cached = self.loaded.read().get(id).cloned();
+                match cached {
+                    Some(m) => m,
+                    None => {
+                        let m = crate::embeddings::cross_encoder::load_cross_encoder(Some(id))?;
+                        crate::embeddings::cross_encoder::prewarm(Arc::clone(&m));
+                        self.loaded.write().insert(id.to_string(), Arc::clone(&m));
+                        m
+                    }
+                }
+            }
+        };
+        let mut active = self.cross_encoder.write();
+        if active.id() != model.id() {
+            tracing::info!(from = %active.id(), to = %model.id(), "cross-encoder switched");
+        }
+        *active = model;
+        Ok(())
     }
 
     /// Score one pair through the cross-encoder, loading it if it has not loaded yet, and
     /// return its id. An error means [`Self::rerank`] would fall back to bi-encoder scores.
     pub fn probe(&self) -> Result<String> {
-        self.cross_encoder
-            .score_pairs(CROSS_ENCODER_PROBE, &[CROSS_ENCODER_PROBE])?;
-        Ok(self.cross_encoder.id().to_string())
+        let model = self.model();
+        model.score_pairs(CROSS_ENCODER_PROBE, &[CROSS_ENCODER_PROBE])?;
+        Ok(model.id().to_string())
     }
 
     /// Rerank candidates using true cross-encoder with bi-encoder fallback
@@ -1041,11 +1147,13 @@ impl CrossEncoderReranker {
             bi_scores.push(bi);
         }
 
-        // Try cross-encoder for blended scoring
-        let use_cross_encoder = self.cross_encoder.is_available();
+        // Try cross-encoder for blended scoring. The model is read once per call so a dial
+        // turned mid-query scores every candidate of this query with one model.
+        let cross_encoder = self.model();
+        let use_cross_encoder = cross_encoder.is_available();
         let blended_scores = if use_cross_encoder {
             let doc_texts: Vec<&str> = candidates.iter().map(|(_, c, _, _)| c.as_str()).collect();
-            match self.cross_encoder.score_pairs(query, &doc_texts) {
+            match cross_encoder.score_pairs(query, &doc_texts) {
                 Ok(ce_scores) => {
                     // Normalize cross-encoder logits to [0,1] via sigmoid
                     let ce_normalized: Vec<f32> = ce_scores
@@ -1292,6 +1400,17 @@ impl HybridSearchEngine {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Commit and reload only if documents are buffered. Writes journaled
+    /// through the intent log reach the index via the BM25 projection, which
+    /// commits in batches; a search calls this first so a memory written by
+    /// the caller is keyword-findable on its next recall.
+    pub fn commit_pending(&self) -> Result<bool> {
+        self.bm25_index.commit_pending().inspect_err(|_| {
+            self.bm25_commit_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
     }
 
     /// Commit batches lost since process start. Non-zero means the BM25 index
@@ -1573,6 +1692,10 @@ impl HybridSearchEngine {
             .as_ref()
             .and_then(|d| d.candidate_count)
             .unwrap_or(self.config.candidate_count);
+
+        if let Err(e) = self.commit_pending() {
+            tracing::warn!(error = %e, "BM25 commit before search failed; buffered writes are not yet searchable");
+        }
 
         // 1. BM25 search with IC-weighted term boosting AND phrase matching
         let bm25_results = self.bm25_index.search_with_term_and_phrase_weights(
@@ -2688,6 +2811,48 @@ mod tests {
         assert!(
             delta.abs() < 1e-6,
             "delta must be zero when learned == static; got {delta}"
+        );
+    }
+
+    /// Selecting a reranker the reranker has not loaded yet must return, and a second
+    /// selection must reuse it. Under edition 2021 a read guard held across the load
+    /// deadlocked the first selection: every gate arm that set rerank_model hung until the
+    /// job limit.
+    #[test]
+    fn selecting_a_reranker_not_yet_loaded_returns_and_is_reused() {
+        struct FixedEmbedder;
+        impl Embedder for FixedEmbedder {
+            fn encode(&self, _text: &str) -> Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0])
+            }
+            fn dimension(&self) -> usize {
+                2
+            }
+            fn id(&self) -> &str {
+                "fixed"
+            }
+        }
+        let env_model = crate::embeddings::cross_encoder::load_cross_encoder(None).unwrap();
+        let reranker = Arc::new(CrossEncoderReranker::with_cross_encoder(
+            Arc::new(FixedEmbedder),
+            env_model,
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&reranker);
+        std::thread::spawn(move || {
+            let id = crate::embeddings::cross_encoder::MS_MARCO_MINILM_L6_ID;
+            let selected = worker
+                .select_model(Some(id))
+                .and_then(|_| worker.select_model(Some(id)))
+                .map(|_| worker.model().id().to_string());
+            let _ = tx.send(selected.ok());
+        });
+        let selected = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("select_model deadlocked");
+        assert_eq!(
+            selected.as_deref(),
+            Some(crate::embeddings::cross_encoder::MS_MARCO_MINILM_L6_ID)
         );
     }
 }

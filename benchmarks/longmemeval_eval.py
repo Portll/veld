@@ -702,6 +702,8 @@ def judge_answer(question_type: str, abstention: bool,
     response = _llm_with_retry("openai", judge_model, prompt,
                                 temperature=0, max_tokens=10,
                                 api_key=api_key)
+    # The official evaluator (src/evaluation/evaluate_qa.py) labels exactly this way; a stricter
+    # parse would score differently from every published LongMemEval number.
     correct = "yes" in response.lower()
     return correct, response
 

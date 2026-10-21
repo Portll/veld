@@ -39,7 +39,11 @@ pub struct StatusClientConfig {
 }
 
 impl StatusClientConfig {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>, user_id: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        user_id: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
@@ -118,7 +122,11 @@ impl StatusClient {
 
     /// Probe `GET /api/users` once and return the list. Useful for tools that want
     /// to pick a user before constructing the client.
-    pub async fn list_users(base_url: &str, api_key: &str, timeout: Duration) -> Result<Vec<String>> {
+    pub async fn list_users(
+        base_url: &str,
+        api_key: &str,
+        timeout: Duration,
+    ) -> Result<Vec<String>> {
         let base = normalize_base_url(base_url)?;
         let http = Client::builder().timeout(timeout).build()?;
         let url = format!("{}/api/users", base);
