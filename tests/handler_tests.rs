@@ -236,6 +236,21 @@ async fn auth_graph_data_requires_key() {
     );
 }
 
+#[tokio::test]
+async fn auth_context_status_reads_require_key() {
+    // Regression: GET /api/context/status listed every session's id, model, token
+    // counts and working directory to any caller, cross-origin included.
+    let h = Harness::new();
+    for path in ["/api/context/status", "/api/context_status"] {
+        let status = status_of(h.app(), noauth_get(path)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} must be behind auth"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // health.rs
 // ═══════════════════════════════════════════════════════════════════════
@@ -335,7 +350,6 @@ async fn metrics_endpoint() {
 #[tokio::test]
 async fn context_status_roundtrip() {
     let h = Harness::new();
-    // POST a context status update (public route)
     let (status, _) = json_of(
         h.app(),
         authed_post(

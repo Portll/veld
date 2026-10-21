@@ -510,10 +510,15 @@ pub struct ListMemoriesQuery {
 #[tracing::instrument(skip(state), fields(user_id = %params.user_id))]
 pub async fn list_memories_get(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<ListMemoriesQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&params.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     let req = ListMemoriesRequest {
-        user_id: params.user_id,
+        user_id,
         limit: params.limit,
         offset: params.offset,
         memory_type: params.memory_type,
@@ -528,12 +533,17 @@ pub async fn list_memories_get(
 #[tracing::instrument(skip(state), fields(user_id = %params.user_id))]
 pub async fn count_memories(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<CountMemoriesQuery>,
 ) -> Result<Json<CountResponse>, AppError> {
-    validation::validate_user_id(&params.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&params.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory_async(&params.user_id)
+        .get_user_memory_async(&user_id)
         .await
         .map_err(AppError::Internal)?;
 
@@ -2125,10 +2135,7 @@ mod tests {
 
     /// The retrieval-side engine over the tenant's shared BM25 index, as recall
     /// builds it, with nothing but BM25 contributing.
-    fn keyword_engine(
-        harness: &TestHarness,
-        user_id: &str,
-    ) -> crate::memory::HybridSearchEngine {
+    fn keyword_engine(harness: &TestHarness, user_id: &str) -> crate::memory::HybridSearchEngine {
         crate::memory::HybridSearchEngine::with_bm25_index(
             harness.manager.get_user_bm25_index(user_id).unwrap(),
             std::sync::Arc::new(UnusedEmbedder),
@@ -2199,7 +2206,10 @@ mod tests {
         );
         let (status, body) = test_helpers::send(harness.router(), req).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let id = body["id"].as_str().expect("remember returns an id").to_string();
+        let id = body["id"]
+            .as_str()
+            .expect("remember returns an id")
+            .to_string();
 
         assert_eq!(keyword_hits(&engine, "quokkazephyr"), vec![id]);
     }
@@ -2257,8 +2267,90 @@ mod tests {
         forgets.sort();
         let mut swept = vec![ids[0].clone(), ids[1].clone()];
         swept.sort();
-        assert_eq!(forgets, swept, "one Forget per removed id, none for the kept one");
+        assert_eq!(
+            forgets, swept,
+            "one Forget per removed id, none for the kept one"
+        );
 
         assert_eq!(keyword_hits(&engine, "sweepterm"), vec![ids[2].clone()]);
+    }
+
+    /// `auth_middleware` binds a tenant key only by patching a JSON body and inserting
+    /// `AuthenticatedUser`, so a `user_id` in the query string or path is the handler's to refuse.
+    /// The extension is layered directly: the real binding needs `VELD_MULTI_TENANT` set
+    /// process-wide, which would turn every concurrently running handler test's key away.
+    #[tokio::test]
+    async fn a_bound_key_cannot_name_another_tenant_in_the_query_or_path() {
+        use crate::auth::AuthenticatedUser;
+        use axum::http::Method;
+
+        let harness = TestHarness::new();
+        remember_n(&harness, "bob", &["bob's private note".to_string()]);
+        let app = harness.router().layer(axum::Extension(AuthenticatedUser {
+            user_id: "alice".to_string(),
+        }));
+
+        let session = uuid::Uuid::new_v4();
+        let comment = uuid::Uuid::new_v4();
+        let probes: &[(Method, String)] = &[
+            (Method::GET, "/api/memories?user_id=bob".into()),
+            (Method::GET, "/api/memories/count?user_id=bob".into()),
+            (Method::GET, "/api/storage/stats?user_id=bob".into()),
+            (Method::GET, "/api/consolidation/events?user_id=bob".into()),
+            (Method::GET, "/api/embeddings/backlog?user_id=bob".into()),
+            (Method::GET, "/api/context/blocks?user_id=bob".into()),
+            (
+                Method::GET,
+                "/api/context/blocks/persona?user_id=bob".into(),
+            ),
+            (
+                Method::DELETE,
+                "/api/context/blocks/persona?user_id=bob".into(),
+            ),
+            (Method::GET, "/api/dials?user_id=bob".into()),
+            (Method::GET, "/api/files/stats?user_id=bob".into()),
+            (Method::GET, format!("/api/sessions/{session}?user_id=bob")),
+            (Method::GET, "/api/sleep_time/status/bob".into()),
+            (Method::POST, "/api/reminders/abc/delete?user_id=bob".into()),
+            (Method::GET, "/api/todos/abc?user_id=bob".into()),
+            (Method::DELETE, "/api/todos/abc?user_id=bob".into()),
+            (Method::GET, "/api/todos/abc/subtasks?user_id=bob".into()),
+            (Method::GET, "/api/todos/abc/dependents?user_id=bob".into()),
+            (
+                Method::GET,
+                "/api/todos/abc/dependency_chain?user_id=bob".into(),
+            ),
+            (Method::GET, "/api/todos/abc/comments?user_id=bob".into()),
+            (
+                Method::DELETE,
+                format!("/api/todos/abc/comments/{comment}?user_id=bob"),
+            ),
+            (Method::GET, "/api/projects/work?user_id=bob".into()),
+            (Method::GET, "/api/visualization/bob/stats".into()),
+            (Method::GET, "/api/visualization/bob/dot".into()),
+            (Method::GET, "/api/events/sse?user_id=bob".into()),
+        ];
+        for (method, uri) in probes {
+            let req = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .header("x-api-key", test_helpers::TEST_API_KEY)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, body) = test_helpers::send(app.clone(), req).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {body}");
+            assert_eq!(body["code"], "INVALID_INPUT", "{method} {uri}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("tenant binding")),
+                "{method} {uri}: {body}"
+            );
+        }
+
+        let (status, body) =
+            test_helpers::send(app, test_helpers::get("/api/memories?user_id=alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 0u64, "alice sees her own store, not bob's");
     }
 }

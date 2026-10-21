@@ -3613,7 +3613,7 @@ impl GraphMemory {
         relation_type: &RelationType,
     ) -> Result<Option<RelationshipEdge>> {
         Ok(self
-            .get_entity_relationships(entity_a)?
+            .stored_entity_relationships(entity_a)?
             .into_iter()
             .find(|edge| edge.relation_type == *relation_type && edge.joins(entity_a, entity_b)))
     }
@@ -4036,6 +4036,42 @@ impl GraphMemory {
         self.get_entity_relationships_limited(entity_uuid, None)
     }
 
+    /// Every stored edge that touches `entity_uuid`, in index order, before any
+    /// strength ordering or decay pruning: what the store holds, which is what the
+    /// storage trait's listing answers on every engine.
+    pub fn stored_entity_relationships(&self, entity_uuid: &Uuid) -> Result<Vec<RelationshipEdge>> {
+        let prefix = format!("{entity_uuid}:");
+        let mut edge_uuids: Vec<Uuid> = Vec::with_capacity(256);
+        for (key, _) in self
+            .store
+            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
+        {
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                continue;
+            };
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            if let Some(edge_uuid) = key_str
+                .split(':')
+                .nth(1)
+                .and_then(|id| Uuid::parse_str(id).ok())
+            {
+                edge_uuids.push(edge_uuid);
+            }
+        }
+
+        let mut edges = Vec::with_capacity(edge_uuids.len());
+        for edge_uuid in &edge_uuids {
+            if let Some(bytes) = self.store.get_cf(CF_RELATIONSHIPS, edge_uuid.as_bytes())? {
+                if let Ok(edge) = RelationshipEdge::decode(&bytes) {
+                    edges.push(edge);
+                }
+            }
+        }
+        Ok(edges)
+    }
+
     /// Get relationships for an entity with limit, ordered by effective strength
     ///
     /// Collects ALL edge UUIDs first, reads them, sorts by effective_strength
@@ -4075,47 +4111,17 @@ impl GraphMemory {
         limit: Option<usize>,
         now: DateTime<Utc>,
     ) -> Result<Vec<(RelationshipEdge, f32)>> {
-        let prefix = format!("{entity_uuid}:");
-
-        // Phase 1: Collect ALL edge UUIDs from index (fast prefix scan)
-        // We must read all to sort by strength — storage order is arbitrary
-        let mut edge_uuids: Vec<Uuid> = Vec::with_capacity(256);
-        let iter = self
-            .store
-            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
-            .into_iter()
-            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
-
-        for (key, _) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with(&prefix) {
-                    break;
-                }
-
-                if let Some(edge_uuid_str) = key_str.split(':').nth(1) {
-                    if let Ok(edge_uuid) = Uuid::parse_str(edge_uuid_str) {
-                        edge_uuids.push(edge_uuid);
-                    }
-                }
-            }
-        }
-
-        if edge_uuids.is_empty() {
+        let stored = self.stored_entity_relationships(entity_uuid)?;
+        if stored.is_empty() {
             return Ok(Vec::new());
         }
-
-        // Phase 2: one point read per edge. `ColumnStore` has no batch read, so this is
-        // N `get_cf` calls on either engine.
-        let mut edges: Vec<(RelationshipEdge, f32)> = Vec::with_capacity(edge_uuids.len());
-        for uuid in &edge_uuids {
-            let Ok(Some(value)) = self.store.get_cf(CF_RELATIONSHIPS, uuid.as_bytes()) else {
-                continue;
-            };
-            if let Ok(edge) = RelationshipEdge::decode(&value) {
+        let mut edges: Vec<(RelationshipEdge, f32)> = stored
+            .into_iter()
+            .map(|edge| {
                 let strength = edge.effective_strength_at(now);
-                edges.push((edge, strength));
-            }
-        }
+                (edge, strength)
+            })
+            .collect();
 
         // Phase 3: Sort by effective strength descending (strongest first). Strengths are
         // computed once above against one `now`: recomputing them inside the comparator
@@ -11466,8 +11472,8 @@ mod tests {
         let corroborated = graph.find_edge_between_entities(&a, &b).unwrap().unwrap();
         assert!(corroborated.strength > repeated.strength);
         assert_eq!(corroborated.distinct_sources(), 2);
-        let one_step = crate::constants::COACTIVATION_FORWARD_BOOST
-            * (1.0 - repeated.forward_strength);
+        let one_step =
+            crate::constants::COACTIVATION_FORWARD_BOOST * (1.0 - repeated.forward_strength);
         assert!(
             (corroborated.forward_strength - (repeated.forward_strength + one_step)).abs() < 1e-6,
             "a new session moves the triggered direction by one step: {} -> {}",

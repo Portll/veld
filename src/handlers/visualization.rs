@@ -154,8 +154,13 @@ pub async fn get_brain_state(
 /// GET /api/visualization/{user_id}/stats - Get visualization statistics
 pub async fn get_visualization_stats(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<VisualizationStats>, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
@@ -171,8 +176,13 @@ pub async fn get_visualization_stats(
 /// GET /api/visualization/{user_id}/dot - Export graph as DOT format
 pub async fn get_visualization_dot(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> Result<String, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
@@ -436,7 +446,25 @@ pub async fn get_graph_data(
 /// Generate the HTML page for graph visualization (includes 2D/3D toggle)
 fn generate_graph_html(user_id: &str, nonce: &str) -> String {
     let html = include_str!("graph_view.html");
-    let user_id_json = serde_json::to_string(user_id).unwrap_or_else(|_| "\"default\"".to_string());
+    // The value lands inside an inline <script>; a literal `</script>` in it would close the
+    // element and render whatever follows as markup on this public page.
+    let user_id_json = serde_json::to_string(user_id)
+        .unwrap_or_else(|_| "\"default\"".to_string())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
     html.replace("{{USER_ID_JSON}}", &user_id_json)
         .replace("{{CSP_NONCE}}", nonce)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_graph_html;
+
+    #[test]
+    fn a_user_id_cannot_close_the_inline_script() {
+        let html = generate_graph_html("</script><meta http-equiv=refresh content=0>&", "n");
+        assert!(!html.contains("</script><meta"));
+        assert!(html.contains("\\u003c/script\\u003e\\u003cmeta"));
+    }
 }

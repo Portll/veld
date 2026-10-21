@@ -3418,7 +3418,7 @@ impl MemoryStorage {
             if !key.starts_with(prefix) {
                 break;
             }
-            if key.len() == 16 {
+            if is_memory_key(&key) {
                 keys.push(key.to_vec());
             }
         }

@@ -607,6 +607,7 @@ impl MemoryStream {
         let resp = self
             .client
             .get(format!("{}/api/context_status", self.base_url))
+            .header("X-API-Key", &self.api_key)
             .send()
             .await?;
 

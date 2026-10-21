@@ -212,10 +212,10 @@ pub(crate) fn journal_forget(
 }
 
 /// Complete a journaled remember's deferred embedding in the background. When
-/// the write gate absorbs the memory into an existing one it is deleted from
-/// the store, and the `Forget` is journaled here. Spawn this only after the
-/// memory's `Remember` frame is journaled, or the `Forget` could take the lower
-/// LSN and replay would resurrect the deleted memory.
+/// the write gate absorbs the memory into an existing one, both records changed
+/// in the store, and their snapshots are journaled here. Spawn this only after
+/// the memory's `Remember` frame is journaled, or the absorbed snapshot could
+/// take the lower LSN and replay would bring back the unflagged memory.
 fn spawn_journaled_embed(
     state: &AppState,
     memory: &SharedUserMemory,
@@ -233,8 +233,27 @@ fn spawn_journaled_embed(
         };
         match outcome {
             Ok(outcome) => {
-                if outcome.absorbed_by.is_some() {
-                    journal_forget(&state_bg, &user_id, &mid);
+                let Some(survivor) = outcome
+                    .absorbed_by
+                    .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+                    .map(crate::memory::MemoryId)
+                else {
+                    return;
+                };
+                let guard = memory_bg.read();
+                for id in [&mid, &survivor] {
+                    match guard.get_memory(id) {
+                        Ok(memory) => journal_memory_snapshot(
+                            &state_bg,
+                            &user_id,
+                            &memory,
+                            SnapshotKind::Update,
+                        ),
+                        Err(e) => tracing::warn!(
+                            memory_id = %id.0,
+                            "write-gate absorption: snapshot not journaled, memory unreadable: {e}"
+                        ),
+                    }
                 }
             }
             Err(e) => {

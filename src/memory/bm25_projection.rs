@@ -232,12 +232,20 @@ impl Bm25Projection {
             } => {
                 let mid = parse_memory_id(memory_id)?;
                 let memory = decode_memory(memory_bincode)?;
-                let content = memory.experience.content.as_str();
-                let tags = memory.experience.tags.as_slice();
-                let entities = memory.experience.entities.as_slice();
-                self.index
-                    .upsert(&mid, content, tags, entities)
-                    .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
+                // A soft-forgotten record stays in the store (the write gate keeps an
+                // absorbed memory that way) but leaves the keyword index.
+                if memory.is_forgotten() {
+                    self.index
+                        .delete(&mid)
+                        .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
+                } else {
+                    let content = memory.experience.content.as_str();
+                    let tags = memory.experience.tags.as_slice();
+                    let entities = memory.experience.entities.as_slice();
+                    self.index
+                        .upsert(&mid, content, tags, entities)
+                        .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
+                }
             }
             IntentPayload::Forget { memory_id, .. } => {
                 let mid = parse_memory_id(memory_id)?;
@@ -735,7 +743,10 @@ mod tests {
 
         let first = mk_memory(Uuid::new_v4(), "buffered tamarind entry", &[], &[]);
         TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&first)).unwrap();
-        assert!(index.has_uncommitted(), "inside the interval nothing commits");
+        assert!(
+            index.has_uncommitted(),
+            "inside the interval nothing commits"
+        );
         assert!(index.search("tamarind", 10).unwrap().is_empty());
         assert_eq!(ckpt.lock().get(PROJECTION_NAME), None);
 
@@ -764,7 +775,10 @@ mod tests {
 
         let memory = mk_memory(Uuid::new_v4(), "flushed by the reader", &[], &[]);
         TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&memory)).unwrap();
-        assert!(index.commit_pending().unwrap(), "buffered work is committed");
+        assert!(
+            index.commit_pending().unwrap(),
+            "buffered work is committed"
+        );
         assert!(!index.commit_pending().unwrap(), "and only once");
         assert_eq!(index.search("flushed reader", 10).unwrap().len(), 1);
 

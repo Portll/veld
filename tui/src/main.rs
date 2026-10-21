@@ -1192,6 +1192,10 @@ async fn run_user_selector(
     Ok(result)
 }
 
+fn api_key_from_env() -> String {
+    std::env::var("VELD_API_KEY").unwrap_or_else(|_| "sk-veld-dev-local-testing-key".to_string())
+}
+
 /// Status line mode: reads JSON from stdin, posts to backend, outputs formatted status
 /// This is called by Claude Code's statusLine configuration
 async fn run_statusline() -> Result<()> {
@@ -1270,10 +1274,12 @@ async fn run_statusline() -> Result<()> {
 
     // Spawn background task to POST (don't block status line output)
     let url = format!("{}/api/context_status", base_url);
+    let api_key = api_key_from_env();
     tokio::spawn(async move {
         let _ = client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("X-API-Key", api_key)
             .json(&post_body)
             .send()
             .await;
@@ -1331,8 +1337,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "http://127.0.0.1:3030".to_string())
         .trim_end_matches("/api/events")
         .to_string();
-    let mut api_key = std::env::var("VELD_API_KEY")
-        .unwrap_or_else(|_| "sk-veld-dev-local-testing-key".to_string());
+    let mut api_key = api_key_from_env();
 
     // Initialize terminal for splash and user selector
     enable_raw_mode()?;
