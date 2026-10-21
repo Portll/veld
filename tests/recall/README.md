@@ -9,8 +9,10 @@ This directory holds the fixtures, ground truth, and frozen baselines for the re
 | --- | --- |
 | `src/recall_harness/` library (`run_smoke_suite`, `run_longmemeval`) | wired, unit-tested |
 | `recall-eval` binary (`src/bin/recall_eval.rs`, `--suite`, `--layer`, `--baseline`) | ported from upstream `20de49c3`, the revision veld's harness tracks |
-| `.github/workflows/recall.yml` | the recall gate: weekly and on dispatch, once per storage engine |
+| `.github/workflows/recall.yml` | the recall gate, once per storage engine: on every pull request that touches a path that can move a ranking, weekly, and on dispatch |
 | `scripts/recall_diff.py`, `scripts/recall_engines_equal.py` | the diff table, and the check that both engines score the same |
+| `scripts/stage_diff.py` | compares two stage exports (`VELD_STAGE_EXPORT`) stage by stage |
+| Directional corpus + `directional_cases.jsonl` | `--suite directional`, ungated; written by `benchmarks/build_directional_suite.py` |
 | Smoke corpus + `smoke_cases.jsonl` + `baseline.json` | present, consumed by the library |
 | LOCOMO gate fixtures, `locomo-gate-baseline.json`, `locomo-gate-baseline.per-case.json` | read by the gate |
 
@@ -37,13 +39,38 @@ gate is a no-net-loss check. Repeats must give identical rank lists, so a case t
 same runner class is a real change; the case list is how a reviewer decides whether a change is
 worth what it moved.
 
+### CPU kernel classes
+
+Across runner classes, identical code does not give identical results. ONNX Runtime picks its
+kernels by CPUID and no setting pins the choice, so runners that expose different CPU features (AVX2
+only, AVX-512, AVX-512 with VNNI, BF16, FP16 or AMX) give different low bits in every model, and in
+the cross-encoder that reorders near-ties. GitHub's `ubuntu-latest` pool mixes these. A hypervisor
+can hide AVX-512 from a chip that has it, so the class is what the runner exposes, not what the chip
+is.
+
+Every report records its class as `kernel.class` (`KernelClass` in `src/recall_harness/report.rs`),
+with the CPU model and features beside it. `recall-eval` refuses to compare two recorded classes
+that differ, as `infrastructure`, and the workflow fails a gated run on the wrong class within
+seconds, before the build: re-run the job, since GitHub assigns runner hardware per job. Two runs
+that replayed one model tape are compared on any class. `scripts/recall_engines_equal.py` exits 2,
+not 1, when the two engine legs differ after running their models live on two classes, since such
+a difference says nothing about the engines.
+
+A baseline that records no class is compared rather than refused, so the gate keeps measuring; its
+report carries an `unattributable` entry, the diff comment warns that a moved case may be the
+runner's, and the workflow raises a warning. `locomo-gate-baseline.json` (`1b85a9b`) records no
+class, so until it is recorded again every gate run is unattributable in that sense.
+
 Regenerate both files together, from one run on `main`, after a merged change that intentionally
 moved quality:
 
 1. `gh workflow run recall.yml --ref main -f record=true`.
 2. `gh run download <run-id> -n recall-rocksdb`.
 3. Copy `current-rocksdb.json` to `locomo-gate-baseline.json` and `per-case-rocksdb.json` to
-   `locomo-gate-baseline.per-case.json`. Check that `git_sha` names the commit you meant.
+   `locomo-gate-baseline.per-case.json`. Check that `git_sha` names the commit you meant and that
+   `kernel.class` is `x86_64-avx2-fma`: with the models live, a pull request's run is gated only on
+   the baseline's class, and that is the class the pool hands out most often. If the run landed on
+   another class, dispatch again.
 4. Add a row to the regeneration history below, naming the run.
 
 ## Model tapes
@@ -58,9 +85,9 @@ run as infrastructure rather than falling back. A recording also scores every (q
 cross-encoder pair the run did not, so a retrieval change that hands the reranker another candidate
 still finds it.
 
-The workflow's `model_tape` input drives it. `pinned`, the default and what the schedule runs,
-replays the tape named in `tests/recall/model-tape.json` (`{"tag", "asset", "sha256"}`, a GitHub
-release asset) after checking its sha256; with no pin file, as now, the models run live. `record`
+The workflow's `model_tape` input drives it. `pinned`, the default and what pull requests and the
+schedule run, replays the tape named in `tests/recall/model-tape.json` (`{"tag", "asset",
+"sha256"}`, a GitHub release asset) after checking its sha256; with no pin file, as now, the models run live. `record`
 uploads each engine's tape as `model-tape-<engine>`; `replay` with `tape_run` replays another run's
 RocksDB tape. Every report records the tape it replayed as `model_tape`, and `recall-eval` refuses
 to compare a live run with a replayed one, or two different tapes. So pinning a tape is three steps
@@ -110,6 +137,13 @@ for it.
   conversations, and 1,166 cases on 2026-10-21. Run ungated with `suite=locomo-holdout`. This is
   the number to report, with its interval.
 - `locomo-holdout-spent.txt` — hold-out cases whose individual results someone has examined.
+- `corpora/directional.jsonl`, `directional_cases.jsonl` — who did what to whom: 60 pairs of twin
+  memories made of exactly the same words with the roles swapped, 40 filler memories, and 240
+  questions (`dir_object`, `dir_subject`, `dir_passive`) whose single gold has its twin as the
+  decisive distractor. Both twins are asked about in both directions, so ignoring direction scores
+  exactly 50% p@1. Run ungated with `suite=directional`; regenerate with
+  `python3 benchmarks/build_directional_suite.py` (fixed seed). The fixtures test
+  `directional_fixtures_give_every_gold_a_same_words_twin` pins the twin property.
 
 ## The held-out set (`locomo-holdout`)
 
@@ -186,6 +220,38 @@ The eval scoring clock is pinned to a fixed anchor by `pin_harness_threads()`
 components cannot drift between repeat passes or rot a baseline as the static corpus ages against
 wall-clock time. The variable name is inherited from shodh and is the live name in this codebase —
 do not "correct" it without changing the readers in `runner.rs` and `bridge_harness.rs`.
+
+## Stage fingerprints (`VELD_STAGE_EXPORT`)
+
+`VELD_STAGE_EXPORT=<path.jsonl>` (or the workflow's `stage_export=on`, which writes
+`stages-<engine>.jsonl` into the report artifact) makes `recall-eval` write every stage of the
+`full` pipeline as JSON lines:
+
+- `ingest`: one record per corpus item, with a hash of its stored embedding bytes, the first four
+  values' bit patterns, and its NER spans (`text|type|confidence bits|start|end`).
+- `graph`: one record for the graph's node and edge sets, keyed by entity name because uuids are
+  minted per process. Edges keep their direction, so the directional suite's export audits edge
+  direction against the generator.
+- `case`: one record per case: every stage the recall recorded (`graph`, `vector`, `date_window`,
+  `fusion`, `ce`, `final`, in pipeline order, with each candidate's score where the stage has
+  one), then the production rank list (`ranks`), the `RECALL_DIAG_K`-deep list (`deep`) and the
+  final list of the captured recall (`final_captured`). `ce` is the cross-encoder's scores over the
+  pool it reranked, in the pool's order.
+
+Scores are f32 bit patterns, so a one-ULP move shows as a move. The file is overwritten on each
+repeat; the repeat check requires the repeats to agree, so the last one stands for the run.
+
+The repeat check compares stages within one process. The export compares two processes, from two
+machines, two commits or two settings:
+
+```bash
+python3 scripts/stage_diff.py a.jsonl b.jsonl
+```
+
+For each stage it reports whether the order changed or only the scores did, and whether NER span
+sets and graph membership moved or only their numbers. Two kernel classes move scores and keep
+memberships; a code change usually moves an order. Collect per-case records for anything that
+learns from the reranker's scores on one kernel class: the scores differ across classes.
 
 ## Per-pipeline-layer attribution (`LayerMode`)
 

@@ -21,7 +21,7 @@ use crate::handlers::MultiUserMemoryManager;
 use crate::memory::retrieval::RetrievalOutcome;
 use crate::memory::types::MemoryId;
 use crate::memory::types::{ExperienceType, LayerMode, NerEntityRecord};
-use crate::memory::{Experience, Query};
+use crate::memory::{Experience, MemorySystem, Query};
 
 use super::fixtures::{
     self, CorpusItem, SmokeCase, SmokeCategory, SMOKE_CASES_PATH, SMOKE_CORPUS_PATH,
@@ -29,8 +29,8 @@ use super::fixtures::{
 use super::metrics::{paired_bootstrap_ci, Metrics};
 use super::report::{
     aggregate_category, aggregate_layer, median, AblationCaseRow, AblationReport, AblationRow,
-    CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure, LayerReport,
-    LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord,
+    CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure, KernelClass,
+    LayerReport, LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord,
     ReachabilityCategory, ReachabilityReport, Report, RerankSetting, RetrievalDials, SMOKE_K,
 };
 
@@ -451,6 +451,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         rerank: Some(passes[0].rerank.clone()),
         retrieval_dials: Some(passes[0].retrieval_dials.clone()),
         model_tape: crate::embeddings::model_tape::replay_digest(),
+        kernel: KernelClass::detect(),
         git_sha: inputs.git_sha.clone(),
         timestamp: chrono::Utc::now(),
         layers,
@@ -685,6 +686,27 @@ fn run_one_pass(
         .map(|(corpus_id, uuid)| (*uuid, corpus_id.clone()))
         .collect();
 
+    // Stage fingerprints (`VELD_STAGE_EXPORT=<jsonl path>`, Full mode only).
+    //
+    // The repeat check compares stages between passes of ONE process. This writes the same
+    // stages, plus the ingest-side ones it cannot see (embedding bytes, NER spans, the graph's
+    // node and edge sets), so two processes can be diffed stage by stage with
+    // scripts/stage_diff.py: two machines, two commits or two settings. Scores travel as f32
+    // bit patterns, so a one-ULP move shows as a move.
+    let stage_export: Option<PathBuf> = std::env::var_os("VELD_STAGE_EXPORT")
+        .or_else(|| std::env::var_os("SHODH_STAGE_EXPORT"))
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let mut stage_lines: Vec<String> = Vec::new();
+    if stage_export.is_some() {
+        stage_lines.extend(ingest_fingerprints(
+            &manager,
+            &system.read(),
+            corpus,
+            &id_map,
+        )?);
+    }
+
     let mut per_mode: BTreeMap<LayerMode, ModePassResult> = BTreeMap::new();
     let mut failures: Vec<Failure> = Vec::new();
 
@@ -915,6 +937,63 @@ fn run_one_pass(
                     .to_string(),
                 );
             }
+            if stage_export.is_some() && matches!(*mode, LayerMode::Full) {
+                // One more production-shaped recall with every stage captured, the
+                // cross-encoder's scores over its pool (`ce`) among them.
+                let mut query = Query {
+                    query_text: Some(case.query.clone()),
+                    max_results: SMOKE_K,
+                    layers: Some(*mode),
+                    ..Default::default()
+                };
+                manager.annotate_query_ner(&mut query);
+                crate::memory::gold_funnel::begin_capture();
+                let captured = system.read().recall(&query);
+                let stages = crate::memory::gold_funnel::take_capture().unwrap_or_default();
+                let corpus_id = |id: &MemoryId| {
+                    uuid_to_corpus_id
+                        .get(&id.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("<unknown:{}>", id.0))
+                };
+                let final_captured: Vec<String> = match captured {
+                    Ok(memories) => memories.iter().map(|m| corpus_id(&m.id)).collect(),
+                    Err(e) => {
+                        failures.push(Failure {
+                            kind: "case".to_string(),
+                            detail: format!(
+                                "stage-export recall failed for {} [mode={}]: {e:#}",
+                                case.id,
+                                mode.report_key()
+                            ),
+                        });
+                        Vec::new()
+                    }
+                };
+                let stages_json: Vec<serde_json::Value> = stages
+                    .iter()
+                    .map(|(stage, entries)| {
+                        let items: Vec<(String, Option<String>)> = entries
+                            .iter()
+                            .map(|(id, score)| {
+                                (corpus_id(id), score.map(|v| format!("{:08x}", v.to_bits())))
+                            })
+                            .collect();
+                        serde_json::json!({ "stage": stage, "items": items })
+                    })
+                    .collect();
+                stage_lines.push(
+                    serde_json::json!({
+                        "kind": "case",
+                        "case_id": case.id,
+                        "ranks": ranks[k].retrieved,
+                        "deep": deep_retrieved,
+                        "final_captured": final_captured,
+                        "stages": stages_json,
+                    })
+                    .to_string(),
+                );
+            }
             deep_ranks.push(CaseRankList {
                 case_id: case.id.clone(),
                 retrieved: deep_retrieved,
@@ -931,6 +1010,24 @@ fn run_one_pass(
                 deep_ranks,
             },
         );
+    }
+
+    if let Some(path) = &stage_export {
+        if !stage_lines.is_empty() {
+            use std::io::Write as _;
+            // Truncated, as the pool export is: every repeat runs this pass, the repeat check
+            // requires the passes to agree, and the last pass's records stand for the run.
+            let mut f = std::fs::File::create(path)
+                .with_context(|| format!("creating stage export {}", path.display()))?;
+            for line in &stage_lines {
+                writeln!(f, "{line}")?;
+            }
+            eprintln!(
+                "  stage export: {} records -> {}",
+                stage_lines.len(),
+                path.display()
+            );
+        }
     }
 
     if let Some(path) = &pool_export {
@@ -971,6 +1068,124 @@ fn run_one_pass(
         rerank,
         retrieval_dials,
     })
+}
+
+/// Ingest-side fingerprints for `VELD_STAGE_EXPORT`: one record per corpus item (its stored
+/// embedding and its NER spans with confidence bits) and one for the graph (node and edge sets,
+/// keyed by entity name because uuids are minted per process, with strength bits). Embeddings
+/// are hashed over their raw little-endian bytes with the leading values' bit patterns beside
+/// the hash, so a diff between two machines shows both whether and by how much a stage moved.
+fn ingest_fingerprints(
+    manager: &MultiUserMemoryManager,
+    system: &MemorySystem,
+    corpus: &[CorpusItem],
+    id_map: &HashMap<String, Uuid>,
+) -> Result<Vec<String>> {
+    use sha2::{Digest, Sha256};
+    let head_bits = |values: &[f32], n: usize| -> Vec<String> {
+        values
+            .iter()
+            .take(n)
+            .map(|v| format!("{:08x}", v.to_bits()))
+            .collect()
+    };
+    let sha_f32 = |values: &[f32]| -> String {
+        let mut h = Sha256::new();
+        for v in values {
+            h.update(v.to_le_bytes());
+        }
+        hex::encode(h.finalize())
+    };
+    let ner = manager.get_neural_ner();
+    let mut lines = Vec::with_capacity(corpus.len() + 1);
+    let mut all_embeddings = Sha256::new();
+    let mut all_ner = Sha256::new();
+    for item in corpus {
+        let Some(uuid) = id_map.get(&item.id) else {
+            continue;
+        };
+        let embedding = system
+            .get_memory(&MemoryId(*uuid))
+            .with_context(|| format!("stage export: reading memory {}", item.id))?
+            .experience
+            .embeddings
+            .unwrap_or_default();
+        for v in &embedding {
+            all_embeddings.update(v.to_le_bytes());
+        }
+        // The call ingest_corpus made for this item. The session is deterministic within a
+        // process (the repeat check holds it to that), so these are the spans the graph was
+        // built from.
+        let spans: Vec<String> = ner
+            .extract(&item.content)
+            .unwrap_or_default()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}|{}|{:08x}|{}|{}",
+                    e.text,
+                    e.entity_type.as_str(),
+                    e.confidence.to_bits(),
+                    e.start,
+                    e.end
+                )
+            })
+            .collect();
+        let ner_line = spans.join(";");
+        all_ner.update(ner_line.as_bytes());
+        lines.push(
+            serde_json::json!({
+                "kind": "ingest",
+                "id": item.id,
+                "embedding_dim": embedding.len(),
+                "embedding_sha256": sha_f32(&embedding),
+                "embedding_head": head_bits(&embedding, 4),
+                "ner_sha256": hex::encode(Sha256::digest(ner_line.as_bytes())),
+                "ner": spans,
+            })
+            .to_string(),
+        );
+    }
+
+    let graph = manager.get_user_graph(EVAL_USER)?;
+    let graph = graph.read();
+    let entities = graph.get_all_entities()?;
+    let names: HashMap<Uuid, String> = entities.iter().map(|e| (e.uuid, e.name.clone())).collect();
+    let name_of = |uuid: &Uuid| names.get(uuid).cloned().unwrap_or_else(|| uuid.to_string());
+    let mut nodes: Vec<String> = entities
+        .iter()
+        .map(|e| format!("{}|{:?}|{}", e.name, e.labels, e.mention_count))
+        .collect();
+    nodes.sort();
+    let mut edges: Vec<String> = graph
+        .get_all_relationships()?
+        .iter()
+        .map(|r| {
+            format!(
+                "{}|{}|{}|{:08x}",
+                name_of(&r.from_entity),
+                name_of(&r.to_entity),
+                r.relation_type.as_str(),
+                r.strength.to_bits()
+            )
+        })
+        .collect();
+    edges.sort();
+    lines.push(
+        serde_json::json!({
+            "kind": "graph",
+            "embeddings_sha256": hex::encode(all_embeddings.finalize()),
+            "ner_sha256": hex::encode(all_ner.finalize()),
+            "node_count": nodes.len(),
+            "nodes_sha256": hex::encode(Sha256::digest(nodes.join("\n").as_bytes())),
+            "edge_count": edges.len(),
+            "edges_sha256": hex::encode(Sha256::digest(edges.join("\n").as_bytes())),
+            "nodes": nodes,
+            "edges": edges,
+        })
+        .to_string(),
+    );
+    Ok(lines)
 }
 
 /// Close out a model tape at the end of a suite run, returning what must fail the run.
@@ -3504,6 +3719,9 @@ fn category_name(c: SmokeCategory) -> &'static str {
         SmokeCategory::Negation => "negation",
         SmokeCategory::SingleHop => "single_hop",
         SmokeCategory::OpenDomain => "open_domain",
+        SmokeCategory::DirObject => "dir_object",
+        SmokeCategory::DirSubject => "dir_subject",
+        SmokeCategory::DirPassive => "dir_passive",
     }
 }
 

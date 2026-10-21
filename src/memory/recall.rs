@@ -1320,7 +1320,12 @@ impl super::MemorySystem {
             }
         };
 
-        crate::memory::gold_funnel::record("graph", graph_results.iter().map(|(id, _, _)| id));
+        crate::memory::gold_funnel::record_scored(
+            "graph",
+            graph_results
+                .iter()
+                .map(|(id, activation, _)| (id, *activation)),
+        );
 
         let t_graph = recall_start.elapsed();
         observe_recall_stage(RecallStage::Graph, t_graph - t_embedding);
@@ -1534,7 +1539,10 @@ impl super::MemorySystem {
             }
         };
 
-        crate::memory::gold_funnel::record("vector", vector_results.iter().map(|(id, _)| id));
+        crate::memory::gold_funnel::record_scored(
+            "vector",
+            vector_results.iter().map(|(id, score)| (id, *score)),
+        );
 
         let t_vector = recall_start.elapsed();
         observe_recall_stage(RecallStage::Vector, t_vector - t_graph);
@@ -1728,9 +1736,9 @@ impl super::MemorySystem {
             &query_embedding,
             query_embedding_secondary.as_ref(),
         );
-        crate::memory::gold_funnel::record(
+        crate::memory::gold_funnel::record_scored(
             "date_window",
-            date_window_results.iter().map(|(id, _)| id),
+            date_window_results.iter().map(|(id, score)| (id, *score)),
         );
 
         // ===========================================================================
@@ -2766,7 +2774,10 @@ impl super::MemorySystem {
             (res, heb, attr)
         };
 
-        crate::memory::gold_funnel::record("fusion", memory_ids.iter().map(|(id, _)| id));
+        crate::memory::gold_funnel::record_scored(
+            "fusion",
+            memory_ids.iter().map(|(id, score)| (id, *score)),
+        );
 
         let t_fusion = recall_start.elapsed();
         observe_recall_stage(RecallStage::Fusion, t_fusion - t_vector);
@@ -3451,6 +3462,17 @@ impl super::MemorySystem {
                         // Build score lookup from cross-encoder results
                         let ce_scores: std::collections::HashMap<MemoryId, f32> =
                             reranked.into_iter().collect();
+
+                        // The reranker's own scores, in its pool's order so a capture joins
+                        // them to the stages before it by position. A capture that ended at
+                        // fusion could not tell a pool change from a score change over one pool.
+                        crate::memory::gold_funnel::record_scored(
+                            "ce",
+                            memories
+                                .iter()
+                                .take(rerank_budget)
+                                .filter_map(|m| ce_scores.get(&m.id).map(|score| (&m.id, *score))),
+                        );
 
                         // The share comes from the dials by query shape (see
                         // CognitiveDials::ce_share and constants::CE_BLEND_*).
