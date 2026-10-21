@@ -23,12 +23,38 @@ pub struct DiscoveredInstance {
     #[serde(default)]
     pub label: String,
     #[serde(default)]
+    pub pid: u32,
+    /// The host the listener bound to (`VELD_HOST`), as distinct from `base_url`'s
+    /// connectable host.
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
     pub port: u16,
     #[serde(default)]
     pub version: String,
     #[serde(default)]
     pub data_path: String,
+    /// When the server process started: its own uptime, unlike a watcher's
+    /// first successful probe.
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
     pub last_heartbeat: DateTime<Utc>,
+    /// How the server was started; absent for entries written by older servers.
+    #[serde(default)]
+    pub launch: Option<LaunchRecipe>,
+}
+
+/// Mirror of the server's `instance_registry::LaunchRecipe`: command line and
+/// working directory, plus the names (never values) of its `VELD_*` variables.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LaunchRecipe {
+    pub exe: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env_names: Vec<String>,
 }
 
 /// The shared registry directory: `<config>/veld/instances`, sibling of
@@ -71,6 +97,10 @@ pub fn discover_instances() -> Vec<DiscoveredInstance> {
             out.push(inst);
         }
     }
-    out.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.base_url.cmp(&b.base_url)));
+    out.sort_by(|a, b| {
+        a.port
+            .cmp(&b.port)
+            .then_with(|| a.base_url.cmp(&b.base_url))
+    });
     out
 }

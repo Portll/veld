@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 220afc0e97da675545795950e1a5e21de93b12a79b07250ceb97f39f0aa324c2 # shrinks to ops = [PutRelationship { slot: 0, spec: EdgeSpec { from: 0, to: 0, relation: 0, strength_tenths: 0, context: 0, activation_count: 0, source_episode: None, confidence_tenths: None } }]

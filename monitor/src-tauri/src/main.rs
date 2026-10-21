@@ -3,6 +3,7 @@
 //! Veld Monitor — tray + window GUI over [`veld_status_core`].
 
 mod app;
+mod replica;
 mod tray;
 
 fn main() {

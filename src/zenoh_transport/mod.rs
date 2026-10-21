@@ -493,7 +493,7 @@ async fn register_stream_subscribers(
                                 }
                             };
 
-                            let user_mem = match mgr.get_user_memory(&user_id) {
+                            let user_mem = match mgr.get_user_memory_async(&user_id).await {
                                 Ok(m) => m,
                                 Err(e) => {
                                     error!(user_id = %user_id, "Failed to get user memory: {}", e);
@@ -1114,8 +1114,9 @@ async fn register_auto_topic(
     .await
     .map_err(|e| anyhow::anyhow!("Failed to create stream session for auto-topic: {e}"))?;
 
-    let _user_mem = manager
-        .get_user_memory(&topic.user_id)
+    let memory = manager
+        .get_user_memory_async(&topic.user_id)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get user memory for auto-topic: {e}"))?;
 
     let mgr = Arc::clone(manager);

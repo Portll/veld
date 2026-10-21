@@ -160,6 +160,17 @@ fn validate_project_path(path_str: &str) -> Result<PathBuf, AppError> {
         });
     }
 
+    if crate::path_guard::is_private_home_path(&canonical) {
+        return Err(AppError::InvalidInput {
+            field: "project_path".to_string(),
+            reason: format!(
+                "Access denied: '{}' is the home directory or one of its credential or \
+                 application-data roots (dot-directories, Library, AppData)",
+                path_str
+            ),
+        });
+    }
+
     Ok(canonical)
 }
 

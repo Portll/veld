@@ -31,6 +31,23 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Cosine similarity for vectors the caller already knows are L2-normalised: the
+/// dot product alone, without recomputing both norms. Mismatched lengths and
+/// non-finite results give 0.0, as in [`cosine_similarity`]. On a vector that is
+/// not unit length this is NOT cosine similarity; use [`cosine_similarity`] there.
+#[inline]
+pub fn dot_normalized(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let dot = dot_product_inline(a, b);
+    if dot.is_finite() {
+        dot
+    } else {
+        0.0
+    }
+}
+
 /// Find top-k most similar vectors
 pub fn top_k_similar<T>(query: &[f32], candidates: &[(Vec<f32>, T)], k: usize) -> Vec<(f32, T)>
 where
@@ -58,6 +75,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dot_normalized_agrees_with_cosine_on_unit_vectors() {
+        let a = [0.6_f32, 0.8, 0.0];
+        let b = [0.0_f32, 0.6, 0.8];
+        assert!((dot_normalized(&a, &b) - cosine_similarity(&a, &b)).abs() < 1e-6);
+        assert!((dot_normalized(&a, &a) - 1.0).abs() < 1e-6);
+        assert_eq!(dot_normalized(&a, &[1.0]), 0.0);
+        assert_eq!(dot_normalized(&[f32::NAN, 0.0], &[1.0, 0.0]), 0.0);
+    }
 
     #[test]
     fn test_cosine_similarity() {

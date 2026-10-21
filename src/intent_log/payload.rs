@@ -14,13 +14,21 @@
 //!
 //! ## Schema evolution
 //!
-//! `IntentPayload` is `#[non_exhaustive]` and each variant uses serde's
-//! `default` attribute on every optional field. Adding a new variant or
-//! field is forward-compatible — older binaries skip records they don't
-//! recognise without crashing, and newer binaries deserialise older
-//! records by filling in defaults. A breaking change (renaming a field,
-//! changing a type) requires both a `format_version` bump on the log
-//! header (see [`super::header::IntentLogHeader`]) AND a per-record
+//! Bincode is positional: it writes a variant's index and then its fields
+//! in order, with no names and no lengths. Two rules follow.
+//!
+//! - **Never add a field to an existing variant.** `#[serde(default)]` does
+//!   not help: decoding a frame written before the field existed runs out
+//!   of bytes (`UnexpectedEnd`), so every existing log becomes unreadable.
+//!   Add a new variant instead.
+//! - **Only append variants, never reorder or remove them.** The index is
+//!   the wire identity. A binary that predates a variant fails to decode
+//!   frames carrying it, so a follower must be upgraded before its leader
+//!   writes the new variant.
+//!
+//! A change that cannot be expressed as a new variant (a type widened, a
+//! field's meaning changed) requires both a `format_version` bump on the
+//! log header (see [`super::header::IntentLogHeader`]) AND a per-record
 //! `schema_version` bump, with a migration arm registered in
 //! [`super::migrations::migrate_payload`].
 //!
@@ -98,10 +106,23 @@ pub enum IntentPayload {
         #[serde(default)]
         schema_version: Option<u16>,
     },
-    /// An existing memory was anchored (decay-resistant boost).
+    /// An existing memory was anchored or released, written before the flag was
+    /// journaled: only the importance after the change is known. Kept so older
+    /// logs decode; new writes use [`IntentPayload::SetAnchored`].
     Anchor {
         user_id: String,
         memory_id: String,
+        importance: f32,
+        #[serde(default)]
+        schema_version: Option<u16>,
+    },
+    /// An existing memory was anchored (`anchored: true`, decay-resistant) or
+    /// released, with its importance after the change. A release can leave
+    /// importance unchanged, so the flag cannot be inferred from it.
+    SetAnchored {
+        user_id: String,
+        memory_id: String,
+        anchored: bool,
         importance: f32,
         #[serde(default)]
         schema_version: Option<u16>,
@@ -118,6 +139,7 @@ impl IntentPayload {
             IntentPayload::Forget { user_id, .. } => user_id,
             IntentPayload::Update { user_id, .. } => user_id,
             IntentPayload::Anchor { user_id, .. } => user_id,
+            IntentPayload::SetAnchored { user_id, .. } => user_id,
         }
     }
 
@@ -130,6 +152,7 @@ impl IntentPayload {
             IntentPayload::Forget { memory_id, .. } => memory_id,
             IntentPayload::Update { memory_id, .. } => memory_id,
             IntentPayload::Anchor { memory_id, .. } => memory_id,
+            IntentPayload::SetAnchored { memory_id, .. } => memory_id,
         }
     }
 
@@ -141,6 +164,7 @@ impl IntentPayload {
             IntentPayload::Forget { schema_version, .. } => *schema_version,
             IntentPayload::Update { schema_version, .. } => *schema_version,
             IntentPayload::Anchor { schema_version, .. } => *schema_version,
+            IntentPayload::SetAnchored { schema_version, .. } => *schema_version,
         }
     }
 }
@@ -398,6 +422,43 @@ mod tests {
         };
         let bytes = encode(&original).unwrap();
         assert_eq!(decode(&bytes).unwrap(), original);
+    }
+
+    /// An `Anchor` frame as 0.8.3 wrote it. If this stops decoding, a change
+    /// broke every log on disk: add a variant instead of a field.
+    #[test]
+    fn anchor_frame_from_before_set_anchored_still_decodes() {
+        let frame: &[u8] = &[
+            3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 117, 1, 0, 0, 0, 0, 0, 0, 0, 109, 0, 0, 0, 63, 1,
+            1, 0,
+        ];
+        assert_eq!(
+            decode(frame).unwrap(),
+            IntentPayload::Anchor {
+                user_id: "u".to_string(),
+                memory_id: "m".to_string(),
+                importance: 0.5,
+                schema_version: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn set_anchored_round_trips_as_an_appended_variant() {
+        let release = IntentPayload::SetAnchored {
+            user_id: "carol".to_string(),
+            memory_id: "mem-7".to_string(),
+            anchored: false,
+            importance: 0.83,
+            schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+        };
+        let bytes = encode(&release).unwrap();
+        assert_eq!(
+            &bytes[..4],
+            &4u32.to_le_bytes(),
+            "variant index after Anchor"
+        );
+        assert_eq!(decode(&bytes).unwrap(), release);
     }
 
     #[test]

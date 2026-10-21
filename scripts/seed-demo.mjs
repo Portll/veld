@@ -74,9 +74,38 @@ const memories = fixture.memories.map((m) => ({
   created_at: at(m.minutesAgo ?? 0),
 }));
 
+// /api/memories/clear clears MEMORIES. Todos and projects survive it, so a second seed run stacked
+// another copy of every project on top: four projects, two of them empty, in a screenshot of a
+// feature whose point is that it tracks work.
+// The DELETE routes take the owner in the body, which a bare DELETE cannot carry here, so use the
+// flat POST forms: both resolve to the same handler.
+async function del(path, body) {
+  const res = await fetch(`${URL_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-API-Key': KEY },
+    body: JSON.stringify({ user_id: PROFILE, ...body }),
+  });
+  if (!res.ok && res.status !== 404) throw new Error(`${path} answered ${res.status}: ${(await res.text()).slice(0, 160)}`);
+}
+async function listOf(path, key) {
+  const res = await fetch(`${URL_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-API-Key': KEY },
+    body: JSON.stringify({ user_id: PROFILE }),
+  });
+  if (!res.ok) throw new Error(`${path} answered ${res.status}`);
+  const body = await res.json();
+  return (body[key] ?? []).flat().filter((row) => row && row.id);
+}
+
 if (RESET && !DRY) {
   const cleared = await call('/api/memories/clear', { user_id: PROFILE, confirm: 'CONFIRM' });
-  console.log(`  reset ${PROFILE}: ${JSON.stringify(cleared).slice(0, 120)}`);
+  const todos = await listOf('/api/todos/list', 'todos');
+  for (const todo of todos) await del('/api/todos/delete', { todo_id: todo.id });
+  const projects = await listOf('/api/projects/list', 'projects');
+  for (const project of projects) await del(`/api/projects/${project.id}/delete`, {});
+  console.log(`  reset ${PROFILE}: ${JSON.parse(JSON.stringify(cleared)).deleted_count ?? 0} memories, `
+    + `${todos.length} todos, ${projects.length} projects`);
 }
 
 console.log(`profile ${PROFILE} at ${URL_BASE}`);
@@ -168,6 +197,19 @@ if (created !== allRows.length) {
   console.error(`    ${allRows.length} rows were sent and the server created ${created}`);
   process.exitCode = 4;
 }
+
+// Projects and todos: the README shows a GTD screen, and an empty one teaches nothing.
+let projectsMade = 0;
+for (const project of fixture.projects ?? []) {
+  await call('/api/projects', { user_id: PROFILE, name: project.name, description: project.description });
+  projectsMade += 1;
+}
+let todosMade = 0;
+for (const todo of fixture.todos ?? []) {
+  await call('/api/todos/add', { user_id: PROFILE, ...todo });
+  todosMade += 1;
+}
+if (projectsMade || todosMade) console.log(`  gtd: ${projectsMade} projects, ${todosMade} todos`);
 
 // Report what the profile actually holds. A seeder that cannot read its own result is a seeder that
 // cannot tell you it wrote nothing.

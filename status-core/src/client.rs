@@ -39,7 +39,11 @@ pub struct StatusClientConfig {
 }
 
 impl StatusClientConfig {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>, user_id: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        user_id: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
@@ -118,7 +122,11 @@ impl StatusClient {
 
     /// Probe `GET /api/users` once and return the list. Useful for tools that want
     /// to pick a user before constructing the client.
-    pub async fn list_users(base_url: &str, api_key: &str, timeout: Duration) -> Result<Vec<String>> {
+    pub async fn list_users(
+        base_url: &str,
+        api_key: &str,
+        timeout: Duration,
+    ) -> Result<Vec<String>> {
         let base = normalize_base_url(base_url)?;
         let http = Client::builder().timeout(timeout).build()?;
         let url = format!("{}/api/users", base);
@@ -266,6 +274,66 @@ impl StatusClient {
         }
         if let Some(code) = step_up.filter(|c| !c.is_empty()) {
             request = request.header("X-Veld-Step-Up", code);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let resp = request.send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let json = if text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+        };
+        Ok((status, json))
+    }
+
+    /// One call to the data-management surface: backups, MIF export/import, the
+    /// admin storage migration routes, and `/health`. Authenticates with the API key;
+    /// `admin_key` rides as `X-Admin-API-Key` for the `/api/admin/storage/` routes.
+    /// Returns the status with the JSON body whatever the status. Nothing outside the
+    /// listed prefixes is reachable this way.
+    pub async fn data_request(
+        base_url: &str,
+        api_key: &str,
+        method: &str,
+        path: &str,
+        admin_key: Option<&str>,
+        body: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<(u16, serde_json::Value)> {
+        const ALLOWED: &[&str] = &[
+            "/health",
+            "/api/backup/",
+            "/api/export/mif",
+            "/api/import/mif",
+            "/api/mif/adapters",
+            "/api/admin/storage/",
+            "/api/admin/replication/",
+        ];
+        let base = normalize_base_url(base_url)?;
+        if path.contains("..") || !ALLOWED.iter().any(|p| path.starts_with(p)) {
+            return Err(StatusError::InvalidBaseUrl(
+                path.to_string(),
+                "not a data-management path".to_string(),
+            ));
+        }
+        let http = Client::builder().timeout(timeout).build()?;
+        let url = format!("{base}{path}");
+        let mut request = match method {
+            "GET" => http.get(&url),
+            "POST" => http.post(&url),
+            other => {
+                return Err(StatusError::InvalidBaseUrl(
+                    other.to_string(),
+                    "method must be GET or POST".to_string(),
+                ))
+            }
+        };
+        request = request.header("X-API-Key", api_key);
+        if let Some(key) = admin_key.filter(|k| !k.is_empty()) {
+            request = request.header("X-Admin-API-Key", key);
         }
         if let Some(body) = body {
             request = request.json(&body);

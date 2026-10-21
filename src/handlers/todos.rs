@@ -7,7 +7,7 @@
 //! - Todo comments and activity tracking
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::Json,
 };
 use chrono::Datelike;
@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::sessions::SessionEvent;
 use crate::memory::todo_formatter;
@@ -570,7 +572,10 @@ async fn verify_memory_ids(
         return Ok(parsed);
     }
 
-    let memory_system = state.get_user_memory(user_id).map_err(AppError::Internal)?;
+    let memory_system = state
+        .get_user_memory_async(user_id)
+        .await
+        .map_err(AppError::Internal)?;
     let to_check = parsed.clone();
     let missing = tokio::task::spawn_blocking(move || {
         let guard = memory_system.read();
@@ -626,7 +631,10 @@ async fn sync_memory_back_links(
     if add.is_empty() && remove.is_empty() {
         return Ok(());
     }
-    let memory_system = state.get_user_memory(user_id).map_err(AppError::Internal)?;
+    let memory_system = state
+        .get_user_memory_async(user_id)
+        .await
+        .map_err(AppError::Internal)?;
     let todo_id = *todo_id;
     tokio::task::spawn_blocking(move || {
         let guard = memory_system.read();
@@ -729,7 +737,7 @@ pub async fn create_reminder(
 
     // Cache embedding at creation time for context triggers (avoids recomputation on every check)
     if matches!(task.trigger, ProspectiveTrigger::OnContext { .. }) {
-        if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory_system) = state.get_user_memory_async(&req.user_id).await {
             let content_for_embed = task.content.clone();
             let memory_clone = memory_system.clone();
             if let Ok(Ok(embedding)) = tokio::task::spawn_blocking(move || {
@@ -936,7 +944,8 @@ pub async fn check_context_reminders(
     }
 
     let memory_system = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let context_for_embed = req.context.clone();
@@ -1080,17 +1089,22 @@ pub async fn dismiss_reminder(
 /// Delete (cancel) a reminder
 pub async fn delete_reminder(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(reminder_id): Path<String>,
     Query(query): Query<DeleteReminderQuery>,
 ) -> Result<Json<ReminderActionResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let task_id = if let Ok(uuid) = uuid::Uuid::parse_str(&reminder_id) {
         ProspectiveTaskId(uuid)
     } else {
         let task = state
             .prospective_store
-            .find_by_prefix(&query.user_id, &reminder_id)
+            .find_by_prefix(&user_id, &reminder_id)
             .map_err(AppError::Internal)?
             .ok_or_else(|| AppError::InvalidInput {
                 field: "reminder_id".to_string(),
@@ -1101,12 +1115,12 @@ pub async fn delete_reminder(
 
     let success = state
         .prospective_store
-        .delete(&query.user_id, &task_id)
+        .delete(&user_id, &task_id)
         .map_err(AppError::Internal)?;
 
     if success {
         tracing::info!(
-            user_id = %query.user_id,
+            user_id = %user_id,
             reminder_id = %task_id.0,
             "Deleted reminder"
         );
@@ -1217,7 +1231,7 @@ pub async fn create_todo(
         todo.tags.join(" ")
     );
 
-    if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+    if let Ok(memory_system) = state.get_user_memory_async(&req.user_id).await {
         let memory_clone = memory_system.clone();
         let embedding_text_clone = embedding_text.clone();
 
@@ -1282,7 +1296,7 @@ pub async fn create_todo(
         ..Default::default()
     };
 
-    if let Ok(memory) = state.get_user_memory(&req.user_id) {
+    if let Ok(memory) = state.get_user_memory_async(&req.user_id).await {
         let memory_clone = memory.clone();
         let exp_clone = experience.clone();
         let state_clone = state.clone();
@@ -1386,7 +1400,7 @@ pub async fn list_todos(
             // Semantic and lexical: an exact word match surfaces even when the embedder is
             // down or the todo predates embeddings.
             let query_embedding: Option<Vec<f32>> =
-                if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+                if let Ok(memory_system) = state.get_user_memory_async(&req.user_id).await {
                     let query_clone = query.clone();
                     tokio::task::spawn_blocking(move || {
                         let memory_guard = memory_system.read();
@@ -1578,21 +1592,26 @@ pub async fn list_due_todos(
 /// GET /api/todos/{todo_id} - Get a single todo
 pub async fn get_todo(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(todo_id): Path<String>,
     Query(query): Query<TodoQuery>,
 ) -> Result<Json<TodoResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let todo = state
         .todo_store
-        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .find_todo_by_prefix(&user_id, &todo_id)
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
 
     let project_name = if let Some(ref pid) = todo.project_id {
         state
             .todo_store
-            .get_project(&query.user_id, pid)
+            .get_project(&user_id, pid)
             .map_err(AppError::Internal)?
             .map(|p| p.name)
     } else {
@@ -1604,7 +1623,7 @@ pub async fn get_todo(
         let deps: Vec<String> = todo
             .depends_on
             .iter()
-            .map(|id| match state.todo_store.get_todo(&query.user_id, id) {
+            .map(|id| match state.todo_store.get_todo(&user_id, id) {
                 Ok(Some(dep)) => {
                     format!(
                         "{} ({})",
@@ -1749,7 +1768,7 @@ async fn update_todo_core(
             todo.tags.join(" ")
         );
 
-        if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory_system) = state.get_user_memory_async(&req.user_id).await {
             let memory_clone = memory_system.clone();
             let embedding_text_clone = embedding_text.clone();
 
@@ -1862,7 +1881,7 @@ async fn update_todo_core(
             ..Default::default()
         };
 
-        if let Ok(memory) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory) = state.get_user_memory_async(&req.user_id).await {
             let memory_clone = memory.clone();
             let exp_clone = experience.clone();
             let state_clone = state.clone();
@@ -2006,7 +2025,7 @@ async fn complete_todo_core(
             ..Default::default()
         };
 
-        if let Ok(memory) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory) = state.get_user_memory_async(&req.user_id).await {
             let memory_clone = memory.clone();
             let exp_clone = experience.clone();
             let state_clone = state.clone();
@@ -2120,10 +2139,15 @@ async fn complete_todo_core(
 /// DELETE /api/todos/{todo_id} - Delete a todo
 pub async fn delete_todo(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(todo_id): Path<String>,
     Query(query): Query<TodoQuery>,
 ) -> Result<Json<TodoResponse>, AppError> {
-    delete_todo_core(state, todo_id, query.user_id).await
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    delete_todo_core(state, todo_id, user_id).await
 }
 
 /// POST /api/todos/delete - Delete a todo named in the body
@@ -2282,14 +2306,19 @@ async fn reorder_todo_core(
 /// GET /api/todos/{todo_id}/subtasks - List subtasks of a parent todo
 pub async fn list_subtasks(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(todo_id): Path<String>,
     Query(query): Query<TodoQuery>,
 ) -> Result<Json<TodoListResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let parent = state
         .todo_store
-        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .find_todo_by_prefix(&user_id, &todo_id)
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
 
@@ -2300,7 +2329,7 @@ pub async fn list_subtasks(
 
     let projects = state
         .todo_store
-        .list_projects(&query.user_id)
+        .list_projects(&user_id)
         .map_err(AppError::Internal)?;
 
     let formatted = if subtasks.is_empty() {
@@ -2317,7 +2346,7 @@ pub async fn list_subtasks(
     };
 
     tracing::debug!(
-        user_id = %query.user_id,
+        user_id = %user_id,
         parent_id = %parent.id,
         count = subtasks.len(),
         "Listed subtasks"
@@ -2372,14 +2401,19 @@ pub async fn list_ready_todos(
 /// GET /api/todos/{todo_id}/dependents - List todos that depend on this todo
 pub async fn list_dependents(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(todo_id): Path<String>,
     Query(query): Query<TodoQuery>,
 ) -> Result<Json<TodoListResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let todo = state
         .todo_store
-        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .find_todo_by_prefix(&user_id, &todo_id)
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
 
@@ -2390,7 +2424,7 @@ pub async fn list_dependents(
 
     let projects = state
         .todo_store
-        .list_projects(&query.user_id)
+        .list_projects(&user_id)
         .map_err(AppError::Internal)?;
 
     let formatted = if dependents.is_empty() {
@@ -2435,26 +2469,31 @@ fn default_max_depth() -> usize {
 /// GET /api/todos/{todo_id}/dependency_chain - Walk the dependency graph
 pub async fn dependency_chain(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(todo_id): Path<String>,
     Query(query): Query<DependencyChainQuery>,
 ) -> Result<Json<TodoListResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let todo = state
         .todo_store
-        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .find_todo_by_prefix(&user_id, &todo_id)
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
 
     let chain = if query.direction == "backward" {
         state
             .todo_store
-            .dependency_chain_backward(&query.user_id, &todo.id, query.max_depth)
+            .dependency_chain_backward(&user_id, &todo.id, query.max_depth)
             .map_err(AppError::Internal)?
     } else {
         state
             .todo_store
-            .dependency_chain_forward(&query.user_id, &todo.id, query.max_depth)
+            .dependency_chain_forward(&user_id, &todo.id, query.max_depth)
             .map_err(AppError::Internal)?
     };
 
@@ -2462,7 +2501,7 @@ pub async fn dependency_chain(
 
     let projects = state
         .todo_store
-        .list_projects(&query.user_id)
+        .list_projects(&user_id)
         .map_err(AppError::Internal)?;
 
     let label = if query.direction == "backward" {
@@ -2614,7 +2653,7 @@ pub async fn add_todo_comment(
         ..Default::default()
     };
 
-    if let Ok(memory) = state.get_user_memory(&req.user_id) {
+    if let Ok(memory) = state.get_user_memory_async(&req.user_id).await {
         let memory_clone = memory.clone();
         let exp_clone = experience.clone();
         let memory_result = tokio::task::spawn_blocking(move || {
@@ -2679,26 +2718,31 @@ pub async fn add_todo_comment(
 /// GET /api/todos/{todo_id}/comments - List comments for a todo
 pub async fn list_todo_comments(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(todo_id): Path<String>,
     Query(query): Query<TodoQuery>,
 ) -> Result<Json<CommentListResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let todo = state
         .todo_store
-        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .find_todo_by_prefix(&user_id, &todo_id)
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
 
     let comments = state
         .todo_store
-        .get_comments(&query.user_id, &todo.id)
+        .get_comments(&user_id, &todo.id)
         .map_err(AppError::Internal)?;
 
     let formatted = todo_formatter::format_comment_list(&todo.short_id(), &comments);
 
     tracing::debug!(
-        user_id = %query.user_id,
+        user_id = %user_id,
         todo_id = %todo.id,
         count = comments.len(),
         "Listed todo comments"
@@ -2776,14 +2820,19 @@ pub async fn update_todo_comment(
 /// DELETE /api/todos/{todo_id}/comments/{comment_id} - Delete a comment
 pub async fn delete_todo_comment(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path((todo_id, comment_id)): Path<(String, String)>,
     Query(query): Query<TodoQuery>,
 ) -> Result<Json<CommentResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let todo = state
         .todo_store
-        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .find_todo_by_prefix(&user_id, &todo_id)
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
 
@@ -2795,7 +2844,7 @@ pub async fn delete_todo_comment(
 
     let success = state
         .todo_store
-        .delete_comment(&query.user_id, &todo.id, &comment_id_typed)
+        .delete_comment(&user_id, &todo.id, &comment_id_typed)
         .map_err(AppError::Internal)?;
 
     let formatted = if success {
@@ -2808,7 +2857,7 @@ pub async fn delete_todo_comment(
         state.emit_event(MemoryEvent {
             event_type: "TODO_COMMENT_DELETE".to_string(),
             timestamp: chrono::Utc::now(),
-            user_id: query.user_id.clone(),
+            user_id: user_id.clone(),
             memory_id: Some(comment_id.to_string()),
             content_preview: Some(format!("[{}] comment deleted", todo.short_id())),
             memory_type: None,
@@ -2820,7 +2869,7 @@ pub async fn delete_todo_comment(
     }
 
     tracing::debug!(
-        user_id = %query.user_id,
+        user_id = %user_id,
         todo_id = %todo.id,
         comment_id = %comment_id,
         success = success,
@@ -2954,20 +3003,25 @@ pub async fn list_projects(
 /// GET /api/projects/{project_id} - Get a project with stats
 pub async fn get_project(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(project_id): Path<String>,
     Query(query): Query<TodoQuery>,
 ) -> Result<Json<ProjectResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let project = state
         .todo_store
-        .find_project_by_name(&query.user_id, &project_id)
+        .find_project_by_name(&user_id, &project_id)
         .map_err(AppError::Internal)?
         .or_else(|| {
             uuid::Uuid::parse_str(&project_id).ok().and_then(|uuid| {
                 state
                     .todo_store
-                    .get_project(&query.user_id, &ProjectId(uuid))
+                    .get_project(&user_id, &ProjectId(uuid))
                     .ok()
                     .flatten()
             })
@@ -2976,12 +3030,12 @@ pub async fn get_project(
 
     let stats = state
         .todo_store
-        .get_project_stats(&query.user_id, &project.id)
+        .get_project_stats(&user_id, &project.id)
         .map_err(AppError::Internal)?;
 
     let todos = state
         .todo_store
-        .list_todos_by_project(&query.user_id, &project.id)
+        .list_todos_by_project(&user_id, &project.id)
         .map_err(AppError::Internal)?;
 
     let formatted = todo_formatter::format_project_todos(&project, &todos, &stats);

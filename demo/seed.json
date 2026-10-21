@@ -1,5 +1,5 @@
 {
-  "note": "Pinned rows for the `demo` profile. Every statement here is about veld itself and is drawn from this repository, so the demo screenshots disclose nothing that is not already published. Ages are minutes before seed time and sit inside the last hour, so these rows lead the activity feed instead of sinking below the repo scan, so a fresh seed reads as a session that just happened; set VELD_DEMO_NOW to `anchor` for a byte-identical reproduction. The repo scan in scripts/seed-demo.mjs supplies the surrounding density.",
+  "note": "Pinned rows for the `demo` profile. Every statement here is about veld itself and is drawn from this repository, so the demo screenshots disclose nothing that is not already published. Ages are minutes before seed time and sit inside the last hour, so these rows lead the activity feed instead of sinking below the repo scan, so a fresh seed reads as a session that just happened; set VELD_DEMO_NOW to `anchor` for a byte-identical reproduction. The repo scan in scripts/seed-demo.mjs supplies the surrounding density. `projects` and `todos` fill the GTD view the README shows; without them that screen reads empty.",
   "anchor": "2026-01-15T09:00:00Z",
   "memories": [
     {
@@ -164,6 +164,79 @@
         "demo"
       ],
       "content": "This profile is seeded from veld's own repository by scripts/seed-demo.mjs. Anything it shows is already public, which is what makes it safe to screenshot."
+    }
+  ],
+  "projects": [
+    {
+      "name": "Recall quality",
+      "description": "Measure and improve what comes back, not what goes in."
+    },
+    {
+      "name": "Storage parity",
+      "description": "redb and RocksDB answer the same questions the same way."
+    }
+  ],
+  "todos": [
+    {
+      "content": "Pin the persisted layout of Memory against a committed fixture",
+      "project": "Storage parity",
+      "priority": "high",
+      "status": "in_progress",
+      "tags": [
+        "bincode",
+        "fixtures"
+      ],
+      "notes": "A round-trip test cannot fail for a layout change. The fixture has to be bytes the current code cannot regenerate."
+    },
+    {
+      "content": "Bracket every recall benchmark with an idle arm of the same duration",
+      "project": "Recall quality",
+      "priority": "high",
+      "status": "todo",
+      "tags": [
+        "benchmark",
+        "method"
+      ],
+      "notes": "A scheduled sweep inside the measurement window reads as the change under test."
+    },
+    {
+      "content": "Report engine disagreement as a finding, not a retry",
+      "project": "Storage parity",
+      "priority": "medium",
+      "status": "todo",
+      "tags": [
+        "redb",
+        "rocksdb"
+      ]
+    },
+    {
+      "content": "Give the embedder swap a migration path",
+      "project": "Recall quality",
+      "priority": "medium",
+      "status": "todo",
+      "tags": [
+        "embedding"
+      ],
+      "notes": "Changing the model re-embeds every record, so it is a migration and not a setting."
+    },
+    {
+      "content": "Refuse a seed whose truncation budget lands mid-character",
+      "project": "Storage parity",
+      "priority": "low",
+      "status": "done",
+      "tags": [
+        "seed",
+        "unicode"
+      ]
+    },
+    {
+      "content": "Record why each todo exists so the causal chain is queryable",
+      "project": "Recall quality",
+      "priority": "low",
+      "status": "todo",
+      "tags": [
+        "lineage"
+      ]
     }
   ]
 }

@@ -12,12 +12,14 @@
 //! [`super::external_dimensions`] — both drive the same substrate.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     response::Json,
 };
 use serde::Deserialize;
 
 use super::state::MultiUserMemoryManager;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::CognitiveDials;
 use crate::validation;
@@ -41,11 +43,17 @@ pub struct SetDialsRequest {
 /// `GET /api/dials?user_id=…` — return the user's current cognitive dials.
 pub async fn get_dials(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(query): Query<DialsQuery>,
 ) -> Result<Json<CognitiveDials>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
     let memory = state
-        .get_user_memory(&query.user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let dials = memory.read().cognitive_dials();
     Ok(Json(dials))
@@ -59,7 +67,8 @@ pub async fn set_dials(
 ) -> Result<Json<CognitiveDials>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let guard = memory.read();
     guard.set_cognitive_dials(req.dials);

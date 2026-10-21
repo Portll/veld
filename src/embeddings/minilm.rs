@@ -12,17 +12,152 @@
 //! - VELD_MODEL_PATH: Base path to model files (default: ./models/minilm-l6)
 //! - VELD_EMBED_TIMEOUT_MS: Embedding timeout in ms (default: 5000)
 //! - VELD_LAZY_LOAD: Set to "false" to load model at startup (default: true)
-//! - VELD_ONNX_THREADS: Number of ONNX threads (default: 1 on macOS ARM64, 2 elsewhere)
+//! - VELD_ONNX_THREADS: intra-op threads for every ONNX session veld builds (default: 1 on
+//!   macOS ARM64, min(available cores, 8) elsewhere); see [`OrtThreading`]
 
 use anyhow::{Context, Result};
+use ort::session::builder::SessionBuilder;
 use ort::session::Session;
 use ort::value::Value;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokenizers::Tokenizer;
 
 use super::Embedder;
+
+/// Threading for every ONNX session veld builds: both embedders, the cross-encoder and NER.
+///
+/// Intra-op threads default to `min(available_parallelism, 8)` and inter-op threads to 1,
+/// because the graphs run in sequential mode and never use a second inter-op thread. macOS on
+/// Apple silicon keeps one non-spinning intra-op thread: ORT's Eigen pool deadlocks there when
+/// its threads move from spinning to blocking across P and E cores (microsoft/onnxruntime#10270,
+/// pykeio/ort#516). Elsewhere the threads spin, since turning spinning off cost 3-5x per call on
+/// x86. `VELD_ONNX_THREADS`, or the recall harness's `SHODH_ONNX_THREADS`, sets the intra-op
+/// count on every platform.
+///
+/// The value is part of each shared model's spec, so a process that pins one thread for
+/// deterministic reductions gets its own sessions rather than reusing wider ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OrtThreading {
+    pub intra: usize,
+    pub inter: usize,
+    pub spinning: bool,
+}
+
+impl OrtThreading {
+    /// The platform default with the environment's intra-op pin applied.
+    pub fn resolve() -> Self {
+        let pinned = std::env::var("VELD_ONNX_THREADS")
+            // The recall harness pins the upstream spelling.
+            .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        Self::with_pin(Self::platform_default(), pinned)
+    }
+
+    fn with_pin(mut base: Self, pinned: Option<usize>) -> Self {
+        if let Some(intra) = pinned {
+            base.intra = intra;
+        }
+        base
+    }
+
+    fn platform_default() -> Self {
+        static DEFAULT: OnceLock<OrtThreading> = OnceLock::new();
+        *DEFAULT.get_or_init(|| {
+            Self::default_for(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4),
+            )
+        })
+    }
+
+    fn default_for(parallelism: usize) -> Self {
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Self {
+                intra: 1,
+                inter: 1,
+                spinning: false,
+            }
+        } else {
+            Self {
+                intra: parallelism.clamp(1, 8),
+                inter: 1,
+                spinning: true,
+            }
+        }
+    }
+
+    /// Apply to a session builder before the model is committed.
+    pub(crate) fn apply(self, builder: SessionBuilder) -> Result<SessionBuilder> {
+        builder
+            .with_intra_threads(self.intra)
+            .context("Failed to set intra thread count")?
+            .with_inter_threads(self.inter)
+            .context("Failed to set inter thread count")?
+            .with_intra_op_spinning(self.spinning)
+            .context("Failed to set intra-op spinning")?
+            .with_inter_op_spinning(self.spinning)
+            .context("Failed to set inter-op spinning")
+    }
+}
+
+/// Default number of sessions in a model's [`SessionPool`].
+///
+/// A session is the model's weights plus its arena, so the pool multiplies resident memory by
+/// its size. It is shared by every tenant on the model, so it bounds that model's concurrent
+/// inferences for the whole process; past half the cores, more sessions only oversubscribe.
+pub(crate) fn default_session_pool_size() -> usize {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        2
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(2))
+            .unwrap_or(2)
+            .min(4)
+    }
+}
+
+/// Independently lockable sessions for one model.
+///
+/// `Session::run` takes `&mut self`, so a session runs one inference at a time; N sessions run N.
+pub(crate) struct SessionPool {
+    sessions: Vec<Mutex<Session>>,
+    next: AtomicUsize,
+}
+
+impl SessionPool {
+    /// `size` sessions (at least one), each from `build(slot)`.
+    pub(crate) fn build(
+        size: usize,
+        mut build: impl FnMut(usize) -> Result<Session>,
+    ) -> Result<Self> {
+        let sessions = (0..size.max(1))
+            .map(|slot| build(slot).map(Mutex::new))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            sessions,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// A free session if one is free, else the next in turn once it frees within `timeout`.
+    pub(crate) fn acquire(&self, timeout: Duration) -> Option<MutexGuard<'_, Session>> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let n = self.sessions.len();
+        (0..n)
+            .find_map(|i| self.sessions[(start + i) % n].try_lock())
+            .or_else(|| self.sessions[start % n].try_lock_for(timeout))
+    }
+}
 
 /// Thread-safe guard for ORT_DYLIB_PATH initialization.
 /// Using OnceLock ensures set_var is called exactly once.
@@ -39,54 +174,49 @@ pub fn pre_init_ort_runtime(offline_mode: bool) {
     let _ = ORT_PATH_INIT.get_or_init(|| MiniLMEmbedder::init_ort_path_inner(offline_mode));
 }
 
-/// Lazily initialized ONNX session and tokenizer
+/// Locate (or, when allowed, download) the shared ONNX Runtime before any `ort` call.
+pub(crate) fn ensure_ort_runtime(offline_mode: bool) -> Result<()> {
+    MiniLMEmbedder::ensure_onnx_runtime_available(offline_mode)
+}
+
+/// `VELD_LAZY_LOAD=false` loads a model when its embedder is built instead of on first use.
+pub(crate) fn lazy_load_enabled() -> bool {
+    std::env::var("VELD_LAZY_LOAD")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true)
+}
+
+/// Inference time past which a single embed is logged as slow (`VELD_EMBED_TIMEOUT_MS`).
+pub(crate) fn embed_timeout_ms() -> u64 {
+    std::env::var("VELD_EMBED_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000)
+}
+
+/// Lazily initialized ONNX sessions and tokenizer
 struct LazyModel {
-    session: Mutex<Session>,
+    sessions: SessionPool,
     tokenizer: Tokenizer,
 }
 
 impl LazyModel {
-    fn new(config: &EmbeddingConfig) -> Result<Self> {
-        // macOS ARM64 (M1/M2/M3): default to 1 thread to avoid Eigen thread pool
-        // spin-to-block deadlock on heterogeneous P/E cores.
-        // See: https://github.com/microsoft/onnxruntime/issues/10270
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let default_threads = 1;
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let default_threads = 2;
-
-        let num_threads = std::env::var("VELD_ONNX_THREADS")
-            // The recall harness pins the upstream spelling.
-            .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default_threads);
-
+    fn new(config: &EmbeddingConfig, threading: OrtThreading, pool_size: usize) -> Result<Self> {
         tracing::info!(
-            "Loading MiniLM-L6-v2 model from {:?} with {} threads",
+            "Loading MiniLM-L6-v2 model from {:?} (pool={}, intra={}, inter={}, spinning={})",
             config.model_path,
-            num_threads
+            pool_size,
+            threading.intra,
+            threading.inter,
+            threading.spinning
         );
 
-        let builder = Session::builder()
-            .context("Failed to create session builder")?
-            .with_intra_threads(num_threads)
-            .context("Failed to set intra thread count")?
-            .with_inter_threads(1)
-            .context("Failed to set inter thread count")?;
-
-        // Disable thread pool spinning to prevent Eigen spin-to-block deadlock
-        // on macOS ARM64 heterogeneous cores (P-core/E-core architecture).
-        // See: microsoft/onnxruntime#10270, pykeio/ort#516
-        let builder = builder
-            .with_intra_op_spinning(false)
-            .context("Failed to disable intra-op spinning")?
-            .with_inter_op_spinning(false)
-            .context("Failed to disable inter-op spinning")?;
-
-        let session = builder
-            .commit_from_file(&config.model_path)
-            .context("Failed to load ONNX model")?;
+        let sessions = SessionPool::build(pool_size, |slot| {
+            threading
+                .apply(Session::builder().context("Failed to create session builder")?)?
+                .commit_from_file(&config.model_path)
+                .with_context(|| format!("Failed to load ONNX model (session #{slot})"))
+        })?;
 
         let mut tokenizer = Tokenizer::from_file(&config.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
@@ -113,17 +243,20 @@ impl LazyModel {
             );
         }
 
-        tracing::info!("MiniLM-L6-v2 model loaded successfully");
+        tracing::info!(
+            "MiniLM-L6-v2 model loaded successfully ({} sessions)",
+            sessions.len()
+        );
 
         Ok(Self {
-            session: Mutex::new(session),
+            sessions,
             tokenizer,
         })
     }
 }
 
 /// Configuration for MiniLM embedder
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EmbeddingConfig {
     /// Path to ONNX model file
     pub model_path: PathBuf,
@@ -182,10 +315,7 @@ impl EmbeddingConfig {
                     .unwrap_or_else(super::downloader::get_models_dir) // Default to cache dir
             });
 
-        let embed_timeout_ms = std::env::var("VELD_EMBED_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5000);
+        let embed_timeout_ms = embed_timeout_ms();
 
         let use_quantized = std::env::var("VELD_USE_QUANTIZED_MODEL")
             .map(|v| v != "0" && v.to_lowercase() != "false")
@@ -226,6 +356,8 @@ impl EmbeddingConfig {
 /// - Reduces idle RAM by ~200MB until first use
 pub struct MiniLMEmbedder {
     config: EmbeddingConfig,
+    threading: OrtThreading,
+    pool_size: usize,
     /// Lazily initialized model (OnceLock for thread-safe init)
     lazy_model: OnceLock<Result<Arc<LazyModel>, String>>,
     /// Flag for simplified mode (no ONNX)
@@ -374,9 +506,17 @@ impl MiniLMEmbedder {
     /// - If ONNX Runtime not found, downloads from GitHub (~50MB)
     /// - Files cached in ~/.cache/veld/
     pub fn new(config: EmbeddingConfig) -> Result<Self> {
-        let lazy_load = std::env::var("VELD_LAZY_LOAD")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
+        Self::with_runtime(config, OrtThreading::resolve(), default_session_pool_size())
+    }
+
+    /// [`Self::new`] with the session threading and pool size given rather than resolved, so a
+    /// shared instance is built from exactly the values its spec was keyed on.
+    pub fn with_runtime(
+        config: EmbeddingConfig,
+        threading: OrtThreading,
+        pool_size: usize,
+    ) -> Result<Self> {
+        let lazy_load = lazy_load_enabled();
 
         let offline_mode = super::offline_mode_enabled();
 
@@ -441,7 +581,7 @@ impl MiniLMEmbedder {
                     };
 
                     // Recursively create with updated config (ORT_DYLIB_PATH already set)
-                    return Self::new(updated_config);
+                    return Self::with_runtime(updated_config, threading, pool_size);
                 }
                 Err(e) => {
                     return Self::simplified_or_fail(
@@ -458,6 +598,8 @@ impl MiniLMEmbedder {
         );
         let embedder = Self {
             config: config.clone(),
+            threading,
+            pool_size,
             lazy_model: OnceLock::new(),
             simplified_mode: false,
             dimension: 384,
@@ -477,7 +619,7 @@ impl MiniLMEmbedder {
     /// Ensure the model is loaded (thread-safe, idempotent)
     fn ensure_model_loaded(&self) -> Result<&Arc<LazyModel>> {
         let result = self.lazy_model.get_or_init(|| {
-            LazyModel::new(&self.config)
+            LazyModel::new(&self.config, self.threading, self.pool_size)
                 .map(Arc::new)
                 .map_err(|e| e.to_string())
         });
@@ -491,6 +633,17 @@ impl MiniLMEmbedder {
     /// Check if model is currently loaded (for diagnostics)
     pub fn is_model_loaded(&self) -> bool {
         self.lazy_model.get().is_some()
+    }
+
+    /// True once a load was attempted and failed. The failure is kept for this instance's
+    /// lifetime, so a shared registry replaces such an instance rather than handing it out.
+    pub fn model_load_failed(&self) -> bool {
+        matches!(self.lazy_model.get(), Some(Err(_)))
+    }
+
+    /// Whether this embedder produces non-semantic hash vectors instead of running the model.
+    pub fn is_simplified(&self) -> bool {
+        self.simplified_mode
     }
 
     /// Degrade to hash embeddings, but only if someone asked for that.
@@ -543,6 +696,8 @@ impl MiniLMEmbedder {
 
         Ok(Self {
             config,
+            threading: OrtThreading::resolve(),
+            pool_size: 1,
             lazy_model: OnceLock::new(),
             simplified_mode: true,
             dimension: 384,
@@ -641,7 +796,7 @@ impl MiniLMEmbedder {
         tracing::debug!("ONNX: model ready, acquiring session lock...");
 
         let lock_timeout = std::time::Duration::from_secs(30);
-        let mut session = model.session.try_lock_for(lock_timeout).ok_or_else(|| {
+        let mut session = model.sessions.acquire(lock_timeout).ok_or_else(|| {
             tracing::error!(
                 "ONNX session lock acquisition timed out after {}s — a previous inference \
                      call is likely stuck. Falling back to simplified embeddings.",
@@ -794,7 +949,7 @@ impl MiniLMEmbedder {
         // Lazy load model on first use
         let model = self.ensure_model_loaded()?;
         let lock_timeout = std::time::Duration::from_secs(30);
-        let mut session = model.session.try_lock_for(lock_timeout).ok_or_else(|| {
+        let mut session = model.sessions.acquire(lock_timeout).ok_or_else(|| {
             tracing::error!(
                 "ONNX session lock timed out after {}s in batch embed — \
                  a previous inference call is likely stuck.",
@@ -1131,6 +1286,33 @@ impl Embedder for MiniLMEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn threading_is_the_cores_up_to_eight_with_one_inter_op_thread() {
+        let wide = OrtThreading::default_for(32);
+        assert_eq!(wide.inter, 1);
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(wide.intra, 1, "the Apple-silicon deadlock guard holds");
+            assert!(!wide.spinning);
+        } else {
+            assert_eq!(wide.intra, 8);
+            assert_eq!(OrtThreading::default_for(3).intra, 3);
+            assert!(wide.spinning);
+        }
+        assert_eq!(OrtThreading::with_pin(wide, Some(1)).intra, 1);
+        assert_eq!(OrtThreading::with_pin(wide, None), wide);
+    }
+
+    #[test]
+    fn a_session_pool_always_builds_at_least_one_session() {
+        let mut attempts = 0;
+        let built = SessionPool::build(0, |_| {
+            attempts += 1;
+            anyhow::bail!("no runtime in this test")
+        });
+        assert!(built.is_err());
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn test_minilm_creation() {

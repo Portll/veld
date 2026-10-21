@@ -13,13 +13,25 @@ use tauri::{
 };
 use veld_status_core::{ReachState, StatusSnapshot};
 
-pub fn build(app: &mut App, snapshot: Arc<RwLock<StatusSnapshot>>) -> tauri::Result<()> {
+/// Where the replication line sits while shown: after "Sessions".
+const REPLICATION_POSITION: usize = 5;
+
+/// `replication` is the one-line summary of the instances that follow a leader
+/// (see [`crate::replica`]); the menu shows it only while there is one.
+pub fn build(
+    app: &mut App,
+    snapshot: Arc<RwLock<StatusSnapshot>>,
+    replication: Arc<RwLock<Option<String>>>,
+) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Dashboard", true, None::<&str>)?;
     let status_item = MenuItem::with_id(app, "status", "Server: probing…", false, None::<&str>)?;
     let memory_item = MenuItem::with_id(app, "memory", "Memories: —", false, None::<&str>)?;
     let sessions_item =
         MenuItem::with_id(app, "sessions", "Sessions: —", false, None::<&str>)?;
+    let replication_item =
+        MenuItem::with_id(app, "replication", "Replica: —", false, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
+    let restart = MenuItem::with_id(app, "restart", "Restart Server", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Veld Monitor", true, None::<&str>)?;
 
     let menu = Menu::with_items(
@@ -31,6 +43,7 @@ pub fn build(app: &mut App, snapshot: Arc<RwLock<StatusSnapshot>>) -> tauri::Res
             &memory_item,
             &sessions_item,
             &separator,
+            &restart,
             &quit,
         ],
     )?;
@@ -50,6 +63,7 @@ pub fn build(app: &mut App, snapshot: Arc<RwLock<StatusSnapshot>>) -> tauri::Res
                     let _ = window.set_focus();
                 }
             }
+            "restart" => crate::app::restart_pinned(app),
             "quit" => app.exit(0),
             _ => {}
         })
@@ -75,12 +89,16 @@ pub fn build(app: &mut App, snapshot: Arc<RwLock<StatusSnapshot>>) -> tauri::Res
     // Background task: refresh tray title + menu labels from the live snapshot.
     let handle = app.handle().clone();
     let snapshot_for_refresh = Arc::clone(&snapshot);
+    let menu_for_refresh = menu.clone();
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        let mut replication_shown = false;
         loop {
             ticker.tick().await;
             let snap = snapshot_for_refresh.read().clone();
             update_menu(&snap, &status_item, &memory_item, &sessions_item);
+            let line = replication.read().clone();
+            update_replication(&menu_for_refresh, &replication_item, line, &mut replication_shown);
             update_tray_title(&handle, &snap);
         }
     });
@@ -109,6 +127,26 @@ fn update_menu(
     let _ = sessions_item.set_text(format!("Sessions: {}", snap.sessions.len()));
 }
 
+fn update_replication(
+    menu: &Menu<tauri::Wry>,
+    item: &MenuItem<tauri::Wry>,
+    line: Option<String>,
+    shown: &mut bool,
+) {
+    match line {
+        Some(text) => {
+            let _ = item.set_text(text);
+            if !*shown {
+                *shown = menu.insert(item, REPLICATION_POSITION).is_ok();
+            }
+        }
+        None if *shown => {
+            *shown = menu.remove(item).is_err();
+        }
+        None => {}
+    }
+}
+
 fn update_tray_title(handle: &tauri::AppHandle, snap: &StatusSnapshot) {
     if let Some(tray) = handle.tray_by_id("main") {
         // macOS shows tray title text next to the icon; other platforms ignore.
@@ -131,7 +169,7 @@ fn short(s: &str) -> String {
     }
 }
 
-fn thousands(n: u64) -> String {
+pub(crate) fn thousands(n: u64) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);

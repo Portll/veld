@@ -41,7 +41,8 @@ pub const HEBBIAN_DECAY_MISLEADING: f32 = 0.10;
 /// Repeated recall from one source is one piece of evidence, so the default is zero:
 /// the repeat refreshes `last_activated` and nothing else moves. A non-zero value is
 /// applied as `boost × (1 − strength)` without counting as an activation, so repeats
-/// alone cannot reach LTP or a tier promotion.
+/// alone cannot reach LTP or a tier promotion. The directional components take the
+/// same fraction of their own step: `boost / (LTP_LEARNING_RATE + tier boost)`.
 pub const HEBBIAN_REPEAT_SOURCE_BOOST: f32 = 0.0;
 
 /// Upper bound on the distinct strengthening sources one edge records.
@@ -112,7 +113,12 @@ pub const EDGE_INITIAL_STRENGTH: f32 = 0.5;
 /// the trigger, not the target).
 ///
 /// Justification:
-/// - 1.5% per activation: ~67 co-activations to saturate from 0.25 → 1.0
+/// - Closes 1.5% of the remaining gap to 1.0 per activation, so it approaches 1.0
+///   and never reaches it: from 0.25, 67 activations (one e-folding) give 0.73 and
+///   ~198 close 95% of the gap
+/// - An activation is one strengthening source (a session), not one recall: a
+///   repeat from a source already on the edge earns `HEBBIAN_REPEAT_SOURCE_BOOST`'s
+///   fraction of the step, zero by default
 /// - Higher than backward (1.0%) because trigger→target is the user's intent
 /// - Moderate enough to require repeated evidence, not single-shot
 /// - Hebbian delta form: δ = boost × (1 - current), asymptotic to 1.0
@@ -125,7 +131,9 @@ pub const COACTIVATION_FORWARD_BOOST: f32 = 0.015;
 /// directional relevance than being the trigger.
 ///
 /// Justification:
-/// - 1.0% per activation: ~100 co-activations to saturate from 0.25 → 1.0
+/// - Closes 1.0% of the remaining gap per activation: from 0.25, 100 activations
+///   give 0.72 and ~298 close 95% of the gap; counted per strengthening source as
+///   for the forward boost
 /// - 2/3 of forward boost, matching the intuition that co-retrieval is
 ///   weaker directional evidence than triggering
 /// - Still allows backward edges to strengthen with sufficient evidence
@@ -154,6 +162,11 @@ pub const EDGE_MIN_STRENGTH: f32 = 0.05;
 ///
 /// Reference: Chechik et al. (1998) "Synaptic Pruning in Development"
 pub const MAX_ENTITY_DEGREE: usize = 500;
+
+/// Degree an entity is pruned back to once it passes [`MAX_ENTITY_DEGREE`]. Pruning only to
+/// the cap left a hub one edge below the next prune, so every new edge on it paid a full
+/// load, sort and delete over ~500 edges; the gap spreads one prune over the next 50 edges.
+pub const ENTITY_DEGREE_PRUNE_TARGET: usize = MAX_ENTITY_DEGREE - MAX_ENTITY_DEGREE / 10;
 
 /// Edge half-life base in hours (for time-based decay)
 ///
@@ -671,6 +684,13 @@ pub const FACT_DECAY_HALF_LIFE_BASE_DAYS: f64 = 180.0;
 /// - support=10: 480-day half-life (~16 months)
 pub const FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS: f64 = 30.0;
 
+/// Smallest confidence drop the fact-decay pass persists
+///
+/// A smaller step is neither written nor marked as applied, so its interval keeps
+/// accruing until the decay owed is large enough to record. Matches the maintenance
+/// pass's own write threshold.
+pub const FACT_DECAY_MIN_STEP: f32 = 0.001;
+
 /// Cosine similarity threshold for hybrid fact deduplication
 ///
 /// Justification:
@@ -1031,6 +1051,31 @@ pub const SPREADING_EARLY_TERMINATION_RATIO: f32 = 0.05;
 ///
 /// Tuning (2026-01): Increased from 20 to 50 for richer exploration
 pub const SPREADING_EARLY_TERMINATION_CANDIDATES: usize = 50;
+
+/// Most entities expanded per spreading-activation hop
+///
+/// Each hop expands the not-yet-expanded entities above threshold, strongest
+/// activation first, and stops at this many. Every expansion is an adjacency read
+/// of up to 100 edges, so an uncapped frontier on a hub-heavy graph turns one hop
+/// into thousands of reads for entities too weakly activated to change the ranking.
+pub const SPREADING_FRONTIER_CAP: usize = 200;
+
+/// Fuzzy name matches kept per focal query entity on the recall path
+///
+/// Recall resolves query words with exact, case-insensitive and stemmed lookups;
+/// only a focal entity those miss falls back to substring/word matching, which
+/// keeps this many candidates (shortest names first) and reads salience for
+/// those alone.
+pub const QUERY_ENTITY_FUZZY_MAX_CANDIDATES: usize = 32;
+
+/// Most recent episodes recall takes from each entity a graph traversal reaches
+pub const RECALL_GRAPH_EPISODES_PER_ENTITY: usize = 20;
+
+/// Fused candidates compared pairwise by recall's temporal topic dedup (Layer 4.54)
+///
+/// The pass is O(n²) over entity sets; the top candidates by fused score are the
+/// ones whose relative order the demotion can still change.
+pub const TEMPORAL_DEDUP_MAX_CANDIDATES: usize = 50;
 
 /// Activation normalization factor per hop
 ///
@@ -2322,6 +2367,14 @@ pub const COMPETITION_MAX_PAIRS: usize = 20;
 /// Minimum shared-entity overlap required before two memories can compete.
 pub const COMPETITION_ENTITY_OVERLAP_MIN: usize = 1;
 
+/// How far above a candidate pool's own median pair cosine, as a share of the way to 1, a
+/// pair must sit to compete. The absolute bar ([`INTERFERENCE_SIMILARITY_THRESHOLD`]) was set
+/// on MiniLM, whose unrelated LoCoMo turns sit at a median cosine of 0.39 and cross 0.85 in
+/// 0.08% of pairs; arctic-embed-xs puts the median at 0.84 and 40% of pairs over 0.85, nomic
+/// 0.75 and 4%. Measured relative to the pool, a MiniLM pool (median at most 0.62) keeps 0.85
+/// and the others need a pair that stands out from their own background.
+pub const COMPETITION_POOL_HEADROOM: f32 = 0.6;
+
 // =============================================================================
 // PATTERN-TRIGGERED REPLAY CONSTANTS (PIPE-2)
 // Based on hippocampal sharp-wave ripple research (Rasch & Born 2013)
@@ -2660,6 +2713,129 @@ pub const MMR_LAMBDA_ABSTRACT: f32 = 0.5;
 /// - Relationship queries benefit from diverse connection paths
 /// - 0.7 allows more relevance weight while still preventing near-duplicates
 pub const MMR_LAMBDA_RELATIONSHIP: f32 = 0.7;
+
+/// Whether Layer 5.4 MMR diversification runs when no `use_mmr` dial is set.
+///
+/// Off. Until 2026-10-19 the penalty was raw embedding cosine, and the embedding spaces veld
+/// runs on are anisotropic: on the LOCOMO-20 API suite the 190 memory pairs sit at cosine
+/// p10 0.52, p50 0.62, p90 0.69 under nomic-embed, so an unrelated memory and a same-topic
+/// sibling differed by a tenth while the penalty weight was half the score. Measured with
+/// that MMR on, the siblings a query expects together ("what decisions did we make", "how
+/// did the Stripe migration fix EU checkout") landed at ranks 9-10 or fell out of the top
+/// 10; with it off they returned to the top 5 and no query lost a result. Upstream
+/// shodh-memory has no MMR layer and ranked the same cases correctly. The penalty is now
+/// centred on the pool baseline ([`MMR_REDUNDANCY_THRESHOLD`]); the default stays off until
+/// the gate shows the centred form earns its place. Set the dial, or
+/// `VELD_DIALS_USE_MMR=true`, to opt in.
+pub const MMR_ENABLED_DEFAULT: bool = false;
+
+/// Centred-redundancy threshold above which MMR penalises a candidate for resembling an
+/// already-selected result.
+///
+/// Raw cosine cannot be the penalty: the embedding spaces are anisotropic, so every pair sits
+/// near a corpus baseline (p50 0.62 under nomic-embed on LOCOMO-20) and a topical sibling is
+/// only a tenth above a stranger. `apply_mmr` therefore centres each pair on the candidate
+/// pool's mean pairwise cosine, `(sim - mean) / (1 - mean)`, and ignores anything below this
+/// threshold. At 0.5 a pair has to close half the distance from the baseline to identity
+/// before it counts as redundant: two records of the same fact do, two decisions on
+/// different subsystems do not.
+pub const MMR_REDUNDANCY_THRESHOLD: f32 = 0.5;
+
+/// Stepped multiplier for "recently" / "recent" queries, by memory age in days: the upper
+/// bound of each step and the factor applied to everything in it. Older than the last step
+/// gets [`RECENTLY_FLOOR_MULTIPLIER`].
+///
+/// "Recently" is graded, not a window. Asked what happened recently, a person reaches for the
+/// last few days first, still counts the last month, and will offer something from a few
+/// months back if it is the thing that matters; a year ago is the edge of what the word can
+/// mean. The factors are multiplicative on the fused relevance score, so a strong match from
+/// three months ago outranks a weak one from yesterday, and among equal matches the newer
+/// wins. The previous model was a 14-day window that cut everything older to 0.3-0.5x,
+/// which on LOCOMO-20 put two of the three decisions a "recently" query asked for at ranks
+/// 9 and 10 behind unrelated memories from the last three days.
+pub const RECENTLY_STEPS: &[(i64, f32)] =
+    &[(7, 1.0), (30, 0.95), (90, 0.85), (180, 0.75), (365, 0.65)];
+
+/// Factor for memories older than the last [`RECENTLY_STEPS`] bound.
+pub const RECENTLY_FLOOR_MULTIPLIER: f32 = 0.5;
+
+/// Cross-encoder share of the Layer 5.3 blend, by query shape
+/// ([`crate::memory::query_parser::RerankShape`]). The fused score keeps `1 - share`.
+///
+/// The share is lowered where the reranker has nothing to add and can only re-sort what a
+/// better-informed layer ordered, and raised where the lexical and vector legs disagree and
+/// the question needs query-to-passage reasoning.
+///
+/// - Identifier: the reranker tokenises `admin/serve.mjs` into fragments; BM25 exact match
+///   is the truth.
+/// - Ordinal ("first", "latest", "last"): Layer 5.9 pins the answer by time and the blend
+///   can only re-sort it back down. On the recall gate (2026-10-19) this gained a gold
+///   document.
+/// - Keyword (under three content words): a cross-encoder needs a question to read.
+/// - Temporal and People stay at the exploratory share. Both were lowered to 0.10 and
+///   measured: a date in a content question filters rather than answers, so the reranker
+///   still matches the content (the gate lost a gold document on "what filling did she use
+///   in the cake she made recently"), and a small reranker is what a who-question has until
+///   a person-density signal exists (LOCOMO-20 Q20 lost a top-5 answer). They remain
+///   separate dials so they can be tuned without touching everything else.
+/// - Attribute: entity-to-value matching is what the reranker is trained on; the gate
+///   gained rank on "what is Nate's favorite genre".
+/// - Relational ("how did X fix Y", "why"): under nomic-embed on LOCOMO-20 the
+///   EU-migration answer sat at rank 10 because the vector leg saw topic overlap and the
+///   lexical leg saw stems; only the reranker reads that one passage answers the other.
+/// - Abstract (decomposed): the 0.45 these queries already had.
+///
+/// The `ce_blend` dial overrides every shape except Abstract, which takes the larger of it and
+/// its own share; the per-shape dials override one shape each.
+pub const CE_BLEND_IDENTIFIER: f32 = 0.0;
+pub const CE_BLEND_ORDINAL: f32 = 0.05;
+pub const CE_BLEND_KEYWORD: f32 = 0.10;
+pub const CE_BLEND_TEMPORAL: f32 = 0.18;
+pub const CE_BLEND_PEOPLE: f32 = 0.18;
+pub const CE_BLEND_EXPLORATORY: f32 = 0.18;
+pub const CE_BLEND_ATTRIBUTE: f32 = 0.30;
+pub const CE_BLEND_RELATIONAL: f32 = 0.35;
+pub const CE_BLEND_ABSTRACT: f32 = 0.45;
+
+/// Below this share the reranker is not called at all: at scale it is the dominant
+/// latency cost and a share this small cannot move a rank.
+pub const CE_BLEND_SKIP_BELOW: f32 = 0.05;
+
+/// Layer 5.36 query-term coverage: a candidate's score is multiplied by
+/// `1 - weight * (1 - coverage)`, where coverage is the information-content-weighted
+/// fraction of the query's focal and modifier stems that appear in the memory's content or
+/// tags. Stems, not surface forms: "caching" in the query matches "cache" in the memory.
+/// Vector similarity lets a memory outrank one that names the thing asked about (LOCOMO-20
+/// Q12: a Stripe migration outranked the Redis cache bug for "what caching problems did we
+/// have"); this restores the lexical evidence after fusion. Synonyms are the vector leg's
+/// job, so the weight is bounded and the layer needs [`QUERY_COVERAGE_MIN_TERMS`] terms.
+pub const QUERY_COVERAGE_WEIGHT: f32 = 0.25;
+
+/// Minimum distinct query stems before coverage applies. With one term coverage is all or
+/// nothing and would punish every synonym match.
+pub const QUERY_COVERAGE_MIN_TERMS: usize = 2;
+
+/// Layer 5.37 person density: on a people question a candidate's score is multiplied by
+/// `1 + max * intent * people_score`, with `people_score` in `[0, 1]` from the count and
+/// share of person names in the memory. Multiplicative, so it reorders within a relevant
+/// band and cannot lift an irrelevant memory over a strong match.
+///
+/// Off by default. Measured 2026-10-20 at 0.15 it moved nothing on LOCOMO-20 or the recall
+/// gate, because the rule-based `EntityExtractor` it reads labels a bare capitalised name
+/// ("Sarah", "Raj") as unknown or concept and marks it seen before its person rule can
+/// fire; only a title ("Dr", "Mrs") yields a Person. At 0 the layer is skipped, so
+/// who-questions do not pay for an extraction pass that finds no one. Raise it once person
+/// detection is fixed.
+pub const PEOPLE_BOOST_MAX: f32 = 0.0;
+
+/// Pseudo-relevance feedback: a second lexical pass whose query is the original plus terms
+/// shared by the first pass's top documents, fused as its own reciprocal-rank leg at
+/// [`PRF_WEIGHT`] of the hybrid weight. Pulls in siblings of strong hits that share their
+/// vocabulary but not the query's.
+pub const PRF_ENABLED_DEFAULT: bool = false;
+pub const PRF_DOCS: usize = 3;
+pub const PRF_TERMS: usize = 5;
+pub const PRF_WEIGHT: f32 = 0.3;
 
 /// Duration of the reconsolidation labile window in seconds.
 ///
