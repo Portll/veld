@@ -12,11 +12,14 @@
 //! - a `created_unix_secs` timestamp purely for diagnostics — it costs
 //!   nothing and a future operator can use it to correlate a log with
 //!   the run that produced it;
-//! - 12 reserved bytes, zeroed today. Reserved space lets a forwards-
-//!   compatible *additive* change to the header (e.g. a tenant id) land
-//!   without bumping `format_version`. Bytes added there must be parsed
-//!   as zero by current readers, which they already are: today's parser
-//!   ignores their content;
+//! - a `base_lsn`: the LSN of the first frame a rotated segment holds
+//!   (see the module docs on segments), in the first 8 of 12 reserved
+//!   bytes. Zero for the first segment and for every file written before
+//!   segments existed, whose first frame is LSN 0. Readers that predate
+//!   it ignore reserved bytes, so it is an additive change;
+//! - 4 reserved bytes, zeroed today. Reserved space lets a forwards-
+//!   compatible *additive* change to the header land without bumping
+//!   `format_version`;
 //! - a CRC32 over every preceding byte, so a torn write *during header
 //!   creation* (process killed between the header write and any frame
 //!   write) is detected as a corrupt header rather than silently
@@ -25,11 +28,11 @@
 //! ## Wire layout
 //!
 //! ```text
-//!   ┌────────────┬─────────────┬─────────────────┬─────────────┬──────────┐
-//!   │ magic 8 B  │ version 4 B │ created 8 B     │ reserved 12 │ crc 4 B  │
-//!   │ "VELDIL01" │   u32 LE    │   u64 LE secs   │   zero      │  u32 LE  │
-//!   └────────────┴─────────────┴─────────────────┴─────────────┴──────────┘
-//!     offset 0       8             12              20            32
+//!   ┌────────────┬─────────────┬───────────────┬─────────────┬────────────┬──────────┐
+//!   │ magic 8 B  │ version 4 B │ created 8 B   │ base_lsn 8B │ reserved 4 │ crc 4 B  │
+//!   │ "VELDIL01" │   u32 LE    │ u64 LE secs   │   u64 LE    │   zero     │  u32 LE  │
+//!   └────────────┴─────────────┴───────────────┴─────────────┴────────────┴──────────┘
+//!     offset 0       8             12              20            28           32
 //! ```
 //!
 //! Total on-disk size: [`HEADER_BYTES`] = 36. The CRC covers the first
@@ -70,9 +73,9 @@ pub const HEADER_BYTES: usize = 36;
 /// i.e. everything except the CRC itself.
 const HEADER_PRECRC_BYTES: usize = HEADER_BYTES - 4;
 
-/// Reserved-byte span. Filled with zero on write; readers ignore the
-/// contents but the CRC covers them so a torn write is detected.
-const RESERVED_BYTES: usize = 12;
+/// Reserved-byte span after `base_lsn`. Filled with zero on write; readers
+/// ignore the contents but the CRC covers them so a torn write is detected.
+const RESERVED_BYTES: usize = 4;
 
 /// Errors raised when reading or validating the intent log header.
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +109,8 @@ pub enum HeaderError {
 pub struct IntentLogHeader {
     pub format_version: u32,
     pub created_unix_secs: u64,
+    /// LSN of the first frame in this file: 0 for the first segment.
+    pub base_lsn: u64,
 }
 
 impl IntentLogHeader {
@@ -121,6 +126,18 @@ impl IntentLogHeader {
         Self {
             format_version: CURRENT_FORMAT_VERSION,
             created_unix_secs: created,
+            base_lsn: 0,
+        }
+    }
+
+    /// The header of a segment a rotation opens: it keeps the log's creation
+    /// time, which identifies the log (replication followers compare it), and
+    /// names the LSN its first frame will carry.
+    pub fn for_segment(created_unix_secs: u64, base_lsn: u64) -> Self {
+        Self {
+            format_version: CURRENT_FORMAT_VERSION,
+            created_unix_secs,
+            base_lsn,
         }
     }
 
@@ -132,7 +149,8 @@ impl IntentLogHeader {
         buf[0..8].copy_from_slice(MAGIC);
         buf[8..12].copy_from_slice(&self.format_version.to_le_bytes());
         buf[12..20].copy_from_slice(&self.created_unix_secs.to_le_bytes());
-        // buf[20..32] stays zero — reserved.
+        buf[20..28].copy_from_slice(&self.base_lsn.to_le_bytes());
+        // buf[28..32] stays zero — reserved.
         let crc = crc32fast::hash(&buf[..HEADER_PRECRC_BYTES]);
         buf[HEADER_PRECRC_BYTES..HEADER_BYTES].copy_from_slice(&crc.to_le_bytes());
         buf
@@ -170,7 +188,8 @@ impl IntentLogHeader {
             });
         }
         let created_unix_secs = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-        // bytes[20..32] are reserved-and-zero. We do not enforce that
+        let base_lsn = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
+        // bytes[28..32] are reserved-and-zero. We do not enforce that
         // they are literally zero — future minor changes will write
         // additive fields there, and existing parsers must not refuse
         // those files. The CRC keeps the bytes honest either way.
@@ -178,6 +197,7 @@ impl IntentLogHeader {
         Ok(Self {
             format_version,
             created_unix_secs,
+            base_lsn,
         })
     }
 
@@ -222,6 +242,7 @@ mod tests {
         let h = IntentLogHeader {
             format_version: CURRENT_FORMAT_VERSION,
             created_unix_secs: 1_700_000_000,
+            base_lsn: 41_000,
         };
         let bytes = h.to_bytes();
         let back = IntentLogHeader::parse(&bytes).unwrap();
@@ -270,6 +291,7 @@ mod tests {
         let h = IntentLogHeader {
             format_version: 999,
             created_unix_secs: 0,
+            base_lsn: 0,
         };
         // Hand-build a header with version=999 but a correct CRC.
         let mut bytes = [0u8; HEADER_BYTES];
@@ -311,5 +333,16 @@ mod tests {
         let h = IntentLogHeader::new_current();
         let bytes = h.to_bytes();
         assert!(bytes[20..32].iter().all(|b| *b == 0));
+    }
+
+    /// A header written before `base_lsn` existed (reserved bytes zero) reads
+    /// back as the first segment.
+    #[test]
+    fn a_header_from_before_segments_has_base_zero() {
+        let mut bytes = IntentLogHeader::new_current().to_bytes();
+        bytes[20..32].fill(0);
+        let crc = crc32fast::hash(&bytes[..HEADER_PRECRC_BYTES]);
+        bytes[HEADER_PRECRC_BYTES..HEADER_BYTES].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(IntentLogHeader::parse(&bytes).unwrap().base_lsn, 0);
     }
 }
