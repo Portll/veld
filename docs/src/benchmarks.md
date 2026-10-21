@@ -5,33 +5,49 @@ Retrieval-quality benchmarks are tracked in
 [benchmark_report.json](https://github.com/Portll/veld/blob/main/benchmark_report.json)
 in the repo. This page summarises the most recent snapshot.
 
-## Most recent benchmarked snapshot — v0.7.2
+## Most recent measurement: LoCoMo, 1,531 questions
+
+Measured 2026-10-20 at `3faec074` on 1,531 questions from the LoCoMo dataset's 10 conversations
+(single-hop, multi-hop, temporal and open-domain; the adversarial category is left out), with the
+MiniLM embedder and the mxbai-rerank-xsmall-v1 cross-encoder reranking the top 20.
 
 | Metric | Value |
 |---|---|
-| **MRR** (Mean Reciprocal Rank) | 0.925 |
-| **Temporal MRR** | 0.900 |
-| **Single-hop accuracy** | 1.000 |
-| **Composite score** | 78.4% |
+| **p@1** (gold memory ranked first) | 0.406 |
+| **MRR** (Mean Reciprocal Rank) | 0.492 |
+| **recall@10** | 0.589 |
+| **nDCG@10** | 0.493 |
 
-Source: [PROGRESS.md](https://github.com/Portll/veld/blob/main/PROGRESS.md)
-v0.7.2 retrieval benchmark.
+By category, nDCG@10 is 0.551 single-hop (841 questions), 0.593 temporal (320), 0.294
+multi-hop (281) and 0.221 open-domain (89).
 
-## What changed since the snapshot
+These are retrieval metrics: whether the gold turn was ranked, and where. They are not
+end-to-end answer accuracy. Published LoCoMo figures for Mem0, Zep, Letta and others are
+LLM-judged answer accuracy ("J"), so the two are on different scales and do not compare. The
+1,531 questions also include the 100-question gate (conversation conv-42) that recall changes are
+tuned against, so the run is not a fully held-out measurement; a held-out set without conv-42,
+with confidence intervals, is task 7 of plan `veld-review-remediation-20261020`.
 
-The retrieval pipeline has shipped several improvements since v0.7.2 that
-have not yet been benchmarked publicly:
+## Withdrawn figures
 
-- Layer 3.5: dual-embedder max-score merge (MiniLM + Nomic)
-- Layer 4.527: BM25 specificity discount
-- Layer 4.92: interference detection
-- Layer 5.3: cross-encoder reranking wired in (18% blend, top-20 budget)
-- Layer 5.85: linguistic boost reordering
-- Layer 5.87: calendar-aware temporal range demotion
-- Cross-embedder alignment (Procrustes + Ridge) — see
-  [alignment](architecture/alignment.md)
+Earlier pages quoted MRR 0.925 for v0.7.2, and a changelog entry quotes MRR 0.917 (`6dae51f6`).
+Both came from `benchmarks/locomo_api_benchmark.py`, which stores 20 synthetic memories and asks
+20 questions about them. That is not the LoCoMo dataset, and a store of 20 memories leaves a
+retriever very few candidates to rank, so the figures do not describe veld's retrieval. They are
+withdrawn; the table above replaces them.
 
-A v0.8 benchmark pass is part of the stabilization track.
+## Not yet measured on the full suite
+
+Main has gained these since `3faec074`; the 100-question LoCoMo gate measured each one on its
+own, and a full-suite run of all of them together is part of the v0.8 track:
+
+- Recall embeds the query, and each sub-query, on the embedder's query side.
+- Layer 3.7: a date-window candidate leg for questions that name a day or a month and year.
+- Reranker dials: which cross-encoder (`rerank_model`), how many candidates it sees
+  (`rerank_pool`) and how many it scores (`rerank_count`).
+- Faster cross-encoding: pairs batched by length, a second session under concurrent load, and a
+  cache of pair scores.
+- snowflake-arctic-embed-xs as an optional embedder.
 
 ## Running benchmarks locally
 
