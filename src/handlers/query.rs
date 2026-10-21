@@ -214,3 +214,72 @@ impl RelationalQuerier for NullRelationalQuerier {
         Ok(false)
     }
 }
+
+#[cfg(test)]
+mod planner_sources_while_a_tenant_opens {
+    //! The graph and vector sources reach the manager through sync providers that open a
+    //! tenant, or its journaled writer, on first use. Each test runtime has one thread, so a
+    //! source that ran its provider on it would stall the timeout until the init lock is let go.
+    use super::*;
+    use crate::handlers::test_helpers::{hold_init_lock, TestHarness};
+    use crate::query_planner::{GraphPredicate, GraphQuerier, VectorPredicate, VectorQuerier};
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_graph_scan_opens_its_tenant_off_the_runtime_thread() {
+        const TENANT: &str = "planner-graph-mid-open";
+        let harness = TestHarness::new();
+
+        let (release, opener) = hold_init_lock(harness.manager.user_memory_init_lock(TENANT));
+        let querier = RealGraphQuerier::new(harness.manager.clone());
+        let predicate = GraphPredicate::LinkedToEntity {
+            entity_id: uuid::Uuid::new_v4(),
+        };
+        let mut scan = tokio::spawn(async move { querier.scan(TENANT, &predicate).await });
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut scan).await;
+        assert!(
+            waited.is_err(),
+            "the scan finished while the tenant's init lock was held, so it held the runtime \
+             thread until the lock was let go"
+        );
+
+        release.send(()).expect("opener waits for release");
+        opener.join().expect("opener thread");
+        let ids = scan.await.expect("scan task").expect("scan");
+        assert!(ids.is_empty(), "a new tenant holds no memories: {ids:?}");
+        assert!(
+            harness.manager.user_memories.get(TENANT).is_some(),
+            "the scan opened the tenant"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_vector_scan_opens_its_writer_off_the_runtime_thread() {
+        const TENANT: &str = "planner-vector-mid-open";
+        let harness = TestHarness::new();
+
+        let (release, opener) = hold_init_lock(harness.manager.journaled_writer_init_lock(TENANT));
+        let querier = RealVectorQuerier::new(harness.manager.clone());
+        let predicate = VectorPredicate {
+            kind: "vamana-text-primary".to_string(),
+            query_vector: vec![1.0, 0.0, 0.0],
+            top_k: 5,
+        };
+        let mut scan = tokio::spawn(async move { querier.scan(TENANT, &predicate).await });
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut scan).await;
+        assert!(
+            waited.is_err(),
+            "the scan finished while the writer's init lock was held, so it held the runtime \
+             thread until the lock was let go"
+        );
+
+        release.send(()).expect("opener waits for release");
+        opener.join().expect("opener thread");
+        let hits = scan.await.expect("scan task").expect("scan");
+        assert!(hits.is_empty(), "a new tenant has no vectors: {hits:?}");
+        assert!(
+            harness.manager.journaled_writers.get(TENANT).is_some(),
+            "the scan opened the tenant's writer"
+        );
+    }
+}

@@ -432,7 +432,7 @@ pub async fn consolidate_memories(
         // on the existing mirror.
         if let (Ok(graph), Ok(store)) = (
             state_clone.get_user_graph_async(&user_id).await,
-            state_clone.get_user_slow_store(&user_id),
+            state_clone.get_user_slow_store_async(&user_id).await,
         ) {
             let scope = user_id.clone();
             let ttl = state_clone.server_config().graph_mirror_sync_ttl();
@@ -788,7 +788,7 @@ pub async fn sleep_phase_consolidation(
         // skipped.
         if let (Ok(graph), Ok(store)) = (
             state_clone.get_user_graph_async(&user_id).await,
-            state_clone.get_user_slow_store(&user_id),
+            state_clone.get_user_slow_store_async(&user_id).await,
         ) {
             let scope = user_id.clone();
             let ttl = state_clone.server_config().graph_mirror_sync_ttl();
