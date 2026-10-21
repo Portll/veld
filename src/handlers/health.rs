@@ -438,6 +438,16 @@ pub async fn health_index_user(
                 "needs_rebuild": s.needs_rebuild,
                 "deletion_ratio": s.deletion_ratio,
             })),
+            "spaces": health.spaces.iter().map(|s| serde_json::json!({
+                "space": s.space,
+                "codec": s.codec,
+                "memories": s.memories,
+                "total_vectors": s.total_vectors,
+                "vector_bytes": s.vector_bytes,
+                "deleted_count": s.deleted_count,
+                "needs_rebuild": s.needs_rebuild,
+                "needs_compaction": s.needs_compaction,
+            })).collect::<Vec<_>>(),
             "timestamp": chrono::Utc::now().to_rfc3339()
         })),
     ))

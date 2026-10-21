@@ -134,6 +134,12 @@ boots use that endpoint or refuse, so an endpoint that happens to be down cannot
 the store back to a local model and trigger a second full re-embed. A 2.5 GB tenant takes
 minutes to tens of minutes against a local server; the server answers throughout.
 
+**A second space costs a fraction of the first.** Every space but the primary keeps its index
+as product-quantized codes, a 32nd of the vectors' size, and reranks each search's best
+candidates against the full vectors in the records. `VELD_SPACE_CODEC=f32` keeps full vectors in
+a graph instead; changing it rebuilds those indexes from the records at the next start. See
+[codecs](../architecture/embedding-spaces.md#codecs).
+
 ## Reverse proxy
 
 If you expose veld beyond localhost, put it behind a reverse proxy with TLS:

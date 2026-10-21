@@ -135,13 +135,15 @@ It writes a JSON report under `evaluations/spaces/`. The plan's rows use
 Every later step of the plan re-runs it and adds a row here, so each step has a before and after.
 No numbers are recorded yet: the baseline is the first run, before deferred embedding lands.
 
-| Step | Commit | Memories | Spaces | Search p95 | Query p95, 2 spaces ÷ 1 | RSS per space | Write per memory | Drain at 64 |
-|---|---|---|---|---|---|---|---|---|
-| baseline | | 10k | 1 / 2 | | | | | |
-| baseline | | 100k | 1 / 2 | | | | | |
+| Step | Commit | Memories | Spaces | Search p95 | Query p95, 2 spaces ÷ 1 | RSS per space | Stored, 2 spaces ÷ 1 | pq recall@10 | Write per memory | Drain at 64 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline | | 10k | 1 / 2 | | | | | | | |
+| baseline | | 100k | 1 / 2 | | | | | | | |
 
 Step 10 is done when the query p95 with two spaces at once is within 1.3x of one space at 100k
-memories. The bench's query rows leave out graph traversal and BM25, which the second space's
+memories. Step 11 is done when two spaces, the second as `pq`, hold under 1.3x of one at 100k
+(the `two/one` row, by bytes and by RSS). The `pq` search rows rerank against vectors in memory;
+the server reads them from the records, one read per candidate. The bench's query rows leave out graph traversal and BM25, which the second space's
 search also overlaps in recall.
 
 The LoCoMo gate under each space configuration runs in CI (`.github/workflows/recall.yml`).

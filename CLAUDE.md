@@ -93,7 +93,7 @@ Veld is an **edge-native cognitive memory system**. Single binary, runs offline,
 
 The retrieval pipeline is **multi-layer hybrid search**, not a single algorithm. Layers (numbering follows the codebase's "Layer 3.5 / 4.527 / 5.85" convention from [PROGRESS.md](PROGRESS.md) — non-integer numbers are real, not typos):
 
-- **Vector search**: HNSW (default), Vamana/DiskANN, SPANN, and PQ codecs all live in [src/vector_db/](src/vector_db/). HNSW is the active retrieval engine.
+- **Vector search**: HNSW (default), Vamana/DiskANN, SPANN, and PQ codecs all live in [src/vector_db/](src/vector_db/). HNSW is the active retrieval engine. Every embedding space but the primary is indexed as flat PQ codes reranked against the records' exact vectors ([src/vector_db/quantized.rs](src/vector_db/quantized.rs); `VELD_SPACE_CODEC=f32` keeps a Vamana graph instead).
 - **BM25 keyword search** via Tantivy (full-text index).
 - **Graph spreading activation** over Hebbian edges in [src/memory/graph_retrieval.rs](src/memory/graph_retrieval.rs).
 - **Cross-encoder reranking** ([src/embeddings/cross_encoder.rs](src/embeddings/cross_encoder.rs)) at ~18% blend, top-20 budget.
