@@ -2853,7 +2853,7 @@ impl super::MemorySystem {
                 .max(rerank_count_dial.or(query.rerank_count).unwrap_or(0))
                 .max(query.max_results);
             // Query filters are applied in the Layer 5 scan below, which stops once
-            // `rerank_pool` memories pass. Cutting the list here first meant a selective
+            // `scan_limit` memories pass. Cutting the list here first meant a selective
             // filter (tags, type, time range) judged only the top 30/50 and could discard
             // nearly all of them while matching memories sat just below the cut (live:
             // filtered_out=45 of 50). With filters the full fused list goes to the scan.
@@ -2886,11 +2886,20 @@ impl super::MemorySystem {
         let mut storage_fetches = 0;
         let mut filtered_out = 0;
 
-        // Fetch up to rerank_pool candidates so Layer 5.5 cross-encoder can rerank
+        // Fetch up to scan_limit candidates so Layer 5.5 cross-encoder can rerank
         // before truncating to max_results. Without this, the early break at max_results
         // would prevent the cross-encoder from ever firing (max_results == max_results).
         // Decomposed queries benefit from a larger pool — more candidates to rerank.
-        let rerank_pool = if decomposed { 30_usize } else { 20_usize }.max(query.max_results);
+        // An explicit rerank_count is Layer 5.3's budget, so the scan must find that many;
+        // stopping at 20 would cap the dial at 20 whenever max_results is small.
+        let explicit_rerank_count = self
+            .cognitive_dials
+            .read()
+            .rerank_count
+            .or(query.rerank_count);
+        let scan_limit = if decomposed { 30_usize } else { 20_usize }
+            .max(query.max_results)
+            .max(explicit_rerank_count.unwrap_or(0));
 
         // Layer 5: Unified scoring with hebbian + recency + emotional + feedback signals
         // Recency decay: recent memories get boost, old memories decay
@@ -3403,7 +3412,7 @@ impl super::MemorySystem {
                 }
             }
 
-            if memories.len() >= rerank_pool {
+            if memories.len() >= scan_limit {
                 break;
             }
         }
