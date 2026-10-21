@@ -93,6 +93,7 @@ pub fn generate_multihop_fixtures(chains: usize) -> (Vec<CorpusItem>, Vec<SmokeC
             memory_type: "fact".to_string(),
             tags: vec![a.clone(), b.clone()],
             created_at: base + chrono::Duration::minutes(2 * i as i64),
+            episode: None,
         });
 
         // link_i: b — c (the second hop, and the gold for both cases). Every link
@@ -104,6 +105,7 @@ pub fn generate_multihop_fixtures(chains: usize) -> (Vec<CorpusItem>, Vec<SmokeC
             memory_type: "fact".to_string(),
             tags: vec![b.clone(), c.clone()],
             created_at: base + chrono::Duration::minutes(2 * i as i64 + 1),
+            episode: None,
         });
 
         // 2-hop case: mentions ONLY `a`; gold = link_i. Reachable solely via the

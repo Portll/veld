@@ -49,6 +49,22 @@ pub struct CorpusItem {
     pub tags: Vec<String>,
     /// Authoring timestamp. Used to drive temporal queries.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The writer's episode threading, when it sent one. Absent for LoCoMo and the smoke
+    /// corpus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<CorpusEpisode>,
+}
+
+/// Where a corpus memory sits in its writer's episode, the way the Claude Code hook threads
+/// a session: the episode id, the memory's position in it, and the corpus item it follows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CorpusEpisode {
+    pub id: String,
+    pub sequence: u32,
+    /// `CorpusItem::id` of the memory this one follows. It must come earlier in the corpus,
+    /// as a writer can only name a memory it has already stored.
+    #[serde(default)]
+    pub follows: Option<String>,
 }
 
 /// One graded relevance judgement for a query.
@@ -123,6 +139,13 @@ pub const LOCOMO_HOLDOUT_SPENT_PATH: &str = "tests/recall/locomo-holdout-spent.t
 /// conversation's 629-turn corpus. `recall-eval --suite locomo-gate` reads it, and
 /// `.github/workflows/recall.yml` gates it against `tests/recall/locomo-gate-baseline.json`.
 pub const LOCOMO_GATE_CORPUS_PATH: &str = "tests/recall/corpora/locomo-gate.jsonl";
+
+/// Agent-episode recall suite: memories shaped the way the Claude Code hook writes them
+/// (tasks, errors, fixes, decisions threaded into sessions by episode id, sequence number
+/// and the memory each follows) among unthreaded project notes, with questions about
+/// what fixed, caused or followed what. Read by `recall-eval --suite agent-episodes`.
+pub const AGENT_EPISODES_CORPUS_PATH: &str = "tests/recall/corpora/agent-episodes.jsonl";
+pub const AGENT_EPISODES_CASES_PATH: &str = "tests/recall/agent-episodes-cases.jsonl";
 pub const LOCOMO_GATE_CASES_PATH: &str = "tests/recall/locomo-gate-cases.jsonl";
 
 /// Errors surfaced by the fixture loaders.
@@ -341,6 +364,48 @@ mod tests {
         }
     }
 
+    /// The agent-episode suite validates like any suite, and every threaded item names an
+    /// earlier item of its own episode as the one it follows, at the next sequence number:
+    /// the harness resolves `follows` through the ids it has already ingested.
+    #[test]
+    fn agent_episode_fixtures_load_and_thread_in_order() {
+        use std::collections::HashMap;
+        let corpus = load_corpus(&manifest_path(AGENT_EPISODES_CORPUS_PATH))
+            .expect("agent-episodes corpus loads");
+        let cases = load_smoke_cases(&manifest_path(AGENT_EPISODES_CASES_PATH))
+            .expect("agent-episodes cases load");
+        validate_structure(&corpus, &cases)
+            .expect("agent-episodes fixtures must validate structurally");
+        for case in &cases {
+            assert_eq!(case.fixture_corpus_id, "agent-episodes", "case {}", case.id);
+        }
+
+        let mut placed: HashMap<&str, (&str, u32)> = HashMap::new();
+        let mut last_sequence: HashMap<&str, u32> = HashMap::new();
+        for item in &corpus {
+            if let Some(episode) = &item.episode {
+                let next = last_sequence.get(episode.id.as_str()).copied().unwrap_or(0) + 1;
+                assert_eq!(episode.sequence, next, "{}: sequence", item.id);
+                if let Some(follows) = &episode.follows {
+                    let (follows_episode, follows_sequence) = placed
+                        .get(follows.as_str())
+                        .copied()
+                        .unwrap_or_else(|| panic!("{}: follows a later or unknown item", item.id));
+                    assert_eq!(follows_episode, episode.id, "{}: crosses episodes", item.id);
+                    assert_eq!(follows_sequence + 1, episode.sequence, "{}", item.id);
+                }
+                last_sequence.insert(&episode.id, episode.sequence);
+                placed.insert(&item.id, (&episode.id, episode.sequence));
+            }
+        }
+        assert!(
+            placed.len() > 100,
+            "threaded items: {} of {}",
+            placed.len(),
+            corpus.len()
+        );
+    }
+
     /// The hold-out files are exactly the full suite with the gate's conversations removed,
     /// in source order, so a stale or hand-edited hold-out cannot pass for a held-out measurement.
     #[test]
@@ -434,6 +499,7 @@ mod tests {
             memory_type: "decision".to_string(),
             tags: vec![],
             created_at: now(),
+            episode: None,
         }
     }
 
