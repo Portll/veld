@@ -67,6 +67,9 @@ struct RelationshipCensus {
     total_activations: u64,
 }
 
+/// Edges decayed per synapse-lock hold and write batch by the full decay pass.
+const DECAY_CHUNK_EDGES: usize = 20_000;
+
 const GRAPH_CF_NAMES: &[&str] = &[
     CF_ENTITIES,
     CF_RELATIONSHIPS,
@@ -6665,6 +6668,7 @@ impl GraphMemory {
         &self,
         edges: &mut [RelationshipEdge],
         now: DateTime<Utc>,
+        mention_counts: &HashMap<Uuid, usize>,
     ) -> Result<Vec<Uuid>> {
         if edges.is_empty() {
             return Ok(Vec::new());
@@ -6676,11 +6680,6 @@ impl GraphMemory {
             .ok_or_else(|| {
                 anyhow::anyhow!("synapse_update_lock timeout in batch_decay_edges_in_place")
             })?;
-
-        // Build entity mention_count cache for NPMI computation.
-        // Collect all unique entity UUIDs referenced by edges, then batch-read
-        // their EntityNode.mention_count to avoid per-edge RocksDB lookups.
-        let mention_counts = self.build_mention_count_cache(edges.iter());
 
         let mut batch = crate::storage::WriteBatch::new();
         let mut to_prune = Vec::new();
@@ -6754,33 +6753,47 @@ impl GraphMemory {
     }
 
     /// As [`apply_decay`](Self::apply_decay), ageing every edge as of `now`.
+    ///
+    /// The family is read a first-key-byte page at a time and decayed in chunks of
+    /// [`DECAY_CHUNK_EDGES`], each under its own hold of the synapse lock and in its own
+    /// write batch: decaying a whole large graph in one pass held every edge in memory
+    /// and the lock that every new edge waits on. Mention counts are read once per
+    /// entity across chunks.
     pub fn apply_decay_at(
         &self,
         now: DateTime<Utc>,
     ) -> Result<crate::memory::types::GraphDecayResult> {
-        // Get all edges (need full data for orphan tracking)
-        let mut all_edges = self.get_all_relationships()?;
-
-        if all_edges.is_empty() {
-            return Ok(crate::memory::types::GraphDecayResult::default());
+        let mut mention_counts: HashMap<Uuid, usize> = HashMap::new();
+        let mut counted: HashSet<Uuid> = HashSet::new();
+        let mut chunk: Vec<RelationshipEdge> = Vec::new();
+        let mut to_prune: Vec<Uuid> = Vec::new();
+        let mut orphan_candidates: HashSet<Uuid> = HashSet::new();
+        let mut total_edges = 0usize;
+        for first in 0..=u8::MAX {
+            for (_, value) in self.store.scan_cf(CF_RELATIONSHIPS, Some(&[first]), None)? {
+                if let Ok(edge) = RelationshipEdge::decode(&value) {
+                    chunk.push(edge);
+                }
+            }
+            if chunk.len() < DECAY_CHUNK_EDGES && first != u8::MAX {
+                continue;
+            }
+            total_edges += chunk.len();
+            self.extend_mention_count_cache(&mut mention_counts, &mut counted, chunk.iter());
+            let pruned = self.batch_decay_edges_in_place_at(&mut chunk, now, &mention_counts)?;
+            if !pruned.is_empty() {
+                let pruned_set: HashSet<Uuid> = pruned.iter().copied().collect();
+                for edge in chunk.iter().filter(|edge| pruned_set.contains(&edge.uuid)) {
+                    orphan_candidates.insert(edge.from_entity);
+                    orphan_candidates.insert(edge.to_entity);
+                }
+                to_prune.extend(pruned);
+            }
+            chunk.clear();
         }
-
-        // Apply decay in-place on already-deserialized edges (avoids double deserialization)
-        let to_prune = self.batch_decay_edges_in_place_at(&mut all_edges, now)?;
 
         if to_prune.is_empty() {
             return Ok(crate::memory::types::GraphDecayResult::default());
-        }
-
-        // Collect entity UUIDs from edges being pruned (candidates for orphan status)
-        let pruned_set: std::collections::HashSet<Uuid> = to_prune.iter().copied().collect();
-        let mut orphan_candidates: std::collections::HashSet<Uuid> =
-            std::collections::HashSet::new();
-        for edge in &all_edges {
-            if pruned_set.contains(&edge.uuid) {
-                orphan_candidates.insert(edge.from_entity);
-                orphan_candidates.insert(edge.to_entity);
-            }
         }
 
         // Delete pruned edges
@@ -6808,7 +6821,7 @@ impl GraphMemory {
             tracing::debug!(
                 "Graph decay: {} edges pruned (of {} total), {} entities orphaned",
                 pruned_count,
-                all_edges.len(),
+                total_edges,
                 orphaned_entity_ids.len()
             );
         }
@@ -6954,10 +6967,26 @@ impl GraphMemory {
         &self,
         edges: impl IntoIterator<Item = &'e RelationshipEdge>,
     ) -> HashMap<Uuid, usize> {
+        let mut mention_counts = HashMap::new();
+        self.extend_mention_count_cache(&mut mention_counts, &mut HashSet::new(), edges);
+        mention_counts
+    }
+
+    /// Add to `mention_counts` the endpoints of `edges` not yet in `counted`, each read
+    /// once; an entity that is gone stays out of the map, as in a fresh cache.
+    fn extend_mention_count_cache<'e>(
+        &self,
+        mention_counts: &mut HashMap<Uuid, usize>,
+        counted: &mut HashSet<Uuid>,
+        edges: impl IntoIterator<Item = &'e RelationshipEdge>,
+    ) {
         let mut entity_uuids: HashSet<Uuid> = HashSet::new();
         for edge in edges {
-            entity_uuids.insert(edge.from_entity);
-            entity_uuids.insert(edge.to_entity);
+            for entity in [edge.from_entity, edge.to_entity] {
+                if counted.insert(entity) {
+                    entity_uuids.insert(entity);
+                }
+            }
         }
 
         let keys: Vec<[u8; 16]> = entity_uuids.iter().map(|u| *u.as_bytes()).collect();
@@ -6967,7 +6996,6 @@ impl GraphMemory {
             .map(|k| self.store.get_cf(CF_ENTITIES, k))
             .collect();
 
-        let mut mention_counts = HashMap::with_capacity(entity_uuids.len());
         let uuid_vec: Vec<Uuid> = entity_uuids.into_iter().collect();
         for (i, result) in results.into_iter().enumerate() {
             if let Ok(Some(value)) = result {
@@ -6979,7 +7007,6 @@ impl GraphMemory {
                 }
             }
         }
-        mention_counts
     }
 
     /// Get all entities in the graph
