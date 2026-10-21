@@ -126,11 +126,9 @@ pub struct RetireReport {
 
 /// Put `vector` in the memory's primary slot, keeping the vector it replaces beside it.
 fn replace_primary(memory: &mut Memory, vector: Vec<f32>, space: SpaceId) {
-    let displaced = memory
-        .experience
-        .embeddings
-        .take()
-        .zip(memory.experience.primary_space(None));
+    // The slot's space is read off the vector in it, so it is read before the vector leaves.
+    let displaced_space = memory.experience.primary_space(None);
+    let displaced = memory.experience.embeddings.take().zip(displaced_space);
     memory.experience.set_primary_vector(vector, space);
     if let Some((old, old_space)) = displaced {
         memory.experience.keep_vector(old_space, old);

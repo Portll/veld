@@ -5881,8 +5881,8 @@ impl MemorySystem {
         self.long_term_memory.update_many(memories)?;
         let index_space = self.retriever.index_space().clone();
         for (memory, vectors_kept) in memories.iter().zip(vectors_kept) {
-            let holds_own_vector = memory.experience.primary_space(Some(&index_space)).as_ref()
-                == Some(&index_space);
+            let holds_own_vector =
+                memory.experience.primary_space(Some(&index_space)).as_ref() == Some(&index_space);
             if !vectors_kept && holds_own_vector {
                 if let Err(e) = self.retriever.reindex_memory(memory) {
                     tracing::warn!(
@@ -6594,9 +6594,9 @@ impl MemorySystem {
                     held_out_cosine = report.held_out_cosine,
                     "replication: fitted a map into the leader's space"
                 ),
-                Err(e) => tracing::debug!(
-                    "replication: no map into {space} yet, will try again: {e:#}"
-                ),
+                Err(e) => {
+                    tracing::debug!("replication: no map into {space} yet, will try again: {e:#}")
+                }
             }
         }
     }
