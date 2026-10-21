@@ -31,12 +31,27 @@
 //! - `VELD_CROSS_ENCODER=<id>` — single model.
 //! - `VELD_CROSS_ENCODERS=<id1>:<weight1>,<id2>:<weight2>,...` — weighted
 //!   ensemble. Weights default to 1.0 if omitted (`<id>` is allowed).
-//! - Default (neither set): ms-marco-MiniLM-L-6-v2.
+//! - Default (neither set): mxbai-rerank-xsmall-v1.
+//!
+//! The env vars are the process-wide choice. On top of it, the per-user `rerank_model`
+//! dial (`crate::memory::dials::CognitiveDials`) selects one registry id at runtime;
+//! [`load_cross_encoder`] resolves a dial value over the env. The dial is `None` by
+//! default, so the shipped pipeline is unchanged until someone turns it.
 //!
 //! The result is shared process-wide by [`CrossEncoderSpec`]: every tenant's reranker on the
 //! same models holds the same instance and so the same ONNX session.
 //!
 //! Files cache under `~/.cache/veld/cross-encoder/<sanitised-id>/`.
+//!
+//! # Speed
+//!
+//! - `VELD_ONNX_THREADS`: intra-op threads per session (default: [`OrtThreading`]'s platform
+//!   default, one on Apple silicon).
+//! - `VELD_CROSS_ENCODER_BATCH=pair|bucket`: run each pair alone, or batch pairs of similar
+//!   token length (default `bucket`).
+//! - `VELD_CROSS_ENCODER_SESSIONS`: sessions one model may open for concurrent reranks
+//!   (default 2, 1..=8). Each holds its own copy of the weights; extras open on contention.
+//! - `VELD_CROSS_ENCODER_CACHE`: pair scores one reranker remembers (default 4096, 0 disables).
 
 use anyhow::{Context, Result};
 use ort::session::Session;
@@ -53,6 +68,54 @@ use super::minilm::OrtThreading;
 /// Maximum input sequence length (query + document tokens combined).
 const MAX_PAIR_LENGTH: usize = 512;
 
+/// Most pairs one forward pass carries.
+const MAX_BATCH: usize = 16;
+
+/// How much longer than the shortest pair of a batch another pair may be and still join it:
+/// a quarter of that length, and never less than [`BATCH_SLACK_MIN_TOKENS`]. Every pair is
+/// padded to the batch's longest, so a wider band trades fewer passes for more padding.
+const BATCH_SLACK_FRACTION: usize = 4;
+const BATCH_SLACK_MIN_TOKENS: usize = 8;
+
+/// Sessions a cross-encoder may open (`VELD_CROSS_ENCODER_SESSIONS`, 1..=8). Each holds its
+/// own copy of the weights, 284 MB for mxbai-rerank-xsmall-v1, so a second one opens only when
+/// two recalls rerank at the same moment.
+const DEFAULT_SESSIONS: usize = 2;
+
+/// Pair scores a cross-encoder remembers (`VELD_CROSS_ENCODER_CACHE`, 0 disables).
+/// `proactive_context` reranks overlapping candidates for similar queries on every prompt.
+const DEFAULT_PAIR_CACHE: usize = 4096;
+
+fn env_count(name: &str, default: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .min(max)
+}
+
+/// How pairs reach the model: `bucket` (the default) batches pairs of similar token length,
+/// `pair` runs each pair alone (`VELD_CROSS_ENCODER_BATCH`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BatchMode {
+    Pair,
+    Bucket,
+}
+
+fn batch_mode() -> BatchMode {
+    match std::env::var("VELD_CROSS_ENCODER_BATCH").as_deref() {
+        Ok("pair") => BatchMode::Pair,
+        _ => BatchMode::Bucket,
+    }
+}
+
+fn build_session(model_path: &std::path::Path, threading: OrtThreading) -> Result<Session> {
+    threading
+        .apply(Session::builder().context("Failed to create session builder")?)?
+        .commit_from_file(model_path)
+        .context("Failed to load ONNX model")
+}
+
 /// Default cross-encoder id when no env var is set. mxbai-rerank-xsmall-v1
 /// is the smallest 2024-vintage reranker that meaningfully beats the
 /// legacy ms-marco-MiniLM — ~280 MB download, 70 M params, modern QA +
@@ -61,6 +124,11 @@ const MAX_PAIR_LENGTH: usize = 512;
 /// ms-marco floor. Swap up to `bge-reranker-v2-m3` (568 M) for the best
 /// quality, or stack via `VELD_CROSS_ENCODERS=…`.
 const DEFAULT_CROSS_ENCODER_ID: &str = "mxbai-rerank-xsmall-v1";
+
+/// Registry id of the legacy reranker, pinned so the recall gate has a parity arm against
+/// upstream shodh-memory (which measured under this model). Select it per user with the
+/// `rerank_model` dial.
+pub const MS_MARCO_MINILM_L6_ID: &str = "ms-marco-MiniLM-L-6-v2";
 
 /// The query and the candidate the background pre-warm scores.
 pub const WARMUP_TEXT: &str = "warmup";
@@ -132,6 +200,10 @@ pub struct CrossEncoderConfig {
     pub year: u16,
     /// One-line summary of training data / domain.
     pub notes: &'static str,
+    /// SPDX identifier of the licence the model's weights are distributed under, as the
+    /// model card declares it at the pinned revision. Recorded with the pin so a
+    /// deployment can tell at a glance which rerankers it may ship.
+    pub license: &'static str,
 }
 
 impl CrossEncoderConfig {
@@ -173,6 +245,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             notes:
                 "BERT; smallest current reranker. ~3x MiniLM but trained on modern QA + retrieval; \
                  the cheap upgrade path off MS-MARCO-MiniLM.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "mxbai-rerank-base-v1".into(),
@@ -191,6 +264,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             rerank_top_k: 12,
             notes:
                 "BERT; mid-size mxbai variant. Quality close to bge-reranker-v2-m3 at a third the cost.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "jina-reranker-v1-tiny-en".into(),
@@ -210,6 +284,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             notes:
                 "JinaBERT (English only); modern drop-in replacement for ms-marco-MiniLM-L-6-v2 \
                  in the same size class. ~50% larger than MiniLM, 3 years newer, broader training mix.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "jina-reranker-v1-turbo-en".into(),
@@ -229,23 +304,32 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             notes:
                 "JinaBERT (English only); slightly larger sibling of jina-reranker-v1-tiny-en. \
                  The mini-class option for English-only deployments wanting a small accuracy bump.",
+            license: "apache-2.0",
         },
+        // Pinned like the default: upstream shodh-memory measured its LoCoMo numbers under
+        // this model, so it is the parity arm of the recall gate (`rerank_model` dial), and
+        // a parity arm whose files can move is not one.
         CrossEncoderConfig {
-            id: "ms-marco-MiniLM-L-6-v2".into(),
+            id: MS_MARCO_MINILM_L6_ID.into(),
             model_url:
-                "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx"
+                "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a/onnx/model.onnx"
                     .into(),
             tokenizer_url:
-                "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/tokenizer.json"
+                "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a/tokenizer.json"
                     .into(),
-            model_sha256: None,
-            tokenizer_sha256: None,
+            model_sha256: Some(
+                "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a".into(),
+            ),
+            tokenizer_sha256: Some(
+                "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66".into(),
+            ),
             has_token_type_ids: true,
             params_millions: 22,
-            download_mb: 80,
+            download_mb: 87,
             year: 2021,
             rerank_top_k: 20,
             notes: "BERT-style; trained on MS MARCO web-search passages. Fast, narrow domain.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "bge-reranker-v2-m3".into(),
@@ -274,6 +358,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
                 "XLM-RoBERTa-style; multilingual + multi-task (QA, retrieval, conversational). \
                  Best quality but biggest download (2.3 GB across model.onnx + model.onnx_data). \
                  Source: hooman650/bge-reranker-v2-m3-onnx-o4 (Olive O4 CPU-optimised, apache-2.0).",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "mxbai-rerank-large-v1".into(),
@@ -291,6 +376,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             year: 2024,
             rerank_top_k: 8,
             notes: "BERT-style; trained on QA + retrieval pairs. Strong on factoid queries.",
+            license: "apache-2.0",
         },
         CrossEncoderConfig {
             id: "jina-reranker-v2-base-multilingual".into(),
@@ -309,6 +395,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             rerank_top_k: 10,
             notes:
                 "XLM-RoBERTa-style; multilingual; late-interaction-influenced training. Mid-size sweet spot.",
+            // Non-commercial: selectable, never a default.
+            license: "cc-by-nc-4.0",
         },
     ]
 }
@@ -393,6 +481,22 @@ pub fn list_registered() -> Vec<(String, u32, u32, u16, &'static str)> {
 // ONNX cross-encoder
 // -----------------------------------------------------------------------------
 
+/// One download lock per cache directory, shared by every [`OnnxCrossEncoder`] that
+/// resolves to it: the registry can hand out two instances of one id (the env-selected
+/// model and a dial-selected one, or the harness's tape filler), and they must not fetch
+/// the same files at once.
+static DOWNLOAD_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn download_lock(dir: &std::path::Path) -> Arc<Mutex<()>> {
+    Arc::clone(
+        DOWNLOAD_LOCKS
+            .lock()
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
 /// What the model's primary output head looks like — detected by inspecting
 /// the loaded ONNX graph, not the registry's hint, so a wrong (or missing)
 /// `rerank_top_k`/`has_token_type_ids` config never lets a runtime bug
@@ -455,7 +559,16 @@ impl OutputHead {
 }
 
 struct LazyOnnx {
-    session: Mutex<Session>,
+    /// Built at load; every call can fall back to waiting for it.
+    primary: Mutex<Session>,
+    /// Opened one at a time, the first time every open session is busy.
+    extra: Vec<OnceLock<Mutex<Session>>>,
+    /// Held while an extra session is built, so two callers never build the same slot.
+    growing: Mutex<()>,
+    /// Set when building an extra session failed, so contended calls stop retrying it.
+    grow_failed: AtomicBool,
+    model_path: PathBuf,
+    threading: OrtThreading,
     tokenizer: Tokenizer,
     /// Whether the loaded ONNX graph accepts `token_type_ids`. Detected
     /// from `session.inputs` at load time — the registry's
@@ -465,12 +578,104 @@ struct LazyOnnx {
     output_head: OutputHead,
 }
 
+impl LazyOnnx {
+    /// A session to run on: a free open one, else a newly opened one while the pool has
+    /// room, else the primary once it frees.
+    fn checkout(&self, id: &str) -> Result<parking_lot::MutexGuard<'_, Session>> {
+        if let Some(guard) = self.primary.try_lock() {
+            return Ok(guard);
+        }
+        for slot in &self.extra {
+            if let Some(guard) = slot.get().and_then(|s| s.try_lock()) {
+                return Ok(guard);
+            }
+        }
+        if let Some(guard) = self.open_extra(id) {
+            return Ok(guard);
+        }
+        self.primary
+            .try_lock_for(std::time::Duration::from_secs(30))
+            .ok_or_else(|| anyhow::anyhow!("Cross-encoder session lock timeout ({id})"))
+    }
+
+    fn open_extra(&self, id: &str) -> Option<parking_lot::MutexGuard<'_, Session>> {
+        if self.grow_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let _growing = self.growing.try_lock()?;
+        let slot = self.extra.iter().find(|s| s.get().is_none())?;
+        match build_session(&self.model_path, self.threading) {
+            Ok(session) => {
+                let _ = slot.set(Mutex::new(session));
+                let open = 1 + self.extra.iter().filter(|s| s.get().is_some()).count();
+                crate::metrics::CROSS_ENCODER_SESSIONS
+                    .with_label_values(&[id])
+                    .set(open as i64);
+                tracing::info!(
+                    "cross-encoder `{id}`: opened session {open} for concurrent reranks"
+                );
+                slot.get().and_then(|s| s.try_lock())
+            }
+            Err(e) => {
+                self.grow_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    "cross-encoder `{id}`: could not open another session, concurrent reranks \
+                     will wait for the first: {e:#}"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// One (query, document) pair, tokenized and cut to its own length.
+struct EncodedPair {
+    ids: Vec<i64>,
+    mask: Vec<i64>,
+    types: Vec<i64>,
+}
+
+impl EncodedPair {
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
+/// Group pair indices, already sorted by token length, into batches whose longest pair is
+/// within the slack of its shortest.
+fn length_buckets(order: &[usize], lens: &[usize]) -> Vec<Vec<usize>> {
+    let mut buckets: Vec<Vec<usize>> = Vec::new();
+    for &i in order {
+        let joins = buckets.last().is_some_and(|b| {
+            let shortest = lens[b[0]];
+            let slack = (shortest / BATCH_SLACK_FRACTION).max(BATCH_SLACK_MIN_TOKENS);
+            b.len() < MAX_BATCH && lens[i] <= shortest + slack
+        });
+        match buckets.last_mut() {
+            Some(b) if joins => b.push(i),
+            _ => buckets.push(vec![i]),
+        }
+    }
+    buckets
+}
+
+/// Cache key for a pair. The query's byte length leads, so no two distinct pairs share a key
+/// whatever characters either text contains.
+fn pair_key(query: &str, document: &str) -> String {
+    format!("{}:{query}{document}", query.len())
+}
+
 /// Cross-encoder backed by a single ONNX model.
 pub struct OnnxCrossEncoder {
     config: CrossEncoderConfig,
     threading: OrtThreading,
     model: OnceLock<Result<LazyOnnx, String>>,
     available: AtomicBool,
+    /// Scores this reranker has already computed. The instance is shared process-wide (see
+    /// [`cross_encoder_for`]), so every tenant on the model reads one cache; the recall harness
+    /// turns it off so each repeat's latency is the model's.
+    pair_cache: Option<Mutex<lru::LruCache<String, f32>>>,
 }
 
 impl OnnxCrossEncoder {
@@ -480,11 +685,14 @@ impl OnnxCrossEncoder {
 
     /// [`Self::new`] with the session threading given rather than resolved.
     pub fn with_threading(config: CrossEncoderConfig, threading: OrtThreading) -> Self {
+        let capacity = env_count("VELD_CROSS_ENCODER_CACHE", DEFAULT_PAIR_CACHE, 1 << 20);
         Self {
             config,
             threading,
             model: OnceLock::new(),
             available: AtomicBool::new(true),
+            pair_cache: std::num::NonZeroUsize::new(capacity)
+                .map(|n| Mutex::new(lru::LruCache::new(n))),
         }
     }
 
@@ -520,11 +728,24 @@ impl OnnxCrossEncoder {
         }));
     }
 
+    /// The files on disk, downloading whichever is missing. Downloads of one cache
+    /// directory are serialised process-wide: the background pre-warm and the first
+    /// scorer (the recall harness's probe, a first query) both arrive here within
+    /// milliseconds of each other on a cold cache, and two downloads of one file share one
+    /// `.part` path, so the second to finish found its partial file renamed away by the
+    /// first and failed as "Failed to download model". Under the lock the second finds
+    /// the files present and returns.
     fn ensure_downloaded(&self) -> Result<(PathBuf, PathBuf)> {
         let dir = self.cache_dir();
         let model_path = dir.join("model.onnx");
         let tokenizer_path = dir.join("tokenizer.json");
 
+        if model_path.exists() && tokenizer_path.exists() {
+            return Ok((model_path, tokenizer_path));
+        }
+
+        let lock = download_lock(&dir);
+        let _downloading = lock.lock();
         if model_path.exists() && tokenizer_path.exists() {
             return Ok((model_path, tokenizer_path));
         }
@@ -670,12 +891,7 @@ impl OnnxCrossEncoder {
                 ));
             }
 
-            let session = match (|| -> Result<Session> {
-                self.threading
-                    .apply(Session::builder().context("Failed to create session builder")?)?
-                    .commit_from_file(&model_path)
-                    .context("Failed to load ONNX model")
-            })() {
+            let session = match build_session(&model_path, self.threading) {
                 Ok(s) => s,
                 Err(e) => {
                     self.available
@@ -711,8 +927,17 @@ impl OnnxCrossEncoder {
                 has_token_type_ids
             );
 
+            let sessions = env_count("VELD_CROSS_ENCODER_SESSIONS", DEFAULT_SESSIONS, 8).max(1);
+            crate::metrics::CROSS_ENCODER_SESSIONS
+                .with_label_values(&[self.config.id.as_str()])
+                .set(1);
             Ok(LazyOnnx {
-                session: Mutex::new(session),
+                primary: Mutex::new(session),
+                extra: (1..sessions).map(|_| OnceLock::new()).collect(),
+                growing: Mutex::new(()),
+                grow_failed: AtomicBool::new(false),
+                model_path,
+                threading: self.threading,
                 tokenizer,
                 has_token_type_ids,
                 output_head,
@@ -739,10 +964,10 @@ impl CrossEncoderModel for OnnxCrossEncoder {
         self.ensure_downloaded().map(|_| ())
     }
 
-    /// Scores N (query, document) pairs, each in its own forward pass at its own token length,
-    /// capped at `MAX_PAIR_LENGTH`. One batch would pad every pair to the longest, letting one long
-    /// memory set the cost of all of them; on live 20-candidate sets, pair by pair takes half the
-    /// time for the same scores. The session lock is held across the N passes.
+    /// Scores N (query, document) pairs, each cut to its own token length (at most
+    /// `MAX_PAIR_LENGTH`). Pairs of similar length share a forward pass; one batch of all N would
+    /// pad every pair to the longest and let one long memory set the cost of the rest. A pair this
+    /// reranker scored before is answered from its cache.
     fn score_pairs(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
         if documents.is_empty() {
             return Ok(Vec::new());
@@ -761,61 +986,159 @@ impl CrossEncoderModel for OnnxCrossEncoder {
 }
 
 impl OnnxCrossEncoder {
-    /// One forward pass per pair; `documents` is non-empty.
+    /// Scores from the cache where it has them and from the model for the rest;
+    /// `documents` is non-empty.
     fn score_pairs_live(
         &self,
         model: &LazyOnnx,
         query: &str,
         documents: &[&str],
     ) -> Result<Vec<f32>> {
-        let mut session = model
-            .session
-            .try_lock_for(std::time::Duration::from_secs(30))
-            .ok_or_else(|| {
-                anyhow::anyhow!("Cross-encoder session lock timeout ({})", self.config.id)
-            })?;
+        let mut scores: Vec<Option<f32>> = vec![None; documents.len()];
+        let mut pending: Vec<usize> = Vec::with_capacity(documents.len());
+        match &self.pair_cache {
+            Some(cache) => {
+                let mut cache = cache.lock();
+                for (i, doc) in documents.iter().enumerate() {
+                    match cache.get(&pair_key(query, doc)) {
+                        Some(&score) => scores[i] = Some(score),
+                        None => pending.push(i),
+                    }
+                }
+            }
+            None => pending.extend(0..documents.len()),
+        }
+        let hits = documents.len() - pending.len();
+        if hits > 0 {
+            crate::metrics::CROSS_ENCODER_PAIRS_TOTAL
+                .with_label_values(&["cache"])
+                .inc_by(hits as u64);
+        }
+
+        if !pending.is_empty() {
+            let encoded = pending
+                .iter()
+                .map(|&i| self.encode_pair(model, query, documents[i]))
+                .collect::<Result<Vec<_>>>()?;
+            let fresh = self.run_pairs(model, &encoded)?;
+            crate::metrics::CROSS_ENCODER_PAIRS_TOTAL
+                .with_label_values(&["model"])
+                .inc_by(fresh.len() as u64);
+            let mut cache = self.pair_cache.as_ref().map(|c| c.lock());
+            for (&i, score) in pending.iter().zip(fresh) {
+                if let Some(cache) = cache.as_mut() {
+                    cache.put(pair_key(query, documents[i]), score);
+                }
+                scores[i] = Some(score);
+            }
+        }
+
+        scores
+            .into_iter()
+            .collect::<Option<Vec<f32>>>()
+            .ok_or_else(|| anyhow::anyhow!("cross-encoder {} left a pair unscored", self.config.id))
+    }
+
+    /// Tokenize a pair and cut it to its last attended token, at most `MAX_PAIR_LENGTH`.
+    fn encode_pair(&self, model: &LazyOnnx, query: &str, document: &str) -> Result<EncodedPair> {
+        let encoding = model
+            .tokenizer
+            .encode((query, document), true)
+            .map_err(|e| anyhow::anyhow!("Tokenization failed ({}): {e}", self.config.id))?;
+        let len = encoding
+            .get_attention_mask()
+            .iter()
+            .rposition(|&m| m != 0)
+            .map_or(0, |p| p + 1)
+            .clamp(1, MAX_PAIR_LENGTH);
+        let row = |values: &[u32]| -> Vec<i64> {
+            let mut out: Vec<i64> = values.iter().take(len).map(|&v| i64::from(v)).collect();
+            out.resize(len, 0);
+            out
+        };
+        Ok(EncodedPair {
+            ids: row(encoding.get_ids()),
+            mask: row(encoding.get_attention_mask()),
+            types: row(encoding.get_type_ids()),
+        })
+    }
+
+    /// Score encoded pairs, in their order, on one checked-out session.
+    fn run_pairs(&self, model: &LazyOnnx, pairs: &[EncodedPair]) -> Result<Vec<f32>> {
+        let batches: Vec<Vec<usize>> = match batch_mode() {
+            BatchMode::Pair => (0..pairs.len()).map(|i| vec![i]).collect(),
+            BatchMode::Bucket => {
+                let lens: Vec<usize> = pairs.iter().map(EncodedPair::len).collect();
+                let mut order: Vec<usize> = (0..pairs.len()).collect();
+                order.sort_by_key(|&i| lens[i]);
+                length_buckets(&order, &lens)
+            }
+        };
+        let mut session = model.checkout(&self.config.id)?;
+        let mut scores = vec![0.0_f32; pairs.len()];
+        for batch in &batches {
+            let rows: Vec<&EncodedPair> = batch.iter().map(|&i| &pairs[i]).collect();
+            for (&i, score) in batch
+                .iter()
+                .zip(self.run_batch(&mut session, model, &rows)?)
+            {
+                scores[i] = score;
+            }
+        }
+        Ok(scores)
+    }
+
+    /// One forward pass over `rows`, each padded with zeros (attention 0) to the longest.
+    /// A batch of one is exactly the pair at its own length.
+    fn run_batch(
+        &self,
+        session: &mut Session,
+        model: &LazyOnnx,
+        rows: &[&EncodedPair],
+    ) -> Result<Vec<f32>> {
+        let width = rows.iter().map(|r| r.len()).max().unwrap_or(1);
+        let padded = |pick: fn(&EncodedPair) -> &[i64]| -> Vec<i64> {
+            let mut out = Vec::with_capacity(rows.len() * width);
+            for row in rows {
+                out.extend_from_slice(pick(row));
+                out.resize(out.len() + width - row.len(), 0);
+            }
+            out
+        };
+        let shape = vec![rows.len(), width];
+        let input_ids = Value::from_array((shape.clone(), padded(|r| &r.ids)))?;
+        let attention = Value::from_array((shape.clone(), padded(|r| &r.mask)))?;
+        let outputs = if model.has_token_type_ids {
+            let token_types = Value::from_array((shape, padded(|r| &r.types)))?;
+            session.run(ort::inputs![
+                "input_ids"      => &input_ids,
+                "attention_mask" => &attention,
+                "token_type_ids" => &token_types,
+            ])?
+        } else {
+            session.run(ort::inputs![
+                "input_ids"      => &input_ids,
+                "attention_mask" => &attention,
+            ])?
+        };
         let head_size = match model.output_head {
             OutputHead::Regression => 1_usize,
             OutputHead::BinaryClassifier => 2_usize,
         };
-
-        let mut scores = Vec::with_capacity(documents.len());
-        for &doc in documents {
-            let encoding = model
-                .tokenizer
-                .encode((query, doc), true)
-                .map_err(|e| anyhow::anyhow!("Tokenization failed ({}): {e}", self.config.id))?;
-            let len = encoding
-                .get_attention_mask()
-                .iter()
-                .rposition(|&m| m != 0)
-                .map_or(0, |p| p + 1)
-                .clamp(1, MAX_PAIR_LENGTH);
-            let row = |values: &[u32]| -> Vec<i64> {
-                let mut out: Vec<i64> = values.iter().take(len).map(|&v| i64::from(v)).collect();
-                out.resize(len, 0);
-                out
-            };
-            let input_ids = Value::from_array((vec![1, len], row(encoding.get_ids())))?;
-            let attention = Value::from_array((vec![1, len], row(encoding.get_attention_mask())))?;
-            let outputs = if model.has_token_type_ids {
-                let token_types = Value::from_array((vec![1, len], row(encoding.get_type_ids())))?;
-                session.run(ort::inputs![
-                    "input_ids"      => &input_ids,
-                    "attention_mask" => &attention,
-                    "token_type_ids" => &token_types,
-                ])?
-            } else {
-                session.run(ort::inputs![
-                    "input_ids"      => &input_ids,
-                    "attention_mask" => &attention,
-                ])?
-            };
-            let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
-            scores.push(model.output_head.extract_score(&data[..head_size]));
+        let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
+        if data.len() < rows.len() * head_size {
+            anyhow::bail!(
+                "cross-encoder {} returned {} values for {} pairs",
+                self.config.id,
+                data.len(),
+                rows.len()
+            );
         }
-
-        Ok(scores)
+        Ok(data
+            .chunks(head_size)
+            .take(rows.len())
+            .map(|chunk| model.output_head.extract_score(chunk))
+            .collect())
     }
 }
 
@@ -904,11 +1227,6 @@ fn sigmoid(x: f32) -> f32 {
 // Env-var-driven factory
 // -----------------------------------------------------------------------------
 
-/// The env-configured cross-encoder, shared with every other caller whose environment
-/// resolves to the same models. Default is [`DEFAULT_CROSS_ENCODER_ID`] when neither
-/// `VELD_CROSS_ENCODER` nor `VELD_CROSS_ENCODERS` is set.
-///
-/// `VELD_CROSS_ENCODERS` takes precedence when both are set.
 /// The built-in default cross-encoder, the one used when no env var selects another.
 pub fn default_cross_encoder() -> OnnxCrossEncoder {
     OnnxCrossEncoder::new(
@@ -917,6 +1235,27 @@ pub fn default_cross_encoder() -> OnnxCrossEncoder {
     )
 }
 
+/// The cross-encoder a `rerank_model` dial value selects. `Some(id)` is a single registry
+/// model, whatever the environment says; `None` defers to
+/// [`load_cross_encoder_from_env`]. An id the registry does not know is an error, not a
+/// fallback: the dial is sanitized before it reaches here, so an unknown id means the
+/// registry changed under a persisted dial, and reranking silently with another model
+/// would mislabel every measurement made under it.
+pub fn load_cross_encoder(selected: Option<&str>) -> Result<Arc<dyn CrossEncoderModel>> {
+    match selected {
+        Some(id) => {
+            let spec = CrossEncoderSpec::of(vec![(lookup(id)?, 1.0)]);
+            Ok(cross_encoder_for(&spec))
+        }
+        None => Ok(load_cross_encoder_from_env()),
+    }
+}
+
+/// The env-configured cross-encoder, shared with every other caller whose environment
+/// resolves to the same models. Default is [`DEFAULT_CROSS_ENCODER_ID`] when neither
+/// `VELD_CROSS_ENCODER` nor `VELD_CROSS_ENCODERS` is set.
+///
+/// `VELD_CROSS_ENCODERS` takes precedence when both are set.
 pub fn load_cross_encoder_from_env() -> Arc<dyn CrossEncoderModel> {
     cross_encoder_for(&CrossEncoderSpec::from_env())
 }
@@ -1216,7 +1555,8 @@ fn submit_prewarm(job: PrewarmJob) {
 fn download_file(url: &str, path: &PathBuf) -> Result<()> {
     tracing::info!("Downloading cross-encoder file: {url}");
 
-    let resp = ureq::get(url)
+    let resp = super::downloader::download_agent()
+        .get(url)
         .call()
         .with_context(|| format!("HTTP request failed: {url}"))?;
     let status = resp.status().as_u16();
@@ -1285,6 +1625,42 @@ mod tests {
         }
     }
 
+    /// The parity arm of the recall gate reranks with this model; a moving revision or an
+    /// unverified file would make two runs under the same dial two pipelines.
+    #[test]
+    fn the_ms_marco_parity_reranker_is_pinned_to_a_revision_and_checksums() {
+        let cfg = lookup(MS_MARCO_MINILM_L6_ID).unwrap();
+        for url in [&cfg.model_url, &cfg.tokenizer_url] {
+            assert!(
+                url.contains("/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a/"),
+                "{url} does not name the pinned revision"
+            );
+        }
+        for sha in [&cfg.model_sha256, &cfg.tokenizer_sha256] {
+            let sha = sha.as_deref().expect("a pinned checksum");
+            assert!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        assert_eq!(cfg.license, "apache-2.0");
+    }
+
+    #[test]
+    fn every_built_in_records_a_licence() {
+        for cfg in built_ins() {
+            assert!(!cfg.license.is_empty(), "{} has no licence", cfg.id);
+        }
+        assert_eq!(
+            lookup(DEFAULT_CROSS_ENCODER_ID).unwrap().license,
+            "apache-2.0"
+        );
+    }
+
+    #[test]
+    fn a_selected_id_loads_that_model_and_an_unknown_one_is_refused() {
+        let selected = load_cross_encoder(Some(MS_MARCO_MINILM_L6_ID)).unwrap();
+        assert_eq!(selected.id(), MS_MARCO_MINILM_L6_ID);
+        assert!(load_cross_encoder(Some("no-such-reranker")).is_err());
+    }
+
     #[test]
     fn lookup_resolves_built_ins() {
         assert!(lookup("ms-marco-MiniLM-L-6-v2").is_ok());
@@ -1320,6 +1696,7 @@ mod tests {
             year: 2026,
             rerank_top_k: 15,
             notes: "test fixture",
+            license: "apache-2.0",
         });
         let cfg = lookup("test-custom-model").unwrap();
         assert_eq!(cfg.params_millions, 100);
@@ -1459,5 +1836,43 @@ mod tests {
         let bc_score_relevant = OutputHead::BinaryClassifier.extract_score(&very_relevant);
         let bc_score_barely = OutputHead::BinaryClassifier.extract_score(&barely_relevant);
         assert!(bc_score_relevant > bc_score_barely); // correct ordering.
+    }
+
+    fn sorted_by_len(lens: &[usize]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..lens.len()).collect();
+        order.sort_by_key(|&i| lens[i]);
+        order
+    }
+
+    #[test]
+    fn pairs_of_similar_length_share_a_batch_and_a_long_one_runs_apart() {
+        let lens = [40, 42, 300, 38, 45];
+        let buckets = length_buckets(&sorted_by_len(&lens), &lens);
+        assert_eq!(buckets, vec![vec![3, 0, 1, 4], vec![2]]);
+    }
+
+    #[test]
+    fn short_pairs_within_the_minimum_slack_batch_together() {
+        let lens = [10, 18, 19];
+        let buckets = length_buckets(&sorted_by_len(&lens), &lens);
+        assert_eq!(buckets, vec![vec![0, 1], vec![2]]);
+    }
+
+    #[test]
+    fn a_batch_never_exceeds_the_cap() {
+        let lens = vec![50; MAX_BATCH * 2 + 1];
+        let buckets = length_buckets(&sorted_by_len(&lens), &lens);
+        assert_eq!(buckets.len(), 3);
+        assert!(buckets.iter().all(|b| b.len() <= MAX_BATCH));
+        let mut all: Vec<usize> = buckets.concat();
+        all.sort_unstable();
+        assert_eq!(all, (0..lens.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pair_keys_differ_wherever_the_query_ends() {
+        assert_ne!(pair_key("ab", "c"), pair_key("a", "bc"));
+        assert_ne!(pair_key("a:1", "x"), pair_key("a", ":1x"));
+        assert_eq!(pair_key("q", "d"), pair_key("q", "d"));
     }
 }

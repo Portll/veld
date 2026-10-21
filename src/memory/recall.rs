@@ -26,44 +26,25 @@ use crate::metrics::{EMBEDDING_CACHE_QUERY, EMBEDDING_CACHE_QUERY_SIZE};
 /// Secondary is a refinement signal, not a replacement for primary vector search.
 const SECONDARY_RRF_WEIGHT_RATIO: f32 = 0.5;
 
+/// Days the date window leg adds on each side of a calendar day a query names.
+///
+/// A conversational memory is stamped when it was said, and what it reports was often
+/// said the day after it happened: "watched it last night" on 2 May answers "what did she
+/// watch on 1 May". One day either side covers that; a month-year window is already wide.
+const DATE_WINDOW_DAY_SLACK_DAYS: i64 = 1;
+
 /// Secondary-model query embeddings, keyed by sha256(secondary id, text). Process-wide
 /// because the key carries the model identity; the primary cache lives on `MemorySystem`.
 static SECONDARY_QUERY_CACHE: std::sync::LazyLock<moka::sync::Cache<[u8; 32], Vec<f32>>> =
     std::sync::LazyLock::new(|| moka::sync::Cache::builder().max_capacity(2_000).build());
 
-/// Whether each embedder's query-side encoding equals its document-side encoding,
-/// keyed by embedder id. Probed once per embedder.
-static QUERY_SIDE_SYMMETRY: std::sync::LazyLock<dashmap::DashMap<String, bool>> =
-    std::sync::LazyLock::new(dashmap::DashMap::new);
-
-const SYMMETRY_PROBE_TEXT: &str = "query side symmetry probe";
-
 impl super::MemorySystem {
-    /// True when `encode_for_query` and `encode` produce the same vector for this
-    /// embedder, so one embedding serves both the query-side callers and the recall
-    /// pipeline (which searches with the document-side `encode`). Asymmetric models
-    /// (Nomic's `search_query: ` prefix) answer false. A failed probe answers false
-    /// and is retried on the next call.
-    pub fn query_embedding_is_symmetric(&self) -> bool {
-        let id = self.embedder.id();
-        if let Some(known) = QUERY_SIDE_SYMMETRY.get(id) {
-            return *known;
-        }
-        let (Ok(doc), Ok(query)) = (
-            self.embedder.encode(SYMMETRY_PROBE_TEXT),
-            self.embedder.encode_for_query(SYMMETRY_PROBE_TEXT),
-        ) else {
-            return false;
-        };
-        let symmetric =
-            doc.len() == query.len() && doc.iter().zip(&query).all(|(a, b)| (a - b).abs() < 1e-6);
-        QUERY_SIDE_SYMMETRY.insert(id.to_string(), symmetric);
-        symmetric
-    }
-
     /// The embedding `recall` searches with for `text`, through the same SHA256-keyed
     /// cache the pipeline uses. A caller that passes this as `Query::query_embedding`
     /// gets exactly the ranking it would get by leaving the field unset.
+    ///
+    /// It is the query side, so an asymmetric model's query instruction is applied;
+    /// `query_cache` holds only query-side vectors, the sub-query sites included.
     pub fn recall_query_embedding(&self, text: &str) -> Result<Vec<f32>> {
         let query_hash = Self::sha256_hash(text);
         if let Some(cached) = self.query_cache.get(&query_hash) {
@@ -74,7 +55,7 @@ impl super::MemorySystem {
         let embedding = self
             .embedder
             .as_ref()
-            .encode(text)
+            .encode_for_query(text)
             .context("Failed to generate query embedding")?;
         self.query_cache.insert(query_hash, embedding.clone());
         EMBEDDING_CACHE_QUERY_SIZE.set(self.query_cache.entry_count() as i64);
@@ -379,6 +360,139 @@ impl super::MemorySystem {
             }
         }
         Ok(memories)
+    }
+
+    /// The date window candidate leg: memories whose `created_at` falls in a calendar day
+    /// or month-year the query names, ranked by similarity to the query.
+    ///
+    /// Vector and BM25 search cannot reach a memory whose only link to the query is a date
+    /// held in `created_at` ("What did Nate do for Joanna on 25 May, 2022?" against
+    /// "Nate: Looky here, I got this new pup for you!"). The temporal boost at Layer 4.55
+    /// rescores candidates that are already in the pool; this leg puts the window's
+    /// memories into the pool, as one more list for RRF fusion. Day windows are widened by
+    /// [`DATE_WINDOW_DAY_SLACK_DAYS`] on each side; month windows are taken as written.
+    /// Year-only mentions produce nothing (see [`query_parser::extract_date_windows`]).
+    ///
+    /// The list is ordered by cosine similarity to the query embedding (the larger of the
+    /// primary and secondary spaces), then by `created_at`, then by id, so the rank RRF
+    /// reads is deterministic. Capped at the `candidate_count` dial, or `max_results * 8`
+    /// like the vector leg. Empty when the `date_window_leg` dial is off or the query names
+    /// no window.
+    pub(crate) fn date_window_candidates(
+        &self,
+        query_text: &str,
+        query: &Query,
+        query_embedding: &[f32],
+        query_embedding_secondary: Option<&Vec<f32>>,
+    ) -> Vec<(MemoryId, f32)> {
+        let (enabled, cap) = {
+            let dials = self.cognitive_dials.read();
+            (
+                dials.date_window_leg != Some(false),
+                dials
+                    .candidate_count
+                    .unwrap_or(query.max_results * 8)
+                    .max(1),
+            )
+        };
+        if !enabled {
+            return Vec::new();
+        }
+        let windows = query_parser::extract_date_windows(query_text);
+        if windows.is_empty() {
+            return Vec::new();
+        }
+        crate::metrics::RECALL_DATE_WINDOW_QUERIES_TOTAL.inc();
+
+        let similarity = |mem: &Memory| -> f32 {
+            let mut best = 0.0f32;
+            if let Some(emb) = mem.experience.embeddings.as_ref().filter(|e| !e.is_empty()) {
+                if !query_embedding.is_empty() {
+                    best =
+                        crate::memory::hybrid_search::cosine_similarity_pub(query_embedding, emb);
+                }
+            }
+            if let (Some(q_sec), Some(m_sec)) = (
+                query_embedding_secondary,
+                mem.experience
+                    .embeddings_secondary
+                    .as_ref()
+                    .filter(|e| !e.is_empty()),
+            ) {
+                best = best.max(crate::memory::hybrid_search::cosine_similarity_pub(
+                    q_sec, m_sec,
+                ));
+            }
+            best
+        };
+
+        let mut seen: HashSet<MemoryId> = HashSet::new();
+        let mut candidates: Vec<(MemoryId, f32, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        for window in &windows {
+            let slack = match window.granularity {
+                query_parser::DateWindowGranularity::Day => {
+                    chrono::Duration::days(DATE_WINDOW_DAY_SLACK_DAYS)
+                }
+                query_parser::DateWindowGranularity::Month => chrono::Duration::zero(),
+            };
+            // `ByDate` is inclusive on both ends in every backend and the RocksDB index is
+            // keyed by day, so the end is the last instant of the last day covered.
+            let start = (window.start - slack)
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight exists")
+                .and_utc();
+            let end = (window.end + slack - chrono::Duration::days(1))
+                .and_hms_milli_opt(23, 59, 59, 999)
+                .expect("end of day exists")
+                .and_utc();
+
+            let mut in_window = |mem: &Memory| {
+                if mem.created_at < start || mem.created_at > end || mem.is_forgotten() {
+                    return;
+                }
+                if seen.insert(mem.id.clone()) {
+                    candidates.push((mem.id.clone(), similarity(mem), mem.created_at));
+                }
+            };
+            match self
+                .long_term_memory
+                .search(SearchCriteria::ByDate { start, end })
+            {
+                Ok(memories) => memories.iter().for_each(&mut in_window),
+                Err(e) => tracing::warn!(
+                    window = %window.original_text,
+                    "date window leg: long-term search failed (non-fatal): {e}"
+                ),
+            }
+            // The in-memory tiers hold what the long-term index may not have yet.
+            for mem in self.working_memory.read().all_memories() {
+                in_window(&mem);
+            }
+            for mem in self.session_memory.read().all_memories() {
+                in_window(&mem);
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        candidates.truncate(cap);
+        crate::metrics::RECALL_DATE_WINDOW_CANDIDATES_TOTAL.inc_by(candidates.len() as u64);
+        tracing::info!(
+            windows = ?windows
+                .iter()
+                .map(|w| w.original_text.as_str())
+                .collect::<Vec<_>>(),
+            candidates = candidates.len(),
+            cap,
+            "recall [layer:3.7] date window candidate leg"
+        );
+        candidates
+            .into_iter()
+            .map(|(id, score, _)| (id, score))
+            .collect()
     }
 
     /// CACHE-AWARE semantic retrieval: Check working → session → storage
@@ -1279,7 +1393,7 @@ impl super::MemorySystem {
                     if let Some(cached) = self.query_cache.get(&sub_hash) {
                         cached.clone()
                     } else {
-                        match self.embedder.as_ref().encode(sub_q) {
+                        match self.embedder.as_ref().encode_for_query(sub_q) {
                             Ok(emb) => {
                                 self.query_cache.insert(sub_hash, emb.clone());
                                 emb
@@ -1419,7 +1533,7 @@ impl super::MemorySystem {
                 let emb = if let Some(cached) = self.query_cache.get(&sub_hash) {
                     cached.clone()
                 } else {
-                    match self.embedder.as_ref().encode(sub_q) {
+                    match self.embedder.as_ref().encode_for_query(sub_q) {
                         Ok(e) => {
                             self.query_cache.insert(sub_hash, e.clone());
                             e
@@ -1567,6 +1681,24 @@ impl super::MemorySystem {
                 );
             }
         }
+
+        // ===========================================================================
+        // LAYER 3.7: DATE WINDOW CANDIDATE LEG
+        // ===========================================================================
+        // When the query names a calendar day or month-year, the memories created in
+        // that window are a candidate list of their own, fused below with the same
+        // weight as the hybrid list. Empty for every other query, and under the
+        // `date_window_leg` dial when it is off.
+        let date_window_results = self.date_window_candidates(
+            query_text,
+            query,
+            &query_embedding,
+            query_embedding_secondary.as_ref(),
+        );
+        crate::memory::gold_funnel::record(
+            "date_window",
+            date_window_results.iter().map(|(id, _)| id),
+        );
 
         // ===========================================================================
         // LAYER 4: BM25 + RRF FUSION
@@ -1760,6 +1892,21 @@ impl super::MemorySystem {
                         "Layer 4: pseudo-relevance feedback leg"
                     );
                 }
+            }
+
+            // Date window results (Layer 3.7): pure RRF at the hybrid weight. A memory
+            // the hybrid list also holds gains from both, which is the point: the date
+            // confirms the match. One the hybrid list could not reach enters here.
+            if !date_window_results.is_empty() {
+                for (r, (id, _)) in date_window_results.iter().enumerate() {
+                    *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
+                    attr.entry(id.clone()).or_default().temporal_match = true;
+                }
+                tracing::debug!(
+                    "Layer 4 RRF: date window leg added {} results (w={:.2})",
+                    date_window_results.len(),
+                    hybrid_w
+                );
             }
 
             // Secondary Vamana (768d) results: 4th RRF signal
@@ -2560,9 +2707,18 @@ impl super::MemorySystem {
             // Phase 2.1: Keep wider candidate pool for cross-encoder reranking.
             // Decomposed queries produce a wider candidate set — widen the budget
             // so more candidates survive into the cross-encoder.
-            let rerank_budget = if decomposed { 50_usize } else { 30_usize }.max(query.max_results);
+            // The `rerank_pool` dial overrides the width; the pool never drops below an explicit
+            // `rerank_count`, or Layer 5.3 would be asked to score candidates already cut.
+            let (pool_dial, rerank_count_dial) = {
+                let d = self.cognitive_dials.read();
+                (d.rerank_pool, d.rerank_count)
+            };
+            let rerank_budget = pool_dial
+                .unwrap_or(if decomposed { 50_usize } else { 30_usize })
+                .max(rerank_count_dial.or(query.rerank_count).unwrap_or(0))
+                .max(query.max_results);
             // Query filters are applied in the Layer 5 scan below, which stops once
-            // `rerank_pool` memories pass. Cutting the list here first meant a selective
+            // `scan_limit` memories pass. Cutting the list here first meant a selective
             // filter (tags, type, time range) judged only the top 30/50 and could discard
             // nearly all of them while matching memories sat just below the cut (live:
             // filtered_out=45 of 50). With filters the full fused list goes to the scan.
@@ -2595,11 +2751,20 @@ impl super::MemorySystem {
         let mut storage_fetches = 0;
         let mut filtered_out = 0;
 
-        // Fetch up to rerank_pool candidates so Layer 5.5 cross-encoder can rerank
+        // Fetch up to scan_limit candidates so Layer 5.5 cross-encoder can rerank
         // before truncating to max_results. Without this, the early break at max_results
         // would prevent the cross-encoder from ever firing (max_results == max_results).
         // Decomposed queries benefit from a larger pool — more candidates to rerank.
-        let rerank_pool = if decomposed { 30_usize } else { 20_usize }.max(query.max_results);
+        // An explicit rerank_count is Layer 5.3's budget, so the scan must find that many;
+        // stopping at 20 would cap the dial at 20 whenever max_results is small.
+        let explicit_rerank_count = self
+            .cognitive_dials
+            .read()
+            .rerank_count
+            .or(query.rerank_count);
+        let scan_limit = if decomposed { 30_usize } else { 20_usize }
+            .max(query.max_results)
+            .max(explicit_rerank_count.unwrap_or(0));
 
         // Layer 5: Unified scoring with hebbian + recency + emotional + feedback signals
         // Recency decay: recent memories get boost, old memories decay
@@ -3089,7 +3254,7 @@ impl super::MemorySystem {
                 }
             }
 
-            if memories.len() >= rerank_pool {
+            if memories.len() >= scan_limit {
                 break;
             }
         }
@@ -3203,11 +3368,13 @@ impl super::MemorySystem {
                 // Decomposed queries: widen CE budget from 20→30 to exploit the
                 // broader candidate pool from multi-query vector search.
                 let ce_cap = if decomposed { 30 } else { 20 };
-                // rerank_count dial caps the budget when set (query-level or dials-level).
-                let dial_cap = layer53_rerank_count_dial
-                    .or(query.rerank_count)
-                    .unwrap_or(ce_cap);
-                let rerank_budget = memories.len().min(query.max_results * 2).min(dial_cap);
+                // An explicit rerank_count (dial or query) is the budget, so it can reach past
+                // twice max_results to gold the fused order left below rank 20; absent one, the
+                // budget stays bounded by max_results for latency.
+                let rerank_budget = match layer53_rerank_count_dial.or(query.rerank_count) {
+                    Some(explicit) => memories.len().min(explicit),
+                    None => memories.len().min(query.max_results * 2).min(ce_cap),
+                };
                 // Pass each candidate's stored embedding so the reranker's
                 // bi-encoder pass can reuse it instead of re-embedding via the
                 // HTTP embedder (5–6s/call for CPU Nomic). The reranker
@@ -4883,6 +5050,7 @@ impl super::MemorySystem {
         let mut competitions_detected = 0;
         let mut pair_count = 0;
         let check_limit = memories.len().min(20);
+        let similarity_floor = competition_similarity_floor(&memories[..check_limit]);
 
         for left_idx in 0..check_limit {
             if eliminated.contains(&left_idx) {
@@ -4927,7 +5095,7 @@ impl super::MemorySystem {
                     }
                 };
 
-                if similarity < crate::constants::INTERFERENCE_SIMILARITY_THRESHOLD {
+                if similarity < similarity_floor {
                     continue;
                 }
 
@@ -5599,6 +5767,35 @@ pub(crate) fn query_token_matches_entity(token: &str, entity: &str) -> bool {
             .next_back()
             .is_none_or(|c| !c.is_alphanumeric())
     })
+}
+
+/// The cosine two candidates must reach to compete: the pool's median pair cosine plus
+/// [`COMPETITION_POOL_HEADROOM`] of the way to 1, never below the absolute
+/// [`INTERFERENCE_SIMILARITY_THRESHOLD`]. Fewer than three comparable pairs keep the absolute bar.
+///
+/// [`COMPETITION_POOL_HEADROOM`]: crate::constants::COMPETITION_POOL_HEADROOM
+/// [`INTERFERENCE_SIMILARITY_THRESHOLD`]: crate::constants::INTERFERENCE_SIMILARITY_THRESHOLD
+fn competition_similarity_floor(pool: &[SharedMemory]) -> f32 {
+    use crate::constants::{COMPETITION_POOL_HEADROOM, INTERFERENCE_SIMILARITY_THRESHOLD};
+    let vectors: Vec<&[f32]> = pool
+        .iter()
+        .filter_map(|m| m.experience.embeddings.as_deref())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let mut sims: Vec<f32> = Vec::new();
+    for (i, left) in vectors.iter().enumerate() {
+        for right in &vectors[i + 1..] {
+            if left.len() == right.len() {
+                sims.push(crate::similarity::cosine_similarity(left, right));
+            }
+        }
+    }
+    if sims.len() < 3 {
+        return INTERFERENCE_SIMILARITY_THRESHOLD;
+    }
+    sims.sort_by(|a, b| a.total_cmp(b));
+    let median = sims[sims.len() / 2];
+    (median + COMPETITION_POOL_HEADROOM * (1.0 - median)).max(INTERFERENCE_SIMILARITY_THRESHOLD)
 }
 
 /// Orders each run of exactly equal scores in a score-sorted list by content, then id.
@@ -6286,6 +6483,63 @@ mod signal_disable_gate_tests {
 }
 
 #[cfg(test)]
+mod competition_floor_tests {
+    use super::*;
+    use crate::constants::INTERFERENCE_SIMILARITY_THRESHOLD;
+    use crate::memory::types::{Experience, Memory, MemoryId};
+
+    fn embedded(v: Vec<f32>) -> SharedMemory {
+        let experience = Experience {
+            content: "turn".into(),
+            embeddings: Some(v),
+            ..Default::default()
+        };
+        Arc::new(Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            experience,
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    fn pool_at(angles: &[f32]) -> Vec<SharedMemory> {
+        angles
+            .iter()
+            .map(|a| embedded(vec![a.cos(), a.sin()]))
+            .collect()
+    }
+
+    #[test]
+    fn a_pool_of_unrelated_candidates_keeps_the_absolute_bar() {
+        let pool = pool_at(&[0.0, 1.2, 2.4, 3.6]);
+        assert_eq!(
+            competition_similarity_floor(&pool),
+            INTERFERENCE_SIMILARITY_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn a_pool_whose_pairs_all_score_high_must_be_beaten_by_its_own_background() {
+        // Pair cosines 0.955 x3, 0.825 x2, 0.622: the median is 0.955, so the bar sits above it.
+        let pool = pool_at(&[0.0, 0.3, 0.6, 0.9]);
+        let floor = competition_similarity_floor(&pool);
+        assert!(floor > 0.955 && floor < 1.0, "{floor}");
+    }
+
+    #[test]
+    fn too_few_embedded_candidates_keep_the_absolute_bar() {
+        let pool = pool_at(&[0.0, 0.1]);
+        assert_eq!(
+            competition_similarity_floor(&pool),
+            INTERFERENCE_SIMILARITY_THRESHOLD
+        );
+    }
+}
+
+#[cfg(test)]
 mod score_tie_order_tests {
     use super::order_score_ties_by_content;
     use crate::memory::types::MemoryId;
@@ -6416,6 +6670,186 @@ mod query_token_tests {
         ));
         // A plain word keeps the old substring rule.
         assert!(query_token_matches_entity("serv", "observer"));
+    }
+}
+
+#[cfg(test)]
+mod date_window_leg_tests {
+    use super::*;
+    use crate::memory::dials::CognitiveDials;
+    use crate::memory::{MemoryConfig, MemorySystem};
+    use tempfile::TempDir;
+
+    fn fresh_system() -> (MemorySystem, TempDir) {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        (sys, tmp)
+    }
+
+    fn remember_on(sys: &MemorySystem, content: &str, day: &str) -> MemoryId {
+        let created_at = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .expect("test date")
+            .and_hms_opt(12, 0, 0)
+            .expect("noon")
+            .and_utc();
+        sys.remember(
+            Experience {
+                content: content.to_string(),
+                ..Default::default()
+            },
+            Some(created_at),
+        )
+        .expect("remember")
+    }
+
+    fn leg(sys: &MemorySystem, query_text: &str) -> Vec<MemoryId> {
+        let query = Query {
+            user_id: Some("date-window-user".to_string()),
+            query_text: Some(query_text.to_string()),
+            ..Default::default()
+        };
+        sys.date_window_candidates(query_text, &query, &[], None)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn sorted(mut ids: Vec<MemoryId>) -> Vec<MemoryId> {
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_day_in_the_query_yields_that_day_and_one_day_either_side() {
+        let (sys, _tmp) = fresh_system();
+        let _far = remember_on(&sys, "Nate: Dyed my hair last week", "2022-04-29");
+        let before = remember_on(&sys, "Joanna: Big day tomorrow", "2022-04-30");
+        let on = remember_on(
+            &sys,
+            "Nate: Try the Lord of the Rings trilogy",
+            "2022-05-01",
+        );
+        let after = remember_on(
+            &sys,
+            "Joanna: I took your recommendation and saw the trilogy last night",
+            "2022-05-02",
+        );
+        let _later = remember_on(&sys, "Nate: Glad you liked it", "2022-05-03");
+
+        let got = leg(&sys, "What movie did Joanna watch on 1 May, 2022?");
+        assert_eq!(sorted(got), sorted(vec![before, on, after]));
+    }
+
+    #[test]
+    fn a_month_in_the_query_yields_the_whole_month_and_nothing_else() {
+        let (sys, _tmp) = fresh_system();
+        let _march = remember_on(&sys, "Nate: Spring is here", "2022-03-31");
+        let first = remember_on(&sys, "Nate: Dyed my hair last week", "2022-04-01");
+        let mid = remember_on(&sys, "Nate: Check it out, it's blue", "2022-04-15");
+        let last = remember_on(&sys, "Joanna: Looks great", "2022-04-30");
+        let _may = remember_on(&sys, "Joanna: Hey Nate, how's it going?", "2022-05-01");
+
+        let got = leg(
+            &sys,
+            "What physical transformation did Nate undergo in April 2022?",
+        );
+        assert_eq!(sorted(got), sorted(vec![first, mid, last]));
+    }
+
+    #[test]
+    fn a_year_alone_or_no_date_yields_no_candidates() {
+        let (sys, _tmp) = fresh_system();
+        remember_on(&sys, "Joanna: I went to Woodhaven", "2021-07-10");
+        assert!(leg(&sys, "What state did Joanna visit in 2021?").is_empty());
+        assert!(leg(&sys, "Where did Joanna travel to?").is_empty());
+    }
+
+    #[test]
+    fn the_dial_switches_the_leg_off() {
+        let (sys, _tmp) = fresh_system();
+        remember_on(&sys, "Nate: I got this new pup for you!", "2022-05-25");
+        assert_eq!(
+            leg(&sys, "What did Nate do for Joanna on 25 May, 2022?").len(),
+            1
+        );
+
+        sys.set_cognitive_dials(CognitiveDials {
+            date_window_leg: Some(false),
+            ..Default::default()
+        });
+        assert!(leg(&sys, "What did Nate do for Joanna on 25 May, 2022?").is_empty());
+    }
+
+    #[test]
+    fn the_leg_is_capped_at_the_candidate_dial() {
+        let (sys, _tmp) = fresh_system();
+        for i in 0..5 {
+            remember_on(&sys, &format!("Nate: gaming party plan {i}"), "2022-06-03");
+        }
+        sys.set_cognitive_dials(CognitiveDials {
+            candidate_count: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(
+            leg(
+                &sys,
+                "Who did Nate plan to invite to his gaming party in June 2022?"
+            )
+            .len(),
+            2
+        );
+    }
+
+    /// The gold funnel records, per pipeline stage, the best rank any gold id holds. A memory
+    /// the query shares no word with is at the head of the date window list, and is in the
+    /// fused pool; with the dial off the list is empty.
+    #[test]
+    fn the_leg_hands_a_memory_the_query_shares_no_word_with_to_fusion() {
+        let (sys, _tmp) = fresh_system();
+        for day in 1..=20 {
+            remember_on(
+                &sys,
+                &format!("Joanna: watched a movie with Nate, day {day}"),
+                &format!("2022-03-{day:02}"),
+            );
+        }
+        let gold = remember_on(
+            &sys,
+            "Looky here, I got this new pup for you!",
+            "2022-05-25",
+        );
+        let query = Query {
+            user_id: Some("date-window-user".to_string()),
+            query_text: Some("What did Nate do for Joanna on 25 May, 2022?".to_string()),
+            max_results: 5,
+            ..Default::default()
+        };
+        let stage = |funnel: &[(String, Option<usize>)], name: &str| -> Option<usize> {
+            funnel
+                .iter()
+                .find(|(s, _)| s == name)
+                .unwrap_or_else(|| panic!("stage {name} not recorded in {funnel:?}"))
+                .1
+        };
+
+        crate::memory::gold_funnel::begin(HashSet::from([gold.clone()]));
+        sys.recall(&query).expect("recall");
+        let funnel = crate::memory::gold_funnel::take().expect("funnel armed");
+        assert_eq!(stage(&funnel, "date_window"), Some(0), "{funnel:?}");
+        assert!(stage(&funnel, "fusion").is_some(), "{funnel:?}");
+
+        sys.set_cognitive_dials(CognitiveDials {
+            date_window_leg: Some(false),
+            ..Default::default()
+        });
+        crate::memory::gold_funnel::begin(HashSet::from([gold]));
+        sys.recall(&query).expect("recall");
+        let funnel = crate::memory::gold_funnel::take().expect("funnel armed");
+        assert_eq!(stage(&funnel, "date_window"), None, "{funnel:?}");
     }
 }
 

@@ -1074,9 +1074,11 @@ impl MemorySystem {
         // whole process, so a tenant open after the first loads nothing and probes nothing.
         //
         // PRIMARY embedder, in order:
-        //   1. `VELD_EMBEDDER` when set: `nomic` | `minilm` | `http` | an `http(s)://` URL
-        //      (optionally `#model`). An explicit ask that cannot be honoured is an error, not
-        //      a fallback — the operator said which vectors they want in the store.
+        //   1. `VELD_EMBEDDER` when set: `nomic` | `minilm` | `arctic-embed-xs` | `http` | an
+        //      `http(s)://` URL (optionally `#model`). An explicit ask that cannot be honoured is
+        //      an error, not a fallback — the operator said which vectors they want in the store.
+        //      arctic-embed-xs is reached only this way: it is an alternative under measurement,
+        //      not a step in the automatic order below.
         //   2. Nomic-embed-text-v1.5 ONNX (768d), when its model files are present.
         //   3. The OpenAI-compatible HTTP endpoint (LM Studio :1234, `llama-server
         //      --embedding` :8080, …) when it answers a probe for the configured model —
@@ -1089,7 +1091,7 @@ impl MemorySystem {
         //      silently non-semantic vectors; on the current code, a refusal to boot.
         let primary: Arc<dyn crate::embeddings::Embedder> = {
             use crate::embeddings::shared::{self, EmbedderSpec};
-            use crate::embeddings::{http_embedder, PrimaryEmbedderInfo};
+            use crate::embeddings::{arctic, http_embedder, PrimaryEmbedderInfo};
 
             let record =
                 |e: &dyn crate::embeddings::Embedder, kind: &'static str, reason: String| {
@@ -1121,6 +1123,16 @@ impl MemorySystem {
                 record(m.as_ref(), "minilm-onnx", reason.to_string());
                 Ok(m)
             };
+            let arctic_onnx = |reason: &str| -> Result<Arc<dyn crate::embeddings::Embedder>> {
+                let a = shared::embedder_for(&EmbedderSpec::arctic_from_env())
+                    .context("Failed to initialize arctic-embed-xs embedder (ONNX model)")?;
+                tracing::info!(
+                    "Primary embedder: arctic-embed-xs ONNX ({}d) — {reason}",
+                    a.dimension()
+                );
+                record(a.as_ref(), "arctic-onnx", reason.to_string());
+                Ok(a)
+            };
             let http = |cfg: http_embedder::HttpEmbedderConfig,
                         reason: &str|
              -> Result<Arc<dyn crate::embeddings::Embedder>> {
@@ -1144,12 +1156,14 @@ impl MemorySystem {
             match explicit.as_deref() {
                 Some("nomic") => nomic_onnx("VELD_EMBEDDER=nomic")?,
                 Some("minilm") => minilm_onnx("VELD_EMBEDDER=minilm")?,
+                Some(arctic::ARCTIC_XS_ID) => arctic_onnx("VELD_EMBEDDER=arctic-embed-xs")?,
                 Some("http") => http(http_embedder::HttpEmbedderConfig::from_env(), "VELD_EMBEDDER=http")?,
                 Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
                     http(http_embedder::HttpEmbedderConfig::from_id(url), "VELD_EMBEDDER=<url>")?
                 }
                 Some(other) => anyhow::bail!(
-                    "VELD_EMBEDDER={other:?} not understood: use nomic, minilm, http, or an http(s):// URL"
+                    "VELD_EMBEDDER={other:?} not understood: use nomic, minilm, arctic-embed-xs, http, \
+                     or an http(s):// URL"
                 ),
                 // STICKY. The corpus marker (`.veld_embedder`, written by the retrieval
                 // engine after a clean pass) names what embedded the store. If that was an
@@ -1539,6 +1553,10 @@ impl MemorySystem {
             }
         }
         hybrid_search_engine.attach_dials(cognitive_dials_arc.clone());
+        {
+            let mut d = cognitive_dials_arc.write();
+            Self::apply_rerank_model_dial(&hybrid_search_engine, &mut d);
+        }
 
         #[cfg(feature = "multi-tenant")]
         if let Some(collective_dir) = config.collective_store_dir.as_ref() {
@@ -1781,6 +1799,28 @@ impl MemorySystem {
         self.hybrid_search.reranker().map(|r| r.probe())
     }
 
+    /// Point the reranker at the model the `rerank_model` dial names (`None`: the
+    /// process-wide choice). When the model cannot be built the dial is cleared in `dials`
+    /// before it is stored or reported, so `GET /api/dials` never names a model that is
+    /// not reranking. Without a reranker (`use_reranking` off in config) the dial is kept
+    /// and has nothing to act on.
+    fn apply_rerank_model_dial(
+        hybrid_search: &HybridSearchEngine,
+        dials: &mut dials::CognitiveDials,
+    ) {
+        let Some(reranker) = hybrid_search.reranker() else {
+            return;
+        };
+        if let Err(e) = reranker.select_model(dials.rerank_model.as_deref()) {
+            tracing::warn!(
+                "rerank_model dial {:?} not applied, keeping {}: {e:#}",
+                dials.rerank_model,
+                reranker.model_id()
+            );
+            dials.rerank_model = None;
+        }
+    }
+
     /// Snapshot the current cognitive dials (cheap clone under read lock).
     pub fn cognitive_dials(&self) -> dials::CognitiveDials {
         self.cognitive_dials.read().clone()
@@ -1793,6 +1833,7 @@ impl MemorySystem {
     pub fn set_cognitive_dials(&self, new_dials: dials::CognitiveDials) {
         let mut d = new_dials.sanitized();
         d.updated_at = Some(chrono::Utc::now());
+        Self::apply_rerank_model_dial(&self.hybrid_search, &mut d);
         match serde_json::to_vec(&d) {
             Ok(bytes) => {
                 if let Err(e) = self

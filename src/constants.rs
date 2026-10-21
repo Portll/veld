@@ -2335,6 +2335,14 @@ pub const COMPETITION_MAX_PAIRS: usize = 20;
 /// Minimum shared-entity overlap required before two memories can compete.
 pub const COMPETITION_ENTITY_OVERLAP_MIN: usize = 1;
 
+/// How far above a candidate pool's own median pair cosine, as a share of the way to 1, a
+/// pair must sit to compete. The absolute bar ([`INTERFERENCE_SIMILARITY_THRESHOLD`]) was set
+/// on MiniLM, whose unrelated LoCoMo turns sit at a median cosine of 0.39 and cross 0.85 in
+/// 0.08% of pairs; arctic-embed-xs puts the median at 0.84 and 40% of pairs over 0.85, nomic
+/// 0.75 and 4%. Measured relative to the pool, a MiniLM pool (median at most 0.62) keeps 0.85
+/// and the others need a pair that stands out from their own background.
+pub const COMPETITION_POOL_HEADROOM: f32 = 0.6;
+
 // =============================================================================
 // PATTERN-TRIGGERED REPLAY CONSTANTS (PIPE-2)
 // Based on hippocampal sharp-wave ripple research (Rasch & Born 2013)

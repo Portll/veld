@@ -653,15 +653,10 @@ pub async fn recall(
             let memory_guard = memory_for_recall.read();
 
             // 1. Compute query embedding (reused for prospective + recall + todo search).
-            // The recall pipeline searches with the document-side embedding, so that is
-            // the one handed to it; for a symmetric model it is also the query-side one
-            // and a single cached encode serves every consumer below.
+            // The recall pipeline searches with the query-side embedding, the one the
+            // other consumers below want too, so a single cached encode serves them all.
             let recall_embedding_opt = memory_guard.recall_query_embedding(&query_for_recall).ok();
-            let query_embedding_opt = if memory_guard.query_embedding_is_symmetric() {
-                recall_embedding_opt.clone()
-            } else {
-                memory_guard.compute_query_embedding(&query_for_recall).ok()
-            };
+            let query_embedding_opt = recall_embedding_opt.clone();
 
             // 2. Semantic prospective matching (fixes C5: was keyword-only)
             // Skip semantic matching if embedding failed — keyword matching still works
