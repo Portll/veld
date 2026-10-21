@@ -35,14 +35,13 @@
 
 use anyhow::{anyhow, Result};
 use memmap2::{Mmap, MmapMut};
-use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read};
 use std::path::Path;
 use tracing::info;
 
 use super::vamana::{DistanceMetric, VamanaConfig, VamanaIndex, VamanaNode};
-use super::vamana_store::VectorStore;
+use super::vamana_store::{DeletedSet, VectorStore};
 
 const MAGIC: [u8; 4] = *b"VAMA";
 const VERSION: u32 = 1;
@@ -313,7 +312,7 @@ impl VamanaIndex {
                 .iter()
                 .flat_map(|node| node.neighbors.iter().copied())
                 .collect();
-            let deleted: Vec<u32> = deleted_ids.iter().copied().collect();
+            let deleted: Vec<u32> = deleted_ids.iter().collect();
             (
                 vector_data,
                 neighbor_counts,
@@ -434,10 +433,17 @@ impl VamanaIndex {
 
         // Read deleted IDs
         let mut offset = HEADER_SIZE;
-        let mut deleted_ids = HashSet::with_capacity(deleted_count);
+        let mut deleted_ids = DeletedSet::default();
         for _ in 0..deleted_count {
             ensure_available(mmap.len(), offset, 4, "deleted id")?;
             let id = u32::from_le_bytes(mmap[offset..offset + 4].try_into()?);
+            if id as usize >= num_vectors {
+                return Err(anyhow!(
+                    "Invalid persisted deleted id {} for {} vectors",
+                    id,
+                    num_vectors
+                ));
+            }
             deleted_ids.insert(id);
             offset += 4;
         }
@@ -523,6 +529,7 @@ impl VamanaIndex {
             ),
             rebuilding: std::sync::atomic::AtomicBool::new(false),
             deleted_ids: std::sync::Arc::new(parking_lot::RwLock::new(deleted_ids)),
+            visited: Default::default(),
             exact_search_max: super::vamana::EXACT_SEARCH_MAX_VECTORS,
         };
 

@@ -728,7 +728,7 @@ impl RetrievalEngine {
 
         let loaded_count = loaded_index.len();
         let deleted = loaded_index.deleted_ids.read().clone();
-        let live = |vid: u32| (vid as usize) < loaded_count && !deleted.contains(&vid);
+        let live = |vid: u32| (vid as usize) < loaded_count && !deleted.contains(vid);
 
         // A mapping whose ids are missing or deleted in this file was written after the last save;
         // its memory goes back to the startup repair, which re-indexes and re-records it.
@@ -758,7 +758,7 @@ impl RetrievalEngine {
             .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
         let unreferenced: Vec<u32> = (0..loaded_count as u32)
-            .filter(|vid| !referenced.contains(vid) && !deleted.contains(vid))
+            .filter(|vid| !referenced.contains(vid) && !deleted.contains(*vid))
             .collect();
         for &vid in &unreferenced {
             loaded_index.mark_deleted(vid);
