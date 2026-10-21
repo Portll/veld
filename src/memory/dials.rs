@@ -131,6 +131,13 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub rrf_weights: Option<(f32, f32, f32)>,
 
+    /// Whether recall adds the date window candidate leg: when a query names a
+    /// calendar day or month-year, memories whose `created_at` falls in that window
+    /// enter RRF fusion as their own candidate list (recall.rs Layer 4). `None` and
+    /// `Some(true)` run it; `Some(false)` leaves the window to the temporal boost only.
+    #[serde(default)]
+    pub date_window_leg: Option<bool>,
+
     // ---- Recall ranking sliders (None = compile-time constant default) ---------------
     // Overlay the historical `const`s in recall.rs / hybrid_search.rs / constants.rs.
     // Rendered as sliders in the monitor "Dials" tab; see [`RECALL_SLIDER_SPECS`] for
@@ -601,6 +608,7 @@ impl Default for CognitiveDials {
             candidate_count: None,
             rerank_count: None,
             rrf_weights: None,
+            date_window_leg: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
             rrf_k_inner: None,
@@ -743,7 +751,7 @@ impl CognitiveDials {
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
-    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT}`.
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,DATE_WINDOW_LEG}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -794,6 +802,9 @@ impl CognitiveDials {
         }
         if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_COUNT") {
             d.rerank_count = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_DATE_WINDOW_LEG") {
+            d.date_window_leg = Some(v);
         }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
@@ -870,6 +881,7 @@ mod tests {
         assert!(d.use_mmr.is_none());
         assert!(d.candidate_count.is_none());
         assert!(d.rrf_weights.is_none());
+        assert!(d.date_window_leg.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,
             crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS

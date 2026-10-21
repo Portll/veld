@@ -28,6 +28,11 @@ pub struct Report {
     /// refuses: "not recorded" is not the same as "off".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<RerankSetting>,
+    /// The candidate-generation dials the run overrode, if any. `None` on reports written
+    /// before this field existed; [`compare_to_baseline`] reads that as no overrides, since
+    /// the gate never set one (see [`RetrievalDials`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_dials: Option<RetrievalDials>,
     /// sha256 of the model tape the run replayed its model outputs from, or `None` when the
     /// models ran live (see `crate::embeddings::model_tape`). Two runs that replayed one tape
     /// saw byte-identical model outputs, whatever CPU they ran on; a live run and a replayed
@@ -106,6 +111,43 @@ impl RerankSetting {
             return false;
         }
         !self.enabled || (self.model == other.model && self.depth == other.depth)
+    }
+}
+
+/// The candidate-generation dials a run was measured under, recorded as the operator's
+/// overrides.
+///
+/// A candidate leg that is on for one run and off for the other hands fusion two different
+/// pools, so a diff between them reads as a change no code caused. Unlike [`RerankSetting`],
+/// which records what loaded, this records what was *set*: `None` in a field is the engine
+/// default at that run's `git_sha`, so a code change to a default is measured by the gate as
+/// code, and only an operator override is refused across. A report written before this
+/// field existed is read as no overrides: the gate workflow has never set one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetrievalDials {
+    /// The `date_window_leg` dial: `None` is the engine default (on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_window_leg: Option<bool>,
+}
+
+impl RetrievalDials {
+    /// The overrides in `dials`.
+    pub fn of(dials: &crate::memory::dials::CognitiveDials) -> Self {
+        Self {
+            date_window_leg: dials.date_window_leg,
+        }
+    }
+
+    fn describe(&self) -> String {
+        let mut set: Vec<String> = Vec::new();
+        if let Some(v) = self.date_window_leg {
+            set.push(format!("date_window_leg={v}"));
+        }
+        if set.is_empty() {
+            "engine defaults".to_string()
+        } else {
+            set.join(", ")
+        }
     }
 }
 
@@ -735,6 +777,20 @@ pub fn compare_to_baseline(
             ),
         }];
     }
+    let base_dials = baseline.retrieval_dials.clone().unwrap_or_default();
+    let cur_dials = current.retrieval_dials.clone().unwrap_or_default();
+    if base_dials != cur_dials {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "retrieval dials differ: baseline {}, current {}. These are two candidate \
+                 pools, so their difference is not a regression or an improvement of either. \
+                 Compare against a baseline recorded under the same dials",
+                base_dials.describe(),
+                cur_dials.describe()
+            ),
+        }];
+    }
     let Some(base_full) = baseline.layers.get("full") else {
         return vec![Failure {
             kind: "infrastructure".to_string(),
@@ -1166,6 +1222,7 @@ mod tests {
                 model: Some("mxbai-rerank-xsmall-v1".to_string()),
                 depth: 20,
             }),
+            retrieval_dials: Some(RetrievalDials::default()),
             model_tape: None,
             git_sha: "deadbeef".to_string(),
             timestamp: chrono::Utc::now(),
@@ -1317,6 +1374,63 @@ mod tests {
         let failures = compare_to_baseline(&baseline, &current, 2.0);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// A run with the date window leg switched off against a baseline measured with it on is
+    /// two candidate pools. Refused before any metric, in either order.
+    #[test]
+    fn different_retrieval_dials_refuse_before_any_metric_is_compared() {
+        let off = Some(RetrievalDials {
+            date_window_leg: Some(false),
+        });
+        let defaults = Some(RetrievalDials::default());
+        for (b, c) in [(defaults.clone(), off.clone()), (off, defaults)] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+            baseline.retrieval_dials = b;
+            current.retrieval_dials = c;
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            let detail = &failures[0].detail;
+            assert!(detail.contains("retrieval dials differ"), "{detail}");
+            assert!(detail.contains("date_window_leg=false"), "{detail}");
+            assert!(detail.contains("engine defaults"), "{detail}");
+        }
+    }
+
+    /// A baseline written before the field existed ran under engine defaults, so a current
+    /// run with no overrides is compared, and a real drop is a regression.
+    #[test]
+    fn unrecorded_retrieval_dials_read_as_engine_defaults() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        baseline.retrieval_dials = None;
+        let current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// The same override on both sides is one pipeline, and the comparison runs.
+    #[test]
+    fn same_retrieval_dial_override_on_both_sides_is_compared() {
+        let off = Some(RetrievalDials {
+            date_window_leg: Some(false),
+        });
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+        baseline.retrieval_dials = off.clone();
+        current.retrieval_dials = off;
+        assert!(compare_to_baseline(&baseline, &current, 2.0).is_empty());
+    }
+
+    /// Reports written before the field existed parse as unrecorded.
+    #[test]
+    fn report_without_retrieval_dials_key_parses_as_unrecorded() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("retrieval_dials");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.retrieval_dials, None);
     }
 
     /// Not recorded is refused on either side: it is not the same as off.
