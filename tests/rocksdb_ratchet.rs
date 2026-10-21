@@ -12,7 +12,7 @@ const BASELINE: &[(&str, usize)] = &[
     ("backup", 4),
     ("graph_memory", 7),
     ("handlers", 17),
-    ("memory", 57),
+    ("memory", 52),
     ("memory/sleep_time", 0),
     ("user_auth", 4),
     ("user_memory", 0),
