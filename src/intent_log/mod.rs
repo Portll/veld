@@ -550,6 +550,10 @@ pub struct IntentLog {
     /// A sync that leaves the head file at least this long rotates it.
     /// `None` never rotates.
     segment_bytes: Option<u64>,
+    /// After a failed rotation, the head length at which the next attempt is
+    /// made, so a lasting failure is retried (and logged) every so often
+    /// rather than at every sync.
+    retry_rotation_at: u64,
 }
 
 /// The file under the log's `BufWriter`. A newtype rather than a bare `File`
@@ -693,13 +697,18 @@ impl IntentLog {
         let (mode, header_base) = probe_header(&path)?;
         if header_base > 0 {
             // Segments at or past the head's base are what an interrupted
-            // truncation into a sealed segment was dropping.
+            // truncation into a sealed segment was dropping. They are set
+            // aside rather than deleted, and out of the way of the name the
+            // head will be sealed under.
             let stale = sealed.partition_point(|s| s.base.0 < header_base);
             for segment in sealed.drain(stale..) {
+                let mut aside = segment.path.as_os_str().to_os_string();
+                aside.push(".orphaned");
+                std::fs::rename(&segment.path, &aside)?;
                 tracing::warn!(
                     path = %segment.path.display(),
                     head_base = header_base,
-                    "intent log segment starts at or after the head; left out of the log",
+                    "intent log segment starts at or after the head; set aside as .orphaned",
                 );
             }
         }
@@ -799,6 +808,7 @@ impl IntentLog {
             sealed,
             base_lsn,
             segment_bytes: None,
+            retry_rotation_at: 0,
         };
         if actual_len > durable_end {
             if tail_is_torn(&log.path, durable_end, actual_len, next_lsn)? {
@@ -1018,14 +1028,18 @@ impl IntentLog {
         INTENT_LOG_SYNC_TOTAL.with_label_values(&["ok"]).inc();
         let due = self
             .segment_bytes
-            .is_some_and(|limit| self.durable_end_offset >= limit);
+            .is_some_and(|limit| self.durable_end_offset >= limit.max(self.retry_rotation_at));
         if due && self.index.latest().is_some() {
             // The frames are durable either way; a head that could not rotate
-            // keeps taking appends and is tried again at the next sync.
+            // keeps taking appends and is tried again once it has grown by
+            // another eighth of a segment.
             if let Err(e) = self.rotate() {
+                let limit = self.segment_bytes.unwrap_or_default();
+                self.retry_rotation_at = self.durable_end_offset + (limit / 8).max(1);
                 tracing::error!(
                     path = %self.path.display(),
                     bytes = self.durable_end_offset,
+                    retry_at = self.retry_rotation_at,
                     error = %e,
                     "intent log rotation failed; appending to the current head",
                 );
@@ -1134,6 +1148,7 @@ impl IntentLog {
         self.synced_end_offset = self.durable_end_offset;
         self.index = FrameIndex::default();
         self.synced_index_latest = None;
+        self.retry_rotation_at = 0;
         INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(self.durable_end_offset as i64);
         tracing::info!(
             path = %self.path.display(),
@@ -2979,6 +2994,54 @@ mod segment_tests {
         log.append(b"next").unwrap();
         log.sync().unwrap();
         assert_eq!(lsns(log.iter().unwrap()).last(), Some(&target.next().0));
+    }
+
+    #[test]
+    fn a_rotation_that_fails_keeps_every_frame_and_waits_before_trying_again() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = rotating_log(&dir, LIMIT);
+        let blocker = segment_path(log.path(), Lsn::ZERO);
+        std::fs::write(&blocker, b"not a segment").unwrap();
+        append_synced(&mut log, 6);
+        assert!(
+            log.sealed().is_empty(),
+            "the name it would seal under is taken"
+        );
+        assert!(log.retry_rotation_at > log.durable_end_offset() - 30);
+
+        std::fs::remove_file(&blocker).unwrap();
+        append_synced(&mut log, 14);
+        assert!(!log.sealed().is_empty(), "it rotates once the way is clear");
+        assert_eq!(lsns(log.iter().unwrap()), (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_segment_left_past_the_head_is_set_aside_and_rotation_carries_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = rotating_log(&dir, LIMIT);
+        append_synced(&mut log, 20);
+        let target = Lsn(log.sealed()[1].base.0 + 1);
+        let dropped = log.sealed()[2].path.clone();
+        drop(log);
+        // An interrupted truncation into segment 1: the head is already its
+        // copy, the later segments still lie beside it.
+        let head = dir.path().join("intent.log");
+        std::fs::copy(segment_path(&head, Lsn(target.0 - 1)), &head).unwrap();
+
+        let mut reopened = IntentLog::open(&head).unwrap();
+        reopened.set_segment_bytes(Some(LIMIT));
+        assert!(!dropped.exists());
+        let mut aside = dropped.into_os_string();
+        aside.push(".orphaned");
+        assert!(std::path::Path::new(&aside).exists());
+        assert!(reopened
+            .sealed()
+            .iter()
+            .all(|s| s.base < reopened.base_lsn()));
+        reopened.truncate_to_lsn(target).unwrap();
+        append_synced(&mut reopened, 10);
+        let read = lsns(reopened.iter().unwrap());
+        assert_eq!(read, (0..=target.0 + 10).collect::<Vec<_>>());
     }
 
     #[test]
