@@ -33,11 +33,13 @@ on:
           conversation; locomo-holdout leaves it out, and every case someone has examined, and
           is the number to report. Neither is gated. smoke is the 108-case set over hand-written
           engineering memories, no dialogue: the check that a ranking change made for LoCoMo
-          does not cost non-conversational recall. It is ungated too.
+          does not cost non-conversational recall. agent-episodes is agent sessions shaped the
+          way the Claude Code hook writes them (tasks, errors and fixes threaded by episode)
+          among unthreaded project notes. Both are ungated.
         required: false
         default: 'locomo-gate'
         type: choice
-        options: ['locomo-gate', 'locomo', 'locomo-holdout', 'smoke']
+        options: ['locomo-gate', 'locomo', 'locomo-holdout', 'smoke', 'agent-episodes']
       record:
         description: 'Record a new baseline: run ungated and upload the reports'
         required: false

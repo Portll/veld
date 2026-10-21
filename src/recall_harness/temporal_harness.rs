@@ -86,6 +86,7 @@ pub fn generate_temporal_fixtures(subjects: usize) -> (Vec<CorpusItem>, Vec<Smok
                 memory_type: "fact".to_string(),
                 tags: vec![subj.clone()],
                 created_at: base + chrono::Duration::minutes(3 * i as i64 + s as i64),
+                episode: None,
             });
             state_ids.push(id);
         }

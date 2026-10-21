@@ -792,10 +792,11 @@ impl CognitiveDials {
     }
 
     /// Whether linked memories are contextualised at ingest (`turn_context`;
-    /// the engine default is on).
+    /// the engine default is on). The `turn_context` signal switches it off too, so an
+    /// ablation arm can run it both ways from one build.
     #[inline]
     pub fn turn_context_enabled(&self) -> bool {
-        self.turn_context.unwrap_or(true)
+        self.turn_context.unwrap_or(true) && self.signal_enabled("turn_context")
     }
 
     /// Whether a contextualised turn's embedding carries the context too
@@ -806,10 +807,10 @@ impl CognitiveDials {
     }
 
     /// Whether recall runs neighbour expansion (`neighbour_expansion`; the engine
-    /// default is on).
+    /// default is on). The `neighbour_expansion` signal switches it off too.
     #[inline]
     pub fn neighbour_expansion_enabled(&self) -> bool {
-        self.neighbour_expansion.unwrap_or(true)
+        self.neighbour_expansion.unwrap_or(true) && self.signal_enabled("neighbour_expansion")
     }
 
     /// How many top fused candidates neighbour expansion reads (`neighbour_expansion_top`).
@@ -1090,6 +1091,12 @@ mod tests {
             "query_coverage",
             "people_density",
             "prf",
+            "entity_overlap_relative",
+            "topic_dedup_topical",
+            "competition_demote",
+            "rerank_context",
+            "turn_context",
+            "neighbour_expansion",
         ];
         for id in &all_ids {
             assert!(
