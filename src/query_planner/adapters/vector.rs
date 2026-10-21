@@ -15,7 +15,7 @@
 
 use crate::query_planner::executor::VectorQuerier;
 use crate::query_planner::predicate::VectorPredicate;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -34,6 +34,10 @@ use crate::vector_db::VamanaIndex;
 /// the manager surfaces its Vamana state. The `kind` parameter is the
 /// projection-name string used in the `VectorPredicate` payload (e.g.
 /// `"vamana-text-primary"`, `"vamana-text-secondary"`, etc.).
+///
+/// Both may block: the live binding opens a tenant's journaled writer, and
+/// replays its intent log, on first use. The querier calls them, and runs
+/// the search, on the blocking pool.
 pub trait VamanaProvider: Send + Sync {
     fn index(&self, user_id: &str, kind: &str) -> Option<Arc<RwLock<VamanaIndex>>>;
     fn memory_id_for(&self, user_id: &str, kind: &str, vector_id: u32) -> Option<String>;
@@ -50,17 +54,13 @@ impl RealVectorQuerier {
     pub fn new(provider: Arc<dyn VamanaProvider>) -> Self {
         Self { provider }
     }
-}
 
-#[async_trait]
-impl VectorQuerier for RealVectorQuerier {
-    async fn scan(&self, user_id: &str, p: &VectorPredicate) -> Result<Vec<(String, f32)>> {
+    fn scan_blocking(&self, user_id: &str, p: &VectorPredicate) -> Result<Vec<(String, f32)>> {
         let index = match self.provider.index(user_id, &p.kind) {
             Some(idx) => idx,
             None => return Ok(Vec::new()),
         };
-        // Vamana's index search is synchronous (and cheap); hold the read
-        // lock only for the duration of the call.
+        // Hold the index read lock only for the search itself.
         let hits = {
             let guard = index.read();
             guard.search(&p.query_vector, p.top_k)?
@@ -79,6 +79,16 @@ impl VectorQuerier for RealVectorQuerier {
             }
         }
         Ok(out)
+    }
+}
+
+#[async_trait]
+impl VectorQuerier for RealVectorQuerier {
+    async fn scan(&self, user_id: &str, p: &VectorPredicate) -> Result<Vec<(String, f32)>> {
+        let (querier, user_id, p) = (self.clone(), user_id.to_string(), p.clone());
+        tokio::task::spawn_blocking(move || querier.scan_blocking(&user_id, &p))
+            .await
+            .context("vector scan task did not complete")?
     }
 
     async fn score(

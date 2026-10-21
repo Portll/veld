@@ -24,7 +24,7 @@
 
 use crate::query_planner::executor::GraphQuerier;
 use crate::query_planner::predicate::GraphPredicate;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -36,7 +36,9 @@ use uuid::Uuid;
 /// `GraphPredicate` variants.
 ///
 /// Every primitive is tenant-scoped via `user_id` and returns owned data,
-/// so the querier never holds a store lock across an `await`.
+/// so the querier never holds a store lock across an `await`. A primitive
+/// may block: the live binding opens a tenant not yet open and scans its
+/// whole store, so the querier calls them on the blocking pool.
 pub trait GraphProvider: Send + Sync {
     /// Entity ids referenced by a memory (its `EntityRef` set). Empty when
     /// the memory is unknown to this tenant or carries no entities.
@@ -80,12 +82,9 @@ impl RealGraphQuerier {
         }
         seen.into_iter().collect()
     }
-}
 
-#[async_trait]
-impl GraphQuerier for RealGraphQuerier {
-    async fn scan(&self, user_id: &str, p: &GraphPredicate) -> Result<Vec<String>> {
-        let ids = match p {
+    fn scan_blocking(&self, user_id: &str, p: &GraphPredicate) -> Vec<String> {
+        match p {
             GraphPredicate::LinkedToEntity { entity_id } => {
                 self.provider.memory_ids_with_entity(user_id, entity_id)
             }
@@ -95,12 +94,11 @@ impl GraphQuerier for RealGraphQuerier {
             GraphPredicate::EpisodeContains { episode_id } => {
                 self.provider.memory_ids_in_episode(user_id, episode_id)
             }
-        };
-        Ok(ids)
+        }
     }
 
-    async fn matches(&self, user_id: &str, memory_id: &str, p: &GraphPredicate) -> Result<bool> {
-        let hit = match p {
+    fn matches_blocking(&self, user_id: &str, memory_id: &str, p: &GraphPredicate) -> bool {
+        match p {
             GraphPredicate::LinkedToEntity { entity_id } => self
                 .provider
                 .entity_ids_of_memory(user_id, memory_id)
@@ -127,8 +125,29 @@ impl GraphQuerier for RealGraphQuerier {
                 .memory_ids_in_episode(user_id, episode_id)
                 .iter()
                 .any(|m| m == memory_id),
-        };
-        Ok(hit)
+        }
+    }
+}
+
+#[async_trait]
+impl GraphQuerier for RealGraphQuerier {
+    async fn scan(&self, user_id: &str, p: &GraphPredicate) -> Result<Vec<String>> {
+        let (querier, user_id, p) = (self.clone(), user_id.to_string(), p.clone());
+        tokio::task::spawn_blocking(move || querier.scan_blocking(&user_id, &p))
+            .await
+            .context("graph scan task did not complete")
+    }
+
+    async fn matches(&self, user_id: &str, memory_id: &str, p: &GraphPredicate) -> Result<bool> {
+        let (querier, user_id, memory_id, p) = (
+            self.clone(),
+            user_id.to_string(),
+            memory_id.to_string(),
+            p.clone(),
+        );
+        tokio::task::spawn_blocking(move || querier.matches_blocking(&user_id, &memory_id, &p))
+            .await
+            .context("graph match task did not complete")
     }
 }
 

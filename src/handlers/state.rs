@@ -1626,6 +1626,16 @@ impl MultiUserMemoryManager {
             .clone()
     }
 
+    /// The lock `get_user_journaled_writer` opens `user_id`'s intent log and replays its
+    /// projections under, for the same use as [`Self::user_memory_init_lock`].
+    #[cfg(test)]
+    pub(crate) fn journaled_writer_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
+        self.journaled_writer_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
     /// Does NOT delete data — used before restore to release file locks.
     /// Evict the tenant and close its memory and graph stores before files are restored under
@@ -2117,6 +2127,9 @@ impl MultiUserMemoryManager {
     ///
     /// SlowStores are cached per-user to avoid reopening SQLite on every request
     /// and to ensure the sync TTL actually works across calls.
+    ///
+    /// A miss opens SQLite and creates its schema on the calling thread. Async code calls
+    /// [`Self::get_user_slow_store_async`] instead.
     pub fn get_user_slow_store(
         &self,
         user_id: &str,
@@ -2135,6 +2148,23 @@ impl MultiUserMemoryManager {
         )?);
         self.slow_stores.insert(user_id.to_string(), store.clone());
         Ok(store)
+    }
+
+    /// [`Self::get_user_slow_store`] for async code, on the [`Self::get_user_graph_async`] model:
+    /// a cached store comes back at once; an open, which waits up to SQLite's busy timeout
+    /// while another connection holds the file, runs on the blocking pool.
+    pub async fn get_user_slow_store_async(
+        self: &Arc<Self>,
+        user_id: &str,
+    ) -> Result<std::sync::Arc<crate::memory::slow_store::SlowStore>> {
+        if let Some(store) = self.slow_stores.get(user_id) {
+            return Ok(store.clone());
+        }
+        let manager = Arc::clone(self);
+        let user_id = user_id.to_string();
+        tokio::task::spawn_blocking(move || manager.get_user_slow_store(&user_id))
+            .await
+            .context("slow store open task did not complete")?
     }
 
     /// Get or create the per-tenant `Arc<BM25Index>`.
@@ -4845,6 +4875,9 @@ pub const GENERIC_DERIVED_ENTITY_WORDS: &[&str] = &[
 /// a direct name match. Each call clones the index `Arc` out and releases
 /// the writer mutex immediately; the ANN search runs under the index's
 /// own `RwLock`, never under the writer lock.
+///
+/// A writer not yet open is opened here, which replays the tenant's intent
+/// log; the querier calls these on the blocking pool for that reason.
 impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
     fn index(
         &self,
@@ -4880,7 +4913,8 @@ impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
 /// The memory↔entity link lives on the `Memory` itself (its `entity_refs`
 /// set), not in `GraphMemory`, so these primitives read the tenant's
 /// `UserMemory`. Each returns owned ids and releases the `UserMemory` read lock
-/// before returning — the querier never holds it across an `await`.
+/// before returning — the querier never holds it across an `await`. Each also
+/// opens a tenant not yet open, so the querier calls them on the blocking pool.
 ///
 /// `memory_ids_with_entity` / `memory_ids_in_episode` scan the tenant's
 /// live memory set (`get_all_memories`); that is `O(n)` in the corpus.
