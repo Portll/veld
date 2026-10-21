@@ -167,3 +167,10 @@ conv-50_q138
 conv-50_q153
 conv-50_q154
 conv-50_q155
+#
+# 2026-10-21, veld-0f: the five bare-acronym (LGBTQ) questions whose MRR, 0.767 -> 0.600, is quoted in
+# evaluations/recall/2026-10-20-heldout-loss-attribution.md for the short-acronym change. q32 and q39
+# are above; these are the other three.
+conv-26_q0
+conv-26_q25
+conv-26_q98
