@@ -247,7 +247,8 @@ pub async fn ingest(
     };
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_id = {

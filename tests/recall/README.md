@@ -106,17 +106,27 @@ for it.
   ungated by dispatching the gate with `suite=locomo`. They include every gate case, so this set
   measures fit as well as generalisation.
 - `corpora/locomo-holdout.jsonl`, `locomo-holdout-cases.jsonl` — the same set without the gate's
-  conversation (conv-42): 1,332 cases over 5,253 turns in nine conversations. Run ungated with
-  `suite=locomo-holdout`. This is the number to report, with its interval.
+  conversation (conv-42) and without the cases in `locomo-holdout-spent.txt`: 5,253 turns in nine
+  conversations, and 1,166 cases on 2026-10-21. Run ungated with `suite=locomo-holdout`. This is
+  the number to report, with its interval.
+- `locomo-holdout-spent.txt` — hold-out cases whose individual results someone has examined.
 
 ## The held-out set (`locomo-holdout`)
 
 Nothing is tuned against it: do not diagnose a miss on it and then change recall to fix that case,
 or it stops being held out. Diagnose on the gate, measure on the hold-out.
 
+A case whose individual result you have read (a moved-case list, a miss you looked into) is spent.
+Add its id to `locomo-holdout-spent.txt` under a dated comment naming the source, and regenerate.
+It stays in the corpus, so the retrieval problem is unchanged; it leaves the scored cases. The
+first entries are the 163 hold-out cases in the moved list behind
+`evaluations/recall/2026-10-20-heldout-loss-attribution.md`, which shaped the frame-word and
+short-acronym changes.
+
 - Regenerate it with `python3 scripts/build_locomo_holdout.py` whenever `locomo.jsonl`,
-  `locomo_cases.jsonl` or the gate cases change. The fixtures test
-  `locomo_holdout_is_the_full_suite_without_the_gate_conversations` fails until you do.
+  `locomo_cases.jsonl`, the gate cases or the spent list change. The fixtures test
+  `locomo_holdout_is_the_full_suite_without_the_gate_conversations_or_spent_cases` fails until
+  you do.
 - Report it with intervals: `python3 scripts/recall_ci.py <per-case.json>` prints each metric's
   mean and 95% percentile-bootstrap interval, overall and per category. Two runs whose difference
   lies inside the intervals have not been shown to differ. For an A/B on the same cases pair them:

@@ -5836,17 +5836,25 @@ impl MemorySystem {
     /// Store and vector-index replicated snapshots. BM25 is left to the intent-log
     /// projection: replication journals every frame after this returns, and the
     /// projection is the only BM25 writer for journaled writes.
+    ///
+    /// The records are written in one atomic store write (one commit and sync for a
+    /// follower's page, not one per memory), so `memories` should name each id once.
     pub fn upsert_memories(&self, memories: &[Memory]) -> Result<usize> {
-        for memory in memories {
-            // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
-            // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
-            // them, and a replica applying every snapshot grew 18.7 vectors per memory.
-            let vectors_kept = self.retriever.is_indexed(&memory.id)
-                && self.long_term_memory.get(&memory.id).is_ok_and(|stored| {
-                    keeps_vectors(&stored, &memory.experience.content)
-                        && stored.experience.embeddings == memory.experience.embeddings
-                });
-            self.long_term_memory.update(memory)?;
+        // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
+        // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
+        // them, and a replica applying every snapshot grew 18.7 vectors per memory.
+        let vectors_kept: Vec<bool> = memories
+            .iter()
+            .map(|memory| {
+                self.retriever.is_indexed(&memory.id)
+                    && self.long_term_memory.get(&memory.id).is_ok_and(|stored| {
+                        keeps_vectors(&stored, &memory.experience.content)
+                            && stored.experience.embeddings == memory.experience.embeddings
+                    })
+            })
+            .collect();
+        self.long_term_memory.update_many(memories)?;
+        for (memory, vectors_kept) in memories.iter().zip(vectors_kept) {
             if !vectors_kept {
                 if let Err(e) = self.retriever.reindex_memory(memory) {
                     tracing::warn!(

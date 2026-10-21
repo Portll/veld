@@ -506,6 +506,9 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn get(&self, id: &MemoryId) -> Result<Memory>;
     fn store(&self, memory: &Memory) -> Result<()>;
     fn update(&self, memory: &Memory) -> Result<()>;
+    /// [`Self::update`] for many memories as one atomic write: every record and its
+    /// index rows commit together, or none does. One commit, one sync.
+    fn update_many(&self, memories: &[Memory]) -> Result<()>;
     fn delete(&self, id: &MemoryId) -> Result<()>;
     /// Every LIVE memory: forgotten (soft-deleted, `Memory::is_forgotten`) records are
     /// left out on every engine. Its callers index, list, repair and merge what recall

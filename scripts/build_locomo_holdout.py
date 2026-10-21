@@ -4,7 +4,8 @@
 The `locomo` suite (1,531 questions over 10 conversations) contains all 100 gate questions, and
 the gate is what recall changes are tuned against, so a number measured on `locomo` is partly a
 measurement of fit. `locomo-holdout` drops the gate's conversations from both the corpus and the
-cases. Nothing may be tuned against it.
+cases. It also drops from the cases, not the corpus, every case in locomo-holdout-spent.txt: cases
+whose individual result someone has examined. Nothing may be tuned against it.
 
 Usage:
     python3 scripts/build_locomo_holdout.py [--check]
@@ -27,6 +28,7 @@ SOURCE_CASES = RECALL / "locomo_cases.jsonl"
 GATE_CASES = RECALL / "locomo-gate-cases.jsonl"
 HOLDOUT_CORPUS = RECALL / "corpora" / "locomo-holdout.jsonl"
 HOLDOUT_CASES = RECALL / "locomo-holdout-cases.jsonl"
+SPENT_CASES = RECALL / "locomo-holdout-spent.txt"
 
 
 def conversation_of_case(case_id: str) -> str:
@@ -41,10 +43,22 @@ def read_lines(path: Path) -> list[str]:
     return [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def read_spent() -> set[str]:
+    return {
+        line.strip()
+        for line in read_lines(SPENT_CASES)
+        if not line.lstrip().startswith("#")
+    }
+
+
 def build() -> tuple[str, str, set[str]]:
     gate_conversations = {
         conversation_of_case(json.loads(line)["id"]) for line in read_lines(GATE_CASES)
     }
+    spent = read_spent()
+    unknown = sorted(spent - {json.loads(line)["id"] for line in read_lines(SOURCE_CASES)})
+    if unknown:
+        raise SystemExit(f"{SPENT_CASES.name} names cases that do not exist: {unknown}")
     corpus = [
         line
         for line in read_lines(SOURCE_CORPUS)
@@ -53,7 +67,7 @@ def build() -> tuple[str, str, set[str]]:
     cases = []
     for line in read_lines(SOURCE_CASES):
         case = json.loads(line)
-        if conversation_of_case(case["id"]) in gate_conversations:
+        if conversation_of_case(case["id"]) in gate_conversations or case["id"] in spent:
             continue
         leaked = [
             item["corpus_item_id"]

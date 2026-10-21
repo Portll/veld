@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """95% percentile-bootstrap intervals for one recall-eval run, overall and per category.
 
-recall-eval reports means. A mean over 100 or 1,332 cases moves by whole cases, and two runs that
+recall-eval reports means. A mean over 100 or a thousand cases moves by whole cases, and two runs that
 differ by less than the interval width do not differ in a way the suite can show. Report a held-out
 number with its interval.
 
