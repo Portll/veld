@@ -239,6 +239,26 @@ impl CompetitiveEmbedder {
         Ok(Some(alignment.project(&s)?))
     }
 
+    /// The secondary model's query face of `text` (`encode_for_query`), the input
+    /// [`Self::encode_aligned`] projects for [`AlignedSide::Query`]. `Ok(None)` when there
+    /// is no secondary model.
+    pub fn encode_secondary_for_query(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        match &self.secondary {
+            Some(secondary) => Ok(Some(secondary.encode_for_query(text)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Project a secondary-space vector into primary space through the installed
+    /// alignment, as [`Self::encode_aligned`] does after encoding. `Ok(None)` when no
+    /// alignment is installed.
+    pub fn project_secondary(&self, secondary: &[f32]) -> Result<Option<Vec<f32>>> {
+        match self.alignment_snapshot() {
+            Some(alignment) => Ok(Some(alignment.project(secondary)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Encode `text` with the primary and additionally produce a *fused
     /// primary-space vector* — the "regular task space" position — as a
     /// weighted blend of the primary embedding and the projected secondary.
@@ -478,5 +498,41 @@ mod tests {
             .unwrap()
             .expect("encode_aligned yields a projected vector once aligned");
         assert_eq!(aligned.len(), 8, "aligned vector lives in primary space");
+    }
+
+    /// Encoding the secondary query face and projecting it in two steps lands where
+    /// `encode_aligned(.., Query)` does, so a caller can cache the face and project per
+    /// recall. Without an alignment the projection is absent, as the one-step path is.
+    #[test]
+    fn the_two_step_aligned_query_matches_encode_aligned() {
+        use crate::embeddings::{AlignmentPairId, IdentityAlignment};
+
+        let primary: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(8));
+        let secondary: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(8));
+        let embedder = CompetitiveEmbedder::new(primary, Some(secondary));
+        let face = embedder
+            .encode_secondary_for_query("query text")
+            .unwrap()
+            .expect("a secondary model is configured");
+        assert!(embedder.project_secondary(&face).unwrap().is_none());
+
+        embedder
+            .install_alignment(Arc::new(IdentityAlignment::new(
+                8,
+                AlignmentPairId::new("stub-primary", "stub-secondary"),
+            )))
+            .expect("identity alignment installs (dims match)");
+        let two_step = embedder.project_secondary(&face).unwrap().unwrap();
+        let one_step = embedder
+            .encode_aligned("query text", AlignedSide::Query)
+            .unwrap()
+            .unwrap();
+        assert_eq!(two_step, one_step);
+
+        let no_secondary = CompetitiveEmbedder::new(Arc::new(StubEmbedder::new(8)), None);
+        assert!(no_secondary
+            .encode_secondary_for_query("query text")
+            .unwrap()
+            .is_none());
     }
 }

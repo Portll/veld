@@ -1254,18 +1254,33 @@ impl CrossEncoderReranker {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-
-        // Always compute bi-encoder scores (fast, used for blending or fallback).
         // Query side uses encode_for_query so asymmetric models apply the query prefix.
         let query_embedding = self.embedder.encode_for_query(query)?;
+        self.rerank_with_query_embedding(query, &query_embedding, candidates)
+    }
+
+    /// [`Self::rerank`] with the bi-encoder query embedding supplied: it must be what this
+    /// reranker's embedder returns from `encode_for_query(query)`, which a recall has
+    /// already computed (and cached) before it reaches the rerank.
+    pub fn rerank_with_query_embedding(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        candidates: Vec<(MemoryId, String, f32, Option<Vec<f32>>)>,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Always compute bi-encoder scores (fast, used for blending or fallback).
         let query_dim = query_embedding.len();
         let mut bi_scores: Vec<f32> = Vec::with_capacity(candidates.len());
         for (_, content, _, stored) in &candidates {
             let bi = match stored {
-                Some(emb) if emb.len() == query_dim => cosine_similarity(&query_embedding, emb),
+                Some(emb) if emb.len() == query_dim => cosine_similarity(query_embedding, emb),
                 _ => {
                     let doc_embedding = self.embedder.encode(content)?;
-                    cosine_similarity(&query_embedding, &doc_embedding)
+                    cosine_similarity(query_embedding, &doc_embedding)
                 }
             };
             bi_scores.push(bi);
@@ -3079,6 +3094,81 @@ mod tests {
             delta.abs() < 1e-6,
             "delta must be zero when learned == static; got {delta}"
         );
+    }
+
+    /// Given the embedding `rerank` would compute, the rerank scores identically and
+    /// encodes nothing: the query side is not encoded again, and stored document vectors
+    /// of the query's dimension are reused.
+    #[test]
+    fn a_supplied_query_embedding_reranks_exactly_as_encoding_it() {
+        struct CountingEmbedder {
+            query_encodes: AtomicU64,
+        }
+        impl Embedder for CountingEmbedder {
+            fn encode(&self, text: &str) -> Result<Vec<f32>> {
+                Ok(vec![text.len() as f32, 1.0, 0.5])
+            }
+            fn encode_for_query(&self, text: &str) -> Result<Vec<f32>> {
+                self.query_encodes.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![1.0, text.len() as f32, 0.25])
+            }
+            fn dimension(&self) -> usize {
+                3
+            }
+            fn id(&self) -> &str {
+                "counting"
+            }
+        }
+        struct LengthCrossEncoder;
+        impl crate::embeddings::cross_encoder::CrossEncoderModel for LengthCrossEncoder {
+            fn id(&self) -> &str {
+                "length"
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn score_pairs(&self, _query: &str, documents: &[&str]) -> Result<Vec<f32>> {
+                Ok(documents.iter().map(|d| d.len() as f32 / 10.0).collect())
+            }
+        }
+        let embedder = Arc::new(CountingEmbedder {
+            query_encodes: AtomicU64::new(0),
+        });
+        let reranker = CrossEncoderReranker::with_cross_encoder(
+            embedder.clone(),
+            Arc::new(LengthCrossEncoder),
+        );
+        let candidates = || {
+            vec![
+                (
+                    MemoryId(uuid::Uuid::from_u128(1)),
+                    "a short note".to_string(),
+                    0.4,
+                    Some(vec![0.2, 0.9, 0.1]),
+                ),
+                (
+                    MemoryId(uuid::Uuid::from_u128(2)),
+                    "a much longer note about the deploy".to_string(),
+                    0.3,
+                    None,
+                ),
+            ]
+        };
+        let query = "what about the deploy";
+        let encoded = reranker.rerank(query, candidates()).unwrap();
+        assert_eq!(embedder.query_encodes.load(Ordering::Relaxed), 1);
+
+        let supplied = embedder.encode_for_query(query).unwrap();
+        let before = embedder.query_encodes.load(Ordering::Relaxed);
+        let reused = reranker
+            .rerank_with_query_embedding(query, &supplied, candidates())
+            .unwrap();
+        assert_eq!(embedder.query_encodes.load(Ordering::Relaxed), before);
+        assert_eq!(encoded.len(), reused.len());
+        for ((id_a, score_a), (id_b, score_b)) in encoded.iter().zip(&reused) {
+            assert_eq!(id_a, id_b);
+            assert_eq!(score_a.to_bits(), score_b.to_bits());
+        }
     }
 
     /// Selecting a reranker the reranker has not loaded yet must return, and a second
