@@ -27,10 +27,15 @@ reconsolidation behaves exactly as it did pre-dials.
 |---|---|---|---|
 | `date_window_leg` | `VELD_DIALS_DATE_WINDOW_LEG` | `None` (on) | The date window candidate leg (recall Layer 3.7). When a query names a calendar day ("1 May, 2022") or month-year ("April 2022"), the memories whose `created_at` falls in that window — a day widened by one day either side, a month as written — enter RRF fusion as their own list, ranked by similarity to the query and capped at `candidate_count` (or `max_results × 8`). Year-only mentions never fire it. `Some(false)` leaves dated queries to the Layer 4.55 temporal boost alone. |
 | `relative_priors` | `VELD_DIALS_RELATIVE_PRIORS` | `None` (off) | How Layer 5 combines the fused base with its priors (recency, arousal, credibility, temporal match, access, graph strength and the rest). Off, they are added to the base, and since the RRF base at k = 20 is about 0.033 at rank 1 and 0.010 at rank 50, priors worth up to ~0.5 decide the order. On, the base is divided by the best base among the candidates and multiplied by `1 + Σ priors`, so relevance leads and the priors adjust it; the Hebbian bonus and the 2-hour session bonus are not added a second time. This also changes the cross-encoder blend, whose share then applies to a base on the same 0–1 scale as its own score. Off until a locomo-holdout A/B decides it. |
+| `graph_episode_entities` | `VELD_DIALS_GRAPH_EPISODE_ENTITIES` | `None` (every entity) | How many of the entities recall's graph traversal reaches (Layer 2) have their recent episodes read as candidates. The entities kept are those with the highest decay factor (the nearest to a query entity; an entity reached twice counts at its best), ties broken by salience, then name. Each expanded entity costs an index scan and up to `RECALL_GRAPH_EPISODES_PER_ENTITY` episode reads, so a dense graph can spend most of a recall here. Clamped to 1–1000. |
+| `bm25_read_staleness_ms` | `VELD_DIALS_BM25_READ_STALENESS_MS` | `None` (commit every buffered write) | How long a journaled write may sit buffered in the BM25 index before a recall commits it itself. `None` commits everything buffered before the search, so a memory is keyword-findable on the first recall after its write (a `/api/remember` memory has no embedding until its background embed finishes, so BM25 is then its only route into recall). `Some(ms)` leaves younger writes to the BM25 projection's background committer, which commits within `COMMIT_INTERVAL` (200 ms) of the previous commit; a recall then pays no commit, and can miss the keyword match of a memory written less than that long ago. Clamped to at most 60 000. |
 
 The recall gate records the overrides a run was measured under
-(`retrieval_dials` in `tests/recall/locomo-gate-baseline.json`) and refuses to
-diff two runs that overrode them differently.
+(`retrieval_dials` in `tests/recall/locomo-gate-baseline.json`: `date_window_leg`
+and `graph_episode_entities`) and refuses to diff two runs that overrode them
+differently. `bm25_read_staleness_ms` is not recorded: the gate ingests through
+`MemorySystem::remember`, which commits BM25 as it writes, so nothing is ever
+buffered when it recalls.
 
 ## Lifecycle
 

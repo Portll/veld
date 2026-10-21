@@ -154,6 +154,10 @@ pub struct RetrievalDials {
     /// The `relative_priors` dial: `None` is the engine default (priors added to the base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_priors: Option<bool>,
+    /// The `graph_episode_entities` dial: `None` is the engine default (every reached
+    /// entity's episodes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_episode_entities: Option<usize>,
 }
 
 impl RetrievalDials {
@@ -162,6 +166,7 @@ impl RetrievalDials {
         Self {
             date_window_leg: dials.date_window_leg,
             relative_priors: dials.relative_priors,
+            graph_episode_entities: dials.graph_episode_entities,
         }
     }
 
@@ -172,6 +177,9 @@ impl RetrievalDials {
         }
         if let Some(v) = self.relative_priors {
             set.push(format!("relative_priors={v}"));
+        }
+        if let Some(v) = self.graph_episode_entities {
+            set.push(format!("graph_episode_entities={v}"));
         }
         if set.is_empty() {
             "engine defaults".to_string()
@@ -1477,6 +1485,27 @@ mod tests {
             assert!(detail.contains("date_window_leg=false"), "{detail}");
             assert!(detail.contains("engine defaults"), "{detail}");
         }
+    }
+
+    /// A capped graph expansion is another candidate pool, refused like a switched-off leg.
+    #[test]
+    fn a_graph_episode_cap_on_one_side_refuses_the_comparison() {
+        let capped = Some(RetrievalDials {
+            graph_episode_entities: Some(40),
+            ..Default::default()
+        });
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+        baseline.retrieval_dials = Some(RetrievalDials::default());
+        current.retrieval_dials = capped;
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        assert!(
+            failures[0].detail.contains("graph_episode_entities=40"),
+            "{}",
+            failures[0].detail
+        );
     }
 
     /// Relative priors reorder the whole candidate list, so a run with them is another

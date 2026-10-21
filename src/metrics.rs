@@ -217,11 +217,84 @@ pub static MEMORY_RETRIEVE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
             "veld_retrieve_duration_seconds",
             "Memory retrieve operation duration",
         )
-        .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+        ]),
         &["retrieval_mode"],
     )
     .expect("MEMORY_RETRIEVE_DURATION metric must be valid at compile time")
 });
+
+/// One stage of a recall: the `stage` label of [`RECALL_STAGE_DURATION`]. A closed set, so
+/// the metric has a fixed number of series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallStage {
+    /// Query parsing plus the attribute, temporal-fact and fact-source lookups (Layers 0.5-0.7).
+    QueryAnalysis,
+    /// Query embedding, primary and secondary.
+    Embedding,
+    /// Episode pre-filter and graph expansion (Layers 1-2).
+    Graph,
+    /// Vector search, query decomposition included (Layer 3).
+    Vector,
+    /// BM25, RRF fusion and the Layer 4 boosts.
+    Fusion,
+    /// Candidate fetch and unified scoring (Layer 5).
+    Fetch,
+    /// Cross-encoder reranking (Layer 5.3), observed only when the reranker runs.
+    CrossEncoder,
+    /// Everything after the fetch except the cross-encoder.
+    Post,
+}
+
+impl RecallStage {
+    pub const ALL: [RecallStage; 8] = [
+        RecallStage::QueryAnalysis,
+        RecallStage::Embedding,
+        RecallStage::Graph,
+        RecallStage::Vector,
+        RecallStage::Fusion,
+        RecallStage::Fetch,
+        RecallStage::CrossEncoder,
+        RecallStage::Post,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecallStage::QueryAnalysis => "query_analysis",
+            RecallStage::Embedding => "embedding",
+            RecallStage::Graph => "graph",
+            RecallStage::Vector => "vector",
+            RecallStage::Fusion => "fusion",
+            RecallStage::Fetch => "fetch",
+            RecallStage::CrossEncoder => "cross_encoder",
+            RecallStage::Post => "post",
+        }
+    }
+}
+
+/// Duration of each recall stage. Buckets run from 1 ms to 60 s, the request timeout, so a
+/// stalled stage lands in a bucket instead of +Inf.
+pub static RECALL_STAGE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "veld_recall_stage_duration_seconds",
+            "Duration of each stage of the recall pipeline",
+        )
+        .buckets(vec![
+            0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 60.0,
+        ]),
+        &["stage"],
+    )
+    .expect("RECALL_STAGE_DURATION metric must be valid at compile time")
+});
+
+/// Observe one recall stage.
+pub fn observe_recall_stage(stage: RecallStage, elapsed: std::time::Duration) {
+    RECALL_STAGE_DURATION
+        .with_label_values(&[stage.as_str()])
+        .observe(elapsed.as_secs_f64());
+}
 
 /// Results returned per query
 pub static MEMORY_RETRIEVE_RESULTS: LazyLock<HistogramVec> = LazyLock::new(|| {
@@ -495,14 +568,32 @@ pub static VECTOR_SEARCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("VECTOR_SEARCH_TOTAL metric must be valid at compile time")
 });
 
-/// Vector search duration
+/// Vector search duration. The buckets run past the sub-millisecond range of a warm index
+/// to 5 s, so a search that pages a cold memory-mapped index in is still measured.
 pub static VECTOR_SEARCH_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
-    Histogram::with_opts(fast_histogram_opts(
-        "veld_vector_search_duration_seconds",
-        "Vector search duration",
-    ))
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "veld_vector_search_duration_seconds",
+            "Vector search duration",
+        )
+        .buckets(vec![
+            0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0,
+        ]),
+    )
     .expect("VECTOR_SEARCH_DURATION metric must be valid at compile time")
 });
+
+/// Time one vector index search into [`VECTOR_SEARCH_DURATION`] and count it in
+/// [`VECTOR_SEARCH_TOTAL`] by outcome.
+pub fn timed_vector_search<T, E>(search: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    let started = std::time::Instant::now();
+    let result = search();
+    VECTOR_SEARCH_DURATION.observe(started.elapsed().as_secs_f64());
+    VECTOR_SEARCH_TOTAL
+        .with_label_values(&[if result.is_ok() { "ok" } else { "error" }])
+        .inc();
+    result
+}
 
 // ============================================================================
 // Storage Metrics
@@ -1064,6 +1155,7 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(MEMORY_RETRIEVE_TOTAL, "MEMORY_RETRIEVE_TOTAL");
     register!(MEMORY_RETRIEVE_DURATION, "MEMORY_RETRIEVE_DURATION");
     register!(MEMORY_RETRIEVE_RESULTS, "MEMORY_RETRIEVE_RESULTS");
+    register!(RECALL_STAGE_DURATION, "RECALL_STAGE_DURATION");
 
     // Ontological retrieval metrics
     register!(
@@ -1286,6 +1378,66 @@ mod tests {
                 .get_sample_count()
                 >= 1
         );
+    }
+
+    #[test]
+    fn recall_stage_histogram_registers_every_stage_and_reaches_thirty_seconds() {
+        let _ = register_metrics();
+        let labels: std::collections::HashSet<&str> =
+            RecallStage::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(labels.len(), RecallStage::ALL.len(), "labels are distinct");
+        for stage in RecallStage::ALL {
+            observe_recall_stage(stage, std::time::Duration::from_secs(20));
+        }
+        let family = METRICS_REGISTRY
+            .gather()
+            .into_iter()
+            .find(|f| f.name() == "veld_recall_stage_duration_seconds")
+            .expect("registered");
+        for metric in family.get_metric() {
+            let histogram = metric.get_histogram();
+            let in_thirty = histogram
+                .get_bucket()
+                .iter()
+                .find(|b| b.upper_bound() == 30.0)
+                .expect("a 30 s bucket");
+            assert!(
+                in_thirty.cumulative_count() >= 1,
+                "a 20 s stage lands below +Inf"
+            );
+        }
+    }
+
+    #[test]
+    fn retrieve_duration_buckets_reach_past_one_second() {
+        let h = MEMORY_RETRIEVE_DURATION.with_label_values(&["bucket_probe"]);
+        h.observe(12.0);
+        let metric = h.metric();
+        let bounds: Vec<f64> = metric
+            .get_histogram()
+            .get_bucket()
+            .iter()
+            .map(|b| b.upper_bound())
+            .collect();
+        assert!(
+            bounds.contains(&30.0) && bounds.contains(&60.0),
+            "{bounds:?}"
+        );
+    }
+
+    #[test]
+    fn a_timed_vector_search_is_observed_and_counted_by_outcome() {
+        let before = VECTOR_SEARCH_DURATION.get_sample_count();
+        let ok_before = VECTOR_SEARCH_TOTAL.with_label_values(&["ok"]).get();
+        let err_before = VECTOR_SEARCH_TOTAL.with_label_values(&["error"]).get();
+        assert_eq!(timed_vector_search(|| Ok::<_, ()>(3)), Ok(3));
+        assert_eq!(
+            timed_vector_search(|| Err::<(), _>("no index")),
+            Err("no index")
+        );
+        assert!(VECTOR_SEARCH_DURATION.get_sample_count() >= before + 2);
+        assert!(VECTOR_SEARCH_TOTAL.with_label_values(&["ok"]).get() > ok_before);
+        assert!(VECTOR_SEARCH_TOTAL.with_label_values(&["error"]).get() > err_before);
     }
 
     #[test]

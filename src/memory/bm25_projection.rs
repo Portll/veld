@@ -47,24 +47,40 @@
 //!
 //! Tantivy `IndexWriter` writes are buffered: an `add_document` /
 //! `delete_term` call doesn't make the change visible to the index reader
-//! until `commit()` runs. Committing on every record is correct but slow
-//! (each commit fsyncs the segment + bumps the meta), so the projection
-//! commits in batches.
+//! until `commit()` runs. Each commit fsyncs the segment files and the meta,
+//! so the projection commits in batches, and on the live-write path not on the
+//! writer's thread: `apply` buffers the change under the tenant's journal
+//! mutex and leaves the commit to a background committer, one per projection,
+//! started on the first live apply.
 //!
-//! On the live-write path a batch closes at whichever comes first:
-//! [`COMMIT_EVERY`] applies, or an apply arriving when the index's last
-//! commit is older than [`COMMIT_INTERVAL`]. There is no timer thread; a
-//! quiet tenant's tail stays buffered until the next apply or until a search
-//! calls [`crate::memory::HybridSearchEngine::commit_pending`], which is how a
+//! The committer commits once something is buffered and the index's last
+//! commit is at least [`COMMIT_INTERVAL`] old, or at once when
+//! [`COMMIT_EVERY`] records are waiting, and then persists the projection
+//! checkpoint. A search commits what is still buffered before it reads (see
+//! [`crate::memory::HybridSearchEngine::commit_for_read`]), which is how a
 //! recall sees a memory written just before it.
 //!
-//! The batch size is owned in one place — [`COMMIT_EVERY`] — and the replay
-//! driver is told to persist the projection checkpoint with the same
-//! period via `replay(..., Some(COMMIT_EVERY))`. This means the
-//! on-disk BM25 segments and the persisted intent-log checkpoint advance
-//! together: a crash that loses an unflushed batch also loses the
-//! checkpoint for that batch, so on restart the replay driver re-applies
-//! exactly the records the BM25 index never durably saw.
+//! The checkpoint never names a record the index has not committed: the
+//! committer reads the last applied LSN, then commits, then persists that LSN,
+//! and every record up to it was buffered before the commit began. Persists
+//! never move the checkpoint backwards, whichever of the committer, a drain or
+//! replay makes them.
+//!
+//! The committer stops, after a final commit, when the projection is dropped
+//! or [`TypedProjection::stop_background`] is called (the journaled writer's
+//! shutdown and a restore); applies after that commit inline on the same
+//! cadence. The periodic flush and the shutdown flush reach it through
+//! [`crate::intent_log::journal::DeferredDrainHandle::drain`], without the
+//! writer's mutex.
+//!
+//! Replay commits on the replaying thread. The batch size is owned in one
+//! place — [`COMMIT_EVERY`] — and the replay driver is told to persist the
+//! projection checkpoint with the same period via
+//! `replay(..., Some(COMMIT_EVERY))`. This means the on-disk BM25 segments and
+//! the persisted intent-log checkpoint advance together: a crash that loses an
+//! unflushed batch also loses the checkpoint for that batch, so on restart the
+//! replay driver re-applies exactly the records the BM25 index never durably
+//! saw.
 //!
 //! ## Idempotency
 //!
@@ -72,7 +88,10 @@
 //!
 //! - `Remember` / `Update` — `BM25Index::upsert` does a `delete_term` on
 //!   the `id` field followed by `add_document`. Replaying the same LSN
-//!   twice produces exactly one document in the index.
+//!   twice produces exactly one document in the index. An `Update` whose
+//!   content, tags and entities are what the index last wrote for that
+//!   memory writes nothing (`BM25Index::upsert_if_changed`): most updates
+//!   change importance, anchoring or embeddings, not the indexed text.
 //! - `Forget` — `BM25Index::delete` is a `delete_term` on `id`. Deleting a
 //!   missing document is a no-op in tantivy.
 //! - `Anchor` — no-op. Anchoring affects importance/decay, not text
@@ -83,13 +102,13 @@
 
 use std::error::Error;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::intent_log::{
-    CheckpointStore, CheckpointStoreError, IntentPayload, IntentRecord, Lsn, PayloadError,
-    Projection, TypedProjection,
+    BackgroundFlush, CheckpointStore, CheckpointStoreError, IntentPayload, IntentRecord, Lsn,
+    PayloadError, Projection, TypedProjection,
 };
 
 use super::hybrid_search::BM25Index;
@@ -130,9 +149,9 @@ pub enum Bm25ProjectionError {
 /// migration.
 pub const PROJECTION_NAME: &str = "bm25";
 
-/// Number of successful applies between `IndexWriter::commit` calls in
-/// the live-write path AND between `persist_checkpoint` calls in the
-/// replay path.
+/// Applies waiting for a commit at which the live path commits without
+/// waiting for [`COMMIT_INTERVAL`], AND the number of applies between
+/// `persist_checkpoint` calls in the replay path.
 ///
 /// Tantivy commits are expensive (fsync of segment files + meta), so we
 /// amortise. The replay driver is given the same number as
@@ -141,30 +160,198 @@ pub const PROJECTION_NAME: &str = "bm25";
 /// the next replay will re-apply.
 pub const COMMIT_EVERY: u64 = 100;
 
-/// Age of the index's last commit past which the next live apply commits,
-/// whatever the batch size. Bounds how long a journaled write stays invisible
-/// to a reader that does not itself flush (searches flush via
-/// [`crate::memory::HybridSearchEngine::commit_pending`]).
+/// Shortest gap between two live-path commits. A write arriving after a quiet
+/// spell is committed at once; one arriving sooner waits until the last commit
+/// is this old, so a burst shares one commit. Bounds how long a journaled write
+/// stays invisible to a reader that does not itself commit.
 pub const COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long dropping a projection waits for its committer's final commit.
+const COMMITTER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bridge between the intent log and the BM25 inverted index.
 ///
 /// One per tenant. Owns an `Arc<BM25Index>` (the tantivy handle shared
-/// between the projection and any read-side hybrid-search reader), a
-/// shared [`CheckpointStore`] (the per-projection LSN bookkeeping), and
-/// an in-memory copy of the last-applied LSN.
+/// between the projection and any read-side hybrid-search reader), the
+/// committer that commits it in the background (which holds the shared
+/// [`CheckpointStore`]), and an in-memory copy of the last-applied LSN.
 pub struct Bm25Projection {
     index: Arc<BM25Index>,
-    checkpoint_store: Arc<Mutex<CheckpointStore>>,
     /// LSN of the last record this projection successfully applied. Lives
-    /// in memory; `persist_checkpoint` synchronises it to disk.
+    /// in memory; the committer, or replay, persists it.
     checkpoint: Option<Lsn>,
-    /// Number of successful applies since the last `commit`. Reset on
-    /// commit. Lets the dyn-`TypedProjection` arm batch commits without
-    /// the replay driver's `persist_every` ceremony.
+    /// Number of successful applies since the last commit on the inline
+    /// path, which runs when there is no background committer.
     applies_since_commit: u64,
     /// Live-path time trigger; [`COMMIT_INTERVAL`] unless overridden.
     commit_interval: Duration,
+    committer: Arc<Committer>,
+    worker: CommitterWorker,
+}
+
+/// The background committer's thread, as the projection sees it.
+enum CommitterWorker {
+    /// No live apply yet; the thread starts on the first.
+    NotStarted,
+    Running(std::thread::JoinHandle<()>),
+    /// Stopped, or it could not start: live applies commit inline.
+    Stopped,
+}
+
+/// State the projection shares with its committer thread and with drain handles.
+struct Committer {
+    index: Arc<BM25Index>,
+    checkpoint_store: Arc<Mutex<CheckpointStore>>,
+    state: Mutex<CommitterState>,
+    /// Signalled when a record is applied, the committer is told to stop, and when it exits.
+    wake: Condvar,
+    /// The checkpoint last persisted, held across the store write so that persists from
+    /// the committer, a drain and replay never move it backwards.
+    persisted: Mutex<Option<Lsn>>,
+}
+
+struct CommitterState {
+    /// LSN of the last record applied to the index.
+    applied: Option<Lsn>,
+    /// Live applies since the committer last committed.
+    waiting: u64,
+    stop: bool,
+    exited: bool,
+}
+
+impl Committer {
+    fn new(
+        index: Arc<BM25Index>,
+        checkpoint_store: Arc<Mutex<CheckpointStore>>,
+        persisted: Option<Lsn>,
+    ) -> Self {
+        Self {
+            index,
+            checkpoint_store,
+            state: Mutex::new(CommitterState {
+                applied: None,
+                waiting: 0,
+                stop: false,
+                exited: false,
+            }),
+            wake: Condvar::new(),
+            persisted: Mutex::new(persisted),
+        }
+    }
+
+    /// Record `lsn` as applied to the index. A live apply also counts toward the
+    /// committer's batch and wakes it.
+    fn record(&self, lsn: Lsn, live: bool) {
+        let mut st = self.state.lock();
+        st.applied = Some(lsn);
+        if live {
+            st.waiting += 1;
+            if st.waiting == 1 || st.waiting >= COMMIT_EVERY {
+                self.wake.notify_all();
+            }
+        }
+    }
+
+    fn run(self: Arc<Self>, interval: Duration) {
+        loop {
+            let target = {
+                let mut st = self.state.lock();
+                while st.waiting == 0 && !st.stop {
+                    self.wake.wait(&mut st);
+                }
+                if st.stop {
+                    break;
+                }
+                let due = Instant::now() + interval.saturating_sub(self.index.since_last_commit());
+                while !st.stop && st.waiting < COMMIT_EVERY && Instant::now() < due {
+                    self.wake.wait_until(&mut st, due);
+                }
+                if st.stop {
+                    break;
+                }
+                st.waiting = 0;
+                st.applied
+            };
+            if let Err(error) = self.commit_through(target) {
+                tracing::warn!(
+                    projection = PROJECTION_NAME,
+                    error = %error,
+                    "background BM25 commit failed; the next write or search commits the batch, \
+                     and replay re-applies it after a crash",
+                );
+            }
+        }
+        if let Err(error) = self.flush_now() {
+            tracing::warn!(
+                projection = PROJECTION_NAME,
+                error = %error,
+                "final BM25 commit failed as the committer stopped (replay recovers the tail)",
+            );
+        }
+        self.state.lock().exited = true;
+        self.wake.notify_all();
+    }
+
+    /// Tell the thread to stop and wait, until `deadline`, for its final commit.
+    fn stop(&self, deadline: Instant) -> bool {
+        let mut st = self.state.lock();
+        st.stop = true;
+        self.wake.notify_all();
+        while !st.exited {
+            if self.wake.wait_until(&mut st, deadline).timed_out() {
+                return st.exited;
+            }
+        }
+        true
+    }
+
+    /// Commit and persist everything applied so far.
+    fn flush_now(&self) -> Result<(), Bm25ProjectionError> {
+        let target = self.state.lock().applied;
+        self.commit_through(target)
+    }
+
+    /// Commit what the index has buffered, then persist `target`. Every record at or
+    /// below `target` was applied before this call, so the commit covers it; one a
+    /// search already committed leaves nothing to commit.
+    fn commit_through(&self, target: Option<Lsn>) -> Result<(), Bm25ProjectionError> {
+        self.index
+            .commit_pending()
+            .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
+        self.persist(target)
+    }
+
+    /// Persist `target` as the checkpoint unless one at or past it already is.
+    fn persist(&self, target: Option<Lsn>) -> Result<(), Bm25ProjectionError> {
+        let Some(lsn) = target else {
+            return Ok(());
+        };
+        let mut persisted = self.persisted.lock();
+        if persisted.is_some_and(|done| done >= lsn) {
+            return Ok(());
+        }
+        let mut store = self.checkpoint_store.lock();
+        store.set(PROJECTION_NAME, lsn)?;
+        store.sync()?;
+        *persisted = Some(lsn);
+        Ok(())
+    }
+}
+
+impl BackgroundFlush for Committer {
+    fn flush(&self) -> bool {
+        match self.flush_now() {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    projection = PROJECTION_NAME,
+                    error = %error,
+                    "BM25 flush failed (replay recovers the tail)",
+                );
+                false
+            }
+        }
+    }
 }
 
 impl Bm25Projection {
@@ -173,13 +360,7 @@ impl Bm25Projection {
     /// `replay` / live `apply` calls resume from the right LSN.
     pub fn new(index: Arc<BM25Index>, checkpoint_store: Arc<Mutex<CheckpointStore>>) -> Self {
         let checkpoint = checkpoint_store.lock().get(PROJECTION_NAME);
-        Self {
-            index,
-            checkpoint_store,
-            checkpoint,
-            applies_since_commit: 0,
-            commit_interval: COMMIT_INTERVAL,
-        }
+        Self::with_checkpoint(index, checkpoint_store, checkpoint)
     }
 
     /// A projection over an index that starts empty every time (held in memory for
@@ -189,16 +370,31 @@ impl Bm25Projection {
         index: Arc<BM25Index>,
         checkpoint_store: Arc<Mutex<CheckpointStore>>,
     ) -> Self {
+        Self::with_checkpoint(index, checkpoint_store, None)
+    }
+
+    fn with_checkpoint(
+        index: Arc<BM25Index>,
+        checkpoint_store: Arc<Mutex<CheckpointStore>>,
+        checkpoint: Option<Lsn>,
+    ) -> Self {
+        let committer = Arc::new(Committer::new(
+            Arc::clone(&index),
+            checkpoint_store,
+            checkpoint,
+        ));
         Self {
             index,
-            checkpoint_store,
-            checkpoint: None,
+            checkpoint,
             applies_since_commit: 0,
             commit_interval: COMMIT_INTERVAL,
+            committer,
+            worker: CommitterWorker::NotStarted,
         }
     }
 
-    /// Replace the live-path time trigger (default [`COMMIT_INTERVAL`]).
+    /// Replace the live-path time trigger (default [`COMMIT_INTERVAL`]). Takes effect
+    /// for a committer not yet started, which is any before the first live apply.
     pub fn with_commit_interval(mut self, interval: Duration) -> Self {
         self.commit_interval = interval;
         self
@@ -242,9 +438,14 @@ impl Bm25Projection {
                     let content = memory.experience.content.as_str();
                     let tags = memory.experience.tags.as_slice();
                     let entities = memory.experience.entities.as_slice();
-                    self.index
-                        .upsert(&mid, content, tags, entities)
-                        .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
+                    let written = if matches!(payload, IntentPayload::Update { .. }) {
+                        self.index
+                            .upsert_if_changed(&mid, content, tags, entities)
+                            .map(|_| ())
+                    } else {
+                        self.index.upsert(&mid, content, tags, entities)
+                    };
+                    written.map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
                 }
             }
             IntentPayload::Forget { memory_id, .. } => {
@@ -280,7 +481,7 @@ impl Bm25Projection {
         Ok(())
     }
 
-    /// Whether the live path should close the current batch now.
+    /// Whether the inline live path should close the current batch now.
     fn commit_due(&self) -> bool {
         self.applies_since_commit >= COMMIT_EVERY
             || self.index.since_last_commit() >= self.commit_interval
@@ -288,14 +489,41 @@ impl Bm25Projection {
 
     /// Persist the in-memory checkpoint to the shared checkpoint store.
     /// Called by the replay driver on its `persist_every` cadence and at
-    /// the end of every live-write commit boundary.
+    /// every inline commit boundary.
     fn persist(&mut self) -> Result<(), Bm25ProjectionError> {
-        if let Some(lsn) = self.checkpoint {
-            let mut store = self.checkpoint_store.lock();
-            store.set(PROJECTION_NAME, lsn)?;
-            store.sync()?;
+        self.committer.persist(self.checkpoint)
+    }
+
+    /// Whether the background committer takes this live apply's commit, starting it on
+    /// first use. `false` when there is none and the caller commits inline.
+    fn commit_in_background(&mut self) -> bool {
+        if matches!(self.worker, CommitterWorker::NotStarted) {
+            let committer = Arc::clone(&self.committer);
+            let interval = self.commit_interval;
+            self.worker = match std::thread::Builder::new()
+                .name("veld-bm25-commit".to_string())
+                .spawn(move || committer.run(interval))
+            {
+                Ok(handle) => CommitterWorker::Running(handle),
+                Err(error) => {
+                    tracing::warn!(
+                        projection = PROJECTION_NAME,
+                        error = %error,
+                        "could not start the BM25 committer; committing inline",
+                    );
+                    CommitterWorker::Stopped
+                }
+            };
         }
-        Ok(())
+        matches!(self.worker, CommitterWorker::Running(_))
+    }
+}
+
+impl Drop for Bm25Projection {
+    fn drop(&mut self) {
+        if matches!(self.worker, CommitterWorker::Running(_)) {
+            self.stop_background(Instant::now() + COMMITTER_STOP_TIMEOUT);
+        }
     }
 }
 
@@ -316,11 +544,16 @@ fn decode_memory(bytes: &[u8]) -> Result<Memory, Bm25ProjectionError> {
         .map_err(|e| Bm25ProjectionError::MemoryDecode(e.to_string()))
 }
 
+fn boxed(e: Bm25ProjectionError) -> Box<dyn Error + Send + Sync> {
+    Box::new(e)
+}
+
 /// Dyn-friendly arm: the [`crate::intent_log::JournaledWriter`] hands us
-/// typed payloads at live-write time. We batch commits via
-/// [`COMMIT_EVERY`] / [`COMMIT_INTERVAL`] and persist the checkpoint every
-/// time we commit, never before, so the checkpoint can trail the segments
-/// (replay re-applies idempotently) but never lead them.
+/// typed payloads at live-write time, under the tenant's journal mutex. The
+/// change is buffered here and committed by the background committer, which
+/// persists the checkpoint only after the commit that covers it, so the
+/// checkpoint can trail the segments (replay re-applies idempotently) but
+/// never lead them.
 impl TypedProjection for Bm25Projection {
     fn name(&self) -> &str {
         PROJECTION_NAME
@@ -331,20 +564,48 @@ impl TypedProjection for Bm25Projection {
         lsn: Lsn,
         payload: &IntentPayload,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.apply_typed(lsn, payload)
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        self.apply_typed(lsn, payload).map_err(boxed)?;
+        if self.commit_in_background() {
+            self.committer.record(lsn, true);
+            return Ok(());
+        }
+        self.committer.record(lsn, false);
         self.applies_since_commit += 1;
         if self.commit_due() {
-            self.commit_index()
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-            self.persist()
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            self.commit_index().map_err(boxed)?;
+            self.persist().map_err(boxed)?;
         }
         Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn background_flush(&self) -> Option<Arc<dyn BackgroundFlush>> {
+        Some(Arc::clone(&self.committer) as Arc<dyn BackgroundFlush>)
+    }
+
+    fn stop_background(&mut self, deadline: Instant) -> bool {
+        match std::mem::replace(&mut self.worker, CommitterWorker::Stopped) {
+            CommitterWorker::Running(handle) => {
+                if !self.committer.stop(deadline) {
+                    tracing::warn!(
+                        projection = PROJECTION_NAME,
+                        "BM25 committer still committing at the deadline; detached, it persists \
+                         the checkpoint itself when the commit ends",
+                    );
+                    return false;
+                }
+                if handle.join().is_err() {
+                    tracing::warn!(projection = PROJECTION_NAME, "BM25 committer panicked");
+                }
+                true
+            }
+            CommitterWorker::NotStarted | CommitterWorker::Stopped => {
+                BackgroundFlush::flush(self.committer.as_ref())
+            }
+        }
     }
 }
 
@@ -361,6 +622,7 @@ impl Projection for Bm25Projection {
     fn apply(&mut self, record: &IntentRecord) -> Result<(), Self::Error> {
         let (lsn, payload) = crate::intent_log::payload::decode_record(record)?;
         self.apply_typed(lsn, &payload)?;
+        self.committer.record(lsn, false);
         self.applies_since_commit += 1;
         Ok(())
     }
@@ -387,6 +649,7 @@ impl Projection for Bm25Projection {
 mod tests {
     use super::*;
     use crate::intent_log::{payload::CURRENT_PAYLOAD_SCHEMA_VERSION, replay, IntentLog};
+    use std::time::{Duration, Instant};
 
     /// A payload journaled before 4a54053 carries the old session layout; the projection must
     /// read it the way the store does, or replay stalls at that lsn forever (lsn 12753,
@@ -730,37 +993,172 @@ mod tests {
         assert_eq!(proj.checkpoint(), Some(Lsn(1)));
     }
 
-    /// Below the batch size, the live path commits on the first apply that
-    /// arrives once the last commit is older than the interval; until then
-    /// the documents stay buffered.
+    /// Poll `done` for up to ten seconds; the committer runs on its own thread.
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A live apply only buffers. The committer commits once the last commit is an
+    /// interval old, and the checkpoint it persists names only committed records.
     #[test]
-    fn an_apply_after_the_commit_interval_commits_the_batch() {
+    fn the_committer_commits_after_the_interval_and_persists_after_the_commit() {
         let (bm25_path, _, checkpoint_path) = tmp_paths("commit_interval");
         let (index, ckpt, proj) = open_projection(&bm25_path, &checkpoint_path);
-        let interval = std::time::Duration::from_millis(500);
-        let mut proj = proj.with_commit_interval(interval);
+        let mut proj = proj.with_commit_interval(Duration::from_millis(500));
         index.commit().unwrap();
 
         let first = mk_memory(Uuid::new_v4(), "buffered tamarind entry", &[], &[]);
         TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&first)).unwrap();
         assert!(
             index.has_uncommitted(),
-            "inside the interval nothing commits"
+            "the apply leaves the commit to the committer"
         );
         assert!(index.search("tamarind", 10).unwrap().is_empty());
         assert_eq!(ckpt.lock().get(PROJECTION_NAME), None);
 
-        std::thread::sleep(interval + std::time::Duration::from_millis(100));
         let second = mk_memory(Uuid::new_v4(), "late tamarind entry", &[], &[]);
         TypedProjection::apply(&mut proj, Lsn(1), &remember_payload(&second)).unwrap();
-
-        assert!(!index.has_uncommitted(), "the late apply closed the batch");
-        assert_eq!(index.search("tamarind", 10).unwrap().len(), 2);
-        assert_eq!(
-            ckpt.lock().get(PROJECTION_NAME),
-            Some(Lsn(1)),
-            "the checkpoint is persisted with the commit"
+        wait_for("the checkpoint at lsn 1", || {
+            ckpt.lock().get(PROJECTION_NAME) == Some(Lsn(1))
+        });
+        assert!(
+            !index.has_uncommitted(),
+            "the checkpoint is persisted after the commit that covers it"
         );
+        assert_eq!(index.search("tamarind", 10).unwrap().len(), 2);
+    }
+
+    /// A drain flushes what the committer is still waiting on, without the writer, and
+    /// the writer's shutdown stops the committer.
+    #[test]
+    fn a_drain_flushes_the_committer_through_the_journaled_writer() {
+        let (bm25_path, log_path, checkpoint_path) = tmp_paths("drain");
+        let (index, ckpt, proj) = open_projection(&bm25_path, &checkpoint_path);
+        let proj = proj.with_commit_interval(Duration::from_secs(3600));
+        index.commit().unwrap();
+        let mut writer =
+            crate::intent_log::JournaledWriter::new(IntentLog::open(&log_path).unwrap());
+        writer.add_projection(Box::new(proj));
+
+        let memory = mk_memory(Uuid::new_v4(), "drained quince entry", &[], &[]);
+        let lsn = writer
+            .record_and_apply(&remember_payload(&memory))
+            .unwrap()
+            .lsn;
+        assert!(index.has_uncommitted());
+
+        assert!(writer
+            .deferred_drain_handle()
+            .drain(Duration::from_secs(10)));
+        assert!(!index.has_uncommitted());
+        assert_eq!(index.search("quince", 10).unwrap().len(), 1);
+        assert_eq!(ckpt.lock().get(PROJECTION_NAME), Some(lsn));
+
+        assert!(writer.shutdown_deferred(Duration::from_secs(10)));
+    }
+
+    /// Dropping the projection stops its committer after a final commit.
+    #[test]
+    fn dropping_the_projection_commits_what_it_buffered() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("drop");
+        let (index, ckpt, proj) = open_projection(&bm25_path, &checkpoint_path);
+        let mut proj = proj.with_commit_interval(Duration::from_secs(3600));
+        index.commit().unwrap();
+
+        let memory = mk_memory(Uuid::new_v4(), "persimmon entry", &[], &[]);
+        TypedProjection::apply(&mut proj, Lsn(4), &remember_payload(&memory)).unwrap();
+        assert!(index.has_uncommitted());
+        drop(proj);
+
+        assert!(!index.has_uncommitted());
+        assert_eq!(index.search("persimmon", 10).unwrap().len(), 1);
+        assert_eq!(ckpt.lock().get(PROJECTION_NAME), Some(Lsn(4)));
+    }
+
+    /// After `stop_background` the projection commits on its own thread again, on the
+    /// same cadence: with a zero interval, at every apply.
+    #[test]
+    fn a_stopped_committer_hands_commits_back_to_the_apply() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("stopped");
+        let (index, ckpt, proj) = open_projection(&bm25_path, &checkpoint_path);
+        let mut proj = proj.with_commit_interval(Duration::ZERO);
+
+        let first = mk_memory(Uuid::new_v4(), "first medlar entry", &[], &[]);
+        TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&first)).unwrap();
+        assert!(proj.stop_background(Instant::now() + Duration::from_secs(10)));
+        assert_eq!(ckpt.lock().get(PROJECTION_NAME), Some(Lsn(0)));
+
+        let second = mk_memory(Uuid::new_v4(), "second medlar entry", &[], &[]);
+        TypedProjection::apply(&mut proj, Lsn(1), &remember_payload(&second)).unwrap();
+        assert!(
+            !index.has_uncommitted(),
+            "committed inline, before apply returned"
+        );
+        assert_eq!(ckpt.lock().get(PROJECTION_NAME), Some(Lsn(1)));
+        assert_eq!(index.search("medlar", 10).unwrap().len(), 2);
+    }
+
+    fn update_payload(memory: &Memory) -> IntentPayload {
+        let bytes = bincode::serde::encode_to_vec(memory, bincode::config::standard()).unwrap();
+        IntentPayload::Update {
+            user_id: "alice".into(),
+            memory_id: memory.id.0.to_string(),
+            memory_bincode: bytes,
+            schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+        }
+    }
+
+    /// An `Update` that leaves content, tags and entities as indexed writes nothing to
+    /// the index yet still advances the checkpoint; one that changes them, or forgets
+    /// the memory, is applied.
+    #[test]
+    fn an_update_with_unchanged_text_writes_nothing() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("unchanged_update");
+        let (index, _ckpt, mut proj) = open_projection(&bm25_path, &checkpoint_path);
+
+        let mut memory = mk_memory(
+            Uuid::new_v4(),
+            "loquat orchard notes",
+            &["fruit"],
+            &["Loquat"],
+        );
+        Projection::apply(&mut proj, &record_of(Lsn(0), &remember_payload(&memory))).unwrap();
+        Projection::persist_checkpoint(&mut proj).unwrap();
+        assert!(!index.has_uncommitted());
+
+        memory.experience.embeddings = Some(vec![0.25; 8]);
+        Projection::apply(&mut proj, &record_of(Lsn(1), &update_payload(&memory))).unwrap();
+        assert!(
+            !index.has_uncommitted(),
+            "an embedding-only update leaves the index alone"
+        );
+        assert_eq!(proj.checkpoint(), Some(Lsn(1)));
+
+        memory.experience.tags.push("orchard".to_string());
+        Projection::apply(&mut proj, &record_of(Lsn(2), &update_payload(&memory))).unwrap();
+        assert!(index.has_uncommitted(), "a tag change is re-indexed");
+        Projection::persist_checkpoint(&mut proj).unwrap();
+
+        memory
+            .experience
+            .metadata
+            .insert("forgotten".to_string(), "true".to_string());
+        Projection::apply(&mut proj, &record_of(Lsn(3), &update_payload(&memory))).unwrap();
+        Projection::persist_checkpoint(&mut proj).unwrap();
+        assert_eq!(index.len(), 0, "a forgotten snapshot leaves the index");
+        assert!(index.search("loquat", 10).unwrap().is_empty());
+    }
+
+    /// The record the replay driver would hand the projection for `payload` at `lsn`.
+    fn record_of(lsn: Lsn, payload: &IntentPayload) -> IntentRecord {
+        IntentRecord {
+            lsn,
+            payload: crate::intent_log::payload::encode(payload).unwrap(),
+        }
     }
 
     /// A search-side `commit_pending` commits what the projection buffered;
@@ -893,6 +1291,27 @@ mod tests {
             "engine sharing the projection's Arc<BM25Index> must see committed writes"
         );
         assert_eq!(hits[0].0, MemoryId(id));
+    }
+
+    /// A search keeps read-your-writes by default: it commits the write the committer is
+    /// still holding. Under a staleness bound it leaves a younger write to the committer.
+    #[test]
+    fn the_read_commit_honours_the_staleness_bound() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("read_staleness");
+        let (index, _ckpt, proj) = open_projection(&bm25_path, &checkpoint_path);
+        let mut proj = proj.with_commit_interval(Duration::from_secs(3600));
+        index.commit().unwrap();
+        let engine = open_engine_sharing(index.clone());
+
+        let memory = mk_memory(Uuid::new_v4(), "jujube harvest", &[], &[]);
+        TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&memory)).unwrap();
+
+        assert!(!engine
+            .commit_for_read(Some(Duration::from_secs(3600)))
+            .unwrap());
+        assert!(engine.bm25_index().search("jujube", 10).unwrap().is_empty());
+        assert!(engine.commit_for_read(None).unwrap());
+        assert_eq!(engine.bm25_index().search("jujube", 10).unwrap().len(), 1);
     }
 
     /// Idempotency at the unified boundary: applying the same

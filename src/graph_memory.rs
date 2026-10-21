@@ -4067,12 +4067,19 @@ impl GraphMemory {
             }
         }
 
+        let keys: Vec<&[u8]> = edge_uuids
+            .iter()
+            .map(|uuid| uuid.as_bytes().as_slice())
+            .collect();
         let mut edges = Vec::with_capacity(edge_uuids.len());
-        for edge_uuid in &edge_uuids {
-            if let Some(bytes) = self.store.get_cf(CF_RELATIONSHIPS, edge_uuid.as_bytes())? {
-                if let Ok(edge) = RelationshipEdge::decode(&bytes) {
-                    edges.push(edge);
-                }
+        for bytes in self
+            .store
+            .multi_get_cf(CF_RELATIONSHIPS, &keys)?
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(edge) = RelationshipEdge::decode(&bytes) {
+                edges.push(edge);
             }
         }
         Ok(edges)
@@ -4165,18 +4172,15 @@ impl GraphMemory {
                                 .unwrap_or_default()
                         });
                     }
-                    edges[start..end].sort_by(|(a, _), (b, _)| {
-                        peer_names[&peer_of(a)]
-                            .cmp(&peer_names[&peer_of(b)])
-                            .then_with(|| {
-                                format!("{:?}", a.relation_type)
-                                    .cmp(&format!("{:?}", b.relation_type))
-                            })
-                            .then_with(|| {
-                                (b.from_entity == *entity_uuid)
-                                    .cmp(&(a.from_entity == *entity_uuid))
-                            })
-                            .then_with(|| a.uuid.cmp(&b.uuid))
+                    // Keys built once per edge, not twice per comparison. Outgoing edges
+                    // (`from_entity` is this entity) sort before incoming ones.
+                    edges[start..end].sort_by_cached_key(|(e, _)| {
+                        (
+                            peer_names[&peer_of(e)].clone(),
+                            format!("{:?}", e.relation_type),
+                            e.from_entity != *entity_uuid,
+                            e.uuid,
+                        )
                     });
                 }
                 start = end;
@@ -11975,6 +11979,57 @@ mod repeat_stable_order_tests {
             peers,
             ["zz-strong", "peer-00", "peer-01", "peer-02", "peer-03"],
             "strength first, then peer name; edge uuids must not choose the survivors"
+        );
+    }
+
+    /// Equal-strength edges to one peer are ordered by relation type, and every stored
+    /// edge comes back through the batched read.
+    #[test]
+    fn equal_strength_edges_to_one_peer_follow_relation_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let hub = graph.add_entity(entity("hub", 0.5)).unwrap();
+        let pine = graph.add_entity(entity("pine", 0.5)).unwrap();
+        let alder = graph.add_entity(entity("alder", 0.5)).unwrap();
+        let typed = |from: Uuid, to: Uuid, relation_type: RelationType| RelationshipEdge {
+            relation_type,
+            ..edge(from, to, 0.3)
+        };
+        graph
+            .add_relationship(typed(hub, pine, RelationType::WorksWith))
+            .unwrap();
+        graph
+            .add_relationship(typed(pine, hub, RelationType::Uses))
+            .unwrap();
+        graph
+            .add_relationship(typed(hub, pine, RelationType::RelatedTo))
+            .unwrap();
+        graph
+            .add_relationship(typed(hub, alder, RelationType::RelatedTo))
+            .unwrap();
+
+        assert_eq!(graph.stored_entity_relationships(&hub).unwrap().len(), 4);
+        let order: Vec<(Uuid, RelationType)> = graph
+            .get_entity_relationships_limited(&hub, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| {
+                let peer = if e.from_entity == hub {
+                    e.to_entity
+                } else {
+                    e.from_entity
+                };
+                (peer, e.relation_type)
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (alder, RelationType::RelatedTo),
+                (pine, RelationType::RelatedTo),
+                (pine, RelationType::Uses),
+                (pine, RelationType::WorksWith),
+            ]
         );
     }
 

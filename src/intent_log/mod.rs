@@ -115,7 +115,8 @@ pub mod reseal;
 pub use checkpoint_store::{CheckpointStore, CheckpointStoreError};
 pub use header::{HeaderError, IntentLogHeader, CURRENT_FORMAT_VERSION, HEADER_BYTES, MAGIC};
 pub use journal::{
-    ApplyError, JournalError, JournaledWriter, SharedJournal, TypedProjection, WriteOutcome,
+    ApplyError, BackgroundFlush, JournalError, JournaledWriter, SharedJournal, TypedProjection,
+    WriteOutcome,
 };
 pub use migrations::{migrate_payload, MigrationError};
 pub use payload::{IntentPayload, PayloadError};

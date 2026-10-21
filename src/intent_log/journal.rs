@@ -51,6 +51,14 @@
 //!   and [`DeferredDrainHandle::drain`] wait, bounded, for the queue to
 //!   empty and then persist the checkpoint.
 //!
+//! ## Background work of inline projections
+//!
+//! An inline projection may apply each record inside `record_and_apply` but
+//! leave making it durable to a thread of its own (the BM25 projection's
+//! committer), exposed as a [`BackgroundFlush`]. [`DeferredDrainHandle::drain`]
+//! flushes that work too, and [`JournaledWriter::shutdown_deferred`] stops it
+//! through [`TypedProjection::stop_background`].
+//!
 //! ## Offset hints
 //!
 //! With a checkpoint store attached ([`JournaledWriter::attach_checkpoint_store`])
@@ -142,6 +150,28 @@ pub trait TypedProjection: Send {
     fn flush_checkpoint(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
     }
+
+    /// A handle that makes durable, without the writer's mutex, what this
+    /// projection has applied but left to background work. `None` for a
+    /// projection that finishes its work inside `apply`.
+    fn background_flush(&self) -> Option<Arc<dyn BackgroundFlush>> {
+        None
+    }
+
+    /// Stop the projection's background work, making what it has applied
+    /// durable first; later applies do that work inline. Returns `false` if the
+    /// work had not stopped by `deadline`.
+    fn stop_background(&mut self, _deadline: Instant) -> bool {
+        true
+    }
+}
+
+/// Background work of an inline projection, made durable on demand from
+/// outside the writer's mutex. See [`TypedProjection::background_flush`].
+pub trait BackgroundFlush: Send + Sync {
+    /// Make every record applied so far durable. Returns `false` when that
+    /// failed; the failure is logged and replay recovers the records.
+    fn flush(&self) -> bool;
 }
 
 /// Tuning for one deferred projection's queue.
@@ -459,11 +489,13 @@ impl DeferredLane {
 #[derive(Clone)]
 pub struct DeferredDrainHandle {
     lanes: Vec<Arc<LaneShared>>,
+    background: Vec<Arc<dyn BackgroundFlush>>,
 }
 
 impl DeferredDrainHandle {
     /// Wait until every deferred queue is empty, then persist each
-    /// projection's checkpoint. Returns `false` if `timeout` passed first.
+    /// projection's checkpoint, and flush the inline projections' background
+    /// work. Returns `false` if `timeout` passed first or a flush failed.
     pub fn drain(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut drained = true;
@@ -477,6 +509,9 @@ impl DeferredDrainHandle {
                 );
             }
             lane.flush(deadline);
+        }
+        for background in &self.background {
+            drained &= background.flush();
         }
         drained
     }
@@ -657,18 +692,27 @@ impl JournaledWriter {
                 .iter()
                 .map(|lane| Arc::clone(&lane.shared))
                 .collect(),
+            background: self
+                .projections
+                .iter()
+                .filter_map(|p| p.background_flush())
+                .collect(),
         }
     }
 
     /// Drain every deferred queue (bounded by `timeout`), persist the
-    /// checkpoints and stop the workers. Records journaled afterwards apply
-    /// inline. Returns `false` if a queue was still non-empty at the
-    /// deadline; those records are recovered by replay on the next open.
+    /// checkpoints and stop the workers, the inline projections' background
+    /// work included. Records journaled afterwards apply inline. Returns
+    /// `false` if a queue was still non-empty or background work still running
+    /// at the deadline; those records are recovered by replay on the next open.
     pub fn shutdown_deferred(&mut self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut drained = true;
         for lane in &mut self.deferred {
             drained &= lane.shutdown(deadline);
+        }
+        for projection in &mut self.projections {
+            drained &= projection.stop_background(deadline);
         }
         drained
     }

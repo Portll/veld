@@ -500,6 +500,36 @@ pub struct BM25Index {
     uncommitted: AtomicU64,
     /// When the writer last committed, from any caller.
     last_commit: parking_lot::Mutex<Instant>,
+    /// When the oldest change still buffered in the writer was made; `None` when nothing
+    /// is buffered. Only changed while the writer lock is held.
+    oldest_uncommitted: parking_lot::Mutex<Option<Instant>>,
+    /// Fingerprint of the text each recently written memory was indexed with, so a writer
+    /// can skip a rewrite that would index the same text again. Bounded: a memory not
+    /// held here is rewritten. Only changed while the writer lock is held.
+    indexed_text: parking_lot::Mutex<lru::LruCache<uuid::Uuid, [u8; 16]>>,
+}
+
+/// Memories whose indexed-text fingerprint a [`BM25Index`] keeps.
+const INDEXED_TEXT_CAPACITY: usize = 16_384;
+
+/// Fingerprint of the text BM25 indexes for a memory. Each part is length-prefixed, so
+/// two different tag or entity lists never share one.
+fn indexed_text_fingerprint(content: &str, tags: &[String], entities: &[String]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((content.len() as u64).to_le_bytes());
+    hasher.update(content.as_bytes());
+    for list in [tags, entities] {
+        hasher.update((list.len() as u64).to_le_bytes());
+        for item in list {
+            hasher.update((item.len() as u64).to_le_bytes());
+            hasher.update(item.as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let mut fingerprint = [0u8; 16];
+    fingerprint.copy_from_slice(&digest[..16]);
+    fingerprint
 }
 
 impl BM25Index {
@@ -625,6 +655,11 @@ impl BM25Index {
             in_memory,
             uncommitted: AtomicU64::new(0),
             last_commit: parking_lot::Mutex::new(Instant::now()),
+            oldest_uncommitted: parking_lot::Mutex::new(None),
+            indexed_text: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(INDEXED_TEXT_CAPACITY)
+                    .expect("INDEXED_TEXT_CAPACITY is not zero"),
+            )),
         })
     }
 
@@ -637,7 +672,43 @@ impl BM25Index {
         entities: &[String],
     ) -> Result<()> {
         let writer = self.writer.write();
+        self.upsert_locked(
+            &writer,
+            memory_id,
+            content,
+            tags,
+            entities,
+            indexed_text_fingerprint(content, tags, entities),
+        )
+    }
 
+    /// [`Self::upsert`], unless the last write of `memory_id` this index remembers indexed
+    /// exactly this text, in which case nothing is written. Returns whether it wrote.
+    pub fn upsert_if_changed(
+        &self,
+        memory_id: &MemoryId,
+        content: &str,
+        tags: &[String],
+        entities: &[String],
+    ) -> Result<bool> {
+        let fingerprint = indexed_text_fingerprint(content, tags, entities);
+        let writer = self.writer.write();
+        if self.indexed_text.lock().get(&memory_id.0) == Some(&fingerprint) {
+            return Ok(false);
+        }
+        self.upsert_locked(&writer, memory_id, content, tags, entities, fingerprint)?;
+        Ok(true)
+    }
+
+    fn upsert_locked(
+        &self,
+        writer: &IndexWriter,
+        memory_id: &MemoryId,
+        content: &str,
+        tags: &[String],
+        entities: &[String],
+        fingerprint: [u8; 16],
+    ) -> Result<()> {
         // Delete existing document with this ID
         let id_term = tantivy::Term::from_field_text(self.id_field, &memory_id.0.to_string());
         writer.delete_term(id_term);
@@ -650,8 +721,15 @@ impl BM25Index {
         doc.add_text(self.tags_field, tags.join(" "));
         doc.add_text(self.entities_field, entities.join(" "));
 
-        writer.add_document(doc)?;
-        self.uncommitted.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = writer.add_document(doc) {
+            // The delete above is buffered, so whatever this index held for the memory
+            // is no longer known.
+            self.indexed_text.lock().pop(&memory_id.0);
+            self.note_buffered();
+            return Err(e.into());
+        }
+        self.indexed_text.lock().put(memory_id.0, fingerprint);
+        self.note_buffered();
 
         Ok(())
     }
@@ -661,24 +739,35 @@ impl BM25Index {
         let writer = self.writer.write();
         let id_term = tantivy::Term::from_field_text(self.id_field, &memory_id.0.to_string());
         writer.delete_term(id_term);
-        self.uncommitted.fetch_add(1, Ordering::Relaxed);
+        self.indexed_text.lock().pop(&memory_id.0);
+        self.note_buffered();
         Ok(())
+    }
+
+    /// Count one change buffered in the writer. Called with the writer lock held.
+    fn note_buffered(&self) {
+        self.uncommitted.fetch_add(1, Ordering::Relaxed);
+        self.oldest_uncommitted
+            .lock()
+            .get_or_insert_with(Instant::now);
     }
 
     /// Commit pending changes to disk
     pub fn commit(&self) -> Result<()> {
         let mut writer = self.writer.write();
-        Self::commit_locked(&mut writer, &self.uncommitted, &self.last_commit)
+        self.commit_locked(&mut writer)
     }
 
-    fn commit_locked(
-        writer: &mut IndexWriter,
-        uncommitted: &AtomicU64,
-        last_commit: &parking_lot::Mutex<Instant>,
-    ) -> Result<()> {
-        writer.commit().context("Failed to commit BM25 index")?;
-        uncommitted.store(0, Ordering::Relaxed);
-        *last_commit.lock() = Instant::now();
+    fn commit_locked(&self, writer: &mut IndexWriter) -> Result<()> {
+        if let Err(e) = writer.commit() {
+            // What the writer holds after a failed commit is not known, so no fingerprint
+            // may vouch for it.
+            self.indexed_text.lock().clear();
+            return Err(e).context("Failed to commit BM25 index");
+        }
+        self.uncommitted.store(0, Ordering::Relaxed);
+        *self.oldest_uncommitted.lock() = None;
+        *self.last_commit.lock() = Instant::now();
         Ok(())
     }
 
@@ -693,6 +782,21 @@ impl BM25Index {
         self.last_commit.lock().elapsed()
     }
 
+    /// How long the oldest change still buffered has waited for a commit; `None` when
+    /// nothing is buffered.
+    pub fn oldest_uncommitted_age(&self) -> Option<Duration> {
+        self.oldest_uncommitted.lock().map(|at| at.elapsed())
+    }
+
+    /// [`Self::commit_pending`], when the oldest buffered change is at least `age` old.
+    /// Younger changes stay buffered. Returns whether a commit ran.
+    pub fn commit_pending_older_than(&self, age: Duration) -> Result<bool> {
+        match self.oldest_uncommitted_age() {
+            Some(waited) if waited >= age => self.commit_pending(),
+            _ => Ok(false),
+        }
+    }
+
     /// Commit and reload the reader if anything is buffered; returns whether
     /// a commit ran. The check is repeated under the writer lock so that
     /// concurrent callers racing on one batch produce a single commit.
@@ -705,7 +809,7 @@ impl BM25Index {
             if self.uncommitted.load(Ordering::Relaxed) == 0 {
                 return Ok(false);
             }
-            Self::commit_locked(&mut writer, &self.uncommitted, &self.last_commit)?;
+            self.commit_locked(&mut writer)?;
         }
         self.reload()?;
         Ok(true)
@@ -1402,12 +1506,19 @@ impl HybridSearchEngine {
         Ok(())
     }
 
-    /// Commit and reload only if documents are buffered. Writes journaled
-    /// through the intent log reach the index via the BM25 projection, which
-    /// commits in batches; a search calls this first so a memory written by
-    /// the caller is keyword-findable on its next recall.
-    pub fn commit_pending(&self) -> Result<bool> {
-        self.bm25_index.commit_pending().inspect_err(|_| {
+    /// Commit buffered writes before a read of the BM25 index. Writes journaled through
+    /// the intent log reach the index via the BM25 projection, whose background committer
+    /// commits them in batches. With `staleness` `None` every buffered write is committed,
+    /// so a memory is keyword-findable on the first recall after its write. With
+    /// `Some(age)` only writes buffered at least `age` are; younger ones are left to the
+    /// committer, so a recall can miss the keyword match of a memory written less than
+    /// that long ago.
+    pub fn commit_for_read(&self, staleness: Option<Duration>) -> Result<bool> {
+        let committed = match staleness {
+            None => self.bm25_index.commit_pending(),
+            Some(age) => self.bm25_index.commit_pending_older_than(age),
+        };
+        committed.inspect_err(|_| {
             self.bm25_commit_failures
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         })
@@ -1702,7 +1813,11 @@ impl HybridSearchEngine {
             .and_then(|d| d.candidate_count)
             .unwrap_or(self.config.candidate_count);
 
-        if let Err(e) = self.commit_pending() {
+        let staleness = dial
+            .as_ref()
+            .and_then(|d| d.bm25_read_staleness_ms)
+            .map(Duration::from_millis);
+        if let Err(e) = self.commit_for_read(staleness) {
             tracing::warn!(error = %e, "BM25 commit before search failed; buffered writes are not yet searchable");
         }
 
@@ -2002,6 +2117,62 @@ mod tests {
             Some(id)
         );
         assert!(!path.exists(), "indexing wrote nothing to disk");
+    }
+
+    /// `upsert_if_changed` writes only text the index does not already hold for the
+    /// memory; a delete forgets what it held.
+    #[test]
+    fn an_upsert_of_the_text_already_indexed_writes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let index = BM25Index::new(&home.path().join("bm25")).unwrap();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        let tags = vec!["fruit".to_string()];
+        index.upsert(&id, "a ripe quince", &tags, &[]).unwrap();
+        index.commit().unwrap();
+
+        assert!(!index
+            .upsert_if_changed(&id, "a ripe quince", &tags, &[])
+            .unwrap());
+        assert!(!index.has_uncommitted(), "nothing was buffered");
+
+        let more_tags = vec!["fruit".to_string(), "autumn".to_string()];
+        assert!(index
+            .upsert_if_changed(&id, "a ripe quince", &more_tags, &[])
+            .unwrap());
+        // Tags joined the same way are still a different list.
+        let joined = vec!["fruit autumn".to_string()];
+        assert!(index
+            .upsert_if_changed(&id, "a ripe quince", &joined, &[])
+            .unwrap());
+
+        index.delete(&id).unwrap();
+        assert!(index
+            .upsert_if_changed(&id, "a ripe quince", &joined, &[])
+            .unwrap());
+        index.commit().unwrap();
+        index.reload().unwrap();
+        assert_eq!(index.len(), 1);
+    }
+
+    /// A read with a staleness bound commits only writes buffered longer than it.
+    #[test]
+    fn a_bounded_read_commit_leaves_younger_writes_buffered() {
+        let home = tempfile::tempdir().unwrap();
+        let index = BM25Index::new(&home.path().join("bm25")).unwrap();
+        assert_eq!(index.oldest_uncommitted_age(), None);
+        index
+            .upsert(&MemoryId(uuid::Uuid::new_v4()), "fresh damson", &[], &[])
+            .unwrap();
+        assert!(index.oldest_uncommitted_age().is_some());
+
+        assert!(!index
+            .commit_pending_older_than(Duration::from_secs(3600))
+            .unwrap());
+        assert!(index.has_uncommitted());
+        assert!(index.commit_pending_older_than(Duration::ZERO).unwrap());
+        assert!(!index.has_uncommitted());
+        assert_eq!(index.oldest_uncommitted_age(), None);
+        assert_eq!(index.search("damson", 5).unwrap().len(), 1);
     }
     use crate::storage::KeyValueStore;
 

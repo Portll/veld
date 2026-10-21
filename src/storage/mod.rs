@@ -342,6 +342,14 @@ pub trait ColumnStore: Send + Sync {
     /// something wrote it, and a read cannot tell those apart from an empty family.
     /// Writes name a family that must exist; see [`Self::ensure_cf`].
     fn get_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
+
+    /// [`Self::get_cf`] for every key in `keys`, values in the same order. The first read
+    /// that fails fails the whole call, as a loop of `get_cf` with `?` would. Engines
+    /// override it to read the batch in one pass; this default reads one key at a time.
+    fn multi_get_cf(&self, cf: &str, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        keys.iter().map(|key| self.get_cf(cf, key)).collect()
+    }
+
     fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete_cf(&self, cf: &str, key: &[u8]) -> Result<()>;
 
@@ -504,6 +512,13 @@ pub trait PrimaryMemoryStore: Send + Sync {
     //    exactly: an alias that "tidies" one of these changes behaviour at a call
     //    site that will not look any different.
     fn get(&self, id: &MemoryId) -> Result<Memory>;
+    /// [`Self::get`] for every id in `ids`, results in the same order, each exactly what
+    /// `get` returns for that id: the same record, forgotten ones included, and the same
+    /// not-found error. Engines override it to read the batch in one pass; this default
+    /// reads one id at a time.
+    fn get_many(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
+        ids.iter().map(|id| self.get(id)).collect()
+    }
     fn store(&self, memory: &Memory) -> Result<()>;
     fn update(&self, memory: &Memory) -> Result<()>;
     /// [`Self::update`] for many memories as one atomic write: every record and its
@@ -831,7 +846,7 @@ mod backend_coverage_matrix {
         )
     }
 
-    /// Calls all 46 trait methods and returns (name, outcome), sorted.
+    /// Calls all 47 trait methods and returns (name, outcome), sorted.
     fn matrix(s: &dyn PrimaryMemoryStore) -> Vec<(&'static str, Outcome)> {
         let m = a_memory();
         let id = m.id.clone();
@@ -864,6 +879,14 @@ mod backend_coverage_matrix {
             ),
             ("flush", probe(|| s.flush())),
             ("get", probe(|| s.get(&id))),
+            (
+                "get_many",
+                probe(|| {
+                    s.get_many(std::slice::from_ref(&id))
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()
+                }),
+            ),
             ("store", probe(|| s.store(&m))),
             ("update", probe(|| s.update(&m))),
             ("get_all", probe(|| s.get_all())),
@@ -991,7 +1014,7 @@ mod backend_coverage_matrix {
 
         let r = matrix(&rocks);
         let b = matrix(&redb);
-        assert_eq!(r.len(), 46, "the matrix must cover every trait method");
+        assert_eq!(r.len(), 47, "the matrix must cover every trait method");
         assert_eq!(r.len(), b.len());
 
         let rocks_ok = r.iter().filter(|(_, o)| *o == Outcome::Works).count();
@@ -1004,7 +1027,7 @@ mod backend_coverage_matrix {
             .collect();
 
         eprintln!(
-            "COVERAGE  rocksdb {rocks_ok}/46   redb {redb_ok}/46   gap {}",
+            "COVERAGE  rocksdb {rocks_ok}/47   redb {redb_ok}/47   gap {}",
             gap.len()
         );
         for name in &gap {
@@ -1019,7 +1042,7 @@ mod backend_coverage_matrix {
         );
         assert_eq!(
             gap.len(),
-            46 - redb_ok,
+            47 - redb_ok,
             "a redb method failed that rocksdb also fails — the gap list is not the whole story"
         );
         // ADR 0007: redb implements every trait method. A capability added for RocksDB alone
@@ -1069,6 +1092,21 @@ mod column_store_conformance {
         note(
             "get alpha/missing",
             format!("{:?}", s.get_cf("alpha", b"nope").unwrap()),
+        );
+        let keys: [&[u8]; 4] = [b"k2", b"nope", b"k1", b"k2"];
+        let batch = s.multi_get_cf("alpha", &keys).unwrap();
+        let single: Vec<_> = keys
+            .iter()
+            .map(|key| s.get_cf("alpha", key).unwrap())
+            .collect();
+        assert_eq!(
+            batch, single,
+            "multi_get_cf answers as get_cf does, in order"
+        );
+        note("multi_get alpha", format!("{batch:?}"));
+        note(
+            "multi_get absent family",
+            format!("{:?}", s.multi_get_cf("delta", &keys).unwrap()),
         );
 
         s.put_cf("alpha", b"pre:a", b"1").unwrap();
@@ -1214,6 +1252,11 @@ mod column_store_conformance {
             "families are not isolated — the same key read back the other family's value"
         );
         assert_eq!(find("get alpha/missing"), "None");
+        assert_eq!(
+            find("multi_get alpha"),
+            "[Some([118, 50]), None, Some([118, 49]), Some([118, 50])]"
+        );
+        assert_eq!(find("multi_get absent family"), "[None, None, None, None]");
         assert_eq!(find("scan prefix"), "[[112, 114, 101, 58, 97], [112, 114, 101, 58, 98]]",
             "the prefix scan did not return exactly the two pre: keys — `qqq` sorts after them and \
              must not be included");
@@ -1226,5 +1269,102 @@ mod column_store_conformance {
         );
         assert_eq!(find("after batch alpha/k2 deleted"), "None");
         assert_eq!(find("after delete alpha/k1"), "None");
+    }
+}
+
+#[cfg(test)]
+mod get_many_matches_get {
+    //! `get_many` is `get` for a batch: the same answer per id, in the order asked, on
+    //! every engine.
+    use super::*;
+    use crate::memory::types::Experience;
+
+    fn memory(content: &str) -> Memory {
+        Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                content: content.into(),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn outcome(result: &Result<Memory>) -> String {
+        match result {
+            Ok(m) => format!(
+                "ok {} {:?} forgotten={}",
+                m.id.0,
+                m.experience.content,
+                m.is_forgotten()
+            ),
+            Err(e) => format!("err {e:#}"),
+        }
+    }
+
+    /// Present, missing and forgotten ids, one repeated, against a loop of single gets.
+    fn check(store: &dyn PrimaryMemoryStore) {
+        let live = memory("a live record");
+        let other = memory("another live record");
+        let mut forgotten = memory("a forgotten record");
+        forgotten
+            .experience
+            .metadata
+            .insert("forgotten".to_string(), "true".to_string());
+        for m in [&live, &other, &forgotten] {
+            store.store(m).unwrap();
+        }
+        let missing = MemoryId(uuid::Uuid::new_v4());
+        let ids = vec![
+            other.id.clone(),
+            missing.clone(),
+            forgotten.id.clone(),
+            live.id.clone(),
+            missing,
+            other.id.clone(),
+        ];
+
+        let batch: Vec<String> = store.get_many(&ids).iter().map(outcome).collect();
+        let single: Vec<String> = ids.iter().map(|id| outcome(&store.get(id))).collect();
+        assert_eq!(batch, single);
+        assert!(batch[0].starts_with(&format!("ok {}", other.id.0)));
+        assert!(
+            batch[1].starts_with("err ") && batch[1].contains("Memory not found"),
+            "{}",
+            batch[1]
+        );
+        assert!(
+            batch[2].ends_with("forgotten=true"),
+            "a forgotten record comes back as get returns it: {}",
+            batch[2]
+        );
+        assert!(batch[3].starts_with(&format!("ok {}", live.id.0)));
+        assert_eq!(batch[0], batch[5]);
+        assert!(store.get_many(&[]).is_empty());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_get_many_answers_as_single_gets_do() {
+        let td = tempfile::tempdir().unwrap();
+        let store = crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::open(
+            &td.path().join("rocks"),
+            None,
+        )
+        .unwrap();
+        check(&store);
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[test]
+    fn redb_get_many_answers_as_single_gets_do() {
+        let td = tempfile::tempdir().unwrap();
+        let store =
+            crate::storage::redb::RedbPrimaryMemoryStore::open(&td.path().join("redb")).unwrap();
+        check(&store);
     }
 }
