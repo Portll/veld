@@ -114,6 +114,12 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
         .build()
         .expect("Failed to build tokio runtime");
     let result = runtime.block_on(async_main(file_limit));
+    // The gap between "Server shutdown complete" and exit was 10.2 s on 2026-10-20 and
+    // 4.5 s on 2026-10-21 with nothing in flight. These two lines split it: up to the
+    // first is async_main dropping its state (tenant stores close here), between them
+    // is blocking work outliving the drain, after the second is process teardown.
+    let stopping = std::time::Instant::now();
+    info!("Shutdown sequence returned; stopping the runtime");
     // Dropping a runtime waits without limit for blocking work still running. On
     // 2026-10-18 a SlowStore sync and a gap detection kept the process alive 3 min 23 s
     // after "Server shutdown complete". Stores are flushed by now; give stragglers a
@@ -122,6 +128,11 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
     runtime.shutdown_timeout(std::time::Duration::from_secs(
         RUNTIME_SHUTDOWN_TIMEOUT_SECS,
     ));
+    info!(
+        waited_ms = stopping.elapsed().as_millis() as u64,
+        bound_ms = RUNTIME_SHUTDOWN_TIMEOUT_SECS * 1000,
+        "Runtime stopped"
+    );
     result
 }
 
