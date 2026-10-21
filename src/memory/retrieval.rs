@@ -1418,6 +1418,13 @@ impl RetrievalEngine {
         Ok(vector_ids)
     }
 
+    /// Drop the memory from every index and add back only its vectors in spaces other than the
+    /// primary's: for a memory whose primary vector is still to come.
+    pub fn reindex_other_spaces(&self, memory: &Memory) {
+        self.remove_memory(&memory.id);
+        self.index_other_spaces(memory);
+    }
+
     /// Add the memory's vector in every other space that has an index, recording any space
     /// whose index refused it.
     fn index_other_spaces(&self, memory: &Memory) {

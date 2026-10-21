@@ -153,6 +153,17 @@ pub fn resolve(stored: Option<&SpaceId>, len: usize, assumed: Option<&SpaceId>) 
     }
 }
 
+/// How an instance reads a vector slot that records no space: its primary index's space for the
+/// primary slot, its secondary index's for the secondary. A replication leader sends its own
+/// with every page, so a follower with another embedder does not read the leader's vectors as
+/// its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotSpaces {
+    pub primary: SpaceId,
+    #[serde(default)]
+    pub secondary: Option<SpaceId>,
+}
+
 /// The space registry beside a tenant's corpus markers: every space the corpus holds, read by
 /// `veld doctor` and anything else that must not open the store to ask.
 pub const REGISTRY_FILE: &str = ".veld_spaces.json";
