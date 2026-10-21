@@ -44,9 +44,9 @@ enum Suite {
     /// gold evidence dia-ids (snap-research/locomo). It contains every gate
     /// question, so it measures fit as well as generalisation. Not gated.
     Locomo,
-    /// `Locomo` without the gate's conversation: 5,253 turns, 1,332 questions
-    /// over nine conversations nothing is tuned against. The number to report.
-    /// Not gated.
+    /// `Locomo` without the gate's conversation (5,253 turns over nine
+    /// conversations) and without the cases in `locomo-holdout-spent.txt`.
+    /// Nothing is tuned against it; the number to report. Not gated.
     LocomoHoldout,
     /// LoCoMo-100 fast CI gate — 100 real LoCoMo cases against one
     /// conversation's 629-turn corpus. The per-PR recall-regression gate that
