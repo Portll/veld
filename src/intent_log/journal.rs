@@ -135,7 +135,7 @@ pub trait TypedProjection: Send {
     /// Downcast hook. Lets a holder of `&dyn TypedProjection` recover the
     /// concrete projection type — e.g. the W6 query planner reaching a
     /// live `VamanaProjection`'s ANN index through the writer that owns
-    /// it. Every impl is the one-liner `{ self }`.
+    /// it, inline or deferred. Every impl is the one-liner `{ self }`.
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Never persist a checkpoint at or beyond `lsn` for the rest of this
@@ -517,6 +517,23 @@ impl DeferredDrainHandle {
     }
 }
 
+/// A deferred projection reached for reading without holding the writer.
+/// See [`JournaledWriter::deferred_projection`].
+#[derive(Clone)]
+pub struct DeferredProjection {
+    lane: Arc<LaneShared>,
+}
+
+impl DeferredProjection {
+    /// Run `read` against the projection. Waits for an apply in progress to
+    /// finish and holds the next one off until `read` returns. The projection
+    /// holds every record up to the last one its worker applied, which may
+    /// trail what has been journaled by the records still queued.
+    pub fn read<R>(&self, read: impl FnOnce(&dyn TypedProjection) -> R) -> R {
+        read(self.lane.projection.lock().as_ref())
+    }
+}
+
 /// Errors raised by [`JournaledWriter::record_and_apply`].
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -723,12 +740,26 @@ impl JournaledWriter {
     /// planner's vector adapter) to reach a live projection's state
     /// without owning it — the projections live here, behind the
     /// writer's mutex, for the lifetime of the tenant. Deferred projections
-    /// live behind their worker's lock and are not reachable here.
+    /// live behind their worker's lock; reach them with
+    /// [`Self::deferred_projection`].
     pub fn projection_by_name(&self, name: &str) -> Option<&dyn TypedProjection> {
         self.projections
             .iter()
             .find(|p| p.name() == name)
             .map(|p| p.as_ref())
+    }
+
+    /// An attached deferred projection by its [`TypedProjection::name`]. The
+    /// handle outlives the borrow of the writer, so the caller can release
+    /// the writer's mutex before [`DeferredProjection::read`] waits on the
+    /// projection's worker.
+    pub fn deferred_projection(&self, name: &str) -> Option<DeferredProjection> {
+        self.deferred
+            .iter()
+            .find(|lane| lane.shared.name == name)
+            .map(|lane| DeferredProjection {
+                lane: Arc::clone(&lane.shared),
+            })
     }
 
     /// Borrow the underlying log read-only. Useful for diagnostics —
