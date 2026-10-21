@@ -2,7 +2,7 @@
 //!
 //! Provides optimized distance calculations for vector similarity search.
 //! Supports:
-//! - x86-64: AVX2 + FMA instructions
+//! - x86-64: AVX2 + FMA instructions, chosen at runtime (see [`active_kernel`])
 //! - ARM64: NEON instructions (Apple Silicon, ARM servers)
 //! - Fallback: Scalar with loop unrolling
 //!
@@ -17,10 +17,78 @@ use std::arch::x86_64::*;
 use std::arch::aarch64::*;
 
 // =============================================================================
+// KERNEL SELECTION
+// =============================================================================
+
+/// The instruction family the distance functions in this module run on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdKernel {
+    /// x86-64 AVX2 with fused multiply-add.
+    Avx2Fma,
+    /// ARM64 NEON.
+    Neon,
+    /// Portable unrolled loops.
+    Scalar,
+}
+
+impl SimdKernel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SimdKernel::Avx2Fma => "avx2+fma",
+            SimdKernel::Neon => "neon",
+            SimdKernel::Scalar => "scalar",
+        }
+    }
+}
+
+/// The kernel family this process uses. On x86-64 it is decided once, from what the CPU
+/// reports, because a default build targets the x86-64 baseline and never enables AVX2 at
+/// compile time.
+#[inline(always)]
+pub fn active_kernel() -> SimdKernel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86_avx2_fma() {
+            SimdKernel::Avx2Fma
+        } else {
+            SimdKernel::Scalar
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if cfg!(target_feature = "neon") {
+            SimdKernel::Neon
+        } else {
+            SimdKernel::Scalar
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        SimdKernel::Scalar
+    }
+}
+
+/// Whether the AVX2 + FMA kernels may run: known at compile time when the build enables both,
+/// otherwise detected on first use and cached.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x86_avx2_fma() -> bool {
+    if cfg!(all(target_feature = "avx2", target_feature = "fma")) {
+        return true;
+    }
+    static DETECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DETECTED.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    })
+}
+
+// =============================================================================
 // DOT PRODUCT
 // =============================================================================
 
-/// Inline dot product with compile-time SIMD selection
+/// Inline dot product on the [`active_kernel`]
 ///
 /// For normalized vectors, dot product equals cosine similarity.
 /// Higher values = more similar.
@@ -30,15 +98,11 @@ pub fn dot_product_inline(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        #[cfg(target_feature = "avx2")]
-        unsafe {
-            return dot_product_avx2_inline(a, b);
+        if x86_avx2_fma() {
+            // SAFETY: the CPU reports AVX2 and FMA, the features the kernel is compiled with.
+            return unsafe { dot_product_avx2_inline(a, b) };
         }
-
-        #[cfg(not(target_feature = "avx2"))]
-        {
-            dot_product_scalar_inline(a, b)
-        }
+        dot_product_scalar_inline(a, b)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -186,15 +250,11 @@ pub fn euclidean_squared_inline(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        #[cfg(target_feature = "avx2")]
-        unsafe {
-            return euclidean_squared_avx2_inline(a, b);
+        if x86_avx2_fma() {
+            // SAFETY: the CPU reports AVX2 and FMA, the features the kernel is compiled with.
+            return unsafe { euclidean_squared_avx2_inline(a, b) };
         }
-
-        #[cfg(not(target_feature = "avx2"))]
-        {
-            euclidean_squared_scalar_inline(a, b)
-        }
+        euclidean_squared_scalar_inline(a, b)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -323,15 +383,11 @@ pub fn l2_norm_inline(a: &[f32]) -> f32 {
 pub fn l2_norm_squared_inline(a: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        #[cfg(target_feature = "avx2")]
-        unsafe {
-            return l2_norm_squared_avx2_inline(a);
+        if x86_avx2_fma() {
+            // SAFETY: the CPU reports AVX2 and FMA, the features the kernel is compiled with.
+            return unsafe { l2_norm_squared_avx2_inline(a) };
         }
-
-        #[cfg(not(target_feature = "avx2"))]
-        {
-            l2_norm_squared_scalar_inline(a)
-        }
+        l2_norm_squared_scalar_inline(a)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -607,6 +663,53 @@ mod tests {
         let c = vec![0.8, 0.6]; // closer to a
         let dist_c = normalized_distance_inline(&a, &c);
         assert!(dist_c < dist); // c is closer to a than b
+    }
+
+    fn unit(seed: u64, len: usize) -> Vec<f32> {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut v: Vec<f32> = (0..len).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        normalize_inplace(&mut v);
+        v
+    }
+
+    /// Whichever kernel the dispatcher picks, every length (tails included) agrees with the
+    /// scalar loops.
+    #[test]
+    fn the_dispatched_kernel_agrees_with_scalar() {
+        let kernel = active_kernel();
+        #[cfg(target_arch = "x86_64")]
+        assert!(matches!(kernel, SimdKernel::Avx2Fma | SimdKernel::Scalar));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(kernel, SimdKernel::Neon);
+        eprintln!("distance kernel: {}", kernel.as_str());
+
+        let lengths = (1..=40).chain([63, 64, 65, 127, 384, 768, 1024]);
+        for (i, len) in lengths.enumerate() {
+            let a = unit(2 * i as u64 + 1, len);
+            let b = unit(2 * i as u64 + 2, len);
+            let pairs = [
+                (
+                    dot_product_inline(&a, &b),
+                    dot_product_scalar_inline(&a, &b),
+                ),
+                (
+                    euclidean_squared_inline(&a, &b),
+                    euclidean_squared_scalar_inline(&a, &b),
+                ),
+                (
+                    l2_norm_squared_inline(&a),
+                    l2_norm_squared_scalar_inline(&a),
+                ),
+            ];
+            for (dispatched, scalar) in pairs {
+                assert!(
+                    (dispatched - scalar).abs() <= EPSILON,
+                    "len {len}: {} kernel {dispatched} vs scalar {scalar}",
+                    kernel.as_str()
+                );
+            }
+        }
     }
 
     #[test]
