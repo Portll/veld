@@ -1589,6 +1589,21 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
     fn update(&self, memory: &Memory) -> Result<()> {
         self.update_memory(memory)
     }
+    fn update_many(&self, memories: &[Memory]) -> Result<()> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+        let prepared = memories
+            .iter()
+            .map(|memory| self.prepare(memory))
+            .collect::<Result<Vec<_>>>()?;
+        self.commit_indexed(|txn| {
+            for record in &prepared {
+                put_prepared(txn, record)?;
+            }
+            Ok(())
+        })
+    }
     fn delete(&self, id: &MemoryId) -> Result<()> {
         self.delete_memory(id)
     }

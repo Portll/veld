@@ -1973,6 +1973,39 @@ impl MemoryStorage {
         })
     }
 
+    /// [`Self::store`] for many memories in one atomic write. Each record's replaced
+    /// index rows are read from the store as it stands before the write, so a memory
+    /// should appear once.
+    pub fn store_many(&self, memories: &[Memory]) -> Result<()> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+        let values = memories
+            .iter()
+            .map(|memory| {
+                self.serialize_memory(memory)
+                    .context(format!("Failed to serialize memory {}", memory.id.0))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Rebuilt per attempt: `write_opt` consumes the batch and the write latch may replay it.
+        let build = || {
+            let mut batch = WriteBatch::default();
+            for (memory, value) in memories.iter().zip(&values) {
+                self.queue_replaced_index_removals(&memory.id, &mut batch);
+                batch.put(memory.id.0.as_bytes(), value);
+                self.queue_index_writes(memory, &mut batch);
+            }
+            batch
+        };
+        let opts = self.write_options();
+        self.guarded_write(|| {
+            self.db
+                .write_opt(build(), &opts)
+                .with_context(|| format!("Failed to write {} memories to RocksDB", memories.len()))
+        })
+    }
+
     /// Queue the removal of the index rows of whatever version is stored under `id`.
     /// Its rows are named by its fields, so it is read before the write that replaces it.
     fn queue_replaced_index_removals(&self, id: &MemoryId, batch: &mut WriteBatch) {
