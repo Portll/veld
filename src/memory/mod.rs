@@ -891,12 +891,21 @@ pub enum Bm25Sync {
 /// What [`MemorySystem::embed_and_index_journaled`] did beyond indexing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbedIndexOutcome {
-    /// Set when the write gate absorbed the memory being indexed into a stored one
-    /// that already says everything it does; holds that memory's id. Both records
-    /// changed in the store (the absorbed one is kept, flagged forgotten; the survivor
-    /// took its tags and an importance boost), so a journaled caller owes the intent
-    /// log an `Update` snapshot of each. Neither is a `Forget`: no key was removed.
-    pub absorbed_by: Option<String>,
+    /// The records this pass rewrote in the store, each once: the memory itself when
+    /// its vectors or importance landed, the stored memory the write gate absorbed it
+    /// into (it took the tags and an importance boost; the absorbed one is kept,
+    /// flagged forgotten, so neither is a `Forget`), and older memories interference
+    /// weakened. A journaled caller owes the intent log an `Update` snapshot of each,
+    /// or a replica keeps the memory without vectors and the others at their old state.
+    pub rewritten: Vec<MemoryId>,
+}
+
+impl EmbedIndexOutcome {
+    fn note_rewritten(&mut self, id: &MemoryId) {
+        if !self.rewritten.contains(id) {
+            self.rewritten.push(id.clone());
+        }
+    }
 }
 
 /// How a new memory's vectors fared in [`MemorySystem::store_new_memory`].
@@ -2676,10 +2685,9 @@ impl MemorySystem {
             .map(|_| ())
     }
 
-    /// [`Self::embed_and_index`] for a caller that journals: when the write
-    /// gate absorbs the memory into an existing one (reported in
-    /// [`EmbedIndexOutcome::absorbed_by`]), the caller MUST journal `Update`
-    /// snapshots of the absorbed memory and its survivor.
+    /// [`Self::embed_and_index`] for a caller that journals: the caller MUST
+    /// journal an `Update` snapshot of every memory in
+    /// [`EmbedIndexOutcome::rewritten`].
     pub fn embed_and_index_journaled(&self, memory_id: &MemoryId) -> Result<EmbedIndexOutcome> {
         self.embed_and_index_with(memory_id, Bm25Sync::Journaled)
     }
@@ -2695,6 +2703,7 @@ impl MemorySystem {
             return Err(write_gate::WritesClosed.into());
         }
         let start = std::time::Instant::now();
+        let mut outcome = EmbedIndexOutcome::default();
 
         // Load fresh from storage (owned Memory, so we can mutate experience.embeddings)
         let mut memory = self
@@ -2783,8 +2792,9 @@ impl MemorySystem {
                 if let Some(ctx) = fresh.experience.context.as_mut() {
                     ctx.binding = binding;
                 }
-                if let Err(e) = self.long_term_memory.update(&fresh) {
-                    tracing::warn!("Failed to persist background embedding: {e}");
+                match self.long_term_memory.update(&fresh) {
+                    Ok(()) => outcome.note_rewritten(memory_id),
+                    Err(e) => tracing::warn!("Failed to persist background embedding: {e}"),
                 }
                 memory = fresh;
             }
@@ -2808,8 +2818,11 @@ impl MemorySystem {
                 // Persist so restarts retain the secondary embedding (parity with
                 // the primary, which is persisted above). No-op for the no-secondary
                 // common case since this branch is skipped entirely.
-                if let Err(e) = self.long_term_memory.update(&memory) {
-                    tracing::warn!("Failed to persist background secondary embedding: {e}");
+                match self.long_term_memory.update(&memory) {
+                    Ok(()) => outcome.note_rewritten(memory_id),
+                    Err(e) => {
+                        tracing::warn!("Failed to persist background secondary embedding: {e}")
+                    }
                 }
             }
         }
@@ -2882,6 +2895,8 @@ impl MemorySystem {
                                         )
                                 });
                             if let Some(survivor) = survivor {
+                                outcome.note_rewritten(memory_id);
+                                outcome.note_rewritten(&survivor.id);
                                 self.absorb_redundant_memory(
                                     &memory_arc,
                                     survivor,
@@ -2892,9 +2907,7 @@ impl MemorySystem {
                                 let elapsed = start.elapsed();
                                 crate::metrics::EMBED_BACKGROUND_DURATION
                                     .observe(elapsed.as_secs_f64());
-                                return Ok(EmbedIndexOutcome {
-                                    absorbed_by: Some(best_id.clone()),
-                                });
+                                return Ok(outcome);
                             }
                         }
                     }
@@ -2918,13 +2931,14 @@ impl MemorySystem {
                                 {
                                     let before = old_memory.importance();
                                     old_memory.decay_importance(*decay_amount);
-                                    if self.long_term_memory.update(&old_memory).is_ok()
-                                        && !old_memory.is_forgotten()
-                                    {
-                                        self.note_importance_change(
-                                            before,
-                                            old_memory.importance(),
-                                        );
+                                    if self.long_term_memory.update(&old_memory).is_ok() {
+                                        outcome.note_rewritten(&old_memory.id);
+                                        if !old_memory.is_forgotten() {
+                                            self.note_importance_change(
+                                                before,
+                                                old_memory.importance(),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2934,6 +2948,7 @@ impl MemorySystem {
                             let before = memory_arc.importance();
                             memory_arc.decay_importance(interference_result.proactive_decay);
                             if self.long_term_memory.update(&memory_arc).is_ok() {
+                                outcome.note_rewritten(memory_id);
                                 self.note_importance_change(before, memory_arc.importance());
                             }
                         }
@@ -2950,6 +2965,7 @@ impl MemorySystem {
                             let before = memory_arc.importance();
                             memory_arc.decay_importance(0.99);
                             if self.long_term_memory.update(&memory_arc).is_ok() {
+                                outcome.note_rewritten(memory_id);
                                 self.note_importance_change(before, memory_arc.importance());
                             }
                         }
@@ -2982,7 +2998,7 @@ impl MemorySystem {
         );
         crate::metrics::EMBED_BACKGROUND_DURATION.observe(elapsed.as_secs_f64());
 
-        Ok(EmbedIndexOutcome::default())
+        Ok(outcome)
     }
 
     /// Fold a redundant new memory into `survivor`: the survivor gains importance and

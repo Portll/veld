@@ -253,9 +253,13 @@ pub async fn ingest(
     let memory_id = {
         let memory = memory.clone();
         let exp_clone = experience.clone();
+        let state = state.clone();
+        let user_id = req.user_id.clone();
         tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            memory_guard.remember(exp_clone, None)
+            super::remember::remember_journaled(
+                &state, &memory, &user_id, exp_clone, None, None, None,
+            )
+            .map(|outcome| outcome.id)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?

@@ -189,11 +189,123 @@ pub(crate) fn journal_batch(
     }
 }
 
-/// Complete a journaled remember's deferred embedding in the background. When
-/// the write gate absorbs the memory into an existing one, both records changed
-/// in the store, and their snapshots are journaled here. Spawn this only after
-/// the memory's `Remember` frame is journaled, or the absorbed snapshot could
-/// take the lower LSN and replay would bring back the unflagged memory.
+/// Journal `Update` (or `Remember`) snapshots of `ids` as the store holds them
+/// now, in one batch. Blocking.
+pub(crate) fn journal_stored(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    ids: &[crate::memory::MemoryId],
+    kind: SnapshotKind,
+) {
+    let payloads: Vec<_> = {
+        let guard = memory.read();
+        ids.iter()
+            .filter_map(|id| match guard.get_memory(id) {
+                Ok(stored) => snapshot_payload(user_id, &stored, kind),
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %id.0,
+                        "snapshot not journaled, memory unreadable: {e}"
+                    );
+                    None
+                }
+            })
+            .collect()
+    };
+    journal_batch(state, user_id, &payloads);
+}
+
+/// Complete a journaled write's deferred embedding and journal a snapshot of
+/// each record the pass rewrote: the memory once its vectors landed (a replica
+/// gets them from that frame), a write-gate survivor, and memories interference
+/// weakened. Run it only after the memory's `Remember` frame is journaled, or
+/// the absorbed snapshot could take the lower LSN and replay would bring back
+/// the unflagged memory. Blocking.
+pub(crate) fn embed_journaled(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    memory_id: &crate::memory::MemoryId,
+) {
+    let outcome = memory.read().embed_and_index_journaled(memory_id);
+    match outcome {
+        Ok(outcome) => journal_stored(
+            state,
+            memory,
+            user_id,
+            &outcome.rewritten,
+            SnapshotKind::Update,
+        ),
+        Err(e) => {
+            tracing::warn!(memory_id = %memory_id.0, "Background embed_and_index failed: {e}")
+        }
+    }
+}
+
+/// Store `experience` journaled, embedding included: the `Remember` frame, then
+/// [`embed_journaled`]. For write paths that answer after the vectors land.
+/// Blocking.
+pub(crate) fn remember_journaled(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    experience: crate::memory::Experience,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+) -> anyhow::Result<crate::memory::RememberOutcome> {
+    let outcome = {
+        let guard = memory.read();
+        if agent_id.is_some() || run_id.is_some() {
+            guard.remember_with_agent_deferred_detailed_journaled(
+                experience, created_at, agent_id, run_id, None,
+            )?
+        } else {
+            guard.remember_deferred_detailed_journaled(experience, created_at, None)?
+        }
+    };
+    journal_stored(
+        state,
+        memory,
+        user_id,
+        std::slice::from_ref(&outcome.id),
+        SnapshotKind::Remember,
+    );
+    embed_journaled(state, memory, user_id, &outcome.id);
+    Ok(outcome)
+}
+
+/// [`crate::memory::MemorySystem::upsert`], journaled: a `Remember` frame for a
+/// create, an `Update` for an update. The upsert embeds before it stores, so the
+/// frame carries the vectors. Blocking.
+pub(crate) fn upsert_journaled(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    external_id: String,
+    experience: crate::memory::Experience,
+    change_type: crate::memory::types::ChangeType,
+    changed_by: Option<String>,
+) -> anyhow::Result<(crate::memory::MemoryId, bool)> {
+    let (id, was_update) = memory.read().upsert_with_provenance_journaled(
+        external_id,
+        experience,
+        change_type,
+        changed_by,
+        None,
+        crate::memory::UpsertProvenance::default(),
+    )?;
+    let kind = if was_update {
+        SnapshotKind::Update
+    } else {
+        SnapshotKind::Remember
+    };
+    journal_stored(state, memory, user_id, std::slice::from_ref(&id), kind);
+    Ok((id, was_update))
+}
+
+/// [`embed_journaled`] on the task tracker.
 fn spawn_journaled_embed(
     state: &AppState,
     memory: &SharedUserMemory,
@@ -204,41 +316,9 @@ fn spawn_journaled_embed(
     let memory_bg = memory.clone();
     let user_id = user_id.to_string();
     let mid = memory_id.clone();
-    state.task_tracker.spawn_blocking(move || {
-        let outcome = {
-            let guard = memory_bg.read();
-            guard.embed_and_index_journaled(&mid)
-        };
-        match outcome {
-            Ok(outcome) => {
-                let Some(survivor) = outcome
-                    .absorbed_by
-                    .and_then(|id| uuid::Uuid::parse_str(&id).ok())
-                    .map(crate::memory::MemoryId)
-                else {
-                    return;
-                };
-                let guard = memory_bg.read();
-                for id in [&mid, &survivor] {
-                    match guard.get_memory(id) {
-                        Ok(memory) => journal_memory_snapshot(
-                            &state_bg,
-                            &user_id,
-                            &memory,
-                            SnapshotKind::Update,
-                        ),
-                        Err(e) => tracing::warn!(
-                            memory_id = %id.0,
-                            "write-gate absorption: snapshot not journaled, memory unreadable: {e}"
-                        ),
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(memory_id = %mid.0, "Background embed_and_index failed: {e}");
-            }
-        }
-    });
+    state
+        .task_tracker
+        .spawn_blocking(move || embed_journaled(&state_bg, &memory_bg, &user_id, &mid));
 }
 
 // =============================================================================

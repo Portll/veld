@@ -19,8 +19,9 @@ use zenoh::query::Query;
 use zenoh::sample::Sample;
 
 use crate::errors::ValidationErrorExt;
+use crate::handlers::crud::journal_bulk_forget;
 use crate::handlers::recall::recall_memory_view;
-use crate::handlers::remember::{build_rich_context, parse_experience_type};
+use crate::handlers::remember::{build_rich_context, parse_experience_type, remember_journaled};
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::handlers::types::{MemoryEvent, RecallFact, RecallMemory, RecallResponse, RecallTodo};
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
@@ -464,13 +465,18 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     let run_id = req.run_id.clone();
     let created_at = req.created_at;
 
+    let journal = Arc::clone(&manager);
+    let journal_user_id = req.user_id.clone();
     let outcome = match tokio::task::spawn_blocking(move || {
-        let guard = user_mem_clone.read();
-        if agent_id.is_some() || run_id.is_some() {
-            guard.remember_with_agent_detailed(exp_clone, created_at, agent_id, run_id)
-        } else {
-            guard.remember_detailed(exp_clone, created_at)
-        }
+        remember_journaled(
+            &journal,
+            &user_mem_clone,
+            &journal_user_id,
+            exp_clone,
+            created_at,
+            agent_id,
+            run_id,
+        )
     })
     .await
     {
@@ -1026,9 +1032,14 @@ pub async fn handle_forget(sample: Sample, manager: Arc<MultiUserMemoryManager>)
     };
 
     let mid = MemoryId(memory_uuid);
+    let journal = Arc::clone(&manager);
+    let journal_user_id = user_id.clone();
     match tokio::task::spawn_blocking(move || {
-        let guard = user_mem.read();
-        guard.forget(ForgetCriteria::ById(mid))
+        let count = user_mem
+            .read()
+            .forget_journaled(ForgetCriteria::ById(mid.clone()))?;
+        journal_bulk_forget(&journal, &journal_user_id, [mid]);
+        anyhow::Ok(count)
     })
     .await
     {
@@ -1095,11 +1106,11 @@ pub async fn handle_stream_message(
     message: StreamMessage,
     session_id: &str,
     memory: SharedUserMemory,
-    manager: &MultiUserMemoryManager,
+    manager: &Arc<MultiUserMemoryManager>,
 ) {
     let result = manager
         .streaming_extractor()
-        .process_message(session_id, message, memory)
+        .process_message(session_id, message, memory, Arc::clone(manager))
         .await;
 
     match result {
@@ -1223,8 +1234,9 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
 
     let mission_id = req.mission_id.clone();
     let robot_id = req.robot_id.clone();
+    let journal = Arc::clone(&manager);
+    let journal_user_id = user_id.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let guard = user_mem.read();
         let experience = Experience {
             content,
             mission_id: Some(mission_id),
@@ -1233,7 +1245,15 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
             entities: vec!["mission".to_string(), "mission_start".to_string()],
             ..Default::default()
         };
-        guard.remember(experience, None)
+        remember_journaled(
+            &journal,
+            &user_mem,
+            &journal_user_id,
+            experience,
+            None,
+            None,
+            None,
+        )
     })
     .await;
 
@@ -1323,8 +1343,9 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
     let robot_id = req.robot_id.clone();
     let outcome_type = req.outcome.clone();
     let reward = req.reward;
+    let journal = Arc::clone(&manager);
+    let journal_user_id = user_id.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let guard = user_mem.read();
         let experience = Experience {
             content,
             mission_id: Some(mission_id),
@@ -1335,7 +1356,15 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
             entities: vec!["mission".to_string(), "mission_end".to_string()],
             ..Default::default()
         };
-        guard.remember(experience, None)
+        remember_journaled(
+            &journal,
+            &user_mem,
+            &journal_user_id,
+            experience,
+            None,
+            None,
+            None,
+        )
     })
     .await;
 
