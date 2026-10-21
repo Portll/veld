@@ -4,7 +4,7 @@
 //! open triads, diamond gaps, star gaps, and orbit gaps.
 
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::similarity::cosine_similarity;
 
@@ -298,8 +298,8 @@ pub fn detect_orbit_gaps(
     let mut gaps = Vec::new();
     for i in 0..meaningful_clusters.len() {
         for j in (i + 1)..meaningful_clusters.len() {
-            let (id_a, members_a) = &meaningful_clusters[i];
-            let (id_b, members_b) = &meaningful_clusters[j];
+            let (_, members_a) = &meaningful_clusters[i];
+            let (_, members_b) = &meaningful_clusters[j];
             let Some(&(shared_attractors, cross_links)) = links.get(&(i, j)) else {
                 continue;
             };
@@ -314,7 +314,15 @@ pub fn detect_orbit_gaps(
                 let confidence =
                     (shared_attractors as f32 / 5.0).clamp(0.0, 1.0) * (1.0 - cross_ratio);
 
-                let gap_id = format!("orbit:{}:{}", id_a, id_b);
+                // Named by each cluster's first member, as triads are by their
+                // nodes: a label is a position among all entities and moves
+                // whenever an entity sorting before it comes or goes.
+                let (first_a, first_b) = (&members_a[0], &members_b[0]);
+                let gap_id = format!(
+                    "orbit:{}:{}",
+                    &first_a[..8.min(first_a.len())],
+                    &first_b[..8.min(first_b.len())]
+                );
 
                 // Get names for entities
                 let all_uuids: Vec<&str> = members_a
@@ -425,62 +433,207 @@ fn cluster_links(
     links
 }
 
-/// Simple label propagation for community detection.
+/// Label propagation for community detection.
 ///
 /// Each node starts with its own label, then adopts the most common label
 /// among its neighbors. Converges to clusters of densely connected nodes.
+/// Returns `(label, members)` per cluster, ordered by label, members sorted.
+///
+/// The result depends only on the graph, not on the order `adj` was built or
+/// iterates in: ids are interned to `u32` in sorted order, each sweep visits
+/// nodes in that order updating labels in place, and a tie between neighbour
+/// labels goes to the smallest. A node also keeps its label while that label
+/// ties for most common. That rule is what makes the sweeps settle: every change
+/// then strictly raises the number of edges whose ends share a label, so there
+/// can be at most one change per edge, where adopting any tied label could
+/// trade the same labels back and forth until `max_iterations` cut it off.
 pub fn label_propagation(
     adj: &HashMap<String, Vec<String>>,
     max_iterations: usize,
 ) -> Vec<(usize, Vec<String>)> {
-    let nodes: Vec<&String> = adj.keys().collect();
-    let mut labels: HashMap<&str, usize> = HashMap::new();
-    for (i, node) in nodes.iter().enumerate() {
-        labels.insert(node.as_str(), i);
+    let mut ids: Vec<&str> = adj.keys().map(String::as_str).collect();
+    ids.sort_unstable();
+    let node_count =
+        u32::try_from(ids.len()).expect("a knowledge graph mirror holds fewer than 2^32 entities");
+    let index: HashMap<&str, u32> = ids.iter().copied().zip(0..node_count).collect();
+
+    // Neighbours as one flat array, node `v`'s at `offsets[v]..offsets[v + 1]`.
+    // A neighbour that is not itself a key has no label and is skipped.
+    let mut offsets: Vec<usize> = Vec::with_capacity(ids.len() + 1);
+    let mut neighbours: Vec<u32> = Vec::new();
+    offsets.push(0);
+    for id in &ids {
+        neighbours.extend(
+            adj[*id]
+                .iter()
+                .filter_map(|n| index.get(n.as_str()).copied()),
+        );
+        offsets.push(neighbours.len());
     }
 
+    let mut labels: Vec<u32> = (0..node_count).collect();
+    // Votes per label for the node being swept, and which labels got any, so
+    // only those are read and reset.
+    let mut votes: Vec<u32> = vec![0; ids.len()];
+    let mut voted: Vec<u32> = Vec::new();
     for _ in 0..max_iterations {
         let mut changed = false;
-        for node in &nodes {
-            if let Some(neighbors) = adj.get(node.as_str()) {
-                if neighbors.is_empty() {
-                    continue;
+        for node in 0..ids.len() {
+            for &neighbour in &neighbours[offsets[node]..offsets[node + 1]] {
+                let label = labels[neighbour as usize];
+                if votes[label as usize] == 0 {
+                    voted.push(label);
                 }
-                // Count neighbor labels
-                let mut label_counts: HashMap<usize, usize> = HashMap::new();
-                for neighbor in neighbors {
-                    if let Some(&label) = labels.get(neighbor.as_str()) {
-                        *label_counts.entry(label).or_default() += 1;
-                    }
-                }
-                // Adopt most common neighbor label
-                if let Some((&best_label, _)) = label_counts.iter().max_by_key(|(_, count)| *count)
+                votes[label as usize] += 1;
+            }
+            let most = voted
+                .iter()
+                .map(|&label| votes[label as usize])
+                .max()
+                .unwrap_or(0);
+            if votes[labels[node] as usize] < most {
+                if let Some(best) = voted
+                    .iter()
+                    .copied()
+                    .filter(|&label| votes[label as usize] == most)
+                    .min()
                 {
-                    let current = labels.get(node.as_str()).copied().unwrap_or(0);
-                    if best_label != current {
-                        labels.insert(node.as_str(), best_label);
-                        changed = true;
-                    }
+                    labels[node] = best;
+                    changed = true;
                 }
             }
+            for &label in &voted {
+                votes[label as usize] = 0;
+            }
+            voted.clear();
         }
         if !changed {
             break;
         }
     }
 
-    // Group by label
-    let mut clusters: HashMap<usize, Vec<String>> = HashMap::new();
-    for (node, label) in &labels {
-        clusters.entry(*label).or_default().push(node.to_string());
+    // Nodes are visited in sorted order, so each member list comes out sorted.
+    let mut clusters: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    for (node, id) in ids.iter().enumerate() {
+        clusters
+            .entry(labels[node])
+            .or_default()
+            .push((*id).to_string());
     }
-
-    clusters.into_iter().collect()
+    clusters
+        .into_iter()
+        .map(|(label, members)| (label as usize, members))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::slow_store::{RawDiamondGap, RawOpenTriad, RawStarGap};
+
+    /// The adjacency `get_adjacency_list` builds from `edges`, in their order.
+    /// Every `HashMap::new()` draws its own random hash seed, so two maps built
+    /// from one edge list iterate in different orders as well.
+    fn adjacency<'a>(
+        edges: impl Iterator<Item = &'a (String, String)>,
+    ) -> HashMap<String, Vec<String>> {
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+        for (a, b) in edges {
+            adj.entry(a.clone()).or_default().push(b.clone());
+            adj.entry(b.clone()).or_default().push(a.clone());
+        }
+        adj
+    }
+
+    fn clique(names: &[&str]) -> Vec<(String, String)> {
+        let mut edges = Vec::new();
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                edges.push((a.to_string(), b.to_string()));
+            }
+        }
+        edges
+    }
+
+    /// A store that only has an adjacency list, for orbit detection alone.
+    struct AdjacencyOnly(HashMap<String, Vec<String>>);
+
+    impl GapStore for AdjacencyOnly {
+        fn find_open_triads(&self, _: f32, _: usize) -> Result<Vec<RawOpenTriad>> {
+            Ok(Vec::new())
+        }
+        fn find_diamond_gaps(&self, _: f32, _: usize) -> Result<Vec<RawDiamondGap>> {
+            Ok(Vec::new())
+        }
+        fn find_star_gaps(&self, _: usize, _: f32, _: usize) -> Result<Vec<RawStarGap>> {
+            Ok(Vec::new())
+        }
+        fn get_adjacency_list(&self, _: f32) -> Result<HashMap<String, Vec<String>>> {
+            Ok(self.0.clone())
+        }
+        fn get_entity_names(&self, _: &[&str]) -> Result<HashMap<String, String>> {
+            Ok(HashMap::new())
+        }
+        fn load_embeddings(&self, _: &[&str]) -> Result<HashMap<String, Vec<f32>>> {
+            Ok(HashMap::new())
+        }
+    }
+
+    #[test]
+    fn label_propagation_ignores_insertion_order() {
+        for seed in 1..=10u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move |n: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % n as u64) as usize
+            };
+            let names: Vec<String> = (0..80).map(|i| format!("n{i:02}")).collect();
+            let edges: Vec<(String, String)> = (0..200)
+                .map(|_| (names[next(80)].clone(), names[next(80)].clone()))
+                .collect();
+
+            let forward = label_propagation(&adjacency(edges.iter()), 20);
+            let backward = label_propagation(&adjacency(edges.iter().rev()), 20);
+
+            assert_eq!(forward, backward, "seed {seed}");
+            assert!(forward.windows(2).all(|w| w[0].0 < w[1].0), "seed {seed}");
+            for (_, members) in &forward {
+                assert!(members.windows(2).all(|w| w[0] < w[1]), "seed {seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn orbit_gaps_ignore_insertion_order() {
+        // Two 4-cliques P and Q with no edge between them, and a triangle H whose
+        // members each touch one node of P and one of Q: H is a third cluster,
+        // and all three of its members are attractors shared by P and Q.
+        let mut edges = clique(&["p0", "p1", "p2", "p3"]);
+        edges.extend(clique(&["q0", "q1", "q2", "q3"]));
+        edges.extend(clique(&["h0", "h1", "h2"]));
+        for (h, p, q) in [("h0", "p3", "q3"), ("h1", "p2", "q2"), ("h2", "p1", "q1")] {
+            edges.push((h.to_string(), p.to_string()));
+            edges.push((h.to_string(), q.to_string()));
+        }
+        let config = GapDetectionConfig::default();
+
+        let forward = detect_orbit_gaps(&AdjacencyOnly(adjacency(edges.iter())), &config).unwrap();
+        let backward =
+            detect_orbit_gaps(&AdjacencyOnly(adjacency(edges.iter().rev())), &config).unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&forward).unwrap(),
+            serde_json::to_string(&backward).unwrap()
+        );
+        assert_eq!(forward.len(), 1);
+        let gap = &forward[0];
+        assert_eq!(gap.id, "orbit:p0:q0");
+        assert_eq!(gap.shape.canonical, "orbit:a=4,b=4,shared_attractors=3");
+        let uuids: Vec<&str> = gap.entities.iter().map(|e| e.uuid.as_str()).collect();
+        assert_eq!(uuids, ["p0", "p1", "p2", "p3", "q0", "q1", "q2", "q3"]);
+    }
 
     #[test]
     fn cluster_links_counts_what_the_per_pair_scan_counted() {
