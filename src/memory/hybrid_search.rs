@@ -211,6 +211,26 @@ impl SignalScores {
         }
     }
 
+    /// The largest BM25 score among one query's hybrid results: the scale that puts each
+    /// result's raw Tantivy score in `[0, 1]`. Zero when the query matched nothing by keyword.
+    pub fn query_bm25_max(results: &[HybridSearchResult]) -> f32 {
+        results
+            .iter()
+            .filter_map(|r| r.bm25_score)
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// A raw BM25 score divided by its query's best one. Tantivy scores are unbounded and
+    /// vary with corpus statistics, so beside cosine and activation (both near `[0, 1]`) a
+    /// raw score takes the largest share of [`Self::from_components`] by scale alone.
+    pub fn normalized_bm25(raw: f32, query_max: f32) -> f32 {
+        if query_max > 0.0 {
+            (raw / query_max).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
     /// Invert contributions for negative feedback (misleading results)
     ///
     /// When a result is misleading, we want to shift weights AWAY from the
@@ -2512,6 +2532,46 @@ mod tests {
             "Zero input should produce uniform weights"
         );
         assert!((scores.bm25_contribution - 1.0 / 3.0).abs() < 0.001);
+    }
+
+    fn bm25_hit(raw: Option<f32>) -> HybridSearchResult {
+        HybridSearchResult {
+            memory_id: MemoryId(uuid::Uuid::new_v4()),
+            score: 0.0,
+            bm25_score: raw,
+            vector_score: None,
+            graph_score: None,
+            rrf_score: 0.0,
+            rerank_score: None,
+            bm25_rank: None,
+            vector_rank: None,
+            graph_rank: None,
+        }
+    }
+
+    /// Each query's best keyword match scores 1.0 and the rest scale with it; a result BM25
+    /// never matched contributes nothing.
+    #[test]
+    fn bm25_is_normalized_by_the_query_maximum() {
+        let results = vec![bm25_hit(Some(12.0)), bm25_hit(Some(3.0)), bm25_hit(None)];
+        let max = SignalScores::query_bm25_max(&results);
+        assert_eq!(max, 12.0);
+        assert_eq!(SignalScores::normalized_bm25(12.0, max), 1.0);
+        assert_eq!(SignalScores::normalized_bm25(3.0, max), 0.25);
+        assert_eq!(SignalScores::query_bm25_max(&[bm25_hit(None)]), 0.0);
+        assert_eq!(SignalScores::normalized_bm25(3.0, 0.0), 0.0);
+    }
+
+    /// A raw Tantivy score of 12 against a cosine of 0.8 took 94% of the training target;
+    /// on the query's own scale the same match takes its share from rank, not magnitude.
+    #[test]
+    fn a_raw_bm25_scale_no_longer_sets_its_training_share() {
+        let raw = SignalScores::from_components(12.0, 0.8, 0.0);
+        assert!(raw.bm25_contribution > 0.9);
+        let normalized =
+            SignalScores::from_components(SignalScores::normalized_bm25(12.0, 12.0), 0.8, 0.0);
+        assert!((normalized.bm25_contribution - 1.0 / 1.8).abs() < 1e-6);
+        assert!(normalized.vector_contribution > 0.4);
     }
 
     #[test]

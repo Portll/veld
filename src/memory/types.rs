@@ -126,7 +126,8 @@ impl ExternalDimensionScores {
 /// (unified scoring) for cross-encoder and recency contributions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SignalAttribution {
-    /// BM25 keyword match score (from Tantivy full-text search)
+    /// BM25 keyword match score (from Tantivy full-text search), divided by the best BM25
+    /// score of the same query so it shares the `[0, 1]` scale of the other contributions
     pub bm25_contribution: f32,
     /// Vector embedding cosine similarity score
     pub vector_contribution: f32,
