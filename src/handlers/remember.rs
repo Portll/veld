@@ -189,28 +189,6 @@ pub(crate) fn journal_batch(
     }
 }
 
-/// Journal a `Forget` for a memory already removed from the primary store.
-/// Failure handling as [`journal_memory_snapshot`]. Blocking.
-pub(crate) fn journal_forget(
-    state: &super::state::MultiUserMemoryManager,
-    user_id: &str,
-    memory_id: &crate::memory::MemoryId,
-) {
-    let payload = crate::intent_log::IntentPayload::Forget {
-        user_id: user_id.to_string(),
-        memory_id: memory_id.0.to_string(),
-        schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
-    };
-    if let Err(e) = state.journal_and_apply(user_id, &payload) {
-        tracing::warn!(
-            user_id = %user_id,
-            memory_id = %memory_id.0,
-            error = %e,
-            "intent-log journal_and_apply (Forget) failed (RocksDB delete already durable)",
-        );
-    }
-}
-
 /// Complete a journaled remember's deferred embedding in the background. When
 /// the write gate absorbs the memory into an existing one, both records changed
 /// in the store, and their snapshots are journaled here. Spawn this only after
