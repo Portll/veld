@@ -2704,17 +2704,41 @@ impl MemorySystem {
                 memory.when.context_drift = snapshot;
             }
 
-            // R3: populate the conjunctive binding from the engram's W-facets
-            // (was dead scaffold). Surfaced at recall so the consumer can tell a
-            // bound episode from loose gist (anti-confabulation default-deny).
-            let binding = Self::compute_engram_binding(&memory);
-            if let Some(ctx) = memory.experience.context.as_mut() {
-                ctx.binding = binding;
-            }
-
-            // Persist embedding to storage so restarts don't re-embed
-            if let Err(e) = self.long_term_memory.update(&memory) {
-                tracing::warn!("Failed to persist background embedding: {e}");
+            // Persist embedding to storage so restarts don't re-embed. The record is
+            // read again under the write lock and given only what this pass computed:
+            // writing back the copy read before the (slow) embedding would undo a
+            // write made meanwhile, such as a duplicate's merged tags and entities.
+            {
+                let _write_guard = self.write_lock.lock();
+                let mut fresh = match self.long_term_memory.get(memory_id) {
+                    Ok(fresh) => fresh,
+                    Err(e) => {
+                        tracing::debug!(
+                            "memory {} gone before its embedding landed: {e}",
+                            memory_id.0
+                        );
+                        return Ok(EmbedIndexOutcome::default());
+                    }
+                };
+                if fresh.experience.content != memory.experience.content {
+                    // Rewritten meanwhile; that write embedded its own content.
+                    return Ok(EmbedIndexOutcome::default());
+                }
+                if fresh.experience.embeddings.is_none() {
+                    fresh.experience.embeddings = memory.experience.embeddings.take();
+                    fresh.when.context_drift = std::mem::take(&mut memory.when.context_drift);
+                }
+                // R3: populate the conjunctive binding from the engram's W-facets
+                // (was dead scaffold). Surfaced at recall so the consumer can tell a
+                // bound episode from loose gist (anti-confabulation default-deny).
+                let binding = Self::compute_engram_binding(&fresh);
+                if let Some(ctx) = fresh.experience.context.as_mut() {
+                    ctx.binding = binding;
+                }
+                if let Err(e) = self.long_term_memory.update(&fresh) {
+                    tracing::warn!("Failed to persist background embedding: {e}");
+                }
+                memory = fresh;
             }
         }
 
