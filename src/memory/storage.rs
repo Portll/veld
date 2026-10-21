@@ -5461,7 +5461,8 @@ mod tests {
     #[test]
     fn a_v3_record_with_a_pre_writer_session_recovers_and_keeps_its_facets() {
         let original = memory_with_session("written before persistent was inserted");
-        let current = encode(&original);
+        // A V3 record predates the space fields too.
+        let current = strip_space_fields(&encode(&original));
         let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
         let (_, persistent_at) = bincode::serde::decode_from_slice::<
             (

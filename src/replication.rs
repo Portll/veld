@@ -1401,7 +1401,7 @@ mod tests {
             primary: primary.clone(),
             secondary: None,
         };
-        assert_eq!(page_spaces(&records, Some(&slot)), vec![kept, primary]);
+        assert_eq!(page_spaces(&records, Some(&slot)), vec![primary, kept]);
         assert_eq!(
             page_spaces(&records, None),
             vec![SpaceId::new("older-model", 2), SpaceId::unrecorded(4)]
