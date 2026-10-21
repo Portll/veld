@@ -38,11 +38,15 @@
 //! [`load_cross_encoder`] resolves a dial value over the env. The dial is `None` by
 //! default, so the shipped pipeline is unchanged until someone turns it.
 //!
+//! The result is shared process-wide by [`CrossEncoderSpec`]: every tenant's reranker on the
+//! same models holds the same instance and so the same ONNX session.
+//!
 //! Files cache under `~/.cache/veld/cross-encoder/<sanitised-id>/`.
 //!
 //! # Speed
 //!
-//! - `VELD_ONNX_THREADS`: intra-op threads per session (default: the core count, at most 4).
+//! - `VELD_ONNX_THREADS`: intra-op threads per session (default: [`OrtThreading`]'s platform
+//!   default, one on Apple silicon).
 //! - `VELD_CROSS_ENCODER_BATCH=pair|bucket`: run each pair alone, or batch pairs of similar
 //!   token length (default `bucket`).
 //! - `VELD_CROSS_ENCODER_SESSIONS`: sessions one model may open for concurrent reranks
@@ -56,8 +60,10 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 use tokenizers::Tokenizer;
+
+use super::minilm::OrtThreading;
 
 /// Maximum input sequence length (query + document tokens combined).
 const MAX_PAIR_LENGTH: usize = 512;
@@ -79,22 +85,6 @@ const DEFAULT_SESSIONS: usize = 2;
 /// Pair scores a cross-encoder remembers (`VELD_CROSS_ENCODER_CACHE`, 0 disables).
 /// `proactive_context` reranks overlapping candidates for similar queries on every prompt.
 const DEFAULT_PAIR_CACHE: usize = 4096;
-
-/// Intra-op threads per session. `VELD_ONNX_THREADS`, or `SHODH_ONNX_THREADS`, which the recall
-/// harness pins to 1 so repeat passes score identically; otherwise the core count, at most 4.
-/// Apple Silicon used to get 1 here to leave room for Metal or Neural Engine providers, but
-/// none is registered, so the CPU provider ran single-threaded.
-fn intra_threads() -> usize {
-    std::env::var("VELD_ONNX_THREADS")
-        .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map_or(1, |n| n.get())
-                .min(4)
-        })
-}
 
 fn env_count(name: &str, default: usize, max: usize) -> usize {
     std::env::var(name)
@@ -119,11 +109,9 @@ fn batch_mode() -> BatchMode {
     }
 }
 
-fn build_session(model_path: &std::path::Path, threads: usize) -> Result<Session> {
-    Session::builder()
-        .context("Failed to create session builder")?
-        .with_intra_threads(threads)
-        .context("Failed to set thread count")?
+fn build_session(model_path: &std::path::Path, threading: OrtThreading) -> Result<Session> {
+    threading
+        .apply(Session::builder().context("Failed to create session builder")?)?
         .commit_from_file(model_path)
         .context("Failed to load ONNX model")
 }
@@ -580,7 +568,7 @@ struct LazyOnnx {
     /// Set when building an extra session failed, so contended calls stop retrying it.
     grow_failed: AtomicBool,
     model_path: PathBuf,
-    threads: usize,
+    threading: OrtThreading,
     tokenizer: Tokenizer,
     /// Whether the loaded ONNX graph accepts `token_type_ids`. Detected
     /// from `session.inputs` at load time — the registry's
@@ -616,7 +604,7 @@ impl LazyOnnx {
         }
         let _growing = self.growing.try_lock()?;
         let slot = self.extra.iter().find(|s| s.get().is_none())?;
-        match build_session(&self.model_path, self.threads) {
+        match build_session(&self.model_path, self.threading) {
             Ok(session) => {
                 let _ = slot.set(Mutex::new(session));
                 let open = 1 + self.extra.iter().filter(|s| s.get().is_some()).count();
@@ -681,23 +669,37 @@ fn pair_key(query: &str, document: &str) -> String {
 /// Cross-encoder backed by a single ONNX model.
 pub struct OnnxCrossEncoder {
     config: CrossEncoderConfig,
+    threading: OrtThreading,
     model: OnceLock<Result<LazyOnnx, String>>,
     available: AtomicBool,
-    /// Scores this reranker has already computed. Per instance, so a fresh system (each
-    /// recall-gate repeat builds one) starts cold and its latency is the model's.
+    /// Scores this reranker has already computed. The instance is shared process-wide (see
+    /// [`cross_encoder_for`]), so every tenant on the model reads one cache; the recall harness
+    /// turns it off so each repeat's latency is the model's.
     pair_cache: Option<Mutex<lru::LruCache<String, f32>>>,
 }
 
 impl OnnxCrossEncoder {
     pub fn new(config: CrossEncoderConfig) -> Self {
+        Self::with_threading(config, OrtThreading::resolve())
+    }
+
+    /// [`Self::new`] with the session threading given rather than resolved.
+    pub fn with_threading(config: CrossEncoderConfig, threading: OrtThreading) -> Self {
         let capacity = env_count("VELD_CROSS_ENCODER_CACHE", DEFAULT_PAIR_CACHE, 1 << 20);
         Self {
             config,
+            threading,
             model: OnceLock::new(),
             available: AtomicBool::new(true),
             pair_cache: std::num::NonZeroUsize::new(capacity)
                 .map(|n| Mutex::new(lru::LruCache::new(n))),
         }
+    }
+
+    /// True once a download or load was attempted and failed. The failure is kept for this
+    /// instance's lifetime, so the shared registry replaces such an instance.
+    fn load_failed(&self) -> bool {
+        matches!(self.model.get(), Some(Err(_)))
     }
 
     pub fn cache_dir(&self) -> PathBuf {
@@ -866,8 +868,6 @@ impl OnnxCrossEncoder {
                 }
             };
 
-            let num_threads = intra_threads();
-
             // ort's `load-dynamic` PANICS (not Errs) when libonnxruntime cannot be
             // dlopen'd, which ends the calling thread instead of engaging the lazy
             // fallback below (and the whole process in the abort-built fortress
@@ -891,7 +891,7 @@ impl OnnxCrossEncoder {
                 ));
             }
 
-            let session = match build_session(&model_path, num_threads) {
+            let session = match build_session(&model_path, self.threading) {
                 Ok(s) => s,
                 Err(e) => {
                     self.available
@@ -937,7 +937,7 @@ impl OnnxCrossEncoder {
                 growing: Mutex::new(()),
                 grow_failed: AtomicBool::new(false),
                 model_path,
-                threads: num_threads,
+                threading: self.threading,
                 tokenizer,
                 has_token_type_ids,
                 output_head,
@@ -1243,45 +1243,163 @@ pub fn default_cross_encoder() -> OnnxCrossEncoder {
 /// would mislabel every measurement made under it.
 pub fn load_cross_encoder(selected: Option<&str>) -> Result<Arc<dyn CrossEncoderModel>> {
     match selected {
-        Some(id) => Ok(Arc::new(OnnxCrossEncoder::new(lookup(id)?))),
+        Some(id) => {
+            let spec = CrossEncoderSpec::of(vec![(lookup(id)?, 1.0)]);
+            Ok(cross_encoder_for(&spec))
+        }
         None => Ok(load_cross_encoder_from_env()),
     }
 }
 
-/// Build the cross-encoder from environment variables. Default is
-/// [`DEFAULT_CROSS_ENCODER_ID`] when neither `VELD_CROSS_ENCODER` nor
-/// `VELD_CROSS_ENCODERS` is set. `VELD_CROSS_ENCODERS` takes precedence when both are set.
+/// The env-configured cross-encoder, shared with every other caller whose environment
+/// resolves to the same models. Default is [`DEFAULT_CROSS_ENCODER_ID`] when neither
+/// `VELD_CROSS_ENCODER` nor `VELD_CROSS_ENCODERS` is set.
+///
+/// `VELD_CROSS_ENCODERS` takes precedence when both are set.
 pub fn load_cross_encoder_from_env() -> Arc<dyn CrossEncoderModel> {
-    if let Ok(spec) = std::env::var("VELD_CROSS_ENCODERS") {
-        match parse_ensemble_spec(&spec) {
-            Ok(arc) => return arc,
-            Err(e) => {
-                tracing::warn!(
-                    "VELD_CROSS_ENCODERS=`{spec}` invalid: {e}; falling back to default"
-                );
-            }
-        }
-    }
-
-    if let Ok(id) = std::env::var("VELD_CROSS_ENCODER") {
-        match lookup(id.trim()) {
-            Ok(cfg) => return Arc::new(OnnxCrossEncoder::new(cfg)),
-            Err(e) => {
-                tracing::warn!("VELD_CROSS_ENCODER=`{id}` invalid: {e}; falling back to default");
-            }
-        }
-    }
-
-    // Default is whatever DEFAULT_CROSS_ENCODER_ID points at (currently
-    // mxbai-rerank-xsmall-v1). Override via VELD_CROSS_ENCODER=<id> or
-    // VELD_CROSS_ENCODERS=<id>:<w>,…
-    let cfg = lookup(DEFAULT_CROSS_ENCODER_ID)
-        .expect("default cross-encoder id must be registered as a built-in");
-    Arc::new(OnnxCrossEncoder::new(cfg))
+    cross_encoder_for(&CrossEncoderSpec::from_env())
 }
 
-fn parse_ensemble_spec(spec: &str) -> Result<Arc<dyn CrossEncoderModel>> {
-    let mut members: Vec<(Arc<dyn CrossEncoderModel>, f32)> = Vec::new();
+/// What selects a cross-encoder, as values: the member models, their ensemble weights, and the
+/// session threading. Equal specs share one instance.
+#[derive(Clone, Debug)]
+pub struct CrossEncoderSpec {
+    /// One entry is a single model; more are a weighted ensemble.
+    members: Vec<(CrossEncoderConfig, f32)>,
+    threading: OrtThreading,
+}
+
+impl CrossEncoderSpec {
+    /// Resolve from `VELD_CROSS_ENCODERS`, then `VELD_CROSS_ENCODER`, then the default; an
+    /// unparseable value is warned about and the next source is used.
+    pub fn from_env() -> Self {
+        if let Ok(spec) = std::env::var("VELD_CROSS_ENCODERS") {
+            match parse_ensemble_members(&spec) {
+                Ok(members) => return Self::of(members),
+                Err(e) => {
+                    tracing::warn!(
+                        "VELD_CROSS_ENCODERS=`{spec}` invalid: {e}; falling back to default"
+                    );
+                }
+            }
+        }
+
+        if let Ok(id) = std::env::var("VELD_CROSS_ENCODER") {
+            match lookup(id.trim()) {
+                Ok(cfg) => return Self::of(vec![(cfg, 1.0)]),
+                Err(e) => {
+                    tracing::warn!(
+                        "VELD_CROSS_ENCODER=`{id}` invalid: {e}; falling back to default"
+                    );
+                }
+            }
+        }
+
+        let cfg = lookup(DEFAULT_CROSS_ENCODER_ID)
+            .expect("default cross-encoder id must be registered as a built-in");
+        Self::of(vec![(cfg, 1.0)])
+    }
+
+    /// `members` (at least one) with the process's session threading.
+    fn of(members: Vec<(CrossEncoderConfig, f32)>) -> Self {
+        Self {
+            members,
+            threading: OrtThreading::resolve(),
+        }
+    }
+}
+
+/// What one [`OnnxCrossEncoder`] is keyed by: the files it loads and how its session threads.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ModelKey {
+    id: String,
+    model_url: String,
+    tokenizer_url: String,
+    threading: OrtThreading,
+}
+
+impl ModelKey {
+    fn new(config: &CrossEncoderConfig, threading: OrtThreading) -> Self {
+        Self {
+            id: config.id.clone(),
+            model_url: config.model_url.clone(),
+            tokenizer_url: config.tokenizer_url.clone(),
+            threading,
+        }
+    }
+}
+
+/// A shared ensemble and the shared models it is made of.
+struct SharedEnsemble {
+    ensemble: Arc<EnsembleCrossEncoder>,
+    members: Vec<Arc<OnnxCrossEncoder>>,
+}
+
+static SHARED_MODELS: LazyLock<Mutex<HashMap<ModelKey, Arc<OnnxCrossEncoder>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Each member's [`ModelKey`] and the bits of its weight.
+type EnsembleKey = Vec<(ModelKey, u32)>;
+
+static SHARED_ENSEMBLES: LazyLock<Mutex<HashMap<EnsembleKey, SharedEnsemble>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The model `config` loads with `threading`, one instance per process. An instance whose
+/// download or load failed is replaced, so the next caller retries instead of inheriting it.
+fn shared_model(config: &CrossEncoderConfig, threading: OrtThreading) -> Arc<OnnxCrossEncoder> {
+    let key = ModelKey::new(config, threading);
+    let mut models = SHARED_MODELS.lock();
+    if let Some(model) = models.get(&key).filter(|m| !m.load_failed()) {
+        return Arc::clone(model);
+    }
+    let model = Arc::new(OnnxCrossEncoder::with_threading(config.clone(), threading));
+    models.insert(key, Arc::clone(&model));
+    model
+}
+
+/// The cross-encoder `spec` selects, shared with every caller whose spec is equal. A
+/// single-member spec is that model itself; an ensemble's members are the same instances a
+/// single-model spec on their files gets, so a model is loaded once however it is used.
+pub fn cross_encoder_for(spec: &CrossEncoderSpec) -> Arc<dyn CrossEncoderModel> {
+    if let [(config, _)] = spec.members.as_slice() {
+        return shared_model(config, spec.threading);
+    }
+    let key: EnsembleKey = spec
+        .members
+        .iter()
+        .map(|(config, weight)| (ModelKey::new(config, spec.threading), weight.to_bits()))
+        .collect();
+    let mut ensembles = SHARED_ENSEMBLES.lock();
+    if let Some(shared) = ensembles.get(&key) {
+        if !shared.members.iter().any(|m| m.load_failed()) {
+            return Arc::clone(&shared.ensemble) as Arc<dyn CrossEncoderModel>;
+        }
+    }
+    let members: Vec<Arc<OnnxCrossEncoder>> = spec
+        .members
+        .iter()
+        .map(|(config, _)| shared_model(config, spec.threading))
+        .collect();
+    let ensemble = Arc::new(EnsembleCrossEncoder::new(
+        members
+            .iter()
+            .zip(&spec.members)
+            .map(|(model, (_, weight))| (Arc::clone(model) as Arc<dyn CrossEncoderModel>, *weight))
+            .collect(),
+    ));
+    ensembles.insert(
+        key,
+        SharedEnsemble {
+            ensemble: Arc::clone(&ensemble),
+            members,
+        },
+    );
+    ensemble
+}
+
+/// `<id>[:<weight>],…` as configs and weights; at least one member.
+fn parse_ensemble_members(spec: &str) -> Result<Vec<(CrossEncoderConfig, f32)>> {
+    let mut members = Vec::new();
     for raw in spec.split(',') {
         let raw = raw.trim();
         if raw.is_empty() {
@@ -1296,23 +1414,36 @@ fn parse_ensemble_spec(spec: &str) -> Result<Arc<dyn CrossEncoderModel>> {
             ),
             None => (raw, 1.0),
         };
-        let cfg = lookup(id)?;
-        members.push((Arc::new(OnnxCrossEncoder::new(cfg)), weight));
+        members.push((lookup(id)?, weight));
     }
     if members.is_empty() {
         anyhow::bail!("VELD_CROSS_ENCODERS produced no members");
     }
-    if members.len() == 1 {
-        // Single-member ensemble is just the underlying model.
-        return Ok(members.into_iter().next().unwrap().0);
+    Ok(members)
+}
+
+/// Whether `model` is yet to be pre-warmed, recording that it now has been. Every tenant's
+/// reranker passes the shared model to [`prewarm`]; one pre-fetch job per instance is enough,
+/// and each further one would queue behind it on the single worker for nothing.
+fn claim_prewarm(model: &Arc<dyn CrossEncoderModel>) -> bool {
+    static PREWARMED: LazyLock<Mutex<Vec<Weak<dyn CrossEncoderModel>>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+    let mut prewarmed = PREWARMED.lock();
+    prewarmed.retain(|seen| seen.strong_count() > 0);
+    if prewarmed
+        .iter()
+        .any(|seen| std::ptr::addr_eq(seen.as_ptr(), Arc::as_ptr(model)))
+    {
+        return false;
     }
-    Ok(Arc::new(EnsembleCrossEncoder::new(members)))
+    prewarmed.push(Arc::downgrade(model));
+    true
 }
 
 /// Pre-fetch a cross-encoder's files (single model or ensemble) on the shared
 /// pre-warm worker, so the first query pays for the ONNX session build and not
 /// for an 80-280 MB download. Idempotent — a model already on disk returns
-/// immediately.
+/// immediately, and an instance shared by several rerankers is submitted once.
 ///
 /// Skipped when `VELD_LAZY_CROSS_ENCODER=1` is set.
 pub fn prewarm(model: Arc<dyn CrossEncoderModel>) {
@@ -1321,6 +1452,10 @@ pub fn prewarm(model: Arc<dyn CrossEncoderModel>) {
         return;
     }
     let id = model.id().to_string();
+    if !claim_prewarm(&model) {
+        tracing::debug!("cross-encoder pre-fetch already queued for {id}");
+        return;
+    }
     submit_prewarm(Box::new(move || match model.prefetch() {
         Ok(_) => tracing::info!("Cross-encoder files ready: {id}"),
         Err(e) => {
@@ -1567,17 +1702,88 @@ mod tests {
         assert_eq!(cfg.params_millions, 100);
     }
 
+    fn spec(members: &str) -> CrossEncoderSpec {
+        CrossEncoderSpec::of(parse_ensemble_members(members).unwrap())
+    }
+
+    fn from_spec(members: &str) -> Arc<dyn CrossEncoderModel> {
+        cross_encoder_for(&spec(members))
+    }
+
     #[test]
     fn parse_ensemble_spec_handles_weights() {
-        let res = parse_ensemble_spec("ms-marco-MiniLM-L-6-v2:0.5,bge-reranker-v2-m3:1.5").unwrap();
+        let res = from_spec("ms-marco-MiniLM-L-6-v2:0.5,bge-reranker-v2-m3:1.5");
         assert!(res.id().contains("0.50"));
         assert!(res.id().contains("1.50"));
     }
 
     #[test]
     fn parse_ensemble_spec_collapses_singleton() {
-        let res = parse_ensemble_spec("ms-marco-MiniLM-L-6-v2").unwrap();
+        let res = from_spec("ms-marco-MiniLM-L-6-v2");
         assert_eq!(res.id(), "ms-marco-MiniLM-L-6-v2");
+    }
+
+    #[test]
+    fn parse_ensemble_spec_refuses_an_empty_list() {
+        assert!(parse_ensemble_members(" , ").is_err());
+    }
+
+    /// Every tenant's reranker on the same models holds one instance, so one ONNX session.
+    /// Each spec is resolved once: the recall harness may pin the thread count mid-run.
+    #[test]
+    fn equal_specs_share_one_instance_and_different_specs_do_not() {
+        let ms_marco = spec("ms-marco-MiniLM-L-6-v2");
+        let single = cross_encoder_for(&ms_marco);
+        assert!(Arc::ptr_eq(&single, &cross_encoder_for(&ms_marco.clone())));
+        assert!(!Arc::ptr_eq(&single, &from_spec("bge-reranker-v2-m3")));
+
+        let pair = CrossEncoderSpec {
+            threading: ms_marco.threading,
+            ..spec("ms-marco-MiniLM-L-6-v2:0.5,bge-reranker-v2-m3:1.5")
+        };
+        let ensemble = cross_encoder_for(&pair);
+        assert!(Arc::ptr_eq(&ensemble, &cross_encoder_for(&pair.clone())));
+        let key: EnsembleKey = pair
+            .members
+            .iter()
+            .map(|(config, weight)| (ModelKey::new(config, pair.threading), weight.to_bits()))
+            .collect();
+        let first_member: Arc<OnnxCrossEncoder> =
+            Arc::clone(&SHARED_ENSEMBLES.lock()[&key].members[0]);
+        let first_member: Arc<dyn CrossEncoderModel> = first_member;
+        assert!(
+            Arc::ptr_eq(&first_member, &single),
+            "an ensemble member is the single model's instance, so its session loads once"
+        );
+        let mut reweighted = pair.clone();
+        reweighted.members[0].1 = 1.5;
+        assert!(
+            !Arc::ptr_eq(&ensemble, &cross_encoder_for(&reweighted)),
+            "the weights are part of the spec"
+        );
+
+        let mut other_threads = ms_marco;
+        other_threads.threading.intra += 1;
+        assert!(
+            !Arc::ptr_eq(&single, &cross_encoder_for(&other_threads)),
+            "a session threaded differently is a different instance"
+        );
+    }
+
+    #[test]
+    fn an_instance_is_prewarmed_once() {
+        let cfg = lookup("ms-marco-MiniLM-L-6-v2").unwrap();
+        let a: Arc<dyn CrossEncoderModel> = Arc::new(OnnxCrossEncoder::new(cfg.clone()));
+        let b: Arc<dyn CrossEncoderModel> = Arc::new(OnnxCrossEncoder::new(cfg.clone()));
+        assert!(claim_prewarm(&a));
+        assert!(!claim_prewarm(&a), "a second reranker on the same instance");
+        assert!(claim_prewarm(&b), "another instance is warmed on its own");
+        drop(a);
+        let c: Arc<dyn CrossEncoderModel> = Arc::new(OnnxCrossEncoder::new(cfg));
+        assert!(
+            claim_prewarm(&c),
+            "a new instance is never mistaken for a dropped one at the same address"
+        );
     }
 
     // -- OutputHead detection --------------------------------------------

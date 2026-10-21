@@ -53,6 +53,10 @@ fn a_passphrase_alone_seals_the_journal_and_keeps_bm25_off_disk() {
         },
     )
     .expect("journal");
+    assert!(
+        mgr.drain_deferred_projections(std::time::Duration::from_secs(10)),
+        "the slow-store projection drained before its file is inspected"
+    );
 
     let tenant = dir.path().join("alice");
     let raw = std::fs::read(tenant.join("intent.log")).expect("journal on disk");

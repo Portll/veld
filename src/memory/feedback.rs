@@ -1850,6 +1850,10 @@ pub(crate) const TRACE_PENDING_TTL_HOURS: i64 = 48;
 /// expiry go first, so we never evict a fresh row whose label may still be coming.
 /// Each such eviction is a join miss (B9).
 pub(crate) const TRACE_PENDING_MAX: usize = 50_000;
+/// Recalls between full PENDING bound checks when the live row count is under the
+/// cap. TTL expiry is time-driven, so it cannot be detected from the count alone;
+/// the check still has to run, just not on every recall.
+pub(crate) const TRACE_PENDING_CHECK_INTERVAL: usize = 64;
 /// Ring cap on TRAINING rows. When exceeded, the oldest labeled rows are dropped
 /// (a labeled row has already served its purpose for the join; pure-recency
 /// eviction here is fine because the (features,label) pair is preserved-or-trained).
@@ -1927,6 +1931,12 @@ impl RetrievalTrace {
 #[derive(Clone)]
 pub struct RetrievalTraceStore {
     kv: Option<Arc<dyn crate::storage::KeyValueStore>>,
+    /// Live PENDING row count. Seeded from a key scan at open, then maintained by
+    /// `record_pending`, graduation and eviction, so a recall can compare it to the
+    /// cap without scanning and decoding every row. Shared across clones.
+    pending_rows: Arc<std::sync::atomic::AtomicUsize>,
+    /// Recalls since the last full bound check.
+    recalls_since_check: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for RetrievalTraceStore {
@@ -1939,7 +1949,11 @@ impl std::fmt::Debug for RetrievalTraceStore {
 
 impl Default for RetrievalTraceStore {
     fn default() -> Self {
-        Self { kv: None }
+        Self {
+            kv: None,
+            pending_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            recalls_since_check: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 }
 
@@ -1951,7 +1965,25 @@ impl RetrievalTraceStore {
 
     /// Persistent store over a per-user KV handle.
     pub fn with_kv(kv: Arc<dyn crate::storage::KeyValueStore>) -> Self {
-        Self { kv: Some(kv) }
+        let seeded = match kv.scan_prefix(TRACE_PENDING_PREFIX.as_bytes(), None) {
+            Ok(rows) => rows.len(),
+            Err(e) => {
+                tracing::warn!(error = %e, "LTR trace: failed to count pending rows at open");
+                0
+            }
+        };
+        Self {
+            kv: Some(kv),
+            pending_rows: Arc::new(std::sync::atomic::AtomicUsize::new(seeded)),
+            ..Self::default()
+        }
+    }
+
+    fn sub_pending(&self, n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self
+            .pending_rows
+            .fetch_update(Relaxed, Relaxed, |c| Some(c.saturating_sub(n)));
     }
 
     fn pending_key(trace_id: &str) -> Vec<u8> {
@@ -1973,11 +2005,15 @@ impl RetrievalTraceStore {
     pub fn record_pending(&self, trace: &RetrievalTrace) {
         let Some(kv) = &self.kv else { return };
         match serde_json::to_vec(trace) {
-            Ok(bytes) => {
-                if let Err(e) = kv.put_bytes(&Self::pending_key(&trace.trace_id), &bytes) {
-                    tracing::warn!(error = %e, "LTR trace: failed to persist pending row");
+            Ok(bytes) => match kv.put_bytes(&Self::pending_key(&trace.trace_id), &bytes) {
+                Ok(()) => {
+                    self.pending_rows
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(error = %e, "LTR trace: failed to persist pending row")
+                }
+            },
             Err(e) => tracing::warn!(error = %e, "LTR trace: failed to serialize pending row"),
         }
     }
@@ -2062,6 +2098,7 @@ impl RetrievalTraceStore {
                         .is_ok()
                     {
                         let _ = kv.delete_bytes(&Self::pending_key(&trace.trace_id));
+                        self.sub_pending(1);
                         graduated += 1;
                         crate::metrics::LTR_TRACE_GRADUATED_TOTAL.inc();
                     }
@@ -2101,15 +2138,23 @@ impl RetrievalTraceStore {
         // 2) Reservoir cap: evict OLDEST first (closest to TTL), so fresh rows whose
         // label may still arrive are preserved (do NOT evict by pure recency ahead
         // of TTL — J3).
+        let mut cap_evicted = 0;
         if rows.len() > TRACE_PENDING_MAX {
             rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
             let overflow = rows.len() - TRACE_PENDING_MAX;
+            cap_evicted = overflow;
             for t in rows.iter().take(overflow) {
                 let _ = kv.delete_bytes(&Self::pending_key(&t.trace_id));
                 crate::metrics::LTR_TRACE_LABEL_JOIN_MISS.inc();
                 evicted += 1;
             }
         }
+
+        // `rows` was scanned fresh above, so this also corrects any drift in the counter.
+        self.pending_rows.store(
+            rows.len() - cap_evicted,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         if evicted > 0 {
             tracing::info!(
@@ -2118,6 +2163,24 @@ impl RetrievalTraceStore {
             );
         }
         evicted
+    }
+
+    /// `enforce_pending_bound` for the recall path: a full scan only when the live
+    /// count is over the cap or every `TRACE_PENDING_CHECK_INTERVAL` calls (which is
+    /// what catches TTL expiry). Returns the number of rows evicted by this call.
+    pub fn enforce_pending_bound_amortized(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.kv.is_none() {
+            return 0;
+        }
+        let over_cap = self.pending_rows.load(Relaxed) > TRACE_PENDING_MAX;
+        let due =
+            self.recalls_since_check.fetch_add(1, Relaxed) + 1 >= TRACE_PENDING_CHECK_INTERVAL;
+        if !over_cap && !due {
+            return 0;
+        }
+        self.recalls_since_check.store(0, Relaxed);
+        self.enforce_pending_bound()
     }
 
     /// Bound the TRAINING stage (ring): drop oldest labeled rows over the cap.
@@ -2759,6 +2822,63 @@ mod tests {
             0.5,
             0.9,
         )
+    }
+
+    fn live_rows(store: &RetrievalTraceStore) -> usize {
+        store
+            .pending_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The atomic count follows record, graduation and eviction, and a reopened
+    /// store seeds it from the persisted rows.
+    #[test]
+    fn test_pending_counter_tracks_rows() {
+        let kv = Arc::new(MemKv::default());
+        let store = RetrievalTraceStore::with_kv(kv.clone());
+        assert_eq!(live_rows(&store), 0);
+
+        let graduating = MemoryId(Uuid::new_v4());
+        store.record_pending(&pending_trace(graduating.clone(), 0));
+        store.record_pending(&pending_trace(MemoryId(Uuid::new_v4()), 1));
+        let mut stale = pending_trace(MemoryId(Uuid::new_v4()), 2);
+        stale.created_at = Utc::now() - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
+        store.record_pending(&stale);
+        assert_eq!(live_rows(&store), 3);
+        assert_eq!(live_rows(&store), store.pending_count());
+
+        store.join_feedback(&[graduating], RetrievalOutcome::Helpful);
+        assert_eq!(live_rows(&store), 2);
+
+        assert_eq!(store.enforce_pending_bound(), 1);
+        assert_eq!(live_rows(&store), 1);
+        assert_eq!(live_rows(&store), store.pending_count());
+
+        let reopened = RetrievalTraceStore::with_kv(kv);
+        assert_eq!(live_rows(&reopened), 1, "seeded from persisted rows");
+    }
+
+    /// Under the cap, the full scan runs once per check interval, not per recall;
+    /// the interval is what retires TTL-expired rows.
+    #[test]
+    fn test_amortized_enforcement_runs_once_per_interval() {
+        let store = mem_store();
+        let mut stale = pending_trace(MemoryId(Uuid::new_v4()), 0);
+        stale.created_at = Utc::now() - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
+        store.record_pending(&stale);
+
+        for _ in 0..TRACE_PENDING_CHECK_INTERVAL - 1 {
+            assert_eq!(store.enforce_pending_bound_amortized(), 0);
+        }
+        assert_eq!(
+            store.pending_count(),
+            1,
+            "no scan before the interval elapses"
+        );
+
+        assert_eq!(store.enforce_pending_bound_amortized(), 1);
+        assert_eq!(store.pending_count(), 0);
+        assert_eq!(live_rows(&store), 0);
     }
 
     /// PENDING → feedback → TRAINING join graduates exactly the matching row,

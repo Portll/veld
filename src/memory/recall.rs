@@ -33,7 +33,55 @@ const SECONDARY_RRF_WEIGHT_RATIO: f32 = 0.5;
 /// watch on 1 May". One day either side covers that; a month-year window is already wide.
 const DATE_WINDOW_DAY_SLACK_DAYS: i64 = 1;
 
+/// Secondary-model query embeddings, keyed by sha256(secondary id, text). Process-wide
+/// because the key carries the model identity; the primary cache lives on `MemorySystem`.
+static SECONDARY_QUERY_CACHE: std::sync::LazyLock<moka::sync::Cache<[u8; 32], Vec<f32>>> =
+    std::sync::LazyLock::new(|| moka::sync::Cache::builder().max_capacity(2_000).build());
+
 impl super::MemorySystem {
+    /// The embedding `recall` searches with for `text`, through the same SHA256-keyed
+    /// cache the pipeline uses. A caller that passes this as `Query::query_embedding`
+    /// gets exactly the ranking it would get by leaving the field unset.
+    ///
+    /// It is the query side, so an asymmetric model's query instruction is applied;
+    /// `query_cache` holds only query-side vectors, the sub-query sites included.
+    pub fn recall_query_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        let query_hash = Self::sha256_hash(text);
+        if let Some(cached) = self.query_cache.get(&query_hash) {
+            EMBEDDING_CACHE_QUERY.with_label_values(&["hit"]).inc();
+            return Ok(cached);
+        }
+        EMBEDDING_CACHE_QUERY.with_label_values(&["miss"]).inc();
+        let embedding = self
+            .embedder
+            .as_ref()
+            .encode_for_query(text)
+            .context("Failed to generate query embedding")?;
+        self.query_cache.insert(query_hash, embedding.clone());
+        EMBEDDING_CACHE_QUERY_SIZE.set(self.query_cache.entry_count() as i64);
+        Ok(embedding)
+    }
+
+    /// Secondary-model query embedding for dual-index competition, cached.
+    /// `None` when there is no secondary model or it failed (failures are not cached).
+    fn secondary_query_embedding(&self, text: &str) -> Option<Vec<f32>> {
+        let secondary_id = self.embedder.secondary_embedder()?.id();
+        let key: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(secondary_id.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(text.as_bytes());
+            hasher.finalize().into()
+        };
+        if let Some(cached) = SECONDARY_QUERY_CACHE.get(&key) {
+            return Some(cached);
+        }
+        let embedding = self.embedder.encode_secondary(text).ok().flatten()?;
+        SECONDARY_QUERY_CACHE.insert(key, embedding.clone());
+        Some(embedding)
+    }
+
     /// Search and retrieve relevant memories (zero-copy with Arc<Memory>)
     ///
     /// PRODUCTION IMPLEMENTATION:
@@ -468,6 +516,17 @@ impl super::MemorySystem {
             return self.spreading_activation_recall(query_text, query);
         }
 
+        // Layer 0.5 reads the BM25 index directly, ahead of hybrid search's own commit, so
+        // buffered writes are committed here for a just-written memory to be findable there.
+        if let Err(e) = self.hybrid_search.commit_pending() {
+            tracing::warn!(error = %e, "BM25 commit before recall failed; buffered writes are not yet searchable");
+        }
+
+        // One clock for the whole recall: graph edge decay and Layer 5 recency agree on "now".
+        let now = super::scoring_now();
+        // Every candidate record this recall reads, each fetched once.
+        let candidates = RecallCandidates::new(self);
+
         // ===========================================================================
         // TEMPORAL EXTRACTION (TEMPR approach from Hindsight - 89.6% on LoCoMo)
         // ===========================================================================
@@ -523,38 +582,72 @@ impl super::MemorySystem {
         // Used by Layer 2 (filtered traversal) and Layer 4.9 (type-aware re-ranking).
         let onto_intent = query_parser::infer_ontological_intent(query_text, &query_analysis);
 
+        let use_graph = matches!(
+            query.retrieval_mode,
+            RetrievalMode::Hybrid | RetrievalMode::Associative | RetrievalMode::Causal
+        ) && query
+            .layer_mode()
+            .allows(crate::memory::types::LayerMode::PlusSpreading);
+        let onto_confident = onto_intent.confidence >= crate::constants::ONTOLOGICAL_MIN_CONFIDENCE;
+
+        // Query words resolved to graph entities once, for the ontology density gate below
+        // and Layer 2's traversal seeds. Nouns, adjectives AND verbs seed traversal, for
+        // multi-hop reasoning.
+        let resolved_entities: Option<ResolvedQueryEntities> = self
+            .graph_memory
+            .as_ref()
+            .filter(|_| use_graph || onto_confident)
+            .map(|graph| {
+                let focal_words: Vec<&str> = query_analysis
+                    .focal_entities
+                    .iter()
+                    .map(|e| e.text.as_str())
+                    .collect();
+                let other_words: Vec<&str> = query_analysis
+                    .discriminative_modifiers
+                    .iter()
+                    .map(|m| m.text.as_str())
+                    .chain(
+                        query_analysis
+                            .relational_context
+                            .iter()
+                            .map(|r| r.text.as_str()),
+                    )
+                    .chain(
+                        query_analysis
+                            .relational_context
+                            .iter()
+                            .map(|r| r.stem.as_str()),
+                    )
+                    .collect();
+                resolve_query_entities(&graph.read(), &focal_words, &other_words, query_text)
+            });
+
         // Compute graph density for ontological gating (consistent with Layer 2 in graph_retrieval.rs).
         // Dense/young graphs have too many noisy L1 edges for type filtering to help.
         // Short-circuit: skip the RocksDB density lookups entirely when confidence is too low.
-        let (graph_density_for_rerank, use_ontology_rerank) =
-            if onto_intent.confidence < crate::constants::ONTOLOGICAL_MIN_CONFIDENCE {
-                (None, false)
-            } else if let Some(graph) = self.graph_memory.as_ref() {
-                let g = graph.read();
-                let seed_uuids: Vec<uuid::Uuid> = query_analysis
-                    .focal_entities
-                    .iter()
-                    .filter_map(|e| {
-                        g.find_entity_by_name(&e.text)
-                            .ok()
-                            .flatten()
-                            .map(|n| n.uuid)
-                    })
-                    .collect();
-                let density = if seed_uuids.is_empty() {
-                    None
-                } else {
-                    g.entities_average_density(&seed_uuids).ok().flatten()
-                };
-                let use_rerank = !density
-                    .is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD)
-                    && query
-                        .layer_mode()
-                        .allows(crate::memory::types::LayerMode::PlusRerank);
-                (density, use_rerank)
+        let (graph_density_for_rerank, use_ontology_rerank) = if !onto_confident {
+            (None, false)
+        } else if let Some(graph) = self.graph_memory.as_ref() {
+            let g = graph.read();
+            let seed_uuids: &[uuid::Uuid] = resolved_entities
+                .as_ref()
+                .map(|r| r.focal.as_slice())
+                .unwrap_or_default();
+            let density = if seed_uuids.is_empty() {
+                None
             } else {
-                (None, false)
+                g.entities_average_density(seed_uuids).ok().flatten()
             };
+            let use_rerank = !density
+                .is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD)
+                && query
+                    .layer_mode()
+                    .allows(crate::memory::types::LayerMode::PlusRerank);
+            (density, use_rerank)
+        } else {
+            (None, false)
+        };
 
         // Ontology telemetry
         crate::metrics::ONTOLOGICAL_INTENT_CONFIDENCE.observe(onto_intent.confidence as f64);
@@ -595,27 +688,11 @@ impl super::MemorySystem {
                 let entity_lower = attr_query.entity.to_lowercase();
                 let mut boosted_ids = HashSet::new();
 
+                candidates.prefetch(bm25_matches.iter().map(|(id, _)| id));
                 for (mem_id, _score) in bm25_matches {
                     // Get memory content to verify it contains entity + attribute value
-                    let content = self
-                        .working_memory
-                        .read()
-                        .get(&mem_id)
-                        .map(|m| m.experience.content.to_lowercase())
-                        .or_else(|| {
-                            self.session_memory
-                                .read()
-                                .get(&mem_id)
-                                .map(|m| m.experience.content.to_lowercase())
-                        })
-                        .or_else(|| {
-                            self.long_term_memory
-                                .get(&mem_id)
-                                .ok()
-                                .map(|m| m.experience.content.to_lowercase())
-                        });
-
-                    if let Some(content) = content {
+                    if let Some(view) = candidates.get(&mem_id) {
+                        let content = &view.content_lower;
                         // Must contain entity
                         if !content.contains(&entity_lower) {
                             continue;
@@ -938,34 +1015,12 @@ impl super::MemorySystem {
                 tracing::debug!("Query embedding PRECOMPUTED by caller — skipping encode");
                 pre.clone()
             } else {
-                let query_hash = Self::sha256_hash(query_text);
-                if let Some(cached_embedding) = self.query_cache.get(&query_hash) {
-                    EMBEDDING_CACHE_QUERY.with_label_values(&["hit"]).inc();
-                    tracing::debug!("Query embedding cache HIT for: {}", query_text);
-                    cached_embedding.clone()
-                } else {
-                    EMBEDDING_CACHE_QUERY.with_label_values(&["miss"]).inc();
-                    tracing::debug!(
-                        "Query embedding cache MISS - generating for: {}",
-                        query_text
-                    );
-                    // The query side, so an asymmetric model's query instruction is applied;
-                    // query_cache holds only query-side vectors, the sub-query sites included.
-                    let embedding = self
-                        .embedder
-                        .as_ref()
-                        .encode_for_query(query_text)
-                        .context("Failed to generate query embedding")?;
-
-                    self.query_cache.insert(query_hash, embedding.clone());
-                    EMBEDDING_CACHE_QUERY_SIZE.set(self.query_cache.entry_count() as i64);
-                    embedding
-                }
+                self.recall_query_embedding(query_text)?
             };
 
         // Secondary query embedding for dual-index competition (Nomic 768d)
         let query_embedding_secondary: Option<Vec<f32>> = if self.embedder.has_secondary() {
-            self.embedder.encode_secondary(query_text).ok().flatten()
+            self.secondary_query_embedding(query_text)
         } else {
             None
         };
@@ -1007,12 +1062,6 @@ impl super::MemorySystem {
         // ===========================================================================
         // LAYER 2: GRAPH EXPANSION (Knowledge Graph Traversal)
         // ===========================================================================
-        let use_graph = matches!(
-            query.retrieval_mode,
-            RetrievalMode::Hybrid | RetrievalMode::Associative | RetrievalMode::Causal
-        ) && query
-            .layer_mode()
-            .allows(crate::memory::types::LayerMode::PlusSpreading);
         #[allow(clippy::type_complexity)]
         let (
             graph_results,
@@ -1049,59 +1098,17 @@ impl super::MemorySystem {
                 let entity_count = query_analysis.focal_entities.len()
                     + query_analysis.discriminative_modifiers.len();
 
-                // First, collect all query entity UUIDs
-                // Include nouns, adjectives, AND verbs for multi-hop reasoning
-                let mut query_entities: Vec<uuid::Uuid> = Vec::new();
-                for e in query_analysis
-                    .focal_entities
-                    .iter()
-                    .map(|e| e.text.as_str())
-                    .chain(
-                        query_analysis
-                            .discriminative_modifiers
-                            .iter()
-                            .map(|m| m.text.as_str()),
-                    )
-                    .chain(
-                        query_analysis
-                            .relational_context
-                            .iter()
-                            .map(|r| r.text.as_str()),
-                    )
-                    .chain(
-                        query_analysis
-                            .relational_context
-                            .iter()
-                            .map(|r| r.stem.as_str()),
-                    )
-                {
-                    if let Ok(Some(ent)) = g.find_entity_by_name(e) {
-                        query_entities.push(ent.uuid);
-                    }
-                }
-                // A path-shaped query word also seeds every declared FilePath entity whose path
-                // ends with it at a `/` boundary: "serve.mjs" and "admin/serve.mjs" reach
-                // `commitwork:admin/serve.mjs`, which no name tier above resolves without also
-                // admitting `observe.mjs`. One index probe per path-shaped word, at most
-                // FILE_PATH_SUFFIX_MAX_CANDIDATES entity reads each.
-                for word in query_text.split_whitespace() {
-                    let token = clean_query_token(word);
-                    if !token.contains('.') && !token.contains('/') {
-                        continue;
-                    }
-                    if let Ok(found) = g.find_file_paths_by_suffix(&token) {
-                        for ent in found {
-                            if !query_entities.contains(&ent.uuid) {
-                                query_entities.push(ent.uuid);
-                            }
-                        }
-                    }
-                }
+                // Query entities, each once: a word and its stem resolving to one entity
+                // would otherwise traverse it twice.
+                let query_entities: &[uuid::Uuid] = resolved_entities
+                    .as_ref()
+                    .map(|r| r.all.as_slice())
+                    .unwrap_or_default();
 
                 // Calculate PER-ENTITY density (not global graph density)
                 // Sparse entities = trust graph, Dense entities = trust vector
                 let d = if !query_entities.is_empty() {
-                    g.entities_average_density(&query_entities).ok().flatten()
+                    g.entities_average_density(query_entities).ok().flatten()
                 } else {
                     // No query entities — skip density calculation.
                     // The default weights (0.6, 0.3, 0.1) handle this case correctly.
@@ -1113,6 +1120,12 @@ impl super::MemorySystem {
                 // activation sort below (memory ids are random per ingest).
                 let mut episode_content: std::collections::HashMap<MemoryId, String> =
                     std::collections::HashMap::new();
+                // Each reached entity's recent episodes, read once however many traversals
+                // reach it.
+                let mut entity_episodes: std::collections::HashMap<
+                    uuid::Uuid,
+                    Vec<(MemoryId, String)>,
+                > = std::collections::HashMap::new();
 
                 // Density-adaptive traversal: dense graphs get shallower depth
                 // and stricter strength filters to avoid exploring noisy L1 edges.
@@ -1149,39 +1162,39 @@ impl super::MemorySystem {
                             if pair_count >= max_pairs {
                                 break 'bidir;
                             }
-                            if let Ok(path) = g.traverse_bidirectional(
+                            if let Ok(path) = g.traverse_bidirectional_at(
                                 &query_entities[i],
                                 &query_entities[j],
                                 bidir_depth,
                                 bidir_min_str,
+                                now,
                             ) {
                                 for tr in &path.entities {
-                                    if let Ok(mut eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
-                                        // Keep most recent episodes — recency correlates
-                                        // with relevance for graph-surfaced candidates.
-                                        eps.sort_by(|a, b| {
-                                            b.created_at
-                                                .cmp(&a.created_at)
-                                                .then_with(|| a.content.cmp(&b.content))
-                                        });
-                                        eps.truncate(20);
-                                        for ep in eps {
-                                            let mid = MemoryId(ep.uuid);
-                                            if episode_candidates
-                                                .as_ref()
-                                                .is_none_or(|c| c.contains(&mid))
-                                            {
-                                                let path_boost = 1.5;
-                                                let activation = tr.entity.salience
-                                                    * tr.decay_factor
-                                                    * path_boost;
-                                                // Relevance floor: skip low-activation candidates
-                                                if activation >= 0.1 {
-                                                    episode_content
-                                                        .entry(mid.clone())
-                                                        .or_insert(ep.content);
-                                                    ids.push((mid, activation, tr.decay_factor));
-                                                }
+                                    // Most recent episodes only: recency correlates with
+                                    // relevance for graph-surfaced candidates.
+                                    let episodes = recent_entity_episodes(
+                                        &g,
+                                        &mut entity_episodes,
+                                        &tr.entity.uuid,
+                                    );
+                                    for (mid, content) in episodes {
+                                        if episode_candidates
+                                            .as_ref()
+                                            .is_none_or(|c| c.contains(mid))
+                                        {
+                                            let path_boost = 1.5;
+                                            let activation =
+                                                tr.entity.salience * tr.decay_factor * path_boost;
+                                            // Relevance floor: skip low-activation candidates
+                                            if activation >= 0.1 {
+                                                episode_content
+                                                    .entry(mid.clone())
+                                                    .or_insert_with(|| content.clone());
+                                                ids.push((
+                                                    mid.clone(),
+                                                    activation,
+                                                    tr.decay_factor,
+                                                ));
                                             }
                                         }
                                     }
@@ -1205,33 +1218,26 @@ impl super::MemorySystem {
                         None
                     };
 
-                for entity_uuid in &query_entities {
-                    if let Ok(t) = g.traverse_weighted(
+                for entity_uuid in query_entities {
+                    if let Ok(t) = g.traverse_weighted_at(
                         entity_uuid,
                         weighted_depth,
                         relation_filter.as_deref(),
                         weighted_min_str,
+                        now,
                     ) {
                         for tr in &t.entities {
-                            if let Ok(mut eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
-                                eps.sort_by(|a, b| {
-                                    b.created_at
-                                        .cmp(&a.created_at)
-                                        .then_with(|| a.content.cmp(&b.content))
-                                });
-                                eps.truncate(20);
-                                for ep in eps {
-                                    let mid = MemoryId(ep.uuid);
-                                    if episode_candidates.as_ref().is_none_or(|c| c.contains(&mid))
-                                    {
-                                        let activation = tr.entity.salience * tr.decay_factor;
-                                        // Relevance floor: skip low-activation candidates
-                                        if activation >= 0.1 {
-                                            episode_content
-                                                .entry(mid.clone())
-                                                .or_insert(ep.content);
-                                            ids.push((mid, activation, tr.decay_factor));
-                                        }
+                            let episodes =
+                                recent_entity_episodes(&g, &mut entity_episodes, &tr.entity.uuid);
+                            for (mid, content) in episodes {
+                                if episode_candidates.as_ref().is_none_or(|c| c.contains(mid)) {
+                                    let activation = tr.entity.salience * tr.decay_factor;
+                                    // Relevance floor: skip low-activation candidates
+                                    if activation >= 0.1 {
+                                        episode_content
+                                            .entry(mid.clone())
+                                            .or_insert_with(|| content.clone());
+                                        ids.push((mid.clone(), activation, tr.decay_factor));
                                     }
                                 }
                             }
@@ -1710,24 +1716,7 @@ impl super::MemorySystem {
         );
 
         let (memory_ids, hebbian_scores, mut signal_attributions): FusionLayerOutput = {
-            let get_content = |id: &MemoryId| -> Option<String> {
-                self.working_memory
-                    .read()
-                    .get(id)
-                    .map(|m| m.experience.content.clone())
-                    .or_else(|| {
-                        self.session_memory
-                            .read()
-                            .get(id)
-                            .map(|m| m.experience.content.clone())
-                    })
-                    .or_else(|| {
-                        self.long_term_memory
-                            .get(id)
-                            .ok()
-                            .map(|m| m.experience.content.clone())
-                    })
-            };
+            let get_content = |id: &MemoryId| -> Option<String> { candidates.content(id) };
             // Use IC-weighted BM25 search with phrase matching
             let term_weights = if ic_weights.is_empty() {
                 None
@@ -2062,6 +2051,10 @@ impl super::MemorySystem {
                 }
             }
 
+            // The fused set is final from here on (later layers only rescore it): read every
+            // candidate once, tiers first and one storage batch for the rest.
+            candidates.prefetch(fused.keys());
+
             // ===========================================================================
             // LAYER 4.52: EXPERIENCE-TYPE BOOST
             // ===========================================================================
@@ -2077,37 +2070,18 @@ impl super::MemorySystem {
                     || (query_lower.contains("what") && query_lower.contains("use"));
 
                 if is_decision_query {
-                    let get_experience_type =
-                        |id: &MemoryId| -> Option<crate::memory::types::ExperienceType> {
-                            self.working_memory
-                                .read()
-                                .get(id)
-                                .map(|m| m.experience.experience_type.clone())
-                                .or_else(|| {
-                                    self.session_memory
-                                        .read()
-                                        .get(id)
-                                        .map(|m| m.experience.experience_type.clone())
-                                })
-                                .or_else(|| {
-                                    self.long_term_memory
-                                        .get(id)
-                                        .ok()
-                                        .map(|m| m.experience.experience_type.clone())
-                                })
-                        };
-
                     const DECISION_TYPE_BOOST: f32 = 0.15;
                     let mut boosted_count = 0usize;
-                    let ids: Vec<MemoryId> = fused.keys().cloned().collect();
-                    for id in &ids {
-                        if let Some(exp_type) = get_experience_type(id) {
-                            if matches!(exp_type, crate::memory::types::ExperienceType::Decision) {
-                                if let Some(score) = fused.get_mut(id) {
-                                    *score += DECISION_TYPE_BOOST;
-                                    boosted_count += 1;
-                                }
-                            }
+                    for (id, score) in fused.iter_mut() {
+                        let is_decision = candidates.get(id).is_some_and(|view| {
+                            matches!(
+                                view.memory.experience.experience_type,
+                                crate::memory::types::ExperienceType::Decision
+                            )
+                        });
+                        if is_decision {
+                            *score += DECISION_TYPE_BOOST;
+                            boosted_count += 1;
                         }
                     }
                     if boosted_count > 0 {
@@ -2150,33 +2124,18 @@ impl super::MemorySystem {
                     .collect();
 
                 if !query_stems.is_empty() {
-                    let get_entities = |id: &MemoryId| -> Vec<String> {
-                        self.working_memory
-                            .read()
-                            .get(id)
-                            .map(|m| m.experience.entities.clone())
-                            .or_else(|| {
-                                self.session_memory
-                                    .read()
-                                    .get(id)
-                                    .map(|m| m.experience.entities.clone())
-                            })
-                            .or_else(|| {
-                                self.long_term_memory
-                                    .get(id)
-                                    .ok()
-                                    .map(|m| m.experience.entities.clone())
-                            })
-                            .unwrap_or_default()
-                    };
-
                     let ids: Vec<MemoryId> = fused.keys().cloned().collect();
                     for id in &ids {
-                        let entities = get_entities(id);
-                        let entity_stems: Vec<String> = entities
-                            .iter()
-                            .map(|e| stem_query_token(&stemmer, &e.to_lowercase()))
-                            .collect();
+                        let view = candidates.get(id);
+                        let entity_stems: Vec<String> = view
+                            .as_ref()
+                            .map(|v| {
+                                v.entities_lower
+                                    .iter()
+                                    .map(|e| stem_query_token(&stemmer, e))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         let matched: Vec<&String> = query_stems
                             .iter()
                             .filter(|qs| {
@@ -2215,8 +2174,8 @@ impl super::MemorySystem {
                             // would boost wrong-session memories indiscriminately.
                             // [signal: content_fallback] Gated by disabled_signals dial; default = always on.
                             if early_dials_snapshot.signal_enabled("content_fallback") {
-                                if let Some(content) = get_content(id) {
-                                    let content_lower = content.to_lowercase();
+                                if let Some(view) = view.as_ref() {
+                                    let content_lower = &view.content_lower;
                                     let content_overlap = query_stems
                                         .iter()
                                         .filter(|qs| content_lower.contains(qs.as_str()))
@@ -2277,8 +2236,8 @@ impl super::MemorySystem {
             {
                 let mut lengths: Vec<(MemoryId, usize)> = Vec::new();
                 for id in fused.keys() {
-                    if let Some(content) = get_content(id) {
-                        lengths.push((id.clone(), content.len()));
+                    if let Some(view) = candidates.get(id) {
+                        lengths.push((id.clone(), view.memory.experience.content.len()));
                     }
                 }
                 if lengths.len() >= 5 {
@@ -2340,33 +2299,15 @@ impl super::MemorySystem {
                     .collect();
 
                 if q_stems.len() >= 2 {
-                    let get_ents = |id: &MemoryId| -> Vec<String> {
-                        self.working_memory
-                            .read()
-                            .get(id)
-                            .map(|m| m.experience.entities.clone())
-                            .or_else(|| {
-                                self.session_memory
-                                    .read()
-                                    .get(id)
-                                    .map(|m| m.experience.entities.clone())
-                            })
-                            .or_else(|| {
-                                self.long_term_memory
-                                    .get(id)
-                                    .ok()
-                                    .map(|m| m.experience.entities.clone())
-                            })
-                            .unwrap_or_default()
-                    };
-
-                    let ids: Vec<MemoryId> = fused.keys().cloned().collect();
-                    for id in &ids {
-                        let entities = get_ents(id);
-                        if entities.len() >= 2 {
-                            let ent_stems: Vec<String> = entities
+                    for (id, score) in fused.iter_mut() {
+                        let Some(view) = candidates.get(id) else {
+                            continue;
+                        };
+                        if view.entities_lower.len() >= 2 {
+                            let ent_stems: Vec<String> = view
+                                .entities_lower
                                 .iter()
-                                .map(|e| stem.stem(&e.to_lowercase()).to_string())
+                                .map(|e| stem.stem(e).to_string())
                                 .collect();
                             let matching = q_stems
                                 .iter()
@@ -2374,12 +2315,10 @@ impl super::MemorySystem {
                                 .count();
                             let concentration = matching as f32 / ent_stems.len() as f32;
 
-                            if let Some(score) = fused.get_mut(id) {
-                                if concentration < 0.20 {
-                                    *score *= 0.85;
-                                } else if concentration > 0.50 {
-                                    *score *= 1.10;
-                                }
+                            if concentration < 0.20 {
+                                *score *= 0.85;
+                            } else if concentration > 0.50 {
+                                *score *= 1.10;
                             }
                         }
                     }
@@ -2392,76 +2331,14 @@ impl super::MemorySystem {
             // When two memories cover the same topic (high entity overlap) and the
             // query has recency intent, demote the older memory. Belt & braces
             // against light pollution from old-but-topical memories.
+            // Only the top TEMPORAL_DEDUP_MAX_CANDIDATES by fused score are compared: the pass
+            // is all-pairs over the fused set, which runs to hundreds of candidates.
             if has_any_temporal_intent || has_temporal_keywords {
-                // Pairs are visited in content order: when two same-topic memories share a
-                // timestamp the second one visited is demoted, so the visiting order must not
-                // come from the map's hash order.
-                let mut ids: Vec<(MemoryId, Option<String>)> = fused
-                    .keys()
-                    .map(|id| (id.clone(), get_content(id)))
-                    .collect();
-                ids.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-                let ids: Vec<MemoryId> = ids.into_iter().map(|(id, _)| id).collect();
-                let get_created_at = |id: &MemoryId| -> Option<chrono::DateTime<chrono::Utc>> {
-                    self.working_memory
-                        .read()
-                        .get(id)
-                        .map(|m| m.created_at)
-                        .or_else(|| self.session_memory.read().get(id).map(|m| m.created_at))
-                        .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.created_at))
-                };
-                let get_ents = |id: &MemoryId| -> std::collections::HashSet<String> {
-                    self.working_memory
-                        .read()
-                        .get(id)
-                        .map(|m| m.experience.entities.clone())
-                        .or_else(|| {
-                            self.session_memory
-                                .read()
-                                .get(id)
-                                .map(|m| m.experience.entities.clone())
-                        })
-                        .or_else(|| {
-                            self.long_term_memory
-                                .get(id)
-                                .ok()
-                                .map(|m| m.experience.entities.clone())
-                        })
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|e| e.to_lowercase())
-                        .collect()
-                };
-
-                let entity_sets: Vec<(MemoryId, std::collections::HashSet<String>)> =
-                    ids.iter().map(|id| (id.clone(), get_ents(id))).collect();
-
-                let mut demoted = 0usize;
-                for i in 0..entity_sets.len() {
-                    for j in (i + 1)..entity_sets.len() {
-                        let (id_a, set_a) = &entity_sets[i];
-                        let (id_b, set_b) = &entity_sets[j];
-                        if set_a.is_empty() || set_b.is_empty() {
-                            continue;
-                        }
-
-                        let intersection = set_a.intersection(set_b).count();
-                        let union = set_a.union(set_b).count();
-                        let jaccard = intersection as f32 / union.max(1) as f32;
-
-                        if jaccard > 0.40 {
-                            if let (Some(ts_a), Some(ts_b)) =
-                                (get_created_at(id_a), get_created_at(id_b))
-                            {
-                                let older_id = if ts_a < ts_b { id_a } else { id_b };
-                                if let Some(score) = fused.get_mut(older_id) {
-                                    *score *= 0.85;
-                                    demoted += 1;
-                                }
-                            }
-                        }
-                    }
-                }
+                let demoted = temporal_topic_dedup(
+                    &mut fused,
+                    &candidates,
+                    crate::constants::TEMPORAL_DEDUP_MAX_CANDIDATES,
+                );
                 if demoted > 0 {
                     tracing::debug!(
                         "Layer 4.54: Temporal dedup demoted {} older same-topic memories",
@@ -2552,14 +2429,12 @@ impl super::MemorySystem {
 
                     if !signal_terms.is_empty() {
                         let mut boosted_count = 0;
-                        let ids: Vec<MemoryId> = fused.keys().cloned().collect();
 
-                        for id in &ids {
-                            if let Some(content) = get_content(id) {
-                                let content_lower = content.to_lowercase();
+                        for (id, score) in fused.iter_mut() {
+                            if let Some(view) = candidates.get(id) {
                                 let match_count = signal_terms
                                     .iter()
-                                    .filter(|term| content_lower.contains(term.as_str()))
+                                    .filter(|term| view.content_lower.contains(term.as_str()))
                                     .count();
 
                                 if match_count > 0 {
@@ -2567,10 +2442,8 @@ impl super::MemorySystem {
                                     let boost = (PROSPECTIVE_BOOST_PER_MATCH
                                         * (match_count as f32).sqrt())
                                     .min(MAX_PROSPECTIVE_BOOST);
-                                    if let Some(score) = fused.get_mut(id) {
-                                        *score += boost;
-                                        boosted_count += 1;
-                                    }
+                                    *score += boost;
+                                    boosted_count += 1;
                                 }
                             }
                         }
@@ -2716,33 +2589,22 @@ impl super::MemorySystem {
                 let interference_budget = 20.min(res.len());
                 let mut demoted = 0usize;
 
-                // Collect content and timestamps for the top candidates
-                let contents: Vec<Option<String>> = res
+                // Content and timestamps for the top candidates
+                let views: Vec<Option<Arc<CandidateView>>> = res
                     .iter()
                     .take(interference_budget)
-                    .map(|(id, _)| get_content(id))
-                    .collect();
-                let get_ts = |id: &MemoryId| -> Option<chrono::DateTime<chrono::Utc>> {
-                    self.working_memory
-                        .read()
-                        .get(id)
-                        .map(|m| m.created_at)
-                        .or_else(|| self.session_memory.read().get(id).map(|m| m.created_at))
-                        .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.created_at))
-                };
-                let timestamps: Vec<Option<chrono::DateTime<chrono::Utc>>> = res
-                    .iter()
-                    .take(interference_budget)
-                    .map(|(id, _)| get_ts(id))
+                    .map(|(id, _)| candidates.get(id))
                     .collect();
 
                 // Check pairwise: only pairs with high text similarity (>0.7)
                 // that also show semantic opposition
                 let mut demote_indices: Vec<(usize, f32)> = Vec::new();
-                for i in 0..contents.len() {
-                    let Some(ref ci) = contents[i] else { continue };
-                    for j in (i + 1)..contents.len() {
-                        let Some(ref cj) = contents[j] else { continue };
+                for (i, vi) in views.iter().enumerate() {
+                    let Some(vi) = vi else { continue };
+                    let ci = &vi.memory.experience.content;
+                    for (j, vj) in views.iter().enumerate().skip(i + 1) {
+                        let Some(vj) = vj else { continue };
+                        let cj = &vj.memory.experience.content;
 
                         let sim = text_similarity(ci, cj);
                         if sim < 0.7 {
@@ -2751,13 +2613,9 @@ impl super::MemorySystem {
 
                         if detect_semantic_opposition(ci, cj) {
                             // Contradiction detected — demote the older memory
-                            let ti = timestamps[i];
-                            let tj = timestamps[j];
-                            let older_idx = match (ti, tj) {
-                                (Some(a), Some(b)) if a < b => i,
-                                (Some(a), Some(b)) if b < a => j,
-                                _ => j, // default: demote the lower-ranked one
-                            };
+                            let (ti, tj) = (vi.memory.created_at, vj.memory.created_at);
+                            // On equal timestamps, demote the lower-ranked one.
+                            let older_idx = if ti < tj { i } else { j };
                             // Penalty proportional to similarity: higher sim = more
                             // confident this is a true contradiction, not coincidence
                             let penalty = sim * 0.20;
@@ -2797,8 +2655,15 @@ impl super::MemorySystem {
                     .iter()
                     .take(dedup_budget)
                     .map(|(id, _)| {
-                        get_content(id)
-                            .map(|c| c.chars().take(200).collect::<String>().to_lowercase())
+                        candidates.get(id).map(|view| {
+                            view.memory
+                                .experience
+                                .content
+                                .chars()
+                                .take(200)
+                                .collect::<String>()
+                                .to_lowercase()
+                        })
                     })
                     .collect();
 
@@ -2905,7 +2770,6 @@ impl super::MemorySystem {
         // Recency decay: recent memories get boost, old memories decay
         // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
         const RECENCY_DECAY_RATE: f32 = 0.01;
-        let now = super::scoring_now();
 
         // PIPE-9: Get feedback store guard for momentum-based scoring
         // Acquire once outside the loop to avoid repeated locking
@@ -3356,56 +3220,34 @@ impl super::MemorySystem {
                 Arc::new(cloned)
             };
 
-            // Try working memory first (hot cache)
-            if let Some(memory) = self.working_memory.read().get(&memory_id) {
-                // CRITICAL FIX: Apply filters before adding to results
-                if self.retriever.matches_filters(&memory, &vector_query) {
-                    memories.push(with_unified_score(&memory, base_score));
-                    if !sources.contains(&"working") {
-                        sources.push("working");
-                    }
-                    cache_hits += 1;
-                } else {
-                    filtered_out += 1;
-                }
-                continue;
-            }
-
-            // Try session memory second (warm cache)
-            if let Some(memory) = self.session_memory.read().get(&memory_id) {
-                // CRITICAL FIX: Apply filters before adding to results
-                if self.retriever.matches_filters(&memory, &vector_query) {
-                    memories.push(with_unified_score(&memory, base_score));
-                    if !sources.contains(&"session") {
-                        sources.push("session");
-                    }
-                    cache_hits += 1;
-                } else {
-                    filtered_out += 1;
-                }
-                continue;
-            }
-
-            // Cold path: Fetch from RocksDB storage (expensive deserialization)
-            match self.retriever.get_from_storage(&memory_id) {
-                Ok(memory) => {
+            // The record the fusion layers already read: working, session, or storage.
+            match candidates.get(&memory_id) {
+                Some(view) => {
                     // CRITICAL FIX: Apply filters before adding to results
-                    if self.retriever.matches_filters(&memory, &vector_query) {
-                        // Reuse unified scoring (includes feedback_multiplier)
-                        let shared = Arc::new(memory);
-                        memories.push(with_unified_score(&shared, base_score));
-                        if !sources.contains(&"longterm") {
-                            sources.push("longterm");
+                    if self.retriever.matches_filters(&view.memory, &vector_query) {
+                        memories.push(with_unified_score(&view.memory, base_score));
+                        let source = view.tier.source_label();
+                        if !sources.contains(&source) {
+                            sources.push(source);
                         }
-                        storage_fetches += 1;
+                        if view.tier == CandidateTier::LongTerm {
+                            storage_fetches += 1;
+                        } else {
+                            cache_hits += 1;
+                        }
                     } else {
                         filtered_out += 1;
                     }
+                    // A tier-resident candidate never stopped the fetch: only a storage read
+                    // or a stale reference reaches the pool check below.
+                    if view.tier != CandidateTier::LongTerm {
+                        continue;
+                    }
                 }
-                Err(e) => {
+                None => {
                     tracing::warn!(
                         memory_id = %memory_id.0,
-                        error = %e,
+                        error = %candidates.failure(&memory_id).unwrap_or_default(),
                         "Stale vector reference — cleaning up orphaned index entry"
                     );
                     self.retriever.remove_memory(&memory_id);
@@ -3932,7 +3774,6 @@ impl super::MemorySystem {
             };
 
             if let Some(range) = temporal_range {
-                let now = super::scoring_now();
                 let mut demoted = 0;
 
                 match range {
@@ -4476,20 +4317,16 @@ impl super::MemorySystem {
                                         continue;
                                     }
                                     // Load and score the fact-source memory
-                                    if let Some(src_mem) = self.working_memory.read().get(src_id) {
-                                        memories.push(src_mem);
-                                        injected += 1;
-                                    } else if let Some(src_mem) =
-                                        self.session_memory.read().get(src_id)
-                                    {
-                                        memories.push(src_mem);
-                                        injected += 1;
-                                    } else if let Ok(src_mem) = self.long_term_memory.get(src_id) {
-                                        let mut scored = src_mem;
-                                        // Score slightly below top result to avoid displacing
-                                        // the original match entirely
-                                        scored.set_score(top_score * 0.85 * fact.confidence);
-                                        memories.push(Arc::new(scored));
+                                    if let Some(view) = candidates.get(src_id) {
+                                        if view.tier == CandidateTier::LongTerm {
+                                            let mut scored = view.memory.as_ref().clone();
+                                            // Score slightly below top result to avoid
+                                            // displacing the original match entirely
+                                            scored.set_score(top_score * 0.85 * fact.confidence);
+                                            memories.push(Arc::new(scored));
+                                        } else {
+                                            memories.push(Arc::clone(&view.memory));
+                                        }
                                         injected += 1;
                                     }
                                     if injected >= 2 {
@@ -4855,7 +4692,7 @@ impl super::MemorySystem {
             // B9 batch enforcement: enforce the PENDING bound once per recall
             // (after all rows for this retrieval are written) rather than once
             // per result row. Avoids a full KV prefix scan per insert.
-            self.retrieval_trace_store.enforce_pending_bound();
+            self.retrieval_trace_store.enforce_pending_bound_amortized();
 
             // R3b SHADOW DELTA — compute the learned-weighted score alongside
             // the static score and log the delta.  PURELY READ-ONLY w.r.t. the
@@ -4984,28 +4821,12 @@ impl super::MemorySystem {
             |episode: &crate::graph_memory::EpisodicNode| -> Result<Option<SharedMemory>> {
                 let target_id = MemoryId(episode.uuid);
 
-                // Check working memory first (highest activation)
-                {
-                    let working = working_ref.read();
-                    if let Some(mem) = working
-                        .all_memories()
-                        .into_iter()
-                        .find(|m| m.id == target_id)
-                    {
-                        return Ok(Some(mem));
-                    }
+                // Check working memory first (highest activation), then session
+                if let Some(mem) = working_ref.read().get(&target_id) {
+                    return Ok(Some(mem));
                 }
-
-                // Check session memory
-                {
-                    let session = session_ref.read();
-                    if let Some(mem) = session
-                        .all_memories()
-                        .into_iter()
-                        .find(|m| m.id == target_id)
-                    {
-                        return Ok(Some(mem));
-                    }
+                if let Some(mem) = session_ref.read().get(&target_id) {
+                    return Ok(Some(mem));
                 }
 
                 // Fall back to long-term storage
@@ -6008,6 +5829,336 @@ where
     }
 }
 
+/// Which tier a recall candidate's record was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateTier {
+    Working,
+    Session,
+    LongTerm,
+}
+
+impl CandidateTier {
+    fn source_label(self) -> &'static str {
+        match self {
+            CandidateTier::Working => "working",
+            CandidateTier::Session => "session",
+            CandidateTier::LongTerm => "longterm",
+        }
+    }
+}
+
+/// One recall candidate's record plus the derived fields the fusion layers read.
+pub(crate) struct CandidateView {
+    pub(crate) memory: SharedMemory,
+    pub(crate) tier: CandidateTier,
+    pub(crate) content_lower: String,
+    pub(crate) entities_lower: Vec<String>,
+}
+
+impl CandidateView {
+    fn new(memory: SharedMemory, tier: CandidateTier) -> Self {
+        let content_lower = memory.experience.content.to_lowercase();
+        let entities_lower = memory
+            .experience
+            .entities
+            .iter()
+            .map(|e| e.to_lowercase())
+            .collect();
+        Self {
+            memory,
+            tier,
+            content_lower,
+            entities_lower,
+        }
+    }
+}
+
+/// Where [`RecallCandidates`] reads records from.
+pub(crate) trait CandidateSource {
+    /// The records among `ids` resident in the in-memory tiers, working before session.
+    fn resident(&self, ids: &[MemoryId]) -> Vec<(MemoryId, SharedMemory, CandidateTier)>;
+    /// Storage reads for `ids`, results in the same order.
+    fn stored(&self, ids: &[MemoryId]) -> Vec<Result<Memory>>;
+}
+
+impl CandidateSource for super::MemorySystem {
+    fn resident(&self, ids: &[MemoryId]) -> Vec<(MemoryId, SharedMemory, CandidateTier)> {
+        let mut found = Vec::new();
+        let mut not_working: Vec<&MemoryId> = Vec::new();
+        {
+            let working = self.working_memory.read();
+            for id in ids {
+                match working.get(id) {
+                    Some(memory) => found.push((id.clone(), memory, CandidateTier::Working)),
+                    None => not_working.push(id),
+                }
+            }
+        }
+        if !not_working.is_empty() {
+            let session = self.session_memory.read();
+            for id in not_working {
+                if let Some(memory) = session.get(id) {
+                    found.push((id.clone(), memory, CandidateTier::Session));
+                }
+            }
+        }
+        found
+    }
+
+    fn stored(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
+        self.retriever.get_many_from_storage(ids)
+    }
+}
+
+enum CandidateSlot {
+    Loaded(Arc<CandidateView>),
+    /// Neither tier holds it and storage could not produce it; the reason, for the log.
+    Missing(String),
+}
+
+/// One recall's projection of its candidates: each id is read once (tiers first, then one
+/// storage batch for the rest) and every fusion layer and the Layer 5 fetch read the same
+/// record. Before this, each layer re-read every fused candidate through its own
+/// tier-lock-then-storage closure.
+pub(crate) struct RecallCandidates<'s, S: CandidateSource + ?Sized> {
+    source: &'s S,
+    slots: std::cell::RefCell<std::collections::HashMap<MemoryId, CandidateSlot>>,
+}
+
+impl<'s, S: CandidateSource + ?Sized> RecallCandidates<'s, S> {
+    pub(crate) fn new(source: &'s S) -> Self {
+        Self {
+            source,
+            slots: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Load every id not yet held.
+    pub(crate) fn prefetch<'a>(&self, ids: impl IntoIterator<Item = &'a MemoryId>) {
+        let wanted: Vec<MemoryId> = {
+            let slots = self.slots.borrow();
+            let mut seen: HashSet<&MemoryId> = HashSet::new();
+            ids.into_iter()
+                .filter(|id| !slots.contains_key(*id) && seen.insert(*id))
+                .cloned()
+                .collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let mut slots = self.slots.borrow_mut();
+        for (id, memory, tier) in self.source.resident(&wanted) {
+            slots.insert(
+                id,
+                CandidateSlot::Loaded(Arc::new(CandidateView::new(memory, tier))),
+            );
+        }
+        let from_storage: Vec<MemoryId> = wanted
+            .into_iter()
+            .filter(|id| !slots.contains_key(id))
+            .collect();
+        if from_storage.is_empty() {
+            return;
+        }
+        let results = self.source.stored(&from_storage);
+        for (id, result) in from_storage.into_iter().zip(results) {
+            let slot = match result {
+                Ok(memory) => CandidateSlot::Loaded(Arc::new(CandidateView::new(
+                    Arc::new(memory),
+                    CandidateTier::LongTerm,
+                ))),
+                Err(e) => CandidateSlot::Missing(format!("{e:#}")),
+            };
+            slots.insert(id, slot);
+        }
+    }
+
+    /// The candidate's view, loading it first if no earlier call did.
+    pub(crate) fn get(&self, id: &MemoryId) -> Option<Arc<CandidateView>> {
+        self.prefetch(std::iter::once(id));
+        match self.slots.borrow().get(id) {
+            Some(CandidateSlot::Loaded(view)) => Some(Arc::clone(view)),
+            _ => None,
+        }
+    }
+
+    /// Why `id` could not be loaded, if it could not.
+    pub(crate) fn failure(&self, id: &MemoryId) -> Option<String> {
+        match self.slots.borrow().get(id) {
+            Some(CandidateSlot::Missing(reason)) => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
+    /// The candidate's content, owned, for callers that take `Fn(&MemoryId) -> Option<String>`.
+    pub(crate) fn content(&self, id: &MemoryId) -> Option<String> {
+        self.get(id)
+            .map(|view| view.memory.experience.content.clone())
+    }
+}
+
+/// Layer 4.54 (temporal topic dedup) over the `cap` highest fused scores: for each pair of
+/// those whose lowercase entity sets have Jaccard > 0.40, the older is demoted ×0.85.
+/// Pairs are visited in content order: when two same-topic memories share a timestamp the
+/// second one visited is demoted, so the order must not come from the map's hash order.
+/// Returns the number of demotions.
+fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
+    fused: &mut std::collections::HashMap<MemoryId, f32>,
+    candidates: &RecallCandidates<'_, S>,
+    cap: usize,
+) -> usize {
+    let mut entries: Vec<(MemoryId, f32, Arc<CandidateView>)> = fused
+        .iter()
+        .filter_map(|(id, score)| candidates.get(id).map(|view| (id.clone(), *score, view)))
+        .filter(|(_, _, view)| !view.entities_lower.is_empty())
+        .collect();
+    let by_content = |a: &(MemoryId, f32, Arc<CandidateView>),
+                      b: &(MemoryId, f32, Arc<CandidateView>)| {
+        a.2.memory
+            .experience
+            .content
+            .cmp(&b.2.memory.experience.content)
+            .then_with(|| a.0.cmp(&b.0))
+    };
+    entries.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| by_content(a, b)));
+    entries.truncate(cap);
+    entries.sort_by(by_content);
+
+    let entity_sets: Vec<HashSet<&str>> = entries
+        .iter()
+        .map(|(_, _, view)| view.entities_lower.iter().map(String::as_str).collect())
+        .collect();
+
+    let mut demoted = 0usize;
+    for i in 0..entries.len() {
+        for j in (i + 1)..entries.len() {
+            let (set_a, set_b) = (&entity_sets[i], &entity_sets[j]);
+            let (small, large) = if set_a.len() <= set_b.len() {
+                (set_a, set_b)
+            } else {
+                (set_b, set_a)
+            };
+            let intersection = small.iter().filter(|e| large.contains(*e)).count();
+            let union = set_a.len() + set_b.len() - intersection;
+            let jaccard = intersection as f32 / union.max(1) as f32;
+            if jaccard > 0.40 {
+                let (ts_a, ts_b) = (
+                    entries[i].2.memory.created_at,
+                    entries[j].2.memory.created_at,
+                );
+                let older_id = if ts_a < ts_b {
+                    &entries[i].0
+                } else {
+                    &entries[j].0
+                };
+                if let Some(score) = fused.get_mut(older_id) {
+                    *score *= 0.85;
+                    demoted += 1;
+                }
+            }
+        }
+    }
+    demoted
+}
+
+/// Query words resolved to graph entities for recall.
+pub(crate) struct ResolvedQueryEntities {
+    /// Entities the focal words resolved to, in query order, each once.
+    pub(crate) focal: Vec<uuid::Uuid>,
+    /// Every resolved entity in query order (focal, then the other words, then path-shaped
+    /// words' FilePath entities), each once: two words resolving to one entity traverse it once.
+    pub(crate) all: Vec<uuid::Uuid>,
+}
+
+/// Resolve recall's query words against the graph. Every word goes through the exact,
+/// case-insensitive and stemmed indexes, which cost no storage read. Only a focal word those
+/// miss falls back to fuzzy matching, bounded to
+/// [`QUERY_ENTITY_FUZZY_MAX_CANDIDATES`](crate::constants::QUERY_ENTITY_FUZZY_MAX_CANDIDATES):
+/// on the other words (modifiers and verbs, mostly not entities) the unbounded fuzzy tiers
+/// scanned the whole name index and read every match on most queries.
+pub(crate) fn resolve_query_entities(
+    graph: &crate::graph_memory::GraphMemory,
+    focal_words: &[&str],
+    other_words: &[&str],
+    query_text: &str,
+) -> ResolvedQueryEntities {
+    let mut focal: Vec<uuid::Uuid> = Vec::new();
+    let mut all: Vec<uuid::Uuid> = Vec::new();
+    let mut tried: HashSet<&str> = HashSet::new();
+    let add = |list: &mut Vec<uuid::Uuid>, uuid: uuid::Uuid| {
+        if !list.contains(&uuid) {
+            list.push(uuid);
+        }
+    };
+
+    for &word in focal_words {
+        if !tried.insert(word) {
+            continue;
+        }
+        let resolved = graph.find_entity_uuid_strict(word).or_else(|| {
+            graph
+                .find_entity_by_name_bounded(
+                    word,
+                    crate::constants::QUERY_ENTITY_FUZZY_MAX_CANDIDATES,
+                )
+                .ok()
+                .flatten()
+                .map(|entity| entity.uuid)
+        });
+        if let Some(uuid) = resolved {
+            add(&mut focal, uuid);
+            add(&mut all, uuid);
+        }
+    }
+    for &word in other_words {
+        if !tried.insert(word) {
+            continue;
+        }
+        if let Some(uuid) = graph.find_entity_uuid_strict(word) {
+            add(&mut all, uuid);
+        }
+    }
+    // A path-shaped query word also seeds every declared FilePath entity whose path ends with
+    // it at a `/` boundary: "serve.mjs" and "admin/serve.mjs" reach `commitwork:admin/serve.mjs`,
+    // which no name tier resolves without also admitting `observe.mjs`. One index probe per
+    // path-shaped word, at most FILE_PATH_SUFFIX_MAX_CANDIDATES entity reads each.
+    for word in query_text.split_whitespace() {
+        let token = clean_query_token(word);
+        if !token.contains('.') && !token.contains('/') {
+            continue;
+        }
+        if let Ok(found) = graph.find_file_paths_by_suffix(&token) {
+            for entity in found {
+                add(&mut all, entity.uuid);
+            }
+        }
+    }
+    ResolvedQueryEntities { focal, all }
+}
+
+/// An entity's most recent episodes as recall's graph layer uses them, read once per recall
+/// however many traversals reach the entity.
+fn recent_entity_episodes<'c>(
+    graph: &crate::graph_memory::GraphMemory,
+    cache: &'c mut std::collections::HashMap<uuid::Uuid, Vec<(MemoryId, String)>>,
+    entity: &uuid::Uuid,
+) -> &'c [(MemoryId, String)] {
+    cache.entry(*entity).or_insert_with(|| {
+        graph
+            .get_recent_episodes_by_entity(
+                entity,
+                crate::constants::RECALL_GRAPH_EPISODES_PER_ENTITY,
+            )
+            .map(|episodes| {
+                episodes
+                    .into_iter()
+                    .map(|ep| (MemoryId(ep.uuid), ep.content))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
 // =============================================================================
 // R2 unit tests — temporal boost bound-overlap logic
 // =============================================================================
@@ -6699,5 +6850,236 @@ mod date_window_leg_tests {
         sys.recall(&query).expect("recall");
         let funnel = crate::memory::gold_funnel::take().expect("funnel armed");
         assert_eq!(stage(&funnel, "date_window"), None, "{funnel:?}");
+    }
+}
+
+#[cfg(test)]
+mod candidate_projection_tests {
+    use super::{temporal_topic_dedup, CandidateSource, CandidateTier, RecallCandidates};
+    use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId, SharedMemory};
+    use anyhow::Result;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn memory(content: &str, entities: &[&str]) -> Memory {
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: content.to_string(),
+            entities: entities.iter().map(|s| s.to_string()).collect(),
+            ..Experience::default()
+        };
+        Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            experience,
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A source that counts every read, per id.
+    #[derive(Default)]
+    struct CountingSource {
+        working: HashMap<MemoryId, SharedMemory>,
+        stored: HashMap<MemoryId, Memory>,
+        storage_reads: RefCell<HashMap<MemoryId, usize>>,
+        storage_batches: RefCell<usize>,
+    }
+
+    impl CountingSource {
+        fn reads_of(&self, id: &MemoryId) -> usize {
+            self.storage_reads.borrow().get(id).copied().unwrap_or(0)
+        }
+    }
+
+    impl CandidateSource for CountingSource {
+        fn resident(&self, ids: &[MemoryId]) -> Vec<(MemoryId, SharedMemory, CandidateTier)> {
+            ids.iter()
+                .filter_map(|id| {
+                    self.working
+                        .get(id)
+                        .map(|m| (id.clone(), Arc::clone(m), CandidateTier::Working))
+                })
+                .collect()
+        }
+
+        fn stored(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
+            *self.storage_batches.borrow_mut() += 1;
+            ids.iter()
+                .map(|id| {
+                    *self
+                        .storage_reads
+                        .borrow_mut()
+                        .entry(id.clone())
+                        .or_default() += 1;
+                    self.stored
+                        .get(id)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("Memory not found: {id:?}"))
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn every_candidate_is_read_once_however_many_layers_ask() {
+        let mut source = CountingSource::default();
+        let hot = memory("Working Tier note", &["Rust"]);
+        let cold_a = memory("Stored Note A", &["Tokio", "Rust"]);
+        let cold_b = memory("Stored Note B", &[]);
+        let missing = MemoryId(uuid::Uuid::new_v4());
+        let (hot_id, a_id, b_id) = (hot.id.clone(), cold_a.id.clone(), cold_b.id.clone());
+        source.working.insert(hot_id.clone(), Arc::new(hot));
+        source.stored.insert(a_id.clone(), cold_a);
+        source.stored.insert(b_id.clone(), cold_b);
+
+        let candidates = RecallCandidates::new(&source);
+        let fused = [hot_id.clone(), a_id.clone(), b_id.clone(), missing.clone()];
+        candidates.prefetch(fused.iter());
+        assert_eq!(*source.storage_batches.borrow(), 1, "one storage batch");
+
+        // Every layer after fusion reads every candidate, several fields each.
+        for _layer in 0..8 {
+            for id in &fused {
+                let _ = candidates.get(id);
+                let _ = candidates.content(id);
+            }
+            candidates.prefetch(fused.iter());
+        }
+        assert_eq!(*source.storage_batches.borrow(), 1);
+        assert_eq!(
+            source.reads_of(&hot_id),
+            0,
+            "a resident record never reaches storage"
+        );
+        assert_eq!(source.reads_of(&a_id), 1);
+        assert_eq!(source.reads_of(&b_id), 1);
+        assert_eq!(
+            source.reads_of(&missing),
+            1,
+            "a miss is remembered, not retried"
+        );
+
+        let hot_view = candidates.get(&hot_id).unwrap();
+        assert_eq!(hot_view.tier, CandidateTier::Working);
+        assert_eq!(hot_view.content_lower, "working tier note");
+        let a_view = candidates.get(&a_id).unwrap();
+        assert_eq!(a_view.tier, CandidateTier::LongTerm);
+        assert_eq!(a_view.entities_lower, ["tokio", "rust"]);
+        assert!(candidates.get(&missing).is_none());
+        assert!(candidates
+            .failure(&missing)
+            .is_some_and(|reason| reason.contains("not found")));
+
+        // A candidate first named after fusion is read once, on its own.
+        let late = memory("Late", &[]);
+        let late_id = late.id.clone();
+        source.stored.insert(late_id.clone(), late);
+        let candidates = RecallCandidates::new(&source);
+        assert!(candidates.get(&late_id).is_some());
+        assert!(candidates.get(&late_id).is_some());
+        assert_eq!(source.reads_of(&late_id), 1);
+    }
+
+    #[test]
+    fn temporal_dedup_compares_only_the_top_candidates() {
+        let mut source = CountingSource::default();
+        let base = chrono::Utc::now() - chrono::Duration::days(100);
+        let mut fused: HashMap<MemoryId, f32> = HashMap::new();
+        let mut by_rank: Vec<MemoryId> = Vec::new();
+        for rank in 0..60 {
+            let mut m = memory(&format!("note {rank:02}"), &["Alpha", "Beta"]);
+            m.created_at = base + chrono::Duration::days(rank);
+            fused.insert(m.id.clone(), 1.0 + rank as f32);
+            by_rank.push(m.id.clone());
+            source.stored.insert(m.id.clone(), m);
+        }
+        let before = fused.clone();
+        let candidates = RecallCandidates::new(&source);
+
+        let demoted = temporal_topic_dedup(&mut fused, &candidates, 50);
+        assert_eq!(
+            demoted,
+            50 * 49 / 2,
+            "every pair among the top 50 overlaps fully"
+        );
+        for id in &by_rank[..10] {
+            assert_eq!(fused[id], before[id], "below the cap, nothing is compared");
+        }
+        // The newest of the compared set loses no pair; the oldest of it loses every one.
+        let newest = &by_rank[59];
+        assert_eq!(fused[newest], before[newest]);
+        let oldest_compared = &by_rank[10];
+        let expected = before[oldest_compared] * 0.85_f32.powi(49);
+        assert!((fused[oldest_compared] - expected).abs() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod query_entity_resolution_tests {
+    use super::resolve_query_entities;
+    use crate::graph_memory::{EntityLabel, EntityNode, GraphMemory, PiiClassification};
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn entity(name: &str) -> EntityNode {
+        EntityNode {
+            uuid: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        }
+    }
+
+    #[test]
+    fn words_resolving_to_one_entity_seed_it_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let deploy = graph.add_entity(entity("deploy")).unwrap();
+        let reactor = graph.add_entity(entity("Vornak Reactors")).unwrap();
+
+        // "deploying" (text) and "deploy" (its stem) are one entity; "vornak reactors" is
+        // the focal entity again in another case.
+        let resolved = resolve_query_entities(
+            &graph,
+            &["Vornak Reactors"],
+            &["deploying", "deploy", "vornak reactors", "deploying"],
+            "when did we start deploying the Vornak Reactors",
+        );
+        assert_eq!(resolved.focal, vec![reactor]);
+        assert_eq!(resolved.all, vec![reactor, deploy]);
+    }
+
+    #[test]
+    fn only_focal_words_fall_back_to_fuzzy_matching() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let reactor = graph.add_entity(entity("Vornak Reactors")).unwrap();
+        assert_eq!(
+            graph.find_entity_by_name("React").unwrap().map(|e| e.uuid),
+            Some(reactor),
+            "the unbounded resolver binds the fragment"
+        );
+
+        let as_other = resolve_query_entities(&graph, &[], &["React", "Vornak"], "react vornak");
+        assert!(
+            as_other.all.is_empty(),
+            "a non-focal word resolves strictly or not at all"
+        );
+
+        let as_focal = resolve_query_entities(&graph, &["Vornak"], &[], "vornak");
+        assert_eq!(as_focal.focal, vec![reactor]);
+        assert_eq!(as_focal.all, vec![reactor]);
     }
 }

@@ -163,6 +163,11 @@ pub const EDGE_MIN_STRENGTH: f32 = 0.05;
 /// Reference: Chechik et al. (1998) "Synaptic Pruning in Development"
 pub const MAX_ENTITY_DEGREE: usize = 500;
 
+/// Degree an entity is pruned back to once it passes [`MAX_ENTITY_DEGREE`]. Pruning only to
+/// the cap left a hub one edge below the next prune, so every new edge on it paid a full
+/// load, sort and delete over ~500 edges; the gap spreads one prune over the next 50 edges.
+pub const ENTITY_DEGREE_PRUNE_TARGET: usize = MAX_ENTITY_DEGREE - MAX_ENTITY_DEGREE / 10;
+
 /// Edge half-life base in hours (for time-based decay)
 ///
 /// Associations decay exponentially with this half-life.
@@ -679,6 +684,13 @@ pub const FACT_DECAY_HALF_LIFE_BASE_DAYS: f64 = 180.0;
 /// - support=10: 480-day half-life (~16 months)
 pub const FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS: f64 = 30.0;
 
+/// Smallest confidence drop the fact-decay pass persists
+///
+/// A smaller step is neither written nor marked as applied, so its interval keeps
+/// accruing until the decay owed is large enough to record. Matches the maintenance
+/// pass's own write threshold.
+pub const FACT_DECAY_MIN_STEP: f32 = 0.001;
+
 /// Cosine similarity threshold for hybrid fact deduplication
 ///
 /// Justification:
@@ -1039,6 +1051,31 @@ pub const SPREADING_EARLY_TERMINATION_RATIO: f32 = 0.05;
 ///
 /// Tuning (2026-01): Increased from 20 to 50 for richer exploration
 pub const SPREADING_EARLY_TERMINATION_CANDIDATES: usize = 50;
+
+/// Most entities expanded per spreading-activation hop
+///
+/// Each hop expands the not-yet-expanded entities above threshold, strongest
+/// activation first, and stops at this many. Every expansion is an adjacency read
+/// of up to 100 edges, so an uncapped frontier on a hub-heavy graph turns one hop
+/// into thousands of reads for entities too weakly activated to change the ranking.
+pub const SPREADING_FRONTIER_CAP: usize = 200;
+
+/// Fuzzy name matches kept per focal query entity on the recall path
+///
+/// Recall resolves query words with exact, case-insensitive and stemmed lookups;
+/// only a focal entity those miss falls back to substring/word matching, which
+/// keeps this many candidates (shortest names first) and reads salience for
+/// those alone.
+pub const QUERY_ENTITY_FUZZY_MAX_CANDIDATES: usize = 32;
+
+/// Most recent episodes recall takes from each entity a graph traversal reaches
+pub const RECALL_GRAPH_EPISODES_PER_ENTITY: usize = 20;
+
+/// Fused candidates compared pairwise by recall's temporal topic dedup (Layer 4.54)
+///
+/// The pass is O(n²) over entity sets; the top candidates by fused score are the
+/// ones whose relative order the demotion can still change.
+pub const TEMPORAL_DEDUP_MAX_CANDIDATES: usize = 50;
 
 /// Activation normalization factor per hop
 ///

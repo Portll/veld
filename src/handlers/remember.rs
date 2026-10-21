@@ -70,6 +70,177 @@ async fn record_tag_sources(
     }
 }
 
+/// Which intent-log variant a stored memory snapshot is journaled as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotKind {
+    Remember,
+    Update,
+}
+
+/// Journal `memory`, as just written to the primary store, through the
+/// tenant's intent log so every projection (SQLite, Vamana, BM25, wiki) sees
+/// the write. The store already holds it durably, so a failure is logged and
+/// the request still succeeds; C2 reconcile on the next open backfills a
+/// frame that never landed. Blocking: run it off the async executor.
+pub(crate) fn journal_memory_snapshot(
+    state: &super::state::MultiUserMemoryManager,
+    user_id: &str,
+    memory: &crate::memory::Memory,
+    kind: SnapshotKind,
+) {
+    let Some(payload) = snapshot_payload(user_id, memory, kind) else {
+        return;
+    };
+    if let Err(e) = state.journal_and_apply(user_id, &payload) {
+        tracing::warn!(
+            user_id = %user_id,
+            memory_id = %memory.id.0,
+            error = %e,
+            "intent-log journal_and_apply failed (RocksDB write already durable)",
+        );
+    }
+}
+
+/// The intent-log frame carrying `memory`'s snapshot, or `None` (logged) when
+/// it cannot be encoded.
+pub(crate) fn snapshot_payload(
+    user_id: &str,
+    memory: &crate::memory::Memory,
+    kind: SnapshotKind,
+) -> Option<crate::intent_log::IntentPayload> {
+    let memory_bincode = match bincode::serde::encode_to_vec(memory, bincode::config::standard()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                memory_id = %memory.id.0,
+                error = %e,
+                "skipping intent-log journal: failed to bincode memory snapshot",
+            );
+            return None;
+        }
+    };
+    let memory_id = memory.id.0.to_string();
+    let schema_version = Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
+    Some(match kind {
+        SnapshotKind::Remember => crate::intent_log::IntentPayload::Remember {
+            user_id: user_id.to_string(),
+            memory_id,
+            memory_bincode,
+            schema_version,
+        },
+        SnapshotKind::Update => crate::intent_log::IntentPayload::Update {
+            user_id: user_id.to_string(),
+            memory_id,
+            memory_bincode,
+            schema_version,
+        },
+    })
+}
+
+/// Journal many frames for one tenant: one writer-lock acquisition and one
+/// fsync per chunk instead of per frame. Failure handling as
+/// [`journal_memory_snapshot`]: the store already holds the writes, so a
+/// chunk that cannot be journaled is logged and C2 reconcile backfills it on
+/// the next open. Blocking.
+pub(crate) fn journal_batch(
+    state: &super::state::MultiUserMemoryManager,
+    user_id: &str,
+    payloads: &[crate::intent_log::IntentPayload],
+) {
+    const CHUNK: usize = 256;
+    if payloads.is_empty() {
+        return;
+    }
+    let writer = match state.get_user_journaled_writer(user_id) {
+        Ok(writer) => writer,
+        Err(e) => {
+            tracing::warn!(
+                user_id = %user_id,
+                frames = payloads.len(),
+                error = %e,
+                "intent-log journal unavailable; batch not journaled (store writes already durable)",
+            );
+            return;
+        }
+    };
+    for chunk in payloads.chunks(CHUNK) {
+        let outcomes = writer.lock().record_and_apply_batch(chunk);
+        match outcomes {
+            Ok(outcomes) => {
+                for outcome in &outcomes {
+                    for err in &outcome.apply_errors {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            projection = %err.projection,
+                            lsn = outcome.lsn.0,
+                            error = %err.source,
+                            "projection apply failed during journaled batch (log durable; replay will retry)",
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                user_id = %user_id,
+                frames = chunk.len(),
+                error = %e,
+                "intent-log batch could not be journaled (store writes already durable)",
+            ),
+        }
+    }
+}
+
+/// Complete a journaled remember's deferred embedding in the background. When
+/// the write gate absorbs the memory into an existing one, both records changed
+/// in the store, and their snapshots are journaled here. Spawn this only after
+/// the memory's `Remember` frame is journaled, or the absorbed snapshot could
+/// take the lower LSN and replay would bring back the unflagged memory.
+fn spawn_journaled_embed(
+    state: &AppState,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    memory_id: &crate::memory::MemoryId,
+) {
+    let state_bg = state.clone();
+    let memory_bg = memory.clone();
+    let user_id = user_id.to_string();
+    let mid = memory_id.clone();
+    state.task_tracker.spawn_blocking(move || {
+        let outcome = {
+            let guard = memory_bg.read();
+            guard.embed_and_index_journaled(&mid)
+        };
+        match outcome {
+            Ok(outcome) => {
+                let Some(survivor) = outcome
+                    .absorbed_by
+                    .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+                    .map(crate::memory::MemoryId)
+                else {
+                    return;
+                };
+                let guard = memory_bg.read();
+                for id in [&mid, &survivor] {
+                    match guard.get_memory(id) {
+                        Ok(memory) => journal_memory_snapshot(
+                            &state_bg,
+                            &user_id,
+                            &memory,
+                            SnapshotKind::Update,
+                        ),
+                        Err(e) => tracing::warn!(
+                            memory_id = %id.0,
+                            "write-gate absorption: snapshot not journaled, memory unreadable: {e}"
+                        ),
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(memory_id = %mid.0, "Background embed_and_index failed: {e}");
+            }
+        }
+    });
+}
+
 // =============================================================================
 // REQUEST/RESPONSE TYPES
 // =============================================================================
@@ -646,6 +817,7 @@ pub async fn remember(
     >,
 ) -> Result<Json<RememberResponse>, AppError> {
     let op_start = std::time::Instant::now();
+    let mut stage_timer = metrics::WriteStageTimer::new("remember");
 
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.content, false).map_validation_err("content")?;
@@ -686,6 +858,7 @@ pub async fn remember(
     let content_for_ner = processed_content.clone();
     let content_for_yake = processed_content.clone();
 
+    let extract_start = std::time::Instant::now();
     let (ner_result, yake_result) = tokio::join!(
         // NER extraction (named entities: Person, Org, Location, Misc)
         // Preserve full entity records for downstream graph insertion with proper labels
@@ -711,6 +884,7 @@ pub async fn remember(
         // Captures important terms like "sunrise", "painting", "lake"
         tokio::task::spawn_blocking(move || yake.extract_texts(&content_for_yake))
     );
+    stage_timer.record("extract", extract_start);
 
     let ner_entities = match ner_result {
         Ok(entities) => entities,
@@ -875,6 +1049,7 @@ pub async fn remember(
         .await
         .map_err(AppError::Internal)?;
 
+    let store_start = std::time::Instant::now();
     let outcome = {
         let memory = memory.clone();
         let exp_clone = experience.clone();
@@ -885,9 +1060,10 @@ pub async fn remember(
 
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            // Fast path: persist + BM25 only (~10ms), embedding deferred to background
+            // Fast path: persist only (~10ms), embedding deferred to background.
+            // BM25 indexing comes from the Remember journaled below.
             if agent_id.is_some() || run_id.is_some() {
-                memory_guard.remember_with_agent_deferred_detailed(
+                memory_guard.remember_with_agent_deferred_detailed_journaled(
                     exp_clone,
                     created_at,
                     agent_id,
@@ -895,18 +1071,24 @@ pub async fn remember(
                     external_id,
                 )
             } else {
-                memory_guard.remember_deferred_detailed(exp_clone, created_at, external_id)
+                memory_guard.remember_deferred_detailed_journaled(
+                    exp_clone,
+                    created_at,
+                    external_id,
+                )
             }
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
         .map_err(AppError::Internal)?
     };
+    stage_timer.record("store", store_start);
     let memory_id = outcome.id.clone();
     // A merge that added entities left the episode built from the old set, and every
     // downstream pass runs on the merged experience, not the request's.
     let rebuild_graph = outcome.needs_graph_rebuild();
     let experience = outcome.merged_experience.unwrap_or(experience);
+    let tag_sources_start = std::time::Instant::now();
     record_tag_sources(
         &memory,
         &memory_id,
@@ -915,19 +1097,7 @@ pub async fn remember(
         true,
     )
     .await;
-
-    // Background: complete embedding + vector indexing.
-    // The memory is already searchable via BM25; vector search follows in ~150ms.
-    {
-        let memory_for_bg = memory.clone();
-        let mid = memory_id.clone();
-        state.task_tracker.spawn_blocking(move || {
-            let guard = memory_for_bg.read();
-            if let Err(e) = guard.embed_and_index(&mid) {
-                tracing::warn!(memory_id = %mid.0, "Background embed_and_index failed: {e}");
-            }
-        });
-    }
+    stage_timer.record("tag_sources", tag_sources_start);
 
     // W5: journal the write to the intent log + SQLite projection.
     //
@@ -949,6 +1119,7 @@ pub async fn remember(
     // the request: RocksDB already holds the canonical write and the
     // operator can replay manually once the underlying issue is fixed.
     {
+        let journal_start = std::time::Instant::now();
         let state = state.clone();
         let user_id = req.user_id.clone();
         let memory_for_journal = memory.clone();
@@ -1001,7 +1172,13 @@ pub async fn remember(
                 "intent-log journal task panicked (RocksDB write already durable; C2 reconcile will backfill)",
             );
         }
+        stage_timer.record("journal", journal_start);
     }
+
+    // Background: complete embedding + vector indexing; vector search follows
+    // in ~150ms. Spawned after the journal so a write-gate Forget follows the
+    // Remember in LSN order.
+    spawn_journaled_embed(&state, &memory, &req.user_id, &memory_id);
 
     // Record metrics + session + broadcast BEFORE returning response (fast, <1ms)
     let duration = op_start.elapsed().as_secs_f64();
@@ -1063,7 +1240,8 @@ pub async fn remember(
                 let user_id = user_id.clone();
                 let experience = experience.clone();
                 let mid = memory_id.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || {
+                let graph_start = std::time::Instant::now();
+                let graph_result = tokio::task::spawn_blocking(move || {
                     if rebuild_graph {
                         state.rebuild_experience_graph_declared(
                             &user_id,
@@ -1081,8 +1259,9 @@ pub async fn remember(
                     }
                 })
                 .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")))
-                {
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")));
+                metrics::observe_write_stage("remember", "graph", graph_start.elapsed());
+                if let Err(e) = graph_result {
                     tracing::debug!("Graph processing failed (non-fatal): {}", e);
                 }
             }
@@ -1360,7 +1539,8 @@ fn detect_and_resolve_conflicts(
         let old_importance = candidate.importance();
         candidate.set_importance(old_importance * CONFLICT_IMPORTANCE_DECAY);
         candidate.set_valid_until(chrono::Utc::now());
-        memory_guard.update_memory(&candidate)?;
+        memory_guard.update_memory_journaled(&candidate)?;
+        journal_memory_snapshot(state, user_id, &candidate, SnapshotKind::Update);
 
         // Create SupersededBy edge in graph
         let now = chrono::Utc::now();
@@ -1419,6 +1599,7 @@ pub async fn batch_remember(
     Json(req): Json<BatchRememberRequest>,
 ) -> Result<Json<BatchRememberResponse>, AppError> {
     let op_start = std::time::Instant::now();
+    let mut stage_timer = metrics::WriteStageTimer::new("batch_remember");
     let batch_size = req.memories.len();
 
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
@@ -1505,130 +1686,159 @@ pub async fn batch_remember(
 
     let create_edges = req.options.create_edges;
 
-    // Build experiences
-    let mut experiences_with_index: Vec<(
-        usize,
-        Experience,
-        Option<chrono::DateTime<chrono::Utc>>,
-    )> = Vec::with_capacity(valid_items.len());
-    let mut parent_ids: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-    let mut labelled_by_index: std::collections::HashMap<usize, TagSources> =
-        std::collections::HashMap::new();
-    let mut declared_by_index: std::collections::HashMap<usize, Vec<DeclaredEntity>> =
-        std::collections::HashMap::new();
+    // NER and YAKE inference for every item, and the entity cap's graph reads: CPU-bound
+    // and blocking, so the whole pass runs off the async workers.
+    let extract_start = std::time::Instant::now();
+    let (experiences_with_index, parent_ids, mut labelled_by_index, declared_by_index) = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        tokio::task::spawn_blocking(move || {
+            // Build experiences
+            let mut experiences_with_index: Vec<(
+                usize,
+                Experience,
+                Option<chrono::DateTime<chrono::Utc>>,
+            )> = Vec::with_capacity(valid_items.len());
+            let mut parent_ids: std::collections::HashMap<usize, String> =
+                std::collections::HashMap::new();
+            let mut labelled_by_index: std::collections::HashMap<usize, TagSources> =
+                std::collections::HashMap::new();
+            let mut declared_by_index: std::collections::HashMap<usize, Vec<DeclaredEntity>> =
+                std::collections::HashMap::new();
 
-    for (index, item, experience_type, mut declared) in valid_items {
-        if let Some(ref pid) = item.parent_id {
-            parent_ids.insert(index, pid.clone());
-        }
-
-        let (merged_entities, ner_records, labelled_tags) = if extract_entities {
-            // NER for named entities (Person, Org, Location, Misc)
-            let ner_records: Vec<NerEntityRecord> = match neural_ner.extract(&item.content) {
-                Ok(entities) => entities
-                    .into_iter()
-                    .map(|e| NerEntityRecord {
-                        text: e.text,
-                        entity_type: e.entity_type.as_str().to_string(),
-                        confidence: e.confidence,
-                        start_char: Some(e.start),
-                        end_char: Some(e.end),
-                    })
-                    .collect(),
-                Err(e) => {
-                    tracing::debug!("NER extraction failed for batch item {}: {}", index, e);
-                    Vec::new()
+            for (index, item, experience_type, mut declared) in valid_items {
+                if let Some(ref pid) = item.parent_id {
+                    parent_ids.insert(index, pid.clone());
                 }
-            };
-            let ner_records = drop_person_location_in_code(ner_records, None, &item.content);
 
-            // YAKE for common nouns, verbs, concepts
-            let extracted_keywords: Vec<String> = keyword_extractor.extract_texts(&item.content);
+                let (merged_entities, ner_records, labelled_tags) = if extract_entities {
+                    // NER for named entities (Person, Org, Location, Misc)
+                    let ner_records: Vec<NerEntityRecord> = match neural_ner.extract(&item.content)
+                    {
+                        Ok(entities) => entities
+                            .into_iter()
+                            .map(|e| NerEntityRecord {
+                                text: e.text,
+                                entity_type: e.entity_type.as_str().to_string(),
+                                confidence: e.confidence,
+                                start_char: Some(e.start),
+                                end_char: Some(e.end),
+                            })
+                            .collect(),
+                        Err(e) => {
+                            tracing::debug!(
+                                "NER extraction failed for batch item {}: {}",
+                                index,
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
+                    let ner_records =
+                        drop_person_location_in_code(ner_records, None, &item.content);
 
-            let (mut merged, mut sources) = authored_tags(&declared, &item.tags);
-            // Derived from here on — see crate::entity_cap.
-            let authored_batch_count = merged.len();
-            let mut seen: HashSet<String> = merged.iter().map(|t| t.to_lowercase()).collect();
-            for record in &ner_records {
-                if seen.insert(record.text.to_lowercase()) {
-                    merged.push(record.text.clone());
-                    sources.push(TagSource::Ner);
-                }
-            }
-            for keyword in extracted_keywords {
-                if seen.insert(keyword.to_lowercase()) {
-                    merged.push(keyword);
-                    sources.push(TagSource::Yake);
-                }
-            }
-            let assembled = merged.clone();
-            let redaction = crate::redaction::redact_entities(&mut merged);
-            crate::declared_entities::retain_unredacted(&mut declared);
-            let redacted = merged.clone();
-            if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
-                tracing::debug!(
-                    batch_index = index,
-                    count = merged.len(),
-                    max = validation::MAX_ENTITIES_PER_MEMORY,
-                    "Capping entities to maximum allowed in batch item"
+                    // YAKE for common nouns, verbs, concepts
+                    let extracted_keywords: Vec<String> =
+                        keyword_extractor.extract_texts(&item.content);
+
+                    let (mut merged, mut sources) = authored_tags(&declared, &item.tags);
+                    // Derived from here on — see crate::entity_cap.
+                    let authored_batch_count = merged.len();
+                    let mut seen: HashSet<String> =
+                        merged.iter().map(|t| t.to_lowercase()).collect();
+                    for record in &ner_records {
+                        if seen.insert(record.text.to_lowercase()) {
+                            merged.push(record.text.clone());
+                            sources.push(TagSource::Ner);
+                        }
+                    }
+                    for keyword in extracted_keywords {
+                        if seen.insert(keyword.to_lowercase()) {
+                            merged.push(keyword);
+                            sources.push(TagSource::Yake);
+                        }
+                    }
+                    let assembled = merged.clone();
+                    let redaction = crate::redaction::redact_entities(&mut merged);
+                    crate::declared_entities::retain_unredacted(&mut declared);
+                    let redacted = merged.clone();
+                    if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
+                        tracing::debug!(
+                            batch_index = index,
+                            count = merged.len(),
+                            max = validation::MAX_ENTITIES_PER_MEMORY,
+                            "Capping entities to maximum allowed in batch item"
+                        );
+                        let mentions = mention_counts_for(&state, &user_id, &merged);
+                        let (kept, report) = crate::entity_cap::cap_by_selectivity(
+                            std::mem::take(&mut merged),
+                            authored_batch_count,
+                            validation::MAX_ENTITIES_PER_MEMORY,
+                            &mentions,
+                        );
+                        merged = kept;
+                        tracing::debug!(
+                            considered = report.considered,
+                            dropped = report.dropped,
+                            rescued_by_ordering = report.rescued_by_ordering,
+                            "Capped batch entities by selectivity"
+                        );
+                    }
+                    let labelled =
+                        TagSources::label(&sources, &assembled, &redacted, &merged, &redaction);
+                    (merged, ner_records, labelled)
+                } else {
+                    // The extraction branch is skipped here, so this path would otherwise reach the graph
+                    // with no redaction at all — a bypass that exists precisely when the cheap path is
+                    // taken. Submitted tags are still tags, and a caller can put a key in one.
+                    let (mut plain, sources) = authored_tags(&declared, &item.tags);
+                    let before = plain.clone();
+                    let redaction = crate::redaction::redact_entities(&mut plain);
+                    crate::declared_entities::retain_unredacted(&mut declared);
+                    let labelled = TagSources::label(&sources, &before, &plain, &plain, &redaction);
+                    (plain, Vec::new(), labelled)
+                };
+                labelled_by_index.insert(index, labelled_tags);
+                declared_by_index.insert(index, declared);
+
+                let context = build_rich_context(
+                    item.emotional_valence,
+                    item.emotional_arousal,
+                    item.emotion.clone(),
+                    item.source_type.clone(),
+                    item.credibility,
+                    item.episode_id.clone(),
+                    item.sequence_number,
+                    item.preceding_memory_id.clone(),
+                    item.writer.clone(),
                 );
-                let mentions = mention_counts_for(&state, &req.user_id, &merged);
-                let (kept, report) = crate::entity_cap::cap_by_selectivity(
-                    std::mem::take(&mut merged),
-                    authored_batch_count,
-                    validation::MAX_ENTITIES_PER_MEMORY,
-                    &mentions,
-                );
-                merged = kept;
-                tracing::debug!(
-                    considered = report.considered,
-                    dropped = report.dropped,
-                    rescued_by_ordering = report.rescued_by_ordering,
-                    "Capped batch entities by selectivity"
-                );
+
+                let experience = Experience {
+                    content: item.content,
+                    experience_type,
+                    entities: merged_entities.clone(),
+                    tags: merged_entities,
+                    context,
+                    ner_entities: ner_records,
+                    ..Default::default()
+                };
+
+                experiences_with_index.push((index, experience, item.created_at));
             }
-            let labelled = TagSources::label(&sources, &assembled, &redacted, &merged, &redaction);
-            (merged, ner_records, labelled)
-        } else {
-            // The extraction branch is skipped here, so this path would otherwise reach the graph
-            // with no redaction at all — a bypass that exists precisely when the cheap path is
-            // taken. Submitted tags are still tags, and a caller can put a key in one.
-            let (mut plain, sources) = authored_tags(&declared, &item.tags);
-            let before = plain.clone();
-            let redaction = crate::redaction::redact_entities(&mut plain);
-            crate::declared_entities::retain_unredacted(&mut declared);
-            let labelled = TagSources::label(&sources, &before, &plain, &plain, &redaction);
-            (plain, Vec::new(), labelled)
-        };
-        labelled_by_index.insert(index, labelled_tags);
-        declared_by_index.insert(index, declared);
-
-        let context = build_rich_context(
-            item.emotional_valence,
-            item.emotional_arousal,
-            item.emotion.clone(),
-            item.source_type.clone(),
-            item.credibility,
-            item.episode_id.clone(),
-            item.sequence_number,
-            item.preceding_memory_id.clone(),
-            item.writer.clone(),
-        );
-
-        let experience = Experience {
-            content: item.content,
-            experience_type,
-            entities: merged_entities.clone(),
-            tags: merged_entities,
-            context,
-            ner_entities: ner_records,
-            ..Default::default()
-        };
-
-        experiences_with_index.push((index, experience, item.created_at));
-    }
+            (
+                experiences_with_index,
+                parent_ids,
+                labelled_by_index,
+                declared_by_index,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Extraction task panicked: {e}")))?
+    };
+    stage_timer.record("extract", extract_start);
 
     // Store memories
+    let store_start = std::time::Instant::now();
     let (memory_results, storage_errors) = {
         let memory = memory.clone();
         let experiences = experiences_with_index;
@@ -1641,7 +1851,7 @@ pub async fn batch_remember(
             let mut errors: Vec<BatchErrorItem> = Vec::new();
 
             for (index, experience, created_at) in experiences {
-                match memory_guard.remember_detailed(experience.clone(), created_at) {
+                match memory_guard.remember_detailed_journaled(experience.clone(), created_at) {
                     Ok(outcome) => {
                         let rebuild = outcome.needs_graph_rebuild();
                         let effective = outcome.merged_experience.unwrap_or(experience);
@@ -1661,6 +1871,53 @@ pub async fn batch_remember(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
+    stage_timer.record("store", store_start);
+
+    // W5: journal every stored memory, as the single remember handler does,
+    // so the projections (BM25 included: nothing above indexed it) see the
+    // batch. Awaited for the same reason as there: LSN order follows request
+    // completion and no store-ahead-of-log window outlives the response.
+    {
+        let journal_start = std::time::Instant::now();
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        let memory_for_journal = memory.clone();
+        let mut seen = HashSet::new();
+        let ids: Vec<crate::memory::MemoryId> = memory_results
+            .iter()
+            .filter_map(|(_, id, _, _)| uuid::Uuid::parse_str(id).ok())
+            .filter(|uuid| seen.insert(*uuid))
+            .map(crate::memory::MemoryId)
+            .collect();
+        let journal_join = tokio::task::spawn_blocking(move || {
+            let payloads: Vec<_> = {
+                let guard = memory_for_journal.read();
+                ids.iter()
+                    .filter_map(|mid| match guard.get_memory(mid) {
+                        Ok(stored) => snapshot_payload(&user_id, &stored, SnapshotKind::Remember),
+                        Err(e) => {
+                            tracing::warn!(
+                                memory_id = %mid.0,
+                                error = %e,
+                                "skipping intent-log journal (batch): memory not retrievable from primary store",
+                            );
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            journal_batch(&state, &user_id, &payloads);
+        });
+        if let Err(e) = journal_join.await {
+            tracing::warn!(
+                error = %e,
+                "intent-log journal task (batch) panicked (RocksDB writes already durable; C2 reconcile will backfill)",
+            );
+        }
+        stage_timer.record("journal", journal_start);
+    }
+
+    let tag_sources_start = std::time::Instant::now();
     for (index, id, effective, _) in &memory_results {
         let (Some(labelled), Ok(uuid)) =
             (labelled_by_index.remove(index), uuid::Uuid::parse_str(id))
@@ -1676,6 +1933,7 @@ pub async fn batch_remember(
         )
         .await;
     }
+    stage_timer.record("tag_sources", tag_sources_start);
 
     let memory_ids: Vec<String> = memory_results
         .iter()
@@ -1711,7 +1969,8 @@ pub async fn batch_remember(
                     let mid = memory_id.clone();
                     let rebuild = *rebuild;
                     let declared = declared_by_index.remove(index).unwrap_or_default();
-                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                    let graph_start = std::time::Instant::now();
+                    let graph_result = tokio::task::spawn_blocking(move || {
                         if rebuild {
                             state.rebuild_experience_graph_declared(&uid, &exp, &mid, &declared)
                         } else {
@@ -1720,8 +1979,9 @@ pub async fn batch_remember(
                         }
                     })
                     .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")))
-                    {
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")));
+                    metrics::observe_write_stage("batch_remember", "graph", graph_start.elapsed());
+                    if let Err(e) = graph_result {
                         tracing::debug!(
                             "Graph processing failed for {} (non-fatal): {}",
                             id_str,
@@ -2007,6 +2267,7 @@ pub async fn upsert_memory(
     Json(req): Json<UpsertRequest>,
 ) -> Result<Json<UpsertResponse>, AppError> {
     let op_start = std::time::Instant::now();
+    let mut stage_timer = metrics::WriteStageTimer::new("upsert");
 
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.content, false).map_validation_err("content")?;
@@ -2030,27 +2291,40 @@ pub async fn upsert_memory(
     };
     let mut declared = crate::declared_entities::validate(&req.entities)?;
 
-    // Extract entities via NER (preserve full records for graph label propagation)
-    let ner_entities: Vec<NerEntityRecord> = match state.get_neural_ner().extract(&req.content) {
-        Ok(entities) => entities
-            .into_iter()
-            .map(|e| NerEntityRecord {
-                text: e.text,
-                entity_type: e.entity_type.as_str().to_string(),
-                confidence: e.confidence,
-                start_char: Some(e.start),
-                end_char: Some(e.end),
-            })
-            .collect(),
-        Err(e) => {
-            tracing::debug!("NER extraction failed in upsert: {}", e);
-            Vec::new()
-        }
-    };
+    // NER and YAKE are CPU-bound inference: off the async workers, and run side by side.
+    let extract_start = std::time::Instant::now();
+    let ner = state.get_neural_ner();
+    let yake = state.get_keyword_extractor();
+    let content_for_ner = req.content.clone();
+    let content_for_yake = req.content.clone();
+    let (ner_result, yake_result) = tokio::join!(
+        tokio::task::spawn_blocking(move || match ner.extract(&content_for_ner) {
+            Ok(entities) => entities
+                .into_iter()
+                .map(|e| NerEntityRecord {
+                    text: e.text,
+                    entity_type: e.entity_type.as_str().to_string(),
+                    confidence: e.confidence,
+                    start_char: Some(e.start),
+                    end_char: Some(e.end),
+                })
+                .collect::<Vec<NerEntityRecord>>(),
+            Err(e) => {
+                tracing::debug!("NER extraction failed in upsert: {}", e);
+                Vec::new()
+            }
+        }),
+        tokio::task::spawn_blocking(move || yake.extract_texts(&content_for_yake))
+    );
+    let ner_entities = ner_result.unwrap_or_else(|e| {
+        tracing::error!("NER extraction task failed in upsert: {e}");
+        Vec::new()
+    });
     let ner_entities = drop_person_location_in_code(ner_entities, None, &req.content);
-
-    // Extract keywords via YAKE for common nouns, verbs, concepts
-    let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
+    let extracted_keywords: Vec<String> = yake_result.unwrap_or_else(|e| {
+        tracing::error!("YAKE extraction task failed in upsert: {e}");
+        Vec::new()
+    });
 
     let (mut merged_entities, mut tag_sources) = authored_tags(&declared, &req.tags);
     // Derived from here on — see crate::entity_cap.
@@ -2073,8 +2347,19 @@ pub async fn upsert_memory(
     crate::declared_entities::retain_unredacted(&mut declared);
     let redacted_tags = merged_entities.clone();
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        // Selectivity-ordered, same as the store path. See crate::entity_cap.
-        let mentions = mention_counts_for(&state, &req.user_id, &merged_entities);
+        // Selectivity-ordered, same as the store path. See crate::entity_cap. The mention
+        // counts are graph reads, so they are taken off the async workers too.
+        let mentions = {
+            let state = state.clone();
+            let user_id = req.user_id.clone();
+            let candidates = merged_entities.clone();
+            tokio::task::spawn_blocking(move || mention_counts_for(&state, &user_id, &candidates))
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("entity cap: mention count task failed: {e}");
+                    std::collections::HashMap::new()
+                })
+        };
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,
@@ -2096,6 +2381,7 @@ pub async fn upsert_memory(
         &merged_entities,
         &redaction,
     );
+    stage_timer.record("extract", extract_start);
 
     // Built the way `remember` builds it, so an upsert-created record carries the same
     // AgentSession facet, declared writer, received_at stamp and episode context. Only the
@@ -2137,12 +2423,13 @@ pub async fn upsert_memory(
         writer: req.writer.clone(),
     };
 
+    let store_start = std::time::Instant::now();
     let (memory_id, was_update) = {
         let memory = memory_system.clone();
         let exp = experience.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            memory_guard.upsert_with_provenance(
+            memory_guard.upsert_with_provenance_journaled(
                 external_id,
                 exp,
                 change_type,
@@ -2169,8 +2456,10 @@ pub async fn upsert_memory(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
+    stage_timer.record("store", store_start);
     // The stored list, not the request's: an upsert's tags are the record's new tags, and the
     // ledger has to describe the record.
+    let tag_sources_start = std::time::Instant::now();
     record_tag_sources(
         &memory_system,
         &memory_id,
@@ -2179,6 +2468,7 @@ pub async fn upsert_memory(
         false,
     )
     .await;
+    stage_timer.record("tag_sources", tag_sources_start);
 
     // W5: journal the upsert as a `Remember` (create) or `Update`
     // (existing) payload. The opaque memory bincode bytes are the same
@@ -2187,6 +2477,7 @@ pub async fn upsert_memory(
     // projection treats them identically — both UPSERT keyed by
     // `(user_id, memory_id)`).
     {
+        let journal_start = std::time::Instant::now();
         let state_clone = state.clone();
         let user_id = req.user_id.clone();
         let memory_system_for_journal = memory_system.clone();
@@ -2256,20 +2547,27 @@ pub async fn upsert_memory(
                 "intent-log journal task (upsert) panicked (RocksDB write already durable; C2 reconcile will backfill)",
             );
         }
+        stage_timer.record("journal", journal_start);
     }
 
     // Build episodic graph for multi-hop retrieval. An update rebuilds the episode, so the
     // graph does not keep the old entity set.
-    let graph_result = if was_update {
-        state.rebuild_experience_graph_declared(&req.user_id, &experience, &memory_id, &declared)
-    } else {
-        state.process_experience_into_graph_declared(
-            &req.user_id,
-            &experience,
-            &memory_id,
-            &declared,
-        )
+    let graph_start = std::time::Instant::now();
+    let graph_result = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        let mid = memory_id.clone();
+        tokio::task::spawn_blocking(move || {
+            if was_update {
+                state.rebuild_experience_graph_declared(&user_id, &experience, &mid, &declared)
+            } else {
+                state.process_experience_into_graph_declared(&user_id, &experience, &mid, &declared)
+            }
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")))
     };
+    stage_timer.record("graph", graph_start);
     if let Err(e) = graph_result {
         tracing::debug!("Graph processing failed (non-fatal): {}", e);
     }

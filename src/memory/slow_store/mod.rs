@@ -11,6 +11,20 @@
 //! - Multi-scale structural analysis across the knowledge graph
 //!
 //! Architecture: RocksDB (fast store) → periodic sync → SQLite (slow store, gap analysis)
+//!
+//! ## Graph mirror rebuild
+//!
+//! The `entities`/`edges` mirror shares its file with the intent-log
+//! projection (`memories`), which writes on every remember inside the
+//! tenant's journal mutex. A rebuild therefore never touches the
+//! projection's connection: it runs on its own writer connection, fills
+//! `entities_shadow`/`edges_shadow` in short chunked transactions (so the
+//! SQLite write lock is free between chunks and a projection write waits
+//! milliseconds, well inside `busy_timeout`), then swaps the shadow tables
+//! in with renames in one tiny transaction. Readers see the old mirror until
+//! the swap commits and the new one after, never a half-built one.
+//! [`SlowStore::begin_sync`] gates rebuilds: one in flight per store, and
+//! none within the caller's TTL of the last one.
 
 mod embeddings;
 mod projection;
@@ -32,7 +46,9 @@ use crate::keystore::SecretCryptor;
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OpenFlags, Transaction};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -49,6 +65,122 @@ pub struct SyncStats {
     /// Other edges left out because an endpoint is not among the synced entities.
     pub edges_dangling: usize,
     pub duration_ms: u64,
+    /// The rebuild did not run because another was in flight; the existing
+    /// mirror was left as it is.
+    pub skipped: bool,
+}
+
+/// Default TTL the gap paths pass to [`SlowStore::begin_sync`]: a mirror
+/// rebuilt this recently is served as it is. A rebuild on a large tenant takes
+/// minutes, so a shorter default would have the next gap request start another
+/// as soon as one finished. Operators change it with `graph_mirror_sync_secs` /
+/// `VELD_GRAPH_MIRROR_SYNC_SECS`.
+pub const MIRROR_SYNC_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Floor for the configured mirror TTL.
+pub const MIRROR_SYNC_TTL_MIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Rows per mirror-rebuild transaction. Each chunk holds the SQLite write
+/// lock only for its own inserts, so a projection write queued behind it
+/// waits milliseconds rather than the whole rebuild.
+const MIRROR_CHUNK_ROWS: usize = 2048;
+
+/// WAL size SQLite truncates back to after a checkpoint resets the log, so a
+/// rebuild's burst of pages does not leave a permanently huge `-wal` file.
+const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
+/// Secondary indexes of the edge mirror: base name, indexed columns, unique.
+/// SQLite index names are database-global and keep their name through a
+/// table rename, so a shadow table cannot reuse the live table's names; the
+/// two generations alternate between the base names and
+/// `{base}{ALT_INDEX_SUFFIX}`.
+const EDGE_INDEXES: [(&str, &str, bool); 4] = [
+    ("idx_edges_from", "from_entity", false),
+    ("idx_edges_to", "to_entity", false),
+    ("idx_edges_strength", "strength DESC", false),
+    (EDGE_PAIR_INDEX, "from_entity, to_entity", true),
+];
+const EDGE_PAIR_INDEX: &str = "idx_edge_pair";
+const ALT_INDEX_SUFFIX: &str = "_alt";
+
+fn entities_table_ddl(table: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table} (
+            uuid TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            labels TEXT NOT NULL DEFAULT '[]',
+            salience REAL NOT NULL DEFAULT 0.5,
+            mention_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            embedding BLOB
+        );"
+    )
+}
+
+fn edges_table_ddl(table: &str, entities_table: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table} (
+            uuid TEXT PRIMARY KEY,
+            from_entity TEXT NOT NULL,
+            to_entity TEXT NOT NULL,
+            relation_type TEXT NOT NULL,
+            strength REAL NOT NULL,
+            tier TEXT NOT NULL DEFAULT 'L1Working',
+            ltp_status TEXT NOT NULL DEFAULT 'None',
+            activation_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_activated TEXT NOT NULL,
+            context TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (from_entity) REFERENCES {entities_table}(uuid),
+            FOREIGN KEY (to_entity) REFERENCES {entities_table}(uuid)
+        );"
+    )
+}
+
+fn index_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Create each edge-mirror index the live `edges` table lacks in BOTH name
+/// generations, so a store whose live mirror carries the alternate names is
+/// not given a duplicate set on the next open.
+fn ensure_edge_indexes(conn: &Connection) -> Result<()> {
+    for (base, columns, unique) in EDGE_INDEXES {
+        let alt = format!("{base}{ALT_INDEX_SUFFIX}");
+        if index_exists(conn, base)? || index_exists(conn, &alt)? {
+            continue;
+        }
+        let unique = if unique { "UNIQUE " } else { "" };
+        conn.execute_batch(&format!(
+            "CREATE {unique}INDEX IF NOT EXISTS {base} ON edges({columns});"
+        ))?;
+    }
+    Ok(())
+}
+
+/// Pragmas shared by the two writer connections (projection and mirror).
+fn configure_writer(conn: &Connection) -> Result<()> {
+    // WAL mode: concurrent readers, no blocking
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // NORMAL sync: survives process crash, not power loss (matches veld's RocksDB async default)
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // 8MB cache for gap analysis queries
+    conn.pragma_update(None, "cache_size", "-8192")?;
+    // Enable foreign keys
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
+    // Busy timeout: wait up to 5s instead of failing immediately on contention
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(())
 }
 
 /// Statistics from a retention cleanup operation
@@ -161,20 +293,35 @@ pub struct SlowStore {
     /// when `encryptor` is `Some`.
     enc: SlowStoreEncrypt,
     path: PathBuf,
-    /// When the most recent full rebuild *started*. Set at start, not end, so
-    /// a caller arriving during a long rebuild sees it as fresh and serves the
-    /// existing mirror instead of queueing a second rebuild behind it.
-    last_sync: Mutex<Option<std::time::Instant>>,
+    /// Writer connection used only by graph-mirror rebuilds, opened on the
+    /// first rebuild, so a rebuild never holds `conn` (the projection's).
+    mirror_conn: Mutex<Option<Connection>>,
+    /// A mirror rebuild holds this; see [`SlowStore::begin_sync`].
     sync_in_flight: AtomicBool,
+    /// When the last mirror rebuild finished (successfully or not).
+    last_sync: Mutex<Option<std::time::Instant>>,
 }
 
-/// Held by the one caller allowed to rebuild the mirror; clears the in-flight
-/// flag on drop, including on the error path.
-pub struct SyncInFlight<'a> {
+/// Exclusive right to rebuild a store's graph mirror, from
+/// [`SlowStore::begin_sync`]. Releases the single-flight slot on drop, so a
+/// rebuild that errors or panics never wedges later ones.
+#[must_use = "dropping the token releases the rebuild slot without rebuilding"]
+pub struct MirrorSyncToken<'a> {
     store: &'a SlowStore,
 }
 
-impl Drop for SyncInFlight<'_> {
+impl MirrorSyncToken<'_> {
+    /// Rebuild the mirror from a full snapshot of the graph. The TTL clock
+    /// restarts when this returns, whether or not the rebuild succeeded, so a
+    /// failing rebuild is not retried back to back.
+    pub fn rebuild(self, entities: &[EntityNode], edges: &[RelationshipEdge]) -> Result<SyncStats> {
+        let result = self.store.rebuild_mirror(entities, edges, &mut || {});
+        *self.store.last_sync.lock() = Some(std::time::Instant::now());
+        result
+    }
+}
+
+impl Drop for MirrorSyncToken<'_> {
     fn drop(&mut self) {
         self.store.sync_in_flight.store(false, Ordering::Release);
     }
@@ -301,24 +448,7 @@ impl SlowStore {
         encryptor: Option<SecretCryptor>,
         enc: SlowStoreEncrypt,
     ) -> Result<Self> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .context("Failed to open slow store SQLite database")?;
-
-        // WAL mode: concurrent readers, no blocking
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        // NORMAL sync: survives process crash, not power loss (matches veld's RocksDB async default)
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        // 8MB cache for gap analysis queries
-        conn.pragma_update(None, "cache_size", "-8192")?;
-        // Enable foreign keys
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        // Busy timeout: wait up to 5s instead of failing immediately on contention
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let conn = Self::open_writer(path)?;
 
         let store = Self {
             conn: Mutex::new(conn),
@@ -326,12 +456,25 @@ impl SlowStore {
             encryptor,
             enc,
             path: path.to_owned(),
-            last_sync: Mutex::new(None),
+            mirror_conn: Mutex::new(None),
             sync_in_flight: AtomicBool::new(false),
+            last_sync: Mutex::new(None),
         };
         store.create_schema()?;
         store.check_schema_version()?;
         Ok(store)
+    }
+
+    fn open_writer(path: &Path) -> Result<Connection> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("Failed to open slow store SQLite database")?;
+        configure_writer(&conn)?;
+        Ok(conn)
     }
 
     /// Check out a pooled read-only connection. All read paths use this instead
@@ -361,46 +504,14 @@ impl SlowStore {
 
     fn create_schema(&self) -> Result<()> {
         let conn = self.conn.lock();
+        // Mirror of GraphMemory entities and relationship edges (rebuilt
+        // periodically). The directional pair index on edges handles A→B as
+        // one entry.
+        conn.execute_batch(&entities_table_ddl("entities"))?;
+        conn.execute_batch(&edges_table_ddl("edges", "entities"))?;
+        ensure_edge_indexes(&conn)?;
         conn.execute_batch(
             "
-            -- Mirror of GraphMemory entities (synced periodically)
-            CREATE TABLE IF NOT EXISTS entities (
-                uuid TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                labels TEXT NOT NULL DEFAULT '[]',
-                salience REAL NOT NULL DEFAULT 0.5,
-                mention_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL,
-                summary TEXT NOT NULL DEFAULT '',
-                embedding BLOB
-            );
-
-            -- Mirror of GraphMemory relationship edges
-            CREATE TABLE IF NOT EXISTS edges (
-                uuid TEXT PRIMARY KEY,
-                from_entity TEXT NOT NULL,
-                to_entity TEXT NOT NULL,
-                relation_type TEXT NOT NULL,
-                strength REAL NOT NULL,
-                tier TEXT NOT NULL DEFAULT 'L1Working',
-                ltp_status TEXT NOT NULL DEFAULT 'None',
-                activation_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                last_activated TEXT NOT NULL,
-                context TEXT NOT NULL DEFAULT '',
-                FOREIGN KEY (from_entity) REFERENCES entities(uuid),
-                FOREIGN KEY (to_entity) REFERENCES entities(uuid)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_entity);
-            CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_entity);
-            CREATE INDEX IF NOT EXISTS idx_edges_strength ON edges(strength DESC);
-
-            -- Directional pair index (handles A→B as one entry)
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_edge_pair
-                ON edges(from_entity, to_entity);
-
             -- Detected gap topologies
             CREATE TABLE IF NOT EXISTS gap_topologies (
                 id TEXT PRIMARY KEY,
@@ -558,53 +669,66 @@ impl SlowStore {
         })
     }
 
-    /// Check if sync is needed based on TTL. Returns true if last sync was
-    /// more than `ttl_secs` ago (or never synced).
-    pub fn should_sync(&self, ttl_secs: u64) -> bool {
+    /// Claim the right to rebuild the graph mirror. Returns `None` when a
+    /// rebuild is already in flight on this store, or the last one finished
+    /// less than `ttl` ago; the caller then serves the existing mirror. Every
+    /// rebuild path goes through here, so callers cannot stack rebuilds.
+    pub fn begin_sync(&self, ttl: std::time::Duration) -> Option<MirrorSyncToken<'_>> {
+        // The TTL read and the slot claim happen under one lock, and
+        // `MirrorSyncToken::rebuild` stamps under it before the slot is
+        // released, so a caller cannot slip in between a finished rebuild
+        // and its stamp.
         let last = self.last_sync.lock();
-        match *last {
-            Some(instant) => instant.elapsed().as_secs() >= ttl_secs,
-            None => true,
+        if last.is_some_and(|at| at.elapsed() < ttl) {
+            return None;
         }
+        self.sync_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(MirrorSyncToken { store: self })
     }
 
-    /// True until the first rebuild starts.
+    /// True until the first mirror rebuild starts.
     pub fn never_synced(&self) -> bool {
         self.last_sync.lock().is_none()
     }
 
-    /// Claim the right to rebuild the mirror. Returns `None` when another
-    /// rebuild is already running or the last one started within `ttl_secs`;
-    /// the caller then serves the existing data. The flag is claimed before
-    /// the TTL is read, so two callers arriving together cannot both pass.
-    pub fn begin_sync(&self, ttl_secs: u64) -> Option<SyncInFlight<'_>> {
-        if self
-            .sync_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return None;
-        }
-        let guard = SyncInFlight { store: self };
-        if !self.should_sync(ttl_secs) {
-            return None;
-        }
-        Some(guard)
-    }
-
-    /// Sync entity and edge data from GraphMemory into SQLite.
+    /// Rebuild the entity/edge mirror from a full graph snapshot, unless a
+    /// rebuild is already in flight (then `skipped` is set and the existing
+    /// mirror stands). No TTL: callers that want one use
+    /// [`begin_sync`](Self::begin_sync).
     ///
     /// Full-mirror semantics: every caller passes the complete graph
-    /// (`get_all_entities` + `get_all_relationships`), so the mirror tables are
-    /// cleared and rebuilt inside one transaction. Entities/edges removed from
-    /// the live graph (decay, prune, forget) are purged here rather than
-    /// lingering as stale rows — closing both an unbounded-growth leak and a
-    /// stale-PII retention gap. Idempotent and atomic (rolls back on error).
-    /// Designed to be called periodically (e.g., after consolidation cycles).
+    /// (`get_all_entities` + `get_all_relationships`), so entities/edges
+    /// removed from the live graph (decay, prune, forget) disappear from the
+    /// mirror rather than lingering as stale rows — closing both an
+    /// unbounded-growth leak and a stale-PII retention gap.
     pub fn sync_from_graph(
         &self,
         entities: &[EntityNode],
         edges: &[RelationshipEdge],
+    ) -> Result<SyncStats> {
+        match self.begin_sync(std::time::Duration::ZERO) {
+            Some(token) => token.rebuild(entities, edges),
+            None => {
+                tracing::debug!("SlowStore sync skipped: a mirror rebuild is already in flight");
+                Ok(SyncStats {
+                    skipped: true,
+                    ..SyncStats::default()
+                })
+            }
+        }
+    }
+
+    /// Build the new mirror into shadow tables on the mirror connection in
+    /// chunked transactions, swap it in atomically, drop the old tables and
+    /// checkpoint the WAL. `between_chunks` runs after each committed chunk,
+    /// with no transaction open.
+    fn rebuild_mirror(
+        &self,
+        entities: &[EntityNode],
+        edges: &[RelationshipEdge],
+        between_chunks: &mut dyn FnMut(),
     ) -> Result<SyncStats> {
         let _span = tracing::info_span!(
             "slow_store.sync",
@@ -616,33 +740,90 @@ impl SlowStore {
         let start = std::time::Instant::now();
         *self.last_sync.lock() = Some(start);
         let mut stats = SyncStats::default();
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
+        let mut guard = self.mirror_conn.lock();
+        if guard.is_none() {
+            *guard = Some(Self::open_writer(&self.path)?);
+        }
+        let conn = guard.as_mut().expect("mirror connection opened above");
 
-        // Clear the mirror first so rows for graph-deleted entities/edges don't
-        // survive. Edges before entities to respect the FK; the re-insert below
-        // runs entities before edges, so referential integrity holds throughout.
-        tx.execute("DELETE FROM edges", [])?;
-        tx.execute("DELETE FROM entities", [])?;
-
-        Self::sync_entities(
-            &tx,
-            entities,
-            &mut stats,
-            self.encryptor.as_ref(),
-            &self.enc,
+        // Shadow or retired tables left by a rebuild that died part-way are
+        // garbage; their indexes go with them, freeing the index names. The
+        // child table goes first, so neither drop has a referencing table.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS edges_shadow;
+             DROP TABLE IF EXISTS entities_shadow;
+             DROP TABLE IF EXISTS edges_old;
+             DROP TABLE IF EXISTS entities_old;",
         )?;
+        let suffix = if index_exists(conn, EDGE_PAIR_INDEX)? {
+            ALT_INDEX_SUFFIX
+        } else {
+            ""
+        };
+        conn.execute_batch(&entities_table_ddl("entities_shadow"))?;
+        conn.execute_batch(&edges_table_ddl("edges_shadow", "entities_shadow"))?;
+        for (base, columns, unique) in EDGE_INDEXES {
+            let unique = if unique { "UNIQUE " } else { "" };
+            conn.execute_batch(&format!(
+                "CREATE {unique}INDEX {base}{suffix} ON edges_shadow({columns});"
+            ))?;
+        }
+
+        for chunk in entities.chunks(MIRROR_CHUNK_ROWS) {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            Self::sync_entities(
+                &tx,
+                "entities_shadow",
+                chunk,
+                &mut stats,
+                self.encryptor.as_ref(),
+                &self.enc,
+            )?;
+            tx.commit()?;
+            between_chunks();
+        }
         let synced: HashSet<Uuid> = entities.iter().map(|e| e.uuid).collect();
-        Self::sync_edges(
-            &tx,
-            edges,
-            &synced,
-            &mut stats,
-            self.encryptor.as_ref(),
-            &self.enc,
-        )?;
+        for chunk in edges.chunks(MIRROR_CHUNK_ROWS) {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            Self::sync_edges(
+                &tx,
+                "edges_shadow",
+                chunk,
+                &synced,
+                &mut stats,
+                self.encryptor.as_ref(),
+                &self.enc,
+            )?;
+            tx.commit()?;
+            between_chunks();
+        }
 
+        // Renames rewrite the foreign keys to follow their parent: edges_old
+        // ends up referencing entities_old, the new edges referencing the new
+        // entities.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "ALTER TABLE edges RENAME TO edges_old;
+             ALTER TABLE entities RENAME TO entities_old;
+             ALTER TABLE entities_shadow RENAME TO entities;
+             ALTER TABLE edges_shadow RENAME TO edges;",
+        )?;
         tx.commit()?;
+        conn.execute_batch("DROP TABLE edges_old; DROP TABLE entities_old;")?;
+
+        // The rebuild pushes the whole mirror through the WAL; fold it back
+        // into the database without waiting on readers or the projection.
+        let (busy, wal_pages, checkpointed): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        tracing::debug!(
+            busy,
+            wal_pages,
+            checkpointed,
+            "SlowStore mirror rebuild: passive WAL checkpoint"
+        );
+
         stats.duration_ms = start.elapsed().as_millis() as u64;
         if stats.edges_dangling > 0 {
             tracing::warn!(
@@ -663,14 +844,15 @@ impl SlowStore {
 
     fn sync_entities(
         tx: &Transaction,
+        table: &str,
         entities: &[EntityNode],
         stats: &mut SyncStats,
         enc: Option<&SecretCryptor>,
         toggles: &SlowStoreEncrypt,
     ) -> Result<()> {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO entities (uuid, name, labels, salience, mention_count,
-                                   created_at, last_seen_at, summary, embedding)
+        let mut stmt = tx.prepare_cached(&format!(
+            "INSERT INTO {table} (uuid, name, labels, salience, mention_count,
+                                  created_at, last_seen_at, summary, embedding)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(uuid) DO UPDATE SET
                 name = excluded.name,
@@ -679,8 +861,8 @@ impl SlowStore {
                 mention_count = excluded.mention_count,
                 last_seen_at = excluded.last_seen_at,
                 summary = excluded.summary,
-                embedding = excluded.embedding",
-        )?;
+                embedding = excluded.embedding"
+        ))?;
 
         for entity in entities {
             let labels_json =
@@ -730,6 +912,7 @@ impl SlowStore {
     /// counted and left out.
     fn sync_edges(
         tx: &Transaction,
+        table: &str,
         edges: &[RelationshipEdge],
         synced: &HashSet<Uuid>,
         stats: &mut SyncStats,
@@ -743,10 +926,10 @@ impl SlowStore {
         // pair-unique index — an unhandled conflict that aborted the whole sync
         // transaction. Collapsing on the pair keeps the first uuid/relation_type
         // and refreshes the mutable strength/tier/activation columns.
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO edges (uuid, from_entity, to_entity, relation_type, strength,
-                                tier, ltp_status, activation_count, created_at,
-                                last_activated, context)
+        let mut stmt = tx.prepare_cached(&format!(
+            "INSERT INTO {table} (uuid, from_entity, to_entity, relation_type, strength,
+                                  tier, ltp_status, activation_count, created_at,
+                                  last_activated, context)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(from_entity, to_entity) DO UPDATE SET
                 strength = excluded.strength,
@@ -754,8 +937,8 @@ impl SlowStore {
                 ltp_status = excluded.ltp_status,
                 activation_count = excluded.activation_count,
                 last_activated = excluded.last_activated,
-                context = excluded.context",
-        )?;
+                context = excluded.context"
+        ))?;
 
         for edge in edges {
             if !synced.contains(&edge.from_entity) || !synced.contains(&edge.to_entity) {
@@ -1595,27 +1778,188 @@ mod tests {
         );
     }
 
+    fn mirror_indexes(store: &SlowStore) -> Vec<String> {
+        let conn = store.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'edges' AND sql IS NOT NULL
+                 ORDER BY name",
+            )
+            .unwrap();
+        let names = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        names
+    }
+
+    fn leftover_tables(store: &SlowStore) -> usize {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+                 AND name IN ('entities_shadow', 'edges_shadow', 'entities_old', 'edges_old')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
     #[test]
-    fn only_one_rebuild_may_be_in_flight_and_the_ttl_counts_from_its_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SlowStore::open(&dir.path().join("slow.db")).unwrap();
+    fn a_second_caller_is_skipped_while_a_rebuild_is_in_flight() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+        let (a, b) = (test_entity("Alice"), test_entity("Bob"));
+        store.sync_from_graph(&[a.clone()], &[]).unwrap();
+
+        let token = store
+            .begin_sync(std::time::Duration::ZERO)
+            .expect("no rebuild in flight yet");
+        assert!(store.begin_sync(std::time::Duration::ZERO).is_none());
+        let stats = store.sync_from_graph(&[a.clone(), b.clone()], &[]).unwrap();
+        assert!(
+            stats.skipped,
+            "the second caller serves the existing mirror"
+        );
+        assert_eq!(store.entity_count().unwrap(), 1);
+
+        token.rebuild(&[a.clone(), b.clone()], &[]).unwrap();
+        assert_eq!(store.entity_count().unwrap(), 2);
+        assert!(
+            store
+                .begin_sync(std::time::Duration::from_secs(3600))
+                .is_none(),
+            "a mirror rebuilt within the TTL is served as it is"
+        );
+        let next = store.begin_sync(std::time::Duration::ZERO);
+        assert!(next.is_some(), "the slot is released when the token drops");
+    }
+
+    #[test]
+    fn a_rebuild_on_another_thread_turns_other_callers_away() {
+        use std::sync::{mpsc, Arc};
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Arc::new(SlowStore::open(tmp.path()).unwrap());
+        let entities: Vec<EntityNode> = (0..3).map(|i| test_entity(&format!("E{i}"))).collect();
+
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let rebuilder = {
+            let store = Arc::clone(&store);
+            let entities = entities.clone();
+            std::thread::spawn(move || {
+                let _token = store.begin_sync(std::time::Duration::ZERO).unwrap();
+                let mut first = true;
+                store
+                    .rebuild_mirror(&entities, &[], &mut || {
+                        if std::mem::take(&mut first) {
+                            paused_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }
+                    })
+                    .unwrap();
+            })
+        };
+        paused_rx.recv().unwrap();
+        let stats = store.sync_from_graph(&entities, &[]).unwrap();
+        assert!(stats.skipped);
+        assert!(store.begin_sync(std::time::Duration::ZERO).is_none());
+        resume_tx.send(()).unwrap();
+        rebuilder.join().unwrap();
+        assert_eq!(store.entity_count().unwrap(), 3);
+        assert!(store.begin_sync(std::time::Duration::ZERO).is_some());
+    }
+
+    #[test]
+    fn projection_writes_succeed_while_a_rebuild_is_in_progress() {
+        use std::sync::{mpsc, Arc};
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Arc::new(SlowStore::open(tmp.path()).unwrap());
+        let old = test_entity("Old");
+        store.sync_from_graph(&[old], &[]).unwrap();
+
+        let entities: Vec<EntityNode> = (0..(MIRROR_CHUNK_ROWS + 5))
+            .map(|i| test_entity(&format!("E{i}")))
+            .collect();
+        let edges = vec![test_edge(
+            entities[0].uuid,
+            entities[1].uuid,
+            crate::graph_memory::RelationType::WorksWith,
+        )];
+        let _token = store.begin_sync(std::time::Duration::ZERO).unwrap();
+        let mut writes = 0u64;
+        store
+            .rebuild_mirror(&entities, &edges, &mut || {
+                // The swap has not happened: readers still see the old mirror.
+                assert_eq!(store.entity_count().unwrap(), 1);
+                writes += 1;
+                let (done_tx, done_rx) = mpsc::channel();
+                let writer = Arc::clone(&store);
+                let lsn = writes;
+                std::thread::spawn(move || {
+                    let res = writer.upsert_memory("u", &format!("m{lsn}"), lsn, b"payload", 0.5);
+                    let _ = done_tx.send(res.map_err(|e| e.to_string()));
+                });
+                let res = done_rx
+                    .recv_timeout(std::time::Duration::from_secs(4))
+                    .expect("a projection write must not wait on the rebuild");
+                res.expect("projection write succeeds mid-rebuild");
+            })
+            .unwrap();
+        assert_eq!(writes, 3, "two entity chunks and one edge chunk");
+        assert_eq!(store.count_memories("u").unwrap(), writes);
+        assert_eq!(store.entity_count().unwrap(), entities.len());
+        assert_eq!(store.edge_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn repeated_rebuilds_swap_cleanly_and_reopen_adds_no_indexes() {
+        let tmp = NamedTempFile::new().unwrap();
+        let (a, b) = (test_entity("Alice"), test_entity("Bob"));
+        let pair = [
+            test_edge(a.uuid, b.uuid, crate::graph_memory::RelationType::WorksWith),
+            test_edge(a.uuid, b.uuid, crate::graph_memory::RelationType::PartOf),
+        ];
+        {
+            let store = SlowStore::open(tmp.path()).unwrap();
+            assert_eq!(mirror_indexes(&store).len(), EDGE_INDEXES.len());
+            for round in 0..3 {
+                store
+                    .sync_from_graph(&[a.clone(), b.clone()], &pair)
+                    .unwrap();
+                assert_eq!(
+                    mirror_indexes(&store).len(),
+                    EDGE_INDEXES.len(),
+                    "round {round}"
+                );
+                assert_eq!(leftover_tables(&store), 0, "round {round}");
+                // The pair index of every generation still collapses relations.
+                assert_eq!(store.edge_count().unwrap(), 1, "round {round}");
+                assert_eq!(store.entity_count().unwrap(), 2, "round {round}");
+            }
+        }
+        let store = SlowStore::open(tmp.path()).unwrap();
+        assert_eq!(mirror_indexes(&store).len(), EDGE_INDEXES.len());
+        assert_eq!(store.edge_count().unwrap(), 1);
+        let fk_violations: usize = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "edges reference the swapped-in entities");
+    }
+
+    #[test]
+    fn never_synced_flips_when_the_first_rebuild_starts() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
         assert!(store.never_synced());
-
-        let first = store
-            .begin_sync(0)
-            .expect("nothing in flight, never synced");
-        assert!(
-            store.begin_sync(0).is_none(),
-            "a second caller must skip while a rebuild is running"
-        );
         store.sync_from_graph(&[], &[]).unwrap();
-        drop(first);
-
         assert!(!store.never_synced());
-        assert!(store.begin_sync(0).is_some(), "flag cleared on drop");
-        assert!(
-            store.begin_sync(3600).is_none(),
-            "the rebuild that just started is fresh under a one-hour TTL"
-        );
     }
 }
