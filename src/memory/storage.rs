@@ -2529,15 +2529,40 @@ impl MemoryStorage {
             .ok_or_else(|| anyhow!("Memory not found: {id:?}"))
     }
 
+    /// [`Self::get`] for every id in `ids`, results in the same order, each what `get`
+    /// returns for that id. One batched read of the default family instead of a point read
+    /// per id; decoding, decryption and lazy migration are `get`'s.
+    pub fn get_many(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
+        let Some(default_cf) = self.db.cf_handle("default") else {
+            return ids.iter().map(|id| self.get(id)).collect();
+        };
+        self.db
+            .batched_multi_get_cf(default_cf, ids.iter().map(|id| id.0.as_bytes()), false)
+            .into_iter()
+            .zip(ids)
+            .map(|(read, id)| {
+                let value = read?;
+                self.open_stored(id, value.as_deref())?
+                    .ok_or_else(|| anyhow!("Memory not found: {id:?}"))
+            })
+            .collect()
+    }
+
     /// [`Self::get`], answering an absent record with `None` instead of an error, so a
     /// caller can tell a missing memory from one that will not decode.
     fn get_if_present(&self, id: &MemoryId) -> Result<Option<Memory>> {
-        let key = id.0.as_bytes();
-        let Some(value) = self.db.get(key)? else {
+        let value = self.db.get(id.0.as_bytes())?;
+        self.open_stored(id, value.as_deref())
+    }
+
+    /// Decode the stored bytes of `id` as [`Self::get_if_present`] does, `None` when absent.
+    fn open_stored(&self, id: &MemoryId, value: Option<&[u8]>) -> Result<Option<Memory>> {
+        let Some(value) = value else {
             return Ok(None);
         };
+        let key = id.0.as_bytes();
         let (memory, needs_migration) = self
-            .decode_stored(key, &value)
+            .decode_stored(key, value)
             .with_context(|| format!("Failed to decode memory {} ({} bytes)", id.0, value.len()))?;
 
         // Lazy migration: re-write legacy formats in current format

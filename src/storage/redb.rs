@@ -173,6 +173,17 @@ impl ColumnStore for RedbColumnStore {
         }
     }
 
+    fn multi_get_cf(&self, cf: &str, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        let txn = self.database.begin_read()?;
+        let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(cf);
+        let Ok(table) = txn.open_table(def) else {
+            return Ok(vec![None; keys.len()]);
+        };
+        keys.iter()
+            .map(|key| Ok(table.get(*key)?.map(|v| v.value().to_vec())))
+            .collect()
+    }
+
     fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
         let txn = begin_write(&self.database, self.durability)?;
         {
@@ -1582,6 +1593,27 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
     fn get(&self, id: &MemoryId) -> Result<Memory> {
         self.get_memory(id)?
             .ok_or_else(|| anyhow!("Memory not found: {}", id.0))
+    }
+    /// One read transaction for the whole batch. A transaction or table that will not open
+    /// is answered id by id through `get`, so each id still carries the error `get` gives.
+    fn get_many(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
+        let table = self
+            .database
+            .begin_read()
+            .map_err(anyhow::Error::from)
+            .and_then(|txn| Ok(txn.open_table(MEMORIES_TABLE)?));
+        let Ok(table) = table else {
+            return ids.iter().map(|id| self.get(id)).collect();
+        };
+        ids.iter()
+            .map(|id| {
+                let key = id.0.as_bytes().as_slice();
+                match table.get(key)? {
+                    Some(bytes) => self.open_record(key, bytes.value()),
+                    None => Err(anyhow!("Memory not found: {}", id.0)),
+                }
+            })
+            .collect()
     }
     fn store(&self, memory: &Memory) -> Result<()> {
         self.put_memory(memory)

@@ -1864,10 +1864,11 @@ impl MultiUserMemoryManager {
 
     /// Wait, bounded by `timeout` across all tenants, for every journaled
     /// writer's deferred projection queue to drain, then persist those
-    /// projections' checkpoints. Each writer's mutex is held only long
-    /// enough to take a drain handle, so journaled writes keep flowing while
-    /// the drain waits. Returns `false` if any queue was still non-empty at
-    /// the deadline; replay on the next open applies the remainder.
+    /// projections' checkpoints and commit what the BM25 committer still
+    /// holds. Each writer's mutex is held only long enough to take a drain
+    /// handle, so journaled writes keep flowing while the drain waits. Returns
+    /// `false` if any queue was still non-empty at the deadline or a flush
+    /// failed; replay on the next open applies the remainder.
     pub fn drain_deferred_projections(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let writers: Vec<(String, _)> = self
@@ -1883,7 +1884,7 @@ impl MultiUserMemoryManager {
                 drained = false;
                 tracing::warn!(
                     user_id = %user_id,
-                    "deferred projection drain timed out; replay on next open applies the remainder",
+                    "projection drain did not finish; replay on next open applies the remainder",
                 );
             }
         }
@@ -6064,6 +6065,19 @@ mod reconcile_restore_tests {
         let writer = manager.get_user_journaled_writer("u").unwrap();
         let guard = writer.lock();
         live_memory_ids(guard.log()).unwrap()
+    }
+
+    /// The periodic and shutdown flush reach the BM25 committer: after a drain the
+    /// journaled memory is committed without a search committing it.
+    #[test]
+    fn a_drain_commits_what_the_bm25_committer_holds() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        remember_journaled(&manager, "the spare key is under the third flowerpot");
+        assert!(manager.drain_deferred_projections(std::time::Duration::from_secs(10)));
+        let index = manager.get_user_bm25_index("u").unwrap();
+        assert!(!index.has_uncommitted());
+        assert_eq!(index.search("flowerpot", 5).unwrap().len(), 1);
     }
 
     #[test]

@@ -1488,12 +1488,13 @@ impl RetrievalEngine {
 
         // Search vector index - fetch more candidates for chunk deduplication
         let index = self.vector_index.read();
-        let results = index
-            .search(
+        let results = crate::metrics::timed_vector_search(|| {
+            index.search(
                 &query_embedding,
                 limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
             )
-            .context("Vector search failed")?;
+        })
+        .context("Vector search failed")?;
 
         // Map vector IDs to memory IDs, deduplicating by MemoryId (keep highest similarity)
         //
@@ -1570,12 +1571,13 @@ impl RetrievalEngine {
 
         // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
         let index = sec_index.read();
-        let results = index
-            .search(
+        let results = crate::metrics::timed_vector_search(|| {
+            index.search(
                 query_embedding_secondary,
                 limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
             )
-            .context("Secondary vector search failed")?;
+        })
+        .context("Secondary vector search failed")?;
 
         let id_mapping = sec_mapping.read();
         let mut best_scores: std::collections::HashMap<MemoryId, f32> =
@@ -1630,9 +1632,10 @@ impl RetrievalEngine {
 
         // LOCK ORDERING: primary vector_index (1) before id_mapping (2)
         let index = self.vector_index.read();
-        let results = index
-            .search(&projected, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
-            .context("Aligned vector search failed")?;
+        let results = crate::metrics::timed_vector_search(|| {
+            index.search(&projected, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
+        })
+        .context("Aligned vector search failed")?;
 
         let id_mapping = self.id_mapping.read();
         let mut best_scores: std::collections::HashMap<MemoryId, f32> =
@@ -1667,10 +1670,9 @@ impl RetrievalEngine {
     }
 
     /// Read `ids` from storage, results in the same order. The one seam recall's candidate
-    /// projection reads through. `PrimaryMemoryStore` has no batch read, so today this is
-    /// one point read per id.
+    /// projection reads through: one batched read per call.
     pub fn get_many_from_storage(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
-        ids.iter().map(|id| self.storage.get(id)).collect()
+        self.storage.get_many(ids)
     }
 
     /// Search for similar memories by embedding directly (SHO-106)
@@ -1690,9 +1692,10 @@ impl RetrievalEngine {
     ) -> Result<Vec<(MemoryId, f32)>> {
         // Search vector index - fetch more candidates to account for chunk deduplication
         let index = self.vector_index.read();
-        let results = index
-            .search(embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
-            .context("Vector search by embedding failed")?;
+        let results = crate::metrics::timed_vector_search(|| {
+            index.search(embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
+        })
+        .context("Vector search by embedding failed")?;
 
         // Map vector IDs to memory IDs, deduplicating by MemoryId (keep highest similarity)
         //
@@ -1774,9 +1777,10 @@ impl RetrievalEngine {
 
         // Search Vamana index with candidate multiplier for filtering headroom
         let index = self.vector_index.read();
-        let results = index
-            .search(&query_embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER)
-            .context("Vector search failed")?;
+        let results = crate::metrics::timed_vector_search(|| {
+            index.search(&query_embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER)
+        })
+        .context("Vector search failed")?;
 
         // Map vector IDs to memory IDs and fetch memories.
         // Deduplicate by MemoryId: chunked memories produce multiple vectors that

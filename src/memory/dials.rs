@@ -162,6 +162,20 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub relative_priors: Option<bool>,
 
+    /// How many of the entities recall's graph traversal reaches (Layer 2) have their
+    /// recent episodes read as candidates, highest decay factor first (ties by salience,
+    /// then name). `None` reads every reached entity's episodes.
+    #[serde(default)]
+    pub graph_episode_entities: Option<usize>,
+
+    /// How long, in milliseconds, a write may sit buffered in the BM25 index before a recall
+    /// commits it itself. `None` commits every buffered write before the search, so a memory
+    /// is keyword-findable on the first recall after its write. `Some(ms)` leaves younger
+    /// writes to the projection's background committer, which commits within
+    /// `bm25_projection::COMMIT_INTERVAL` of the previous commit.
+    #[serde(default)]
+    pub bm25_read_staleness_ms: Option<u64>,
+
     // ---- Recall ranking sliders (None = compile-time constant default) ---------------
     // Overlay the historical `const`s in recall.rs / hybrid_search.rs / constants.rs.
     // Rendered as sliders in the monitor "Dials" tab; see [`RECALL_SLIDER_SPECS`] for
@@ -636,6 +650,8 @@ impl Default for CognitiveDials {
             rrf_weights: None,
             date_window_leg: None,
             relative_priors: None,
+            graph_episode_entities: None,
+            bm25_read_staleness_ms: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
             rrf_k_inner: None,
@@ -702,6 +718,8 @@ impl CognitiveDials {
                 }
             }
         });
+        self.graph_episode_entities = self.graph_episode_entities.map(|n| n.clamp(1, 1000));
+        self.bm25_read_staleness_ms = self.bm25_read_staleness_ms.map(|ms| ms.min(60_000));
         if let Some((b, v, g)) = self.rrf_weights {
             self.rrf_weights = Some((b.clamp(0.0, 1.0), v.clamp(0.0, 1.0), g.clamp(0.0, 1.0)));
         }
@@ -794,7 +812,8 @@ impl CognitiveDials {
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
-    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG}`.
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG,
+    /// GRAPH_EPISODE_ENTITIES,BM25_READ_STALENESS_MS}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -857,6 +876,12 @@ impl CognitiveDials {
         }
         if let Some(v) = env_bool("VELD_DIALS_RELATIVE_PRIORS") {
             d.relative_priors = Some(v);
+        }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_GRAPH_EPISODE_ENTITIES") {
+            d.graph_episode_entities = Some(v);
+        }
+        if let Some(v) = env_parse::<u64>("VELD_DIALS_BM25_READ_STALENESS_MS") {
+            d.bm25_read_staleness_ms = Some(v);
         }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
@@ -938,6 +963,8 @@ mod tests {
         assert!(d.rrf_weights.is_none());
         assert!(d.date_window_leg.is_none());
         assert!(d.relative_priors.is_none());
+        assert!(d.graph_episode_entities.is_none());
+        assert!(d.bm25_read_staleness_ms.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,
             crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS
@@ -1076,6 +1103,28 @@ mod tests {
         assert!(d.signal_enabled("hebbian"), "hebbian must remain enabled");
         // Default reconsolidation state must be preserved.
         assert!(!d.reconsolidation_enabled);
+    }
+
+    /// The two recall-cost dials read their env vars and clamp: at least one entity is
+    /// expanded, and a recall never waits on a write older than a minute.
+    #[test]
+    fn graph_episode_and_bm25_staleness_dials_read_env_and_clamp() {
+        std::env::set_var("VELD_DIALS_GRAPH_EPISODE_ENTITIES", "12");
+        std::env::set_var("VELD_DIALS_BM25_READ_STALENESS_MS", "250");
+        let d = CognitiveDials::from_env();
+        std::env::remove_var("VELD_DIALS_GRAPH_EPISODE_ENTITIES");
+        std::env::remove_var("VELD_DIALS_BM25_READ_STALENESS_MS");
+        assert_eq!(d.graph_episode_entities, Some(12));
+        assert_eq!(d.bm25_read_staleness_ms, Some(250));
+
+        let clamped = CognitiveDials {
+            graph_episode_entities: Some(0),
+            bm25_read_staleness_ms: Some(10_000_000),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(clamped.graph_episode_entities, Some(1));
+        assert_eq!(clamped.bm25_read_staleness_ms, Some(60_000));
     }
 
     #[test]

@@ -158,6 +158,17 @@ impl ColumnStore for RocksDbColumnStore {
         }
     }
 
+    fn multi_get_cf(&self, cf: &str, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        let Some(handle) = self.db.cf_handle(cf) else {
+            return Ok(vec![None; keys.len()]);
+        };
+        self.db
+            .batched_multi_get_cf(handle, keys.iter().copied(), false)
+            .into_iter()
+            .map(|read| Ok(read?.map(|value| value.to_vec())))
+            .collect()
+    }
+
     fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
         let handle = self.cf(cf)?;
         let opts = write_options(self.sync_writes);
@@ -311,6 +322,9 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
     //    would change behaviour in the commit whose point is that nothing changes.
     fn get(&self, id: &MemoryId) -> Result<Memory> {
         self.inner.get(id)
+    }
+    fn get_many(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
+        self.inner.get_many(ids)
     }
     fn store(&self, memory: &Memory) -> Result<()> {
         self.inner.store(memory)

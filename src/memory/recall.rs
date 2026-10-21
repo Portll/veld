@@ -20,7 +20,9 @@ use crate::memory::storage::{self, SearchCriteria};
 use crate::memory::temporal_facts;
 use crate::memory::types::*;
 use crate::memory::wavelet_sessions;
-use crate::metrics::{EMBEDDING_CACHE_QUERY, EMBEDDING_CACHE_QUERY_SIZE};
+use crate::metrics::{
+    observe_recall_stage, RecallStage, EMBEDDING_CACHE_QUERY, EMBEDDING_CACHE_QUERY_SIZE,
+};
 
 /// Fraction of semantic_w used for secondary Vamana RRF signal.
 /// Secondary is a refinement signal, not a replacement for primary vector search.
@@ -518,7 +520,12 @@ impl super::MemorySystem {
 
         // Layer 0.5 reads the BM25 index directly, ahead of hybrid search's own commit, so
         // buffered writes are committed here for a just-written memory to be findable there.
-        if let Err(e) = self.hybrid_search.commit_pending() {
+        let bm25_staleness = self
+            .cognitive_dials
+            .read()
+            .bm25_read_staleness_ms
+            .map(std::time::Duration::from_millis);
+        if let Err(e) = self.hybrid_search.commit_for_read(bm25_staleness) {
             tracing::warn!(error = %e, "BM25 commit before recall failed; buffered writes are not yet searchable");
         }
 
@@ -1000,6 +1007,7 @@ impl super::MemorySystem {
         };
 
         let t_query_analysis = recall_start.elapsed();
+        observe_recall_stage(RecallStage::QueryAnalysis, t_query_analysis);
         tracing::info!(
             query_analysis_ms = format!("{:.2}", t_query_analysis.as_secs_f64() * 1000.0),
             "recall [layer:0.5-0.7] query analysis + attribute + temporal fact + fact source lookup"
@@ -1026,6 +1034,7 @@ impl super::MemorySystem {
         };
 
         let t_embedding = recall_start.elapsed();
+        observe_recall_stage(RecallStage::Embedding, t_embedding - t_query_analysis);
         tracing::info!(
             embedding_ms = format!(
                 "{:.2}",
@@ -1153,6 +1162,7 @@ impl super::MemorySystem {
                 // Cap to top 3 pairs from first 4 entities to avoid O(n²) explosion.
                 // Entities are ordered by query analysis salience, so top pairs
                 // capture dominant relationships.
+                let mut bidirectional_paths: Vec<crate::graph_memory::GraphTraversal> = Vec::new();
                 if query_entities.len() >= 2 {
                     let max_pairs = 3usize;
                     let max_ents = query_entities.len().min(4);
@@ -1169,36 +1179,7 @@ impl super::MemorySystem {
                                 bidir_min_str,
                                 now,
                             ) {
-                                for tr in &path.entities {
-                                    // Most recent episodes only: recency correlates with
-                                    // relevance for graph-surfaced candidates.
-                                    let episodes = recent_entity_episodes(
-                                        &g,
-                                        &mut entity_episodes,
-                                        &tr.entity.uuid,
-                                    );
-                                    for (mid, content) in episodes {
-                                        if episode_candidates
-                                            .as_ref()
-                                            .is_none_or(|c| c.contains(mid))
-                                        {
-                                            let path_boost = 1.5;
-                                            let activation =
-                                                tr.entity.salience * tr.decay_factor * path_boost;
-                                            // Relevance floor: skip low-activation candidates
-                                            if activation >= 0.1 {
-                                                episode_content
-                                                    .entry(mid.clone())
-                                                    .or_insert_with(|| content.clone());
-                                                ids.push((
-                                                    mid.clone(),
-                                                    activation,
-                                                    tr.decay_factor,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
+                                bidirectional_paths.push(path);
                             }
                             pair_count += 1;
                         }
@@ -1218,6 +1199,7 @@ impl super::MemorySystem {
                         None
                     };
 
+                let mut weighted_traversals: Vec<crate::graph_memory::GraphTraversal> = Vec::new();
                 for entity_uuid in query_entities {
                     if let Ok(t) = g.traverse_weighted_at(
                         entity_uuid,
@@ -1226,19 +1208,66 @@ impl super::MemorySystem {
                         weighted_min_str,
                         now,
                     ) {
-                        for tr in &t.entities {
-                            let episodes =
-                                recent_entity_episodes(&g, &mut entity_episodes, &tr.entity.uuid);
-                            for (mid, content) in episodes {
-                                if episode_candidates.as_ref().is_none_or(|c| c.contains(mid)) {
-                                    let activation = tr.entity.salience * tr.decay_factor;
-                                    // Relevance floor: skip low-activation candidates
-                                    if activation >= 0.1 {
-                                        episode_content
-                                            .entry(mid.clone())
-                                            .or_insert_with(|| content.clone());
-                                        ids.push((mid.clone(), activation, tr.decay_factor));
-                                    }
+                        weighted_traversals.push(t);
+                    }
+                }
+
+                // Under the `graph_episode_entities` dial only that many reached entities
+                // have their episodes read; with it unset, every one does.
+                let episode_entity_cap = self.cognitive_dials.read().graph_episode_entities;
+                let expanded: Option<HashSet<uuid::Uuid>> = episode_entity_cap.map(|cap| {
+                    entities_to_expand(bidirectional_paths.iter().chain(&weighted_traversals), cap)
+                });
+                if let Some(expanded) = &expanded {
+                    tracing::debug!(
+                        expanded = expanded.len(),
+                        "Layer 2: episode expansion capped by graph_episode_entities"
+                    );
+                }
+                let expands =
+                    |entity: &uuid::Uuid| expanded.as_ref().is_none_or(|set| set.contains(entity));
+
+                for path in &bidirectional_paths {
+                    for tr in &path.entities {
+                        if !expands(&tr.entity.uuid) {
+                            continue;
+                        }
+                        // Most recent episodes only: recency correlates with
+                        // relevance for graph-surfaced candidates.
+                        let episodes =
+                            recent_entity_episodes(&g, &mut entity_episodes, &tr.entity.uuid);
+                        for (mid, content) in episodes {
+                            if episode_candidates.as_ref().is_none_or(|c| c.contains(mid)) {
+                                let path_boost = 1.5;
+                                let activation = tr.entity.salience * tr.decay_factor * path_boost;
+                                // Relevance floor: skip low-activation candidates
+                                if activation >= 0.1 {
+                                    episode_content
+                                        .entry(mid.clone())
+                                        .or_insert_with(|| content.clone());
+                                    ids.push((mid.clone(), activation, tr.decay_factor));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for t in &weighted_traversals {
+                    for tr in &t.entities {
+                        if !expands(&tr.entity.uuid) {
+                            continue;
+                        }
+                        let episodes =
+                            recent_entity_episodes(&g, &mut entity_episodes, &tr.entity.uuid);
+                        for (mid, content) in episodes {
+                            if episode_candidates.as_ref().is_none_or(|c| c.contains(mid)) {
+                                let activation = tr.entity.salience * tr.decay_factor;
+                                // Relevance floor: skip low-activation candidates
+                                if activation >= 0.1 {
+                                    episode_content
+                                        .entry(mid.clone())
+                                        .or_insert_with(|| content.clone());
+                                    ids.push((mid.clone(), activation, tr.decay_factor));
                                 }
                             }
                         }
@@ -1294,6 +1323,7 @@ impl super::MemorySystem {
         crate::memory::gold_funnel::record("graph", graph_results.iter().map(|(id, _, _)| id));
 
         let t_graph = recall_start.elapsed();
+        observe_recall_stage(RecallStage::Graph, t_graph - t_embedding);
         tracing::info!(
             graph_ms = format!("{:.2}", (t_graph - t_embedding).as_secs_f64() * 1000.0),
             cumulative_ms = format!("{:.2}", t_graph.as_secs_f64() * 1000.0),
@@ -1507,6 +1537,7 @@ impl super::MemorySystem {
         crate::memory::gold_funnel::record("vector", vector_results.iter().map(|(id, _)| id));
 
         let t_vector = recall_start.elapsed();
+        observe_recall_stage(RecallStage::Vector, t_vector - t_graph);
         tracing::info!(
             vector_ms = format!("{:.2}", (t_vector - t_graph).as_secs_f64() * 1000.0),
             cumulative_ms = format!("{:.2}", t_vector.as_secs_f64() * 1000.0),
@@ -2738,6 +2769,7 @@ impl super::MemorySystem {
         crate::memory::gold_funnel::record("fusion", memory_ids.iter().map(|(id, _)| id));
 
         let t_fusion = recall_start.elapsed();
+        observe_recall_stage(RecallStage::Fusion, t_fusion - t_vector);
         tracing::info!(
             fusion_ms = format!("{:.2}", (t_fusion - t_vector).as_secs_f64() * 1000.0),
             cumulative_ms = format!("{:.2}", t_fusion.as_secs_f64() * 1000.0),
@@ -3270,6 +3302,7 @@ impl super::MemorySystem {
         );
 
         let t_fetch = recall_start.elapsed();
+        observe_recall_stage(RecallStage::Fetch, t_fetch - t_fusion);
         tracing::info!(
             fetch_ms = format!("{:.2}", (t_fetch - t_fusion).as_secs_f64() * 1000.0),
             cumulative_ms = format!("{:.2}", t_fetch.as_secs_f64() * 1000.0),
@@ -3330,6 +3363,7 @@ impl super::MemorySystem {
         // Dial gate: VELD_DIALS_USE_RERANKING=false (or cognitive_dials.use_reranking =
         // Some(false)) fully skips this layer. The `rerank_count` dial caps the
         // candidate budget; absent that, the hardcoded ce_cap applies.
+        let mut cross_encoder_elapsed = std::time::Duration::ZERO;
         let rerank_shape = query_parser::classify_rerank_shape(query_text, decomposed, &query_type);
         let (layer53_use_reranking, layer53_rerank_count_dial, ce_w) = {
             let d = self.cognitive_dials.read();
@@ -3350,6 +3384,7 @@ impl super::MemorySystem {
                 .allows(crate::memory::types::LayerMode::PlusRerank)
         {
             if let Some(reranker) = self.hybrid_search.reranker() {
+                let cross_encoder_started = std::time::Instant::now();
                 // Decomposed queries: widen CE budget from 20→30 to exploit the
                 // broader candidate pool from multi-query vector search.
                 let ce_cap = if decomposed { 30 } else { 20 };
@@ -3453,6 +3488,8 @@ impl super::MemorySystem {
                         );
                     }
                 }
+                cross_encoder_elapsed = cross_encoder_started.elapsed();
+                observe_recall_stage(RecallStage::CrossEncoder, cross_encoder_elapsed);
             }
         }
 
@@ -4559,8 +4596,13 @@ impl super::MemorySystem {
         crate::memory::gold_funnel::record("final", memories.iter().map(|m| &m.id));
 
         let t_total = recall_start.elapsed();
+        observe_recall_stage(
+            RecallStage::Post,
+            (t_total - t_fetch).saturating_sub(cross_encoder_elapsed),
+        );
         tracing::info!(
             post_ms = format!("{:.2}", (t_total - t_fetch).as_secs_f64() * 1000.0),
+            cross_encoder_ms = format!("{:.2}", cross_encoder_elapsed.as_secs_f64() * 1000.0),
             total_ms = format!("{:.2}", t_total.as_secs_f64() * 1000.0),
             final_count = memories.len(),
             "recall [layer:post] linguistic + competition + coactivation + hierarchy === RECALL COMPLETE ==="
@@ -6178,6 +6220,41 @@ pub(crate) fn resolve_query_entities(
     ResolvedQueryEntities { focal, all }
 }
 
+/// The at most `cap` entities among those `traversals` reach whose episodes Layer 2 reads:
+/// highest decay factor first (an entity reached twice counts at its best), then salience,
+/// then name and uuid, so the cut does not depend on the order the traversals ran in.
+fn entities_to_expand<'t>(
+    traversals: impl Iterator<Item = &'t crate::graph_memory::GraphTraversal>,
+    cap: usize,
+) -> HashSet<uuid::Uuid> {
+    let mut best: std::collections::HashMap<uuid::Uuid, &crate::graph_memory::TraversedEntity> =
+        std::collections::HashMap::new();
+    for traversal in traversals {
+        for reached in &traversal.entities {
+            best.entry(reached.entity.uuid)
+                .and_modify(|held| {
+                    if reached.decay_factor > held.decay_factor {
+                        *held = reached;
+                    }
+                })
+                .or_insert(reached);
+        }
+    }
+    let mut ranked: Vec<&crate::graph_memory::TraversedEntity> = best.into_values().collect();
+    ranked.sort_by(|a, b| {
+        b.decay_factor
+            .total_cmp(&a.decay_factor)
+            .then_with(|| b.entity.salience.total_cmp(&a.entity.salience))
+            .then_with(|| a.entity.name.cmp(&b.entity.name))
+            .then_with(|| a.entity.uuid.cmp(&b.entity.uuid))
+    });
+    ranked
+        .into_iter()
+        .take(cap)
+        .map(|reached| reached.entity.uuid)
+        .collect()
+}
+
 /// An entity's most recent episodes as recall's graph layer uses them, read once per recall
 /// however many traversals reach the entity.
 fn recent_entity_episodes<'c>(
@@ -7123,6 +7200,94 @@ mod query_entity_resolution_tests {
         let as_focal = resolve_query_entities(&graph, &["Vornak"], &[], "vornak");
         assert_eq!(as_focal.focal, vec![reactor]);
         assert_eq!(as_focal.all, vec![reactor]);
+    }
+}
+
+#[cfg(test)]
+mod graph_episode_cap_tests {
+    use super::entities_to_expand;
+    use crate::graph_memory::{
+        EntityLabel, EntityNode, GraphTraversal, PiiClassification, TraversedEntity,
+    };
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn reached(name: &str, salience: f32, decay_factor: f32) -> TraversedEntity {
+        TraversedEntity {
+            entity: EntityNode {
+                uuid: uuid::Uuid::new_v4(),
+                name: name.to_string(),
+                labels: vec![EntityLabel::Concept],
+                created_at: Utc::now(),
+                last_seen_at: Utc::now(),
+                mention_count: 1,
+                summary: String::new(),
+                attributes: HashMap::new(),
+                name_embedding: None,
+                salience,
+                is_proper_noun: false,
+                pii_classification: PiiClassification::Clean,
+            },
+            hop_distance: 0,
+            decay_factor,
+        }
+    }
+
+    fn traversal(entities: Vec<TraversedEntity>) -> GraphTraversal {
+        GraphTraversal {
+            entities,
+            relationships: Vec::new(),
+        }
+    }
+
+    /// The cap keeps the entities nearest a query entity, ties broken by salience then
+    /// name, and an entity reached by two traversals counts at its best decay factor.
+    #[test]
+    fn the_cap_keeps_the_highest_decay_factors_whatever_the_traversal_order() {
+        let start = reached("start", 0.2, 1.0);
+        let near_loud = reached("near-loud", 0.9, 0.7);
+        let near_quiet_b = reached("near-quiet-b", 0.3, 0.7);
+        let near_quiet_a = reached("near-quiet-a", 0.3, 0.7);
+        let far = reached("far", 1.0, 0.4);
+        let mut far_again = reached("far", 1.0, 0.95);
+        far_again.entity.uuid = far.entity.uuid;
+
+        let first = traversal(vec![
+            far.clone(),
+            near_quiet_b.clone(),
+            start.clone(),
+            near_quiet_a.clone(),
+        ]);
+        let second = traversal(vec![near_loud.clone(), far_again]);
+
+        let expected = |n: usize| -> std::collections::HashSet<uuid::Uuid> {
+            [
+                start.entity.uuid,
+                far.entity.uuid,
+                near_loud.entity.uuid,
+                near_quiet_a.entity.uuid,
+                near_quiet_b.entity.uuid,
+            ]
+            .into_iter()
+            .take(n)
+            .collect()
+        };
+        for n in 1..=5 {
+            assert_eq!(
+                entities_to_expand([&first, &second].into_iter(), n),
+                expected(n),
+                "cap {n}"
+            );
+            assert_eq!(
+                entities_to_expand([&second, &first].into_iter(), n),
+                expected(n),
+                "cap {n}, traversals reversed"
+            );
+        }
+        assert_eq!(
+            entities_to_expand([&first, &second].into_iter(), 50).len(),
+            5
+        );
     }
 }
 

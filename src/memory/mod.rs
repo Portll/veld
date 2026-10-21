@@ -2486,8 +2486,8 @@ impl MemorySystem {
     }
 
     /// Commit direct BM25 writes so they are searchable at once. A journaled
-    /// write leaves committing to the projection's batch and to the
-    /// `commit_pending` a search runs first.
+    /// write leaves committing to the projection's committer and to the
+    /// `commit_for_read` a search runs first.
     fn bm25_commit_direct(&self, bm25: Bm25Sync) {
         if bm25 == Bm25Sync::Journaled {
             return;
