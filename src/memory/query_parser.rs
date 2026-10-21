@@ -1556,9 +1556,15 @@ pub fn people_intent(query: &str) -> f32 {
         return 1.0;
     }
     let lower = query.to_lowercase();
-    if ["who is responsible", "who owns", "who worked on", "assigned to", "point of contact"]
-        .iter()
-        .any(|p| lower.contains(p))
+    if [
+        "who is responsible",
+        "who owns",
+        "who worked on",
+        "assigned to",
+        "point of contact",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
     {
         return 1.0;
     }
@@ -1635,7 +1641,9 @@ pub fn classify_rerank_shape(query: &str, decomposed: bool, query_type: &QueryTy
     let mut shapes: Vec<RerankShape> = Vec::with_capacity(3);
 
     if has_lexical_identifiers(query)
-        || query.split_whitespace().any(|w| w.contains('/') || w.contains("::") || w.contains('_'))
+        || query
+            .split_whitespace()
+            .any(|w| w.contains('/') || w.contains("::") || w.contains('_'))
     {
         shapes.push(RerankShape::Identifier);
     }
@@ -1677,9 +1685,16 @@ pub fn classify_rerank_shape(query: &str, decomposed: bool, query_type: &QueryTy
     // temporal share cost the recall gate a gold document on a dated content question and
     // the people share overrode the abstract share on decomposed who-questions (LOCOMO-20
     // Q20 lost a top-5 answer, gate q121 lost rank).
-    if ["last week", "last month", "yesterday", "today", "recently", "recent "]
-        .iter()
-        .any(|kw| lower.contains(kw))
+    if [
+        "last week",
+        "last month",
+        "yesterday",
+        "today",
+        "recently",
+        "recent ",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
         || matches!(
             detect_temporal_intent(query),
             TemporalIntent::SpecificTime | TemporalIntent::Ordering
@@ -6173,48 +6188,114 @@ mod tests {
 
     #[test]
     fn rerank_shape_grounding_shapes_win() {
-        assert_eq!(shape("where is admin/serve.mjs loaded", false), RerankShape::Identifier);
-        assert_eq!(shape("what was the first bug we hit", false), RerankShape::Ordinal);
+        assert_eq!(
+            shape("where is admin/serve.mjs loaded", false),
+            RerankShape::Identifier
+        );
+        assert_eq!(
+            shape("what was the first bug we hit", false),
+            RerankShape::Ordinal
+        );
         assert_eq!(shape("redis cache", false), RerankShape::Keyword);
-        assert_eq!(shape("who fixed the EU checkout last week", false), RerankShape::Ordinal);
-        assert_eq!(shape("how did we fix the latest checkout bug", false), RerankShape::Ordinal);
-        assert_eq!(shape("what was the first bug we hit", true), RerankShape::Ordinal);
+        assert_eq!(
+            shape("who fixed the EU checkout last week", false),
+            RerankShape::Ordinal
+        );
+        assert_eq!(
+            shape("how did we fix the latest checkout bug", false),
+            RerankShape::Ordinal
+        );
+        assert_eq!(
+            shape("what was the first bug we hit", true),
+            RerankShape::Ordinal
+        );
     }
 
     #[test]
     fn rerank_shape_labels_apply_only_when_nothing_else_does() {
-        assert_eq!(shape("what did we decide recently about the API", false), RerankShape::Temporal);
-        assert_eq!(shape("who fixed the EU checkout yesterday", false), RerankShape::Temporal);
-        assert_eq!(shape("who are the key people on the team", false), RerankShape::People);
-        assert_eq!(shape("who are the key people on the team", true), RerankShape::Abstract);
         assert_eq!(
-            shape("what filling did Joanna use in the cake she made recently", true),
+            shape("what did we decide recently about the API", false),
+            RerankShape::Temporal
+        );
+        assert_eq!(
+            shape("who fixed the EU checkout yesterday", false),
+            RerankShape::Temporal
+        );
+        assert_eq!(
+            shape("who are the key people on the team", false),
+            RerankShape::People
+        );
+        assert_eq!(
+            shape("who are the key people on the team", true),
             RerankShape::Abstract
         );
         assert_eq!(
-            shape("how did the migration recently change checkout latency", false),
+            shape(
+                "what filling did Joanna use in the cake she made recently",
+                true
+            ),
+            RerankShape::Abstract
+        );
+        assert_eq!(
+            shape(
+                "how did the migration recently change checkout latency",
+                false
+            ),
             RerankShape::Relational
         );
     }
 
     #[test]
     fn rerank_shape_reasoning_shapes_only_without_grounding() {
-        assert_eq!(shape("how did Sarah's Stripe migration fix the EU checkout delay", false), RerankShape::Relational);
-        assert_eq!(shape("why did the analytics database run out of disk space", false), RerankShape::Relational);
-        assert_eq!(shape("what performance improvements have we achieved across the product", true), RerankShape::Abstract);
-        assert_eq!(shape("what caching problems did we have and how were they resolved", false), RerankShape::Exploratory);
-        assert_eq!(shape("how did we deploy SHO-72 to staging", false), RerankShape::Identifier);
+        assert_eq!(
+            shape(
+                "how did Sarah's Stripe migration fix the EU checkout delay",
+                false
+            ),
+            RerankShape::Relational
+        );
+        assert_eq!(
+            shape(
+                "why did the analytics database run out of disk space",
+                false
+            ),
+            RerankShape::Relational
+        );
+        assert_eq!(
+            shape(
+                "what performance improvements have we achieved across the product",
+                true
+            ),
+            RerankShape::Abstract
+        );
+        assert_eq!(
+            shape(
+                "what caching problems did we have and how were they resolved",
+                false
+            ),
+            RerankShape::Exploratory
+        );
+        assert_eq!(
+            shape("how did we deploy SHO-72 to staging", false),
+            RerankShape::Identifier
+        );
     }
 
     #[test]
     fn people_intent_grades_and_rejects_technical_words() {
         assert_eq!(people_intent("Who are the key people on the team?"), 1.0);
-        assert_eq!(people_intent("which tasks are assigned to the platform group"), 1.0);
+        assert_eq!(
+            people_intent("which tasks are assigned to the platform group"),
+            1.0
+        );
         assert_eq!(people_intent("what did the team members decide"), 0.6);
         assert_eq!(people_intent("what happened to the people counter"), 0.6);
         assert_eq!(people_intent("whose fault was the outage"), 0.0);
         assert_eq!(people_intent("who's on call this week"), 1.0);
-        assert_eq!(people_intent("change the file owner and the contact form"), 0.0);
+        assert_eq!(
+            people_intent("change the file owner and the contact form"),
+            0.0
+        );
     }
 
     #[test]
@@ -6257,7 +6338,12 @@ mod tests {
         ];
         for pair in shares.windows(2) {
             assert!(pair[0].0 < pair[1].0);
-            assert!(pair[0].1 <= pair[1].1, "{:?} share above {:?}", pair[0].0, pair[1].0);
+            assert!(
+                pair[0].1 <= pair[1].1,
+                "{:?} share above {:?}",
+                pair[0].0,
+                pair[1].0
+            );
         }
     }
 }

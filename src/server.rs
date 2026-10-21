@@ -308,12 +308,10 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
         Err(e) => error!("Replication: not following at boot: {e:#}"),
     }
     let replication_shutdown = tokio_util::sync::CancellationToken::new();
-    manager
-        .task_tracker
-        .spawn(crate::replication::run_follower(
-            Arc::clone(&manager),
-            replication_shutdown.clone(),
-        ));
+    manager.task_tracker.spawn(crate::replication::run_follower(
+        Arc::clone(&manager),
+        replication_shutdown.clone(),
+    ));
     start_embedding_backlog_drainer(Arc::clone(&manager));
 
     // Start backup scheduler if enabled

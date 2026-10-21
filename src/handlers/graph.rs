@@ -208,7 +208,8 @@ pub async fn get_all_entities(
 
     let provenance = if req.with_sources {
         let memory = state
-            .get_user_memory(&req.user_id)
+            .get_user_memory_async(&req.user_id)
+            .await
             .map_err(AppError::Internal)?;
         let rows = blocking(move || memory.read().tag_source_store().all()).await?;
         Some(fold_provenance(&rows))
@@ -493,7 +494,8 @@ pub async fn rebuild_user_graph(
 
     // Get all memories for this user
     let memory_sys = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let memories: Vec<(MemoryId, Experience)> = {
         let memory_guard = memory_sys.read();
@@ -787,7 +789,8 @@ pub async fn get_stamped_cores(
         }
     }
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let rows = blocking(move || memory.read().tag_source_store().all()).await?;
     Ok(Json(stamped_cores(&rows, thresholds)))

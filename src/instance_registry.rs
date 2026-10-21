@@ -391,7 +391,10 @@ mod tests {
         std::env::set_var("VELD_REGISTRY_TEST_SECRET", "hunter2");
         let recipe = capture_launch().expect("current_exe is known in tests");
         std::env::remove_var("VELD_REGISTRY_TEST_SECRET");
-        assert!(recipe.env_names.iter().any(|n| n == "VELD_REGISTRY_TEST_SECRET"));
+        assert!(recipe
+            .env_names
+            .iter()
+            .any(|n| n == "VELD_REGISTRY_TEST_SECRET"));
         let json = serde_json::to_string(&recipe).unwrap();
         assert!(!json.contains("hunter2"));
         assert!(!recipe.exe.is_empty());

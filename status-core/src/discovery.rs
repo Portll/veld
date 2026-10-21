@@ -97,6 +97,10 @@ pub fn discover_instances() -> Vec<DiscoveredInstance> {
             out.push(inst);
         }
     }
-    out.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.base_url.cmp(&b.base_url)));
+    out.sort_by(|a, b| {
+        a.port
+            .cmp(&b.port)
+            .then_with(|| a.base_url.cmp(&b.base_url))
+    });
     out
 }

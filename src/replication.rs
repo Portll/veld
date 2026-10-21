@@ -110,7 +110,11 @@ pub fn own_api_key() -> Option<String> {
     ["VELD_API_KEYS", "VELD_API_KEY", "VELD_DEV_API_KEY"]
         .iter()
         .filter_map(|k| std::env::var(k).ok())
-        .flat_map(|v| v.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+        .flat_map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        })
         .find(|k| !k.is_empty())
 }
 
@@ -303,15 +307,18 @@ pub fn normalize_source(raw: &str) -> Result<String> {
 
 /// Leader side: every user's log length, by `stat` alone.
 pub fn user_logs(manager: &MultiUserMemoryManager) -> Vec<UserLogInfo> {
+    // Only tenants with a log: `records` answers 404 for the others, so listing them
+    // would leave a follower retrying a tenant it can never be fed.
     let mut out: Vec<UserLogInfo> = manager
         .list_users()
         .into_iter()
         .filter_map(|user_id| {
             let dir = manager.user_dir(&user_id).ok()?;
-            let log_bytes = std::fs::metadata(dir.join("intent.log"))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            Some(UserLogInfo { user_id, log_bytes })
+            let log = std::fs::metadata(dir.join("intent.log")).ok()?;
+            log.is_file().then_some(UserLogInfo {
+                user_id,
+                log_bytes: log.len(),
+            })
         })
         .collect();
     out.sort_by(|a, b| a.user_id.cmp(&b.user_id));
@@ -438,7 +445,10 @@ pub fn coalesce(frames: Vec<(u64, IntentPayload)>) -> Vec<(u64, IntentPayload)> 
     for id in order {
         let mut frames = by_id.remove(&id).unwrap_or_default();
         let last_snapshot = frames.iter().rposition(|(_, p)| {
-            matches!(p, IntentPayload::Remember { .. } | IntentPayload::Update { .. })
+            matches!(
+                p,
+                IntentPayload::Remember { .. } | IntentPayload::Update { .. }
+            )
         });
         if let Some(i) = last_snapshot {
             frames.drain(..i);
@@ -731,7 +741,10 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     let resp = http
         .get(&url)
         .header("X-API-Key", &target.api_key)
-        .header(crate::handlers::admin::ADMIN_API_KEY_HEADER, &target.admin_key)
+        .header(
+            crate::handlers::admin::ADMIN_API_KEY_HEADER,
+            &target.admin_key,
+        )
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -740,7 +753,10 @@ async fn get_json<T: serde::de::DeserializeOwned>(
         .await
         .with_context(|| format!("GET {url}"))?;
     if !status.is_success() {
-        bail!("GET {url}: {status}: {}", echo(&String::from_utf8_lossy(&body)));
+        bail!(
+            "GET {url}: {status}: {}",
+            echo(&String::from_utf8_lossy(&body))
+        );
     }
     serde_json::from_slice(&body).with_context(|| format!("GET {url}: decoding the reply"))
 }
@@ -822,7 +838,10 @@ async fn sync_user(
         let path = format!(
             "/api/admin/replication/records?user_id={}&after_lsn={}&limit={FEED_LIMIT}",
             percent_encode(&info.user_id),
-            progress.applied_lsn.map(|l| l.to_string()).unwrap_or_default()
+            progress
+                .applied_lsn
+                .map(|l| l.to_string())
+                .unwrap_or_default()
         );
         let page: FeedPage = tokio::select! {
             page = get_json(http, target, &path) => page?,
@@ -1092,7 +1111,10 @@ mod tests {
         assert_eq!(back["alice"].source_bytes, 1234);
         assert_eq!(back["alice"].log_created, Some(1_700_000_000));
         assert_eq!(back["alice"].diverged.as_deref(), Some("rolled back"));
-        assert!(back["alice"].retry_at.is_none(), "backoff deadlines are not persisted");
+        assert!(
+            back["alice"].retry_at.is_none(),
+            "backoff deadlines are not persisted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1151,7 +1173,11 @@ mod tests {
         assert!(!is_loopback_source("https://leader.example:3030"));
         assert!(is_same_instance("http://localhost:3030", "127.0.0.1", 3030));
         assert!(is_same_instance("http://127.0.0.1:3030", "0.0.0.0", 3030));
-        assert!(!is_same_instance("http://127.0.0.1:3031", "127.0.0.1", 3030));
+        assert!(!is_same_instance(
+            "http://127.0.0.1:3031",
+            "127.0.0.1",
+            3030
+        ));
         assert_eq!(source_port("https://leader.example"), Some(443));
     }
 
@@ -1181,10 +1207,22 @@ mod tests {
             ..UserProgress::default()
         };
         assert!(divergence(&caught_up, &page(100, 7)).is_none());
-        assert!(divergence(&caught_up, &page(100, 8)).is_some(), "log recreated");
-        assert!(divergence(&caught_up, &page(99, 7)).is_some(), "head at the applied lsn");
-        assert!(divergence(&caught_up, &page(40, 7)).is_some(), "rolled back");
-        assert!(divergence(&caught_up, &page(100, 0)).is_none(), "legacy log has no identity");
+        assert!(
+            divergence(&caught_up, &page(100, 8)).is_some(),
+            "log recreated"
+        );
+        assert!(
+            divergence(&caught_up, &page(99, 7)).is_some(),
+            "head at the applied lsn"
+        );
+        assert!(
+            divergence(&caught_up, &page(40, 7)).is_some(),
+            "rolled back"
+        );
+        assert!(
+            divergence(&caught_up, &page(100, 0)).is_none(),
+            "legacy log has no identity"
+        );
     }
 
     #[test]
@@ -1196,7 +1234,9 @@ mod tests {
         let p = page(10, 1);
         assert!(status.record_page(2, "u", &p, 9, 10, 4).is_none());
         assert!(status.users.is_empty());
-        let saved = status.record_page(3, "u", &p, 9, 10, 4).expect("current poll");
+        let saved = status
+            .record_page(3, "u", &p, 9, 10, 4)
+            .expect("current poll");
         assert_eq!(saved["u"].applied_lsn, Some(9));
         assert_eq!(saved["u"].leader_head_lsn, Some(10));
         assert_eq!(status.pages, 1);
@@ -1236,7 +1276,11 @@ mod tests {
 
         let appended_after_capture = (0..5).map(record).chain(torn());
         let (page, more) = page_below_head(appended_after_capture, 0, 4, 500).unwrap();
-        assert_eq!(lsns(&page), vec![0, 1, 2, 3], "frame 4 came after the head was read");
+        assert_eq!(
+            lsns(&page),
+            vec![0, 1, 2, 3],
+            "frame 4 came after the head was read"
+        );
         assert!(!more);
 
         let (page, _) = page_below_head((0..4).map(record).chain(torn()), 2, 4, 500)
@@ -1262,10 +1306,29 @@ mod tests {
         let sv = Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
         let user_id = user.to_string();
         let p = match kind {
-            "remember" => IntentPayload::Remember { user_id, memory_id: id.into(), memory_bincode: vec![lsn as u8], schema_version: sv },
-            "update" => IntentPayload::Update { user_id, memory_id: id.into(), memory_bincode: vec![lsn as u8], schema_version: sv },
-            "forget" => IntentPayload::Forget { user_id, memory_id: id.into(), schema_version: sv },
-            _ => IntentPayload::Anchor { user_id, memory_id: id.into(), importance: 0.9, schema_version: sv },
+            "remember" => IntentPayload::Remember {
+                user_id,
+                memory_id: id.into(),
+                memory_bincode: vec![lsn as u8],
+                schema_version: sv,
+            },
+            "update" => IntentPayload::Update {
+                user_id,
+                memory_id: id.into(),
+                memory_bincode: vec![lsn as u8],
+                schema_version: sv,
+            },
+            "forget" => IntentPayload::Forget {
+                user_id,
+                memory_id: id.into(),
+                schema_version: sv,
+            },
+            _ => IntentPayload::Anchor {
+                user_id,
+                memory_id: id.into(),
+                importance: 0.9,
+                schema_version: sv,
+            },
         };
         (lsn, p)
     }
@@ -1281,7 +1344,11 @@ mod tests {
         assert_eq!(p.lag, Some(24_500));
         p.applied_lsn = Some(40_999);
         p.refresh_lag();
-        assert_eq!(p.lag, Some(0), "caught up: the leader's last LSN is head - 1");
+        assert_eq!(
+            p.lag,
+            Some(0),
+            "caught up: the leader's last LSN is head - 1"
+        );
         p.applied_lsn = None;
         p.refresh_lag();
         assert_eq!(p.lag, Some(41_000), "nothing applied: the whole log");
@@ -1332,7 +1399,10 @@ mod tests {
             schema_version: sv,
         };
         apply_non_snapshot(&manager, "u", &legacy).unwrap();
-        assert!(anchored(), "a legacy frame cannot say the anchor was released");
+        assert!(
+            anchored(),
+            "a legacy frame cannot say the anchor was released"
+        );
 
         let release = IntentPayload::SetAnchored {
             user_id: "u".into(),
@@ -1353,7 +1423,10 @@ mod tests {
     fn a_page_naming_another_tenant_is_refused() {
         let ok = vec![frame(0, "a", "remember"), frame(1, "b", "forget")];
         assert!(check_tenant("u", &ok).is_ok());
-        let mixed = vec![frame(0, "a", "remember"), frame_for("other", 1, "b", "forget")];
+        let mixed = vec![
+            frame(0, "a", "remember"),
+            frame_for("other", 1, "b", "forget"),
+        ];
         let err = check_tenant("u", &mixed).unwrap_err().to_string();
         assert!(err.contains("other"));
     }
@@ -1376,9 +1449,26 @@ mod tests {
 
     #[test]
     fn coalesce_lets_a_later_remember_undo_a_forget() {
-        let page = vec![frame(0, "a", "remember"), frame(1, "a", "forget"), frame(2, "a", "remember")];
+        let page = vec![
+            frame(0, "a", "remember"),
+            frame(1, "a", "forget"),
+            frame(2, "a", "remember"),
+        ];
         let out: Vec<u64> = coalesce(page).into_iter().map(|(l, _)| l).collect();
         assert_eq!(out, vec![2]);
+    }
+
+    #[test]
+    fn the_leader_lists_only_tenants_it_can_feed() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        manager.get_user_journaled_writer("journaled").unwrap();
+        std::fs::create_dir_all(manager.user_dir("copied-aside").unwrap()).unwrap();
+        let listed: Vec<String> = user_logs(&manager).into_iter().map(|u| u.user_id).collect();
+        assert!(listed.contains(&"journaled".to_string()));
+        assert!(
+            !listed.contains(&"copied-aside".to_string()),
+            "a directory with no intent log is not a tenant the feed can serve"
+        );
     }
 
     #[test]
@@ -1390,7 +1480,12 @@ mod tests {
         };
         let bytes = payload::encode(&payload).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let back = payload::decode(&base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+        let back = payload::decode(
+            &base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(back.memory_id(), "m");
     }
 }

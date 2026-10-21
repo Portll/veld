@@ -1064,7 +1064,9 @@ impl MemorySystem {
         } else {
             let http_config = if secondary_choice == "auto" {
                 crate::embeddings::http_embedder::HttpEmbedderConfig::from_env()
-            } else if secondary_choice.starts_with("http://") || secondary_choice.starts_with("https://") {
+            } else if secondary_choice.starts_with("http://")
+                || secondary_choice.starts_with("https://")
+            {
                 crate::embeddings::http_embedder::HttpEmbedderConfig::from_id(&secondary_choice)
             } else {
                 anyhow::bail!(

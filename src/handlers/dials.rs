@@ -52,7 +52,8 @@ pub async fn get_dials(
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let dials = memory.read().cognitive_dials();
     Ok(Json(dials))
@@ -66,7 +67,8 @@ pub async fn set_dials(
 ) -> Result<Json<CognitiveDials>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let guard = memory.read();
     guard.set_cognitive_dials(req.dials);

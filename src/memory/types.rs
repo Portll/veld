@@ -6264,11 +6264,20 @@ mod query_filter_tests {
     #[test]
     fn has_selective_filters_ignores_defaults_and_empty_tags() {
         assert!(!Query::default().has_selective_filters());
-        let q = Query { tags: Some(Vec::new()), ..Default::default() };
+        let q = Query {
+            tags: Some(Vec::new()),
+            ..Default::default()
+        };
         assert!(!q.has_selective_filters());
-        let q = Query { tags: Some(vec!["storage".into()]), ..Default::default() };
+        let q = Query {
+            tags: Some(vec!["storage".into()]),
+            ..Default::default()
+        };
         assert!(q.has_selective_filters());
-        let q = Query { failures_only: true, ..Default::default() };
+        let q = Query {
+            failures_only: true,
+            ..Default::default()
+        };
         assert!(q.has_selective_filters());
     }
 }
