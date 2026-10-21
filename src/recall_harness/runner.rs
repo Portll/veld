@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::config::ServerConfig;
+use crate::handlers::remember::{assemble_tags, AssembledTags, TagInputs};
 use crate::handlers::MultiUserMemoryManager;
 use crate::memory::retrieval::RetrievalOutcome;
 use crate::memory::types::MemoryId;
@@ -1242,6 +1243,7 @@ pub fn ingest_corpus(
     guard_ner_backend(manager)?;
     let mut map = HashMap::with_capacity(corpus.len());
     let ner = manager.get_neural_ner();
+    let keyword_extractor = manager.get_keyword_extractor();
     let user_mem = manager.get_user_memory(EVAL_USER)?;
     // Eval-fidelity gate: production embeds entity names so Tier-4 embedding
     // concept-merge runs (cross-memory entity resolution). The eval passed None →
@@ -1268,14 +1270,24 @@ pub fn ingest_corpus(
                 .collect(),
             Err(_) => Vec::new(),
         };
-        // Merge fixture tags + NER entity names (deduped, case-insensitive).
-        let mut merged: Vec<String> = item.tags.clone();
-        let mut seen: HashSet<String> = merged.iter().map(|t| t.to_lowercase()).collect();
-        for r in &ner_entities {
-            if seen.insert(r.text.to_lowercase()) {
-                merged.push(r.text.clone());
-            }
-        }
+        let AssembledTags {
+            entities: merged,
+            ner_entities,
+            ..
+        } = assemble_tags(
+            manager,
+            EVAL_USER,
+            &mut Vec::new(),
+            TagInputs {
+                content: &item.content,
+                filename: None,
+                tags: &item.tags,
+                intent_tags: &[],
+                ingest_tags: &[],
+                ner_entities,
+                keywords: keyword_extractor.extract_texts(&item.content),
+            },
+        );
 
         // Embed entity/tag names so Tier-4 concept-merge runs (gated; see above).
         // Computed before `merged` is moved into the experience.

@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use axum::{extract::State, response::Json};
 
 use super::health::AppState;
+use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
 use crate::declared_entities::{DeclaredEntity, DeclaredEntityInput};
 use crate::errors::{AppError, ValidationErrorExt};
@@ -871,7 +872,7 @@ pub async fn file_answer(
 /// accident, and it must not fail the write either; losing selectivity ordering is a worse outcome
 /// than nothing only if you cannot tell it happened, which is what the warn is for.
 pub(crate) fn mention_counts_for(
-    state: &AppState,
+    state: &MultiUserMemoryManager,
     user_id: &str,
     candidates: &[String],
 ) -> std::collections::HashMap<String, usize> {
@@ -887,6 +888,156 @@ pub(crate) fn mention_counts_for(
         }
     }
     out
+}
+
+/// What a single write brings to its tag list: the request's own fields and what NER and YAKE
+/// found in its content.
+pub(crate) struct TagInputs<'a> {
+    /// The content as the caller sent it, before ingest extraction.
+    pub(crate) content: &'a str,
+    pub(crate) filename: Option<&'a str>,
+    pub(crate) tags: &'a [String],
+    pub(crate) intent_tags: &'a [String],
+    pub(crate) ingest_tags: &'a [String],
+    pub(crate) ner_entities: Vec<NerEntityRecord>,
+    pub(crate) keywords: Vec<String>,
+}
+
+/// A write's tag list, the source of each entry, and the NER records kept for graph insertion.
+pub(crate) struct AssembledTags {
+    pub(crate) entities: Vec<String>,
+    pub(crate) labelled: TagSources,
+    pub(crate) ner_entities: Vec<NerEntityRecord>,
+}
+
+/// Assemble a single write's tag list the way `remember` stores it.
+///
+/// The recall harness ingests through this as well, so the tags it measures are the tags
+/// production stores; a harness that took NER output alone lost every keyword, and under the
+/// neural NER every date and event too.
+pub(crate) fn assemble_tags(
+    state: &MultiUserMemoryManager,
+    user_id: &str,
+    declared: &mut Vec<DeclaredEntity>,
+    inputs: TagInputs<'_>,
+) -> AssembledTags {
+    let ner_entities =
+        drop_person_location_in_code(inputs.ner_entities, inputs.filename, inputs.content);
+
+    let (mut merged_entities, mut tag_sources) = authored_tags(declared, inputs.tags);
+    // FIX-10: Merge semantic intent tags with "intent:" prefix for importance boost
+    for tag in inputs.intent_tags {
+        merged_entities.push(format!("intent:{tag}"));
+        tag_sources.push(TagSource::Intent);
+    }
+    // Everything appended from here on is DERIVED — nobody chose it. The split is what lets the cap
+    // protect the writer's own tags while ranking the rest, and it has to be taken here because
+    // after this point the list is one flat Vec with no record of where authorship ended.
+    let authored_entity_count = merged_entities.len();
+    let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
+    // Merge ingest-derived entity hints (JSON keys, CSV columns, code symbols)
+    for tag in inputs.ingest_tags {
+        if seen.insert(tag.to_lowercase()) {
+            merged_entities.push(tag.clone());
+            tag_sources.push(TagSource::Ingest);
+        }
+    }
+    for record in &ner_entities {
+        if seen.insert(record.text.to_lowercase()) {
+            merged_entities.push(record.text.clone());
+            tag_sources.push(TagSource::Ner);
+        }
+    }
+    for keyword in inputs.keywords {
+        if seen.insert(keyword.to_lowercase()) {
+            merged_entities.push(keyword);
+            tag_sources.push(TagSource::Yake);
+        }
+    }
+
+    // Cold-start entity extraction: when the graph is sparse and NER found few entities,
+    // use aggressive heuristics (proper nouns, CamelCase, acronyms, file paths, versions)
+    let graph_entity_count = state
+        .get_user_graph(user_id)
+        .ok()
+        .map(|g| g.read().get_stats().map(|s| s.entity_count).unwrap_or(0))
+        .unwrap_or(0);
+    if graph_entity_count < crate::constants::ENTITY_COLD_START_THRESHOLD && ner_entities.len() < 2
+    {
+        let cold_entities =
+            crate::embeddings::ner::cold_start_extract_entities(inputs.content, &merged_entities);
+        if !cold_entities.is_empty() {
+            tracing::debug!(
+                "Cold-start extraction found {} additional entities (graph has {})",
+                cold_entities.len(),
+                graph_entity_count
+            );
+            for e in cold_entities {
+                if seen.insert(e.text.to_lowercase()) {
+                    merged_entities.push(e.text);
+                    tag_sources.push(TagSource::ColdStart);
+                }
+            }
+        }
+    }
+
+    // Redact BEFORE the cap. An entity is a one-way door — delete_entity() is not routed and the
+    // forget path does not touch the graph — so this is the only point the decision can be made.
+    // Order matters twice over: filtering after truncate would mean a credential had already
+    // displaced a legitimate entity, and the cap cuts by arrival order rather than by relevance.
+    let assembled_tags = merged_entities.clone();
+    let redaction = crate::redaction::redact_entities(&mut merged_entities);
+    crate::declared_entities::retain_unredacted(declared);
+    let redacted_tags = merged_entities.clone();
+    if redaction.total() > 0 {
+        // Counts and classes only. The value is never logged — that would move the disclosure from
+        // the graph into the log, which is not a fix.
+        tracing::info!(
+            key = redaction.key,
+            private_key = redaction.private_key,
+            token = redaction.token,
+            login = redaction.login,
+            secret = redaction.secret,
+            path = redaction.path,
+            "Redacted credential-shaped entities before graph entry"
+        );
+    }
+
+    if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
+        // Ordered by SELECTIVITY before the cut, not by arrival. Measured 2026-08-27: the tail this
+        // used to discard was 19x more selective than the head it kept, because arrival order is
+        // uncorrelated with worth. See crate::entity_cap.
+        let mentions = mention_counts_for(state, user_id, &merged_entities);
+        let (kept, report) = crate::entity_cap::cap_by_selectivity(
+            std::mem::take(&mut merged_entities),
+            authored_entity_count,
+            validation::MAX_ENTITIES_PER_MEMORY,
+            &mentions,
+        );
+        merged_entities = kept;
+        tracing::debug!(
+            considered = report.considered,
+            authored = report.authored,
+            dropped = report.dropped,
+            // A persistent zero here means the ordering is inert and should be questioned rather
+            // than trusted — which is why it is logged rather than assumed.
+            rescued_by_ordering = report.rescued_by_ordering,
+            "Capped entities by selectivity"
+        );
+    }
+    let labelled = TagSources::label(
+        &tag_sources,
+        &assembled_tags,
+        &redacted_tags,
+        &merged_entities,
+        &redaction,
+    );
+
+    AssembledTags {
+        entities: merged_entities,
+        labelled,
+        ner_entities,
+    }
 }
 
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
@@ -977,8 +1128,6 @@ pub async fn remember(
             Vec::new()
         }
     };
-    let ner_entities =
-        drop_person_location_in_code(ner_entities, req.filename.as_deref(), &req.content);
     let extracted_keywords = match yake_result {
         Ok(keywords) => keywords,
         Err(e) => {
@@ -991,113 +1140,23 @@ pub async fn remember(
         }
     };
 
-    let (mut merged_entities, mut tag_sources) = authored_tags(&declared, &req.tags);
-    // FIX-10: Merge semantic intent tags with "intent:" prefix for importance boost
-    for tag in &req.intent_tags {
-        merged_entities.push(format!("intent:{tag}"));
-        tag_sources.push(TagSource::Intent);
-    }
-    // Everything appended from here on is DERIVED — nobody chose it. The split is what lets the cap
-    // protect the writer's own tags while ranking the rest, and it has to be taken here because
-    // after this point the list is one flat Vec with no record of where authorship ended.
-    let authored_entity_count = merged_entities.len();
-    let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
-    // Merge ingest-derived entity hints (JSON keys, CSV columns, code symbols)
-    for tag in &ingest_tags {
-        if seen.insert(tag.to_lowercase()) {
-            merged_entities.push(tag.clone());
-            tag_sources.push(TagSource::Ingest);
-        }
-    }
-    for record in &ner_entities {
-        if seen.insert(record.text.to_lowercase()) {
-            merged_entities.push(record.text.clone());
-            tag_sources.push(TagSource::Ner);
-        }
-    }
-    for keyword in extracted_keywords {
-        if seen.insert(keyword.to_lowercase()) {
-            merged_entities.push(keyword);
-            tag_sources.push(TagSource::Yake);
-        }
-    }
-
-    // Cold-start entity extraction: when the graph is sparse and NER found few entities,
-    // use aggressive heuristics (proper nouns, CamelCase, acronyms, file paths, versions)
-    let graph_entity_count = state
-        .get_user_graph(&req.user_id)
-        .ok()
-        .map(|g| g.read().get_stats().map(|s| s.entity_count).unwrap_or(0))
-        .unwrap_or(0);
-    if graph_entity_count < crate::constants::ENTITY_COLD_START_THRESHOLD && ner_entities.len() < 2
-    {
-        let cold_entities =
-            crate::embeddings::ner::cold_start_extract_entities(&req.content, &merged_entities);
-        if !cold_entities.is_empty() {
-            tracing::debug!(
-                "Cold-start extraction found {} additional entities (graph has {})",
-                cold_entities.len(),
-                graph_entity_count
-            );
-            for e in cold_entities {
-                if seen.insert(e.text.to_lowercase()) {
-                    merged_entities.push(e.text);
-                    tag_sources.push(TagSource::ColdStart);
-                }
-            }
-        }
-    }
-
-    // Redact BEFORE the cap. An entity is a one-way door — delete_entity() is not routed and the
-    // forget path does not touch the graph — so this is the only point the decision can be made.
-    // Order matters twice over: filtering after truncate would mean a credential had already
-    // displaced a legitimate entity, and the cap cuts by arrival order rather than by relevance.
-    let assembled_tags = merged_entities.clone();
-    let redaction = crate::redaction::redact_entities(&mut merged_entities);
-    crate::declared_entities::retain_unredacted(&mut declared);
-    let redacted_tags = merged_entities.clone();
-    if redaction.total() > 0 {
-        // Counts and classes only. The value is never logged — that would move the disclosure from
-        // the graph into the log, which is not a fix.
-        tracing::info!(
-            key = redaction.key,
-            private_key = redaction.private_key,
-            token = redaction.token,
-            login = redaction.login,
-            secret = redaction.secret,
-            path = redaction.path,
-            "Redacted credential-shaped entities before graph entry"
-        );
-    }
-
-    if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        // Ordered by SELECTIVITY before the cut, not by arrival. Measured 2026-08-27: the tail this
-        // used to discard was 19x more selective than the head it kept, because arrival order is
-        // uncorrelated with worth. See crate::entity_cap.
-        let mentions = mention_counts_for(&state, &req.user_id, &merged_entities);
-        let (kept, report) = crate::entity_cap::cap_by_selectivity(
-            std::mem::take(&mut merged_entities),
-            authored_entity_count,
-            validation::MAX_ENTITIES_PER_MEMORY,
-            &mentions,
-        );
-        merged_entities = kept;
-        tracing::debug!(
-            considered = report.considered,
-            authored = report.authored,
-            dropped = report.dropped,
-            // A persistent zero here means the ordering is inert and should be questioned rather
-            // than trusted — which is why it is logged rather than assumed.
-            rescued_by_ordering = report.rescued_by_ordering,
-            "Capped entities by selectivity"
-        );
-    }
-    let labelled_tags = TagSources::label(
-        &tag_sources,
-        &assembled_tags,
-        &redacted_tags,
-        &merged_entities,
-        &redaction,
+    let AssembledTags {
+        entities: merged_entities,
+        labelled: labelled_tags,
+        ner_entities,
+    } = assemble_tags(
+        &state,
+        &req.user_id,
+        &mut declared,
+        TagInputs {
+            content: &req.content,
+            filename: req.filename.as_deref(),
+            tags: &req.tags,
+            intent_tags: &req.intent_tags,
+            ingest_tags: &ingest_tags,
+            ner_entities,
+            keywords: extracted_keywords,
+        },
     );
 
     let experience_type_str = format!("{:?}", experience_type);
@@ -2767,7 +2826,10 @@ mod client_source_type_tests {
 
 #[cfg(test)]
 mod declared_and_ner_tests {
-    use super::{authored_tags, content_is_code_or_markdown, drop_person_location_in_code};
+    use super::{
+        assemble_tags, authored_tags, content_is_code_or_markdown, drop_person_location_in_code,
+        TagInputs,
+    };
     use crate::declared_entities::{validate, DeclaredEntityInput};
     use crate::memory::tag_sources::TagSource;
     use crate::memory::types::NerEntityRecord;
@@ -2841,5 +2903,30 @@ mod declared_and_ner_tests {
             4,
             "plain prose keeps every NER type"
         );
+    }
+
+    #[test]
+    fn a_write_keeps_its_keywords_and_cold_start_entities_beside_ner() {
+        let harness = crate::handlers::test_helpers::TestHarness::new();
+        let assembled = assemble_tags(
+            &harness.manager,
+            "tag-assembly",
+            &mut Vec::new(),
+            TagInputs {
+                content: "Caroline joined the LGBTQ support group.",
+                filename: None,
+                tags: &tags(&["conversation"]),
+                intent_tags: &[],
+                ingest_tags: &[],
+                ner_entities: vec![record("Caroline", "PER")],
+                keywords: tags(&["support group", "caroline"]),
+            },
+        );
+        assert_eq!(
+            assembled.entities,
+            tags(&["conversation", "Caroline", "support group", "LGBTQ"]),
+            "caller tag, NER, a YAKE keyword NER lacked, then cold start on an empty graph"
+        );
+        assert_eq!(assembled.ner_entities.len(), 1);
     }
 }
