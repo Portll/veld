@@ -2446,6 +2446,33 @@ impl MultiUserMemoryManager {
         Ok(outcome.lsn)
     }
 
+    /// [`Self::journal_and_apply`] for many records: one writer lock, one append
+    /// batch and one fsync, then each record applied to the projections in order. The
+    /// batch is durable whole or not at all.
+    pub fn journal_and_apply_batch(
+        &self,
+        user_id: &str,
+        payloads: &[crate::intent_log::IntentPayload],
+    ) -> Result<Vec<crate::intent_log::Lsn>> {
+        let writer = self.get_user_journaled_writer(user_id)?;
+        let outcomes = writer
+            .lock()
+            .record_and_apply_batch(payloads)
+            .map_err(|e| anyhow::anyhow!("journal record_and_apply_batch: {e}"))?;
+        for outcome in &outcomes {
+            for err in &outcome.apply_errors {
+                tracing::warn!(
+                    user_id = %user_id,
+                    projection = %err.projection,
+                    lsn = outcome.lsn.0,
+                    error = %err.source,
+                    "projection apply failed during journaled write (log durable; replay will retry)",
+                );
+            }
+        }
+        Ok(outcomes.into_iter().map(|outcome| outcome.lsn).collect())
+    }
+
     /// W-018 support: ensure the wiki projection is materialised for
     /// `user_id` and pull any out-of-band page edits back into the canonical
     /// store, then report `(target_dir, pages_on_disk, edits_applied)`.
