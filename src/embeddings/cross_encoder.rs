@@ -39,6 +39,15 @@
 //! default, so the shipped pipeline is unchanged until someone turns it.
 //!
 //! Files cache under `~/.cache/veld/cross-encoder/<sanitised-id>/`.
+//!
+//! # Speed
+//!
+//! - `VELD_ONNX_THREADS`: intra-op threads per session (default: the core count, at most 4).
+//! - `VELD_CROSS_ENCODER_BATCH=pair|bucket`: run each pair alone, or batch pairs of similar
+//!   token length (default `bucket`).
+//! - `VELD_CROSS_ENCODER_SESSIONS`: sessions one model may open for concurrent reranks
+//!   (default 2, 1..=8). Each holds its own copy of the weights; extras open on contention.
+//! - `VELD_CROSS_ENCODER_CACHE`: pair scores one reranker remembers (default 4096, 0 disables).
 
 use anyhow::{Context, Result};
 use ort::session::Session;
@@ -52,6 +61,72 @@ use tokenizers::Tokenizer;
 
 /// Maximum input sequence length (query + document tokens combined).
 const MAX_PAIR_LENGTH: usize = 512;
+
+/// Most pairs one forward pass carries.
+const MAX_BATCH: usize = 16;
+
+/// How much longer than the shortest pair of a batch another pair may be and still join it:
+/// a quarter of that length, and never less than [`BATCH_SLACK_MIN_TOKENS`]. Every pair is
+/// padded to the batch's longest, so a wider band trades fewer passes for more padding.
+const BATCH_SLACK_FRACTION: usize = 4;
+const BATCH_SLACK_MIN_TOKENS: usize = 8;
+
+/// Sessions a cross-encoder may open (`VELD_CROSS_ENCODER_SESSIONS`, 1..=8). Each holds its
+/// own copy of the weights, 284 MB for mxbai-rerank-xsmall-v1, so a second one opens only when
+/// two recalls rerank at the same moment.
+const DEFAULT_SESSIONS: usize = 2;
+
+/// Pair scores a cross-encoder remembers (`VELD_CROSS_ENCODER_CACHE`, 0 disables).
+/// `proactive_context` reranks overlapping candidates for similar queries on every prompt.
+const DEFAULT_PAIR_CACHE: usize = 4096;
+
+/// Intra-op threads per session. `VELD_ONNX_THREADS`, or `SHODH_ONNX_THREADS`, which the recall
+/// harness pins to 1 so repeat passes score identically; otherwise the core count, at most 4.
+/// Apple Silicon used to get 1 here to leave room for Metal or Neural Engine providers, but
+/// none is registered, so the CPU provider ran single-threaded.
+fn intra_threads() -> usize {
+    std::env::var("VELD_ONNX_THREADS")
+        .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(4)
+        })
+}
+
+fn env_count(name: &str, default: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .min(max)
+}
+
+/// How pairs reach the model: `bucket` (the default) batches pairs of similar token length,
+/// `pair` runs each pair alone (`VELD_CROSS_ENCODER_BATCH`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BatchMode {
+    Pair,
+    Bucket,
+}
+
+fn batch_mode() -> BatchMode {
+    match std::env::var("VELD_CROSS_ENCODER_BATCH").as_deref() {
+        Ok("pair") => BatchMode::Pair,
+        _ => BatchMode::Bucket,
+    }
+}
+
+fn build_session(model_path: &std::path::Path, threads: usize) -> Result<Session> {
+    Session::builder()
+        .context("Failed to create session builder")?
+        .with_intra_threads(threads)
+        .context("Failed to set thread count")?
+        .commit_from_file(model_path)
+        .context("Failed to load ONNX model")
+}
 
 /// Default cross-encoder id when no env var is set. mxbai-rerank-xsmall-v1
 /// is the smallest 2024-vintage reranker that meaningfully beats the
@@ -496,7 +571,16 @@ impl OutputHead {
 }
 
 struct LazyOnnx {
-    session: Mutex<Session>,
+    /// Built at load; every call can fall back to waiting for it.
+    primary: Mutex<Session>,
+    /// Opened one at a time, the first time every open session is busy.
+    extra: Vec<OnceLock<Mutex<Session>>>,
+    /// Held while an extra session is built, so two callers never build the same slot.
+    growing: Mutex<()>,
+    /// Set when building an extra session failed, so contended calls stop retrying it.
+    grow_failed: AtomicBool,
+    model_path: PathBuf,
+    threads: usize,
     tokenizer: Tokenizer,
     /// Whether the loaded ONNX graph accepts `token_type_ids`. Detected
     /// from `session.inputs` at load time — the registry's
@@ -506,19 +590,113 @@ struct LazyOnnx {
     output_head: OutputHead,
 }
 
+impl LazyOnnx {
+    /// A session to run on: a free open one, else a newly opened one while the pool has
+    /// room, else the primary once it frees.
+    fn checkout(&self, id: &str) -> Result<parking_lot::MutexGuard<'_, Session>> {
+        if let Some(guard) = self.primary.try_lock() {
+            return Ok(guard);
+        }
+        for slot in &self.extra {
+            if let Some(guard) = slot.get().and_then(|s| s.try_lock()) {
+                return Ok(guard);
+            }
+        }
+        if let Some(guard) = self.open_extra(id) {
+            return Ok(guard);
+        }
+        self.primary
+            .try_lock_for(std::time::Duration::from_secs(30))
+            .ok_or_else(|| anyhow::anyhow!("Cross-encoder session lock timeout ({id})"))
+    }
+
+    fn open_extra(&self, id: &str) -> Option<parking_lot::MutexGuard<'_, Session>> {
+        if self.grow_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let _growing = self.growing.try_lock()?;
+        let slot = self.extra.iter().find(|s| s.get().is_none())?;
+        match build_session(&self.model_path, self.threads) {
+            Ok(session) => {
+                let _ = slot.set(Mutex::new(session));
+                let open = 1 + self.extra.iter().filter(|s| s.get().is_some()).count();
+                crate::metrics::CROSS_ENCODER_SESSIONS
+                    .with_label_values(&[id])
+                    .set(open as i64);
+                tracing::info!(
+                    "cross-encoder `{id}`: opened session {open} for concurrent reranks"
+                );
+                slot.get().and_then(|s| s.try_lock())
+            }
+            Err(e) => {
+                self.grow_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    "cross-encoder `{id}`: could not open another session, concurrent reranks \
+                     will wait for the first: {e:#}"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// One (query, document) pair, tokenized and cut to its own length.
+struct EncodedPair {
+    ids: Vec<i64>,
+    mask: Vec<i64>,
+    types: Vec<i64>,
+}
+
+impl EncodedPair {
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
+/// Group pair indices, already sorted by token length, into batches whose longest pair is
+/// within the slack of its shortest.
+fn length_buckets(order: &[usize], lens: &[usize]) -> Vec<Vec<usize>> {
+    let mut buckets: Vec<Vec<usize>> = Vec::new();
+    for &i in order {
+        let joins = buckets.last().is_some_and(|b| {
+            let shortest = lens[b[0]];
+            let slack = (shortest / BATCH_SLACK_FRACTION).max(BATCH_SLACK_MIN_TOKENS);
+            b.len() < MAX_BATCH && lens[i] <= shortest + slack
+        });
+        match buckets.last_mut() {
+            Some(b) if joins => b.push(i),
+            _ => buckets.push(vec![i]),
+        }
+    }
+    buckets
+}
+
+/// Cache key for a pair. The query's byte length leads, so no two distinct pairs share a key
+/// whatever characters either text contains.
+fn pair_key(query: &str, document: &str) -> String {
+    format!("{}:{query}{document}", query.len())
+}
+
 /// Cross-encoder backed by a single ONNX model.
 pub struct OnnxCrossEncoder {
     config: CrossEncoderConfig,
     model: OnceLock<Result<LazyOnnx, String>>,
     available: AtomicBool,
+    /// Scores this reranker has already computed. Per instance, so a fresh system (each
+    /// recall-gate repeat builds one) starts cold and its latency is the model's.
+    pair_cache: Option<Mutex<lru::LruCache<String, f32>>>,
 }
 
 impl OnnxCrossEncoder {
     pub fn new(config: CrossEncoderConfig) -> Self {
+        let capacity = env_count("VELD_CROSS_ENCODER_CACHE", DEFAULT_PAIR_CACHE, 1 << 20);
         Self {
             config,
             model: OnceLock::new(),
             available: AtomicBool::new(true),
+            pair_cache: std::num::NonZeroUsize::new(capacity)
+                .map(|n| Mutex::new(lru::LruCache::new(n))),
         }
     }
 
@@ -688,20 +866,7 @@ impl OnnxCrossEncoder {
                 }
             };
 
-            // macOS aarch64 (Apple Silicon): keep at 1 to avoid contention with
-            // Metal/ANE-aware ORT execution providers that manage their own threading.
-            // Other platforms: 4 intra-op threads to parallelise batch matrix ops.
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let default_threads = 1;
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let default_threads = 4;
-            // The same pin the embedders read: the recall harness sets it to 1 so ONNX
-            // reductions run in one order and repeat passes score identically.
-            let num_threads = std::env::var("VELD_ONNX_THREADS")
-                .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default_threads);
+            let num_threads = intra_threads();
 
             // ort's `load-dynamic` PANICS (not Errs) when libonnxruntime cannot be
             // dlopen'd, which ends the calling thread instead of engaging the lazy
@@ -726,15 +891,7 @@ impl OnnxCrossEncoder {
                 ));
             }
 
-            let session = match (|| -> Result<Session> {
-                let builder = Session::builder()
-                    .context("Failed to create session builder")?
-                    .with_intra_threads(num_threads)
-                    .context("Failed to set thread count")?;
-                builder
-                    .commit_from_file(&model_path)
-                    .context("Failed to load ONNX model")
-            })() {
+            let session = match build_session(&model_path, num_threads) {
                 Ok(s) => s,
                 Err(e) => {
                     self.available
@@ -770,8 +927,17 @@ impl OnnxCrossEncoder {
                 has_token_type_ids
             );
 
+            let sessions = env_count("VELD_CROSS_ENCODER_SESSIONS", DEFAULT_SESSIONS, 8).max(1);
+            crate::metrics::CROSS_ENCODER_SESSIONS
+                .with_label_values(&[self.config.id.as_str()])
+                .set(1);
             Ok(LazyOnnx {
-                session: Mutex::new(session),
+                primary: Mutex::new(session),
+                extra: (1..sessions).map(|_| OnceLock::new()).collect(),
+                growing: Mutex::new(()),
+                grow_failed: AtomicBool::new(false),
+                model_path,
+                threads: num_threads,
                 tokenizer,
                 has_token_type_ids,
                 output_head,
@@ -798,10 +964,10 @@ impl CrossEncoderModel for OnnxCrossEncoder {
         self.ensure_downloaded().map(|_| ())
     }
 
-    /// Scores N (query, document) pairs, each in its own forward pass at its own token length,
-    /// capped at `MAX_PAIR_LENGTH`. One batch would pad every pair to the longest, letting one long
-    /// memory set the cost of all of them; on live 20-candidate sets, pair by pair takes half the
-    /// time for the same scores. The session lock is held across the N passes.
+    /// Scores N (query, document) pairs, each cut to its own token length (at most
+    /// `MAX_PAIR_LENGTH`). Pairs of similar length share a forward pass; one batch of all N would
+    /// pad every pair to the longest and let one long memory set the cost of the rest. A pair this
+    /// reranker scored before is answered from its cache.
     fn score_pairs(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
         if documents.is_empty() {
             return Ok(Vec::new());
@@ -820,61 +986,159 @@ impl CrossEncoderModel for OnnxCrossEncoder {
 }
 
 impl OnnxCrossEncoder {
-    /// One forward pass per pair; `documents` is non-empty.
+    /// Scores from the cache where it has them and from the model for the rest;
+    /// `documents` is non-empty.
     fn score_pairs_live(
         &self,
         model: &LazyOnnx,
         query: &str,
         documents: &[&str],
     ) -> Result<Vec<f32>> {
-        let mut session = model
-            .session
-            .try_lock_for(std::time::Duration::from_secs(30))
-            .ok_or_else(|| {
-                anyhow::anyhow!("Cross-encoder session lock timeout ({})", self.config.id)
-            })?;
+        let mut scores: Vec<Option<f32>> = vec![None; documents.len()];
+        let mut pending: Vec<usize> = Vec::with_capacity(documents.len());
+        match &self.pair_cache {
+            Some(cache) => {
+                let mut cache = cache.lock();
+                for (i, doc) in documents.iter().enumerate() {
+                    match cache.get(&pair_key(query, doc)) {
+                        Some(&score) => scores[i] = Some(score),
+                        None => pending.push(i),
+                    }
+                }
+            }
+            None => pending.extend(0..documents.len()),
+        }
+        let hits = documents.len() - pending.len();
+        if hits > 0 {
+            crate::metrics::CROSS_ENCODER_PAIRS_TOTAL
+                .with_label_values(&["cache"])
+                .inc_by(hits as u64);
+        }
+
+        if !pending.is_empty() {
+            let encoded = pending
+                .iter()
+                .map(|&i| self.encode_pair(model, query, documents[i]))
+                .collect::<Result<Vec<_>>>()?;
+            let fresh = self.run_pairs(model, &encoded)?;
+            crate::metrics::CROSS_ENCODER_PAIRS_TOTAL
+                .with_label_values(&["model"])
+                .inc_by(fresh.len() as u64);
+            let mut cache = self.pair_cache.as_ref().map(|c| c.lock());
+            for (&i, score) in pending.iter().zip(fresh) {
+                if let Some(cache) = cache.as_mut() {
+                    cache.put(pair_key(query, documents[i]), score);
+                }
+                scores[i] = Some(score);
+            }
+        }
+
+        scores
+            .into_iter()
+            .collect::<Option<Vec<f32>>>()
+            .ok_or_else(|| anyhow::anyhow!("cross-encoder {} left a pair unscored", self.config.id))
+    }
+
+    /// Tokenize a pair and cut it to its last attended token, at most `MAX_PAIR_LENGTH`.
+    fn encode_pair(&self, model: &LazyOnnx, query: &str, document: &str) -> Result<EncodedPair> {
+        let encoding = model
+            .tokenizer
+            .encode((query, document), true)
+            .map_err(|e| anyhow::anyhow!("Tokenization failed ({}): {e}", self.config.id))?;
+        let len = encoding
+            .get_attention_mask()
+            .iter()
+            .rposition(|&m| m != 0)
+            .map_or(0, |p| p + 1)
+            .clamp(1, MAX_PAIR_LENGTH);
+        let row = |values: &[u32]| -> Vec<i64> {
+            let mut out: Vec<i64> = values.iter().take(len).map(|&v| i64::from(v)).collect();
+            out.resize(len, 0);
+            out
+        };
+        Ok(EncodedPair {
+            ids: row(encoding.get_ids()),
+            mask: row(encoding.get_attention_mask()),
+            types: row(encoding.get_type_ids()),
+        })
+    }
+
+    /// Score encoded pairs, in their order, on one checked-out session.
+    fn run_pairs(&self, model: &LazyOnnx, pairs: &[EncodedPair]) -> Result<Vec<f32>> {
+        let batches: Vec<Vec<usize>> = match batch_mode() {
+            BatchMode::Pair => (0..pairs.len()).map(|i| vec![i]).collect(),
+            BatchMode::Bucket => {
+                let lens: Vec<usize> = pairs.iter().map(EncodedPair::len).collect();
+                let mut order: Vec<usize> = (0..pairs.len()).collect();
+                order.sort_by_key(|&i| lens[i]);
+                length_buckets(&order, &lens)
+            }
+        };
+        let mut session = model.checkout(&self.config.id)?;
+        let mut scores = vec![0.0_f32; pairs.len()];
+        for batch in &batches {
+            let rows: Vec<&EncodedPair> = batch.iter().map(|&i| &pairs[i]).collect();
+            for (&i, score) in batch
+                .iter()
+                .zip(self.run_batch(&mut session, model, &rows)?)
+            {
+                scores[i] = score;
+            }
+        }
+        Ok(scores)
+    }
+
+    /// One forward pass over `rows`, each padded with zeros (attention 0) to the longest.
+    /// A batch of one is exactly the pair at its own length.
+    fn run_batch(
+        &self,
+        session: &mut Session,
+        model: &LazyOnnx,
+        rows: &[&EncodedPair],
+    ) -> Result<Vec<f32>> {
+        let width = rows.iter().map(|r| r.len()).max().unwrap_or(1);
+        let padded = |pick: fn(&EncodedPair) -> &[i64]| -> Vec<i64> {
+            let mut out = Vec::with_capacity(rows.len() * width);
+            for row in rows {
+                out.extend_from_slice(pick(row));
+                out.resize(out.len() + width - row.len(), 0);
+            }
+            out
+        };
+        let shape = vec![rows.len(), width];
+        let input_ids = Value::from_array((shape.clone(), padded(|r| &r.ids)))?;
+        let attention = Value::from_array((shape.clone(), padded(|r| &r.mask)))?;
+        let outputs = if model.has_token_type_ids {
+            let token_types = Value::from_array((shape, padded(|r| &r.types)))?;
+            session.run(ort::inputs![
+                "input_ids"      => &input_ids,
+                "attention_mask" => &attention,
+                "token_type_ids" => &token_types,
+            ])?
+        } else {
+            session.run(ort::inputs![
+                "input_ids"      => &input_ids,
+                "attention_mask" => &attention,
+            ])?
+        };
         let head_size = match model.output_head {
             OutputHead::Regression => 1_usize,
             OutputHead::BinaryClassifier => 2_usize,
         };
-
-        let mut scores = Vec::with_capacity(documents.len());
-        for &doc in documents {
-            let encoding = model
-                .tokenizer
-                .encode((query, doc), true)
-                .map_err(|e| anyhow::anyhow!("Tokenization failed ({}): {e}", self.config.id))?;
-            let len = encoding
-                .get_attention_mask()
-                .iter()
-                .rposition(|&m| m != 0)
-                .map_or(0, |p| p + 1)
-                .clamp(1, MAX_PAIR_LENGTH);
-            let row = |values: &[u32]| -> Vec<i64> {
-                let mut out: Vec<i64> = values.iter().take(len).map(|&v| i64::from(v)).collect();
-                out.resize(len, 0);
-                out
-            };
-            let input_ids = Value::from_array((vec![1, len], row(encoding.get_ids())))?;
-            let attention = Value::from_array((vec![1, len], row(encoding.get_attention_mask())))?;
-            let outputs = if model.has_token_type_ids {
-                let token_types = Value::from_array((vec![1, len], row(encoding.get_type_ids())))?;
-                session.run(ort::inputs![
-                    "input_ids"      => &input_ids,
-                    "attention_mask" => &attention,
-                    "token_type_ids" => &token_types,
-                ])?
-            } else {
-                session.run(ort::inputs![
-                    "input_ids"      => &input_ids,
-                    "attention_mask" => &attention,
-                ])?
-            };
-            let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
-            scores.push(model.output_head.extract_score(&data[..head_size]));
+        let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
+        if data.len() < rows.len() * head_size {
+            anyhow::bail!(
+                "cross-encoder {} returned {} values for {} pairs",
+                self.config.id,
+                data.len(),
+                rows.len()
+            );
         }
-
-        Ok(scores)
+        Ok(data
+            .chunks(head_size)
+            .take(rows.len())
+            .map(|chunk| model.output_head.extract_score(chunk))
+            .collect())
     }
 }
 
@@ -1366,5 +1630,43 @@ mod tests {
         let bc_score_relevant = OutputHead::BinaryClassifier.extract_score(&very_relevant);
         let bc_score_barely = OutputHead::BinaryClassifier.extract_score(&barely_relevant);
         assert!(bc_score_relevant > bc_score_barely); // correct ordering.
+    }
+
+    fn sorted_by_len(lens: &[usize]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..lens.len()).collect();
+        order.sort_by_key(|&i| lens[i]);
+        order
+    }
+
+    #[test]
+    fn pairs_of_similar_length_share_a_batch_and_a_long_one_runs_apart() {
+        let lens = [40, 42, 300, 38, 45];
+        let buckets = length_buckets(&sorted_by_len(&lens), &lens);
+        assert_eq!(buckets, vec![vec![3, 0, 1, 4], vec![2]]);
+    }
+
+    #[test]
+    fn short_pairs_within_the_minimum_slack_batch_together() {
+        let lens = [10, 18, 19];
+        let buckets = length_buckets(&sorted_by_len(&lens), &lens);
+        assert_eq!(buckets, vec![vec![0, 1], vec![2]]);
+    }
+
+    #[test]
+    fn a_batch_never_exceeds_the_cap() {
+        let lens = vec![50; MAX_BATCH * 2 + 1];
+        let buckets = length_buckets(&sorted_by_len(&lens), &lens);
+        assert_eq!(buckets.len(), 3);
+        assert!(buckets.iter().all(|b| b.len() <= MAX_BATCH));
+        let mut all: Vec<usize> = buckets.concat();
+        all.sort_unstable();
+        assert_eq!(all, (0..lens.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pair_keys_differ_wherever_the_query_ends() {
+        assert_ne!(pair_key("ab", "c"), pair_key("a", "bc"));
+        assert_ne!(pair_key("a:1", "x"), pair_key("a", ":1x"));
+        assert_eq!(pair_key("q", "d"), pair_key("q", "d"));
     }
 }
