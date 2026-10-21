@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use super::compression::{FactType, PurgeReason, SemanticFact};
 use super::types::MemoryId;
+use crate::similarity::bars::SimilarityBar;
 
 /// Response for fact queries
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -904,7 +905,9 @@ impl SemanticFactStore {
                             new_emb,
                             &existing_emb,
                         ));
-                        if cosine < FACT_DEDUP_COSINE_THRESHOLD {
+                        let below_bar = cosine < FACT_DEDUP_COSINE_THRESHOLD;
+                        SimilarityBar::FactDedupSimilar.record(!below_bar);
+                        if below_bar {
                             continue;
                         }
 
@@ -996,7 +999,9 @@ impl SemanticFactStore {
             };
             let cosine =
                 crate::similarity::scale::to_reference(cosine_similarity(new_emb, &existing_emb));
-            if cosine < FACT_DEDUP_COSINE_THRESHOLD {
+            let below_bar = cosine < FACT_DEDUP_COSINE_THRESHOLD;
+            SimilarityBar::FactDedupContradiction.record(!below_bar);
+            if below_bar {
                 continue;
             }
 
@@ -1192,7 +1197,9 @@ impl SemanticFactStore {
                     new_emb,
                     &existing_emb,
                 ));
-                if cosine < FACT_DEDUP_COSINE_THRESHOLD {
+                let below_bar = cosine < FACT_DEDUP_COSINE_THRESHOLD;
+                SimilarityBar::FactDedupInvalidation.record(!below_bar);
+                if below_bar {
                     continue;
                 }
 

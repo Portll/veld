@@ -5,6 +5,7 @@
 use crate::vector_db::distance_inline::dot_product_inline;
 use ordered_float::OrderedFloat;
 
+pub mod bars;
 pub mod scale;
 
 /// Compute cosine similarity between two vectors (SIMD-optimized)
