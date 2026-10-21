@@ -2585,7 +2585,8 @@ mod tests {
         assert_eq!(body["forgotten"], false);
         assert!(body["version"].as_u64().unwrap() >= 1, "{body}");
 
-        let (status, _) = test_helpers::send(
+        // A caller tells "nothing stored" from "route not mounted" (a bare 404) by this body.
+        let (status, body) = test_helpers::send(
             harness.router(),
             test_helpers::get(&format!(
                 "/api/memory/by-external-id?user_id={user_id}&external_id=spine:plan:never-written"
@@ -2593,6 +2594,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "MEMORY_NOT_FOUND", "{body}");
 
         let (status, _) = test_helpers::send(
             harness.router(),
