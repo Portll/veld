@@ -74,6 +74,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::metrics::{EMBEDDING_CACHE_CONTENT, EMBEDDING_CACHE_CONTENT_SIZE};
+use embed_queue::EmbedPurpose;
 
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
@@ -447,6 +448,10 @@ pub struct MemorySystem {
 
     /// Memories a request stored without embedding, waiting for the next batch.
     embed_queue: parking_lot::Mutex<embed_queue::EmbedQueue>,
+
+    /// Vectors replicated in spaces this corpus does not index, by space, and when the next
+    /// map into each is tried.
+    replica_spaces: parking_lot::Mutex<std::collections::HashMap<SpaceId, ReplicaTally>>,
 
     /// The space registry last written beside the corpus markers, so an unchanged corpus is
     /// not rewritten on every drain tick.
@@ -903,6 +908,18 @@ pub struct EmbedIndexOutcome {
     /// log an `Update` snapshot of each. Neither is a `Forget`: no key was removed.
     pub absorbed_by: Option<String>,
 }
+
+/// Replicated vectors seen in one space this corpus does not index.
+#[derive(Debug, Clone, Copy)]
+struct ReplicaTally {
+    arrived: usize,
+    /// The arrival count at which a map into the space is next tried.
+    fit_at: usize,
+}
+
+/// Replicated vectors in a space before a map into it is first tried: the same count after
+/// which a migration maps its new space back into the old.
+const REPLICA_BRIDGE_FIRST_FIT: usize = 256;
 
 /// What one drain of the embed queue did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1722,6 +1739,7 @@ impl MemorySystem {
             ),
             space_registry_written: parking_lot::Mutex::new(None),
             embed_queue: parking_lot::Mutex::new(Default::default()),
+            replica_spaces: parking_lot::Mutex::new(Default::default()),
             kept_census: parking_lot::Mutex::new(None),
             // R3a (F3): per-user persistent learned-weight store over this user's
             // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
@@ -2698,7 +2716,7 @@ impl MemorySystem {
     /// Safe to call from a background thread (e.g. `tokio::task::spawn_blocking`).
     /// All errors are non-fatal — the memory remains searchable via BM25 regardless.
     pub fn embed_and_index(&self, memory_id: &MemoryId) -> Result<()> {
-        self.embed_and_index_with(memory_id, None, Bm25Sync::Direct)
+        self.embed_and_index_with(memory_id, None, Bm25Sync::Direct, EmbedPurpose::Write)
             .map(|_| ())
     }
 
@@ -2707,16 +2725,18 @@ impl MemorySystem {
     /// [`EmbedIndexOutcome::absorbed_by`]), the caller MUST journal `Update`
     /// snapshots of the absorbed memory and its survivor.
     pub fn embed_and_index_journaled(&self, memory_id: &MemoryId) -> Result<EmbedIndexOutcome> {
-        self.embed_and_index_with(memory_id, None, Bm25Sync::Journaled)
+        self.embed_and_index_with(memory_id, None, Bm25Sync::Journaled, EmbedPurpose::Write)
     }
 
     /// [`Self::embed_and_index`], with the primary vector already computed when a batch call
-    /// computed it.
+    /// computed it. A replica gets its vectors only: the write gate and interference detection
+    /// are the leader's to run, and its frames carry what they decided.
     fn embed_and_index_with(
         &self,
         memory_id: &MemoryId,
         precomputed: Option<(Vec<f32>, SpaceId)>,
         bm25: Bm25Sync,
+        purpose: EmbedPurpose,
     ) -> Result<EmbedIndexOutcome> {
         let _span = tracing::info_span!("embed_and_index", memory_id = %memory_id.0).entered();
         // Checked again at the write-back; this one saves an embedding nobody can store.
@@ -2882,7 +2902,12 @@ impl MemorySystem {
         }
 
         // Write gate + interference detection (retroactive + proactive)
-        if let Some(embedding) = &memory_arc.experience.embeddings {
+        if let Some(embedding) = memory_arc
+            .experience
+            .embeddings
+            .as_ref()
+            .filter(|_| purpose == EmbedPurpose::Write)
+        {
             if let Ok(similar_ids) =
                 self.retriever
                     .search_by_embedding(embedding, 5, Some(&memory_arc.id))
@@ -5854,14 +5879,24 @@ impl MemorySystem {
             })
             .collect();
         self.long_term_memory.update_many(memories)?;
+        let index_space = self.retriever.index_space().clone();
         for (memory, vectors_kept) in memories.iter().zip(vectors_kept) {
-            if !vectors_kept {
+            let holds_own_vector = memory.experience.primary_space(Some(&index_space)).as_ref()
+                == Some(&index_space);
+            if !vectors_kept && holds_own_vector {
                 if let Err(e) = self.retriever.reindex_memory(memory) {
                     tracing::warn!(
                         "Failed to reindex memory {} in vector DB: {}",
                         memory.id.0,
                         e
                     );
+                }
+            } else if !vectors_kept {
+                // No vector in this corpus's space: its other vectors are indexed where an index
+                // holds their space, and the queue embeds it here, a batch at a time.
+                self.retriever.reindex_other_spaces(memory);
+                if !memory.is_forgotten() {
+                    self.enqueue_replica_embedding(&memory.id);
                 }
             }
             let shared = std::sync::Arc::new(memory.clone());
@@ -6480,6 +6515,92 @@ impl MemorySystem {
         self.embed_queue.lock().push(memory_id.clone());
     }
 
+    /// How this corpus reads a vector slot that records no space.
+    pub fn slot_spaces(&self) -> crate::embeddings::space::SlotSpaces {
+        crate::embeddings::space::SlotSpaces {
+            primary: self.retriever.index_space().clone(),
+            secondary: self.retriever.secondary_index_space().cloned(),
+        }
+    }
+
+    /// Queue a replicated memory for its vectors in this corpus's spaces, without the write gate.
+    pub fn enqueue_replica_embedding(&self, memory_id: &MemoryId) {
+        self.embed_queue
+            .lock()
+            .push_as(memory_id.clone(), EmbedPurpose::Replica);
+    }
+
+    /// Read a replicated snapshot's vectors as its leader reads them, then keep in its slots
+    /// only what this corpus indexes there. A slot that records no space takes the leader's
+    /// space for that slot, or this corpus's own when the leader declares none, as before
+    /// spaces existed; a vector in a space this corpus does not write moves to the kept
+    /// vectors. Returns whether the snapshot changed.
+    pub fn normalise_replicated(
+        &self,
+        memory: &mut Memory,
+        leader: Option<&crate::embeddings::space::SlotSpaces>,
+    ) -> bool {
+        let own_primary = self.retriever.index_space().clone();
+        let own_secondary = self
+            .retriever
+            .secondary_index_space()
+            .cloned()
+            .or_else(|| self.embedder.secondary_space());
+        let (assumed_primary, assumed_secondary) = match leader {
+            Some(spaces) => (spaces.primary.clone(), spaces.secondary.clone()),
+            None => (own_primary.clone(), own_secondary.clone()),
+        };
+        let stamped = memory
+            .experience
+            .stamp_vector_spaces(Some(&assumed_primary), assumed_secondary.as_ref());
+        let moved = memory
+            .experience
+            .move_foreign_to_kept(&own_primary, own_secondary.as_ref());
+        stamped || moved
+    }
+
+    /// Note vectors that arrived by replication in spaces this corpus neither writes nor
+    /// indexes, and fit a map into each once enough memories hold vectors in both. Until the
+    /// queue has given those memories vectors here, that map is how a query reaches them. A fit
+    /// that finds too few pairs, because the queue has not caught up, is tried again after
+    /// twice as many arrivals.
+    pub fn note_replicated_spaces(&self, arrived: &std::collections::BTreeMap<SpaceId, usize>) {
+        let index_space = self.retriever.index_space().clone();
+        let indexed = self.retriever.spaces();
+        let mut due = Vec::new();
+        {
+            let mut tally = self.replica_spaces.lock();
+            for (space, n) in arrived {
+                if indexed.contains(space) {
+                    continue;
+                }
+                let t = tally.entry(space.clone()).or_insert(ReplicaTally {
+                    arrived: 0,
+                    fit_at: REPLICA_BRIDGE_FIRST_FIT,
+                });
+                t.arrived += n;
+                if t.arrived >= t.fit_at {
+                    t.fit_at = t.arrived.saturating_mul(2);
+                    due.push(space.clone());
+                }
+            }
+        }
+        for space in due {
+            match self.fit_alignment(&index_space, &space) {
+                Ok(report) => tracing::info!(
+                    from = %index_space,
+                    to = %space,
+                    pairs = report.pairs,
+                    held_out_cosine = report.held_out_cosine,
+                    "replication: fitted a map into the leader's space"
+                ),
+                Err(e) => tracing::debug!(
+                    "replication: no map into {space} yet, will try again: {e:#}"
+                ),
+            }
+        }
+    }
+
     /// Memories waiting for the next embedding batch.
     pub fn embed_queue_len(&self) -> usize {
         self.embed_queue.lock().len()
@@ -6528,14 +6649,14 @@ impl MemorySystem {
     /// recorded in the backlog instead of being retried one by one against a host that is down.
     pub fn embed_and_index_batch(
         &self,
-        ids: &[MemoryId],
+        ids: &[(MemoryId, EmbedPurpose)],
         bm25: Bm25Sync,
     ) -> Vec<(MemoryId, Result<EmbedIndexOutcome>)> {
         let index_space = self.retriever.index_space().clone();
         let mut precomputed: std::collections::HashMap<MemoryId, (Vec<f32>, SpaceId)> =
             Default::default();
         let mut misses: Vec<(MemoryId, String, [u8; 32])> = Vec::new();
-        for id in ids {
+        for (id, _) in ids {
             let Ok(memory) = self.long_term_memory.get(id) else {
                 continue;
             };
@@ -6590,10 +6711,13 @@ impl MemorySystem {
             }
         }
         ids.iter()
-            .filter(|id| !refused.contains(*id))
-            .map(|id| {
+            .filter(|(id, _)| !refused.contains(id))
+            .map(|(id, purpose)| {
                 let vector = precomputed.remove(id);
-                (id.clone(), self.embed_and_index_with(id, vector, bm25))
+                (
+                    id.clone(),
+                    self.embed_and_index_with(id, vector, bm25, *purpose),
+                )
             })
             .collect()
     }
@@ -6676,7 +6800,11 @@ impl MemorySystem {
             .map(|(id, row)| (row.enqueued_at, id))
             .collect();
         primary.sort();
-        let ids: Vec<MemoryId> = primary.into_iter().take(limit).map(|(_, id)| id).collect();
+        let ids: Vec<(MemoryId, EmbedPurpose)> = primary
+            .into_iter()
+            .take(limit)
+            .map(|(_, id)| (id, EmbedPurpose::Write))
+            .collect();
         if !ids.is_empty() {
             let _ = self.embed_and_index_batch(&ids, Bm25Sync::Direct);
         }

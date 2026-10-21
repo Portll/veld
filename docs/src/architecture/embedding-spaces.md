@@ -199,7 +199,7 @@ the same for a vector it cannot re-embed.
 
 | Surface | What carries the space |
 |---|---|
-| Intent log and replication frames | The memory record itself, whose last fields are the spaces |
+| Intent log and replication frames | The memory record itself, whose last fields are the spaces; each replication page also names how the leader reads an unrecorded slot ([replication](replication.md#across-embedding-spaces)) |
 | Portable dump, redb backup, `veld migrate` | The record bytes, carried as stored |
 | RocksDB backup | The store's files, copied as they are |
 | MIF export | `embeddings.model` and `embeddings.dimensions` name the vector's space, not a fixed `minilm-l6-v2` |

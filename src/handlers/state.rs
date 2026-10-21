@@ -5849,6 +5849,27 @@ mod background_task_tests {
 }
 
 impl MultiUserMemoryManager {
+    /// How this server reads a vector slot of `user_id`'s that records no space: from the
+    /// tenant's memory system when it is open, else the space registry beside its store, else
+    /// the corpus markers. `None` when none of them says. Opens nothing.
+    pub fn slot_spaces(&self, user_id: &str) -> Option<crate::embeddings::space::SlotSpaces> {
+        use crate::embeddings::space::{corpus_space, SlotSpaces, SpaceRegistry};
+        if let Some(memory) = self.user_memories.get(user_id) {
+            return Some(memory.read().slot_spaces());
+        }
+        let dir = self.user_dir(user_id).ok()?;
+        if let Ok(Some(registry)) = SpaceRegistry::read(&dir) {
+            return Some(SlotSpaces {
+                primary: registry.index_space,
+                secondary: registry.secondary_index_space,
+            });
+        }
+        corpus_space(&dir).map(|primary| SlotSpaces {
+            primary,
+            secondary: None,
+        })
+    }
+
     /// Embed one batch of every cached user's embed queue, journaling the records the write
     /// gate changed. Returns how many memories were taken off the queues. Users not in the
     /// cache have nothing queued: the queue lives in the user's memory system.
