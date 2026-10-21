@@ -1152,6 +1152,38 @@ pub const ONTOLOGICAL_RERANK_PENALTY: f32 = -0.08;
 pub const ONTOLOGICAL_PENALTY_MIN_CONFIDENCE: f32 = 0.4;
 
 // =============================================================================
+// CONVERSATION NEIGHBOUR EXPANSION
+// =============================================================================
+// An anaphoric reply ("I've had them for 3 years now!") shares no word with the
+// question about it, but the turn it answers usually does. Recall brings the
+// turn after a well-ranked conversation turn into the pre-rerank pool, just
+// below its parent, and the cross-encoder judges it on its own text.
+// =============================================================================
+
+/// Fused candidates neighbour expansion reads by default (`neighbour_expansion_top`).
+pub const NEIGHBOUR_EXPANSION_TOP_DEFAULT: usize = 10;
+
+/// Upper bound on `neighbour_expansion_top`: the widest pre-rerank pool (a
+/// decomposed query's) holds 50 candidates.
+pub const NEIGHBOUR_EXPANSION_TOP_MAX: usize = 50;
+
+/// Fraction of a ranked turn's fused score its neighbour enters the pool at.
+///
+/// Below 1, so the parent keeps its place and a neighbour can never be the top
+/// candidate before the cross-encoder runs. Close to 1, because fused scores are
+/// compressed: at RRF k = 20 adjacent ranks differ by 3–5%, and the additive entity
+/// boost most candidates of a speaker share (+0.10 on a ~0.04 RRF score) shrinks
+/// that to 1–2%. At 0.95 the neighbour of a top-10 turn stays inside the 20
+/// candidates the cross-encoder scores; at 0.9 a boosted rank-10 parent's
+/// neighbour would land past rank 20.
+pub const NEIGHBOUR_EXPANSION_SCORE_DECAY: f32 = 0.95;
+
+/// Successors taken per ranked turn. A turn is normally answered once; two keeps a
+/// turn two writers both threaded onto, and the bound stops one hub turn flooding
+/// the pool.
+pub const NEIGHBOUR_EXPANSION_SUCCESSORS_PER_TURN: usize = 2;
+
+// =============================================================================
 // QUERY DECOMPOSITION CONSTANTS
 // =============================================================================
 // Multi-hop and multi-entity queries dilute vector search signal when embedded
