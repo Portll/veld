@@ -675,6 +675,87 @@ pub async fn update_memory(
 }
 
 // =============================================================================
+// LOOKUP BY EXTERNAL ID
+// =============================================================================
+
+/// What veld holds under an external id: enough to tell whether a write whose response
+/// never arrived (a 408) landed, without reading the record.
+#[derive(Debug, Serialize)]
+pub struct ExternalIdRecord {
+    pub id: String,
+    pub external_id: String,
+    pub version: u32,
+    /// SHA-256 (hex) of the content as written. `None` when a lossy compressor replaced
+    /// the body, so no written content can be compared with it.
+    pub content_sha256: Option<String>,
+    pub forgotten: bool,
+}
+
+/// GET /api/memory/by-external-id?user_id=..&external_id=.. - the record an upsert keyed
+/// by `external_id` wrote, or 404.
+#[tracing::instrument(skip(state, params))]
+pub async fn get_memory_by_external_id(
+    State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<ExternalIdRecord>, AppError> {
+    use sha2::{Digest, Sha256};
+
+    let user_id = resolve_request_user_id(
+        params.get("user_id").map(String::as_str),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
+    let external_id = params
+        .get("external_id")
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .ok_or_else(|| AppError::InvalidInput {
+            field: "external_id".to_string(),
+            reason: "required".to_string(),
+        })?;
+
+    let memory = state
+        .get_user_memory_async(&user_id)
+        .await
+        .map_err(AppError::Internal)?;
+    let lookup_id = external_id.clone();
+    let record = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let guard = memory.read();
+        let Some(stored) = guard.find_by_external_id(&lookup_id)? else {
+            return Ok(None);
+        };
+        let content = if !stored.compressed {
+            Some(stored.experience.content.clone())
+        } else if guard.memory_is_lossless(&stored) {
+            Some(guard.decompress_memory(&stored)?.experience.content)
+        } else {
+            None
+        };
+        let content_sha256 = content.map(|content| hex::encode(Sha256::digest(content.as_bytes())));
+        Ok(Some((
+            stored.id.0.to_string(),
+            stored.version,
+            content_sha256,
+            stored.is_forgotten(),
+        )))
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("external id lookup task failed: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    let (id, version, content_sha256, forgotten) =
+        record.ok_or_else(|| AppError::MemoryNotFound(external_id.clone()))?;
+    Ok(Json(ExternalIdRecord {
+        id,
+        external_id,
+        version,
+        content_sha256,
+        forgotten,
+    }))
+}
+
+// =============================================================================
 // DELETE MEMORY HANDLER
 // =============================================================================
 
@@ -2461,6 +2542,64 @@ mod tests {
         assert_eq!(kinds, vec![false, true]);
         assert!(keyword_hits(&engine, "cobaltwren").is_empty());
         assert_eq!(keyword_hits(&engine, "umberfinch"), vec![id.0.to_string()]);
+    }
+
+    /// A caller whose upsert timed out reads back by its own key what veld holds: the
+    /// version and a hash of the content to compare with what it sent.
+    #[tokio::test]
+    async fn an_upsert_reads_back_by_external_id() {
+        use sha2::{Digest, Sha256};
+
+        let harness = TestHarness::new();
+        let user_id = "external-id-reader";
+        let content = "spine plan veld-features: the lookup answers by key";
+        for _ in 0..2 {
+            let (status, body) = test_helpers::send(
+                harness.router(),
+                test_helpers::post_json(
+                    "/api/upsert",
+                    &serde_json::json!({
+                        "user_id": user_id,
+                        "external_id": "spine:plan:veld-features",
+                        "content": content,
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        let (status, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!(
+                "/api/memory/by-external-id?user_id={user_id}&external_id=spine:plan:veld-features"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["external_id"], "spine:plan:veld-features");
+        assert_eq!(
+            body["content_sha256"],
+            hex::encode(Sha256::digest(content.as_bytes()))
+        );
+        assert_eq!(body["forgotten"], false);
+        assert!(body["version"].as_u64().unwrap() >= 1, "{body}");
+
+        let (status, _) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!(
+                "/api/memory/by-external-id?user_id={user_id}&external_id=spine:plan:never-written"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!("/api/memory/by-external-id?user_id={user_id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// `/api/stream` stores through the deferred path; each stored memory is journaled,
