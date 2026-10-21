@@ -188,7 +188,7 @@ impl VeldMcpServer {
     }
 
     #[tool(
-        description = "REQUIRED: Call this to surface relevant memories based on current context. Enables automatic memory surfacing and implicit feedback learning."
+        description = "Surface memories relevant to the current task or question. Call it when the task turns to something past sessions may have covered; it takes one to several seconds, so not on every message. Set auto_ingest to true only when the context itself is worth remembering."
     )]
     async fn proactive_context(
         &self,
@@ -202,7 +202,7 @@ impl VeldMcpServer {
                     user_id: self.client.user_id.clone(),
                     context: params.context,
                     max_results: params.max_results.unwrap_or(5),
-                    auto_ingest: params.auto_ingest.unwrap_or(true),
+                    auto_ingest: params.auto_ingest.unwrap_or(false),
                 },
             )
             .await;

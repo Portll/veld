@@ -34,8 +34,8 @@ Hooks fire for all tool types. Context is surfaced pre-tool and actions are reco
 
 **Emphasis Layer (explicit tools):**
 - `remember` — mark something HIGH IMPORTANCE (preserved longer, resists decay).
-- `forget` — suppress a memory (reduce its importance, accelerate decay).
-- These are emphasis signals, not on/off switches. Memory happens anyway.
+- `forget` — delete a memory by id. It is a hard delete, journaled, so replicas drop it too.
+- `remember` is an emphasis signal, not an on/off switch: memory happens anyway.
 
 ### What this means for you
 

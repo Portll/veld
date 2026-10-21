@@ -10,7 +10,7 @@ You have access to Veld's persistent memory system via MCP tools. Memory persist
 | `proactive_context` | **Every first message** — surfaces relevant memories, todos, facts, entities | ON |
 | `remember` | After decisions, learnings, errors, discoveries, patterns | ON |
 | `recall` | When searching past context by meaning (modes: semantic, associative, hybrid) | ON |
-| `forget` | To suppress/correct a stored memory | ON |
+| `forget` | To delete a wrong or stale memory by id (hard delete) | ON |
 | `context_summary` | Quick overview of recent learnings/decisions/context | ON |
 | `read_memory` | Read full content of a specific memory by ID | ON |
 | `list_memories` | Browse all stored memories | ON |
