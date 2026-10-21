@@ -7902,7 +7902,9 @@ impl MemorySystem {
     /// Returns the number of memories warmed into the session tier (0 when
     /// disabled, when no rhythm/context signal exists, or when nothing was due).
     pub fn run_prefetch_tick(&self, user_id: &str) -> usize {
-        let now = chrono::Utc::now();
+        // The scoring clock: which memories are due, and so what is warmed into the session
+        // tier that recall searches, is an elapsed-time judgement like recency.
+        let now = scoring_now();
 
         // --- Kill-switch / re-probe gate (I4/J5) -----------------------------
         // Decide up front whether to run at all, without holding any tier lock.
@@ -7979,22 +7981,21 @@ impl MemorySystem {
         // Recent entities are seeded from the due memories so the existing
         // entity_query path can broaden beyond the exact due set; falls back to
         // the temporal-pattern query (time-of-day) when no entities are present.
+        // Most overdue first. The entities are joined into the query text, so their order
+        // decides what is warmed and must not follow the session map's hash order.
         let mut recent_entities: Vec<String> = Vec::new();
         if due_ids.len() >= crate::constants::PREFETCH_MIN_DUE_CANDIDATES {
-            let due_set: std::collections::HashSet<&MemoryId> = due_ids.iter().collect();
             let session = self.session_memory.read();
-            for mem in session.all_memories() {
-                if due_set.contains(&mem.id) {
-                    for e in mem.experience.entities.iter().take(3) {
-                        if !recent_entities.contains(e) {
-                            recent_entities.push(e.clone());
-                        }
+            for mem in due_ids.iter().filter_map(|id| session.get(id)) {
+                for e in mem.experience.entities.iter().take(3) {
+                    if !recent_entities.contains(e) {
+                        recent_entities.push(e.clone());
                     }
                 }
             }
         }
 
-        let mut context = retrieval::PrefetchContext::from_current_time();
+        let mut context = retrieval::PrefetchContext::at(now);
         context.recent_entities = recent_entities;
 
         let engine =
@@ -9179,23 +9180,68 @@ mod prefetch_tick_integration_tests {
         (sys, tmp)
     }
 
-    fn remember_now(sys: &MemorySystem, content: &str) -> MemoryId {
+    fn remember_at(
+        sys: &MemorySystem,
+        content: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> MemoryId {
         let exp = Experience {
             content: content.to_string(),
             ..Default::default()
         };
-        sys.remember(exp, Some(chrono::Utc::now()))
-            .expect("remember")
+        sys.remember(exp, Some(at)).expect("remember")
+    }
+
+    fn remember_now(sys: &MemorySystem, content: &str) -> MemoryId {
+        remember_at(sys, content, chrono::Utc::now())
+    }
+
+    /// `VELD_EVAL_NOW` pinned for one test, restored on drop. The tick reads the scoring
+    /// clock, and a harness test in this binary pins `SHODH_EVAL_NOW` for the rest of the
+    /// process; `VELD_` wins over it.
+    struct PinnedScoringClock {
+        _env: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl PinnedScoringClock {
+        fn at(rfc3339: &str) -> (Self, chrono::DateTime<chrono::Utc>) {
+            let env = crate::memory::ablation::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("VELD_EVAL_NOW").ok();
+            std::env::set_var("VELD_EVAL_NOW", rfc3339);
+            let now = chrono::DateTime::parse_from_rfc3339(rfc3339)
+                .expect("an RFC 3339 instant")
+                .with_timezone(&chrono::Utc);
+            (
+                Self {
+                    _env: env,
+                    previous,
+                },
+                now,
+            )
+        }
+    }
+
+    impl Drop for PinnedScoringClock {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("VELD_EVAL_NOW", value),
+                None => std::env::remove_var("VELD_EVAL_NOW"),
+            }
+        }
     }
 
     /// A memory accessed on a synthetic weekly rhythm is warmed back into the
-    /// session tier by a simulated heavy prefetch tick.
+    /// session tier by a simulated heavy prefetch tick. The rhythm is laid out on a
+    /// scoring clock far from the wall clock, so the tick must judge it on that clock.
     #[test]
     fn periodic_memory_is_warm_in_session_after_tick() {
+        let (_clock, now) = PinnedScoringClock::at("2025-03-04T12:00:00Z");
         let (sys, _tmp) = fresh_system();
-        let now = chrono::Utc::now();
 
-        let id = remember_now(&sys, "weekly standup notes for the platform team");
+        let id = remember_at(&sys, "weekly standup notes for the platform team", now);
 
         // Synthetic weekly rhythm: last access exactly one fallback-period
         // (7 days) ago => the due-predictor marks it due under the default

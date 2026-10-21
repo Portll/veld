@@ -2710,7 +2710,11 @@ impl PrefetchContext {
 
     /// Create context from current system state
     pub fn from_current_time() -> Self {
-        let now = chrono::Utc::now();
+        Self::at(chrono::Utc::now())
+    }
+
+    /// Context for the hour and weekday of `now`.
+    pub fn at(now: chrono::DateTime<chrono::Utc>) -> Self {
         Self {
             hour_of_day: Some(now.hour()),
             day_of_week: Some(now.weekday().num_days_from_sunday()),

@@ -165,7 +165,7 @@ pub fn predict_due_memories(
     // everything.
     let tol = (dominant_period_days * 0.25).clamp(0.25, dominant_period_days);
 
-    let mut scored: Vec<(crate::memory::MemoryId, f64)> = Vec::new();
+    let mut scored: Vec<(crate::memory::MemoryId, f64, DateTime<Utc>)> = Vec::new();
     for (id, last) in last_access {
         let elapsed_days = now.signed_duration_since(*last).num_seconds() as f64 / 86_400.0;
         if elapsed_days < 0.0 {
@@ -183,14 +183,19 @@ pub fn predict_due_memories(
             // Overdue score: prefer memories that are slightly past due (elapsed
             // just exceeds an integer number of periods).
             let overdue = elapsed_days - nearest * dominant_period_days;
-            scored.push((id.clone(), overdue));
+            scored.push((id.clone(), overdue, *last));
         }
     }
 
-    // Most overdue first.
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Most overdue first. Accesses a whole number of periods apart are equally overdue; the
+    // later access goes first, so the cut does not fall in the caller's hash-map order.
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+    });
     scored.truncate(max_candidates);
-    scored.into_iter().map(|(id, _)| id).collect()
+    scored.into_iter().map(|(id, _, _)| id).collect()
 }
 
 #[cfg(test)]
@@ -292,6 +297,30 @@ mod tests {
         assert!(
             !due.contains(&not_due_id),
             "mid-cycle memory should not be due"
+        );
+    }
+
+    #[test]
+    fn equally_overdue_memories_are_cut_by_recency_not_input_order() {
+        let now = Utc::now();
+        let period = 7.0_f64;
+        let one_period = (
+            MemoryId(uuid::Uuid::new_v4()),
+            now - chrono::Duration::days(7),
+        );
+        let two_periods = (
+            MemoryId(uuid::Uuid::new_v4()),
+            now - chrono::Duration::days(14),
+        );
+        let expected = vec![one_period.0.clone(), two_periods.0.clone()];
+
+        let forward = vec![one_period.clone(), two_periods.clone()];
+        let reversed = vec![two_periods.clone(), one_period.clone()];
+        assert_eq!(predict_due_memories(&forward, period, now, 10), expected);
+        assert_eq!(predict_due_memories(&reversed, period, now, 10), expected);
+        assert_eq!(
+            predict_due_memories(&reversed, period, now, 1),
+            vec![one_period.0]
         );
     }
 
