@@ -2813,39 +2813,33 @@ impl super::MemorySystem {
             std::collections::HashMap<MemoryId, crate::memory::types::ScoringFeatures>,
         > = std::cell::RefCell::new(std::collections::HashMap::new());
 
+        let recency_scale = recency_scale_for(query_text, decomposed, query.recency_weight);
+
+        // With `relative_priors`, relevance leads: the fused base is divided by the best
+        // base in the candidate set and the priors scale it by `1 + Σ priors`. The additive
+        // form adds priors up to ~0.5 to an RRF base near 0.03 (k = 20), so recency and the
+        // other priors order the list more than relevance does. Hebbian strength and the
+        // session window are already in the priors (`graph_boost`, `recency_boost`), so this
+        // path adds neither a second time.
+        let relative_priors = dials_snapshot.relative_priors == Some(true);
+        let base_max = memory_ids
+            .iter()
+            .map(|(_, score)| *score)
+            .fold(0.0_f32, f32::max);
+
         for (memory_id, score) in memory_ids {
             // Hebbian boost from learned graph weights (10% contribution)
             // [signal: hebbian] Gated by disabled_signals dial; default = always on.
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
-            let base_score = if hebbian_family_on && dials_snapshot.signal_enabled("hebbian") {
+            let base_score = if !relative_priors
+                && hebbian_family_on
+                && dials_snapshot.signal_enabled("hebbian")
+            {
                 score + hebbian_boost * 0.1
             } else {
                 score
             };
 
-            // Helper to apply unified scoring (recency + arousal + credibility + temporal)
-            // Amplify recency when query explicitly asks for recent items
-            let query_lower_recency = query_text.to_lowercase();
-            // "recently" / "recent" is graded by Layer 5.87's stepped multiplier instead of
-            // amplified here: at 5x this term lifts the last three days above everything
-            // regardless of relevance, which is not what the word asks for.
-            let wants_recent = query_lower_recency.contains("last week")
-                || query_lower_recency.contains("most recent")
-                || query_lower_recency.contains("latest")
-                || query_lower_recency.contains("yesterday")
-                || query_lower_recency.contains("today");
-            let recency_scale = if wants_recent {
-                0.5 // 5x amplification for explicit recency queries
-            } else if decomposed {
-                // Abstract/decomposed queries: dampen recency noise. Recency is
-                // informative for "what happened recently?" but noise for "what are
-                // our strategic priorities?" where M20 (most recent) drowns M13 (OKRs).
-                // wants_recent guard above preserves recency for queries with explicit
-                // recency keywords like "recent", "yesterday", "today", "last week".
-                0.03
-            } else {
-                query.recency_weight.unwrap_or(0.1)
-            };
             let with_unified_score = |mem: &SharedMemory, base: f32| -> SharedMemory {
                 // Recency decay: exponential decay based on age
                 let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
@@ -2978,16 +2972,17 @@ impl super::MemorySystem {
                 // had time to accumulate Hebbian co-activation, BM25 term frequency,
                 // or graph edges — they're signal-poor despite being contextually prime.
                 // [signal: session_continuity] Gated by disabled_signals dial; default = always on.
-                let session_boost = if dials_snapshot.signal_enabled("session_continuity") {
-                    let age_hours = (now - mem.created_at).num_hours();
-                    if age_hours <= 2 {
-                        0.03 // within current session window
+                let session_boost =
+                    if !relative_priors && dials_snapshot.signal_enabled("session_continuity") {
+                        let age_hours = (now - mem.created_at).num_hours();
+                        if age_hours <= 2 {
+                            0.03 // within current session window
+                        } else {
+                            0.0
+                        }
                     } else {
                         0.0
-                    }
-                } else {
-                    0.0
-                };
+                    };
 
                 // =================================================================
                 // BRIDGE SIGNALS (9-19): Connect captured-but-forgotten signals
@@ -3164,8 +3159,7 @@ impl super::MemorySystem {
                     1.0
                 };
 
-                let final_score = (base
-                    + recency_boost
+                let priors = recency_boost
                     + arousal_boost
                     + credibility_boost
                     + valence_boost
@@ -3180,10 +3174,10 @@ impl super::MemorySystem {
                     + temporal_density
                     + entity_density
                     + elaboration_boost
-                    + burstiness_boost)
-                    * feedback_multiplier
-                    * confidence_gate
-                    * external_dim_multiplier;
+                    + burstiness_boost;
+                let fused = fuse_base_with_priors(base, base_max, priors, relative_priors);
+                let final_score =
+                    fused * feedback_multiplier * confidence_gate * external_dim_multiplier;
 
                 // R2 (LTR) SHADOW CAPTURE: read every component that just produced
                 // `final_score` into the feature side-map. This READS the locals
@@ -3290,20 +3284,9 @@ impl super::MemorySystem {
         // Computed post-fetch using the same decay formula as the unified scoring
         // closure so the attribution accurately reflects what was applied.
         {
-            let recency_scale_attr = if query_text.to_lowercase().contains("last week")
-                || query_text.to_lowercase().contains("most recent")
-                || query_text.to_lowercase().contains("recent")
-                || query_text.to_lowercase().contains("latest")
-                || query_text.to_lowercase().contains("yesterday")
-                || query_text.to_lowercase().contains("today")
-            {
-                0.5_f32
-            } else {
-                query.recency_weight.unwrap_or(0.1)
-            };
             for mem in &memories {
                 let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
-                let recency_val = (-RECENCY_DECAY_RATE * hours_old).exp() * recency_scale_attr;
+                let recency_val = (-RECENCY_DECAY_RATE * hours_old).exp() * recency_scale;
                 let has_temporal_match =
                     !mem.experience.temporal_refs.is_empty() && has_temporal_query;
                 let entry = signal_attributions.entry(mem.id.clone()).or_default();
@@ -5573,14 +5556,15 @@ impl super::MemorySystem {
         // EMA ranker learns from this signal.  After all updates, persist the new
         // vector via `learned_weights_store` (R3a F3 closure: survives restarts).
         //
-        // The B8 clamp (max blend = 0.6) lives inside `effective_weights()`; the
+        // The B8 clamp (max blend = 0.6) lives inside `blended_weights()`; the
         // per-epoch regularisation and negative-count tracking live inside
         // `update_weights_from_feedback`.  Per-user blast radius is contained by
         // construction (this MemorySystem is per-user).
         //
         // SHADOW ONLY: `update_weights_from_feedback` mutates `learned_weights`
-        // on the engine, but those weights are NOT consumed by the scoring path
-        // in this PR (`R3B_LIVE_APPLICATION_ENABLED = false`).
+        // on the engine; `effective_weights()` hands live retrieval the static
+        // weights until `weights_ready()`, which `R3B_LIVE_APPLICATION_ENABLED`
+        // holds false.
         {
             let is_negative = matches!(
                 outcome,
@@ -5749,6 +5733,40 @@ fn people_score(content: &str) -> f32 {
 /// `#123`, `snake_case`, `kebab-case` — and stripping it turned `harvest.mjs` into `harvestmjs`,
 /// which matches nothing.
 const QUERY_TOKEN_KEEP: &[char] = &['.', '/', '_', ':', '@', '#', '-'];
+
+/// Layer 5's combination of a candidate's fused base score with the sum of its priors.
+/// Additive by default. With `relative`, the base is first divided by the best base among
+/// the candidates (`base_max`), and the priors scale it by `1 + priors`, so a candidate's
+/// priors can only overtake a more relevant one by out-weighing the relevance ratio.
+pub(crate) fn fuse_base_with_priors(base: f32, base_max: f32, priors: f32, relative: bool) -> f32 {
+    if !relative {
+        return base + priors;
+    }
+    let relevance = if base_max > 0.0 { base / base_max } else { 0.0 };
+    relevance * (1.0 + priors)
+}
+
+/// The Layer 5 recency weight for a query. An explicit recency phrase raises it to 0.5; a
+/// decomposed (abstract) query drops it to 0.03, because for "what are our priorities" the
+/// newest memory is noise; otherwise it is the query's `recency_weight`, default 0.1.
+/// "recent" and "recently" are graded by Layer 5.87's stepped multiplier instead: at 0.5 this
+/// term lifts the last three days above everything regardless of relevance.
+pub(crate) fn recency_scale_for(
+    query_text: &str,
+    decomposed: bool,
+    recency_weight: Option<f32>,
+) -> f32 {
+    const EXPLICIT_RECENCY: [&str; 5] =
+        ["last week", "most recent", "latest", "yesterday", "today"];
+    let lower = query_text.to_lowercase();
+    if EXPLICIT_RECENCY.iter().any(|phrase| lower.contains(phrase)) {
+        0.5
+    } else if decomposed {
+        0.03
+    } else {
+        recency_weight.unwrap_or(0.1)
+    }
+}
 
 /// Clean one whitespace-separated query word for entity matching: keep alphanumerics and
 /// [`QUERY_TOKEN_KEEP`], then trim anything non-alphanumeric off both ends, which is sentence
@@ -7105,5 +7123,78 @@ mod query_entity_resolution_tests {
         let as_focal = resolve_query_entities(&graph, &["Vornak"], &[], "vornak");
         assert_eq!(as_focal.focal, vec![reactor]);
         assert_eq!(as_focal.all, vec![reactor]);
+    }
+}
+
+#[cfg(test)]
+mod recency_scale_tests {
+    use super::recency_scale_for;
+
+    #[test]
+    fn explicit_recency_phrases_raise_the_weight() {
+        assert_eq!(
+            recency_scale_for("What is the latest on the deploy?", false, None),
+            0.5
+        );
+        assert_eq!(
+            recency_scale_for("what happened YESTERDAY", true, None),
+            0.5
+        );
+    }
+
+    /// The attribution pass used to treat "recent" as explicit and give 0.5 where the
+    /// score had used 0.1, so the learned weights trained on a term that was never applied.
+    #[test]
+    fn recent_alone_is_left_to_the_stepped_multiplier() {
+        assert_eq!(
+            recency_scale_for("what did we change recently", false, None),
+            0.1
+        );
+    }
+
+    #[test]
+    fn decomposed_queries_damp_recency_and_plain_queries_take_their_weight() {
+        assert_eq!(
+            recency_scale_for("what are our strategic priorities", true, None),
+            0.03
+        );
+        assert_eq!(
+            recency_scale_for("redis lock design", false, Some(0.2)),
+            0.2
+        );
+    }
+}
+
+#[cfg(test)]
+mod prior_fusion_tests {
+    use super::fuse_base_with_priors;
+
+    /// RRF at k = 20 gives rank 1 about 0.033 and rank 10 about 0.023. Additively, a
+    /// 0.049 recency gap (1 hour old against 70 hours old) is enough to reorder them.
+    #[test]
+    fn additive_priors_outrank_relevance() {
+        let rank1 = fuse_base_with_priors(0.033, 0.033, 0.0, false);
+        let rank10_fresh = fuse_base_with_priors(0.023, 0.033, 0.049, false);
+        assert!(rank10_fresh > rank1);
+    }
+
+    #[test]
+    fn relative_priors_keep_relevance_first() {
+        let rank1 = fuse_base_with_priors(0.033, 0.033, 0.0, true);
+        let rank10_fresh = fuse_base_with_priors(0.023, 0.033, 0.049, true);
+        assert!(rank1 > rank10_fresh);
+        assert!((rank1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn relative_priors_still_break_near_ties() {
+        let a = fuse_base_with_priors(0.0330, 0.0330, 0.00, true);
+        let b = fuse_base_with_priors(0.0325, 0.0330, 0.05, true);
+        assert!(b > a);
+    }
+
+    #[test]
+    fn an_empty_or_zero_base_set_scores_zero_relevance() {
+        assert_eq!(fuse_base_with_priors(0.0, 0.0, 0.3, true), 0.0);
     }
 }

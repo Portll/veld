@@ -26,6 +26,7 @@ reconsolidation behaves exactly as it did pre-dials.
 | Dial | Env | Default | What it switches |
 |---|---|---|---|
 | `date_window_leg` | `VELD_DIALS_DATE_WINDOW_LEG` | `None` (on) | The date window candidate leg (recall Layer 3.7). When a query names a calendar day ("1 May, 2022") or month-year ("April 2022"), the memories whose `created_at` falls in that window — a day widened by one day either side, a month as written — enter RRF fusion as their own list, ranked by similarity to the query and capped at `candidate_count` (or `max_results × 8`). Year-only mentions never fire it. `Some(false)` leaves dated queries to the Layer 4.55 temporal boost alone. |
+| `relative_priors` | `VELD_DIALS_RELATIVE_PRIORS` | `None` (off) | How Layer 5 combines the fused base with its priors (recency, arousal, credibility, temporal match, access, graph strength and the rest). Off, they are added to the base, and since the RRF base at k = 20 is about 0.033 at rank 1 and 0.010 at rank 50, priors worth up to ~0.5 decide the order. On, the base is divided by the best base among the candidates and multiplied by `1 + Σ priors`, so relevance leads and the priors adjust it; the Hebbian bonus and the 2-hour session bonus are not added a second time. This also changes the cross-encoder blend, whose share then applies to a base on the same 0–1 scale as its own score. Off until a locomo-holdout A/B decides it. |
 
 The recall gate records the overrides a run was measured under
 (`retrieval_dials` in `tests/recall/locomo-gate-baseline.json`) and refuses to

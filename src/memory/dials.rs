@@ -154,6 +154,14 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub date_window_leg: Option<bool>,
 
+    /// Whether Layer 5 puts relevance first: the fused base divided by the candidate set's
+    /// best base, scaled by `1 + Σ priors`, instead of the priors added to the base. Added,
+    /// priors up to ~0.5 sit on an RRF base near 0.03, so they order the list more than
+    /// relevance does. `None` and `Some(false)` keep the additive form until a
+    /// locomo-holdout A/B decides the default.
+    #[serde(default)]
+    pub relative_priors: Option<bool>,
+
     // ---- Recall ranking sliders (None = compile-time constant default) ---------------
     // Overlay the historical `const`s in recall.rs / hybrid_search.rs / constants.rs.
     // Rendered as sliders in the monitor "Dials" tab; see [`RECALL_SLIDER_SPECS`] for
@@ -627,6 +635,7 @@ impl Default for CognitiveDials {
             rerank_model: None,
             rrf_weights: None,
             date_window_leg: None,
+            relative_priors: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
             rrf_k_inner: None,
@@ -846,6 +855,9 @@ impl CognitiveDials {
         if let Some(v) = env_bool("VELD_DIALS_DATE_WINDOW_LEG") {
             d.date_window_leg = Some(v);
         }
+        if let Some(v) = env_bool("VELD_DIALS_RELATIVE_PRIORS") {
+            d.relative_priors = Some(v);
+        }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
         d.rrf_k_decomp = env_parse::<f32>("VELD_TUNE_RRF_K_DECOMP").or(d.rrf_k_decomp);
@@ -925,6 +937,7 @@ mod tests {
         assert!(d.rerank_model.is_none());
         assert!(d.rrf_weights.is_none());
         assert!(d.date_window_leg.is_none());
+        assert!(d.relative_priors.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,
             crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS

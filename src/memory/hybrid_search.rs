@@ -1506,14 +1506,16 @@ impl HybridSearchEngine {
     ///   3. The B8 negative-sample diversity floor is met.
     ///
     /// Currently always returns `false` because `R3B_LIVE_APPLICATION_ENABLED`
-    /// is `false` in this PR.  The rest of the checks are exercised by tests.
+    /// is `false`.  The rest of the checks are exercised by tests.
     pub fn weights_ready(&self) -> bool {
         use crate::constants::R3B_LIVE_APPLICATION_ENABLED;
-        if !R3B_LIVE_APPLICATION_ENABLED {
-            return false;
-        }
-        let w = self.learned_weights.read();
-        w.negative_sample_floor_met()
+        R3B_LIVE_APPLICATION_ENABLED && Self::learned_weights_qualify(&self.learned_weights.read())
+    }
+
+    /// The update-count and diversity floors, without the live-application switch.
+    fn learned_weights_qualify(weights: &LearnedWeights) -> bool {
+        use crate::constants::R3B_MIN_UPDATES_BEFORE_READY;
+        weights.update_count >= R3B_MIN_UPDATES_BEFORE_READY && weights.negative_sample_floor_met()
     }
 
     /// Read-only access to the static configuration (R3b: used by the recall
@@ -1522,28 +1524,40 @@ impl HybridSearchEngine {
         &self.config
     }
 
-    /// Get effective weights blending static defaults with learned weights
-    ///
-    /// The blend factor increases with update_count:
-    /// - 0 updates: 100% static defaults
-    /// - CONFIDENCE_THRESHOLD updates: MAX_BLEND% learned, (1-MAX_BLEND)% static
-    /// - Beyond threshold: capped at MAX_BLEND% learned
-    ///
-    /// Returns (bm25_weight, vector_weight, graph_weight) normalized to sum to 1.0
+    /// The (bm25, vector, graph) weights live retrieval fuses with: the static
+    /// configuration until [`Self::weights_ready`] holds, then [`Self::blended_weights`].
+    /// Feedback keeps training the learned vector either way; it reaches ranking only
+    /// through this gate.
     pub fn effective_weights(&self) -> (f32, f32, f32) {
+        if self.weights_ready() {
+            self.blended_weights()
+        } else {
+            self.static_weights()
+        }
+    }
+
+    fn static_weights(&self) -> (f32, f32, f32) {
+        (
+            self.config.bm25_weight,
+            self.config.vector_weight,
+            self.config.graph_weight,
+        )
+    }
+
+    /// Static defaults blended with the learned weights, normalised to sum to 1.0.
+    /// The blend factor rises linearly with `update_count` to
+    /// `ADAPTIVE_WEIGHT_MAX_BLEND` at `ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD` updates.
+    /// This is the shadow ranker's weighting; live retrieval reads it only through
+    /// [`Self::effective_weights`].
+    pub fn blended_weights(&self) -> (f32, f32, f32) {
         use crate::constants::{ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD, ADAPTIVE_WEIGHT_MAX_BLEND};
 
         let learned = self.learned_weights.read();
 
         if learned.update_count == 0 {
-            return (
-                self.config.bm25_weight,
-                self.config.vector_weight,
-                self.config.graph_weight,
-            );
+            return self.static_weights();
         }
 
-        // Confidence ramp: linearly increase blend factor with update count
         let confidence =
             (learned.update_count as f32 / ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD as f32).min(1.0);
         let blend = confidence * ADAPTIVE_WEIGHT_MAX_BLEND;
@@ -1552,16 +1566,11 @@ impl HybridSearchEngine {
         let vector = (1.0 - blend) * self.config.vector_weight + blend * learned.vector;
         let graph = (1.0 - blend) * self.config.graph_weight + blend * learned.graph;
 
-        // Normalize to sum to 1.0
         let sum = bm25 + vector + graph;
         if sum > 0.0 {
             (bm25 / sum, vector / sum, graph / sum)
         } else {
-            (
-                self.config.bm25_weight,
-                self.config.vector_weight,
-                self.config.graph_weight,
-            )
+            self.static_weights()
         }
     }
 
@@ -1721,8 +1730,6 @@ impl HybridSearchEngine {
         // When YAKE identifies discriminative keywords, trust BM25 more
         // YAKE importance = 1/(1+score), so 0.9+ means very discriminative keywords
         //
-        // Base weights come from effective_weights() which blends static defaults
-        // with learned weights from retrieval feedback (P2.3 adaptive learning)
         let (eff_bm25, eff_vector, _eff_graph) = match dial.as_ref().and_then(|d| d.rrf_weights) {
             Some((b, v, g)) => (b, v, g),
             None => self.effective_weights(),
@@ -2738,6 +2745,35 @@ mod tests {
             !engine.weights_ready(),
             "weights_ready() must return false while R3B_LIVE_APPLICATION_ENABLED=false"
         );
+    }
+
+    /// Feedback trains the learned vector, but live fusion keeps the static weights
+    /// until `weights_ready()`: before this, `effective_weights()` blended learned
+    /// weights in after ten updates whatever `R3B_LIVE_APPLICATION_ENABLED` said.
+    #[test]
+    fn effective_weights_stay_static_until_learned_weights_are_ready() {
+        let (engine, _tmp) = make_test_engine();
+        let static_weights = (
+            engine.config().bm25_weight,
+            engine.config().vector_weight,
+            engine.config().graph_weight,
+        );
+
+        let bm25_heavy = SignalScores::from_components(1.0, 0.0, 0.0);
+        for _ in 0..40 {
+            engine.update_weights_from_feedback(&bm25_heavy, true, false);
+        }
+        for _ in 0..10 {
+            engine.update_weights_from_feedback(&bm25_heavy, false, true);
+        }
+
+        let blended = engine.blended_weights();
+        assert!(
+            (blended.0 - static_weights.0).abs() > 1e-3,
+            "the shadow blend should have moved off the static bm25 weight: {blended:?}"
+        );
+        assert!(!engine.weights_ready());
+        assert_eq!(engine.effective_weights(), static_weights);
     }
 
     /// R3b-T4: `weights_ready()` sub-check — `negative_sample_floor_met()` only

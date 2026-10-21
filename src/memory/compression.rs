@@ -110,33 +110,19 @@ impl CompressionPipeline {
         CompressionStrategy::Lz4
     }
 
-    /// LZ4 compression - preserves all data
+    /// Lossless compression: mark the memory compressed and keep its full experience.
+    ///
+    /// The bytes are saved by the storage engine's own block compression where it has one
+    /// (LZ4 blocks on RocksDB). Records written before this also carried a second copy of the
+    /// whole experience, embeddings included, LZ4-encoded into `compressed_data` metadata,
+    /// which roughly doubled them; [`Self::decompress_lz4`] still restores those from the copy.
     fn compress_lz4(&self, memory: &Memory) -> Result<Memory> {
-        let original =
-            bincode::serde::encode_to_vec(&memory.experience, bincode::config::standard())?;
-        let compressed = lz4::block::compress(&original, None, false)?;
-
-        let compression_ratio = compressed.len() as f32 / original.len() as f32;
-
-        // Create compressed version
         let mut compressed_memory = memory.clone();
         compressed_memory.compressed = true;
-
-        // Store compressed data in metadata
-        let compressed_b64 = general_purpose::STANDARD.encode(&compressed);
-        compressed_memory
-            .experience
-            .metadata
-            .insert("compressed_data".to_string(), compressed_b64);
-        compressed_memory.experience.metadata.insert(
-            "compression_ratio".to_string(),
-            compression_ratio.to_string(),
-        );
         compressed_memory
             .experience
             .metadata
             .insert("compression_strategy".to_string(), "lz4".to_string());
-
         Ok(compressed_memory)
     }
 
@@ -234,13 +220,7 @@ impl CompressionPipeline {
         match strategy {
             // Both LZ4 and hybrid store the full experience in the LZ4 blob.
             "lz4" | "hybrid" => self.decompress_lz4(memory),
-            "semantic" => {
-                // New-format semantic records preserve the full body — restore in place.
-                let mut restored = memory.clone();
-                restored.compressed = false;
-                restored.experience.metadata.remove("compression_strategy");
-                Ok(restored)
-            }
+            "semantic" => Ok(Self::restore_in_place(memory)),
             unknown => Err(anyhow!(
                 "Unknown compression strategy '{}' for memory '{}'. Cannot decompress.",
                 unknown,
@@ -298,66 +278,71 @@ impl CompressionPipeline {
             .map(|s| s.as_str())
     }
 
-    /// Decompress LZ4 compressed memory
+    /// A record that holds its full experience: clear the compression markers.
+    fn restore_in_place(memory: &Memory) -> Memory {
+        let mut restored = memory.clone();
+        restored.compressed = false;
+        restored.experience.metadata.remove("compression_ratio");
+        restored.experience.metadata.remove("compression_strategy");
+        restored
+    }
+
+    /// Restore an `lz4` or `hybrid` record: from its `compressed_data` copy when it was
+    /// written with one, otherwise in place.
     fn decompress_lz4(&self, memory: &Memory) -> Result<Memory> {
-        if let Some(compressed_b64) = memory.experience.metadata.get("compressed_data") {
-            let compressed = general_purpose::STANDARD.decode(compressed_b64)?;
+        let Some(compressed_b64) = memory.experience.metadata.get("compressed_data") else {
+            return Ok(Self::restore_in_place(memory));
+        };
+        let compressed = general_purpose::STANDARD.decode(compressed_b64)?;
 
-            // Zip bomb protection: Check compression ratio before decompressing
-            // A small payload claiming to decompress to MAX_DECOMPRESSED_SIZE is suspicious
-            let compressed_size = compressed.len();
-            let max_expected_decompressed = compressed_size.saturating_mul(MAX_COMPRESSION_RATIO);
+        // Zip bomb protection: Check compression ratio before decompressing
+        // A small payload claiming to decompress to MAX_DECOMPRESSED_SIZE is suspicious
+        let compressed_size = compressed.len();
+        let max_expected_decompressed = compressed_size.saturating_mul(MAX_COMPRESSION_RATIO);
 
-            if max_expected_decompressed > MAX_DECOMPRESSED_SIZE as usize {
-                // The compressed size is so small that even at MAX_COMPRESSION_RATIO
-                // it would exceed our limit - this is suspicious
-                return Err(anyhow!(
-                    "Suspicious compression ratio: compressed size {} bytes with max ratio {} \
-                     would allow {} bytes decompressed, which exceeds limit of {} bytes. \
-                     This may indicate a zip bomb attack.",
-                    compressed_size,
-                    MAX_COMPRESSION_RATIO,
-                    max_expected_decompressed,
-                    MAX_DECOMPRESSED_SIZE
-                ));
-            }
-
-            // Limit decompression size to prevent DoS attacks
-            let decompressed = lz4::block::decompress(&compressed, Some(MAX_DECOMPRESSED_SIZE))?;
-
-            // Post-decompression ratio check for additional safety
-            let actual_ratio = if compressed_size > 0 {
-                decompressed.len() / compressed_size
-            } else {
-                0
-            };
-            if actual_ratio > MAX_COMPRESSION_RATIO {
-                return Err(anyhow!(
-                    "Decompression ratio {} exceeds maximum allowed ratio of {}. \
-                     Compressed: {} bytes, Decompressed: {} bytes. \
-                     This may indicate a zip bomb attack.",
-                    actual_ratio,
-                    MAX_COMPRESSION_RATIO,
-                    compressed_size,
-                    decompressed.len()
-                ));
-            }
-
-            let (experience, _): (Experience, _) =
-                bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
-
-            // Restore the memory
-            let mut restored = memory.clone();
-            restored.experience = experience;
-            restored.compressed = false;
-            restored.experience.metadata.remove("compressed_data");
-            restored.experience.metadata.remove("compression_ratio");
-            restored.experience.metadata.remove("compression_strategy");
-
-            Ok(restored)
-        } else {
-            Err(anyhow!("No compressed data found"))
+        if max_expected_decompressed > MAX_DECOMPRESSED_SIZE as usize {
+            // The compressed size is so small that even at MAX_COMPRESSION_RATIO
+            // it would exceed our limit - this is suspicious
+            return Err(anyhow!(
+                "Suspicious compression ratio: compressed size {} bytes with max ratio {} \
+                 would allow {} bytes decompressed, which exceeds limit of {} bytes. \
+                 This may indicate a zip bomb attack.",
+                compressed_size,
+                MAX_COMPRESSION_RATIO,
+                max_expected_decompressed,
+                MAX_DECOMPRESSED_SIZE
+            ));
         }
+
+        // Limit decompression size to prevent DoS attacks
+        let decompressed = lz4::block::decompress(&compressed, Some(MAX_DECOMPRESSED_SIZE))?;
+
+        // Post-decompression ratio check for additional safety
+        let actual_ratio = decompressed.len().checked_div(compressed_size).unwrap_or(0);
+        if actual_ratio > MAX_COMPRESSION_RATIO {
+            return Err(anyhow!(
+                "Decompression ratio {} exceeds maximum allowed ratio of {}. \
+                 Compressed: {} bytes, Decompressed: {} bytes. \
+                 This may indicate a zip bomb attack.",
+                actual_ratio,
+                MAX_COMPRESSION_RATIO,
+                compressed_size,
+                decompressed.len()
+            ));
+        }
+
+        let (experience, _): (Experience, _) =
+            bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
+
+        // Restore the memory
+        let mut restored = memory.clone();
+        restored.experience = experience;
+        restored.compressed = false;
+        restored.experience.metadata.remove("compressed_data");
+        restored.experience.metadata.remove("compression_ratio");
+        restored.experience.metadata.remove("compression_strategy");
+
+        Ok(restored)
     }
 
     /// Create a summary of content (extractive - takes first N words)
@@ -2014,6 +1999,74 @@ mod tests {
         assert_eq!(decompressed.experience.content, memory.experience.content);
     }
 
+    /// The `compressed_data` value records carried before compress_lz4 stopped writing a
+    /// second copy: base64 of the LZ4 block of the bincode experience.
+    fn legacy_compressed_data(memory: &Memory) -> String {
+        let encoded =
+            bincode::serde::encode_to_vec(&memory.experience, bincode::config::standard()).unwrap();
+        general_purpose::STANDARD.encode(lz4::block::compress(&encoded, None, false).unwrap())
+    }
+
+    /// The old blob copied the whole experience, embeddings included, next to the original,
+    /// so a "compressed" record was about twice its uncompressed size.
+    #[test]
+    fn lz4_compression_keeps_one_copy_of_the_experience() {
+        let pipeline = CompressionPipeline::new();
+        let mut memory = create_test_memory(&make_body(200), 0.9);
+        memory.experience.embeddings = Some(vec![0.25; 384]);
+        let before = bincode::serde::encode_to_vec(&memory, bincode::config::standard())
+            .unwrap()
+            .len();
+
+        let compressed = pipeline.compress(&memory).unwrap();
+        let after = bincode::serde::encode_to_vec(&compressed, bincode::config::standard())
+            .unwrap()
+            .len();
+
+        assert!(!compressed
+            .experience
+            .metadata
+            .contains_key("compressed_data"));
+        assert!(
+            after < before + 64,
+            "compression grew the record from {before} to {after} bytes"
+        );
+        let restored = pipeline.decompress(&compressed).unwrap();
+        assert!(!restored.compressed);
+        assert_eq!(restored.experience.content, memory.experience.content);
+        assert_eq!(restored.experience.embeddings, memory.experience.embeddings);
+        assert!(!restored
+            .experience
+            .metadata
+            .contains_key("compression_strategy"));
+    }
+
+    /// Records already on disk carry the blob; they still decompress from it.
+    #[test]
+    fn a_record_written_with_the_old_blob_still_decompresses_from_it() {
+        let pipeline = CompressionPipeline::new();
+        let original = create_test_memory("the body the blob was taken from", 0.9);
+        let mut stored = original.clone();
+        stored.compressed = true;
+        stored.experience.content = "stale copy that the blob overrides".to_string();
+        let meta = &mut stored.experience.metadata;
+        meta.insert("compression_strategy".to_string(), "lz4".to_string());
+        meta.insert("compression_ratio".to_string(), "0.5".to_string());
+        meta.insert(
+            "compressed_data".to_string(),
+            legacy_compressed_data(&original),
+        );
+
+        let restored = pipeline.decompress(&stored).unwrap();
+        assert!(!restored.compressed);
+        assert_eq!(restored.experience.content, original.experience.content);
+        assert!(!restored.experience.metadata.contains_key("compressed_data"));
+        assert!(!restored
+            .experience
+            .metadata
+            .contains_key("compression_ratio"));
+    }
+
     #[test]
     fn test_already_compressed_memory() {
         let pipeline = CompressionPipeline::new();
@@ -2114,18 +2167,10 @@ mod tests {
             meta.insert("compression_strategy".to_string(), label.to_string());
             if label != "semantic" {
                 // A blob is present on the old lz4/hybrid records; it holds the summary experience.
-                let blob = pipeline
-                    .compress_lz4(&create_test_memory(
-                        "first fifty words of a document that is gone...",
-                        0.3,
-                    ))
-                    .unwrap();
-                let data = blob
-                    .experience
-                    .metadata
-                    .get("compressed_data")
-                    .unwrap()
-                    .clone();
+                let data = legacy_compressed_data(&create_test_memory(
+                    "first fifty words of a document that is gone...",
+                    0.3,
+                ));
                 legacy
                     .experience
                     .metadata
