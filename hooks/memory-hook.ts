@@ -2,14 +2,29 @@
 /**
  * Veld Hook - Native Claude Code Integration
  *
- * Aggressive proactive context surfacing at every opportunity.
- * Memory should be woven into every interaction - the AI thinks with memory.
+ * Surfaces relevant memories into the agent's context (SessionStart, UserPromptSubmit,
+ * PreToolUse) and records the captures worth keeping: command failures, subagent
+ * completions and orchestration progress.
  *
- * Events: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStop, Stop
+ * Claude Code spawns a fresh process for every event, so state that must span events
+ * (episode threading, feedback loop, debounce cache, pending tool actions) lives in a
+ * per-session JSON file under VELD_HOOK_STATE_DIR (default: <tmpdir>/veld-hook).
+ *
+ * Events: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse,
+ * PostToolUseFailure, SubagentStop, Stop
  */
 
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 const VELD_API_URL = process.env.VELD_API_URL || "http://127.0.0.1:3030";
@@ -20,7 +35,7 @@ const VELD_USER_ID = process.env.VELD_USER_ID || "claude-code";
  * Resolve the Veld API key, in order:
  *   1. VELD_API_KEY env var (if non-empty)
  *   2. `api_key = "..."` line in the platform's veld config.toml
- *   3. empty string (server may reject; backendDown will trip)
+ *   3. empty string (the server will answer 401, reported as a memory-system error)
  *
  * Exported for testing.
  */
@@ -72,18 +87,19 @@ interface HookInput {
   cwd?: string;
   // UserPromptSubmit
   prompt?: string;
-  // PreToolUse / PostToolUse
+  // PreToolUse / PostToolUse / PostToolUseFailure
   tool_name?: string;
   tool_input?: Record<string, unknown>;
-  tool_output?: string;
   tool_response?: unknown;
-  // Stop
-  stop_reason?: string;
+  error?: string;
+  is_interrupt?: boolean;
   // SubagentStop
   agent_id?: string;
   agent_type?: string;
   agent_transcript_path?: string;
+  last_assistant_message?: string;
   // Legacy field names (backward compat)
+  tool_output?: unknown;
   subagent_type?: string;
   subagent_result?: string;
 }
@@ -115,7 +131,17 @@ interface ProactiveContextResponse {
   detected_entities: { name: string; entity_type: string }[];
 }
 
-const HOOK_TIMEOUT_MS = 5000;
+function envMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const n = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** Per-request budget on tool events. Kept under the 5 s hook `timeout` in the settings files. */
+const TOOL_TIMEOUT_MS = envMs("VELD_HOOK_TIMEOUT_MS", 4000);
+
+/** Budget for SessionStart and UserPromptSubmit, where context matters most. Kept under their 10 s hook `timeout`. */
+const PROMPT_TIMEOUT_MS = envMs("VELD_HOOK_PROMPT_TIMEOUT_MS", 8000);
 
 /** Regex for detecting secrets that must not be stored in memory */
 const SECRET_PATTERN = /(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{36,}|AKIA[A-Z0-9]{16}|Bearer\s+[A-Za-z0-9._\-]{20,}|password\s*[=:]\s*\S+)/i;
@@ -124,40 +150,158 @@ function containsSecrets(text: string): boolean {
   return SECRET_PATTERN.test(text);
 }
 
-/** Per-session boost counter: skip implicit reinforcement after 3 boosts per memory ID */
-const sessionBoostCount = new Map<string, number>();
 const MAX_IMPLICIT_BOOSTS = 3;
 
-/** Backend availability tracking for degradation signaling */
-let backendDown = false;
-let lastSuccessfulContext: string | null = null;
-let lastContextTimestamp: number = 0;
+/** Claude Code renamed the subagent tool from `Task` to `Agent`; older clients still send `Task`. */
+const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+const SHELL_TOOLS = new Set(["Bash", "PowerShell"]);
 
-/** Tool actions collected since last proactive_context call for feedback attribution */
-const pendingToolActions: { tool_name: string; inputs: Record<string, string>; success: boolean; output_snippet?: string }[] = [];
+export function isSubagentTool(toolName: string): boolean {
+  return SUBAGENT_TOOLS.has(toolName);
+}
 
-// =============================================================================
-// EPISODE THREADING (auto-generated per session)
-// =============================================================================
-
-/** Unique episode ID for this session — enables temporal clustering & ordinal boost */
-const sessionEpisodeId = `ep-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-
-/** Monotonic sequence counter for memory ordering within this session */
-let episodeSequenceNumber = 0;
-
-/** ID of the last memory we stored (for preceding_memory_id chains) */
-let lastStoredMemoryId: string | null = null;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 // =============================================================================
-// FEEDBACK LOOP (track surfaced memories for relevance signaling)
+// SESSION STATE (persisted per session_id across hook processes)
 // =============================================================================
 
-/** IDs of memories surfaced in the most recent proactive_context call */
-let lastSurfacedMemoryIds: string[] = [];
+interface ToolActionRecord {
+  tool_name: string;
+  inputs: Record<string, string>;
+  success: boolean;
+  output_snippet?: string;
+}
 
-/** Formatted output from the last proactive_context (for implicit feedback via previous_response) */
-let lastProactiveOutput: string | null = null;
+export interface SessionState {
+  /** Episode ID for this session — enables temporal clustering & ordinal boost */
+  episodeId: string;
+  /** Monotonic sequence counter for memory ordering within the episode */
+  sequence: number;
+  /** ID of the last memory stored (for preceding_memory_id chains) */
+  lastStoredMemoryId: string | null;
+  /** IDs and formatted output of the most recent surfacing, sent back as implicit feedback */
+  lastSurfacedMemoryIds: string[];
+  lastProactiveOutput: string | null;
+  /** Implicit reinforcements sent per memory ID, capped at MAX_IMPLICIT_BOOSTS */
+  boostCounts: Record<string, number>;
+  /** Tool actions since the last proactive_context call, for feedback attribution */
+  pendingToolActions: ToolActionRecord[];
+  /** Last result per debounce key */
+  debounce: Record<string, { at: number; result: string | null }>;
+  /** Agent-session marker written at SessionStart; SessionEnd runs in another process */
+  markerPath: string | null;
+}
+
+const STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_PENDING_TOOL_ACTIONS = 20;
+const MAX_BOOST_ENTRIES = 500;
+
+export function freshSessionState(): SessionState {
+  return {
+    episodeId: `ep-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    sequence: 0,
+    lastStoredMemoryId: null,
+    lastSurfacedMemoryIds: [],
+    lastProactiveOutput: null,
+    boostCounts: {},
+    pendingToolActions: [],
+    debounce: {},
+    markerPath: null,
+  };
+}
+
+export function hookStateDir(): string {
+  return process.env.VELD_HOOK_STATE_DIR || join(tmpdir(), "veld-hook");
+}
+
+export function sessionStatePath(sessionId: string, dir: string = hookStateDir()): string {
+  const safe = sessionId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128);
+  return join(dir, `${safe}.json`);
+}
+
+function isSessionState(value: unknown): value is SessionState {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.episodeId === "string" &&
+    typeof value.sequence === "number" &&
+    (value.lastStoredMemoryId === null || typeof value.lastStoredMemoryId === "string") &&
+    Array.isArray(value.lastSurfacedMemoryIds) &&
+    (value.lastProactiveOutput === null || typeof value.lastProactiveOutput === "string") &&
+    isRecord(value.boostCounts) &&
+    Array.isArray(value.pendingToolActions) &&
+    isRecord(value.debounce) &&
+    (value.markerPath === null || typeof value.markerPath === "string")
+  );
+}
+
+/** Load the session's state. Any read or parse failure yields fresh state: the hook must not fail on it. */
+export function loadSessionState(sessionId: string | undefined, dir: string = hookStateDir()): SessionState {
+  if (!sessionId) return freshSessionState();
+  try {
+    const parsed = JSON.parse(readFileSync(sessionStatePath(sessionId, dir), "utf-8"));
+    if (isSessionState(parsed)) return parsed;
+  } catch {
+    // missing, unreadable or corrupt — start fresh
+  }
+  return freshSessionState();
+}
+
+function compactSessionState(state: SessionState, now: number): void {
+  for (const [key, entry] of Object.entries(state.debounce)) {
+    if (now - entry.at >= PROACTIVE_DEBOUNCE_MS) delete state.debounce[key];
+  }
+  if (state.pendingToolActions.length > MAX_PENDING_TOOL_ACTIONS) {
+    state.pendingToolActions.splice(0, state.pendingToolActions.length - MAX_PENDING_TOOL_ACTIONS);
+  }
+  const boostKeys = Object.keys(state.boostCounts);
+  for (const key of boostKeys.slice(0, Math.max(0, boostKeys.length - MAX_BOOST_ENTRIES))) {
+    delete state.boostCounts[key];
+  }
+}
+
+/** Write state atomically (tmp + rename). Errors are logged and swallowed. */
+export function saveSessionState(sessionId: string | undefined, state: SessionState, dir: string = hookStateDir()): void {
+  if (!sessionId) return;
+  compactSessionState(state, Date.now());
+  const path = sessionStatePath(sessionId, dir);
+  // Per-pid tmp name: parallel hooks for one session must not interleave writes into one tmp file.
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(tmp, JSON.stringify(state), { encoding: "utf-8", mode: 0o600 });
+    renameSync(tmp, path);
+  } catch (e) {
+    console.error(`[veld] session state write failed at ${path}:`, e);
+    try { unlinkSync(tmp); } catch { /* tmp may not exist */ }
+  }
+}
+
+export function removeSessionState(sessionId: string | undefined, dir: string = hookStateDir()): void {
+  if (!sessionId) return;
+  try { unlinkSync(sessionStatePath(sessionId, dir)); } catch { /* already gone */ }
+}
+
+/** Delete state files (and stranded tmp files) untouched for more than a day. */
+export function pruneSessionStates(dir: string = hookStateDir(), now: number = Date.now()): void {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json") && !name.endsWith(".tmp")) continue;
+    const path = join(dir, name);
+    try {
+      if (now - statSync(path).mtimeMs > STATE_MAX_AGE_MS) unlinkSync(path);
+    } catch {
+      // another hook removed or replaced it first
+    }
+  }
+}
 
 // =============================================================================
 // EMOTIONAL CLASSIFICATION
@@ -181,11 +325,6 @@ function classifyEmotion(eventType: string, success: boolean, content: string): 
     return { emotional_valence: 0.5, emotional_arousal: 0.5, emotion: "satisfaction" };
   }
 
-  // File modifications: neutral, low arousal (routine work)
-  if (eventType === "FileAccess") {
-    return { emotional_valence: 0.1, emotional_arousal: 0.2, emotion: "focus" };
-  }
-
   // Discovery/learning: positive, medium-high arousal
   if (eventType === "Discovery" || eventType === "Learning") {
     return { emotional_valence: 0.6, emotional_arousal: 0.6, emotion: "curiosity" };
@@ -200,10 +339,32 @@ function classifyEmotion(eventType: string, success: boolean, content: string): 
   return { emotional_valence: 0.0, emotional_arousal: 0.15, emotion: "neutral" };
 }
 
-async function callBrain(endpoint: string, body: Record<string, unknown>): Promise<unknown> {
+// =============================================================================
+// HTTP
+// =============================================================================
+
+/**
+ * `timeout`: no answer within the budget — the server may be busy, not down.
+ * `unreachable`: the request never got a response (connection refused, DNS, reset).
+ * `error`: the server answered with a non-2xx status or an unreadable body.
+ */
+export type BrainOutcome = "ok" | "timeout" | "unreachable" | "error";
+
+interface BrainResult {
+  outcome: BrainOutcome;
+  status?: number;
+  body: unknown;
+}
+
+async function requestBrain(endpoint: string, body: Record<string, unknown>, timeoutMs: number): Promise<BrainResult> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  let status: number | undefined;
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), HOOK_TIMEOUT_MS);
     const response = await fetch(`${VELD_API_URL}${endpoint}`, {
       method: "POST",
       headers: {
@@ -213,18 +374,19 @@ async function callBrain(endpoint: string, body: Record<string, unknown>): Promi
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      backendDown = true;
-      return null;
-    }
-    backendDown = false;
-    return await response.json();
+    status = response.status;
+    if (!response.ok) return { outcome: "error", status, body: null };
+    return { outcome: "ok", status, body: await response.json() };
   } catch {
-    backendDown = true;
-    return null;
+    const outcome: BrainOutcome = timedOut ? "timeout" : status === undefined ? "unreachable" : "error";
+    return { outcome, status, body: null };
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+async function callBrain(endpoint: string, body: Record<string, unknown>): Promise<unknown> {
+  return (await requestBrain(endpoint, body, TOOL_TIMEOUT_MS)).body;
 }
 
 export function formatRelativeTime(isoDate: string): string {
@@ -260,6 +422,47 @@ export function isErrorOutput(toolOutput: string): boolean {
   );
 }
 
+function blockText(block: unknown): string {
+  if (typeof block === "string") return block;
+  if (isRecord(block) && typeof block.text === "string") return block.text;
+  return "";
+}
+
+/**
+ * Flatten a PostToolUse `tool_response` to text. Its shape depends on the tool: a string,
+ * an array of content blocks, `{ content: [...] }` for Agent, `{ stdout, stderr, ... }`
+ * for Bash, or another structured object.
+ */
+export function toolResponseText(response: unknown): string {
+  if (response == null) return "";
+  if (typeof response === "string") return response;
+  if (Array.isArray(response)) return response.map(blockText).filter(Boolean).join("\n");
+  if (isRecord(response)) {
+    if (Array.isArray(response.content)) return toolResponseText(response.content);
+    const streams = [response.stdout, response.stderr].filter(
+      (s): s is string => typeof s === "string" && s.length > 0
+    );
+    if (streams.length) return streams.join("\n");
+  }
+  try {
+    return JSON.stringify(response) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Error text from a shell tool's PostToolUse `tool_response`, or null. On the object shape
+ * only stderr counts: stdout of a successful command (grep, logs) mentions "error" too often.
+ */
+export function shellErrorText(response: unknown): string | null {
+  if (typeof response === "string") return isErrorOutput(response) ? response : null;
+  if (isRecord(response) && typeof response.stderr === "string" && isErrorOutput(response.stderr)) {
+    return response.stderr;
+  }
+  return null;
+}
+
 export function buildPreToolContext(toolName: string, toolInput: Record<string, unknown>): string {
   if (toolName === "Edit" || toolName === "Write" || toolName === "MultiEdit") {
     const filePath = toolInput.file_path as string;
@@ -270,7 +473,7 @@ export function buildPreToolContext(toolName: string, toolInput: Record<string, 
     if (edits?.length) {
       return `Multi-editing ${edits.length} file(s): ${edits.map((e) => e.file_path).filter(Boolean).slice(0, 3).join(", ")}`;
     }
-  } else if (toolName === "Bash") {
+  } else if (SHELL_TOOLS.has(toolName)) {
     const command = toolInput.command as string;
     if (command) {
       return `Running command: ${command.slice(0, 100)}`;
@@ -280,7 +483,7 @@ export function buildPreToolContext(toolName: string, toolInput: Record<string, 
     if (filePath) {
       return `Reading file: ${filePath}`;
     }
-  } else if (toolName === "Task") {
+  } else if (isSubagentTool(toolName)) {
     const prompt = toolInput.prompt as string;
     if (prompt) {
       return `Spawning agent: ${prompt.slice(0, 100)}`;
@@ -306,21 +509,13 @@ export function buildPreToolContext(toolName: string, toolInput: Record<string, 
 }
 
 /** Debounce window (ms) for proactive_context calls — keyed by context prefix.
- *  Reduces server-side embedding load when parallel agents fan out identical
- *  tool calls. Tunable via VELD_HOOK_DEBOUNCE_MS. */
+ *  Reduces server-side embedding load when the same question repeats in quick
+ *  succession. Tunable via VELD_HOOK_DEBOUNCE_MS (0 disables). */
 const PROACTIVE_DEBOUNCE_MS = (() => {
   const raw = process.env.VELD_HOOK_DEBOUNCE_MS;
   const n = raw ? Number.parseInt(raw, 10) : 500;
   return Number.isFinite(n) && n >= 0 ? n : 500;
 })();
-
-interface ProactiveCacheEntry {
-  at: number;
-  result: string | null;
-}
-/** Last (timestamp, result) per context-key. Bounded; oldest entries evicted. */
-const proactiveDebounceCache = new Map<string, ProactiveCacheEntry>();
-const PROACTIVE_DEBOUNCE_MAX_KEYS = 64;
 
 function proactiveDebounceKey(context: string, maxResults: number): string {
   // 80-char prefix lets "Editing file: a.rs" and "Editing file: b.rs" debounce
@@ -328,135 +523,148 @@ function proactiveDebounceKey(context: string, maxResults: number): string {
   return `${maxResults}|${context.slice(0, 80)}`;
 }
 
-async function surfaceProactiveContext(context: string, maxResults = 3, autoIngest = false): Promise<string | null> {
-  // P2 debounce: parallel agents firing identical proactive_context queries
-  // hammer the Nomic embedder for no extra information. Skip the round-trip
-  // if we answered the same question within VELD_HOOK_DEBOUNCE_MS.
-  //
-  // Two important carve-outs:
-  // - `autoIngest`: UserPromptSubmit relies on this to *record* the prompt;
-  //   debouncing would drop ingestion. Pass through always.
-  // - `backendDown`: when the server is recovering we want every call to try,
-  //   so the offline → online transition is visible quickly.
-  if (PROACTIVE_DEBOUNCE_MS > 0 && !autoIngest && !backendDown) {
-    const key = proactiveDebounceKey(context, maxResults);
-    const cached = proactiveDebounceCache.get(key);
-    const now = Date.now();
-    if (cached && now - cached.at < PROACTIVE_DEBOUNCE_MS) {
-      return cached.result;
+interface SurfaceResult {
+  text: string | null;
+  outcome: BrainOutcome;
+  status?: number;
+}
+
+interface SurfaceOptions {
+  autoIngest?: boolean;
+  timeoutMs?: number;
+}
+
+async function surfaceProactiveContext(
+  state: SessionState,
+  context: string,
+  maxResults: number,
+  { autoIngest = false, timeoutMs = TOOL_TIMEOUT_MS }: SurfaceOptions = {}
+): Promise<SurfaceResult> {
+  // UserPromptSubmit relies on autoIngest to record the prompt; a debounced answer would drop it.
+  const debounceKey = proactiveDebounceKey(context, maxResults);
+  if (PROACTIVE_DEBOUNCE_MS > 0 && !autoIngest) {
+    const cached = state.debounce[debounceKey];
+    if (cached && Date.now() - cached.at < PROACTIVE_DEBOUNCE_MS) {
+      return { text: cached.result, outcome: "ok" };
     }
   }
 
-  // Drain pending tool actions for feedback attribution
-  const toolActions = pendingToolActions.splice(0, pendingToolActions.length);
+  const toolActions = state.pendingToolActions.splice(0, state.pendingToolActions.length);
 
-  // Build feedback payload from previous cycle, capping per-memory implicit boosts
   const feedbackPayload: Record<string, unknown> = {};
-  if (lastProactiveOutput) {
-    feedbackPayload.previous_response = lastProactiveOutput;
+  if (state.lastProactiveOutput) {
+    feedbackPayload.previous_response = state.lastProactiveOutput;
     feedbackPayload.user_followup = context.slice(0, 1000);
   }
-  if (lastSurfacedMemoryIds.length > 0) {
-    // Only include IDs that haven't been reinforced too many times this session
-    const eligibleIds = lastSurfacedMemoryIds.filter((id) => {
-      const count = sessionBoostCount.get(id) ?? 0;
-      return count < MAX_IMPLICIT_BOOSTS;
-    });
-    if (eligibleIds.length > 0) {
-      feedbackPayload.surfaced_memory_ids = eligibleIds;
-      // Increment boost counters for these IDs
-      for (const id of eligibleIds) {
-        sessionBoostCount.set(id, (sessionBoostCount.get(id) ?? 0) + 1);
+  const eligibleIds = state.lastSurfacedMemoryIds.filter(
+    (id) => (state.boostCounts[id] ?? 0) < MAX_IMPLICIT_BOOSTS
+  );
+  if (eligibleIds.length > 0) {
+    feedbackPayload.surfaced_memory_ids = eligibleIds;
+    for (const id of eligibleIds) {
+      state.boostCounts[id] = (state.boostCounts[id] ?? 0) + 1;
+    }
+  }
+
+  if (autoIngest) state.sequence += 1;
+
+  const result = await requestBrain(
+    "/api/proactive_context",
+    {
+      user_id: VELD_USER_ID,
+      context,
+      max_results: maxResults,
+      semantic_threshold: 0.6,
+      entity_match_weight: 0.3,
+      recency_weight: 0.2,
+      auto_ingest: autoIngest,
+      // FIX-05: Propagate episode + emotional context to auto-ingested memories
+      episode_id: state.episodeId,
+      sequence_number: state.sequence,
+      emotional_valence: 0.0,
+      emotional_arousal: 0.15,
+      ...(toolActions.length > 0 ? { tool_actions: toolActions } : {}),
+      ...feedbackPayload,
+    },
+    timeoutMs
+  );
+
+  if (result.outcome !== "ok") {
+    return { text: null, outcome: result.outcome, status: result.status };
+  }
+
+  const response = (result.body ?? {}) as Partial<ProactiveContextResponse>;
+  const memories = response.memories ?? [];
+  const facts = response.relevant_facts ?? [];
+  const todos = response.relevant_todos ?? [];
+  const reminderCount = (response.due_reminders?.length || 0) + (response.context_reminders?.length || 0);
+
+  let output: string | null = null;
+  if (memories.length || facts.length || todos.length || reminderCount) {
+    const now = new Date();
+    output = `📅 ${now.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })} ${now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+    if (memories.length) {
+      output += `\n${formatMemoriesForContext(memories)}`;
+    }
+    if (facts.length) {
+      output += `\n🧠 Facts:`;
+      for (const f of facts.slice(0, 3)) {
+        output += `\n• (${Math.round(f.confidence * 100)}%) ${f.fact}`;
       }
     }
-  }
-
-  // When the backend is down, disable auto_ingest — stale context must not be
-  // re-ingested as ground truth when the backend recovers.
-  const effectiveAutoIngest = autoIngest && !backendDown;
-
-  const response = (await callBrain("/api/proactive_context", {
-    user_id: VELD_USER_ID,
-    context,
-    max_results: maxResults,
-    semantic_threshold: 0.6,
-    entity_match_weight: 0.3,
-    recency_weight: 0.2,
-    auto_ingest: effectiveAutoIngest,
-    // FIX-05: Propagate episode + emotional context to auto-ingested memories
-    episode_id: sessionEpisodeId,
-    sequence_number: episodeSequenceNumber,
-    emotional_valence: 0.0,
-    emotional_arousal: 0.15,
-    ...(toolActions.length > 0 ? { tool_actions: toolActions } : {}),
-    ...feedbackPayload,
-  })) as ProactiveContextResponse | null;
-
-  if (!response) {
-    // Backend unreachable — serve stale cache with age warning.
-    // Do NOT update lastProactiveOutput so stale content is never fed back as feedback.
-    if (lastSuccessfulContext && lastContextTimestamp > 0) {
-      const ageMinutes = Math.round((Date.now() - lastContextTimestamp) / 60_000);
-      return `⚠️ Memory offline (${ageMinutes}m stale cache):\n${lastSuccessfulContext}`;
+    if (todos.length) {
+      output += `\n📋 Todos:`;
+      for (const t of todos.slice(0, 3)) {
+        const icon = t.status === "in_progress" ? "🔄" : "☐";
+        output += `\n${icon} ${t.content.slice(0, 80)}`;
+      }
     }
-    return null;
-  }
-
-  const hasMemories = response.memories?.length > 0;
-  const hasFacts = response.relevant_facts?.length > 0;
-  const hasTodos = response.relevant_todos?.length > 0;
-  const hasReminders = (response.due_reminders?.length || 0) + (response.context_reminders?.length || 0) > 0;
-
-  if (!hasMemories && !hasFacts && !hasTodos && !hasReminders) return null;
-
-  const now = new Date();
-  const header = `📅 ${now.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })} ${now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-
-  let output = header;
-  if (hasMemories) {
-    output += `\n${formatMemoriesForContext(response.memories)}`;
-  }
-  if (hasFacts) {
-    output += `\n🧠 Facts:`;
-    for (const f of response.relevant_facts.slice(0, 3)) {
-      output += `\n• (${Math.round(f.confidence * 100)}%) ${f.fact}`;
+    if (reminderCount) {
+      output += `\n⏰ ${reminderCount} reminder(s) active`;
     }
   }
-  if (hasTodos) {
-    output += `\n📋 Todos:`;
-    for (const t of response.relevant_todos.slice(0, 3)) {
-      const icon = t.status === "in_progress" ? "🔄" : "☐";
-      output += `\n${icon} ${t.content.slice(0, 80)}`;
-    }
-  }
-  if (hasReminders) {
-    const allReminders = [...(response.due_reminders || []), ...(response.context_reminders || [])];
-    output += `\n⏰ ${allReminders.length} reminder(s) active`;
-  }
 
-  // Cache successful context for stale-serve on future failures
-  lastSuccessfulContext = output;
-  lastContextTimestamp = Date.now();
+  state.lastSurfacedMemoryIds = memories.map((m) => m.id);
+  state.lastProactiveOutput = output;
 
-  // Track surfaced memories for feedback loop on next call
-  lastSurfacedMemoryIds = (response.memories || []).map((m) => m.id);
-  lastProactiveOutput = output;
-
-  // P2 debounce: record the result so the next identical call within the
-  // window can answer locally. Cache only success paths — backend-down
-  // returns intentionally bypass the cache so recovery is visible quickly.
   if (PROACTIVE_DEBOUNCE_MS > 0 && !autoIngest) {
-    const key = proactiveDebounceKey(context, maxResults);
-    // LRU-ish eviction: when full, drop the oldest entry. Maps preserve
-    // insertion order, so the first key() is the oldest.
-    if (proactiveDebounceCache.size >= PROACTIVE_DEBOUNCE_MAX_KEYS) {
-      const oldest = proactiveDebounceCache.keys().next().value;
-      if (oldest !== undefined) proactiveDebounceCache.delete(oldest);
-    }
-    proactiveDebounceCache.set(key, { at: Date.now(), result: output });
+    state.debounce[debounceKey] = { at: Date.now(), result: output };
   }
 
-  return output;
+  return { text: output, outcome: "ok" };
+}
+
+/** One-line notice for a server that refused or failed. A timeout gets none: slow is not down. */
+function memoryOfflineNotice(result: SurfaceResult): string | null {
+  if (result.outcome === "unreachable") {
+    return `Memory system unreachable at ${VELD_API_URL}. No persistent context available.`;
+  }
+  if (result.outcome === "error") {
+    return `Memory system returned ${result.status ? `HTTP ${result.status}` : "an unreadable response"}. No persistent context available.`;
+  }
+  return null;
+}
+
+function emitContext(hookEventName: string, additionalContext: string): void {
+  console.log(JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext } }));
+}
+
+async function rememberInEpisode(
+  state: SessionState,
+  memory: { content: string; memory_type: string; tags: string[]; credibility: number },
+  emotion: EmotionalSignal
+): Promise<void> {
+  state.sequence += 1;
+  const resp = (await callBrain("/api/remember", {
+    user_id: VELD_USER_ID,
+    ...memory,
+    source_type: "system",
+    episode_id: state.episodeId,
+    sequence_number: state.sequence,
+    ...(state.lastStoredMemoryId ? { preceding_memory_id: state.lastStoredMemoryId } : {}),
+    ...emotion,
+  })) as { id?: string } | null;
+  if (resp?.id) state.lastStoredMemoryId = resp.id;
 }
 
 // =============================================================================
@@ -476,7 +684,8 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
 //   }
 //
 // Written atomically (write to .tmp then rename) and idempotent (overwrites
-// on every SessionStart). Removed on SessionEnd best-effort.
+// on every SessionStart). Removed on SessionEnd best-effort, via the path kept
+// in session state: SessionEnd runs in a different process with a different pid.
 
 export interface AgentSessionMarker {
   agent_id: string;
@@ -546,342 +755,156 @@ export function removeAgentSessionMarker(path: string = agentSessionMarkerPath()
   }
 }
 
-async function handleSessionStart(): Promise<void> {
+// =============================================================================
+// EVENT HANDLERS
+// =============================================================================
+
+async function handleSessionStart(state: SessionState): Promise<void> {
+  pruneSessionStates();
+
   // Drop the agent-session marker file first so downstream chat-brand
   // detection works even if the memory backend is unreachable below.
-  writeAgentSessionMarker();
+  const markerPath = agentSessionMarkerPath();
+  if (writeAgentSessionMarker(markerPath)) {
+    if (state.markerPath && state.markerPath !== markerPath) removeAgentSessionMarker(state.markerPath);
+    state.markerPath = markerPath;
+  }
 
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const projectName = projectDir.split(/[/\\]/).pop() || "unknown";
 
-  const context = `Starting session in project: ${projectName}`;
-  const memoryContext = await surfaceProactiveContext(context, 5);
+  const result = await surfaceProactiveContext(state, `Starting session in project: ${projectName}`, 5, {
+    timeoutMs: PROMPT_TIMEOUT_MS,
+  });
 
-  const memoryFile = `${projectDir}/.claude/memory-context.md`;
-  if (memoryContext) {
-    console.error(`[veld] Session context loaded`);
-
-    try {
-      await Bun.write(memoryFile, `# Veld Context\n\n${memoryContext}\n`);
-    } catch {
-      // Directory might not exist
-    }
-  } else if (backendDown) {
-    console.error(`[veld] Memory system unreachable — operating without persistent context`);
-    try {
-      await Bun.write(memoryFile, `# Veld Context\n\n⚠️ Memory system offline. No persistent context available.\n`);
-    } catch {
-      // Directory might not exist
-    }
+  if (result.text) {
+    emitContext("SessionStart", `\n<veld>\n${result.text}\n</veld>`);
+    return;
+  }
+  const notice = memoryOfflineNotice(result);
+  if (notice) {
+    console.error(`[veld] ${notice}`);
+    emitContext("SessionStart", `\n<veld-warning>${notice}</veld-warning>`);
   }
 }
 
-async function handleUserPrompt(input: HookInput): Promise<void> {
+async function handleUserPrompt(input: HookInput, state: SessionState): Promise<void> {
   const prompt = input.prompt;
   if (!prompt || prompt.length < 10) return;
 
   // Single call: surface memories AND ingest the prompt in one pipeline pass
-  const memoryContext = await surfaceProactiveContext(prompt.slice(0, 1000), 3, true);
+  const result = await surfaceProactiveContext(state, prompt.slice(0, 1000), 3, {
+    autoIngest: true,
+    timeoutMs: PROMPT_TIMEOUT_MS,
+  });
 
-  if (memoryContext) {
-    console.log(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "UserPromptSubmit",
-          additionalContext: `\n<veld>\n${memoryContext}\n</veld>`,
-        },
-      })
-    );
-  } else if (backendDown) {
-    // Inject a single-line degradation warning so the model knows memory is offline
-    console.log(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "UserPromptSubmit",
-          additionalContext: `\n<veld-warning>Memory system offline. No persistent context for this prompt.</veld-warning>`,
-        },
-      })
-    );
-  }
-}
-
-async function handlePreToolUse(input: HookInput): Promise<void> {
-  const toolName = input.tool_name;
-  const toolInput = input.tool_input;
-  if (!toolName || !toolInput) return;
-
-  const context = buildPreToolContext(toolName, toolInput);
-
-  // Surface relevant context BEFORE the tool runs
-  const memoryContext = await surfaceProactiveContext(context, 2);
-
-  if (memoryContext) {
-    console.log(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          additionalContext: `\n<veld context="pre-${toolName.toLowerCase()}">\n${memoryContext}\n</veld>`,
-        },
-      })
-    );
-  }
-}
-
-async function handlePostToolUse(input: HookInput): Promise<void> {
-  const toolName = input.tool_name;
-  const toolInput = input.tool_input;
-  const toolOutput = input.tool_output;
-
-  if (!toolName) return;
-
-  // Record tool action for feedback attribution (before any early returns)
-  if (toolName !== "Task") {
-    const actionRecord: (typeof pendingToolActions)[number] = {
-      tool_name: toolName,
-      inputs: {},
-      success: true,
-    };
-    if (toolInput) {
-      for (const [k, v] of Object.entries(toolInput)) {
-        if (typeof v === "string") {
-          actionRecord.inputs[k] = v.slice(0, 500);
-        }
-      }
-    }
-    if (toolOutput) {
-      actionRecord.success = !isErrorOutput(toolOutput);
-      actionRecord.output_snippet = toolOutput.slice(0, 200);
-    }
-    pendingToolActions.push(actionRecord);
-    if (pendingToolActions.length > 50) {
-      pendingToolActions.splice(0, pendingToolActions.length - 50);
-    }
-  }
-
-  // Orchestration: handle Task tool completions
-  if (toolName === "Task") {
-    await handlePostToolUseTask(input);
+  if (result.text) {
+    emitContext("UserPromptSubmit", `\n<veld>\n${result.text}\n</veld>`);
     return;
   }
-
-  // Store significant tool uses with emotional context + episode threading
-  if (toolName === "Edit" || toolName === "Write") {
-    const filePath = toolInput?.file_path as string;
-    if (filePath) {
-      // Build descriptive content based on tool type (FIX-01: structured reasoning capture)
-      let content: string;
-      if (toolName === "Edit") {
-        const oldStr = (toolInput?.old_string as string) || "";
-        const newStr = (toolInput?.new_string as string) || "";
-        content = `Edited ${filePath}: replaced ${oldStr.slice(0, 80)} → ${newStr.slice(0, 80)}`;
-      } else {
-        const fileContent = (toolInput?.content as string) || "";
-        content = `Created/wrote ${filePath} (${fileContent.length} chars)`;
-      }
-
-      if (containsSecrets(content)) return;
-
-      const emotion = classifyEmotion("FileAccess", true, filePath);
-      const seq = ++episodeSequenceNumber;
-      const resp = await callBrain("/api/remember", {
-        user_id: VELD_USER_ID,
-        content,
-        memory_type: "FileAccess",
-        tags: [`tool:${toolName}`, `file:${filePath.split(/[/\\]/).pop()}`],
-        source_type: "system",
-        credibility: 0.8,
-        episode_id: sessionEpisodeId,
-        sequence_number: seq,
-        ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
-        ...emotion,
-      }) as { id?: string } | null;
-      if (resp?.id) lastStoredMemoryId = resp.id;
-    }
-  } else if (toolName === "Bash" && toolOutput) {
-    const command = toolInput?.command as string;
-
-    // Store errors/failures for learning
-    if (isErrorOutput(toolOutput)) {
-      const bashContent = `Command failed: ${command?.slice(0, 100)} → ${toolOutput.slice(0, 200)}`;
-      if (containsSecrets(bashContent)) return;
-      const emotion = classifyEmotion("Error", false, toolOutput);
-      const seq = ++episodeSequenceNumber;
-      const resp = await callBrain("/api/remember", {
-        user_id: VELD_USER_ID,
-        content: bashContent,
-        memory_type: "Error",
-        tags: ["tool:Bash", "error"],
-        source_type: "system",
-        credibility: 0.9,
-        episode_id: sessionEpisodeId,
-        sequence_number: seq,
-        ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
-        ...emotion,
-      }) as { id?: string } | null;
-      if (resp?.id) lastStoredMemoryId = resp.id;
-
-      // Surface past errors for this type of command
-      const memoryContext = await surfaceProactiveContext(
-        `Error with command: ${command?.slice(0, 100)}`,
-        2
-      );
-      if (memoryContext) {
-        console.log(
-          JSON.stringify({
-            hookSpecificOutput: {
-              hookEventName: "PostToolUse",
-              additionalContext: `\n<veld context="similar-errors">\n${memoryContext}\n</veld>`,
-            },
-          })
-        );
-      }
-    }
-  } else if (toolName === "Read") {
-    const filePath = toolInput?.file_path as string;
-    if (filePath) {
-      // Surface what we know about this file
-      const memoryContext = await surfaceProactiveContext(
-        `Reading file: ${filePath}`,
-        2
-      );
-      if (memoryContext) {
-        console.log(
-          JSON.stringify({
-            hookSpecificOutput: {
-              hookEventName: "PostToolUse",
-              additionalContext: `\n<veld context="file-context">\n${memoryContext}\n</veld>`,
-            },
-          })
-        );
-      }
-    }
-  } else if (toolName === "MultiEdit") {
-    // MultiEdit: batch file modifications — record each affected file
-    const edits = toolInput?.edits as Array<{ file_path?: string }> | undefined;
-    if (edits?.length) {
-      const files = edits.map((e) => e.file_path).filter(Boolean).slice(0, 5);
-      const content = `Multi-edited ${edits.length} file(s): ${files.join(", ")}`;
-      const emotion = classifyEmotion("FileAccess", true, content);
-      const seq = ++episodeSequenceNumber;
-      const resp = await callBrain("/api/remember", {
-        user_id: VELD_USER_ID,
-        content,
-        memory_type: "FileAccess",
-        tags: ["tool:MultiEdit", ...files.map((f) => `file:${f!.split(/[/\\]/).pop()}`)],
-        source_type: "system",
-        credibility: 0.8,
-        episode_id: sessionEpisodeId,
-        sequence_number: seq,
-        ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
-        ...emotion,
-      }) as { id?: string } | null;
-      if (resp?.id) lastStoredMemoryId = resp.id;
-    }
-  } else if (toolName === "Search" || toolName === "Grep" || toolName === "Glob") {
-    // Search tools: surface related memories for the query
-    const query = (toolInput?.query as string) || (toolInput?.pattern as string) || "";
-    if (query) {
-      const memoryContext = await surfaceProactiveContext(
-        `Searching codebase: ${query.slice(0, 200)}`,
-        2
-      );
-      if (memoryContext) {
-        console.log(
-          JSON.stringify({
-            hookSpecificOutput: {
-              hookEventName: "PostToolUse",
-              additionalContext: `\n<veld context="search-context">\n${memoryContext}\n</veld>`,
-            },
-          })
-        );
-      }
-    }
-  } else if (toolName === "ListFiles" || toolName === "LS") {
-    // Directory listing: surface what we know about the directory
-    const dirPath = (toolInput?.path as string) || (toolInput?.directory as string) || "";
-    if (dirPath) {
-      const memoryContext = await surfaceProactiveContext(
-        `Exploring directory: ${dirPath}`,
-        2
-      );
-      if (memoryContext) {
-        console.log(
-          JSON.stringify({
-            hookSpecificOutput: {
-              hookEventName: "PostToolUse",
-              additionalContext: `\n<veld context="directory-context">\n${memoryContext}\n</veld>`,
-            },
-          })
-        );
-      }
-    }
-  } else if (toolName === "WebFetch") {
-    // Web fetch: store fetched URL as context for future reference
-    const url = (toolInput?.url as string) || "";
-    if (url && toolOutput) {
-      const content = `Fetched ${url}: ${toolOutput.slice(0, 200)}`;
-      if (containsSecrets(content)) return;
-      let urlHostname: string;
-      try { urlHostname = new URL(url).hostname; } catch { urlHostname = url.slice(0, 100); }
-      const emotion = classifyEmotion("Discovery", true, content);
-      const seq = ++episodeSequenceNumber;
-      const resp = await callBrain("/api/remember", {
-        user_id: VELD_USER_ID,
-        content,
-        memory_type: "Context",
-        tags: ["tool:WebFetch", `url:${urlHostname}`],
-        source_type: "system",
-        credibility: 0.6,
-        episode_id: sessionEpisodeId,
-        sequence_number: seq,
-        ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
-        ...emotion,
-      }) as { id?: string } | null;
-      if (resp?.id) lastStoredMemoryId = resp.id;
-    }
-  } else if (toolName === "NotebookEdit") {
-    // Notebook edits: record like file edits
-    const notebook = (toolInput?.notebook as string) || (toolInput?.file_path as string) || "";
-    if (notebook) {
-      const content = `Edited notebook ${notebook}`;
-      const emotion = classifyEmotion("FileAccess", true, content);
-      const seq = ++episodeSequenceNumber;
-      const resp = await callBrain("/api/remember", {
-        user_id: VELD_USER_ID,
-        content,
-        memory_type: "FileAccess",
-        tags: ["tool:NotebookEdit", `file:${notebook.split(/[/\\]/).pop()}`],
-        source_type: "system",
-        credibility: 0.7,
-        episode_id: sessionEpisodeId,
-        sequence_number: seq,
-        ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
-        ...emotion,
-      }) as { id?: string } | null;
-      if (resp?.id) lastStoredMemoryId = resp.id;
-    }
+  const notice = memoryOfflineNotice(result);
+  if (notice) {
+    emitContext("UserPromptSubmit", `\n<veld-warning>${notice}</veld-warning>`);
   }
 }
-
-// --- Orchestration: PostToolUse(Task) handler ---
 
 const ORCH_TAG_RE = /\[ORCH-TODO:([A-Z]+-\d+)\]/;
 
-async function callBrainGet(endpoint: string): Promise<unknown> {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), HOOK_TIMEOUT_MS);
-    const response = await fetch(`${VELD_API_URL}${endpoint}`, {
-      headers: { "X-API-Key": VELD_API_KEY },
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
-    if (!response.ok) return null;
-    return await response.json();
-  } catch {
-    return null;
+function orchestrationTodoId(toolInput: Record<string, unknown>): string | null {
+  const prompt = toolInput.prompt;
+  if (typeof prompt !== "string") return null;
+  return prompt.match(ORCH_TAG_RE)?.[1] ?? null;
+}
+
+/**
+ * Surfacing for tool use happens here, before the tool runs, and nowhere else — with one
+ * exception: an orchestration subagent surfaces after it completes, when unblocked work exists.
+ */
+async function handlePreToolUse(input: HookInput, state: SessionState): Promise<void> {
+  const toolName = input.tool_name;
+  const toolInput = input.tool_input;
+  if (!toolName || !toolInput) return;
+  if (isSubagentTool(toolName) && orchestrationTodoId(toolInput)) return;
+
+  const result = await surfaceProactiveContext(state, buildPreToolContext(toolName, toolInput), 2);
+  if (result.text) {
+    emitContext("PreToolUse", `\n<veld context="pre-${toolName.toLowerCase()}">\n${result.text}\n</veld>`);
   }
 }
+
+function recordToolAction(
+  state: SessionState,
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  success: boolean,
+  output: string
+): void {
+  const inputs: Record<string, string> = {};
+  for (const [k, v] of Object.entries(toolInput)) {
+    if (typeof v === "string" && !containsSecrets(v)) {
+      inputs[k] = v.slice(0, 500);
+    }
+  }
+  const snippet = output.slice(0, 200);
+  state.pendingToolActions.push({
+    tool_name: toolName,
+    inputs,
+    success,
+    ...(snippet && !containsSecrets(snippet) ? { output_snippet: snippet } : {}),
+  });
+}
+
+async function rememberCommandFailure(
+  state: SessionState,
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  errorText: string
+): Promise<void> {
+  const command = typeof toolInput.command === "string" ? toolInput.command : "";
+  const content = `Command failed: ${command.slice(0, 100)} → ${errorText.slice(0, 200)}`;
+  if (containsSecrets(content)) return;
+  await rememberInEpisode(
+    state,
+    { content, memory_type: "Error", tags: [`tool:${toolName}`, "error"], credibility: 0.9 },
+    classifyEmotion("Error", false, errorText)
+  );
+}
+
+/**
+ * PostToolUse fires only for tools that succeeded. It records the action for feedback
+ * attribution and stores nothing per edit or read: those echoes were most of the store's noise.
+ */
+async function handlePostToolUse(input: HookInput, state: SessionState): Promise<void> {
+  const toolName = input.tool_name;
+  if (!toolName) return;
+  const toolInput = input.tool_input ?? {};
+  const response = input.tool_response ?? input.tool_output;
+
+  if (isSubagentTool(toolName)) {
+    await handleSubagentToolResult(toolInput, response, state);
+    return;
+  }
+
+  const errorText = SHELL_TOOLS.has(toolName) ? shellErrorText(response) : null;
+  recordToolAction(state, toolName, toolInput, errorText === null, errorText ?? toolResponseText(response));
+  if (errorText) {
+    await rememberCommandFailure(state, toolName, toolInput, errorText);
+  }
+}
+
+async function handlePostToolUseFailure(input: HookInput, state: SessionState): Promise<void> {
+  const toolName = input.tool_name;
+  if (!toolName || isSubagentTool(toolName)) return;
+  const toolInput = input.tool_input ?? {};
+  const error = typeof input.error === "string" ? input.error : "";
+
+  recordToolAction(state, toolName, toolInput, false, error);
+  if (error && !input.is_interrupt && SHELL_TOOLS.has(toolName)) {
+    await rememberCommandFailure(state, toolName, toolInput, error);
+  }
+}
+
+// --- Orchestration: PostToolUse(Agent) handler ---
 
 async function unblockDependents(completedShortId: string): Promise<void> {
   const dashIdx = completedShortId.lastIndexOf("-");
@@ -946,45 +969,21 @@ async function unblockDependents(completedShortId: string): Promise<void> {
   }
 }
 
-async function handlePostToolUseTask(input: HookInput): Promise<void> {
-  const toolInput = input.tool_input;
-  const toolResult = input.tool_output ?? input.tool_response;
+/**
+ * Only orchestration-tagged subagents are handled here. Plain subagent completions are
+ * stored once, at SubagentStop, which also covers background subagents.
+ */
+async function handleSubagentToolResult(
+  toolInput: Record<string, unknown>,
+  response: unknown,
+  state: SessionState
+): Promise<void> {
+  const todoShortId = orchestrationTodoId(toolInput);
+  if (!todoShortId) return;
+  // A background launch returns at once; the subagent has not done the work yet.
+  if (isRecord(response) && response.status === "async_launched") return;
 
-  if (!toolInput) return;
-
-  const prompt = (toolInput.prompt as string) || "";
-  const resultText = typeof toolResult === "string"
-    ? toolResult
-    : toolResult != null
-      ? JSON.stringify(toolResult)
-      : "";
-
-  // Check for orchestration tag
-  const tagMatch = prompt.match(ORCH_TAG_RE);
-
-  if (!tagMatch) {
-    // Not an orchestration task — store as generic memory
-    if (resultText) {
-      const emotion = classifyEmotion("Task", true, resultText);
-      const seq = ++episodeSequenceNumber;
-      const resp = await callBrain("/api/remember", {
-        user_id: VELD_USER_ID,
-        content: `Task agent completed: ${resultText.slice(0, 300)}`,
-        memory_type: "Task",
-        tags: ["subagent:task", "source:hook"],
-        source_type: "system",
-        credibility: 0.7,
-        episode_id: sessionEpisodeId,
-        sequence_number: seq,
-        ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
-        ...emotion,
-      }) as { id?: string } | null;
-      if (resp?.id) lastStoredMemoryId = resp.id;
-    }
-    return;
-  }
-
-  const todoShortId = tagMatch[1];
+  const resultText = toolResponseText(response);
 
   // 1. Add Resolution comment with agent result
   if (resultText) {
@@ -1013,67 +1012,38 @@ async function handlePostToolUseTask(input: HookInput): Promise<void> {
   }
 
   // 4. Store memory of orchestration completion with emotional + episode context
-  {
-    const emotion = classifyEmotion("Task", true, resultText);
-    const seq = ++episodeSequenceNumber;
-    const resp = await callBrain("/api/remember", {
-      user_id: VELD_USER_ID,
-      content: `Orchestration task ${todoShortId} completed: ${resultText.slice(0, 200)}`,
-      memory_type: "Task",
-      tags: ["orchestration", `todo:${todoShortId}`, "source:hook"],
-      source_type: "system",
-      credibility: 0.75,
-      episode_id: sessionEpisodeId,
-      sequence_number: seq,
-      ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
-      ...emotion,
-    }) as { id?: string } | null;
-    if (resp?.id) lastStoredMemoryId = resp.id;
+  const content = `Orchestration task ${todoShortId} completed: ${resultText.slice(0, 200)}`;
+  if (!containsSecrets(content)) {
+    await rememberInEpisode(
+      state,
+      { content, memory_type: "Task", tags: ["orchestration", `todo:${todoShortId}`, "source:hook"], credibility: 0.75 },
+      classifyEmotion("Task", true, resultText)
+    );
   }
 
   // 5. Surface orchestration status
-  const memoryContext = await surfaceProactiveContext(
+  const result = await surfaceProactiveContext(
+    state,
     `Orchestration: task ${todoShortId} completed, checking for unblocked work`,
     2
   );
-  if (memoryContext) {
-    console.log(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PostToolUse",
-          additionalContext: `\n<veld context="orchestration">\n${memoryContext}\n</veld>`,
-        },
-      })
-    );
+  if (result.text) {
+    emitContext("PostToolUse", `\n<veld context="orchestration">\n${result.text}\n</veld>`);
   }
 }
 
-async function handleSubagentStop(input: HookInput): Promise<void> {
+async function handleSubagentStop(input: HookInput, state: SessionState): Promise<void> {
   const agentType = input.agent_type || input.subagent_type;
-  const agentId = input.agent_id;
-  const result = input.subagent_result;
+  const result = input.last_assistant_message || input.subagent_result;
+  if (!agentType || !result) return;
 
-  if (!agentType) return;
-
-  const content = result
-    ? `${agentType} agent completed: ${result.slice(0, 300)}`
-    : `${agentType} agent (${agentId || "unknown"}) completed`;
-
-  const emotion = classifyEmotion("Task", true, content);
-  const seq = ++episodeSequenceNumber;
-  const resp = await callBrain("/api/remember", {
-    user_id: VELD_USER_ID,
-    content,
-    memory_type: "Task",
-    tags: [`subagent:${agentType}`, "source:hook"],
-    source_type: "system",
-    credibility: 0.6,
-    episode_id: sessionEpisodeId,
-    sequence_number: seq,
-    ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
-    ...emotion,
-  }) as { id?: string } | null;
-  if (resp?.id) lastStoredMemoryId = resp.id;
+  const content = `${agentType} agent completed: ${result.slice(0, 300)}`;
+  if (containsSecrets(content)) return;
+  await rememberInEpisode(
+    state,
+    { content, memory_type: "Task", tags: [`subagent:${agentType}`, "source:hook"], credibility: 0.6 },
+    classifyEmotion("Task", true, content)
+  );
 }
 
 async function handleStop(_input: HookInput): Promise<void> {
@@ -1082,11 +1052,10 @@ async function handleStop(_input: HookInput): Promise<void> {
   // and gets re-ingested by proactive_context auto-ingest, causing duplicate events.
 }
 
-async function handleSessionEnd(_input: HookInput): Promise<void> {
-  // Remove the agent-session marker file written at SessionStart.
-  // Best-effort — leaks are not critical: the file is gitignored and lives in
-  // the worktree, so the next SessionStart will overwrite it anyway.
-  removeAgentSessionMarker();
+function handleSessionEnd(input: HookInput): void {
+  const state = loadSessionState(input.session_id);
+  removeAgentSessionMarker(state.markerPath ?? agentSessionMarkerPath());
+  removeSessionState(input.session_id);
 }
 
 async function main(): Promise<void> {
@@ -1096,35 +1065,44 @@ async function main(): Promise<void> {
   try {
     input = JSON.parse(inputText);
   } catch {
-    const eventType = process.argv[2];
-    input = { hook_event_name: eventType || "SessionStart" };
+    input = { hook_event_name: process.argv[2] || "SessionStart" };
   }
 
-  const eventName = input.hook_event_name;
+  const eventName = input.hook_event_name || process.argv[2];
+  if (eventName === "SessionEnd") {
+    handleSessionEnd(input);
+    return;
+  }
+
+  const state = loadSessionState(input.session_id);
 
   switch (eventName) {
     case "SessionStart":
-      await handleSessionStart();
+      await handleSessionStart(state);
       break;
     case "UserPromptSubmit":
-      await handleUserPrompt(input);
+      await handleUserPrompt(input, state);
       break;
     case "PreToolUse":
-      await handlePreToolUse(input);
+      await handlePreToolUse(input, state);
       break;
     case "PostToolUse":
-      await handlePostToolUse(input);
+      await handlePostToolUse(input, state);
+      break;
+    case "PostToolUseFailure":
+      await handlePostToolUseFailure(input, state);
       break;
     case "SubagentStop":
-      await handleSubagentStop(input);
+      await handleSubagentStop(input, state);
       break;
     case "Stop":
       await handleStop(input);
-      break;
-    case "SessionEnd":
-      await handleSessionEnd(input);
-      break;
+      return;
+    default:
+      return;
   }
+
+  saveSessionState(input.session_id, state);
 }
 
 if (import.meta.main) {

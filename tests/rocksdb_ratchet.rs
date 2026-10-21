@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 const BASELINE: &[(&str, usize)] = &[
-    ("backup", 16),
+    ("backup", 4),
     ("graph_memory", 7),
-    ("handlers", 20),
-    ("memory", 67),
+    ("handlers", 17),
+    ("memory", 52),
     ("memory/sleep_time", 0),
     ("user_auth", 4),
     ("user_memory", 0),
@@ -28,12 +28,45 @@ fn module_of(rel: &str) -> String {
     key.trim_end_matches(".rs").to_string()
 }
 
+/// Runtime code only: a top-level `#[cfg(test)] mod` block is skipped, because a test
+/// that drives a RocksDB store directly is not engine-typed code the port must remove.
 fn count_code_uses(source: &str) -> usize {
-    source
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .map(|line| line.matches("rocksdb::").count())
-        .sum()
+    let lines: Vec<&str> = source.lines().collect();
+    let mut count = 0;
+    let mut index = 0;
+    while index < lines.len() {
+        if let Some(after_module) = end_of_test_module(&lines, index) {
+            index = after_module;
+            continue;
+        }
+        let line = lines[index];
+        if !line.trim_start().starts_with("//") {
+            count += line.matches("rocksdb::").count();
+        }
+        index += 1;
+    }
+    count
+}
+
+/// Index of the line after a top-level `#[cfg(test)] mod x { ... }` that starts at
+/// `start`, or `None` when `start` is not the attribute of such a module.
+fn end_of_test_module(lines: &[&str], start: usize) -> Option<usize> {
+    let attribute = lines[start];
+    if attribute != "#[cfg(test)]" && !attribute.starts_with("#[cfg(all(test") {
+        return None;
+    }
+    let mut declaration = start + 1;
+    while declaration < lines.len() && lines[declaration].starts_with("#[") {
+        declaration += 1;
+    }
+    let header = lines.get(declaration)?;
+    let opens_block =
+        (header.starts_with("mod ") || header.starts_with("pub mod ")) && header.ends_with('{');
+    if !opens_block {
+        return None;
+    }
+    let close = (declaration + 1..lines.len()).find(|&i| lines[i] == "}")?;
+    Some(close + 1)
 }
 
 fn scan(src: &Path, dir: &Path, counts: &mut BTreeMap<String, usize>) {
@@ -65,8 +98,8 @@ fn scan(src: &Path, dir: &Path, counts: &mut BTreeMap<String, usize>) {
 
 #[test]
 fn the_counter_sees_code_and_skips_comments() {
-    let planted = "use rocksdb::{DB, Options};\n// rocksdb::DB in a comment\nlet x: rocksdb::Cache = y; rocksdb::DB::open();\n";
-    assert_eq!(count_code_uses(planted), 3);
+    let planted = "use rocksdb::{DB, Options};\n// rocksdb::DB in a comment\nlet x: rocksdb::Cache = y; rocksdb::DB::open();\n#[cfg(test)]\nmod tests {\n    use rocksdb::WriteBatch;\n}\nfn after() { rocksdb::DB::open(); }\n";
+    assert_eq!(count_code_uses(planted), 4);
     assert_eq!(module_of("memory/sleep_time/queue.rs"), "memory/sleep_time");
     assert_eq!(module_of("memory/storage.rs"), "memory");
     assert_eq!(module_of("backup.rs"), "backup");

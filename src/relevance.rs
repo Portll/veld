@@ -38,21 +38,52 @@ use crate::memory::{Memory, MemorySystem};
 // HELPER FUNCTIONS
 // =============================================================================
 
-/// Check if a word appears as a complete word in text (not as substring).
-/// Uses word boundary matching to avoid false positives like "MIT" matching "submit".
-fn contains_word(text: &str, word: &str) -> bool {
-    if word.is_empty() {
-        return false;
+/// Word-boundary, case-insensitive matcher for one entity name.
+///
+/// Built once per entity per request: compiling the pattern per memory made
+/// the scan cost one regex compilation for every (memory, entity) pair. Text
+/// passed to [`EntityMatcher::is_match`] is already lowercased by the caller.
+struct EntityMatcher {
+    pattern: Option<Regex>,
+    name: String,
+}
+
+impl EntityMatcher {
+    fn new(name: &str) -> Self {
+        let pattern = if name.is_empty() {
+            None
+        } else {
+            Regex::new(&format!(r"(?i)\b{}\b", regex::escape(name))).ok()
+        };
+        Self {
+            pattern,
+            name: name.to_string(),
+        }
     }
-    // Build regex pattern with word boundaries
-    // Escape special regex characters in the word
-    let escaped = regex::escape(word);
-    let pattern = format!(r"(?i)\b{}\b", escaped);
-    match Regex::new(&pattern) {
-        Ok(re) => re.is_match(text),
-        Err(_) => text.contains(word), // Fallback to substring if regex fails
+
+    /// True when the name appears as a whole word. A name the regex engine
+    /// rejects degrades to a substring check; an empty name never matches.
+    fn is_match(&self, text: &str) -> bool {
+        if self.name.is_empty() {
+            return false;
+        }
+        match &self.pattern {
+            Some(re) => re.is_match(text),
+            None => text.contains(&self.name),
+        }
     }
 }
+
+/// Most recent in-memory (working + session tier) memories content-scanned per
+/// request when the entity index cannot answer on its own.
+const ENTITY_TIER_SCAN_LIMIT: usize = 1000;
+const ENTITY_EPISODE_LIMIT: usize = 200;
+
+/// Age past which a graph's entity index is rebuilt on the request path.
+const ENTITY_INDEX_MAX_AGE_SECS: i64 = 300;
+
+/// Distinct graphs whose index is retained; the engine is shared by every user.
+const ENTITY_INDEX_MAX_GRAPHS: usize = 64;
 
 // =============================================================================
 // LEARNED WEIGHT CONSTANTS
@@ -328,6 +359,13 @@ struct EntityIndexEntry {
     /// Last time this entry was updated
     #[allow(dead_code)]
     last_updated: Option<DateTime<Utc>>,
+}
+
+/// One graph's entity index and when it was built.
+#[derive(Debug, Default)]
+struct GraphEntityIndex {
+    entries: HashMap<String, EntityIndexEntry>,
+    built_at: Option<DateTime<Utc>>,
 }
 
 /// Learned weights for score fusion, adapted via feedback
@@ -626,12 +664,11 @@ pub struct RelevanceEngine {
     /// Neural NER for entity extraction
     ner: Arc<NeuralNer>,
 
-    /// Entity name index for O(1) lookup (entity_name_lower -> memory_ids)
-    /// Populated from GraphMemory on first use or via refresh_entity_index()
-    entity_index: Arc<RwLock<HashMap<String, EntityIndexEntry>>>,
-
-    /// Tracks when entity index was last fully refreshed
-    entity_index_timestamp: Arc<RwLock<Option<DateTime<Utc>>>>,
+    /// Entity name index per graph (entity_name_lower -> memory_ids), keyed by
+    /// the address of the user's `GraphMemory`. The engine is shared across
+    /// users, so one flat index would answer one user's request from another
+    /// user's graph. Populated lazily by `ensure_entity_index`.
+    entity_index: Arc<RwLock<HashMap<usize, GraphEntityIndex>>>,
 
     /// Learned weights for score fusion, adapted via feedback
     learned_weights: Arc<RwLock<LearnedWeights>>,
@@ -646,7 +683,6 @@ impl RelevanceEngine {
         Self {
             ner,
             entity_index: Arc::new(RwLock::new(HashMap::new())),
-            entity_index_timestamp: Arc::new(RwLock::new(None)),
             learned_weights: Arc::new(RwLock::new(LearnedWeights::default())),
             active_ab_test: Arc::new(RwLock::new(None)),
         }
@@ -1304,77 +1340,91 @@ impl RelevanceEngine {
         let mut found_ids: HashSet<Uuid> = HashSet::new();
 
         // =====================================================================
-        // FAST PATH: Use cached entity index for O(1) lookups
+        // INDEX PATH: entity name -> memory IDs from the per-graph entity index
         // =====================================================================
-        {
-            let index = self.entity_index.read();
-            if !index.is_empty() {
-                // Collect candidate memory IDs from index
-                let mut candidate_ids: HashMap<Uuid, (f32, Vec<String>)> = HashMap::new();
-
-                for (name_lower, entity, weight) in &entity_lookup {
-                    if let Some(entry) = index.get(name_lower) {
-                        for &memory_id in &entry.memory_ids {
-                            let score = entity.confidence * weight;
-                            candidate_ids
-                                .entry(memory_id)
-                                .and_modify(|(existing_score, matched)| {
-                                    *existing_score += score;
-                                    if !matched.contains(&entity.name) {
-                                        matched.push(entity.name.clone());
-                                    }
-                                })
-                                .or_insert((score, vec![entity.name.clone()]));
-                        }
-                    }
-                }
-
-                // Fetch memories for candidate IDs
-                if !candidate_ids.is_empty() {
-                    // Sort by score descending and take top candidates
-                    let mut sorted_candidates: Vec<_> = candidate_ids.into_iter().collect();
-                    // Score desc; tie-break by id asc for deterministic candidate selection (RH-10).
-                    sorted_candidates
-                        .sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
-
-                    for (memory_id, (score, matched)) in
-                        sorted_candidates.into_iter().take(max_candidates)
-                    {
-                        let normalized_score = (score / matched.len() as f32).min(1.0);
-                        if normalized_score >= config.entity_threshold {
-                            // Try to get the memory
-                            let mem_id = crate::memory::MemoryId(memory_id);
-                            if let Ok(memory) = memory_system.get_memory(&mem_id) {
-                                found_ids.insert(memory_id);
-                                results.push((memory, normalized_score, matched));
+        let mut indexed_hits = 0usize;
+        if let Some(graph) = graph_memory {
+            let key = Self::graph_key(graph);
+            let mut candidate_ids: HashMap<Uuid, (f32, Vec<String>)> = HashMap::new();
+            for (name_lower, entity, weight) in &entity_lookup {
+                let memory_ids = self.indexed_memory_ids(key, name_lower).or_else(|| {
+                    let node = graph
+                        .find_entity_by_name_strict(name_lower)
+                        .ok()
+                        .flatten()?;
+                    let episodes = graph
+                        .get_episodes_by_entity_limited(&node.uuid, ENTITY_EPISODE_LIMIT)
+                        .ok()?;
+                    Some(episodes.iter().map(|e| e.uuid).collect::<HashSet<Uuid>>())
+                });
+                let Some(memory_ids) = memory_ids else {
+                    continue;
+                };
+                for memory_id in memory_ids {
+                    let score = entity.confidence * weight;
+                    candidate_ids
+                        .entry(memory_id)
+                        .and_modify(|(existing_score, matched)| {
+                            *existing_score += score;
+                            if !matched.contains(&entity.name) {
+                                matched.push(entity.name.clone());
                             }
-                        }
-                    }
+                        })
+                        .or_insert((score, vec![entity.name.clone()]));
                 }
+            }
 
-                // If cache hit was successful, return early
-                if !results.is_empty() {
-                    return Ok(results);
+            // Score desc; tie-break by id asc for deterministic candidate selection (RH-10).
+            let mut sorted_candidates: Vec<_> = candidate_ids.into_iter().collect();
+            sorted_candidates.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
+
+            for (memory_id, (score, matched)) in sorted_candidates.into_iter().take(max_candidates)
+            {
+                let normalized_score = (score / matched.len() as f32).min(1.0);
+                if normalized_score >= config.entity_threshold {
+                    if let Ok(memory) =
+                        memory_system.get_memory(&crate::memory::MemoryId(memory_id))
+                    {
+                        found_ids.insert(memory_id);
+                        indexed_hits += 1;
+                        results.push((memory, normalized_score, matched));
+                    }
                 }
             }
         }
 
         // =====================================================================
-        // SLOW PATH: Full memory scan (when cache empty or miss)
+        // TIER SCAN: content match over the newest in-memory memories. Covers
+        // memories stored after the index was built, and stands in for the
+        // index when there is no graph. The long-term store is never decoded
+        // on this path.
         // =====================================================================
-        let all_memories = memory_system.get_all_memories()?;
+        let matchers: Vec<EntityMatcher> = entity_lookup
+            .iter()
+            .map(|(name_lower, _, _)| EntityMatcher::new(name_lower))
+            .collect();
 
-        if all_memories.is_empty() {
-            return Ok(results);
-        }
+        let mut tier_seen: HashSet<Uuid> = HashSet::new();
+        let mut recent: Vec<_> = memory_system
+            .get_working_memories()
+            .into_iter()
+            .chain(memory_system.get_session_memories())
+            .filter(|m| tier_seen.insert(m.id.0))
+            .collect();
+        recent.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.0.cmp(&b.id.0))
+        });
+        recent.truncate(ENTITY_TIER_SCAN_LIMIT);
 
-        for shared_memory in &all_memories {
+        for shared_memory in &recent {
             // Early termination: stop when we have enough high-quality candidates
             if results.len() >= max_candidates {
                 break;
             }
 
-            // Skip if already found via cache
+            // Already matched through the index.
             if found_ids.contains(&shared_memory.id.0) {
                 continue;
             }
@@ -1383,21 +1433,25 @@ impl RelevanceEngine {
             let mut matched: Vec<String> = Vec::new();
             let mut match_score = 0.0f32;
 
-            // Check direct text matches with word boundaries
-            for (name_lower, entity, weight) in &entity_lookup {
-                if contains_word(&content_lower, name_lower) {
+            for ((_, entity, weight), matcher) in entity_lookup.iter().zip(&matchers) {
+                if matcher.is_match(&content_lower) {
                     matched.push(entity.name.clone());
                     match_score += entity.confidence * weight;
                 }
             }
 
-            // Normalize score and filter
             if !matched.is_empty() {
                 let normalized_score = (match_score / matched.len() as f32).min(1.0);
                 if normalized_score >= config.entity_threshold {
                     results.push(((**shared_memory).clone(), normalized_score, matched));
                 }
             }
+        }
+
+        // An index hit is a complete answer; the graph traversal below only
+        // widens a search the index could not satisfy.
+        if indexed_hits > 0 {
+            return Ok(results);
         }
 
         // Skip graph memory lookup if we already have enough results (fast path)
@@ -1578,38 +1632,66 @@ impl RelevanceEngine {
     // Entity Index Caching Methods
     // =========================================================================
 
-    /// Refresh the entity index from GraphMemory
+    /// Identity of a user's graph. The engine is shared across users and the
+    /// graph handle is not cloned per request, so its address is the key.
+    fn graph_key(graph_memory: &GraphMemory) -> usize {
+        graph_memory as *const GraphMemory as usize
+    }
+
+    /// Rebuild the entity index for one graph.
     ///
-    /// This builds an O(1) lookup table from entity names to memory IDs.
-    /// Call this periodically or when the graph changes significantly.
-    ///
-    /// Performance: O(E * M) where E = entities, M = avg memories per entity
-    /// Typically completes in <10ms for 1000 entities.
+    /// Maps lowercase entity names to the memory IDs of their episodes. The
+    /// index is assembled before the lock is taken so readers never wait on
+    /// graph I/O.
     pub fn refresh_entity_index(&self, graph_memory: &GraphMemory) -> Result<()> {
-        let mut index = self.entity_index.write();
-        index.clear();
-
         let now = Utc::now();
-        let entities = graph_memory.get_all_entities()?;
-
-        for entity in entities {
+        let mut entries: HashMap<String, EntityIndexEntry> = HashMap::new();
+        for entity in graph_memory.get_all_entities()? {
             let episodes = graph_memory.get_episodes_by_entity(&entity.uuid)?;
-            let episode_ids: HashSet<Uuid> = episodes.iter().map(|e| e.uuid).collect();
-
-            let name_lower = entity.name.to_lowercase();
-            index.insert(
-                name_lower,
+            entries.insert(
+                entity.name.to_lowercase(),
                 EntityIndexEntry {
-                    memory_ids: episode_ids,
+                    memory_ids: episodes.iter().map(|e| e.uuid).collect(),
                     last_updated: Some(now),
                 },
             );
         }
 
-        // Update timestamp
-        *self.entity_index_timestamp.write() = Some(now);
-
+        let mut indexes = self.entity_index.write();
+        if indexes.len() >= ENTITY_INDEX_MAX_GRAPHS {
+            let oldest = indexes
+                .iter()
+                .min_by_key(|(_, idx)| idx.built_at)
+                .map(|(key, _)| *key);
+            if let Some(key) = oldest {
+                indexes.remove(&key);
+            }
+        }
+        indexes.insert(
+            Self::graph_key(graph_memory),
+            GraphEntityIndex {
+                entries,
+                built_at: Some(now),
+            },
+        );
         Ok(())
+    }
+
+    /// Memory ids an explicitly refreshed index holds for `name_lower`, if
+    /// that graph has one. The request path never builds the index: a full
+    /// rebuild walks every entity's episodes, minutes on a large graph.
+    fn indexed_memory_ids(&self, graph_key: usize, name_lower: &str) -> Option<HashSet<Uuid>> {
+        let indexes = self.entity_index.read();
+        let index = indexes.get(&graph_key)?;
+        if index.built_at.is_some_and(|at| {
+            Utc::now().signed_duration_since(at).num_seconds() > ENTITY_INDEX_MAX_AGE_SECS
+        }) {
+            return None;
+        }
+        index
+            .entries
+            .get(name_lower)
+            .map(|entry| entry.memory_ids.clone())
     }
 
     /// Get memory IDs for an entity name using the cached index
@@ -1621,63 +1703,64 @@ impl RelevanceEngine {
         entity_name: &str,
         graph_memory: Option<&GraphMemory>,
     ) -> Option<HashSet<Uuid>> {
+        let graph = graph_memory?;
+        let key = Self::graph_key(graph);
         let name_lower = entity_name.to_lowercase();
 
         // Try cache first
         {
-            let index = self.entity_index.read();
-            if let Some(entry) = index.get(&name_lower) {
+            let indexes = self.entity_index.read();
+            if let Some(entry) = indexes.get(&key).and_then(|i| i.entries.get(&name_lower)) {
                 return Some(entry.memory_ids.clone());
             }
         }
 
-        // Cache miss - try direct lookup if GraphMemory available
-        if let Some(graph) = graph_memory {
-            if let Ok(Some(entity)) = graph.find_entity_by_name(&name_lower) {
-                if let Ok(episodes) = graph.get_episodes_by_entity(&entity.uuid) {
-                    let memory_ids: HashSet<Uuid> = episodes.iter().map(|e| e.uuid).collect();
+        // Cache miss - direct lookup
+        let entity = graph.find_entity_by_name(&name_lower).ok().flatten()?;
+        let episodes = graph.get_episodes_by_entity(&entity.uuid).ok()?;
+        let memory_ids: HashSet<Uuid> = episodes.iter().map(|e| e.uuid).collect();
 
-                    // Update cache with this entry
-                    let mut index = self.entity_index.write();
-                    index.insert(
-                        name_lower,
-                        EntityIndexEntry {
-                            memory_ids: memory_ids.clone(),
-                            last_updated: Some(Utc::now()),
-                        },
-                    );
-
-                    return Some(memory_ids);
-                }
-            }
+        // Only extend an index that exists; a partial index created here would
+        // read as complete to the index path.
+        if let Some(index) = self.entity_index.write().get_mut(&key) {
+            index.entries.insert(
+                name_lower,
+                EntityIndexEntry {
+                    memory_ids: memory_ids.clone(),
+                    last_updated: Some(Utc::now()),
+                },
+            );
         }
-
-        None
+        Some(memory_ids)
     }
 
-    /// Check if entity index needs refresh (older than max_age_hours)
-    pub fn entity_index_needs_refresh(&self, max_age_hours: i64) -> bool {
-        let timestamp = self.entity_index_timestamp.read();
-        match *timestamp {
+    /// Whether the graph's index is missing or older than `max_age_secs`.
+    pub fn entity_index_needs_refresh(
+        &self,
+        graph_memory: &GraphMemory,
+        max_age_secs: i64,
+    ) -> bool {
+        let indexes = self.entity_index.read();
+        match indexes
+            .get(&Self::graph_key(graph_memory))
+            .and_then(|i| i.built_at)
+        {
             None => true,
-            Some(ts) => {
-                let age = Utc::now().signed_duration_since(ts);
-                age.num_hours() > max_age_hours
-            }
+            Some(ts) => Utc::now().signed_duration_since(ts).num_seconds() > max_age_secs,
         }
     }
 
-    /// Get entity index statistics
-    pub fn entity_index_stats(&self) -> (usize, Option<DateTime<Utc>>) {
-        let index = self.entity_index.read();
-        let timestamp = *self.entity_index_timestamp.read();
-        (index.len(), timestamp)
+    /// Entity index statistics: (entities indexed for the graph, last build time).
+    pub fn entity_index_stats(&self, graph_memory: &GraphMemory) -> (usize, Option<DateTime<Utc>>) {
+        let indexes = self.entity_index.read();
+        indexes
+            .get(&Self::graph_key(graph_memory))
+            .map_or((0, None), |i| (i.entries.len(), i.built_at))
     }
 
-    /// Clear the entity index (useful for testing or memory pressure)
+    /// Clear every graph's entity index (useful for testing or memory pressure)
     pub fn clear_entity_index(&self) {
         self.entity_index.write().clear();
-        *self.entity_index_timestamp.write() = None;
     }
 }
 
@@ -1844,6 +1927,55 @@ mod tests {
         let old = Utc::now() - chrono::Duration::hours(48);
         let not_boosted = engine.apply_recency_boost(0.5, old, 24, 1.2);
         assert!((not_boosted - 0.5).abs() < 0.001);
+    }
+
+    /// The per-memory, per-entity compile this matcher replaced; kept as the
+    /// oracle the precompiled matcher must agree with.
+    fn reference_contains_word(text: &str, word: &str) -> bool {
+        if word.is_empty() {
+            return false;
+        }
+        match Regex::new(&format!(r"(?i)\b{}\b", regex::escape(word))) {
+            Ok(re) => re.is_match(text),
+            Err(_) => text.contains(word),
+        }
+    }
+
+    #[test]
+    fn test_entity_matcher_word_boundary_and_case() {
+        let cases = [
+            ("mit", "i will submit the form", false),
+            ("mit", "studied at mit last year", true),
+            ("mit", "mit.", true),
+            ("mit", "(mit)", true),
+            ("rust", "rust is great", true),
+            ("rust", "trusted", false),
+            ("rust", "rusty", false),
+            ("new york", "flew to new york today", true),
+            ("new york", "new yorker", false),
+            ("c++", "we use c++ daily", false),
+            // \b after a non-word final char needs a word char next: pinned as-is.
+            ("c++", "c++x", true),
+            ("a.b", "see a.b here", true),
+            ("a.b", "see axb here", false),
+            ("zürich", "in zürich now", true),
+            ("", "anything", false),
+        ];
+        for (name, text, expected) in cases {
+            let matcher = EntityMatcher::new(name);
+            assert_eq!(matcher.is_match(text), expected, "{name:?} in {text:?}");
+            assert_eq!(
+                matcher.is_match(text),
+                reference_contains_word(text, name),
+                "matcher diverges from the per-call regex for {name:?} in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_entity_matcher_case_insensitive_name() {
+        assert!(EntityMatcher::new("Rust").is_match("rust lang"));
+        assert!(EntityMatcher::new("rust").is_match("RUST lang"));
     }
 
     #[test]

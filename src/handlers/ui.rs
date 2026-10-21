@@ -1248,7 +1248,8 @@ pub async fn ui_tags(
         authenticated_user.as_ref().map(|e| &e.0),
     )?;
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let params = TagsParams {
         include_hidden: q.include_hidden,
@@ -1304,7 +1305,8 @@ pub async fn ui_recall_log(
         authenticated_user.as_ref().map(|e| &e.0),
     )?;
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let since = q.since.unwrap_or(DateTime::<Utc>::MIN_UTC);
     let limit = q.limit.unwrap_or(200).clamp(1, 5_000);
@@ -1341,7 +1343,8 @@ pub async fn ui_knows(
         authenticated_user.as_ref().map(|e| &e.0),
     )?;
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let graph = state.get_user_graph(&user_id);
     let uid = user_id.clone();

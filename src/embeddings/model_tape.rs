@@ -13,8 +13,9 @@
 //!
 //! (`SHODH_MODEL_TAPE_*` are read when the `VELD_` name is unset.) A model is on the
 //! tape only if it loaded: veld's shipped NER is the rule-based extractor, which is
-//! code rather than a model and is never taped. The HTTP and Nomic embedders are not
-//! taped either, so a tape measures the MiniLM pipeline only.
+//! code rather than a model and is never taped. Of the embedders, MiniLM and
+//! arctic-embed-xs are taped; each registers its own files, so a tape recorded under one
+//! refuses to replay under the other. The HTTP and Nomic embedders are not taped.
 //!
 //! **A replay miss must never be absorbed.** This codebase degrades on purpose when a
 //! model fails: the embedder falls back to simplified embeddings, NER to the rule-based

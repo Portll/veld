@@ -113,6 +113,11 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub use_reranking: Option<bool>,
 
+    /// Override whether Layer 5.4 MMR diversification runs. `None` keeps the engine default
+    /// ([`crate::constants::MMR_ENABLED_DEFAULT`], off).
+    #[serde(default)]
+    pub use_mmr: Option<bool>,
+
     /// Override the initial candidate-pool size. `None` keeps the engine default.
     #[serde(default)]
     pub candidate_count: Option<usize>,
@@ -135,10 +140,33 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub turn_context_embedding: Option<bool>,
 
+    /// Fused candidates kept for the cross-encoder layer (recall Layer 4's truncation).
+    /// `None` keeps 30, or 50 for a decomposed query; the pool never drops below
+    /// `rerank_count`. Raising `rerank_count` alone cannot reach gold that the truncation
+    /// already cut.
+    #[serde(default)]
+    pub rerank_pool: Option<usize>,
+
+    /// Which cross-encoder reranks, by registry id
+    /// (`crate::embeddings::cross_encoder::lookup`). `None` keeps the process-wide choice
+    /// (`VELD_CROSS_ENCODER`, else mxbai-rerank-xsmall-v1). Set to
+    /// `ms-marco-MiniLM-L-6-v2` for the recall gate's parity arm against upstream.
+    /// [`CognitiveDials::sanitized`] drops an id the registry does not know, so what
+    /// `GET /api/dials` returns is what reranks.
+    #[serde(default)]
+    pub rerank_model: Option<String>,
+
     /// Override the RRF fusion weights `(bm25, vector, graph)`. `None` keeps the
     /// engine/learned weights.
     #[serde(default)]
     pub rrf_weights: Option<(f32, f32, f32)>,
+
+    /// Whether recall adds the date window candidate leg: when a query names a
+    /// calendar day or month-year, memories whose `created_at` falls in that window
+    /// enter RRF fusion as their own candidate list (recall.rs Layer 4). `None` and
+    /// `Some(true)` run it; `Some(false)` leaves the window to the temporal boost only.
+    #[serde(default)]
+    pub date_window_leg: Option<bool>,
 
     // ---- Recall ranking sliders (None = compile-time constant default) ---------------
     // Overlay the historical `const`s in recall.rs / hybrid_search.rs / constants.rs.
@@ -168,12 +196,54 @@ pub struct CognitiveDials {
     /// Ontological rerank mismatch penalty (negative). Default -0.08.
     #[serde(default)]
     pub onto_rerank_penalty: Option<f32>,
-    /// Cross-encoder blend weight into the fused score. Default 0.4.
+    /// Cross-encoder share of the Layer 5.3 blend for every query shape at once, except that
+    /// Abstract (decomposed) never drops below its own share. `None` lets the per-shape dials
+    /// and `constants::CE_BLEND_*` decide. See `ce_share`.
     #[serde(default)]
     pub ce_blend: Option<f32>,
     /// Temporal-fact source-memory boost. Default 0.20.
     #[serde(default)]
     pub temporal_recall_boost: Option<f32>,
+    /// Cross-encoder share for one query shape; each overrides its `constants::CE_BLEND_*`
+    /// default and is itself overridden by `ce_blend`. See `ce_share`.
+    #[serde(default)]
+    pub ce_blend_identifier: Option<f32>,
+    #[serde(default)]
+    pub ce_blend_ordinal: Option<f32>,
+    #[serde(default)]
+    pub ce_blend_temporal: Option<f32>,
+    #[serde(default)]
+    pub ce_blend_people: Option<f32>,
+    #[serde(default)]
+    pub ce_blend_keyword: Option<f32>,
+    #[serde(default)]
+    pub ce_blend_exploratory: Option<f32>,
+    #[serde(default)]
+    pub ce_blend_attribute: Option<f32>,
+    #[serde(default)]
+    pub ce_blend_relational: Option<f32>,
+    #[serde(default)]
+    pub ce_blend_abstract: Option<f32>,
+    /// Layer 5.36 query-term coverage weight; `0` disables. Default
+    /// `constants::QUERY_COVERAGE_WEIGHT`.
+    #[serde(default)]
+    pub query_coverage_weight: Option<f32>,
+    /// Layer 5.37 person-density boost ceiling for people questions; `0` disables. Default
+    /// `constants::PEOPLE_BOOST_MAX`.
+    #[serde(default)]
+    pub people_boost_max: Option<f32>,
+    /// Pseudo-relevance feedback leg. Default `constants::PRF_ENABLED_DEFAULT`.
+    #[serde(default)]
+    pub use_prf: Option<bool>,
+    /// Top first-pass documents PRF reads terms from. Default `constants::PRF_DOCS`.
+    #[serde(default)]
+    pub prf_docs: Option<usize>,
+    /// Expansion terms PRF appends. Default `constants::PRF_TERMS`.
+    #[serde(default)]
+    pub prf_terms: Option<usize>,
+    /// PRF leg weight as a fraction of the hybrid weight. Default `constants::PRF_WEIGHT`.
+    #[serde(default)]
+    pub prf_weight: Option<f32>,
     /// MMR diversity λ for exploratory queries. Default 0.6.
     #[serde(default)]
     pub mmr_lambda_exploratory: Option<f32>,
@@ -202,7 +272,8 @@ pub struct CognitiveDials {
     /// `entity_confidence`, `access_burstiness`, `valence`,
     /// `bm25_specificity_discount`, `episode_tcm`, `confidence_gate`,
     /// `content_fallback`, `mmr`, `ordinal_cliff`, `arousal`,
-    /// `valence_credibility`, `session_continuity`, `hebbian`.
+    /// `valence_credibility`, `session_continuity`, `hebbian`, `query_coverage`,
+    /// `people_density`, `prf`.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
 }
@@ -315,12 +386,166 @@ pub const RECALL_SLIDER_SPECS: &[RecallSliderSpec] = &[
     RecallSliderSpec {
         id: "ce_blend",
         group: "Rerank",
-        label: "Cross-encoder blend",
-        default: 0.4,
+        label: "Cross-encoder blend (all shapes)",
+        default: 0.18,
         rec_lo: 0.0,
         rec_hi: 0.6,
         abs_lo: 0.0,
         abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_identifier",
+        group: "Rerank",
+        label: "CE share · identifier",
+        default: 0.0,
+        rec_lo: 0.0,
+        rec_hi: 0.1,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_ordinal",
+        group: "Rerank",
+        label: "CE share · ordinal",
+        default: 0.05,
+        rec_lo: 0.0,
+        rec_hi: 0.2,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_temporal",
+        group: "Rerank",
+        label: "CE share · temporal",
+        default: 0.18,
+        rec_lo: 0.0,
+        rec_hi: 0.3,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_people",
+        group: "Rerank",
+        label: "CE share · people",
+        default: 0.18,
+        rec_lo: 0.0,
+        rec_hi: 0.3,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_keyword",
+        group: "Rerank",
+        label: "CE share · keyword",
+        default: 0.10,
+        rec_lo: 0.0,
+        rec_hi: 0.3,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_exploratory",
+        group: "Rerank",
+        label: "CE share · exploratory",
+        default: 0.18,
+        rec_lo: 0.1,
+        rec_hi: 0.4,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_attribute",
+        group: "Rerank",
+        label: "CE share · attribute",
+        default: 0.30,
+        rec_lo: 0.2,
+        rec_hi: 0.5,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_relational",
+        group: "Rerank",
+        label: "CE share · relational",
+        default: 0.35,
+        rec_lo: 0.2,
+        rec_hi: 0.6,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_abstract",
+        group: "Rerank",
+        label: "CE share · abstract",
+        default: 0.45,
+        rec_lo: 0.3,
+        rec_hi: 0.7,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "query_coverage_weight",
+        group: "Weights",
+        label: "Query-term coverage",
+        default: 0.25,
+        rec_lo: 0.1,
+        rec_hi: 0.4,
+        abs_lo: 0.0,
+        abs_hi: 0.9,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "people_boost_max",
+        group: "Weights",
+        label: "People-question boost",
+        default: 0.0,
+        rec_lo: 0.05,
+        rec_hi: 0.3,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "prf_docs",
+        group: "Expansion",
+        label: "PRF documents",
+        default: 3.0,
+        rec_lo: 2.0,
+        rec_hi: 5.0,
+        abs_lo: 1.0,
+        abs_hi: 20.0,
+        step: 1.0,
+    },
+    RecallSliderSpec {
+        id: "prf_terms",
+        group: "Expansion",
+        label: "PRF terms",
+        default: 5.0,
+        rec_lo: 3.0,
+        rec_hi: 10.0,
+        abs_lo: 1.0,
+        abs_hi: 30.0,
+        step: 1.0,
+    },
+    RecallSliderSpec {
+        id: "prf_weight",
+        group: "Expansion",
+        label: "PRF leg weight",
+        default: 0.3,
+        rec_lo: 0.1,
+        rec_hi: 0.6,
+        abs_lo: 0.0,
+        abs_hi: 2.0,
         step: 0.05,
     },
     RecallSliderSpec {
@@ -409,11 +634,15 @@ impl Default for CognitiveDials {
             working_memory_threshold: default_working_memory_threshold(),
             refiner_mode: None,
             use_reranking: None,
+            use_mmr: None,
             candidate_count: None,
             rerank_count: None,
             turn_context: None,
             turn_context_embedding: None,
+            rerank_pool: None,
+            rerank_model: None,
             rrf_weights: None,
+            date_window_leg: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
             rrf_k_inner: None,
@@ -423,6 +652,21 @@ impl Default for CognitiveDials {
             onto_rerank_max: None,
             onto_rerank_penalty: None,
             ce_blend: None,
+            ce_blend_identifier: None,
+            ce_blend_ordinal: None,
+            ce_blend_temporal: None,
+            ce_blend_people: None,
+            ce_blend_keyword: None,
+            ce_blend_exploratory: None,
+            ce_blend_attribute: None,
+            ce_blend_relational: None,
+            ce_blend_abstract: None,
+            query_coverage_weight: None,
+            people_boost_max: None,
+            use_prf: None,
+            prf_docs: None,
+            prf_terms: None,
+            prf_weight: None,
             temporal_recall_boost: None,
             mmr_lambda_exploratory: None,
             mmr_lambda_abstract: None,
@@ -449,6 +693,22 @@ impl CognitiveDials {
         if let Some(r) = self.rerank_count {
             self.rerank_count = Some(r.clamp(1, 200));
         }
+        if let Some(p) = self.rerank_pool {
+            self.rerank_pool = Some(p.clamp(10, 500));
+        }
+        self.rerank_model = self.rerank_model.take().and_then(|id| {
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            match crate::embeddings::cross_encoder::lookup(id) {
+                Ok(_) => Some(id.to_string()),
+                Err(e) => {
+                    tracing::warn!("rerank_model dial dropped: {e:#}");
+                    None
+                }
+            }
+        });
         if let Some((b, v, g)) = self.rrf_weights {
             self.rrf_weights = Some((b.clamp(0.0, 1.0), v.clamp(0.0, 1.0), g.clamp(0.0, 1.0)));
         }
@@ -467,6 +727,20 @@ impl CognitiveDials {
         cl(&mut self.onto_rerank_max, 0.0, 1.0);
         cl(&mut self.onto_rerank_penalty, -1.0, 0.0);
         cl(&mut self.ce_blend, 0.0, 1.0);
+        cl(&mut self.ce_blend_identifier, 0.0, 1.0);
+        cl(&mut self.ce_blend_ordinal, 0.0, 1.0);
+        cl(&mut self.ce_blend_temporal, 0.0, 1.0);
+        cl(&mut self.ce_blend_people, 0.0, 1.0);
+        cl(&mut self.ce_blend_keyword, 0.0, 1.0);
+        cl(&mut self.ce_blend_exploratory, 0.0, 1.0);
+        cl(&mut self.ce_blend_attribute, 0.0, 1.0);
+        cl(&mut self.ce_blend_relational, 0.0, 1.0);
+        cl(&mut self.ce_blend_abstract, 0.0, 1.0);
+        cl(&mut self.query_coverage_weight, 0.0, 0.9);
+        cl(&mut self.people_boost_max, 0.0, 1.0);
+        cl(&mut self.prf_weight, 0.0, 2.0);
+        self.prf_docs = self.prf_docs.map(|v| v.clamp(1, 20));
+        self.prf_terms = self.prf_terms.map(|v| v.clamp(1, 30));
         cl(&mut self.temporal_recall_boost, 0.0, 1.0);
         cl(&mut self.mmr_lambda_exploratory, 0.0, 1.0);
         cl(&mut self.mmr_lambda_abstract, 0.0, 1.0);
@@ -506,13 +780,42 @@ impl CognitiveDials {
         self.turn_context_enabled() && self.turn_context_embedding.unwrap_or(false)
     }
 
+    /// Cross-encoder share of the Layer 5.3 blend for a query shape: `ce_blend` when set,
+    /// else the shape's own dial, else its `constants::CE_BLEND_*` default.
+    pub fn ce_share(&self, shape: crate::memory::query_parser::RerankShape) -> f32 {
+        use crate::constants as c;
+        use crate::memory::query_parser::RerankShape as S;
+        // A global share overrides every shape except Abstract (decomposed), which keeps its
+        // own share as a floor: the reranker is what reads abstract membership ("is a Redis
+        // fix a performance improvement?"), so lowering every shape must not lower that one.
+        // Only `ce_blend_abstract` lowers it.
+        if let Some(all) = self.ce_blend {
+            return match shape {
+                S::Abstract => all.max(self.ce_blend_abstract.unwrap_or(c::CE_BLEND_ABSTRACT)),
+                _ => all,
+            };
+        }
+        let (dial, default) = match shape {
+            S::Identifier => (self.ce_blend_identifier, c::CE_BLEND_IDENTIFIER),
+            S::Ordinal => (self.ce_blend_ordinal, c::CE_BLEND_ORDINAL),
+            S::Temporal => (self.ce_blend_temporal, c::CE_BLEND_TEMPORAL),
+            S::People => (self.ce_blend_people, c::CE_BLEND_PEOPLE),
+            S::Keyword => (self.ce_blend_keyword, c::CE_BLEND_KEYWORD),
+            S::Exploratory => (self.ce_blend_exploratory, c::CE_BLEND_EXPLORATORY),
+            S::Attribute => (self.ce_blend_attribute, c::CE_BLEND_ATTRIBUTE),
+            S::Relational => (self.ce_blend_relational, c::CE_BLEND_RELATIONAL),
+            S::Abstract => (self.ce_blend_abstract, c::CE_BLEND_ABSTRACT),
+        };
+        dial.unwrap_or(default)
+    }
+
     /// Seed dials from process environment (`VELD_*`), overlaying [`Default`]. Used at
     /// `MemorySystem` construction. Unset vars keep the (inert) default. Result is
     /// [`sanitized`](Self::sanitized). Recognized vars:
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
-    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT}`.
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -555,6 +858,9 @@ impl CognitiveDials {
         if let Some(v) = env_bool("VELD_DIALS_USE_RERANKING") {
             d.use_reranking = Some(v);
         }
+        if let Some(v) = env_bool("VELD_DIALS_USE_MMR") {
+            d.use_mmr = Some(v);
+        }
         if let Some(v) = env_parse::<usize>("VELD_DIALS_CANDIDATE_COUNT") {
             d.candidate_count = Some(v);
         }
@@ -566,6 +872,15 @@ impl CognitiveDials {
         }
         if let Some(v) = env_bool("VELD_DIALS_TURN_CONTEXT_EMBEDDING") {
             d.turn_context_embedding = Some(v);
+        }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_POOL") {
+            d.rerank_pool = Some(v);
+        }
+        if let Ok(v) = std::env::var("VELD_DIALS_RERANK_MODEL") {
+            d.rerank_model = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_DATE_WINDOW_LEG") {
+            d.date_window_leg = Some(v);
         }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
@@ -580,6 +895,30 @@ impl CognitiveDials {
         d.onto_rerank_penalty =
             env_parse::<f32>("VELD_TUNE_ONTO_RERANK_PENALTY").or(d.onto_rerank_penalty);
         d.ce_blend = env_parse::<f32>("VELD_TUNE_CE_BLEND").or(d.ce_blend);
+        d.ce_blend_identifier =
+            env_parse::<f32>("VELD_TUNE_CE_BLEND_IDENTIFIER").or(d.ce_blend_identifier);
+        d.ce_blend_ordinal = env_parse::<f32>("VELD_TUNE_CE_BLEND_ORDINAL").or(d.ce_blend_ordinal);
+        d.ce_blend_temporal =
+            env_parse::<f32>("VELD_TUNE_CE_BLEND_TEMPORAL").or(d.ce_blend_temporal);
+        d.ce_blend_people = env_parse::<f32>("VELD_TUNE_CE_BLEND_PEOPLE").or(d.ce_blend_people);
+        d.ce_blend_keyword = env_parse::<f32>("VELD_TUNE_CE_BLEND_KEYWORD").or(d.ce_blend_keyword);
+        d.ce_blend_exploratory =
+            env_parse::<f32>("VELD_TUNE_CE_BLEND_EXPLORATORY").or(d.ce_blend_exploratory);
+        d.ce_blend_attribute =
+            env_parse::<f32>("VELD_TUNE_CE_BLEND_ATTRIBUTE").or(d.ce_blend_attribute);
+        d.ce_blend_relational =
+            env_parse::<f32>("VELD_TUNE_CE_BLEND_RELATIONAL").or(d.ce_blend_relational);
+        d.ce_blend_abstract =
+            env_parse::<f32>("VELD_TUNE_CE_BLEND_ABSTRACT").or(d.ce_blend_abstract);
+        d.query_coverage_weight =
+            env_parse::<f32>("VELD_TUNE_QUERY_COVERAGE_WEIGHT").or(d.query_coverage_weight);
+        d.people_boost_max = env_parse::<f32>("VELD_TUNE_PEOPLE_BOOST_MAX").or(d.people_boost_max);
+        if let Some(v) = env_bool("VELD_DIALS_USE_PRF") {
+            d.use_prf = Some(v);
+        }
+        d.prf_docs = env_parse::<usize>("VELD_TUNE_PRF_DOCS").or(d.prf_docs);
+        d.prf_terms = env_parse::<usize>("VELD_TUNE_PRF_TERMS").or(d.prf_terms);
+        d.prf_weight = env_parse::<f32>("VELD_TUNE_PRF_WEIGHT").or(d.prf_weight);
         d.temporal_recall_boost =
             env_parse::<f32>("VELD_TUNE_TEMPORAL_RECALL_BOOST").or(d.temporal_recall_boost);
         d.mmr_lambda_exploratory =
@@ -619,14 +958,45 @@ mod tests {
         assert!(d.turn_context_enabled());
         assert!(d.turn_context_embedding.is_none());
         assert!(!d.turn_context_embedding_enabled());
+        assert!(d.use_mmr.is_none());
         assert!(d.candidate_count.is_none());
+        assert!(d.rerank_count.is_none());
+        assert!(d.rerank_pool.is_none());
+        assert!(d.rerank_model.is_none());
         assert!(d.rrf_weights.is_none());
+        assert!(d.date_window_leg.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,
             crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS
         );
         // disabled_signals must be empty by default — every signal enabled.
         assert!(d.disabled_signals.is_empty());
+    }
+
+    #[test]
+    fn ce_share_resolves_global_then_shape_then_constant() {
+        use crate::memory::query_parser::RerankShape as S;
+        let mut d = CognitiveDials::default();
+        assert_eq!(
+            d.ce_share(S::Exploratory),
+            crate::constants::CE_BLEND_EXPLORATORY
+        );
+        assert_eq!(
+            d.ce_share(S::Identifier),
+            crate::constants::CE_BLEND_IDENTIFIER
+        );
+        d.ce_blend_relational = Some(0.5);
+        assert_eq!(d.ce_share(S::Relational), 0.5);
+        assert_eq!(d.ce_share(S::Abstract), crate::constants::CE_BLEND_ABSTRACT);
+        d.ce_blend = Some(0.2);
+        assert_eq!(d.ce_share(S::Relational), 0.2);
+        assert_eq!(d.ce_share(S::Identifier), 0.2);
+        assert_eq!(d.ce_share(S::Abstract), crate::constants::CE_BLEND_ABSTRACT);
+        d.ce_blend = Some(0.6);
+        assert_eq!(d.ce_share(S::Abstract), 0.6);
+        d.ce_blend = Some(0.2);
+        d.ce_blend_abstract = Some(0.3);
+        assert_eq!(d.ce_share(S::Abstract), 0.3);
     }
 
     /// SD-1: With empty disabled_signals, signal_enabled returns true for every
@@ -651,6 +1021,9 @@ mod tests {
             "valence_credibility",
             "session_continuity",
             "hebbian",
+            "query_coverage",
+            "people_density",
+            "prf",
         ];
         for id in &all_ids {
             assert!(
@@ -740,16 +1113,48 @@ mod tests {
             embedding_blend: 0.9,
             candidate_count: Some(100_000),
             rerank_count: Some(0),
+            rerank_pool: Some(5),
             rrf_weights: Some((2.0, -1.0, 0.5)),
             ..Default::default()
         }
         .sanitized();
+        assert_eq!(d.rerank_pool, Some(10));
         assert_eq!(d.reconsolidation_window_secs, 30);
         assert_eq!(d.graph_boost_scale, 1.0);
         assert_eq!(d.embedding_blend, 0.5);
         assert_eq!(d.candidate_count, Some(1000));
         assert_eq!(d.rerank_count, Some(1));
         assert_eq!(d.rrf_weights, Some((1.0, 0.0, 0.5)));
+    }
+
+    /// The reranker dials round-trip through the JSON the `/api/dials` routes carry, and
+    /// sanitising keeps a registry id, trims it, and drops an unknown or empty one.
+    #[test]
+    fn rerank_model_and_count_round_trip_and_sanitise() {
+        let set = CognitiveDials {
+            rerank_model: Some("  ms-marco-MiniLM-L-6-v2 ".to_string()),
+            rerank_count: Some(30),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        let back: CognitiveDials = serde_json::from_str(&json).unwrap();
+        let back = back.sanitized();
+        assert_eq!(back.rerank_model.as_deref(), Some("ms-marco-MiniLM-L-6-v2"));
+        assert_eq!(back.rerank_count, Some(30));
+
+        let unknown = CognitiveDials {
+            rerank_model: Some("no-such-reranker".to_string()),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(unknown.rerank_model, None);
+
+        let empty = CognitiveDials {
+            rerank_model: Some("   ".to_string()),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(empty.rerank_model, None);
     }
 
     #[test]

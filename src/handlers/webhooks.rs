@@ -6,7 +6,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Extension, Query, State,
     },
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -18,6 +18,9 @@ use std::convert::Infallible;
 use tokio_stream::wrappers::BroadcastStream;
 
 use super::state::MultiUserMemoryManager;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
+use crate::errors::AppError;
 use crate::relevance;
 use crate::streaming;
 use crate::validation;
@@ -65,14 +68,22 @@ pub async fn context_status_sse(
 ///
 /// Streams CREATE, RETRIEVE, DELETE events to connected dashboard clients.
 /// Accepts optional `?user_id=X` query parameter to filter events.
-/// Without user_id, no events are sent (secure by default).
+/// Without user_id, no events are sent (secure by default). A tenant-bound key
+/// streams its own user's events and is refused any other `user_id`.
 pub async fn memory_events_sse(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<SseQuery>,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let filter_user_id = match authenticated_user {
+        Some(Extension(authenticated_user)) => Some(resolve_request_user_id(
+            params.user_id.as_deref(),
+            Some(&authenticated_user),
+        )?),
+        None => params.user_id,
+    };
     let receiver = state.subscribe_events();
     let stream = BroadcastStream::new(receiver);
-    let filter_user_id = params.user_id;
 
     let event_stream = stream.filter_map(move |result| {
         let filter_uid = filter_user_id.clone();
@@ -96,11 +107,11 @@ pub async fn memory_events_sse(
         }
     });
 
-    Sse::new(event_stream).keep_alive(
+    Ok(Sse::new(event_stream).keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("heartbeat"),
-    )
+    ))
 }
 
 // =============================================================================
@@ -124,12 +135,18 @@ pub async fn memory_events_sse(
 pub async fn streaming_memory_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_streaming_socket(socket, state))
+    let bound_user = authenticated_user.map(|Extension(user)| user);
+    ws.on_upgrade(|socket| handle_streaming_socket(socket, state, bound_user))
 }
 
 /// Handle WebSocket connection for streaming memory ingestion
-async fn handle_streaming_socket(socket: WebSocket, state: AppState) {
+async fn handle_streaming_socket(
+    socket: WebSocket,
+    state: AppState,
+    bound_user: Option<AuthenticatedUser>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let mut session_id: Option<String> = None;
 
@@ -168,6 +185,23 @@ async fn handle_streaming_socket(socket: WebSocket, state: AppState) {
                 return;
             }
         };
+
+        if let Err(e) = resolve_request_user_id(Some(&handshake.user_id), bound_user.as_ref()) {
+            let error = streaming::ExtractionResult::Error {
+                code: "INVALID_USER_ID".to_string(),
+                message: e.to_string(),
+                fatal: true,
+                timestamp: chrono::Utc::now(),
+            };
+            let _ = sender
+                .send(Message::Text(
+                    serde_json::to_string(&error)
+                        .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                        .into(),
+                ))
+                .await;
+            return;
+        }
 
         // Validate user_id
         if let Err(e) = validation::validate_user_id(&handshake.user_id) {
@@ -288,7 +322,7 @@ async fn handle_streaming_socket(socket: WebSocket, state: AppState) {
             .get_session_stats(&session_id)
             .await;
         match stats {
-            Some(s) => match state.get_user_memory(&s.user_id) {
+            Some(s) => match state.get_user_memory_async(&s.user_id).await {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!("Failed to get user memory: {}", e);
@@ -384,12 +418,18 @@ async fn handle_streaming_socket(socket: WebSocket, state: AppState) {
 pub async fn context_monitor_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_context_monitor_socket(socket, state))
+    let bound_user = authenticated_user.map(|Extension(user)| user);
+    ws.on_upgrade(|socket| handle_context_monitor_socket(socket, state, bound_user))
 }
 
 /// Handle WebSocket connection for context monitoring
-async fn handle_context_monitor_socket(socket: WebSocket, state: AppState) {
+async fn handle_context_monitor_socket(
+    socket: WebSocket,
+    state: AppState,
+    bound_user: Option<AuthenticatedUser>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let mut user_id: Option<String> = None;
     let mut config = relevance::RelevanceConfig::default();
@@ -431,6 +471,23 @@ async fn handle_context_monitor_socket(socket: WebSocket, state: AppState) {
                 return;
             }
         };
+
+        if let Err(e) = resolve_request_user_id(Some(&handshake.user_id), bound_user.as_ref()) {
+            let error = relevance::ContextMonitorResponse::Error {
+                code: "INVALID_USER_ID".to_string(),
+                message: e.to_string(),
+                fatal: true,
+                timestamp: chrono::Utc::now(),
+            };
+            let _ = sender
+                .send(Message::Text(
+                    serde_json::to_string(&error)
+                        .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                        .into(),
+                ))
+                .await;
+            return;
+        }
 
         // Validate user_id
         if let Err(e) = validation::validate_user_id(&handshake.user_id) {
@@ -485,7 +542,7 @@ async fn handle_context_monitor_socket(socket: WebSocket, state: AppState) {
     };
 
     // Get user memory and graph systems
-    let memory_sys = match state.get_user_memory(&user_id) {
+    let memory_sys = match state.get_user_memory_async(&user_id).await {
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Failed to get user memory: {}", e);

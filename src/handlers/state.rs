@@ -298,6 +298,14 @@ pub struct MultiUserMemoryManager {
     /// access; this guards against re-running it on every cache miss.
     reconciled_users: DashMap<String, ()>,
 
+    /// Set by [`Self::close_all_writes`]; a tenant opened after it starts closed.
+    writes_closed: std::sync::atomic::AtomicBool,
+
+    /// Callers that missed the tenant cache and do not have their tenant yet: the one
+    /// opening it and any queued on its init lock. Non-zero means a tenant is opening,
+    /// and `/health/ready` answers 503 until it has.
+    tenant_open_waiters: std::sync::atomic::AtomicUsize,
+
     /// (b) Live wiki edit-back watchers, one per user, kept alive here so the
     /// `notify` watcher keeps running (dropping the handle stops it). The
     /// `Mutex` only satisfies `Sync` — the value is a keep-alive handle, never
@@ -354,24 +362,16 @@ pub struct MultiUserMemoryManager {
     pub task_tracker: tokio_util::task::TaskTracker,
 }
 
+/// Written into a tenant's directory by a backup restore and removed by the C2
+/// reconcile that follows. A backup stages the journal before checkpointing the
+/// primary store, so a memory deleted between the two is live in the restored log
+/// but absent from the restored store; for a restored tenant that is an
+/// acknowledged delete, not a lost write.
+const RESTORED_FROM_BACKUP_MARKER: &str = ".restored-from-backup";
+
 /// User directories under the data root. An unreadable entry is an error, not a
 /// skipped user: the boot guard must see every tenant or refuse.
 pub(crate) fn list_user_dirs(base_path: &std::path::Path) -> std::io::Result<Vec<String>> {
-    const SYSTEM_DIRS: &[&str] = &[
-        "audit_logs",
-        "audit_logs.pre_cf_migration",
-        "backups",
-        "feedback",
-        "feedback.pre_cf_migration",
-        "semantic_facts",
-        "files",
-        "files.pre_cf_migration",
-        "prospective",
-        "prospective.pre_cf_migration",
-        "todos",
-        "todos.pre_cf_migration",
-        "shared",
-    ];
     let mut users = Vec::new();
     for entry in std::fs::read_dir(base_path)? {
         let entry = entry?;
@@ -379,13 +379,30 @@ pub(crate) fn list_user_dirs(base_path: &std::path::Path) -> std::io::Result<Vec
             continue;
         }
         if let Some(name) = entry.file_name().to_str() {
-            if !SYSTEM_DIRS.contains(&name) {
+            if !crate::validation::is_reserved_data_dir(name) {
                 users.push(name.to_string());
             }
         }
     }
     users.sort();
     Ok(users)
+}
+
+/// One count in `MultiUserMemoryManager::tenant_open_waiters` for as long as it lives, so
+/// every way out of `get_user_memory`'s slow path, errors included, gives it back.
+struct TenantOpenWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> TenantOpenWaiter<'a> {
+    fn enter(waiters: &'a std::sync::atomic::AtomicUsize) -> Self {
+        waiters.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(waiters)
+    }
+}
+
+impl Drop for TenantOpenWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl MultiUserMemoryManager {
@@ -569,10 +586,12 @@ impl MultiUserMemoryManager {
         // 256MB pool with LRU eviction of the coldest blocks across all users.
         #[cfg(feature = "rocksdb")]
         let shared_rocksdb_cache = {
-            let cache = rocksdb::Cache::new_lru_cache(crate::constants::ROCKSDB_SHARED_CACHE_BYTES);
+            let cache_bytes =
+                crate::config::StorageTuning::process().rocksdb_shared_block_cache_bytes();
+            let cache = rocksdb::Cache::new_lru_cache(cache_bytes);
             info!(
                 "Shared RocksDB block cache initialized ({}MB)",
-                crate::constants::ROCKSDB_SHARED_CACHE_BYTES / (1024 * 1024)
+                cache_bytes / (1024 * 1024)
             );
             Some(cache)
         };
@@ -609,8 +628,11 @@ impl MultiUserMemoryManager {
 
         // PIPE-9: StreamingMemoryExtractor no longer needs FeedbackStore
         // Feedback momentum is now applied in the MemorySystem pipeline
-        let streaming_extractor =
-            Arc::new(streaming::StreamingMemoryExtractor::new(neural_ner.clone()));
+        let task_tracker = tokio_util::task::TaskTracker::new();
+        let streaming_extractor = Arc::new(
+            streaming::StreamingMemoryExtractor::new(neural_ner.clone())
+                .with_task_tracker(task_tracker.clone()),
+        );
         info!("Streaming memory extractor initialized");
 
         let keyword_extractor = Arc::new(KeywordExtractor::new());
@@ -674,6 +696,7 @@ impl MultiUserMemoryManager {
                 } else {
                     None
                 },
+                auto_compress: server_config.auto_compress,
                 ..MemoryConfig::default()
             },
             audit_log_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -711,6 +734,8 @@ impl MultiUserMemoryManager {
             journaled_writers: DashMap::new(),
             journaled_writer_init_locks: DashMap::new(),
             reconciled_users: DashMap::new(),
+            writes_closed: std::sync::atomic::AtomicBool::new(false),
+            tenant_open_waiters: std::sync::atomic::AtomicUsize::new(0),
             wiki_watchers: DashMap::new(),
             storage_capabilities,
             user_auth_runtime,
@@ -726,7 +751,7 @@ impl MultiUserMemoryManager {
             // rest of state is settled and a tokio runtime is available.
             // See `set_sleep_time_orchestrator()`.
             sleep_time_orchestrator: parking_lot::RwLock::new(None),
-            task_tracker: tokio_util::task::TaskTracker::new(),
+            task_tracker,
         };
 
         info!("Running initial audit log rotation...");
@@ -933,16 +958,30 @@ impl MultiUserMemoryManager {
         db_opts.set_max_write_buffer_number(2);
         db_opts.set_write_buffer_size(8 * 1024 * 1024);
 
-        let mut block_opts = BlockBasedOptions::default();
-        if let Some(cache) = shared_rocksdb_cache {
-            block_opts.set_block_cache(cache);
+        match shared_rocksdb_cache {
+            Some(cache) => {
+                db_opts.set_block_based_table_factory(
+                    &crate::memory::storage::block_based_options(cache),
+                );
+                db_opts.set_write_buffer_manager(
+                    crate::memory::storage::shared_write_buffer_manager(cache),
+                );
+            }
+            None => {
+                let mut block_opts = BlockBasedOptions::default();
+                block_opts.set_cache_index_and_filter_blocks(true);
+                db_opts.set_block_based_table_factory(&block_opts);
+            }
         }
-        block_opts.set_cache_index_and_filter_blocks(true);
-        db_opts.set_block_based_table_factory(&block_opts);
 
         let mut cfs = vec![ColumnFamilyDescriptor::new("default", {
             let mut o = RocksOptions::default();
             o.create_if_missing(true);
+            if let Some(cache) = shared_rocksdb_cache {
+                o.set_block_based_table_factory(&crate::memory::storage::block_based_options(
+                    cache,
+                ));
+            }
             o
         })];
         cfs.extend(TodoStore::cf_descriptors());
@@ -960,16 +999,16 @@ impl MultiUserMemoryManager {
         ] {
             cfs.push(ColumnFamilyDescriptor::new(
                 cf,
-                Self::shared_store_cf_options(),
+                Self::shared_store_cf_options(shared_rocksdb_cache),
             ));
         }
         cfs.push(ColumnFamilyDescriptor::new(
             crate::memory::feedback::CF_FEEDBACK,
-            Self::shared_store_cf_options(),
+            Self::shared_store_cf_options(shared_rocksdb_cache),
         ));
         cfs.push(ColumnFamilyDescriptor::new(
             CF_AUDIT,
-            Self::shared_store_cf_options(),
+            Self::shared_store_cf_options(shared_rocksdb_cache),
         ));
 
         // Phase C user auth: conditionally declare the user_auth CF. When
@@ -987,10 +1026,16 @@ impl MultiUserMemoryManager {
     }
 
     #[cfg(feature = "rocksdb")]
-    fn shared_store_cf_options() -> rocksdb::Options {
+    fn shared_store_cf_options(
+        cache: Option<&crate::storage::SharedBlockCache>,
+    ) -> rocksdb::Options {
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
         options.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        if let Some(cache) = cache {
+            options
+                .set_block_based_table_factory(&crate::memory::storage::block_based_options(cache));
+        }
         options
     }
 
@@ -1068,6 +1113,9 @@ impl MultiUserMemoryManager {
         let old_db = rocksdb::DB::open_for_read_only(&old_opts, &old_dir, false)
             .context("Failed to open old audit_logs DB for migration")?;
 
+        let write_opts = crate::storage::legacy_rocksdb::write_options(
+            crate::config::StorageTuning::process().rocksdb_sync_writes(),
+        );
         let mut batch = rocksdb::WriteBatch::default();
         let mut count = 0usize;
         const BATCH_SIZE: usize = 10_000;
@@ -1081,15 +1129,14 @@ impl MultiUserMemoryManager {
 
             if count.is_multiple_of(BATCH_SIZE) {
                 shared_db
-                    .write(std::mem::take(&mut batch))
+                    .write_opt(std::mem::take(&mut batch), &write_opts)
                     .map_err(|e| anyhow::anyhow!("audit migration batch write error: {e}"))?;
-                batch = rocksdb::WriteBatch::default();
             }
         }
 
         if !count.is_multiple_of(BATCH_SIZE) {
             shared_db
-                .write(batch)
+                .write_opt(batch, &write_opts)
                 .map_err(|e| anyhow::anyhow!("audit migration final batch error: {e}"))?;
         }
 
@@ -1283,7 +1330,10 @@ impl MultiUserMemoryManager {
     /// BEFORE it is joined — `user_id` arrives from HTTP/MCP/CLI callers, and `../` or an
     /// absolute path in it would escape `base_path` at every join below. Every user-scoped path
     /// in this manager goes through here.
-    fn user_dir(&self, user_id: &str) -> Result<std::path::PathBuf> {
+    pub(crate) fn user_dir(&self, user_id: &str) -> Result<std::path::PathBuf> {
+        if crate::validation::is_reserved_data_dir(user_id) {
+            anyhow::bail!("user id '{user_id}' names a reserved data directory, not a tenant");
+        }
         Ok(self
             .base_path
             .join(crate::path_guard::sanitize_component(user_id, "user id")?))
@@ -1402,11 +1452,19 @@ impl MultiUserMemoryManager {
     /// Uses double-checked locking to prevent TOCTOU races where concurrent
     /// first-access requests both miss the cache and try to open RocksDB.
     /// RocksDB holds exclusive file locks, so the second open would fail.
+    ///
+    /// A miss opens the tenant on the calling thread, and every concurrent caller for
+    /// that tenant waits on its init lock until the open is done: 11.7 s for the live
+    /// server's largest tenant and 10 min for the redb replica's on 2026-10-19. Async
+    /// code calls [`Self::get_user_memory_async`] instead; each tokio worker parked here
+    /// is one fewer to run `/health` on, and enough of them stop it answering at all.
     pub fn get_user_memory(&self, user_id: &str) -> Result<SharedUserMemory> {
         // Fast path: already cached
         if let Some(memory) = self.user_memories.get(user_id) {
             return Ok(memory);
         }
+
+        let _waiter = TenantOpenWaiter::enter(&self.tenant_open_waiters);
 
         // Acquire per-user creation lock to serialize initialization
         let lock = self
@@ -1495,6 +1553,11 @@ impl MultiUserMemoryManager {
 
         self.user_memories
             .insert(user_id.to_string(), memory_arc.clone());
+        // Checked after the insert, not before: a close that runs between a check and
+        // the insert would miss this tenant in its cache walk.
+        if self.writes_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            memory_arc.read().close_writes();
+        }
 
         info!("Created memory system for user: {}", user_id);
 
@@ -1517,6 +1580,40 @@ impl MultiUserMemoryManager {
         }
 
         Ok(memory_arc)
+    }
+
+    /// [`Self::get_user_memory`] for async code. A cached tenant comes back at once; an
+    /// open, or a wait behind one, runs on the blocking pool so the worker stays free for
+    /// other requests and the probes. A request dropped mid-open leaves the open to finish
+    /// and cache the tenant for the next one.
+    pub async fn get_user_memory_async(
+        self: &Arc<Self>,
+        user_id: &str,
+    ) -> Result<SharedUserMemory> {
+        if let Some(memory) = self.user_memories.get(user_id) {
+            return Ok(memory);
+        }
+        let manager = Arc::clone(self);
+        let user_id = user_id.to_string();
+        tokio::task::spawn_blocking(move || manager.get_user_memory(&user_id))
+            .await
+            .context("tenant open task did not complete")?
+    }
+
+    /// Callers in `get_user_memory`'s slow path right now; see `tenant_open_waiters`.
+    pub fn tenant_open_waiters(&self) -> usize {
+        self.tenant_open_waiters
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The lock `get_user_memory` opens `user_id` under. Holding it stands in for an
+    /// open that is taking as long as a large tenant's does.
+    #[cfg(test)]
+    pub(crate) fn user_memory_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
+        self.user_memory_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
     }
 
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
@@ -1682,15 +1779,34 @@ impl MultiUserMemoryManager {
     }
 
     /// Flush all RocksDB databases
+    /// Close every tenant's write gate, waiting for the write in progress in each. Queued
+    /// and later creates and upserts fail with `WritesClosed` (503 to HTTP callers)
+    /// instead of running past the flush. Blocking: call it from the blocking pool.
+    /// Returns how many tenants were closed. Reaches the cached tenants only: one the
+    /// cache evicted while a request still held it keeps its gate open.
+    pub fn close_all_writes(&self) -> usize {
+        self.writes_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let tenants: Vec<SharedUserMemory> = self.user_memories.iter().map(|(_, v)| v).collect();
+        for memory in &tenants {
+            memory.read().close_writes();
+        }
+        tenants.len()
+    }
+
     pub fn flush_all_databases(&self) -> Result<()> {
         info!("Flushing all databases to disk...");
+
+        self.drain_deferred_projections(crate::intent_log::journal::DEFERRED_DRAIN_TIMEOUT);
 
         // Single flush covers all shared stores (todos, prospective, files, feedback, audit)
         match &self.shared_db {
             #[cfg(feature = "rocksdb")]
             crate::storage::SharedEngineDb::RocksDb(db) => {
-                db.flush()
-                    .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))?;
+                crate::storage::write_latch::guard(db, || {
+                    db.flush()
+                        .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))
+                })?;
                 info!("  Shared database flushed (todos, prospective, files, feedback, audit)");
             }
             #[cfg(feature = "storage-redb")]
@@ -1725,6 +1841,34 @@ impl MultiUserMemoryManager {
         );
 
         Ok(())
+    }
+
+    /// Wait, bounded by `timeout` across all tenants, for every journaled
+    /// writer's deferred projection queue to drain, then persist those
+    /// projections' checkpoints. Each writer's mutex is held only long
+    /// enough to take a drain handle, so journaled writes keep flowing while
+    /// the drain waits. Returns `false` if any queue was still non-empty at
+    /// the deadline; replay on the next open applies the remainder.
+    pub fn drain_deferred_projections(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let writers: Vec<(String, _)> = self
+            .journaled_writers
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let mut drained = true;
+        for (user_id, writer) in writers {
+            let handle = writer.lock().deferred_drain_handle();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if !handle.drain(remaining) {
+                drained = false;
+                tracing::warn!(
+                    user_id = %user_id,
+                    "deferred projection drain timed out; replay on next open applies the remainder",
+                );
+            }
+        }
+        drained
     }
 
     /// Save all vector indices to disk
@@ -2065,14 +2209,22 @@ impl MultiUserMemoryManager {
         // a passphrase alone seals the records, and the journal beside them holds
         // the same memories, so it is sealed under the same keystore.
         let journal_cryptor = self.purpose_cryptor(user_id, "journal")?;
-        let log = crate::intent_log::IntentLog::open_with_cryptor(&log_path, journal_cryptor)
-            .with_context(|| format!("open intent log for user {user_id}"))?;
         let checkpoint_store = std::sync::Arc::new(parking_lot::Mutex::new(
             crate::intent_log::CheckpointStore::open(&checkpoint_path)
                 .with_context(|| format!("open checkpoint store for user {user_id}"))?,
         ));
+        // The offset hints the last writer persisted let the open scan only
+        // the frames appended after them; a hint that does not verify
+        // against the file is ignored.
+        let frame_index_hint = checkpoint_store.lock().frame_index();
+        let log = crate::intent_log::IntentLog::open_with_index(
+            &log_path,
+            journal_cryptor,
+            frame_index_hint,
+        )
+        .with_context(|| format!("open intent log for user {user_id}"))?;
 
-        // SQLite slow store projection — first attached, replays first.
+        // SQLite slow store projection — first in the replay pass.
         let slow_store = self.get_user_slow_store(user_id)?;
         let mut sqlite_projection = match &self.dataset_executor {
             // W4 cutover: when a relational backend is configured, the
@@ -2093,19 +2245,6 @@ impl MultiUserMemoryManager {
                 checkpoint_store.clone(),
             ),
         };
-
-        // Catch the SQLite projection up to the head of the log before
-        // it goes live. The `Some(100)` flushes the checkpoint every 100
-        // applied records so a crash during a long replay survives.
-        let applied_sqlite = crate::intent_log::replay(&log, &mut sqlite_projection, Some(100))
-            .with_context(|| format!("replay intent log for user {user_id} (sqlite projection)"))?;
-        if applied_sqlite > 0 {
-            tracing::info!(
-                user_id = %user_id,
-                applied = applied_sqlite,
-                "replayed intent log records into SQLite projection on first writer open",
-            );
-        }
 
         // Second family of projections: Vamana, one per embedding kind.
         // Each user gets up to five dedicated vector indices that are
@@ -2162,28 +2301,14 @@ impl MultiUserMemoryManager {
                     distance_metric: crate::vector_db::DistanceMetric::default(),
                 },
             };
-            let mut proj =
-                crate::vector_db::VamanaProjection::lazy(kind, bootstrap, checkpoint_store.clone());
-            let applied =
-                crate::intent_log::replay(&log, &mut proj, Some(100)).with_context(|| {
-                    format!(
-                        "replay intent log for user {user_id} ({} projection)",
-                        kind.projection_name()
-                    )
-                })?;
-            if applied > 0 {
-                tracing::info!(
-                    user_id = %user_id,
-                    projection = kind.projection_name(),
-                    applied,
-                    "replayed intent log records into Vamana projection on first writer open",
-                );
-            }
-            vamana_projections.push(proj);
+            vamana_projections.push(crate::vector_db::VamanaProjection::lazy(
+                kind,
+                bootstrap,
+                checkpoint_store.clone(),
+            ));
         }
 
-        // Third projection: BM25 inverted index. Same independent-checkpoint
-        // pattern — a stalled BM25 can't block the others' catch-up.
+        // Third projection: BM25 inverted index.
         let bm25_index = self.get_user_bm25_index(user_id)?;
         // An in-memory index starts empty every time, so its projection replays
         // the whole log rather than resuming from the checkpoint a past index wrote.
@@ -2195,52 +2320,14 @@ impl MultiUserMemoryManager {
         } else {
             crate::memory::Bm25Projection::new(bm25_index.clone(), checkpoint_store.clone())
         };
-        let bm25_applied = crate::intent_log::replay(
-            &log,
-            &mut bm25_projection,
-            Some(crate::memory::bm25_projection::COMMIT_EVERY),
-        )
-        .with_context(|| format!("replay intent log into BM25 projection for user {user_id}"))?;
-        if bm25_applied > 0 {
-            tracing::info!(
-                user_id = %user_id,
-                applied = bm25_applied,
-                "replayed intent log records into BM25 projection on first writer open",
-            );
-        }
-
         // Fourth projection (default-OFF, gated by VELD_WIKI_RENDER): the
-        // wiki render. Constructed + replayed here, while `&log` is still
-        // borrowable (it is moved into the writer just below). Added to the
-        // writer after the move. Init/replay failure is non-fatal — the
-        // other projections and the write path are unaffected; the wiki is
-        // simply not registered for this writer's lifetime.
-        let wiki_projection = if crate::wiki::wiki_render_enabled() {
+        // wiki render. Init or replay failure is non-fatal — the other
+        // projections and the write path are unaffected; the wiki is simply
+        // not registered for this writer's lifetime.
+        let mut wiki_projection = if crate::wiki::wiki_render_enabled() {
             let wiki_dir = crate::wiki::wiki_target_dir(&user_path, user_id);
             match crate::wiki::WikiProjection::new(wiki_dir, checkpoint_store.clone()) {
-                Ok(mut wp) => {
-                    match crate::intent_log::replay(&log, &mut wp, Some(crate::wiki::COMMIT_EVERY))
-                    {
-                        Ok(applied) => {
-                            if applied > 0 {
-                                tracing::info!(
-                                    user_id = %user_id,
-                                    applied,
-                                    "replayed intent log into wiki projection on first writer open",
-                                );
-                            }
-                            Some(wp)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                user_id = %user_id,
-                                error = %e,
-                                "wiki projection replay failed (non-fatal; wiki render disabled this session)",
-                            );
-                            None
-                        }
-                    }
-                }
+                Ok(wp) => Some(wp),
                 Err(e) => {
                     tracing::warn!(
                         user_id = %user_id,
@@ -2254,11 +2341,88 @@ impl MultiUserMemoryManager {
             None
         };
 
+        // Catch every projection up to the head of the log before any goes
+        // live, in one pass: each frame is read once from the lowest
+        // checkpoint and handed to the projections still below it.
+        // Checkpoints stay independent — a projection that fails stops at
+        // its failed record while the others replay to the head.
+        let persist_every = 100
+            .min(crate::memory::bm25_projection::COMMIT_EVERY)
+            .min(crate::wiki::COMMIT_EVERY);
+        let replay_results = {
+            let mut targets: Vec<&mut dyn crate::intent_log::ReplayTarget> =
+                Vec::with_capacity(vamana_projections.len() + 3);
+            targets.push(&mut sqlite_projection);
+            for vp in vamana_projections.iter_mut() {
+                targets.push(vp);
+            }
+            targets.push(&mut bm25_projection);
+            if let Some(wp) = wiki_projection.as_mut() {
+                targets.push(wp);
+            }
+            let names: Vec<String> = targets
+                .iter()
+                .map(|t| t.target_name().to_string())
+                .collect();
+            let results = crate::intent_log::replay_all(&log, &mut targets, Some(persist_every))
+                .with_context(|| format!("replay intent log for user {user_id}"))?;
+            names.into_iter().zip(results).collect::<Vec<_>>()
+        };
+        let wiki_name = wiki_projection
+            .as_ref()
+            .map(|wp| crate::intent_log::ReplayTarget::target_name(wp).to_string());
+        let mut first_failure = None;
+        for (name, result) in replay_results {
+            match result {
+                Ok(applied) if applied > 0 => tracing::info!(
+                    user_id = %user_id,
+                    projection = %name,
+                    applied,
+                    "replayed intent log records into projection on first writer open",
+                ),
+                Ok(_) => {}
+                Err(e) if Some(&name) == wiki_name.as_ref() => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        error = %e,
+                        "wiki projection replay failed (non-fatal; wiki render disabled this session)",
+                    );
+                    wiki_projection = None;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        user_id = %user_id,
+                        projection = %name,
+                        error = %e,
+                        "intent log replay failed on first writer open",
+                    );
+                    first_failure.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = first_failure {
+            return Err(
+                anyhow::Error::new(e).context(format!("replay intent log for user {user_id}"))
+            );
+        }
+
         // Hand the log handle into the writer so subsequent appends
         // continue against the same file. Replay above used a read-only
         // borrow; the same handle is fine for the writer's appends.
         let mut writer = crate::intent_log::JournaledWriter::new(log);
-        writer.add_projection(Box::new(sqlite_projection));
+        writer.attach_checkpoint_store(checkpoint_store.clone());
+        if let Err(e) = writer.persist_frame_index() {
+            tracing::warn!(
+                user_id = %user_id,
+                error = %e,
+                "could not persist intent log offset hints (the next open scans further back)",
+            );
+        }
+        // The SQLite mirror is derived and non-authoritative, and a busy
+        // competing SQLite writer can stall its apply for seconds; applied
+        // inline that stall serialized every write for the tenant behind the
+        // writer mutex. Deferred, it applies on its own worker after the ack.
+        writer.add_deferred_projection(Box::new(sqlite_projection));
         for vp in vamana_projections {
             writer.add_projection(Box::new(vp));
         }
@@ -2279,7 +2443,9 @@ impl MultiUserMemoryManager {
     /// `JournaledWriter`. Calls `record_and_apply` under the writer's
     /// mutex and returns the assigned LSN. Per-projection apply errors
     /// are *not* propagated as failures — they are logged at warn level
-    /// (the log frame is durable, replay will retry on restart).
+    /// (the log frame is durable, replay will retry on restart). The
+    /// SQLite projection is deferred: the returned LSN is durable and
+    /// applied to the inline projections, but may not be in SQLite yet.
     pub fn journal_and_apply(
         &self,
         user_id: &str,
@@ -2302,6 +2468,33 @@ impl MultiUserMemoryManager {
             );
         }
         Ok(outcome.lsn)
+    }
+
+    /// [`Self::journal_and_apply`] for many records: one writer lock, one append
+    /// batch and one fsync, then each record applied to the projections in order. The
+    /// batch is durable whole or not at all.
+    pub fn journal_and_apply_batch(
+        &self,
+        user_id: &str,
+        payloads: &[crate::intent_log::IntentPayload],
+    ) -> Result<Vec<crate::intent_log::Lsn>> {
+        let writer = self.get_user_journaled_writer(user_id)?;
+        let outcomes = writer
+            .lock()
+            .record_and_apply_batch(payloads)
+            .map_err(|e| anyhow::anyhow!("journal record_and_apply_batch: {e}"))?;
+        for outcome in &outcomes {
+            for err in &outcome.apply_errors {
+                tracing::warn!(
+                    user_id = %user_id,
+                    projection = %err.projection,
+                    lsn = outcome.lsn.0,
+                    error = %err.source,
+                    "projection apply failed during journaled write (log durable; replay will retry)",
+                );
+            }
+        }
+        Ok(outcomes.into_iter().map(|outcome| outcome.lsn).collect())
     }
 
     /// W-018 support: ensure the wiki projection is materialised for
@@ -2457,7 +2650,7 @@ impl MultiUserMemoryManager {
             }
             mem.experience.content = new_content;
             mem.experience.embeddings = None; // force re-embed / re-index
-            guard.update_memory(&mem)?;
+            guard.update_memory_journaled(&mem)?;
             bincode::serde::encode_to_vec(&mem, bincode::config::standard())
                 .map_err(|e| anyhow::anyhow!("wiki edit-back bincode: {e}"))?
         };
@@ -2480,15 +2673,24 @@ impl MultiUserMemoryManager {
     /// scan the log, find store records the log never recorded, and
     /// backfill a `Remember` frame for each.
     ///
-    /// The store is canonical in BOTH directions — this never mutates the
-    /// store, only the log:
+    /// Each direction follows what the client was last told:
     /// - store-ahead-of-log (crashed before a `Remember`/`Update` frame
     ///   landed): backfill a `Remember` frame from the store snapshot.
-    /// - log-ahead-of-store (crashed after a RocksDB delete but before its
-    ///   `Forget` frame landed): backfill a `Forget` frame. Without this,
-    ///   any replay — including restore-from-backup — resurrects the
-    ///   deleted memory into every projection.
-    /// Returns the number of frames backfilled. Non-fatal — the caller
+    /// - log-ahead-of-store: the log holds a live memory the store lacks.
+    ///   Either a store write whose log frame was synced was lost (storage
+    ///   durability is `eventual` by default, so an OS crash can drop it
+    ///   after the remember was acknowledged), or a crash fell between a
+    ///   store delete and its `Forget` frame, and every delete path responds
+    ///   only after journaling, so that delete was never acknowledged. Both
+    ///   ways the memory should exist: restore it into the store from its
+    ///   last logged snapshot, with any later anchor applied, and journal
+    ///   nothing. Only a memory with no snapshot in the log (stored before
+    ///   the journal existed, then anchored) cannot be restored; it gets a
+    ///   `Forget` frame so replay agrees with the store. On a tenant just
+    ///   restored from a backup ([`RESTORED_FROM_BACKUP_MARKER`]) the store
+    ///   is authoritative instead: every log-ahead memory gets a `Forget`.
+    ///
+    /// Returns the number of memories reconciled. Non-fatal — the caller
     /// logs and continues on error.
     fn reconcile_store_with_intent_log(
         &self,
@@ -2496,15 +2698,16 @@ impl MultiUserMemoryManager {
         user_mem: &SharedUserMemory,
     ) -> Result<usize> {
         // Ids the log already covers (Remember/Update/Anchor present, minus
-        // Forget), via the clock-independent Lsn scan (C4). Writer lock is
-        // released before the backfill loop so journal_and_apply can retake
-        // it per frame.
-        let covered = {
-            let writer = self.get_user_journaled_writer(user_id)?;
-            let guard = writer.lock();
-            crate::intent_log::payload::live_memory_ids(guard.log())
-                .map_err(|e| anyhow::anyhow!("reconcile: scanning intent log: {e}"))?
-        };
+        // Forget). The writer resumes this from the snapshot the previous
+        // reconcile left in the checkpoint store, so only frames appended
+        // since are read, and it reads each memory id off the payload prefix
+        // without decoding the memory snapshot. Writer lock is released
+        // before the backfill so each batch can retake it.
+        let writer = self.get_user_journaled_writer(user_id)?;
+        let covered = writer
+            .lock()
+            .live_memory_ids()
+            .map_err(|e| anyhow::anyhow!("reconcile: scanning intent log: {e}"))?;
 
         let store_ids = {
             let guard = user_mem.read();
@@ -2514,14 +2717,14 @@ impl MultiUserMemoryManager {
         let store_id_strings: std::collections::HashSet<String> =
             store_ids.iter().map(|id| id.0.to_string()).collect();
 
-        let mut backfilled = 0usize;
+        // store-ahead-of-log: snapshot each uncovered memory and backfill a
+        // `Remember` frame so the log is a complete record of the store.
+        let mut remember_frames = Vec::new();
         for id in &store_ids {
             let id_str = id.0.to_string();
             if covered.contains(&id_str) {
                 continue;
             }
-            // store-ahead-of-log: snapshot the memory and backfill a
-            // `Remember` frame so the log is a complete record of the store.
             let snapshot = {
                 let guard = user_mem.read();
                 match guard.get_memory(id) {
@@ -2551,58 +2754,217 @@ impl MultiUserMemoryManager {
                 }
             };
             let Some(bytes) = snapshot else { continue };
-            let payload = crate::intent_log::IntentPayload::Remember {
+            remember_frames.push(crate::intent_log::IntentPayload::Remember {
                 user_id: user_id.to_string(),
-                memory_id: id_str.clone(),
+                memory_id: id_str,
                 memory_bincode: bytes,
                 schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
-            };
-            if let Err(e) = self.journal_and_apply(user_id, &payload) {
-                tracing::warn!(
+            });
+        }
+        let backfilled =
+            self.journal_reconcile_backfill(user_id, &writer, remember_frames, "Remember");
+
+        // log-ahead-of-store: the log says live, the store has no such memory. Restore it
+        // from its last logged snapshot; a memory the log holds no snapshot for gets a
+        // `Forget`, so replay (including restore-from-backup) cannot resurrect it.
+        let missing: std::collections::HashSet<String> = covered
+            .iter()
+            .filter(|id| !store_id_strings.contains(*id))
+            .cloned()
+            .collect();
+        let mut restored = 0usize;
+        let mut forget_frames = Vec::new();
+        let marker = self.user_dir(user_id)?.join(RESTORED_FROM_BACKUP_MARKER);
+        let restored_from_backup = marker.exists();
+        let mut snapshots = if missing.is_empty() || restored_from_backup {
+            HashMap::new()
+        } else {
+            self.last_logged_snapshots(user_id, &missing)?
+        };
+        let mut restore = Vec::new();
+        for id_str in &missing {
+            match snapshots.remove(id_str) {
+                Some(Ok(memory)) => restore.push(memory),
+                Some(Err(e)) => tracing::warn!(
                     user_id = %user_id,
                     memory_id = %id_str,
                     error = %e,
-                    "C2 reconcile: backfill journal_and_apply failed",
-                );
-            } else {
-                backfilled += 1;
+                    "C2 reconcile: logged snapshot of a memory missing from the store does not decode; left unrestored",
+                ),
+                None => forget_frames.push(crate::intent_log::IntentPayload::Forget {
+                    user_id: user_id.to_string(),
+                    memory_id: id_str.clone(),
+                    schema_version: Some(
+                        crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION,
+                    ),
+                }),
             }
         }
-        // log-ahead-of-store: the log says live, the store has no such
-        // memory — a crash landed between the RocksDB delete and its
-        // `Forget` frame. Backfill the `Forget` so replay (including
-        // restore-from-backup) cannot resurrect it into projections.
-        let mut forget_backfilled = 0usize;
-        for id_str in &covered {
-            if store_id_strings.contains(id_str) {
-                continue;
-            }
-            let payload = crate::intent_log::IntentPayload::Forget {
-                user_id: user_id.to_string(),
-                memory_id: id_str.clone(),
-                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
-            };
-            if let Err(e) = self.journal_and_apply(user_id, &payload) {
+        let forget_backfilled =
+            self.journal_reconcile_backfill(user_id, &writer, forget_frames, "Forget");
+        if !restore.is_empty() {
+            for memory in &restore {
                 tracing::warn!(
                     user_id = %user_id,
-                    memory_id = %id_str,
-                    error = %e,
-                    "C2 reconcile: Forget backfill journal_and_apply failed",
+                    memory_id = %memory.id.0,
+                    "C2 reconcile: memory live in the intent log but missing from the store; restored from its logged snapshot",
                 );
-            } else {
-                forget_backfilled += 1;
             }
+            restored = user_mem.read().upsert_memories(&restore)?;
         }
 
-        if backfilled > 0 || forget_backfilled > 0 {
+        if restored_from_backup {
+            std::fs::remove_file(&marker).with_context(|| {
+                format!("reconcile: removing the backup-restore marker {marker:?}")
+            })?;
+        }
+        if backfilled + restored + forget_backfilled > 0 {
             tracing::warn!(
                 user_id = %user_id,
                 backfilled,
+                restored,
                 forget_backfilled,
-                "C2 store↔log reconcile backfilled the intent log (Remember frames for store-ahead, Forget frames for log-ahead)",
+                "C2 store↔log reconcile: Remember frames for store-ahead, restores and Forget frames for log-ahead",
             );
         }
-        Ok(backfilled + forget_backfilled)
+        Ok(backfilled + restored + forget_backfilled)
+    }
+
+    /// The last `Remember`/`Update` snapshot of each of `ids` in `user_id`'s log, with
+    /// any later anchor frame applied, decoded. An id the log holds no snapshot for is
+    /// absent from the result. Reads the log once, under the writer lock.
+    fn last_logged_snapshots(
+        &self,
+        user_id: &str,
+        ids: &std::collections::HashSet<String>,
+    ) -> Result<HashMap<String, Result<crate::memory::types::Memory>>> {
+        use crate::intent_log::IntentPayload;
+        enum Anchoring {
+            Inferred(f32),
+            Set(bool, f32),
+        }
+        let mut last: HashMap<String, (Vec<u8>, Option<Anchoring>)> = HashMap::new();
+        {
+            let writer = self.get_user_journaled_writer(user_id)?;
+            let guard = writer.lock();
+            for record in guard
+                .log()
+                .iter()
+                .map_err(|e| anyhow::anyhow!("reconcile: reading intent log: {e}"))?
+            {
+                let record =
+                    record.map_err(|e| anyhow::anyhow!("reconcile: reading intent log: {e}"))?;
+                let (_, payload) = crate::intent_log::payload::decode_record(&record)
+                    .map_err(|e| anyhow::anyhow!("reconcile: decoding intent log: {e}"))?;
+                if !ids.contains(payload.memory_id()) {
+                    continue;
+                }
+                match payload {
+                    IntentPayload::Remember {
+                        memory_id,
+                        memory_bincode,
+                        ..
+                    }
+                    | IntentPayload::Update {
+                        memory_id,
+                        memory_bincode,
+                        ..
+                    } => {
+                        last.insert(memory_id, (memory_bincode, None));
+                    }
+                    IntentPayload::Forget { memory_id, .. } => {
+                        last.remove(&memory_id);
+                    }
+                    IntentPayload::Anchor {
+                        memory_id,
+                        importance,
+                        ..
+                    } => {
+                        if let Some(entry) = last.get_mut(&memory_id) {
+                            entry.1 = Some(Anchoring::Inferred(importance));
+                        }
+                    }
+                    IntentPayload::SetAnchored {
+                        memory_id,
+                        anchored,
+                        importance,
+                        ..
+                    } => {
+                        if let Some(entry) = last.get_mut(&memory_id) {
+                            entry.1 = Some(Anchoring::Set(anchored, importance));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(last
+            .into_iter()
+            .map(|(id, (bytes, anchoring))| {
+                let memory =
+                    crate::memory::storage::decode_memory_snapshot(&bytes).inspect(|memory| {
+                        match anchoring {
+                            // Same reading the replication follower gives an `Anchor` frame,
+                            // which carries only the importance after the change.
+                            Some(Anchoring::Inferred(importance)) => {
+                                if importance > memory.importance() {
+                                    memory.set_anchored(true);
+                                } else if importance < memory.importance() {
+                                    memory.set_anchored(false);
+                                }
+                                memory.set_importance(importance);
+                            }
+                            Some(Anchoring::Set(anchored, importance)) => {
+                                memory.set_anchored(anchored);
+                                memory.set_importance(importance);
+                            }
+                            None => {}
+                        }
+                    });
+                (id, memory)
+            })
+            .collect())
+    }
+
+    /// Journal reconcile backfill frames in batches, one fsync per batch and
+    /// the writer lock held for one batch at a time. A failed batch is logged
+    /// and skipped (the next reconcile finds the same gap). Returns the
+    /// number of frames journaled.
+    fn journal_reconcile_backfill(
+        &self,
+        user_id: &str,
+        writer: &parking_lot::Mutex<crate::intent_log::JournaledWriter>,
+        frames: Vec<crate::intent_log::IntentPayload>,
+        kind: &str,
+    ) -> usize {
+        const BATCH: usize = 256;
+        let mut journaled = 0usize;
+        for batch in frames.chunks(BATCH) {
+            let outcomes = writer.lock().record_and_apply_batch(batch);
+            match outcomes {
+                Ok(outcomes) => {
+                    for outcome in &outcomes {
+                        for err in &outcome.apply_errors {
+                            tracing::warn!(
+                                user_id = %user_id,
+                                projection = %err.projection,
+                                lsn = outcome.lsn.0,
+                                error = %err.source,
+                                "projection apply failed during reconcile backfill (log durable; replay will retry)",
+                            );
+                        }
+                    }
+                    journaled += outcomes.len();
+                }
+                Err(e) => tracing::warn!(
+                    user_id = %user_id,
+                    frames = batch.len(),
+                    kind,
+                    error = %e,
+                    "C2 reconcile: backfill batch could not be journaled",
+                ),
+            }
+        }
+        journaled
     }
 
     /// Get graph statistics for a user
@@ -3507,6 +3869,24 @@ impl MultiUserMemoryManager {
         let _graph_guard = graph_lock.lock();
         self.evict_user_and_wait_for_release(user_id, RELEASE_WAIT)?;
 
+        let restored = self.restore_user_stores(user_id, backup_id, max_lsn)?;
+        std::fs::write(
+            self.user_dir(user_id)?.join(RESTORED_FROM_BACKUP_MARKER),
+            b"",
+        )
+        .with_context(|| format!("marking '{user_id}' as restored from a backup"))?;
+        self.reconciled_users.remove(user_id);
+        Ok(restored)
+    }
+
+    /// The store swap of [`Self::restore_user_backup_with_options`], run with the
+    /// tenant evicted and its open locks held.
+    fn restore_user_stores(
+        &self,
+        user_id: &str,
+        backup_id: Option<u32>,
+        max_lsn: Option<u64>,
+    ) -> Result<Vec<String>> {
         match self.server_config.effective_storage_backend {
             #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => {
@@ -3532,7 +3912,7 @@ impl MultiUserMemoryManager {
                     backup_engine
                         .list_backups(user_id)
                         .ok()
-                        .and_then(|backups| backups.last().map(|metadata| metadata.backup_id))
+                        .and_then(|backups| backups.first().map(|metadata| metadata.backup_id))
                         .unwrap_or(0)
                 });
                 let graph_checkpoint = backup_engine
@@ -3662,7 +4042,17 @@ impl MultiUserMemoryManager {
             .collect();
 
             let writer = self.journaled_writers.get(user_id).map(|w| w.clone());
-            let writer_guard = writer.as_ref().map(|w| w.lock());
+            let mut writer_guard = writer.as_ref().map(|w| w.lock());
+            // The deferred SQLite worker writes the checkpoint file being
+            // swapped below, so it is drained and stopped first.
+            if let Some(guard) = writer_guard.as_mut() {
+                if !guard.shutdown_deferred(crate::intent_log::journal::DEFERRED_DRAIN_TIMEOUT) {
+                    tracing::warn!(
+                        user_id,
+                        "deferred projections not drained before restore; the restored journal replays them",
+                    );
+                }
+            }
             self.evict_user(user_id);
             crate::storage::migrate::backup::swap_files_into_place(&pairs)?;
             // The cached writer appends to the replaced journal; the next access reopens and replays the restored one.
@@ -4510,8 +4900,10 @@ mod shared_store_bootstrap_tests {
         base: &std::path::Path,
         backend: crate::config::StorageBackend,
     ) -> Result<SharedStoreBootstrap> {
-        let mut config = ServerConfig::default();
-        config.effective_storage_backend = backend;
+        let config = ServerConfig {
+            effective_storage_backend: backend,
+            ..ServerConfig::default()
+        };
         #[cfg(feature = "rocksdb")]
         let cache = Some(rocksdb::Cache::new_lru_cache(1024));
         #[cfg(not(feature = "rocksdb"))]
@@ -5138,7 +5530,7 @@ pub(crate) fn purge_user_from_shared_store(
         "files",
         "audit",
     ] {
-        total += purge_family(store, cf, user_id, &[prefix.clone()], false)?;
+        total += purge_family(store, cf, user_id, std::slice::from_ref(&prefix), false)?;
     }
     let todo_index: Vec<String> = [
         "user",
@@ -5477,5 +5869,223 @@ impl MultiUserMemoryManager {
             out.push((user_id, result));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod reserved_dir_tests {
+    use super::*;
+
+    #[test]
+    fn the_registry_and_cursor_directories_are_not_tenants() {
+        let root = tempfile::TempDir::new().unwrap();
+        for dir in ["alice", "instances", "replication", "todos"] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        assert_eq!(
+            list_user_dirs(root.path()).unwrap(),
+            vec!["alice".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_tenant_opens_inside_a_reserved_directory() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = ServerConfig {
+            storage_path: root.path().to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        let manager = MultiUserMemoryManager::new(root.path().to_path_buf(), config).unwrap();
+        assert!(manager.user_dir("instances").is_err());
+        assert!(manager.user_dir("Replication").is_err());
+        assert!(manager.get_user_memory("instances").is_err());
+        assert!(!root.path().join("instances").exists());
+        assert!(manager.user_dir("alice").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod reconcile_restore_tests {
+    use super::*;
+    use crate::intent_log::payload::{live_memory_ids, CURRENT_PAYLOAD_SCHEMA_VERSION};
+    use crate::intent_log::IntentPayload;
+    use crate::memory::types::Experience;
+
+    fn manager(root: &std::path::Path) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: root.to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(root.to_path_buf(), config).unwrap()
+    }
+
+    /// Remember `content` and journal its snapshot, as the remember handler does.
+    fn remember_journaled(manager: &MultiUserMemoryManager, content: &str) -> MemoryId {
+        let user_mem = manager.get_user_memory("u").unwrap();
+        let id = user_mem
+            .read()
+            .remember(
+                Experience {
+                    content: content.into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let mem = user_mem.read().get_memory(&id).unwrap();
+        let memory_bincode =
+            bincode::serde::encode_to_vec(&mem, bincode::config::standard()).unwrap();
+        manager
+            .journal_and_apply(
+                "u",
+                &IntentPayload::Remember {
+                    user_id: "u".into(),
+                    memory_id: id.0.to_string(),
+                    memory_bincode,
+                    schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+                },
+            )
+            .unwrap();
+        id
+    }
+
+    fn live(manager: &MultiUserMemoryManager) -> std::collections::HashSet<String> {
+        let writer = manager.get_user_journaled_writer("u").unwrap();
+        let guard = writer.lock();
+        live_memory_ids(guard.log()).unwrap()
+    }
+
+    #[test]
+    fn a_memory_the_store_lost_is_restored_from_its_logged_snapshot() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        let id = remember_journaled(&manager, "the backup key lives in the second safe");
+        let user_mem = manager.get_user_memory("u").unwrap();
+        user_mem
+            .read()
+            .forget(crate::memory::ForgetCriteria::ById(id.clone()))
+            .unwrap();
+        assert!(
+            user_mem.read().get_memory(&id).is_err(),
+            "the store lost the write"
+        );
+
+        assert_eq!(
+            manager
+                .reconcile_store_with_intent_log("u", &user_mem)
+                .unwrap(),
+            1
+        );
+
+        let restored = user_mem
+            .read()
+            .get_memory(&id)
+            .expect("restored into the store");
+        assert_eq!(
+            restored.experience.content,
+            "the backup key lives in the second safe"
+        );
+        assert!(
+            live(&manager).contains(&id.0.to_string()),
+            "a restore journals no Forget"
+        );
+    }
+
+    #[test]
+    fn a_restore_applies_the_anchor_logged_after_the_snapshot() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        let id = remember_journaled(&manager, "rotate the signing key every ninety days");
+        manager
+            .journal_and_apply(
+                "u",
+                &IntentPayload::SetAnchored {
+                    user_id: "u".into(),
+                    memory_id: id.0.to_string(),
+                    anchored: true,
+                    importance: 0.9,
+                    schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+                },
+            )
+            .unwrap();
+        let user_mem = manager.get_user_memory("u").unwrap();
+        user_mem
+            .read()
+            .forget(crate::memory::ForgetCriteria::ById(id.clone()))
+            .unwrap();
+
+        manager
+            .reconcile_store_with_intent_log("u", &user_mem)
+            .unwrap();
+
+        let restored = user_mem.read().get_memory(&id).expect("restored");
+        assert!(restored.is_anchored());
+        assert!((restored.importance() - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_tenant_restored_from_a_backup_forgets_what_its_store_lacks() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        let id = remember_journaled(&manager, "deleted after the journal was captured");
+        let user_mem = manager.get_user_memory("u").unwrap();
+        user_mem
+            .read()
+            .forget(crate::memory::ForgetCriteria::ById(id.clone()))
+            .unwrap();
+        let marker = manager
+            .user_dir("u")
+            .unwrap()
+            .join(RESTORED_FROM_BACKUP_MARKER);
+        std::fs::write(&marker, b"").unwrap();
+
+        assert_eq!(
+            manager
+                .reconcile_store_with_intent_log("u", &user_mem)
+                .unwrap(),
+            1
+        );
+
+        assert!(
+            user_mem.read().get_memory(&id).is_err(),
+            "the restored store is authoritative for deletes in the backup window"
+        );
+        assert!(!live(&manager).contains(&id.0.to_string()));
+        assert!(!marker.exists(), "the marker is spent by the reconcile");
+    }
+
+    #[test]
+    fn a_memory_with_no_logged_snapshot_is_forgotten() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        let user_mem = manager.get_user_memory("u").unwrap();
+        let orphan = uuid::Uuid::new_v4().to_string();
+        manager
+            .journal_and_apply(
+                "u",
+                &IntentPayload::SetAnchored {
+                    user_id: "u".into(),
+                    memory_id: orphan.clone(),
+                    anchored: true,
+                    importance: 0.8,
+                    schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+                },
+            )
+            .unwrap();
+        assert!(live(&manager).contains(&orphan));
+
+        assert_eq!(
+            manager
+                .reconcile_store_with_intent_log("u", &user_mem)
+                .unwrap(),
+            1
+        );
+
+        assert!(
+            !live(&manager).contains(&orphan),
+            "nothing to restore from, so replay is made to agree with the store"
+        );
     }
 }

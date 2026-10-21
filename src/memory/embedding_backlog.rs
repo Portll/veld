@@ -54,6 +54,9 @@ pub enum EmbedOutcome {
     MemoryGone,
     /// A failure specific to this memory (oversized, index refusal); the row stays, attempts grow.
     Failed(String),
+    /// The tenant closed to writes for shutdown. The drain stops and leaves the row as it
+    /// was: recording the attempt would be a write after the flush.
+    WritesClosed,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -280,6 +283,10 @@ impl EmbeddingBacklogStore {
                     report.stopped = Some(err);
                     break;
                 }
+                EmbedOutcome::WritesClosed => {
+                    report.stopped = Some(crate::memory::write_gate::WritesClosed.to_string());
+                    break;
+                }
             }
         }
         report.remaining = self.all()?.len();
@@ -462,6 +469,30 @@ mod tests {
             s.get(&id(2)).unwrap().unwrap().last_error.as_deref(),
             Some("oversized")
         );
+    }
+
+    #[test]
+    fn a_tenant_closed_for_shutdown_stops_the_drain_and_records_nothing() {
+        let (_, s) = store();
+        s.record(&id(1), EnqueueReason::EmbedFailed, Some("x"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.record(&id(2), EnqueueReason::EmbedFailed, Some("x"))
+            .unwrap();
+        let before = s.get(&id(1)).unwrap().unwrap();
+
+        let mut calls = 0;
+        let r = s
+            .drain_with(10, |_| {
+                calls += 1;
+                EmbedOutcome::WritesClosed
+            })
+            .unwrap();
+
+        assert_eq!(calls, 1, "the next row would be refused the same way");
+        assert_eq!((r.drained, r.failed, r.remaining), (0, 0, 2));
+        assert!(r.stopped.is_some());
+        assert_eq!(s.get(&id(1)).unwrap().unwrap(), before);
     }
 
     #[test]

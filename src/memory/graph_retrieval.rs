@@ -26,7 +26,8 @@
 //! - Complexity reduction: O(b^d) → O(2 × b^(d/2)) for multi-entity queries
 
 use anyhow::Result;
-use std::collections::HashMap;
+use chrono::{DateTime, Utc};
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -45,9 +46,9 @@ use crate::constants::{
     QUERY_TYPE_EXPLORATORY_LINGUISTIC, QUERY_TYPE_EXPLORATORY_SEMANTIC, QUERY_TYPE_TEMPORAL_GRAPH,
     QUERY_TYPE_TEMPORAL_LINGUISTIC, QUERY_TYPE_TEMPORAL_SEMANTIC, SALIENCE_BOOST_FACTOR,
     SPREADING_ACTIVATION_THRESHOLD, SPREADING_DEGREE_NORMALIZATION,
-    SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS,
-    SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
-    SPREADING_RELAXED_THRESHOLD,
+    SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO,
+    SPREADING_FRONTIER_CAP, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS,
+    SPREADING_NORMALIZATION_FACTOR, SPREADING_RELAXED_THRESHOLD,
 };
 use crate::embeddings::Embedder;
 use crate::graph_memory::{EdgeTier, EntityLabel, EpisodicNode, GraphMemory, RelationType};
@@ -293,9 +294,146 @@ pub fn calculate_adaptive_hops(graph_density: Option<f32>) -> usize {
     }
 }
 
+/// Edges read per entity expansion.
+const MAX_EDGES_PER_SPREAD: usize = 100;
+
+/// One edge as spreading activation reads it from a given source entity, with its
+/// strengths decayed to the query's clock once.
+struct SpreadEdge {
+    uuid: Uuid,
+    /// The endpoint that is not the source. Edges are indexed under both endpoints, so
+    /// `to_entity` is sometimes the source itself.
+    target: Uuid,
+    relation_type: RelationType,
+    tier_trust: f32,
+    /// Time-decayed undirected strength.
+    effective: f32,
+    /// `effective` blended with the directional strength from the source (A5 Max Sphere).
+    blended: f32,
+}
+
+/// Per-query adjacency: each entity's edges are read and decayed once, however many hops,
+/// directions or threshold passes reach it.
+struct AdjacencyCache {
+    now: DateTime<Utc>,
+    edges: HashMap<Uuid, Vec<SpreadEdge>>,
+}
+
+impl AdjacencyCache {
+    fn new(now: DateTime<Utc>) -> Self {
+        Self {
+            now,
+            edges: HashMap::new(),
+        }
+    }
+
+    fn edges_of(&mut self, graph: &GraphMemory, entity: &Uuid) -> Result<&[SpreadEdge]> {
+        if !self.edges.contains_key(entity) {
+            let now = self.now;
+            let edges = graph
+                .entity_edges_with_strength(entity, Some(MAX_EDGES_PER_SPREAD), now)?
+                .into_iter()
+                .map(|(edge, effective)| {
+                    // Edge-tier trust weight (SHO-D1, PIPE-4)
+                    let tier_trust = if edge.is_potentiated() {
+                        EDGE_TIER_TRUST_LTP
+                    } else {
+                        match edge.tier {
+                            EdgeTier::L3Semantic => EDGE_TIER_TRUST_L3,
+                            EdgeTier::L2Episodic => EDGE_TIER_TRUST_L2,
+                            EdgeTier::L1Working => EDGE_TIER_TRUST_L1,
+                        }
+                    };
+                    // Weight directional signal at 40%, undirected at 60%, so edges from
+                    // before directional tracking keep their signal.
+                    let directional = edge.directional_strength_at(entity, now);
+                    let blended =
+                        if directional > 0.0 && (directional - effective).abs() > f32::EPSILON {
+                            effective * 0.6 + directional * 0.4
+                        } else {
+                            effective
+                        };
+                    SpreadEdge {
+                        uuid: edge.uuid,
+                        target: edge.neighbor_of(entity),
+                        relation_type: edge.relation_type,
+                        tier_trust,
+                        effective,
+                        blended,
+                    }
+                })
+                .collect();
+            self.edges.insert(*entity, edges);
+        }
+        Ok(&self.edges[entity])
+    }
+}
+
+/// The entities a hop expands: not yet expanded, activation at or above `threshold`,
+/// strongest first (uuid breaks ties so the cut is repeatable), at most `cap`.
+fn select_frontier(
+    activation_map: &HashMap<Uuid, f32>,
+    expanded: &HashSet<Uuid>,
+    threshold: f32,
+    cap: usize,
+) -> Vec<(Uuid, f32)> {
+    let mut frontier: Vec<(Uuid, f32)> = activation_map
+        .iter()
+        .filter(|(id, act)| **act >= threshold && !expanded.contains(id))
+        .map(|(id, act)| (*id, *act))
+        .collect();
+    frontier.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    frontier.truncate(cap);
+    frontier
+}
+
+/// Ontological type penalty for spreading through `edge`: dampens wrong-type relations and
+/// targets. CoOccurs, RelatedTo and CoRetrieved are generic bridges and never penalized.
+/// Target labels are read from storage at most once per query through `entity_label_cache`.
+fn ontological_penalty(
+    edge: &SpreadEdge,
+    intent: &OntologicalIntent,
+    graph: &GraphMemory,
+    entity_label_cache: &mut HashMap<Uuid, Option<Vec<EntityLabel>>>,
+) -> f32 {
+    let mut penalty = 1.0_f32;
+    if !intent.relation_types.is_empty()
+        && !matches!(
+            edge.relation_type,
+            RelationType::CoOccurs | RelationType::RelatedTo | RelationType::CoRetrieved
+        )
+        && !intent.relation_types.contains(&edge.relation_type)
+    {
+        penalty *= ONTOLOGICAL_RELATION_PENALTY;
+    }
+    // Hierarchical matching: Team matches Organization, Service matches Technology.
+    if !intent.expected_labels.is_empty() {
+        let cached_labels = entity_label_cache.entry(edge.target).or_insert_with(|| {
+            graph
+                .get_entity(&edge.target)
+                .ok()
+                .flatten()
+                .map(|e| e.labels)
+        });
+        if let Some(labels) = cached_labels {
+            let type_match = labels.iter().any(|l| {
+                intent
+                    .expected_labels
+                    .iter()
+                    .any(|exp| l.matches_with_hierarchy(exp))
+            });
+            if !type_match {
+                penalty *= ONTOLOGICAL_ENTITY_PENALTY;
+            }
+        }
+    }
+    penalty
+}
+
 /// Spread activation from a set of seed entities for a fixed number of hops
 ///
-/// This is a single-direction spread used by bidirectional algorithm.
+/// This is a single-direction spread used by bidirectional algorithm. Each entity is
+/// expanded once, on the first hop it is in the frontier.
 /// Returns the activation map, traversed edge UUIDs, and path-credit contributions.
 fn spread_single_direction(
     seeds: &[(Uuid, f32)],
@@ -304,24 +442,28 @@ fn spread_single_direction(
     threshold: f32,
     ontological_intent: Option<&OntologicalIntent>,
     entity_label_cache: &mut HashMap<Uuid, Option<Vec<EntityLabel>>>,
+    adjacency: &mut AdjacencyCache,
 ) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>, Vec<(Uuid, f32)>)> {
     let mut activation_map: HashMap<Uuid, f32> = seeds.iter().cloned().collect();
+    let mut expanded: HashSet<Uuid> = HashSet::new();
     let mut traversed_edges: Vec<Uuid> = Vec::new();
     // Path-credit: raw (edge_uuid, spread_amount) contributions across all hops.
     let mut credit_edges: Vec<(Uuid, f32)> = Vec::new();
 
     for hop in 1..=max_hops {
-        let current_activated: Vec<(Uuid, f32)> =
-            activation_map.iter().map(|(id, act)| (*id, *act)).collect();
+        let frontier = select_frontier(
+            &activation_map,
+            &expanded,
+            threshold,
+            SPREADING_FRONTIER_CAP,
+        );
+        if frontier.is_empty() {
+            break;
+        }
 
-        for (entity_uuid, source_activation) in current_activated {
-            if source_activation < threshold {
-                continue;
-            }
-
-            const MAX_EDGES_PER_SPREAD: usize = 100;
-            let edges =
-                graph.get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
+        for (entity_uuid, source_activation) in frontier {
+            expanded.insert(entity_uuid);
+            let edges = adjacency.edges_of(graph, &entity_uuid)?;
 
             // Degree normalization: prevent hub nodes from flooding the network.
             // Divides outgoing activation by sqrt(1 + degree), matching the fan effect
@@ -333,89 +475,19 @@ fn spread_single_direction(
             };
 
             for edge in edges {
-                // Resolve the actual neighbor (handles bidirectional edge indexing)
-                let target_uuid = edge.neighbor_of(&entity_uuid);
-
-                // Edge-tier trust weight
-                let tier_trust = if edge.is_potentiated() {
-                    EDGE_TIER_TRUST_LTP
-                } else {
-                    match edge.tier {
-                        EdgeTier::L3Semantic => EDGE_TIER_TRUST_L3,
-                        EdgeTier::L2Episodic => EDGE_TIER_TRUST_L2,
-                        EdgeTier::L1Working => EDGE_TIER_TRUST_L1,
-                    }
-                };
-
-                // Direction-aware strength: use the directional component
-                // matching the traversal direction (A5 Max Sphere)
-                let directional = edge.directional_strength(&entity_uuid);
-                let effective = edge.effective_strength();
-                // Blend: directional strength modulates the time-decayed undirected strength
-                // When directional data exists, it biases the effective strength
-                let blended = if directional > 0.0 && (directional - effective).abs() > f32::EPSILON
-                {
-                    // Weight directional signal at 40%, undirected at 60%
-                    // This prevents old edges (pre-directional) from losing signal
-                    effective * 0.6 + directional * 0.4
-                } else {
-                    effective
-                };
-
-                let decay_rate = calculate_importance_weighted_decay(blended);
+                let decay_rate = calculate_importance_weighted_decay(edge.blended);
                 let decay = (-decay_rate * hop as f32).exp();
 
-                let base_spread = source_activation * decay * effective * tier_trust * degree_norm;
-
-                // Ontological type penalty: dampen activation through wrong-type edges/entities.
-                // CoOccurs, RelatedTo, CoRetrieved are generic bridges — never penalized.
-                let spread_amount = if let Some(intent) = ontological_intent {
-                    let mut penalty = 1.0_f32;
-
-                    // Relation type penalty
-                    if !intent.relation_types.is_empty()
-                        && !matches!(
-                            edge.relation_type,
-                            RelationType::CoOccurs
-                                | RelationType::RelatedTo
-                                | RelationType::CoRetrieved
-                        )
-                        && !intent.relation_types.contains(&edge.relation_type)
-                    {
-                        penalty *= ONTOLOGICAL_RELATION_PENALTY;
+                let base_spread =
+                    source_activation * decay * edge.effective * edge.tier_trust * degree_norm;
+                let spread_amount = match ontological_intent {
+                    Some(intent) => {
+                        base_spread * ontological_penalty(edge, intent, graph, entity_label_cache)
                     }
-
-                    // Entity type penalty (target entity label mismatch)
-                    // Uses hierarchical matching: Team matches Organization, Service matches Technology
-                    // Cached: each entity is read from RocksDB at most once across all hops.
-                    if !intent.expected_labels.is_empty() {
-                        let cached_labels =
-                            entity_label_cache.entry(target_uuid).or_insert_with(|| {
-                                graph
-                                    .get_entity(&target_uuid)
-                                    .ok()
-                                    .flatten()
-                                    .map(|e| e.labels)
-                            });
-                        if let Some(labels) = cached_labels {
-                            let type_match = labels.iter().any(|l| {
-                                intent
-                                    .expected_labels
-                                    .iter()
-                                    .any(|exp| l.matches_with_hierarchy(exp))
-                            });
-                            if !type_match {
-                                penalty *= ONTOLOGICAL_ENTITY_PENALTY;
-                            }
-                        }
-                    }
-
-                    base_spread * penalty
-                } else {
-                    base_spread
+                    None => base_spread,
                 };
 
-                let new_activation = activation_map.entry(target_uuid).or_insert(0.0);
+                let new_activation = activation_map.entry(edge.target).or_insert(0.0);
                 *new_activation += spread_amount;
 
                 if spread_amount > 0.01 {
@@ -457,6 +529,7 @@ fn spread_single_direction(
 /// - `graph`: The knowledge graph
 /// - `total_salience`: Sum of entity saliences for normalization
 /// - `hops_per_direction`: Density-adaptive hop count (2-4)
+/// - `adjacency`: The query's adjacency cache, shared by both directions
 ///
 /// Returns: (combined_activation_map, traversed_edges, path_credit_edges, intersection_count)
 fn bidirectional_spread(
@@ -465,6 +538,7 @@ fn bidirectional_spread(
     total_salience: f32,
     hops_per_direction: usize,
     ontological_intent: Option<&OntologicalIntent>,
+    adjacency: &mut AdjacencyCache,
 ) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>, Vec<(Uuid, f32)>, usize)> {
     // Split entities into forward/backward sets (alternating assignment)
     // This distributes entities evenly regardless of count
@@ -506,6 +580,7 @@ fn bidirectional_spread(
         threshold,
         ontological_intent,
         &mut entity_label_cache,
+        adjacency,
     )?;
 
     let (backward_map, backward_edges, backward_credit) = spread_single_direction(
@@ -515,6 +590,7 @@ fn bidirectional_spread(
         threshold,
         ontological_intent,
         &mut entity_label_cache,
+        adjacency,
     )?;
 
     // Combine maps with intersection boost
@@ -625,6 +701,8 @@ pub fn spreading_activation_retrieve_with_stats(
 ) -> Result<(Vec<ActivatedMemory>, RetrievalStats)> {
     let start_time = Instant::now();
     let mut stats = RetrievalStats::default();
+    // One clock for the whole query: edge decay and recency scoring agree on "now".
+    let now = crate::memory::scoring_now();
 
     let computed_query_type;
     let resolved_query_type = match query_type {
@@ -831,6 +909,7 @@ pub fn spreading_activation_retrieve_with_stats(
     // Step 3: Spread activation through graph
     // PIPE-7: Use bidirectional spreading when 2+ focal entities, else unidirectional
     let graph_start = Instant::now();
+    let mut adjacency = AdjacencyCache::new(now);
     let mut traversed_edges: Vec<Uuid>;
     // Path-credit raw contributions (edge_uuid, spread_amount) — normalised later.
     let raw_credit_edges: Vec<(Uuid, f32)>;
@@ -854,6 +933,7 @@ pub fn spreading_activation_retrieve_with_stats(
             total_salience,
             adaptive_hops,
             intent_ref,
+            &mut adjacency,
         )?;
 
         activation_map = bidirectional_map;
@@ -880,6 +960,8 @@ pub fn spreading_activation_retrieve_with_stats(
         let mut current_threshold = SPREADING_ACTIVATION_THRESHOLD;
         // Entity label cache: each entity is read from RocksDB at most once across all hops.
         let mut entity_label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
+        // Each entity spreads once, on the first hop it is in the frontier.
+        let mut expanded: HashSet<Uuid> = HashSet::new();
 
         for hop in 1..=SPREADING_MAX_HOPS {
             stats.graph_hops = hop;
@@ -892,100 +974,42 @@ pub fn spreading_activation_retrieve_with_stats(
                 current_threshold
             );
 
-            // Clone to avoid borrow issues
-            let current_activated: Vec<(Uuid, f32)> =
-                activation_map.iter().map(|(id, act)| (*id, *act)).collect();
+            let frontier = select_frontier(
+                &activation_map,
+                &expanded,
+                current_threshold,
+                SPREADING_FRONTIER_CAP,
+            );
+            if frontier.is_empty() {
+                break;
+            }
 
-            for (entity_uuid, source_activation) in current_activated {
-                // Only spread from entities with sufficient activation
-                if source_activation < current_threshold {
-                    continue;
-                }
-
-                // Get relationships from this entity (limited to prevent blowup)
-                const MAX_EDGES_PER_SPREAD: usize = 100;
-                let edges = graph
-                    .get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
+            for (entity_uuid, source_activation) in frontier {
+                expanded.insert(entity_uuid);
+                let edges = adjacency.edges_of(graph, &entity_uuid)?;
 
                 for edge in edges {
-                    // Resolve the real neighbour, as the bidirectional path does.
+                    // Deliberately divergent from the bidirectional path: that path
+                    // decays by the directional blend (effective*0.6 + directional*0.4),
+                    // so learned edge direction affects scoring there and not here. That
+                    // is a scoring change rather than a correctness fix, so it is left
+                    // for a change that can be measured on its own.
                     //
-                    // This was `edge.to_entity` unconditionally. Edges are indexed
-                    // under BOTH endpoints (index_entity_edge writes two keys), so
-                    // get_entity_relationships_limited returns edges where
-                    // entity_uuid is sometimes the `to` side — and on those, taking
-                    // `to_entity` spread activation from a node back onto ITSELF
-                    // instead of to its neighbour. A self-loop that inflates the
-                    // source's own score and never reaches the entity the edge was
-                    // recording a relationship to.
-                    //
-                    // Still divergent from the bidirectional path, deliberately and
-                    // not silently: that path also blends directional_strength
-                    // (effective*0.6 + directional*0.4), so learned edge direction
-                    // affects scoring there and not here. That is a scoring change
-                    // rather than a correctness fix, so it is left for a change that
-                    // can be measured on its own.
-                    let target_uuid = edge.neighbor_of(&entity_uuid);
-
-                    // Edge-tier trust weight (SHO-D1, PIPE-4)
-                    let tier_trust = if edge.is_potentiated() {
-                        EDGE_TIER_TRUST_LTP
-                    } else {
-                        match edge.tier {
-                            EdgeTier::L3Semantic => EDGE_TIER_TRUST_L3,
-                            EdgeTier::L2Episodic => EDGE_TIER_TRUST_L2,
-                            EdgeTier::L1Working => EDGE_TIER_TRUST_L1,
-                        }
-                    };
-
-                    // SHO-26: Importance-weighted decay (using effective_strength for time-aware decay)
-                    let effective = edge.effective_strength();
-                    let decay_rate = calculate_importance_weighted_decay(effective);
+                    // SHO-26: Importance-weighted decay (time-aware effective strength)
+                    let decay_rate = calculate_importance_weighted_decay(edge.effective);
                     let decay = (-decay_rate * hop as f32).exp();
 
-                    let base_spread = source_activation * decay * effective * tier_trust;
+                    let base_spread = source_activation * decay * edge.effective * edge.tier_trust;
 
-                    // Ontological type penalty (same as bidirectional path)
-                    let spread_amount = if let Some(intent) = intent_ref {
-                        let mut penalty = 1.0_f32;
-                        if !intent.relation_types.is_empty()
-                            && !matches!(
-                                edge.relation_type,
-                                RelationType::CoOccurs
-                                    | RelationType::RelatedTo
-                                    | RelationType::CoRetrieved
-                            )
-                            && !intent.relation_types.contains(&edge.relation_type)
-                        {
-                            penalty *= ONTOLOGICAL_RELATION_PENALTY;
+                    let spread_amount = match intent_ref {
+                        Some(intent) => {
+                            base_spread
+                                * ontological_penalty(edge, intent, graph, &mut entity_label_cache)
                         }
-                        if !intent.expected_labels.is_empty() {
-                            let cached_labels =
-                                entity_label_cache.entry(target_uuid).or_insert_with(|| {
-                                    graph
-                                        .get_entity(&target_uuid)
-                                        .ok()
-                                        .flatten()
-                                        .map(|e| e.labels)
-                                });
-                            if let Some(labels) = cached_labels {
-                                let type_match = labels.iter().any(|l| {
-                                    intent
-                                        .expected_labels
-                                        .iter()
-                                        .any(|exp| l.matches_with_hierarchy(exp))
-                                });
-                                if !type_match {
-                                    penalty *= ONTOLOGICAL_ENTITY_PENALTY;
-                                }
-                            }
-                        }
-                        base_spread * penalty
-                    } else {
-                        base_spread
+                        None => base_spread,
                     };
 
-                    let new_activation = activation_map.entry(target_uuid).or_insert(0.0);
+                    let new_activation = activation_map.entry(edge.target).or_insert(0.0);
                     *new_activation += spread_amount;
 
                     if spread_amount > 0.01 {
@@ -1106,8 +1130,6 @@ pub fn spreading_activation_retrieve_with_stats(
     let embedding_start = Instant::now();
     let query_embedding = embedder.encode_for_query(query_text)?;
     stats.embedding_time_us = embedding_start.elapsed().as_micros() as u64;
-
-    let now = crate::memory::scoring_now();
 
     for (_episode_uuid, (graph_activation, episode)) in activated_memories {
         // Convert episode to memory
@@ -1869,5 +1891,98 @@ mod fusion_tests {
     fn degenerate_weights_do_not_produce_nan() {
         // A NaN would poison the sort comparator rather than merely rank badly.
         assert_eq!(fuse_hybrid_score(0.9, 0.9, 0.9, 0.0, 0.0, 0.0, 1.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod spreading_frontier_tests {
+    use super::*;
+    use crate::graph_memory::{EntityNode, LtpStatus, PiiClassification, RelationshipEdge};
+
+    fn entity(name: &str) -> EntityNode {
+        EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        }
+    }
+
+    #[test]
+    fn frontier_is_unexpanded_above_threshold_strongest_first_and_capped() {
+        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        let activation: HashMap<Uuid, f32> = ids
+            .iter()
+            .zip([0.9, 0.5, 0.5, 0.004, 0.7, 0.2])
+            .map(|(id, act)| (*id, act))
+            .collect();
+        let expanded: HashSet<Uuid> = [ids[4]].into_iter().collect();
+
+        let frontier = select_frontier(&activation, &expanded, 0.005, 3);
+        let mut tied = [ids[1], ids[2]];
+        tied.sort();
+        assert_eq!(
+            frontier,
+            vec![(ids[0], 0.9), (tied[0], 0.5), (tied[1], 0.5)],
+            "expanded and below-threshold entities are out; ties order by uuid; cap holds"
+        );
+        assert_eq!(select_frontier(&activation, &expanded, 0.005, 10).len(), 4);
+    }
+
+    #[test]
+    fn spreading_expands_each_entity_once_and_caps_each_hop() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let origin = Utc::now();
+        let mut seeds = Vec::new();
+        for s in 0..3 {
+            let seed = graph.add_entity(entity(&format!("hub {s}"))).unwrap();
+            for l in 0..MAX_EDGES_PER_SPREAD {
+                let leaf = graph.add_entity(entity(&format!("leaf {s} {l}"))).unwrap();
+                let mut edge = RelationshipEdge::synthetic_for_sim(
+                    0.5,
+                    EdgeTier::L2Episodic,
+                    LtpStatus::None,
+                    origin,
+                );
+                edge.from_entity = seed;
+                edge.to_entity = leaf;
+                graph.add_relationship(edge).unwrap();
+            }
+            seeds.push((seed, 1.0_f32));
+        }
+
+        let mut labels = HashMap::new();
+        let mut adjacency = AdjacencyCache::new(Utc::now());
+        let (activation, traversed, _) = spread_single_direction(
+            &seeds,
+            &graph,
+            2,
+            SPREADING_ACTIVATION_THRESHOLD,
+            None,
+            &mut labels,
+            &mut adjacency,
+        )
+        .unwrap();
+
+        // Hop 1 expands the 3 hubs; hop 2's frontier is their 300 leaves, cut to the cap.
+        assert_eq!(adjacency.edges.len(), seeds.len() + SPREADING_FRONTIER_CAP);
+        assert_eq!(
+            activation.len(),
+            seeds.len() + seeds.len() * MAX_EDGES_PER_SPREAD
+        );
+        // Each hub spread once. Re-expanding the hubs on hop 2 would record their 300
+        // edges a second time; a leaf's spread back to its hub is below the record floor.
+        assert_eq!(traversed.len(), seeds.len() * MAX_EDGES_PER_SPREAD);
+        let distinct: HashSet<&Uuid> = traversed.iter().collect();
+        assert_eq!(distinct.len(), traversed.len());
     }
 }

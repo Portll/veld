@@ -27,13 +27,15 @@ on:
         options: ['full', 'all']
       suite:
         description: >-
-          locomo-gate is the 100-case gate. locomo is the 1,531-case held-out set, for a question
-          the gate is too coarse to settle: whole-case metrics move in steps of 1/n, 0.01 overall
-          and 0.04 on multi_hop at n=100, both above a 2% allowance. locomo runs ungated.
+          locomo-gate is the 100-case gate. locomo is all 1,531 LoCoMo cases, for a question the
+          gate is too coarse to settle: whole-case metrics move in steps of 1/n, 0.01 overall and
+          0.04 on multi_hop at n=100, both above a 2% allowance. locomo contains the gate's
+          conversation; locomo-holdout leaves it out, and every case someone has examined, and
+          is the number to report. Neither is gated.
         required: false
         default: 'locomo-gate'
         type: choice
-        options: ['locomo-gate', 'locomo']
+        options: ['locomo-gate', 'locomo', 'locomo-holdout']
       record:
         description: 'Record a new baseline: run ungated and upload the reports'
         required: false
@@ -56,6 +58,43 @@ on:
         description: 'Run id whose model-tape-rocksdb artifact to replay (model_tape=replay only)'
         required: false
         default: ''
+      rerank_model:
+        description: >-
+          Cross-encoder registry id for the rerank_model dial (src/embeddings/cross_encoder.rs);
+          empty keeps the shipped default. The baseline was recorded under mxbai-rerank-xsmall-v1,
+          so another model is another pipeline: the gate refuses the comparison, so pair this
+          with record=true and read the diff table as a comparison, not a gate.
+        required: false
+        default: ''
+      rerank_count:
+        description: >-
+          Cross-encoder budget for the rerank_count dial; empty keeps the shipped default (20).
+          As with rerank_model, a different cap is not gated: pair it with record=true.
+        required: false
+        default: ''
+      rerank_pool:
+        description: >-
+          Fused candidates kept for the cross-encoder (rerank_pool dial); empty keeps the shipped
+          30, or 50 for a decomposed query. Not gated: pair it with record=true.
+        required: false
+        default: ''
+      ce_blend:
+        description: >-
+          Cross-encoder share of the final blend for every query shape (ce_blend dial, 0..1);
+          empty keeps each shape's own share. Not gated: pair it with record=true.
+        required: false
+        default: ''
+      embedder:
+        description: >-
+          Primary embedder. minilm-l6-v2 is what the baseline measures. arctic-embed-xs
+          (snowflake-arctic-embed-xs, CLS-pooled, query prefix) and nomic-embed-text-v1.5 (the
+          in-process ONNX build of the model a live server reaches over HTTP, with its task
+          prefixes) are alternative arms: recall-eval refuses to gate across embedders, so dispatch
+          them with record=true.
+        required: false
+        default: 'minilm-l6-v2'
+        type: choice
+        options: ['minilm-l6-v2', 'arctic-embed-xs', 'nomic-embed-text-v1.5']
 
 permissions:
   contents: read
@@ -77,21 +116,25 @@ env:
   # The schedule always runs the gated `full` rung; only a dispatch widens to every rung. The gate
   # reads `full` alone, so `all` still gates.
   LAYER: ${{ github.event.inputs.layer || 'full' }}
-  # The schedule runs the gate suite; only a dispatch reaches the held-out set, which has no
-  # baseline and is never gated.
+  # The schedule runs the gate suite; only a dispatch reaches the full and held-out sets, which
+  # have no baseline and are never gated.
   SUITE: ${{ github.event.inputs.suite || 'locomo-gate' }}
   RECORD: ${{ github.event.inputs.record || 'false' }}
   # Scheduled runs replay the pinned tape: the same model outputs on every runner.
   MODEL_TAPE: ${{ github.event.inputs.model_tape || 'pinned' }}
+  # The report's `embedder` field names what produced it. VELD_EMBEDDER selects it explicitly in
+  # the eval step, so an arm never reaches its embedder through the fallback order.
+  EMBEDDER: ${{ github.event.inputs.embedder || 'minilm-l6-v2' }}
 
 jobs:
   gate:
     name: Recall gate (${{ matrix.engine }})
     runs-on: ubuntu-latest
     # A recording runs every model live on every call, then scores the rest of the 100 x 629
-    # cross-encoder table, so it gets longer. The held-out suite (1,531 questions over 5,882
-    # turns, reranked) gets the job maximum: upstream's runs of it were cancelled at 60 minutes.
-    timeout-minutes: ${{ github.event.inputs.suite == 'locomo' && 360 || github.event.inputs.model_tape == 'record' && 180 || 90 }}
+    # cross-encoder table, so it gets longer. The full and held-out suites (5,882 and 5,253
+    # turns, over a thousand questions each, reranked) get the job maximum: upstream's runs of
+    # the full suite were cancelled at 60 minutes.
+    timeout-minutes: ${{ (github.event.inputs.suite == 'locomo' || github.event.inputs.suite == 'locomo-holdout') && 360 || github.event.inputs.model_tape == 'record' && 180 || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -113,16 +156,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang
 
-      # The harness refuses the hash embedder, so the ONNX runtime and MiniLM are fetched, pinned
-      # and SHA-256 verified by veld's own downloader, into the cache ci.yml's tests share.
+      # The harness refuses the hash embedder, so the ONNX runtime and the arm's embedder are
+      # fetched, pinned and SHA-256 verified by veld's own downloader. The key names the embedder,
+      # so each arm restores a cache holding its own model.
       - uses: actions/cache@v4
         id: models
         with:
           path: ~/.cache/veld
-          key: veld-models-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs') }}
-      - name: Fetch the ONNX runtime and MiniLM
+          key: veld-models-${{ runner.os }}-${{ env.EMBEDDER }}-${{ hashFiles('src/embeddings/downloader.rs') }}
+      - name: Fetch the ONNX runtime and the embedder
         if: steps.models.outputs.cache-hit != 'true'
-        run: cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime --minilm
+        run: >-
+          cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime
+          ${{ env.EMBEDDER == 'arctic-embed-xs' && '--arctic-xs' || env.EMBEDDER == 'nomic-embed-text-v1.5' && '--nomic' || '--minilm' }}
 
       # The cross-encoder downloads itself on first use; the models cache above is saved only on
       # a miss, so without this it would download every run, and a failed download in one repeat
@@ -201,8 +247,17 @@ jobs:
           # can be read as rank-low (gold in 11..100) or never retrieved. The headline metrics come
           # from the production-depth query alone (src/recall_harness/runner.rs, diag_k).
           RECALL_DIAG_K: '100'
+          # The reranker dials. Empty is unset: CognitiveDials::from_env keeps None for an
+          # empty model id (sanitized away) and an unparsable count.
+          VELD_DIALS_RERANK_MODEL: ${{ github.event.inputs.rerank_model || '' }}
+          VELD_DIALS_RERANK_COUNT: ${{ github.event.inputs.rerank_count || '' }}
+          VELD_DIALS_RERANK_POOL: ${{ github.event.inputs.rerank_pool || '' }}
+          VELD_TUNE_CE_BLEND: ${{ github.event.inputs.ce_blend || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
+          # minilm-l6-v2 is VELD_EMBEDDER=minilm, nomic-embed-text-v1.5 is VELD_EMBEDDER=nomic;
+          # arctic-embed-xs is its own id.
+          VELD_EMBEDDER: ${{ env.EMBEDDER == 'arctic-embed-xs' && 'arctic-embed-xs' || env.EMBEDDER == 'nomic-embed-text-v1.5' && 'nomic' || 'minilm' }}
         run: |
           set +e
           set -o pipefail

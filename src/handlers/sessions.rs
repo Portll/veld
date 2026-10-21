@@ -3,12 +3,14 @@
 //! Handlers for user session tracking and management.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{
     Session, SessionEvent, SessionId, SessionStatus, SessionStoreStats, SessionSummary,
@@ -99,17 +101,26 @@ pub async fn list_sessions(
 /// GET /api/sessions/{session_id} - Get a specific session
 pub async fn get_session(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(session_id): Path<String>,
     Query(req): Query<GetSessionRequest>,
 ) -> Result<Json<GetSessionResponse>, AppError> {
-    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&req.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let uuid = uuid::Uuid::parse_str(&session_id).map_err(|e| AppError::InvalidInput {
         field: "session_id".to_string(),
         reason: format!("Invalid UUID: {e}"),
     })?;
     let sid = SessionId(uuid);
-    let session = state.session_store.get_session(&sid);
+    // The store is keyed by session id alone, so ownership is checked here.
+    let session = state
+        .session_store
+        .get_session(&sid)
+        .filter(|session| session.user_id == user_id);
 
     Ok(Json(GetSessionResponse {
         success: session.is_some(),

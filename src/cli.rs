@@ -7,6 +7,7 @@
 //!   veld init                - First-time setup wizard
 //!   veld status              - Check server health
 //!   veld doctor              - Diagnose common issues
+//!   veld restart [--port N]  - Restart a server the way the monitor does
 //!   veld hook session-start  - Output session start hook JSON
 //!   veld hook prompt <msg>   - Output prompt submit hook JSON
 //!   veld hook commit         - Sync the latest git commit into Veld memory
@@ -167,6 +168,19 @@ enum Commands {
     Stop {
         /// Port the target server is listening on (e.g. --port 3032)
         #[arg(long)]
+        port: u16,
+    },
+
+    /// Restart a veld server the way the monitor does: stop it gracefully, then let
+    /// its launchd job or supervisor bring it back, else relaunch it from its recipe
+    Restart {
+        /// Port the server listens on (defaults to the configured port)
+        #[arg(
+            long,
+            env = "VELD_PORT",
+            default_value_t = 3030,
+            value_parser = clap::value_parser!(u16).range(1..)
+        )]
         port: u16,
     },
 
@@ -549,6 +563,13 @@ async fn main() -> Result<()> {
         }
 
         // =====================================================================
+        // NEW: veld restart — stop a server and bring it back as the monitor does
+        // =====================================================================
+        Commands::Restart { port } => {
+            handle_restart(port).await?;
+        }
+
+        // =====================================================================
         // EXISTING: veld hook — Claude Code hooks
         // =====================================================================
         // The hook handlers use reqwest::blocking, which builds its own runtime. Dropping that
@@ -812,6 +833,7 @@ fn handle_init() -> Result<()> {
              host = \"127.0.0.1\"\n\
              port = 3030\n\
              # storage = \"{}\"  # Uncomment to override default\n\
+             # storage_backend = \"rocksdb\"  # or \"redb\"; the backend the next start serves\n\
              # mcp = true  # Set to false to disable the Veld MCP component (`veld serve`)\n",
             storage.display()
         );
@@ -1035,6 +1057,113 @@ fn pid_listening_on_port(port: u16) -> Option<u32> {
         .and_then(|l| l.trim().parse::<u32>().ok())
 }
 
+/// Restart the server on `port` through status-core's `restart_instance`, with the
+/// saved launch recipes, `server.env` layer and log path the monitor's Restart uses.
+async fn handle_restart(port: u16) -> Result<()> {
+    use anyhow::Context as _;
+
+    let instance = veld_status_core::discover_instances()
+        .into_iter()
+        .find(|i| i.port == port);
+    let recipes = veld_status_core::load_launch_recipes()?;
+    let base_url = restart_base_url(port, instance.as_ref(), &recipes);
+    let mut request = veld_status_core::restart_request(&base_url, instance, &recipes, Vec::new());
+    // The new process inherits this one's environment, which now holds config.toml's
+    // values: carried over, they would beat the file at every later start.
+    if let Some(at_start) = veld::config::veld_env_names_at_start() {
+        request.env_remove = bridged_from_config(
+            std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()),
+            at_start,
+        );
+    }
+
+    match (&request.instance, &request.recipe) {
+        (Some(inst), _) => eprintln!(
+            "Stopping veld on port {port} (pid {}) and waiting for it to come back…",
+            inst.pid
+        ),
+        (None, Some(_)) => eprintln!(
+            "No veld is registered on port {port}; starting it from the launch recipe saved for {base_url}…"
+        ),
+        (None, None) => {}
+    }
+
+    let outcome = veld_status_core::restart_instance(request)
+        .await
+        .with_context(|| format!("could not restart veld on port {port}"))?;
+    println!("{}", describe_restart(port, &outcome));
+    Ok(())
+}
+
+/// The base URL a restart of the server on `port` probes: the registry's when one
+/// is registered there, else the one a launch recipe for that port was saved under,
+/// else loopback.
+fn restart_base_url(
+    port: u16,
+    instance: Option<&veld_status_core::DiscoveredInstance>,
+    recipes: &std::collections::BTreeMap<String, veld_status_core::LaunchSpec>,
+) -> String {
+    if let Some(inst) = instance {
+        return inst.base_url.trim_end_matches('/').to_string();
+    }
+    let loopback = format!("http://127.0.0.1:{port}");
+    if recipes.contains_key(&loopback) {
+        return loopback;
+    }
+    let suffix = format!(":{port}");
+    recipes
+        .keys()
+        .find(|k| k.ends_with(&suffix))
+        .cloned()
+        .unwrap_or(loopback)
+}
+
+/// The `VELD_*` names in `current` that the `config.toml` bridge set, i.e. that
+/// the process was not started with.
+fn bridged_from_config(
+    current: impl IntoIterator<Item = String>,
+    at_start: &[String],
+) -> Vec<String> {
+    current
+        .into_iter()
+        .filter(|k| k.starts_with("VELD_") && !at_start.contains(k))
+        .collect()
+}
+
+/// One paragraph on how a restart went: what brought the server back, where its
+/// output goes, and which of the old process's variables the new one lacks.
+fn describe_restart(port: u16, outcome: &veld_status_core::RestartOutcome) -> String {
+    let mut text = match (outcome.supervisor.as_deref(), outcome.pid) {
+        (Some(job), _) => format!(
+            "veld on port {port} is back: launchd started its job {job} again after the graceful stop, with the environment and log its plist sets."
+        ),
+        (None, None) => format!(
+            "veld on port {port} is back: its supervisor (Veld Desktop or another process manager) started it again after the graceful stop, with its own environment and log."
+        ),
+        (None, Some(pid)) => {
+            let recipe = if outcome.recipe_source == "recipe" {
+                "the launch recipe saved in the monitor"
+            } else {
+                "the launch recipe in the instance registry"
+            };
+            let log = outcome
+                .log_path
+                .as_deref()
+                .map(|p| format!("; its output is appended to {p}"))
+                .unwrap_or_default();
+            format!("veld on port {port} is back as pid {pid}, relaunched from {recipe}{log}.")
+        }
+    };
+    if !outcome.missing_env.is_empty() {
+        text.push_str(&format!(
+            " Not carried, so the new process runs without them: {}. Add them to {} to keep them across restarts.",
+            outcome.missing_env.join(", "),
+            veld_status_core::server_env_path().display()
+        ));
+    }
+    text
+}
+
 fn handle_doctor() -> Result<()> {
     eprintln!();
     eprintln!("  Veld Doctor");
@@ -1070,6 +1199,11 @@ fn handle_doctor() -> Result<()> {
         "  ✓ Backend target: {} (runtime: {})",
         config.requested_storage_backend, config.effective_storage_backend
     );
+
+    // 1b. Per-tenant storage sizes
+    if storage.is_dir() {
+        all_ok &= report_tenant_storage(&storage);
+    }
 
     // 2. Config
     let config_dir = config_directory();
@@ -1135,6 +1269,101 @@ fn handle_doctor() -> Result<()> {
     eprintln!();
 
     Ok(())
+}
+
+/// Tenant entries `veld doctor` sizes, in report order.
+const TENANT_DOCTOR_ENTRIES: [&str; 6] = [
+    "projection_checkpoints.bin.sidedata",
+    "intent.log",
+    "slow_store.db-wal",
+    "graph",
+    "storage",
+    "slow_store.db",
+];
+
+/// Remedy line when `entry` at `bytes` is past its warning threshold.
+fn tenant_size_warning(entry: &str, bytes: u64) -> Option<&'static str> {
+    const MIB: u64 = 1024 * 1024;
+    match entry {
+        "projection_checkpoints.bin.sidedata" if bytes > 256 * MIB => {
+            Some("restart the server so the new side-data compaction runs")
+        }
+        "slow_store.db-wal" if bytes > 128 * MIB => {
+            Some("a passive checkpoint runs after the next slow-store mirror rebuild")
+        }
+        "intent.log" if bytes > 1024 * MIB => Some("intent-log rotation is not implemented yet"),
+        _ => None,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Size of a file, or of a directory tree. Symlinks are not followed and
+/// unreadable entries count as zero: this is a diagnostic, not an audit.
+fn path_size_bytes(path: &std::path::Path) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.is_file() {
+        return Some(meta.len());
+    }
+    if !meta.is_dir() {
+        return Some(0);
+    }
+    let mut total = 0;
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        total += path_size_bytes(&entry.path()).unwrap_or(0);
+    }
+    Some(total)
+}
+
+/// Print per-tenant store sizes. Returns false when any threshold is exceeded.
+fn report_tenant_storage(storage: &std::path::Path) -> bool {
+    let Ok(read_dir) = std::fs::read_dir(storage) else {
+        return true;
+    };
+    let mut tenants: Vec<std::path::PathBuf> = read_dir
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    tenants.sort();
+
+    let mut ok = true;
+    for tenant in tenants {
+        let sizes: Vec<(&str, u64)> = TENANT_DOCTOR_ENTRIES
+            .iter()
+            .filter_map(|name| path_size_bytes(&tenant.join(name)).map(|b| (*name, b)))
+            .collect();
+        if sizes.is_empty() {
+            continue;
+        }
+        let label = tenant
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        eprintln!("  … Tenant {label}");
+        for (name, bytes) in sizes {
+            match tenant_size_warning(name, bytes) {
+                Some(remedy) => {
+                    eprintln!("    ⚠ {name}: {} — {remedy}", format_bytes(bytes));
+                    ok = false;
+                }
+                None => eprintln!("    ✓ {name}: {}", format_bytes(bytes)),
+            }
+        }
+    }
+    ok
 }
 
 fn handle_version() {
@@ -2309,6 +2538,32 @@ async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tenant_size_warning_thresholds() {
+        const MIB: u64 = 1024 * 1024;
+        let side = "projection_checkpoints.bin.sidedata";
+        assert!(tenant_size_warning(side, 256 * MIB).is_none());
+        assert!(tenant_size_warning(side, 256 * MIB + 1).is_some());
+        assert!(tenant_size_warning("slow_store.db-wal", 128 * MIB).is_none());
+        assert!(tenant_size_warning("slow_store.db-wal", 128 * MIB + 1).is_some());
+        assert!(tenant_size_warning("intent.log", 1024 * MIB).is_none());
+        assert!(tenant_size_warning("intent.log", 1024 * MIB + 1).is_some());
+        // Directories and the main db have no threshold, however large.
+        assert!(tenant_size_warning("graph", u64::MAX).is_none());
+        assert!(tenant_size_warning("storage", u64::MAX).is_none());
+    }
+
+    #[test]
+    fn path_size_bytes_sums_trees_and_skips_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), [0u8; 10]).unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        std::fs::write(dir.path().join("d").join("b"), [0u8; 5]).unwrap();
+        assert_eq!(path_size_bytes(dir.path()), Some(15));
+        assert_eq!(path_size_bytes(&dir.path().join("missing")), None);
+        assert_eq!(format_bytes(1536 * 1024), "1.5 MiB");
+    }
+
     /// Regression: the server's `/api/remember` response shape is `{id, success}`
     /// (see `handlers::remember::RememberResponse`). An earlier CLI mirror
     /// required `message` instead of `success`, which made the post-commit hook
@@ -2376,6 +2631,172 @@ mod tests {
         let body = r#"{"id":"mem-xyz","success":true,"message":"ok","latency_ms":42}"#;
         let resp: RememberResponse = serde_json::from_str(body).expect("must deserialize");
         assert_eq!(resp.id, "mem-xyz");
+    }
+
+    fn registered(base_url: &str, port: u16) -> veld_status_core::DiscoveredInstance {
+        veld_status_core::DiscoveredInstance {
+            base_url: base_url.into(),
+            label: String::new(),
+            pid: 4242,
+            host: "127.0.0.1".into(),
+            port,
+            version: String::new(),
+            data_path: String::new(),
+            started_at: None,
+            last_heartbeat: chrono::Utc::now(),
+            launch: None,
+        }
+    }
+
+    #[test]
+    fn restart_takes_a_port_and_defaults_to_the_configured_one() {
+        let cli = Cli::try_parse_from(["veld", "restart", "--port", "3031"]).unwrap();
+        assert!(matches!(cli.command, Commands::Restart { port: 3031 }));
+
+        let configured = std::env::var("VELD_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(3030);
+        let cli = Cli::try_parse_from(["veld", "restart"]).unwrap();
+        assert!(matches!(cli.command, Commands::Restart { port } if port == configured));
+
+        assert!(Cli::try_parse_from(["veld", "restart", "--port", "0"]).is_err());
+        assert!(Cli::try_parse_from(["veld", "restart", "--port", "65536"]).is_err());
+        assert!(Cli::try_parse_from(["veld", "restart", "3031"]).is_err());
+    }
+
+    #[test]
+    fn restart_base_url_prefers_the_registry_then_a_recipe_for_the_port() {
+        let mut recipes = std::collections::BTreeMap::new();
+        assert_eq!(
+            restart_base_url(3031, None, &recipes),
+            "http://127.0.0.1:3031"
+        );
+
+        recipes.insert(
+            "http://localhost:13031".to_string(),
+            veld_status_core::LaunchSpec::default(),
+        );
+        assert_eq!(
+            restart_base_url(3031, None, &recipes),
+            "http://127.0.0.1:3031"
+        );
+
+        recipes.insert(
+            "http://localhost:3031".to_string(),
+            veld_status_core::LaunchSpec::default(),
+        );
+        assert_eq!(
+            restart_base_url(3031, None, &recipes),
+            "http://localhost:3031"
+        );
+
+        recipes.insert(
+            "http://127.0.0.1:3031".to_string(),
+            veld_status_core::LaunchSpec::default(),
+        );
+        assert_eq!(
+            restart_base_url(3031, None, &recipes),
+            "http://127.0.0.1:3031"
+        );
+
+        let inst = registered("http://10.0.0.5:3031/", 3031);
+        assert_eq!(
+            restart_base_url(3031, Some(&inst), &recipes),
+            "http://10.0.0.5:3031"
+        );
+    }
+
+    #[test]
+    fn restart_request_matches_the_monitors() {
+        let saved = veld_status_core::LaunchSpec {
+            exe: "/usr/local/bin/veld".into(),
+            args: vec!["server".into()],
+            ..Default::default()
+        };
+        let mut recipes = std::collections::BTreeMap::new();
+        recipes.insert("http://127.0.0.1:3031".to_string(), saved.clone());
+        let inst = registered("http://127.0.0.1:3031", 3031);
+
+        let base_url = restart_base_url(3031, Some(&inst), &recipes);
+        let req = veld_status_core::restart_request(&base_url, Some(inst), &recipes, Vec::new());
+
+        assert_eq!(req.base_url, "http://127.0.0.1:3031");
+        assert_eq!(req.instance.as_ref().map(|i| i.pid), Some(4242));
+        assert_eq!(req.recipe, Some(saved));
+        assert_eq!(req.log_path, veld_status_core::server_log_path(3031));
+        let server_env = veld_status_core::server_env_path();
+        let expected_files = if server_env.is_file() {
+            vec![server_env]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(req.env_files, expected_files);
+        assert!(req.env_overrides.is_empty());
+    }
+
+    #[test]
+    fn only_variables_config_toml_set_are_withheld_from_the_new_server() {
+        let at_start = vec!["VELD_EMBEDDER".to_string(), "VELD_PORT".to_string()];
+        let current = [
+            "VELD_EMBEDDER",
+            "VELD_API_KEY",
+            "VELD_PORT",
+            "VELD_STORAGE_BACKEND",
+            "PATH",
+        ]
+        .map(String::from);
+        assert_eq!(
+            bridged_from_config(current, &at_start),
+            vec![
+                "VELD_API_KEY".to_string(),
+                "VELD_STORAGE_BACKEND".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn restart_outcome_names_who_brought_the_server_back() {
+        let outcome = |pid: Option<u32>, supervisor: Option<&str>, source: &str| {
+            veld_status_core::RestartOutcome {
+                base_url: "http://127.0.0.1:3030".into(),
+                pid,
+                supervised: pid.is_none(),
+                log_path: pid.map(|_| "/cfg/veld/logs/veld-3030.log".to_string()),
+                missing_env: Vec::new(),
+                carried_env: Vec::new(),
+                recipe_source: source.into(),
+                supervisor: supervisor.map(str::to_string),
+            }
+        };
+
+        let launchd = describe_restart(
+            3030,
+            &outcome(None, Some("gui/501/net.portll.veld"), "launchd"),
+        );
+        assert!(
+            launchd.contains("launchd started its job gui/501/net.portll.veld"),
+            "{launchd}"
+        );
+
+        let supervised = describe_restart(3030, &outcome(None, None, "supervisor"));
+        assert!(supervised.contains("its supervisor"), "{supervised}");
+        assert!(!supervised.contains("Not carried"), "{supervised}");
+
+        let mut relaunched = outcome(Some(777), None, "registry");
+        relaunched.missing_env = vec!["VELD_EMBEDDER".into(), "VELD_EMBEDDING_API_URL".into()];
+        let text = describe_restart(3030, &relaunched);
+        assert!(text.contains("back as pid 777"), "{text}");
+        assert!(text.contains("instance registry"), "{text}");
+        assert!(text.contains("/cfg/veld/logs/veld-3030.log"), "{text}");
+        assert!(
+            text.contains("VELD_EMBEDDER, VELD_EMBEDDING_API_URL"),
+            "{text}"
+        );
+        assert!(!text.contains('\n'), "one paragraph");
+
+        let saved = describe_restart(3031, &outcome(Some(778), None, "recipe"));
+        assert!(saved.contains("saved in the monitor"), "{saved}");
     }
 }
 
