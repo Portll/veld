@@ -28,9 +28,9 @@ You are running with Veld, a persistent cognitive memory system. This is not a t
 - When a session starts, relevant memories from past sessions are surfaced.
 - When the user asks something, related memories are retrieved and injected into your context.
 - When you finish responding, important context is encoded into memory.
-- When you use tools (Edit, Write, Bash, Read, Grep, Glob, etc.) patterns are recorded.
+- When a command fails or a subagent finishes, the outcome is recorded. Routine edits and reads are not.
 
-Hooks fire for all tool types. Context is surfaced pre-tool and actions are recorded post-tool. You don't see the API calls — you just receive the context. Implementation: [hooks/memory-hook.ts](hooks/memory-hook.ts).
+Context is surfaced before a tool runs and returned to the model as `additionalContext`; failures and subagent completions are recorded after. You don't see the API calls — you just receive the context. Implementation: [hooks/memory-hook.ts](hooks/memory-hook.ts).
 
 **Emphasis Layer (explicit tools):**
 - `remember` — mark something HIGH IMPORTANCE (preserved longer, resists decay).
@@ -275,7 +275,7 @@ How to use the memory tools well — what to `remember`, what to leave to the au
 
 ### When to call `remember` explicitly
 
-The hook layer encodes most context automatically (Edit/Write/Bash/Read tool patterns, prompt submissions, session-start surfaces). Reach for explicit `remember(content, importance)` only when:
+The hook layer records command failures and subagent completions automatically, and surfaces context at session start, on each prompt and before tools. Reach for explicit `remember(content, importance)` only when:
 
 - A **decision** was made that future sessions need to honour (e.g., "we chose Redb over RocksDB because …" — see [decision 0001](docs/src/decisions/0001-redb-migration.md)).
 - A **user preference** was stated (e.g., "always run cargo check, never cargo build").
