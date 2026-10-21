@@ -78,10 +78,21 @@ on:
         default: ''
       ce_blend:
         description: >-
-          Cross-encoder weight in the final blend (ce_blend dial, 0..1); empty keeps the shipped
-          0.18. Not gated: pair it with record=true.
+          Cross-encoder share of the final blend for every query shape (ce_blend dial, 0..1);
+          empty keeps each shape's own share. Not gated: pair it with record=true.
         required: false
         default: ''
+      embedder:
+        description: >-
+          Primary embedder. minilm-l6-v2 is what the baseline measures. arctic-embed-xs
+          (snowflake-arctic-embed-xs, CLS-pooled, query prefix) and nomic-embed-text-v1.5 (the
+          in-process ONNX build of the model a live server reaches over HTTP, with its task
+          prefixes) are alternative arms: recall-eval refuses to gate across embedders, so dispatch
+          them with record=true.
+        required: false
+        default: 'minilm-l6-v2'
+        type: choice
+        options: ['minilm-l6-v2', 'arctic-embed-xs', 'nomic-embed-text-v1.5']
 
 permissions:
   contents: read
@@ -109,6 +120,9 @@ env:
   RECORD: ${{ github.event.inputs.record || 'false' }}
   # Scheduled runs replay the pinned tape: the same model outputs on every runner.
   MODEL_TAPE: ${{ github.event.inputs.model_tape || 'pinned' }}
+  # The report's `embedder` field names what produced it. VELD_EMBEDDER selects it explicitly in
+  # the eval step, so an arm never reaches its embedder through the fallback order.
+  EMBEDDER: ${{ github.event.inputs.embedder || 'minilm-l6-v2' }}
 
 jobs:
   gate:
@@ -139,16 +153,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang
 
-      # The harness refuses the hash embedder, so the ONNX runtime and MiniLM are fetched, pinned
-      # and SHA-256 verified by veld's own downloader, into the cache ci.yml's tests share.
+      # The harness refuses the hash embedder, so the ONNX runtime and the arm's embedder are
+      # fetched, pinned and SHA-256 verified by veld's own downloader. The key names the embedder,
+      # so each arm restores a cache holding its own model.
       - uses: actions/cache@v4
         id: models
         with:
           path: ~/.cache/veld
-          key: veld-models-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs') }}
-      - name: Fetch the ONNX runtime and MiniLM
+          key: veld-models-${{ runner.os }}-${{ env.EMBEDDER }}-${{ hashFiles('src/embeddings/downloader.rs') }}
+      - name: Fetch the ONNX runtime and the embedder
         if: steps.models.outputs.cache-hit != 'true'
-        run: cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime --minilm
+        run: >-
+          cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --onnxruntime
+          ${{ env.EMBEDDER == 'arctic-embed-xs' && '--arctic-xs' || env.EMBEDDER == 'nomic-embed-text-v1.5' && '--nomic' || '--minilm' }}
 
       # The cross-encoder downloads itself on first use; the models cache above is saved only on
       # a miss, so without this it would download every run, and a failed download in one repeat
@@ -235,6 +252,9 @@ jobs:
           VELD_TUNE_CE_BLEND: ${{ github.event.inputs.ce_blend || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
+          # minilm-l6-v2 is VELD_EMBEDDER=minilm, nomic-embed-text-v1.5 is VELD_EMBEDDER=nomic;
+          # arctic-embed-xs is its own id.
+          VELD_EMBEDDER: ${{ env.EMBEDDER == 'arctic-embed-xs' && 'arctic-embed-xs' || env.EMBEDDER == 'nomic-embed-text-v1.5' && 'nomic' || 'minilm' }}
         run: |
           set +e
           set -o pipefail
