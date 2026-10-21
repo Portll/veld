@@ -837,8 +837,13 @@ fn decode_memory(bytes: &[u8]) -> Result<Memory, VamanaProjectionError> {
 }
 
 /// Dyn-friendly arm: the [`JournaledWriter`] hands us typed payloads at
-/// live-write time and the checkpoint is persisted on the live cadence
-/// described in the module docs.
+/// live-write time, inline or from a deferred worker, and the checkpoint is
+/// persisted on the live cadence described in the module docs.
+///
+/// There is no `hold_checkpoint_below`: a record this projection cannot apply
+/// (a dimension mismatch) fails again on every replay, and a failed replay
+/// refuses the tenant's writer, so a failed live apply is passed over by the
+/// checkpoint as it always was.
 impl TypedProjection for VamanaProjection {
     fn name(&self) -> &str {
         self.kind.projection_name()
@@ -858,6 +863,11 @@ impl TypedProjection for VamanaProjection {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn flush_checkpoint(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.persist()
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
     }
 }
 

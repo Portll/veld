@@ -2489,8 +2489,21 @@ impl MultiUserMemoryManager {
         // inline that stall serialized every write for the tenant behind the
         // writer mutex. Deferred, it applies on its own worker after the ack.
         writer.add_deferred_projection(Box::new(sqlite_projection));
+        // A text Vamana kind inserts into its graph for every frame carrying
+        // its embedding, which every remember journals once its deferred
+        // embed lands, and every ID_MAP_PERSIST_EVERY applies it rewrites its
+        // whole id map with two fsyncs. Inline, both ran under the writer
+        // mutex. Its one reader, the query planner, reaches it through
+        // `deferred_projection` and may trail the journal by the queue, as it
+        // already trails a remember by the deferred embed. The other kinds
+        // stay inline: no write path produces their vectors, so they never
+        // insert.
         for vp in vamana_projections {
-            writer.add_projection(Box::new(vp));
+            if vp.kind().is_text() {
+                writer.add_deferred_projection(Box::new(vp));
+            } else {
+                writer.add_projection(Box::new(vp));
+            }
         }
         writer.add_projection(Box::new(bm25_projection));
         // Register the wiki render projection (built + replayed above) if it
@@ -4882,9 +4895,12 @@ pub const GENERIC_DERIVED_ENTITY_WORDS: &[&str] = &[
 /// `kind` is the projection-name string carried in the `VectorPredicate`
 /// (e.g. `"vamana-text-primary"`), which is exactly what
 /// [`crate::intent_log::TypedProjection::name`] reports, so resolution is
-/// a direct name match. Each call clones the index `Arc` out and releases
-/// the writer mutex immediately; the ANN search runs under the index's
-/// own `RwLock`, never under the writer lock.
+/// a direct name match. The text kinds apply on deferred workers, so what
+/// they answer covers the journal up to the last record their worker
+/// applied: an LSN-ordered prefix that trails acknowledged writes by the
+/// queue, and that `drain_deferred_projections` brings up to date. Neither
+/// call holds the writer mutex while it reads; the ANN search runs under the
+/// index's own `RwLock`.
 ///
 /// A writer not yet open is opened here, which replays the tenant's intent
 /// log; the querier calls these on the blocking pool for that reason.
@@ -4894,26 +4910,37 @@ impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
         user_id: &str,
         kind: &str,
     ) -> Option<std::sync::Arc<parking_lot::RwLock<crate::vector_db::VamanaIndex>>> {
-        let writer = self.get_user_journaled_writer(user_id).ok()?;
-        let guard = writer.lock();
-        let projection = guard.projection_by_name(kind)?;
-        let vamana = projection
-            .as_any()
-            .downcast_ref::<crate::vector_db::VamanaProjection>()?;
         // `index()` is `None` while the projection is still lazy (no
         // embedded memory of this kind yet); that resolves to "no
         // candidates" upstream, which is correct.
-        vamana.index().cloned()
+        self.read_vamana_projection(user_id, kind, |vamana| vamana.index().cloned())
     }
 
     fn memory_id_for(&self, user_id: &str, kind: &str, vector_id: u32) -> Option<String> {
+        self.read_vamana_projection(user_id, kind, |vamana| vamana.memory_id_for(vector_id))
+    }
+}
+
+impl MultiUserMemoryManager {
+    /// Run `read` against `user_id`'s Vamana projection named `kind`, inline
+    /// or deferred. A deferred one is read after the writer mutex is
+    /// released, so a read waiting out an insert on its worker holds no
+    /// journaled write up.
+    fn read_vamana_projection<R>(
+        &self,
+        user_id: &str,
+        kind: &str,
+        read: impl FnOnce(&crate::vector_db::VamanaProjection) -> Option<R>,
+    ) -> Option<R> {
         let writer = self.get_user_journaled_writer(user_id).ok()?;
-        let guard = writer.lock();
-        let projection = guard.projection_by_name(kind)?;
-        let vamana = projection
-            .as_any()
-            .downcast_ref::<crate::vector_db::VamanaProjection>()?;
-        vamana.memory_id_for(vector_id)
+        let deferred = {
+            let guard = writer.lock();
+            if let Some(projection) = guard.projection_by_name(kind) {
+                return read(projection.as_any().downcast_ref()?);
+            }
+            guard.deferred_projection(kind)?
+        };
+        deferred.read(|projection| read(projection.as_any().downcast_ref()?))
     }
 }
 
@@ -6210,5 +6237,99 @@ mod reconcile_restore_tests {
             !live(&manager).contains(&orphan),
             "nothing to restore from, so replay is made to agree with the store"
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_vamana_tests {
+    use super::*;
+    use crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION;
+    use crate::intent_log::IntentPayload;
+    use crate::query_planner::adapters::VamanaProvider;
+    use crate::vector_db::VamanaProjection;
+
+    const PRIMARY: &str = "vamana-text-primary";
+
+    /// A journaled `Remember` whose memory carries `embedding` as its primary
+    /// text vector.
+    fn remember_with(embedding: Vec<f32>) -> (MemoryId, IntentPayload) {
+        let id = MemoryId(uuid::Uuid::new_v4());
+        let memory = crate::memory::types::Memory::new(
+            id.clone(),
+            Experience {
+                content: format!("memory {}", id.0),
+                embeddings: Some(embedding),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        let payload = IntentPayload::Remember {
+            user_id: "u".into(),
+            memory_id: id.0.to_string(),
+            memory_bincode: bincode::serde::encode_to_vec(&memory, bincode::config::standard())
+                .unwrap(),
+            schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+        };
+        (id, payload)
+    }
+
+    fn axis(axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 8];
+        v[axis] = 1.0;
+        v
+    }
+
+    #[test]
+    fn a_journaled_vector_reaches_the_text_vamana_on_its_worker_not_under_the_writer() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = ServerConfig {
+            storage_path: root.path().to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        let manager = MultiUserMemoryManager::new(root.path().to_path_buf(), config).unwrap();
+        let writer = manager.get_user_journaled_writer("u").unwrap();
+        let primary = {
+            let guard = writer.lock();
+            assert!(guard.projection_by_name(PRIMARY).is_none(), "not inline");
+            guard
+                .deferred_projection(PRIMARY)
+                .expect("the primary text kind applies on a deferred worker")
+        };
+
+        let (first, first_write) = remember_with(axis(1));
+        let (second, second_write) = remember_with(axis(6));
+        // Reading the projection keeps its worker from applying anything.
+        primary.read(|projection| {
+            manager.journal_and_apply("u", &first_write).unwrap();
+            // The first record waits for the worker, and the writer is not
+            // waiting with it: a second write goes straight through.
+            manager.journal_and_apply("u", &second_write).unwrap();
+            let vamana = projection
+                .as_any()
+                .downcast_ref::<VamanaProjection>()
+                .unwrap();
+            assert_eq!(
+                vamana.tracked_memory_count(),
+                0,
+                "applied off the write path"
+            );
+        });
+
+        assert!(manager.drain_deferred_projections(std::time::Duration::from_secs(10)));
+        let index =
+            VamanaProvider::index(&manager, "u", PRIMARY).expect("index built by the apply");
+        for (id, query) in [(first, axis(1)), (second, axis(6))] {
+            let hits = index.read().search(&query, 1).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(
+                VamanaProvider::memory_id_for(&manager, "u", PRIMARY, hits[0].0),
+                Some(id.0.to_string())
+            );
+        }
     }
 }
