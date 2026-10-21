@@ -392,6 +392,7 @@ fn load_config_path_into_env(path: &std::path::Path) {
         ("mcp", "VELD_MCP_ENABLED"),
         ("auto_compress", "VELD_AUTO_COMPRESS"),
         ("graph_mirror_sync_secs", "VELD_GRAPH_MIRROR_SYNC_SECS"),
+        ("intent_log_segment_mb", "VELD_INTENT_LOG_SEGMENT_MB"),
     ];
 
     let mut applied: Vec<&str> = Vec::new();
@@ -760,6 +761,12 @@ pub struct ServerConfig {
     /// rebuilds it again (default: 600, minimum: 30).
     /// Env `VELD_GRAPH_MIRROR_SYNC_SECS`, config.toml key `graph_mirror_sync_secs`.
     pub graph_mirror_sync_secs: u64,
+
+    /// Size, in MiB, at which a tenant's intent log seals its head file into a
+    /// segment and starts a new one (default: 256; 0 never rotates). A log that
+    /// has rotated needs a build that reads segments.
+    /// Env `VELD_INTENT_LOG_SEGMENT_MB`, config.toml key `intent_log_segment_mb`.
+    pub intent_log_segment_mb: u64,
 }
 
 impl Default for ServerConfig {
@@ -796,14 +803,24 @@ impl Default for ServerConfig {
             log_periodic_scales: vec![7.0, 30.0, 365.0], // Weekly, monthly, yearly resonance
             auto_compress: true,
             graph_mirror_sync_secs: crate::memory::slow_store::MIRROR_SYNC_TTL.as_secs(),
+            intent_log_segment_mb: INTENT_LOG_SEGMENT_MB_DEFAULT,
         }
     }
 }
+
+/// Default [`ServerConfig::intent_log_segment_mb`].
+pub const INTENT_LOG_SEGMENT_MB_DEFAULT: u64 = 256;
 
 impl ServerConfig {
     /// The graph-mirror TTL as a `Duration`, for `SlowStore::begin_sync`.
     pub fn graph_mirror_sync_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.graph_mirror_sync_secs)
+    }
+
+    /// The intent-log segment size in bytes, for `IntentLog::set_segment_bytes`.
+    pub fn intent_log_segment_bytes(&self) -> Option<u64> {
+        (self.intent_log_segment_mb > 0)
+            .then(|| self.intent_log_segment_mb.saturating_mul(1024 * 1024))
     }
 
     /// Load configuration from environment variables with defaults
@@ -1013,6 +1030,17 @@ impl ServerConfig {
                     "VELD_GRAPH_MIRROR_SYNC_SECS={} is not a number, using default {}",
                     val,
                     config.graph_mirror_sync_secs
+                ),
+            }
+        }
+
+        if let Ok(val) = env::var("VELD_INTENT_LOG_SEGMENT_MB") {
+            match val.trim().parse::<u64>() {
+                Ok(n) => config.intent_log_segment_mb = n,
+                Err(_) => tracing::warn!(
+                    "VELD_INTENT_LOG_SEGMENT_MB={} is not a number, using default {}",
+                    val,
+                    config.intent_log_segment_mb
                 ),
             }
         }
@@ -1475,6 +1503,29 @@ mod tests {
         env::set_var("VELD_AUTO_COMPRESS", "maybe");
         assert!(ServerConfig::from_env().auto_compress);
         env::remove_var("VELD_AUTO_COMPRESS");
+    }
+
+    #[test]
+    fn test_intent_log_segment_mb_env_parsing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("VELD_INTENT_LOG_SEGMENT_MB");
+        assert_eq!(
+            ServerConfig::from_env().intent_log_segment_bytes(),
+            Some(INTENT_LOG_SEGMENT_MB_DEFAULT * 1024 * 1024)
+        );
+        env::set_var("VELD_INTENT_LOG_SEGMENT_MB", "64");
+        assert_eq!(
+            ServerConfig::from_env().intent_log_segment_bytes(),
+            Some(64 * 1024 * 1024)
+        );
+        env::set_var("VELD_INTENT_LOG_SEGMENT_MB", "0");
+        assert_eq!(ServerConfig::from_env().intent_log_segment_bytes(), None);
+        env::set_var("VELD_INTENT_LOG_SEGMENT_MB", "big");
+        assert_eq!(
+            ServerConfig::from_env().intent_log_segment_mb,
+            INTENT_LOG_SEGMENT_MB_DEFAULT
+        );
+        env::remove_var("VELD_INTENT_LOG_SEGMENT_MB");
     }
 
     #[test]

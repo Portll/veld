@@ -2249,12 +2249,13 @@ impl MultiUserMemoryManager {
         // the frames appended after them; a hint that does not verify
         // against the file is ignored.
         let frame_index_hint = checkpoint_store.lock().frame_index();
-        let log = crate::intent_log::IntentLog::open_with_index(
+        let mut log = crate::intent_log::IntentLog::open_with_index(
             &log_path,
             journal_cryptor,
             frame_index_hint,
         )
         .with_context(|| format!("open intent log for user {user_id}"))?;
+        log.set_segment_bytes(self.server_config.intent_log_segment_bytes());
 
         // SQLite slow store projection — first in the replay pass.
         let slow_store = self.get_user_slow_store(user_id)?;
@@ -4066,14 +4067,26 @@ impl MultiUserMemoryManager {
                 false,
             )?;
             let staged_user = staging.join(live_user.file_name().unwrap_or_default());
+            // The journal's sealed segments as restored, and the live ones the
+            // backup does not hold, which go aside with the head they followed.
+            let segments: std::collections::BTreeSet<String> = [&staged_user, &live_user]
+                .into_iter()
+                .map(|dir| crate::intent_log::sealed_segments(&dir.join("intent.log")))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
             let pairs: Vec<(std::path::PathBuf, std::path::PathBuf)> = [
                 "storage.redb",
                 "graph/graph.redb",
                 "intent.log",
                 "projection_checkpoints.bin",
             ]
-            .iter()
-            .map(|rel| (staged_user.join(rel), live_user.join(rel)))
+            .into_iter()
+            .map(str::to_string)
+            .chain(segments)
+            .map(|rel| (staged_user.join(&rel), live_user.join(&rel)))
             .collect();
 
             let writer = self.journaled_writers.get(user_id).map(|w| w.clone());

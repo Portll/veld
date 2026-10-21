@@ -1291,7 +1291,10 @@ fn tenant_size_warning(entry: &str, bytes: u64) -> Option<&'static str> {
         "slow_store.db-wal" if bytes > 128 * MIB => {
             Some("a passive checkpoint runs after the next slow-store mirror rebuild")
         }
-        "intent.log" if bytes > 1024 * MIB => Some("intent-log rotation is not implemented yet"),
+        "intent.log" if bytes > 1024 * MIB => Some(
+            "the head should seal into segments at VELD_INTENT_LOG_SEGMENT_MB (256 MiB unless set); \
+             check it is not 0, and restart so a build that rotates opens the log",
+        ),
         _ => None,
     }
 }
@@ -1360,6 +1363,20 @@ fn report_tenant_storage(storage: &std::path::Path) -> bool {
                     ok = false;
                 }
                 None => eprintln!("    ✓ {name}: {}", format_bytes(bytes)),
+            }
+        }
+        if let Ok(segments) = veld::intent_log::sealed_segments(&tenant.join("intent.log")) {
+            if !segments.is_empty() {
+                let bytes: u64 = segments
+                    .iter()
+                    .filter_map(|s| std::fs::metadata(&s.path).ok())
+                    .map(|m| m.len())
+                    .sum();
+                eprintln!(
+                    "    ✓ intent.log sealed segments: {} ({})",
+                    segments.len(),
+                    format_bytes(bytes)
+                );
             }
         }
     }
@@ -3088,9 +3105,18 @@ fn reseal_journals(
         };
         match cryptor {
             Some(c) => {
-                let mut report = serde_json::to_value(
-                    veld::intent_log::reseal::reseal_plaintext_frames(&log, &c, dry_run)?,
-                )?;
+                // Every file of the journal: its sealed segments, then the head.
+                let mut files = Vec::new();
+                for file in veld::intent_log::log_files(&log)? {
+                    files.push(veld::intent_log::reseal::reseal_plaintext_frames(
+                        &file, &c, dry_run,
+                    )?);
+                }
+                let head = files.pop().expect("the head exists, checked above");
+                let mut report = serde_json::to_value(head)?;
+                if !files.is_empty() {
+                    report["segments"] = serde_json::to_value(&files)?;
+                }
                 if let Some(sc) = slow_cryptor {
                     let (rows, plaintext) = veld::memory::slow_store::reseal_plaintext_payloads(
                         &slow_store,
