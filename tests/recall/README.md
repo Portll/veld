@@ -22,9 +22,12 @@ reason to accept or decline a port (`docs/upstream/PLAN.md`, 1.5).
 `.github/workflows/recall.yml` runs the 100-case `locomo-gate` suite and compares each engine's
 run against two checked-in files:
 
-- `locomo-gate-baseline.json`: aggregate metrics and the rerank setting they were measured
-  under. `recall-eval` gates on these, and refuses a run reranked differently; its exit code is
-  the pass or fail.
+- `locomo-gate-baseline.json`: aggregate metrics, the rerank setting they were measured
+  under, and any candidate-generation dial the run overrode (`retrieval_dials`, today
+  `date_window_leg`). `recall-eval` gates on these, and refuses a run reranked differently or
+  run under other dial overrides; its exit code is the pass or fail. A baseline without
+  `retrieval_dials` was recorded with no overrides, which is how the gate workflow runs, so it
+  is compared, and a change to a dial's engine default is measured as code.
 - `locomo-gate-baseline.per-case.json`: the per-case records from the same run.
   `scripts/recall_diff.py` uses them to list every case whose result moved: lost gold, gained
   gold, p@1 flips and rank-only moves.
@@ -73,6 +76,23 @@ taken together:
 A change to what a model is fed (another corpus text, a prefix, another candidate source) or a
 model or ONNX Runtime upgrade needs a new tape: replay misses fail the run, and the tape refuses
 model files other than the ones it was recorded from.
+
+## Embedder arms
+
+The workflow's `embedder` input picks the primary embedder: `minilm-l6-v2`, the default and what
+the baseline measures, or `arctic-embed-xs` (snowflake-arctic-embed-xs, see
+`docs/src/guides/deploying.md`). It sets `VELD_EMBEDDER` for the eval, makes `model-fetch` fetch
+that model, and names the models cache, so an arm restores and runs its own model. The report's
+`embedder` field names the model that produced the vectors, and `recall-eval` refuses to gate one
+embedder against another's baseline, so an alternative arm is a recording:
+
+```text
+gh workflow run recall.yml --ref <branch> -f record=true -f embedder=arctic-embed-xs
+```
+
+A pinned tape holds one embedder's outputs, and it refuses to replay under another embedder's
+model files. Once a tape is pinned, run an alternative arm with `model_tape=off` or record a tape
+for it.
 
 ## Files
 

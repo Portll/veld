@@ -174,6 +174,26 @@ pub fn pre_init_ort_runtime(offline_mode: bool) {
     let _ = ORT_PATH_INIT.get_or_init(|| MiniLMEmbedder::init_ort_path_inner(offline_mode));
 }
 
+/// Locate (or, when allowed, download) the shared ONNX Runtime before any `ort` call.
+pub(crate) fn ensure_ort_runtime(offline_mode: bool) -> Result<()> {
+    MiniLMEmbedder::ensure_onnx_runtime_available(offline_mode)
+}
+
+/// `VELD_LAZY_LOAD=false` loads a model when its embedder is built instead of on first use.
+pub(crate) fn lazy_load_enabled() -> bool {
+    std::env::var("VELD_LAZY_LOAD")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true)
+}
+
+/// Inference time past which a single embed is logged as slow (`VELD_EMBED_TIMEOUT_MS`).
+pub(crate) fn embed_timeout_ms() -> u64 {
+    std::env::var("VELD_EMBED_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000)
+}
+
 /// Lazily initialized ONNX sessions and tokenizer
 struct LazyModel {
     sessions: SessionPool,
@@ -295,10 +315,7 @@ impl EmbeddingConfig {
                     .unwrap_or_else(super::downloader::get_models_dir) // Default to cache dir
             });
 
-        let embed_timeout_ms = std::env::var("VELD_EMBED_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5000);
+        let embed_timeout_ms = embed_timeout_ms();
 
         let use_quantized = std::env::var("VELD_USE_QUANTIZED_MODEL")
             .map(|v| v != "0" && v.to_lowercase() != "false")
@@ -499,9 +516,7 @@ impl MiniLMEmbedder {
         threading: OrtThreading,
         pool_size: usize,
     ) -> Result<Self> {
-        let lazy_load = std::env::var("VELD_LAZY_LOAD")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
+        let lazy_load = lazy_load_enabled();
 
         let offline_mode = super::offline_mode_enabled();
 

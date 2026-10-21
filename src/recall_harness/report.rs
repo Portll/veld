@@ -28,6 +28,11 @@ pub struct Report {
     /// refuses: "not recorded" is not the same as "off".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<RerankSetting>,
+    /// The candidate-generation dials the run overrode, if any. `None` on reports written
+    /// before this field existed; [`compare_to_baseline`] reads that as no overrides, since
+    /// the gate never set one (see [`RetrievalDials`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_dials: Option<RetrievalDials>,
     /// sha256 of the model tape the run replayed its model outputs from, or `None` when the
     /// models ran live (see `crate::embeddings::model_tape`). Two runs that replayed one tape
     /// saw byte-identical model outputs, whatever CPU they ran on; a live run and a replayed
@@ -71,7 +76,7 @@ pub const DEFAULT_RERANK_CAP: usize = 20;
 /// Reranking moves p@1 by several points on the gate, so a run with it off, with another
 /// cross-encoder or with another budget measures another pipeline, and a diff against the
 /// baseline would read as a regression no code caused.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RerankSetting {
     /// Whether recall reranks: the `use_reranking` dial is not off and a reranker is configured.
     pub enabled: bool,
@@ -80,6 +85,14 @@ pub struct RerankSetting {
     /// Candidates an undecomposed query hands the cross-encoder at most: the `rerank_count` dial,
     /// or [`DEFAULT_RERANK_CAP`]. Compared only when both runs rerank.
     pub depth: usize,
+    /// The `rerank_pool` dial when set: fused candidates kept for the cross-encoder layer.
+    /// `None` is the shipped width, which is what a report recorded before the dial reads as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<usize>,
+    /// The `ce_blend` dial when set: the cross-encoder's weight in the blend. `None` is the
+    /// shipped weight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blend: Option<f32>,
 }
 
 impl RerankSetting {
@@ -91,12 +104,23 @@ impl RerankSetting {
             enabled,
             model: if enabled { model } else { None },
             depth: dials.rerank_count.unwrap_or(DEFAULT_RERANK_CAP),
+            pool: dials.rerank_pool,
+            blend: dials.ce_blend,
         }
     }
 
     fn describe(&self) -> String {
         match (&self.model, self.enabled) {
-            (Some(m), true) => format!("cross-encoder {m}, cap {}", self.depth),
+            (Some(m), true) => {
+                let mut out = format!("cross-encoder {m}, cap {}", self.depth);
+                if let Some(pool) = self.pool {
+                    out.push_str(&format!(", pool {pool}"));
+                }
+                if let Some(blend) = self.blend {
+                    out.push_str(&format!(", blend {blend:.2}"));
+                }
+                out
+            }
             _ => "cross-encoder off".to_string(),
         }
     }
@@ -105,7 +129,48 @@ impl RerankSetting {
         if self.enabled != other.enabled {
             return false;
         }
-        !self.enabled || (self.model == other.model && self.depth == other.depth)
+        !self.enabled
+            || (self.model == other.model
+                && self.depth == other.depth
+                && self.pool == other.pool
+                && self.blend == other.blend)
+    }
+}
+
+/// The candidate-generation dials a run was measured under, recorded as the operator's
+/// overrides.
+///
+/// A candidate leg that is on for one run and off for the other hands fusion two different
+/// pools, so a diff between them reads as a change no code caused. Unlike [`RerankSetting`],
+/// which records what loaded, this records what was *set*: `None` in a field is the engine
+/// default at that run's `git_sha`, so a code change to a default is measured by the gate as
+/// code, and only an operator override is refused across. A report written before this
+/// field existed is read as no overrides: the gate workflow has never set one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetrievalDials {
+    /// The `date_window_leg` dial: `None` is the engine default (on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_window_leg: Option<bool>,
+}
+
+impl RetrievalDials {
+    /// The overrides in `dials`.
+    pub fn of(dials: &crate::memory::dials::CognitiveDials) -> Self {
+        Self {
+            date_window_leg: dials.date_window_leg,
+        }
+    }
+
+    fn describe(&self) -> String {
+        let mut set: Vec<String> = Vec::new();
+        if let Some(v) = self.date_window_leg {
+            set.push(format!("date_window_leg={v}"));
+        }
+        if set.is_empty() {
+            "engine defaults".to_string()
+        } else {
+            set.join(", ")
+        }
     }
 }
 
@@ -735,6 +800,20 @@ pub fn compare_to_baseline(
             ),
         }];
     }
+    let base_dials = baseline.retrieval_dials.clone().unwrap_or_default();
+    let cur_dials = current.retrieval_dials.clone().unwrap_or_default();
+    if base_dials != cur_dials {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "retrieval dials differ: baseline {}, current {}. These are two candidate \
+                 pools, so their difference is not a regression or an improvement of either. \
+                 Compare against a baseline recorded under the same dials",
+                base_dials.describe(),
+                cur_dials.describe()
+            ),
+        }];
+    }
     let Some(base_full) = baseline.layers.get("full") else {
         return vec![Failure {
             kind: "infrastructure".to_string(),
@@ -1165,7 +1244,10 @@ mod tests {
                 enabled: true,
                 model: Some("mxbai-rerank-xsmall-v1".to_string()),
                 depth: 20,
+                pool: None,
+                blend: None,
             }),
+            retrieval_dials: Some(RetrievalDials::default()),
             model_tape: None,
             git_sha: "deadbeef".to_string(),
             timestamp: chrono::Utc::now(),
@@ -1268,6 +1350,8 @@ mod tests {
             enabled: false,
             model: None,
             depth: 20,
+            pool: None,
+            blend: None,
         });
         let failures = compare_to_baseline(&baseline, &current, 2.0);
         assert_eq!(failures.len(), 1, "{failures:?}");
@@ -1291,11 +1375,52 @@ mod tests {
                 enabled: true,
                 model: Some(model.to_string()),
                 depth,
+                pool: None,
+                blend: None,
             });
             let failures = compare_to_baseline(&baseline, &current, 2.0);
             assert_eq!(failures.len(), 1, "{failures:?}");
             assert_eq!(failures[0].kind, "infrastructure");
         }
+    }
+
+    /// A wider pool or another blend weight changes what the cross-encoder decides, so a
+    /// run under either is another pipeline and the diff names the setting.
+    #[test]
+    fn different_rerank_pool_or_blend_refuses_when_both_rerank() {
+        for (pool, blend, named) in [
+            (Some(100), None, "pool 100"),
+            (None, Some(0.4), "blend 0.40"),
+        ] {
+            let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            current.rerank = Some(RerankSetting {
+                enabled: true,
+                model: Some("mxbai-rerank-xsmall-v1".to_string()),
+                depth: 20,
+                pool,
+                blend,
+            });
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(failures[0].detail.contains(named), "{}", failures[0].detail);
+        }
+    }
+
+    /// A report recorded before the pool and blend were recorded reads as the shipped
+    /// width and weight, so the checked-in baseline still compares with a default run.
+    #[test]
+    fn a_rerank_setting_without_pool_or_blend_reads_as_the_shipped_pipeline() {
+        let old: RerankSetting =
+            serde_json::from_str(r#"{"enabled":true,"model":"mxbai-rerank-xsmall-v1","depth":20}"#)
+                .expect("an old rerank setting parses");
+        assert_eq!(old.pool, None);
+        assert_eq!(old.blend, None);
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"enabled":true,"model":"mxbai-rerank-xsmall-v1","depth":20}"#
+        );
     }
 
     /// With reranking off on both sides the cap is never read, so a different cap is the same
@@ -1308,15 +1433,76 @@ mod tests {
             enabled: false,
             model: None,
             depth: 20,
+            pool: None,
+            blend: None,
         });
         current.rerank = Some(RerankSetting {
             enabled: false,
             model: None,
             depth: 30,
+            pool: None,
+            blend: None,
         });
         let failures = compare_to_baseline(&baseline, &current, 2.0);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// A run with the date window leg switched off against a baseline measured with it on is
+    /// two candidate pools. Refused before any metric, in either order.
+    #[test]
+    fn different_retrieval_dials_refuse_before_any_metric_is_compared() {
+        let off = Some(RetrievalDials {
+            date_window_leg: Some(false),
+        });
+        let defaults = Some(RetrievalDials::default());
+        for (b, c) in [(defaults.clone(), off.clone()), (off, defaults)] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+            baseline.retrieval_dials = b;
+            current.retrieval_dials = c;
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            let detail = &failures[0].detail;
+            assert!(detail.contains("retrieval dials differ"), "{detail}");
+            assert!(detail.contains("date_window_leg=false"), "{detail}");
+            assert!(detail.contains("engine defaults"), "{detail}");
+        }
+    }
+
+    /// A baseline written before the field existed ran under engine defaults, so a current
+    /// run with no overrides is compared, and a real drop is a regression.
+    #[test]
+    fn unrecorded_retrieval_dials_read_as_engine_defaults() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        baseline.retrieval_dials = None;
+        let current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// The same override on both sides is one pipeline, and the comparison runs.
+    #[test]
+    fn same_retrieval_dial_override_on_both_sides_is_compared() {
+        let off = Some(RetrievalDials {
+            date_window_leg: Some(false),
+        });
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+        baseline.retrieval_dials = off.clone();
+        current.retrieval_dials = off;
+        assert!(compare_to_baseline(&baseline, &current, 2.0).is_empty());
+    }
+
+    /// Reports written before the field existed parse as unrecorded.
+    #[test]
+    fn report_without_retrieval_dials_key_parses_as_unrecorded() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("retrieval_dials");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.retrieval_dials, None);
     }
 
     /// Not recorded is refused on either side: it is not the same as off.

@@ -26,6 +26,7 @@ pub mod alignment_config;
 pub mod alignment_csls;
 pub mod alignment_procrustes;
 pub mod alignment_ridge;
+pub mod arctic;
 pub mod chunking;
 pub mod circuit_breaker;
 pub mod competitive;
@@ -47,10 +48,11 @@ use anyhow::Result;
 
 // Re-export downloader functions for convenience
 pub use downloader::{
-    are_models_downloaded, are_ner_models_downloaded, are_nomic_models_downloaded,
-    download_ner_models, download_nomic_models, ensure_downloaded, get_cache_dir, get_models_dir,
-    get_ner_models_dir, get_nomic_models_dir, get_onnx_runtime_path, is_onnx_runtime_downloaded,
-    print_status,
+    are_arctic_xs_models_downloaded, are_models_downloaded, are_ner_models_downloaded,
+    are_nomic_models_downloaded, download_arctic_xs_models, download_ner_models,
+    download_nomic_models, ensure_downloaded, get_arctic_xs_models_dir, get_cache_dir,
+    get_models_dir, get_ner_models_dir, get_nomic_models_dir, get_onnx_runtime_path,
+    is_onnx_runtime_downloaded, print_status,
 };
 
 // Re-export NER types
@@ -91,6 +93,7 @@ pub use alignment_csls::{csls_adjust, local_means, topk_mean};
 /// Dispatch rules:
 /// - prefix `nomic` → `NomicEmbedder::new(NomicConfig::from_env())`
 /// - prefix `minilm` → `MiniLMEmbedder::new(EmbeddingConfig::default())`
+/// - prefix `arctic` → `ArcticEmbedder::new(ArcticConfig::from_env())`
 /// - `http://` / `https://` URL → `HttpEmbedder::new` with `base_url = id`
 /// - anything else → `bail!`
 pub fn load_primary_embedder(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
@@ -120,6 +123,12 @@ fn load_embedder_by_id(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
             minilm::default_session_pool_size(),
         )?);
     }
+    if id.starts_with("arctic") {
+        return Ok(shared::arctic_embedder(
+            &arctic::ArcticConfig::from_env(),
+            minilm::OrtThreading::resolve(),
+        )?);
+    }
     if id.starts_with("http://") || id.starts_with("https://") {
         // `<url>` or `<url>#<model>` — the form HttpEmbedder::id() emits.
         return Ok(shared::http_embedder(
@@ -127,7 +136,7 @@ fn load_embedder_by_id(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
         ));
     }
     anyhow::bail!(
-        "unknown embedder id: {id} (supported prefixes: nomic*, minilm*, http://, https://)"
+        "unknown embedder id: {id} (supported prefixes: nomic*, minilm*, arctic*, http://, https://)"
     );
 }
 
@@ -140,7 +149,7 @@ pub struct PrimaryEmbedderInfo {
     pub id: String,
     pub model: String,
     pub dimension: usize,
-    /// `nomic-onnx` | `minilm-onnx` | `http` — where the vectors come from.
+    /// `nomic-onnx` | `minilm-onnx` | `arctic-onnx` | `http` — where the vectors come from.
     pub kind: &'static str,
     /// Why this one: the env that asked for it, or the fallback step that reached it.
     pub reason: String,
@@ -257,6 +266,7 @@ pub trait Embedder: Send + Sync {
 /// Instances are now keyed by the values that decide which model a tenant gets and how it is
 /// loaded ([`EmbedderSpec`], [`CrossEncoderSpec`]); tenants whose specs are equal hold one `Arc`.
 pub mod shared {
+    use super::arctic::{ArcticConfig, ArcticEmbedder};
     use super::http_embedder::{HttpEmbedder, HttpEmbedderConfig};
     use super::minilm::{EmbeddingConfig, MiniLMEmbedder, OrtThreading};
     use super::nomic::{NomicConfig, NomicEmbedder};
@@ -291,6 +301,11 @@ pub mod shared {
             threading: OrtThreading,
             pool_size: usize,
         },
+        /// snowflake-arctic-embed-xs ONNX, reached only by `VELD_EMBEDDER=arctic-embed-xs`.
+        Arctic {
+            config: ArcticConfig,
+            threading: OrtThreading,
+        },
         /// An OpenAI-compatible endpoint; the config carries its URL and model.
         Http(HttpEmbedderConfig),
     }
@@ -309,6 +324,13 @@ pub mod shared {
                 config: EmbeddingConfig::from_env(),
                 threading: OrtThreading::resolve(),
                 pool_size: super::minilm::default_session_pool_size(),
+            }
+        }
+
+        pub fn arctic_from_env() -> Self {
+            Self::Arctic {
+                config: ArcticConfig::from_env(),
+                threading: OrtThreading::resolve(),
             }
         }
     }
@@ -337,6 +359,7 @@ pub mod shared {
                 threading,
                 pool_size,
             } => Ok(minilm_embedder(config, *threading, *pool_size)?),
+            EmbedderSpec::Arctic { config, threading } => Ok(arctic_embedder(config, *threading)?),
             EmbedderSpec::Http(config) => Ok(HTTP.probed(config)?),
         }
     }
@@ -373,6 +396,18 @@ pub mod shared {
         })
     }
 
+    /// The shared arctic-embed-xs instance.
+    pub(crate) fn arctic_embedder(
+        config: &ArcticConfig,
+        threading: OrtThreading,
+    ) -> Result<Arc<ArcticEmbedder>> {
+        static ARCTIC: LazyLock<Slots<(ArcticConfig, OrtThreading), ArcticEmbedder>> =
+            LazyLock::new(Slots::default);
+        ARCTIC.reuse_or_build(&(config.clone(), threading), || {
+            ArcticEmbedder::with_threading(config.clone(), threading)
+        })
+    }
+
     /// What the registry needs to know about an ONNX embedder.
     trait OnnxModel {
         fn is_simplified(&self) -> bool;
@@ -385,6 +420,15 @@ pub mod shared {
         }
         fn model_load_failed(&self) -> bool {
             NomicEmbedder::model_load_failed(self)
+        }
+    }
+
+    impl OnnxModel for ArcticEmbedder {
+        fn is_simplified(&self) -> bool {
+            false
+        }
+        fn model_load_failed(&self) -> bool {
+            ArcticEmbedder::model_load_failed(self)
         }
     }
 
