@@ -1616,6 +1616,16 @@ impl MultiUserMemoryManager {
             .clone()
     }
 
+    /// The lock `get_user_graph` opens `user_id`'s graph under, for the same use as
+    /// [`Self::user_memory_init_lock`].
+    #[cfg(test)]
+    pub(crate) fn user_graph_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
+        self.user_graph_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
     /// Does NOT delete data — used before restore to release file locks.
     /// Evict the tenant and close its memory and graph stores before files are restored under
@@ -1964,6 +1974,9 @@ impl MultiUserMemoryManager {
     ///
     /// Uses the same per-user creation lock as get_user_memory to prevent
     /// concurrent RocksDB open races on the graph directory.
+    ///
+    /// A miss opens the graph store on the calling thread. Async code calls
+    /// [`Self::get_user_graph_async`] instead, for the reason given on [`Self::get_user_memory`].
     pub fn get_user_graph(&self, user_id: &str) -> Result<Arc<parking_lot::RwLock<GraphMemory>>> {
         // Fast path: already cached
         if let Some(graph) = self.graph_memories.get(user_id) {
@@ -2079,6 +2092,25 @@ impl MultiUserMemoryManager {
         info!("Created graph memory for user: {}", user_id);
 
         Ok(graph_arc)
+    }
+
+    /// [`Self::get_user_graph`] for async code. A miss opens the graph store, or waits on its
+    /// init lock behind an open already running, and graph-only routes reach it before anything
+    /// has opened the tenant's memory; on a tokio worker that is one fewer worker for the probes
+    /// until it is done. A cached graph comes back at once; an open runs on the blocking pool.
+    /// A request dropped mid-open leaves the open to finish and cache the graph for the next one.
+    pub async fn get_user_graph_async(
+        self: &Arc<Self>,
+        user_id: &str,
+    ) -> Result<Arc<parking_lot::RwLock<GraphMemory>>> {
+        if let Some(graph) = self.graph_memories.get(user_id) {
+            return Ok(graph);
+        }
+        let manager = Arc::clone(self);
+        let user_id = user_id.to_string();
+        tokio::task::spawn_blocking(move || manager.get_user_graph(&user_id))
+            .await
+            .context("graph open task did not complete")?
     }
 
     /// Get or create a cached SlowStore for a user.

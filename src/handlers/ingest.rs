@@ -212,8 +212,12 @@ pub async fn ingest(
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         // Ordered by selectivity, same as handlers/remember.rs. A separate door to the same graph
         // gets the same rule, for the same reason the redaction above is duplicated here.
-        let mentions =
-            crate::handlers::remember::mention_counts_for(&state, &req.user_id, &merged_entities);
+        let mentions = crate::handlers::remember::mention_counts_for_async(
+            &state,
+            &req.user_id,
+            &merged_entities,
+        )
+        .await;
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,

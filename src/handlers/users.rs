@@ -20,6 +20,16 @@ use std::sync::Arc;
 
 type AppState = Arc<MultiUserMemoryManager>;
 
+/// [`MultiUserMemoryManager::get_stats`] on the blocking pool: it opens the tenant and its graph
+/// when they are not cached.
+async fn stats_off_worker(state: &AppState, user_id: String) -> Result<MemoryStats, AppError> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || state.get_stats(&user_id))
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("stats task failed: {e}")))?
+        .map_err(AppError::Internal)
+}
+
 /// GET /api/users/{user_id}/stats - Get user statistics
 pub async fn get_user_stats(
     State(state): State<AppState>,
@@ -31,8 +41,7 @@ pub async fn get_user_stats(
         authenticated_user.as_ref().map(|extension| &extension.0),
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
-    let stats = state.get_stats(&user_id).map_err(AppError::Internal)?;
-    Ok(Json(stats))
+    Ok(Json(stats_off_worker(&state, user_id).await?))
 }
 
 /// Query parameters for stats endpoint
@@ -52,8 +61,7 @@ pub async fn get_stats_query(
         authenticated_user.as_ref().map(|extension| &extension.0),
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
-    let stats = state.get_stats(&user_id).map_err(AppError::Internal)?;
-    Ok(Json(stats))
+    Ok(Json(stats_off_worker(&state, user_id).await?))
 }
 
 /// Response for user deletion
