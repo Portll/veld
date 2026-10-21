@@ -116,6 +116,10 @@ jobs:
           # after the -W so it wins for that group.
           cargo clippy --all-targets -- -W clippy::all -D clippy::correctness 2>&1 | tee clippy-output.txt
           cargo clippy --all-targets --no-default-features --features storage-redb -- -W clippy::all -D clippy::correctness 2>&1 | tee -a clippy-output.txt
+          # The Zenoh transport is compiled only under its feature, which no other job enables. It
+          # stopped compiling unnoticed (twelve errors, found 2026-10-21) while the handlers it
+          # mirrors moved on; this keeps it type-checked against them. Check only, no test run.
+          cargo clippy --all-targets --features zenoh -- -W clippy::all -D clippy::correctness 2>&1 | tee -a clippy-output.txt
           WARNINGS=$(grep -c "warning:" clippy-output.txt || true)
           echo "### Clippy Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
