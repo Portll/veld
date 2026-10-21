@@ -10937,8 +10937,8 @@ mod tests {
         let corroborated = graph.find_edge_between_entities(&a, &b).unwrap().unwrap();
         assert!(corroborated.strength > repeated.strength);
         assert_eq!(corroborated.distinct_sources(), 2);
-        let one_step = crate::constants::COACTIVATION_FORWARD_BOOST
-            * (1.0 - repeated.forward_strength);
+        let one_step =
+            crate::constants::COACTIVATION_FORWARD_BOOST * (1.0 - repeated.forward_strength);
         assert!(
             (corroborated.forward_strength - (repeated.forward_strength + one_step)).abs() < 1e-6,
             "a new session moves the triggered direction by one step: {} -> {}",

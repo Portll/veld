@@ -13,6 +13,8 @@ pub mod migrate;
 pub mod portable;
 #[cfg(feature = "storage-redb")]
 pub mod redb;
+#[cfg(feature = "storage-redb")]
+pub(crate) mod redb_latch;
 pub mod relational;
 #[cfg(test)]
 mod stored_enums;

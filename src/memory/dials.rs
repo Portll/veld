@@ -357,20 +357,160 @@ pub const RECALL_SLIDER_SPECS: &[RecallSliderSpec] = &[
         abs_hi: 1.0,
         step: 0.05,
     },
-    RecallSliderSpec { id: "ce_blend_identifier", group: "Rerank", label: "CE share · identifier", default: 0.0, rec_lo: 0.0, rec_hi: 0.1, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "ce_blend_ordinal", group: "Rerank", label: "CE share · ordinal", default: 0.05, rec_lo: 0.0, rec_hi: 0.2, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "ce_blend_temporal", group: "Rerank", label: "CE share · temporal", default: 0.18, rec_lo: 0.0, rec_hi: 0.3, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "ce_blend_people", group: "Rerank", label: "CE share · people", default: 0.18, rec_lo: 0.0, rec_hi: 0.3, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "ce_blend_keyword", group: "Rerank", label: "CE share · keyword", default: 0.10, rec_lo: 0.0, rec_hi: 0.3, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "ce_blend_exploratory", group: "Rerank", label: "CE share · exploratory", default: 0.18, rec_lo: 0.1, rec_hi: 0.4, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "ce_blend_attribute", group: "Rerank", label: "CE share · attribute", default: 0.30, rec_lo: 0.2, rec_hi: 0.5, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "ce_blend_relational", group: "Rerank", label: "CE share · relational", default: 0.35, rec_lo: 0.2, rec_hi: 0.6, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "ce_blend_abstract", group: "Rerank", label: "CE share · abstract", default: 0.45, rec_lo: 0.3, rec_hi: 0.7, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "query_coverage_weight", group: "Weights", label: "Query-term coverage", default: 0.25, rec_lo: 0.1, rec_hi: 0.4, abs_lo: 0.0, abs_hi: 0.9, step: 0.05 },
-    RecallSliderSpec { id: "people_boost_max", group: "Weights", label: "People-question boost", default: 0.0, rec_lo: 0.05, rec_hi: 0.3, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
-    RecallSliderSpec { id: "prf_docs", group: "Expansion", label: "PRF documents", default: 3.0, rec_lo: 2.0, rec_hi: 5.0, abs_lo: 1.0, abs_hi: 20.0, step: 1.0 },
-    RecallSliderSpec { id: "prf_terms", group: "Expansion", label: "PRF terms", default: 5.0, rec_lo: 3.0, rec_hi: 10.0, abs_lo: 1.0, abs_hi: 30.0, step: 1.0 },
-    RecallSliderSpec { id: "prf_weight", group: "Expansion", label: "PRF leg weight", default: 0.3, rec_lo: 0.1, rec_hi: 0.6, abs_lo: 0.0, abs_hi: 2.0, step: 0.05 },
+    RecallSliderSpec {
+        id: "ce_blend_identifier",
+        group: "Rerank",
+        label: "CE share · identifier",
+        default: 0.0,
+        rec_lo: 0.0,
+        rec_hi: 0.1,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_ordinal",
+        group: "Rerank",
+        label: "CE share · ordinal",
+        default: 0.05,
+        rec_lo: 0.0,
+        rec_hi: 0.2,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_temporal",
+        group: "Rerank",
+        label: "CE share · temporal",
+        default: 0.18,
+        rec_lo: 0.0,
+        rec_hi: 0.3,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_people",
+        group: "Rerank",
+        label: "CE share · people",
+        default: 0.18,
+        rec_lo: 0.0,
+        rec_hi: 0.3,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_keyword",
+        group: "Rerank",
+        label: "CE share · keyword",
+        default: 0.10,
+        rec_lo: 0.0,
+        rec_hi: 0.3,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_exploratory",
+        group: "Rerank",
+        label: "CE share · exploratory",
+        default: 0.18,
+        rec_lo: 0.1,
+        rec_hi: 0.4,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_attribute",
+        group: "Rerank",
+        label: "CE share · attribute",
+        default: 0.30,
+        rec_lo: 0.2,
+        rec_hi: 0.5,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_relational",
+        group: "Rerank",
+        label: "CE share · relational",
+        default: 0.35,
+        rec_lo: 0.2,
+        rec_hi: 0.6,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "ce_blend_abstract",
+        group: "Rerank",
+        label: "CE share · abstract",
+        default: 0.45,
+        rec_lo: 0.3,
+        rec_hi: 0.7,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "query_coverage_weight",
+        group: "Weights",
+        label: "Query-term coverage",
+        default: 0.25,
+        rec_lo: 0.1,
+        rec_hi: 0.4,
+        abs_lo: 0.0,
+        abs_hi: 0.9,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "people_boost_max",
+        group: "Weights",
+        label: "People-question boost",
+        default: 0.0,
+        rec_lo: 0.05,
+        rec_hi: 0.3,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
+        id: "prf_docs",
+        group: "Expansion",
+        label: "PRF documents",
+        default: 3.0,
+        rec_lo: 2.0,
+        rec_hi: 5.0,
+        abs_lo: 1.0,
+        abs_hi: 20.0,
+        step: 1.0,
+    },
+    RecallSliderSpec {
+        id: "prf_terms",
+        group: "Expansion",
+        label: "PRF terms",
+        default: 5.0,
+        rec_lo: 3.0,
+        rec_hi: 10.0,
+        abs_lo: 1.0,
+        abs_hi: 30.0,
+        step: 1.0,
+    },
+    RecallSliderSpec {
+        id: "prf_weight",
+        group: "Expansion",
+        label: "PRF leg weight",
+        default: 0.3,
+        rec_lo: 0.1,
+        rec_hi: 0.6,
+        abs_lo: 0.0,
+        abs_hi: 2.0,
+        step: 0.05,
+    },
     RecallSliderSpec {
         id: "temporal_recall_boost",
         group: "Temporal",
@@ -671,7 +811,8 @@ impl CognitiveDials {
         d.ce_blend_identifier =
             env_parse::<f32>("VELD_TUNE_CE_BLEND_IDENTIFIER").or(d.ce_blend_identifier);
         d.ce_blend_ordinal = env_parse::<f32>("VELD_TUNE_CE_BLEND_ORDINAL").or(d.ce_blend_ordinal);
-        d.ce_blend_temporal = env_parse::<f32>("VELD_TUNE_CE_BLEND_TEMPORAL").or(d.ce_blend_temporal);
+        d.ce_blend_temporal =
+            env_parse::<f32>("VELD_TUNE_CE_BLEND_TEMPORAL").or(d.ce_blend_temporal);
         d.ce_blend_people = env_parse::<f32>("VELD_TUNE_CE_BLEND_PEOPLE").or(d.ce_blend_people);
         d.ce_blend_keyword = env_parse::<f32>("VELD_TUNE_CE_BLEND_KEYWORD").or(d.ce_blend_keyword);
         d.ce_blend_exploratory =
@@ -680,7 +821,8 @@ impl CognitiveDials {
             env_parse::<f32>("VELD_TUNE_CE_BLEND_ATTRIBUTE").or(d.ce_blend_attribute);
         d.ce_blend_relational =
             env_parse::<f32>("VELD_TUNE_CE_BLEND_RELATIONAL").or(d.ce_blend_relational);
-        d.ce_blend_abstract = env_parse::<f32>("VELD_TUNE_CE_BLEND_ABSTRACT").or(d.ce_blend_abstract);
+        d.ce_blend_abstract =
+            env_parse::<f32>("VELD_TUNE_CE_BLEND_ABSTRACT").or(d.ce_blend_abstract);
         d.query_coverage_weight =
             env_parse::<f32>("VELD_TUNE_QUERY_COVERAGE_WEIGHT").or(d.query_coverage_weight);
         d.people_boost_max = env_parse::<f32>("VELD_TUNE_PEOPLE_BOOST_MAX").or(d.people_boost_max);
@@ -740,8 +882,14 @@ mod tests {
     fn ce_share_resolves_global_then_shape_then_constant() {
         use crate::memory::query_parser::RerankShape as S;
         let mut d = CognitiveDials::default();
-        assert_eq!(d.ce_share(S::Exploratory), crate::constants::CE_BLEND_EXPLORATORY);
-        assert_eq!(d.ce_share(S::Identifier), crate::constants::CE_BLEND_IDENTIFIER);
+        assert_eq!(
+            d.ce_share(S::Exploratory),
+            crate::constants::CE_BLEND_EXPLORATORY
+        );
+        assert_eq!(
+            d.ce_share(S::Identifier),
+            crate::constants::CE_BLEND_IDENTIFIER
+        );
         d.ce_blend_relational = Some(0.5);
         assert_eq!(d.ce_share(S::Relational), 0.5);
         assert_eq!(d.ce_share(S::Abstract), crate::constants::CE_BLEND_ABSTRACT);
