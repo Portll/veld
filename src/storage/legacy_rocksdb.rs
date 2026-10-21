@@ -318,6 +318,9 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
     fn update(&self, memory: &Memory) -> Result<()> {
         self.inner.update(memory)
     }
+    fn update_many(&self, memories: &[Memory]) -> Result<()> {
+        self.inner.store_many(memories)
+    }
     fn delete(&self, id: &MemoryId) -> Result<()> {
         self.inner.delete(id)
     }
@@ -1752,6 +1755,52 @@ mod engine_parity_tests {
                 }),
                 near_london,
                 "{engine}: a radius search missed or overshot the circle"
+            );
+        }
+    }
+
+    #[test]
+    fn update_many_leaves_what_successive_updates_leave_on_both_engines() {
+        for (engine, store, _dir) in engines() {
+            let mut first = memory("the ferry timetable changes in spring", 0.5);
+            first.experience.tags = vec!["ferries".to_string()];
+            let mut second = memory("the harbour crane is serviced in May", 0.5);
+            second.experience.tags = vec!["cranes".to_string()];
+            store.put_memory(&first).unwrap();
+            store.put_memory(&second).unwrap();
+            store.update_many(&[]).unwrap();
+
+            let mut first_now = first.clone();
+            first_now.experience.tags = vec!["timetables".to_string()];
+            let mut second_now = second.clone();
+            second_now.experience.content = "the harbour crane is serviced in June".to_string();
+            let third = memory("the tide gauge reads high on Thursdays", 0.5);
+            store
+                .update_many(&[first_now.clone(), second_now.clone(), third.clone()])
+                .unwrap();
+
+            assert_eq!(
+                store.get(&second.id).unwrap().experience.content,
+                second_now.experience.content,
+                "{engine}"
+            );
+            assert!(
+                store.get(&third.id).is_ok(),
+                "{engine}: a new id was not stored"
+            );
+            assert!(
+                ids(store.search(SearchCriteria::ByTags(vec!["ferries".to_string()]))).is_empty(),
+                "{engine}: the replaced tag still answers"
+            );
+            assert_eq!(
+                ids(store.search(SearchCriteria::ByTags(vec!["timetables".to_string()]))),
+                vec![first.id.clone()],
+                "{engine}"
+            );
+            assert_eq!(
+                ids(store.search(SearchCriteria::ByTags(vec!["cranes".to_string()]))),
+                vec![second.id.clone()],
+                "{engine}"
             );
         }
     }
