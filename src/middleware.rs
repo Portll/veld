@@ -40,8 +40,25 @@ pub async fn request_timeout(
     let limit = timeouts.for_path(req.uri().path());
     match tokio::time::timeout(limit, next.run(req)).await {
         Ok(response) => response,
-        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+        Err(_) => timed_out(limit),
     }
+}
+
+/// The 408 a timed-out request gets. The timeout drops the handler's future, not the blocking
+/// work it handed off, so a write usually still commits; a caller told only "408" retries
+/// blind or records a failure that did not happen.
+fn timed_out(limit: Duration) -> Response {
+    let body = crate::errors::ErrorResponse {
+        code: "REQUEST_TIMEOUT".to_string(),
+        message: format!(
+            "The request ran past the server's {}s limit. Work it started may still complete, \
+             a write included: read the result back before retrying.",
+            limit.as_secs()
+        ),
+        details: None,
+        request_id: None,
+    };
+    (StatusCode::REQUEST_TIMEOUT, axum::Json(body)).into_response()
 }
 
 /// Request ID extension for correlation across logs and errors
@@ -412,6 +429,28 @@ mod tests {
         };
         assert_eq!(status("/api/gap/analyze").await, StatusCode::OK);
         assert_eq!(status("/api/recall").await, StatusCode::REQUEST_TIMEOUT);
+
+        let timed_out = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recall")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(timed_out.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "REQUEST_TIMEOUT");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("may still complete"),
+            "{body}"
+        );
     }
 
     #[test]
