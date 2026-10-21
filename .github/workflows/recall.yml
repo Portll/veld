@@ -114,6 +114,21 @@ on:
           empty keeps each shape's own share. Not gated: pair it with record=true.
         required: false
         default: ''
+      relative_priors:
+        description: >-
+          'true' turns on the relative_priors dial: Layer 5 divides the fused base by the best
+          base and scales it by 1 + priors instead of adding them. Empty keeps the additive form.
+          The report records it, so the gate refuses the baseline: dispatch a control and this
+          arm with record=true on the same ref and compare them with scripts/recall_diff.py.
+        required: false
+        default: ''
+      graph_episode_entities:
+        description: >-
+          Cap on how many graph-reached entities have their episodes read (graph_episode_entities
+          dial, highest decay factor first). Empty reads every reached entity's episodes. Recorded
+          like relative_priors: pair it with record=true and a control run.
+        required: false
+        default: ''
       embedder:
         description: >-
           Primary embedder. minilm-l6-v2 is what the baseline measures. arctic-embed-xs
@@ -325,6 +340,8 @@ jobs:
           VELD_DIALS_RERANK_COUNT: ${{ github.event.inputs.rerank_count || '' }}
           VELD_DIALS_RERANK_POOL: ${{ github.event.inputs.rerank_pool || '' }}
           VELD_TUNE_CE_BLEND: ${{ github.event.inputs.ce_blend || '' }}
+          VELD_DIALS_RELATIVE_PRIORS: ${{ github.event.inputs.relative_priors || '' }}
+          VELD_DIALS_GRAPH_EPISODE_ENTITIES: ${{ github.event.inputs.graph_episode_entities || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
           VELD_STAGE_EXPORT: ${{ github.event.inputs.stage_export == 'on' && format('stages-{0}.jsonl', matrix.engine) || '' }}

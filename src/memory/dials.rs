@@ -815,11 +815,12 @@ impl CognitiveDials {
     /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG,
     /// GRAPH_EPISODE_ENTITIES,BM25_READ_STALENESS_MS}`.
     pub fn from_env() -> Self {
+        // An empty value is unset: the recall workflow passes '' for a dispatch input left
+        // blank, and reading that as `false` would record an override the run never made.
         fn env_bool(key: &str) -> Option<bool> {
-            std::env::var(key).ok().map(|v| {
-                let v = v.trim();
-                v.eq_ignore_ascii_case("true") || v == "1"
-            })
+            let v = std::env::var(key).ok()?;
+            let v = v.trim();
+            (!v.is_empty()).then(|| v.eq_ignore_ascii_case("true") || v == "1")
         }
         fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
             std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
@@ -1125,6 +1126,19 @@ mod tests {
         .sanitized();
         assert_eq!(clamped.graph_episode_entities, Some(1));
         assert_eq!(clamped.bm25_read_staleness_ms, Some(60_000));
+    }
+
+    /// The recall workflow passes '' for a blank dispatch input. Read as `false`, it would
+    /// record `relative_priors=false` in the report and the gate would refuse the baseline.
+    #[test]
+    fn an_empty_boolean_dial_env_is_unset() {
+        std::env::set_var("VELD_DIALS_RELATIVE_PRIORS", "");
+        let blank = CognitiveDials::from_env();
+        std::env::set_var("VELD_DIALS_RELATIVE_PRIORS", "true");
+        let on = CognitiveDials::from_env();
+        std::env::remove_var("VELD_DIALS_RELATIVE_PRIORS");
+        assert_eq!(blank.relative_priors, None);
+        assert_eq!(on.relative_priors, Some(true));
     }
 
     #[test]
