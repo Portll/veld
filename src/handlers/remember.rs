@@ -244,6 +244,14 @@ pub(crate) fn embed_journaled(
     }
 }
 
+/// The writer of a memory and the caller's own id for it, as `/api/remember` takes them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WriteOrigin {
+    pub agent_id: Option<String>,
+    pub run_id: Option<String>,
+    pub external_id: Option<String>,
+}
+
 /// Store `experience` journaled, embedding included: the `Remember` frame, then
 /// [`embed_journaled`]. For write paths that answer after the vectors land.
 /// Blocking.
@@ -253,17 +261,25 @@ pub(crate) fn remember_journaled(
     user_id: &str,
     experience: crate::memory::Experience,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
-    agent_id: Option<String>,
-    run_id: Option<String>,
+    origin: WriteOrigin,
 ) -> anyhow::Result<crate::memory::RememberOutcome> {
+    let WriteOrigin {
+        agent_id,
+        run_id,
+        external_id,
+    } = origin;
     let outcome = {
         let guard = memory.read();
         if agent_id.is_some() || run_id.is_some() {
             guard.remember_with_agent_deferred_detailed_journaled(
-                experience, created_at, agent_id, run_id, None,
+                experience,
+                created_at,
+                agent_id,
+                run_id,
+                external_id,
             )?
         } else {
-            guard.remember_deferred_detailed_journaled(experience, created_at, None)?
+            guard.remember_deferred_detailed_journaled(experience, created_at, external_id)?
         }
     };
     journal_stored(

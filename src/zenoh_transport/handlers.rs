@@ -21,7 +21,9 @@ use zenoh::sample::Sample;
 use crate::errors::ValidationErrorExt;
 use crate::handlers::crud::journal_bulk_forget;
 use crate::handlers::recall::recall_memory_view;
-use crate::handlers::remember::{build_rich_context, parse_experience_type, remember_journaled};
+use crate::handlers::remember::{
+    build_rich_context, parse_experience_type, remember_journaled, WriteOrigin,
+};
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::handlers::types::{MemoryEvent, RecallFact, RecallMemory, RecallResponse, RecallTodo};
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
@@ -463,6 +465,7 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     let user_mem_clone = user_mem.clone();
     let agent_id = req.agent_id.clone();
     let run_id = req.run_id.clone();
+    let external_id = req.external_id.clone();
     let created_at = req.created_at;
 
     let journal = Arc::clone(&manager);
@@ -474,8 +477,11 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
             &journal_user_id,
             exp_clone,
             created_at,
-            agent_id,
-            run_id,
+            WriteOrigin {
+                agent_id,
+                run_id,
+                external_id,
+            },
         )
     })
     .await
@@ -753,11 +759,16 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
             terrain_type,
             ..Default::default()
         };
-        guard.recall(&mq).unwrap_or_default()
+        guard.recall(&mq)
     })
     .await
     {
-        Ok(memories) => memories,
+        Ok(Ok(memories)) => memories,
+        Ok(Err(e)) => {
+            error!(user_id = %user_id, "Recall failed: {e:#}");
+            reply_error(&query, "Recall failed").await;
+            return;
+        }
         Err(e) => {
             error!("Recall task panicked: {:?}", e);
             reply_error(&query, "Internal error during recall").await;
@@ -1251,8 +1262,7 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
             &journal_user_id,
             experience,
             None,
-            None,
-            None,
+            WriteOrigin::default(),
         )
     })
     .await;
@@ -1362,8 +1372,7 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
             &journal_user_id,
             experience,
             None,
-            None,
-            None,
+            WriteOrigin::default(),
         )
     })
     .await;

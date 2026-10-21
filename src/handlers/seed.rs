@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::remember::remember_journaled;
+use super::remember::{remember_journaled, WriteOrigin};
 use super::state::MultiUserMemoryManager;
 use crate::constants::{
     SEED_DEFAULT_MAX_FILES, SEED_IMPORTANCE_CONFIG, SEED_IMPORTANCE_README, SEED_IMPORTANCE_SOURCE,
@@ -509,7 +509,14 @@ pub async fn seed_project(
                 ..Default::default()
             };
 
-            match remember_journaled(&state, &memory, &user_id, experience, None, None, None) {
+            match remember_journaled(
+                &state,
+                &memory,
+                &user_id,
+                experience,
+                None,
+                WriteOrigin::default(),
+            ) {
                 Ok(_) => {
                     memories_created += 1;
                 }
@@ -577,7 +584,14 @@ pub async fn seed_project(
                 ..Default::default()
             };
 
-            match remember_journaled(&state, &memory, &user_id, experience, None, None, None) {
+            match remember_journaled(
+                &state,
+                &memory,
+                &user_id,
+                experience,
+                None,
+                WriteOrigin::default(),
+            ) {
                 Ok(_) => {
                     memories_created += 1;
                 }

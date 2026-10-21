@@ -2326,8 +2326,7 @@ mod tests {
                 ..Default::default()
             },
             None,
-            None,
-            None,
+            crate::handlers::remember::WriteOrigin::default(),
         )
         .unwrap();
 
