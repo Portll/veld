@@ -32,7 +32,7 @@ Pinned protocol
 Gold labels before 2026-10-21 were sessions whose dialogue contained every
 answer token as a substring. Date answers matched the `[Conversation on ...]`
 header of whichever session carried the date, so only 87 of the 147
-"locatable" questions shared a session with their real evidence, and 173 of
+"locatable" questions shared a session with their real evidence, and 174 of
 321 counted as unlocatable. Numbers measured with those labels (the ~0.76
 anchor below) do not compare with numbers measured with these.
 * Warmup: 5 queries (conv-26 q0/q6/q10/q12/q16) issued and DISCARDED before
