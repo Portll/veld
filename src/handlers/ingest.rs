@@ -258,7 +258,12 @@ pub async fn ingest(
         let user_id = req.user_id.clone();
         tokio::task::spawn_blocking(move || {
             super::remember::remember_journaled(
-                &state, &memory, &user_id, exp_clone, None, None, None,
+                &state,
+                &memory,
+                &user_id,
+                exp_clone,
+                None,
+                super::remember::WriteOrigin::default(),
             )
             .map(|outcome| outcome.id)
         })
