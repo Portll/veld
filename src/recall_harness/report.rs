@@ -151,6 +151,9 @@ pub struct RetrievalDials {
     /// The `date_window_leg` dial: `None` is the engine default (on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_window_leg: Option<bool>,
+    /// The `relative_priors` dial: `None` is the engine default (priors added to the base).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_priors: Option<bool>,
 }
 
 impl RetrievalDials {
@@ -158,6 +161,7 @@ impl RetrievalDials {
     pub fn of(dials: &crate::memory::dials::CognitiveDials) -> Self {
         Self {
             date_window_leg: dials.date_window_leg,
+            relative_priors: dials.relative_priors,
         }
     }
 
@@ -165,6 +169,9 @@ impl RetrievalDials {
         let mut set: Vec<String> = Vec::new();
         if let Some(v) = self.date_window_leg {
             set.push(format!("date_window_leg={v}"));
+        }
+        if let Some(v) = self.relative_priors {
+            set.push(format!("relative_priors={v}"));
         }
         if set.is_empty() {
             "engine defaults".to_string()
@@ -1454,6 +1461,7 @@ mod tests {
     fn different_retrieval_dials_refuse_before_any_metric_is_compared() {
         let off = Some(RetrievalDials {
             date_window_leg: Some(false),
+            ..Default::default()
         });
         let defaults = Some(RetrievalDials::default());
         for (b, c) in [(defaults.clone(), off.clone()), (off, defaults)] {
@@ -1469,6 +1477,27 @@ mod tests {
             assert!(detail.contains("date_window_leg=false"), "{detail}");
             assert!(detail.contains("engine defaults"), "{detail}");
         }
+    }
+
+    /// Relative priors reorder the whole candidate list, so a run with them is another
+    /// pipeline and is refused against a baseline without them.
+    #[test]
+    fn relative_priors_on_one_side_refuses_the_comparison() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+        baseline.retrieval_dials = Some(RetrievalDials::default());
+        current.retrieval_dials = Some(RetrievalDials {
+            relative_priors: Some(true),
+            ..Default::default()
+        });
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        assert!(
+            failures[0].detail.contains("relative_priors=true"),
+            "{}",
+            failures[0].detail
+        );
     }
 
     /// A baseline written before the field existed ran under engine defaults, so a current
@@ -1488,6 +1517,7 @@ mod tests {
     fn same_retrieval_dial_override_on_both_sides_is_compared() {
         let off = Some(RetrievalDials {
             date_window_leg: Some(false),
+            ..Default::default()
         });
         let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
         let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
