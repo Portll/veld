@@ -3477,13 +3477,6 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
 
 #[tokio::test]
 async fn a_declared_file_path_is_recalled_by_its_file_name() {
-    let reranker = veld::embeddings::cross_encoder::default_cross_encoder();
-    assert!(
-        reranker.is_cached(),
-        "this ranking needs the reranker, and it is not cached at {:?}; \
-         fetch it with `cargo run --bin model-fetch -- --cross-encoder`",
-        reranker.cache_dir()
-    );
     let h = Harness::new();
     let user = "recall-declared";
     let distractors = [
@@ -3536,30 +3529,34 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
     // The embedding is deferred too; ranked before it lands, the target has no vector.
     wait_for_background_work(&h).await;
 
-    for query in [
-        "what changed in serve.mjs",
-        "what changed in admin/serve.mjs",
-    ] {
-        let (status, body) = json_of(
-            h.app(),
-            authed_post(
-                "/api/recall",
-                json!({"user_id": user, "query": query, "limit": 5}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let ids: Vec<&str> = body["memories"]
-            .as_array()
-            .expect("memories")
-            .iter()
-            .map(|m| m["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            ids.first().copied(),
-            Some(target.as_str()),
-            "{query}: {:#}",
-            body["memories"]
-        );
+    // "+bm25" is the fused order before the reranker, which may not be installed; "full" is
+    // the whole pipeline, reranker included when it is.
+    for layers in ["+bm25", "full"] {
+        for query in [
+            "what changed in serve.mjs",
+            "what changed in admin/serve.mjs",
+        ] {
+            let (status, body) = json_of(
+                h.app(),
+                authed_post(
+                    "/api/recall",
+                    json!({"user_id": user, "query": query, "limit": 5, "layers": layers}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let ids: Vec<&str> = body["memories"]
+                .as_array()
+                .expect("memories")
+                .iter()
+                .map(|m| m["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                ids.first().copied(),
+                Some(target.as_str()),
+                "{query} at {layers}: {:#}",
+                body["memories"]
+            );
+        }
     }
 }
