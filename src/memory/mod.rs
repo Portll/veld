@@ -25,6 +25,7 @@ pub mod gap_topology;
 pub mod gold_funnel;
 pub mod graph_retrieval;
 pub mod hybrid_search;
+pub mod index_text;
 pub mod injection;
 pub mod introspection;
 pub mod learning_history;
@@ -53,6 +54,7 @@ pub mod tag_sources;
 pub mod temporal_facts;
 pub mod todo_formatter;
 pub mod todos;
+pub mod turn_successors;
 pub mod types;
 pub mod visualization;
 pub mod voronoi;
@@ -472,6 +474,16 @@ pub struct MemorySystem {
     /// construction (MemorySystem is per-user). See the CONSOLIDATION_LOCKS
     /// per-user-lock discipline (CLAUDE.md). Closed at shutdown; see `write_gate`.
     write_lock: write_gate::WriteGate,
+
+    /// Latest conversation turn seen per conversation key (`index_text::conversation_key`).
+    /// Lets a turn written without `preceding_memory_id` find the turn it follows
+    /// without a store scan. Process-local: after a restart the first turn of a
+    /// conversation falls back to a working-memory scan, then the chain rebuilds.
+    turn_chain: dashmap::DashMap<String, index_text::ChainTail>,
+
+    /// Prior turn → the turns that followed it, persisted in this user's KV keyspace so
+    /// recall's neighbour expansion can walk forward from a ranked turn after a restart.
+    turn_successors: turn_successors::TurnSuccessorStore,
 
     /// Drift-adaptive abstention threshold (APP-5).
     /// Calibrated during maintenance by sampling memory importance×confidence scores.
@@ -1708,6 +1720,9 @@ impl MemorySystem {
             embedding_backlog: embedding_backlog::EmbeddingBacklogStore::with_kv(
                 primary_store.key_value_store(),
             ),
+            turn_successors: turn_successors::TurnSuccessorStore::with_kv(
+                primary_store.key_value_store(),
+            ),
             // R3a (F3): per-user persistent learned-weight store over this user's
             // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
             // weights are loaded on init (below) but NOT injected into scoring.
@@ -1726,6 +1741,7 @@ impl MemorySystem {
             tcm_context: Arc::new(parking_lot::RwLock::new(Vec::new())),
             // C1: per-user write-path serialization lock
             write_lock: write_gate::WriteGate::new(),
+            turn_chain: dashmap::DashMap::new(),
             // Drift-adaptive abstention: 0 = use static constant
             calibrated_abstention_threshold: std::sync::atomic::AtomicU32::new(0),
             // R1 (J5): per-user prefetch side-state, freed on user eviction.
@@ -2119,12 +2135,23 @@ impl MemorySystem {
         // Calculate importance
         let importance = self.calculate_importance(&experience);
 
+        // Conversation turns are indexed with their date and the turn they follow
+        // (index_text). The prior turn is resolved once here, before the experience
+        // moves into the record, and threads the episode when the writer did not.
+        let turn = self.turn_index_text(&mut experience, created_at);
+        let embed_input: std::borrow::Cow<'_, str> = match &turn {
+            Some(turn) if self.cognitive_dials.read().turn_context_embedding_enabled() => {
+                std::borrow::Cow::Owned(turn.text.embedding.clone())
+            }
+            _ => std::borrow::Cow::Borrowed(experience.content.as_str()),
+        };
+
         // PERFORMANCE: Content embedding cache (80ms → <1μs for repeated content)
         // If experience doesn't have embeddings, check cache or generate.
         // Skipped when defer_embedding=true — handled by embed_and_index() later.
         if !defer_embedding && experience.embeddings.is_none() {
             // SHA256 hash for stable cache keys (survives restarts, unlike DefaultHasher)
-            let content_hash = Self::sha256_hash(&experience.content);
+            let content_hash = Self::sha256_hash(&embed_input);
 
             // Check cache first
             if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
@@ -2134,7 +2161,7 @@ impl MemorySystem {
             } else {
                 // Cache miss - generate embedding
                 EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
-                match self.embedder.encode(&experience.content) {
+                match self.embedder.encode(&embed_input) {
                     Ok(embedding) => {
                         // Store in cache for future use
                         self.content_cache.insert(content_hash, embedding.clone());
@@ -2238,7 +2265,30 @@ impl MemorySystem {
         // entity embedding for concept-level dedup. Doing it here too would cause
         // double entity inserts and inflated mention_counts.
 
-        self.bm25_index_direct(&memory, bm25);
+        // A contextualised turn's BM25 document carries its date and the prior turn's
+        // entities. A journaled write is indexed by the intent log's BM25 projection from
+        // the stored record, which holds the bare content.
+        match (&turn, bm25) {
+            (Some(turn), Bm25Sync::Direct) => {
+                if let Err(e) = self.hybrid_search.index_memory(
+                    &memory.id,
+                    &turn.text.bm25_content,
+                    &memory.experience.tags,
+                    &turn.text.bm25_entities,
+                ) {
+                    tracing::warn!("Failed to index memory {} in BM25: {}", memory.id.0, e);
+                }
+            }
+            _ => self.bm25_index_direct(&memory, bm25),
+        }
+        self.record_turn_chain(&memory);
+        if let Some(prior) = turn.as_ref().and_then(|turn| turn.prior.as_ref()) {
+            // The memory is stored either way; a missing row only costs this turn its
+            // place in neighbour expansion, so the write is not allowed to fail the call.
+            if let Err(e) = self.turn_successors.record(prior, &memory.id) {
+                tracing::warn!("Failed to record turn successor {}: {e:#}", memory.id.0);
+            }
+        }
 
         // PIPE-2: Register memory for pattern-triggered replay
         // Tracks entity co-occurrence, salience spikes, and temporal clusters
@@ -2680,6 +2730,202 @@ impl MemorySystem {
         }
     }
 
+    /// Derive the index text for a conversation turn about to be stored, resolving the
+    /// turn it follows. Returns `None` when the dial is off or the experience is not a
+    /// conversation turn: the indexes then see the bare content, as before.
+    ///
+    /// When the writer sent no `preceding_memory_id` and the prior turn was resolved
+    /// from the conversation key, the episode context is threaded with the resolved id
+    /// so the deferred embed path and a later re-index derive the same text. The
+    /// resolved prior is returned with the text for the successor index.
+    fn turn_index_text(
+        &self,
+        experience: &mut Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<index_text::ContextualisedTurn> {
+        if !index_text::applies(experience) || !self.cognitive_dials.read().turn_context_enabled() {
+            return None;
+        }
+        let created_at = created_at.unwrap_or_else(chrono::Utc::now);
+        let prior = self.resolve_prior_turn(experience, created_at);
+        let source = prior.as_ref().map_or("none", |prior| prior.source.label());
+        crate::metrics::TURN_CONTEXT_TOTAL
+            .with_label_values(&[source])
+            .inc();
+        if let Some(prior) = prior
+            .as_ref()
+            .filter(|prior| prior.source == index_text::PriorSource::ConversationKey)
+        {
+            let ctx = experience
+                .context
+                .get_or_insert_with(|| index_text::threaded_context(created_at));
+            ctx.episode.preceding_memory_id = Some(prior.id.0.to_string());
+        }
+        Some(index_text::ContextualisedTurn {
+            text: index_text::build(
+                &experience.content,
+                created_at,
+                &experience.entities,
+                prior.as_ref(),
+            ),
+            prior: prior.map(|prior| prior.id),
+        })
+    }
+
+    /// The turn `experience` follows: the writer's `preceding_memory_id` when it names a
+    /// stored memory, else the latest turn sharing the conversation key within the
+    /// session gap (the chain tail, or a working-memory scan after a restart).
+    fn resolve_prior_turn(
+        &self,
+        experience: &Experience,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<index_text::PriorTurn> {
+        if let Some(id) = index_text::preceding_memory_id(experience) {
+            match self.long_term_memory.get(&id) {
+                Ok(prior) => {
+                    return Some(index_text::PriorTurn::from_memory(
+                        &prior,
+                        index_text::PriorSource::PrecedingId,
+                    ));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        preceding_memory_id = %id.0,
+                        "preceding memory not found; resolving the prior turn by conversation key: {e}"
+                    );
+                }
+            }
+        }
+        let key = index_text::conversation_key(experience)?;
+        let sequence_number = index_text::sequence_number_of(experience);
+        let tail = match self.turn_chain.get(&key) {
+            Some(tail) => Some(tail.clone()),
+            None => self.scan_working_memory_for_tail(&key),
+        }?;
+        if !index_text::chain_tail_precedes(&tail, created_at, sequence_number) {
+            return None;
+        }
+        let prior = self.long_term_memory.get(&tail.id).ok()?;
+        Some(index_text::PriorTurn::from_memory(
+            &prior,
+            index_text::PriorSource::ConversationKey,
+        ))
+    }
+
+    /// Rebuild a conversation's chain tail from working memory (bounded by its
+    /// capacity), for the first turn written after a restart.
+    fn scan_working_memory_for_tail(&self, key: &str) -> Option<index_text::ChainTail> {
+        let mut tail: Option<index_text::ChainTail> = None;
+        for memory in self.working_memory.read().all_memories() {
+            if !index_text::applies(&memory.experience)
+                || index_text::conversation_key(&memory.experience).as_deref() != Some(key)
+            {
+                continue;
+            }
+            tail = Some(index_text::later_tail(
+                tail.take(),
+                index_text::ChainTail {
+                    id: memory.id.clone(),
+                    created_at: memory.created_at,
+                    sequence_number: index_text::sequence_number_of(&memory.experience),
+                },
+            ));
+        }
+        if let Some(found) = &tail {
+            self.turn_chain.insert(key.to_string(), found.clone());
+        }
+        tail
+    }
+
+    /// Make a just-stored conversation turn the tail of its conversation's chain.
+    fn record_turn_chain(&self, memory: &Memory) {
+        if !index_text::applies(&memory.experience) {
+            return;
+        }
+        let Some(key) = index_text::conversation_key(&memory.experience) else {
+            return;
+        };
+        let candidate = index_text::ChainTail {
+            id: memory.id.clone(),
+            created_at: memory.created_at,
+            sequence_number: index_text::sequence_number_of(&memory.experience),
+        };
+        let mut entry = self
+            .turn_chain
+            .entry(key)
+            .or_insert_with(|| candidate.clone());
+        let kept = index_text::later_tail(Some(entry.clone()), candidate);
+        *entry = kept;
+    }
+
+    /// The memory `id` names, if it is still live: held by a tier or the store, and not
+    /// soft-forgotten.
+    pub(crate) fn live_memory(&self, id: &MemoryId) -> Option<SharedMemory> {
+        let found = self
+            .working_memory
+            .read()
+            .get(id)
+            .or_else(|| self.session_memory.read().get(id))
+            .or_else(|| self.long_term_memory.get(id).ok().map(Arc::new));
+        found.filter(|memory| !memory.is_forgotten())
+    }
+
+    /// The live conversation turns recorded as following `id`, earliest first. Content
+    /// breaks a timestamp tie, so two stores built from one corpus agree on the order
+    /// (ids are random per ingest). A successor forgotten since it was recorded is
+    /// skipped; a failed index read is logged and reads as no successors.
+    pub(crate) fn live_turn_successors(&self, id: &MemoryId) -> Vec<SharedMemory> {
+        let ids = match self.turn_successors.successors(id) {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!("turn successor lookup for {} failed: {e:#}", id.0);
+                return Vec::new();
+            }
+        };
+        let mut live: Vec<SharedMemory> = ids
+            .iter()
+            .filter_map(|successor| self.live_memory(successor))
+            .filter(|successor| index_text::applies(&successor.experience))
+            .collect();
+        live.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.experience.content.cmp(&b.experience.content))
+        });
+        live
+    }
+
+    /// Ids of the live conversation turns recorded as following `id`, earliest first.
+    pub fn turn_successors(&self, id: &MemoryId) -> Vec<MemoryId> {
+        self.live_turn_successors(id)
+            .into_iter()
+            .map(|successor| successor.id.clone())
+            .collect()
+    }
+
+    /// The text the embedder sees for a stored record: a contextualised conversation
+    /// turn's index text (date + the turn named by `preceding_memory_id`), else the
+    /// enriched searchable text every other record gets.
+    fn stored_embedding_text(&self, memory: &Memory) -> String {
+        if index_text::applies(&memory.experience)
+            && self.cognitive_dials.read().turn_context_embedding_enabled()
+        {
+            let prior = index_text::preceding_memory_id(&memory.experience)
+                .and_then(|id| self.long_term_memory.get(&id).ok())
+                .map(|prior| {
+                    index_text::PriorTurn::from_memory(&prior, index_text::PriorSource::PrecedingId)
+                });
+            return index_text::build(
+                &memory.experience.content,
+                memory.created_at,
+                &memory.experience.entities,
+                prior.as_ref(),
+            )
+            .embedding;
+        }
+        crate::memory::retrieval::RetrievalEngine::extract_searchable_text(memory)
+    }
+
     /// Complete the deferred embedding + vector indexing for a previously stored memory.
     ///
     /// Call this after `remember_deferred()` to generate the ONNX embedding, persist it,
@@ -2726,8 +2972,8 @@ impl MemorySystem {
             // with the synchronous index_memory() path. Without this, deferred
             // embeddings lack context prefixes and produce different similarity
             // scores than the Vamana index, breaking Layer 3.5 brute-force cosine.
-            let searchable_text =
-                crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
+            // A conversation turn gets its index text (date + prior turn) instead.
+            let searchable_text = self.stored_embedding_text(&memory);
             let content_hash = Self::sha256_hash(&searchable_text);
 
             if let Some(cached) = self.content_cache.get(&content_hash) {
@@ -2818,8 +3064,7 @@ impl MemorySystem {
         // no-op. Uses the same enriched searchable text as the primary so the
         // two indexes stay consistent.
         if memory.experience.embeddings_secondary.is_none() && self.embedder.has_secondary() {
-            let secondary_text =
-                crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
+            let secondary_text = self.stored_embedding_text(&memory);
             if let Ok(Some(secondary)) = self.embedder.encode_secondary(&secondary_text) {
                 memory.experience.embeddings_secondary = Some(secondary);
                 // Persist so restarts retain the secondary embedding (parity with
