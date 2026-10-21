@@ -809,10 +809,12 @@ impl super::MemorySystem {
                         "Query embedding cache MISS - generating for: {}",
                         query_text
                     );
+                    // The query side, so an asymmetric model's query instruction is applied;
+                    // query_cache holds only query-side vectors, the sub-query sites included.
                     let embedding = self
                         .embedder
                         .as_ref()
-                        .encode(query_text)
+                        .encode_for_query(query_text)
                         .context("Failed to generate query embedding")?;
 
                     self.query_cache.insert(query_hash, embedding.clone());
@@ -1245,7 +1247,7 @@ impl super::MemorySystem {
                     if let Some(cached) = self.query_cache.get(&sub_hash) {
                         cached.clone()
                     } else {
-                        match self.embedder.as_ref().encode(sub_q) {
+                        match self.embedder.as_ref().encode_for_query(sub_q) {
                             Ok(emb) => {
                                 self.query_cache.insert(sub_hash, emb.clone());
                                 emb
@@ -1385,7 +1387,7 @@ impl super::MemorySystem {
                 let emb = if let Some(cached) = self.query_cache.get(&sub_hash) {
                     cached.clone()
                 } else {
-                    match self.embedder.as_ref().encode(sub_q) {
+                    match self.embedder.as_ref().encode_for_query(sub_q) {
                         Ok(e) => {
                             self.query_cache.insert(sub_hash, e.clone());
                             e
