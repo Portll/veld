@@ -144,6 +144,34 @@ impl super::MemorySystem {
         Some(embedding)
     }
 
+    /// The aligned secondary leg's query, projected into primary space: the secondary
+    /// model's query face of `text` (cached like the face above, under its own key) through
+    /// the alignment installed now. `Ok(None)` without a secondary model or an alignment.
+    fn aligned_query_projection(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        let Some(secondary) = self.embedder.secondary_embedder() else {
+            return Ok(None);
+        };
+        let key: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(secondary.id().as_bytes());
+            hasher.update([1u8]);
+            hasher.update(text.as_bytes());
+            hasher.finalize().into()
+        };
+        let face = match SECONDARY_QUERY_CACHE.get(&key) {
+            Some(cached) => cached,
+            None => match self.embedder.encode_secondary_for_query(text)? {
+                Some(face) => {
+                    SECONDARY_QUERY_CACHE.insert(key, face.clone());
+                    face
+                }
+                None => return Ok(None),
+            },
+        };
+        self.embedder.project_secondary(&face)
+    }
+
     /// Search and retrieve relevant memories (zero-copy with Arc<Memory>)
     ///
     /// PRODUCTION IMPLEMENTATION:
@@ -1099,6 +1127,15 @@ impl super::MemorySystem {
             } else {
                 self.recall_query_embedding(query_text)?
             };
+        // The query-side embedding of `query_text` itself, which Layer 5.3's bi-encoder pass
+        // scores against even after Layer 3.1 replaces `query_embedding` with a sub-query
+        // average. A caller-supplied embedding is not taken to be it.
+        let text_query_embedding: Option<Vec<f32>> = query
+            .query_embedding
+            .as_ref()
+            .filter(|e| !e.is_empty())
+            .is_none()
+            .then(|| query_embedding.clone());
 
         // Secondary query embedding for dual-index competition (Nomic 768d)
         let query_embedding_secondary: Option<Vec<f32>> = if self.embedder.has_secondary() {
@@ -2058,10 +2095,15 @@ impl super::MemorySystem {
                 // path below is byte-identical to before.
                 let aligned_results: Option<Vec<(MemoryId, f32)>> = if self.embedder.has_alignment()
                 {
-                    match self
-                        .retriever
-                        .search_ids_aligned(query_text, query.max_results * 8)
-                    {
+                    let aligned = self
+                        .aligned_query_projection(query_text)
+                        .and_then(|q| match q {
+                            Some(projected) => self
+                                .retriever
+                                .search_ids_projected(&projected, query.max_results * 8),
+                            None => Ok(Vec::new()),
+                        });
+                    match aligned {
                         Ok(r) if !r.is_empty() => Some(r),
                         Ok(_) => Some(Vec::new()),
                         Err(e) => {
@@ -3555,7 +3597,16 @@ impl super::MemorySystem {
                     })
                     .collect();
 
-                match reranker.rerank(query_text, candidates) {
+                let text_embedding = match &text_query_embedding {
+                    Some(embedding) => Ok(std::borrow::Cow::Borrowed(embedding.as_slice())),
+                    None => self
+                        .recall_query_embedding(query_text)
+                        .map(std::borrow::Cow::Owned),
+                };
+                let reranked = text_embedding.and_then(|embedding| {
+                    reranker.rerank_with_query_embedding(query_text, &embedding, candidates)
+                });
+                match reranked {
                     Ok(reranked) => {
                         // Build score lookup from cross-encoder results
                         let ce_scores: std::collections::HashMap<MemoryId, f32> =

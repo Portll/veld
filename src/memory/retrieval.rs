@@ -1629,11 +1629,20 @@ impl RetrievalEngine {
             Some(v) => v,
             None => return Ok(Vec::new()),
         };
+        self.search_ids_projected(&projected, limit)
+    }
 
+    /// [`Self::search_ids_aligned`] for a query already projected into primary space, so a
+    /// recall that holds the secondary query embedding does not encode it again.
+    pub fn search_ids_projected(
+        &self,
+        projected: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
         // LOCK ORDERING: primary vector_index (1) before id_mapping (2)
         let index = self.vector_index.read();
         let results = crate::metrics::timed_vector_search(|| {
-            index.search(&projected, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
+            index.search(projected, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
         })
         .context("Aligned vector search failed")?;
 
