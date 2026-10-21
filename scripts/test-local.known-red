@@ -1,0 +1,3 @@
+# Tests `scripts/test-local.sh --full` skips: red on main, with an owner and a task fixing them.
+# One test name per line, then a comment naming the owner and the spine task.
+# Remove a line in the same commit that makes its test pass.
