@@ -30,7 +30,7 @@ use super::report::{
     aggregate_category, aggregate_layer, median, AblationCaseRow, AblationReport, AblationRow,
     CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure, LayerReport,
     LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord,
-    ReachabilityCategory, ReachabilityReport, Report, RerankSetting, SMOKE_K,
+    ReachabilityCategory, ReachabilityReport, Report, RerankSetting, RetrievalDials, SMOKE_K,
 };
 
 /// Embedder identifier emitted in the report. Matches the model wired into
@@ -339,6 +339,15 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
                 ),
             });
         }
+        if pass.retrieval_dials != passes[0].retrieval_dials {
+            failures.push(Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "repeat {i} ran under retrieval dials {:?}, repeat 0 under {:?}",
+                    pass.retrieval_dials, passes[0].retrieval_dials
+                ),
+            });
+        }
     }
     if repeats > 1 {
         for mode in &layer_modes {
@@ -434,6 +443,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         suite: inputs.suite.clone(),
         embedder,
         rerank: Some(passes[0].rerank.clone()),
+        retrieval_dials: Some(passes[0].retrieval_dials.clone()),
         model_tape: crate::embeddings::model_tape::replay_digest(),
         git_sha: inputs.git_sha.clone(),
         timestamp: chrono::Utc::now(),
@@ -577,6 +587,7 @@ struct OnePassResult {
     per_mode: BTreeMap<LayerMode, ModePassResult>,
     failures: Vec<Failure>,
     rerank: RerankSetting,
+    retrieval_dials: RetrievalDials,
 }
 
 /// Run a single ingest pass, then run the case loop once per `LayerMode`.
@@ -947,10 +958,12 @@ fn run_one_pass(
     }
 
     let rerank = RerankSetting::of(&system.read(), cross_encoder);
+    let retrieval_dials = RetrievalDials::of(&system.read().cognitive_dials());
     Ok(OnePassResult {
         per_mode,
         failures,
         rerank,
+        retrieval_dials,
     })
 }
 
