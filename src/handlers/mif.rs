@@ -63,7 +63,12 @@ pub async fn export_mif(
     };
 
     let graph = if req.include_graph {
-        Some(state.get_user_graph(&user_id).map_err(AppError::Internal)?)
+        Some(
+            state
+                .get_user_graph_async(&user_id)
+                .await
+                .map_err(AppError::Internal)?,
+        )
     } else {
         None
     };
@@ -289,7 +294,8 @@ pub async fn import_mif(
     // Import knowledge graph
     if let Some(ref kg) = doc.knowledge_graph {
         let graph_arc = state
-            .get_user_graph(&req.user_id)
+            .get_user_graph_async(&req.user_id)
+            .await
             .map_err(AppError::Internal)?;
         let graph_guard = graph_arc.read();
 
@@ -371,7 +377,8 @@ pub async fn add_entity(
     validation::validate_entity(&req.label).map_validation_err("label")?;
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let graph_guard = graph.write();
 
@@ -447,7 +454,8 @@ pub async fn add_relationship(
     validation::validate_entity(&req.to_entity).map_validation_err("to_entity")?;
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let graph_guard = graph.write();
 

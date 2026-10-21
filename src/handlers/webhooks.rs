@@ -550,7 +550,7 @@ async fn handle_context_monitor_socket(
         }
     };
 
-    let graph_memory = match state.get_user_graph(&user_id) {
+    let graph_memory = match state.get_user_graph_async(&user_id).await {
         Ok(g) => g,
         Err(e) => {
             tracing::error!("Failed to get user graph: {}", e);

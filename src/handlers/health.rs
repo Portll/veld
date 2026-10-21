@@ -187,11 +187,10 @@ pub async fn health_ready_user(
     };
     let status_str = if ready { "ready" } else { "not_ready" };
 
-    let cached_users = state.list_cached_users();
-    let is_cached = cached_users.contains(&user_id);
-    let exists_on_disk = state.list_users().contains(&user_id);
-
-    if !is_cached {
+    // The cache itself, never the accessors: a tenant evicted since it was last seen would
+    // otherwise be reopened by this probe.
+    let Some(memory) = state.user_memories.get(&user_id) else {
+        let exists_on_disk = state.list_users().contains(&user_id);
         return Ok((
             status_code,
             Json(serde_json::json!({
@@ -208,12 +207,8 @@ pub async fn health_ready_user(
                 "timestamp": chrono::Utc::now().to_rfc3339()
             })),
         ));
-    }
+    };
 
-    let memory = state
-        .get_user_memory_async(&user_id)
-        .await
-        .map_err(AppError::Internal)?;
     let Some(guard) = memory.try_read() else {
         return Ok((
             status_code,
@@ -230,7 +225,13 @@ pub async fn health_ready_user(
 
     let stats = guard.stats();
     let index_health = guard.index_health();
-    let graph_stats = if let Ok(graph) = state.get_user_graph(&user_id) {
+    // The graph cache can expire a graph its tenant's memory still holds, so that handle is the
+    // fallback; neither lookup opens anything.
+    let graph = state
+        .graph_memories
+        .get(&user_id)
+        .or_else(|| guard.graph_memory().cloned());
+    let graph_stats = if let Some(graph) = graph {
         let g = graph.read();
         let gs = g.get_stats().unwrap_or_default();
         serde_json::json!({
@@ -411,7 +412,8 @@ pub async fn metrics_endpoint(State(state): State<AppState>) -> Result<String, S
     // The take(100) cap is retained from the original: it truncates the aggregate
     // silently, but max_users_in_memory bounds the cache well below it in practice.
     for user_id in state.list_cached_users().iter().take(100) {
-        if let Ok(memory_sys) = state.get_user_memory_async(user_id).await {
+        // The cache itself: a tenant evicted since the listing is skipped, not reopened.
+        if let Some(memory_sys) = state.user_memories.get(user_id) {
             if let Some(guard) = memory_sys.try_read() {
                 let stats = guard.stats();
                 total_working += stats.working_memory_count as i64;
@@ -1299,5 +1301,123 @@ mod probes_while_a_tenant_opens {
             .await
             .is_err());
         assert_eq!(harness.manager.tenant_open_waiters(), 0);
+    }
+
+    #[test]
+    fn a_cached_graph_comes_back_without_a_blocking_task() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let harness = TestHarness::new();
+        let opened = harness.manager.get_user_graph("tenant-g").expect("open");
+
+        // One poll, outside any runtime: a lookup that went to the blocking pool would panic
+        // in spawn_blocking, and one that waited would not be ready.
+        let mut lookup = std::pin::pin!(harness.manager.get_user_graph_async("tenant-g"));
+        let Poll::Ready(cached) = lookup
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("a cached graph did not come back on the first poll");
+        };
+        assert!(std::sync::Arc::ptr_eq(&opened, &cached.expect("cached")));
+    }
+
+    /// The test runtime has one thread. An open made on it would stall the timeout below
+    /// until the init lock is let go, so the lock is let go after 5 s at most.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_uncached_graph_opens_off_the_runtime_thread_and_is_cached() {
+        const GRAPH_TENANT: &str = "tenant-graph-mid-open";
+        let harness = TestHarness::new();
+        assert!(harness.manager.graph_memories.get(GRAPH_TENANT).is_none());
+
+        let init_lock = harness.manager.user_graph_init_lock(GRAPH_TENANT);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let opener = std::thread::spawn(move || {
+            let _open = init_lock.lock();
+            held_tx.send(()).expect("test waits for the hold");
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        held_rx.recv().expect("init lock held");
+
+        let manager = harness.manager.clone();
+        let mut lookup =
+            tokio::spawn(async move { manager.get_user_graph_async(GRAPH_TENANT).await });
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut lookup).await;
+        assert!(
+            waited.is_err(),
+            "the lookup finished while the graph's init lock was held, so it held the runtime \
+             thread until the lock was let go"
+        );
+
+        release_tx.send(()).expect("opener waits for release");
+        opener.join().expect("opener thread");
+        let opened = lookup.await.expect("lookup task").expect("open");
+        let cached = harness
+            .manager
+            .graph_memories
+            .get(GRAPH_TENANT)
+            .expect("the open cached the graph");
+        assert!(std::sync::Arc::ptr_eq(&opened, &cached));
+    }
+
+    #[tokio::test]
+    async fn per_user_readiness_and_metrics_leave_an_evicted_tenant_closed() {
+        const EVICTED: &str = "tenant-evicted";
+        let harness = TestHarness::new();
+        harness
+            .manager
+            .get_user_memory_async(EVICTED)
+            .await
+            .expect("open");
+        harness.manager.evict_user(EVICTED);
+
+        let (status, body) = send(
+            harness.router(),
+            get(&format!("/api/health/ready?user_id={EVICTED}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["cached"], false, "{body}");
+        assert_eq!(body["exists_on_disk"], true, "{body}");
+        metrics_endpoint(State(harness.state()))
+            .await
+            .expect("metrics");
+
+        assert!(
+            harness.manager.user_memories.get(EVICTED).is_none(),
+            "a cache-only probe reopened the tenant"
+        );
+        assert!(
+            harness.manager.graph_memories.get(EVICTED).is_none(),
+            "a cache-only probe reopened the tenant's graph"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_user_readiness_reads_the_graph_its_tenant_holds() {
+        const TENANT_G: &str = "tenant-graph-expired";
+        let harness = TestHarness::new();
+        harness
+            .manager
+            .get_user_memory_async(TENANT_G)
+            .await
+            .expect("open");
+        harness.manager.graph_memories.invalidate(TENANT_G);
+        harness.manager.graph_memories.run_pending_tasks();
+
+        let (status, body) = send(
+            harness.router(),
+            get(&format!("/api/health/ready?user_id={TENANT_G}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["cached"], true, "{body}");
+        assert!(body["graph_stats"].is_object(), "{body}");
+        assert!(
+            harness.manager.graph_memories.get(TENANT_G).is_none(),
+            "the probe went through the graph accessor"
+        );
     }
 }

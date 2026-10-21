@@ -162,7 +162,7 @@ pub async fn execute_query(
     // `query_text` AND it asks for a temporal answer AND a date is derivable;
     // otherwise `derived_answer` is `None` and the response is byte-identical to
     // the pre-B4 shape.
-    let derived_answer = derive_answer_for_query(&state, &query);
+    let derived_answer = derive_answer_for_query(&state, &query).await;
 
     Ok(Json(ExecuteResponse {
         results,
@@ -180,10 +180,18 @@ pub async fn execute_query(
 /// - the tenant's memory substrate is unavailable.
 ///
 /// Delegates to [`derive_answer_for_user_query`] in `handlers::temporal_derivation`
-/// so the logic is shared with `/api/recall`.
-fn derive_answer_for_query(state: &AppState, query: &Query) -> Option<DerivedAnswer> {
-    let query_text = query.query_text.as_deref()?;
-    derive_answer_for_user_query(state, &query.user_id, query_text)
+/// so the logic is shared with `/api/recall`. That lookup can open the tenant and reads its
+/// fact and event stores, so it runs on the blocking pool, as `/api/recall` runs it.
+async fn derive_answer_for_query(state: &AppState, query: &Query) -> Option<DerivedAnswer> {
+    let query_text = query.query_text.clone()?;
+    let state = Arc::clone(state);
+    let user_id = query.user_id.clone();
+    tokio::task::spawn_blocking(move || derive_answer_for_user_query(&state, &user_id, &query_text))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("temporal answer derivation task failed: {e}");
+            None
+        })
 }
 
 /// Relational source used when no relational backend is configured. Only

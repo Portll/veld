@@ -678,6 +678,24 @@ fn link_todo_memory(state: &AppState, user_id: &str, todo_id: &TodoId, memory_id
     }
 }
 
+/// Builds a memory the todo flow just stored into the tenant's graph. The pass can open the
+/// graph and writes it, so it runs on the blocking pool, not the worker it was called from.
+async fn build_todo_memory_graph(
+    state: &AppState,
+    user_id: &str,
+    experience: Experience,
+    memory_id: &MemoryId,
+) -> anyhow::Result<()> {
+    let state = state.clone();
+    let user_id = user_id.to_string();
+    let memory_id = memory_id.clone();
+    tokio::task::spawn_blocking(move || {
+        state.process_experience_into_graph(&user_id, &experience, &memory_id)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("graph task panicked: {e}")))
+}
+
 // =============================================================================
 // REMINDER HANDLERS
 // =============================================================================
@@ -1312,7 +1330,7 @@ pub async fn create_todo(
 
             if let Ok(Ok(memory_id)) = memory_result {
                 if let Err(e) =
-                    state_clone.process_experience_into_graph(&user_id, &experience, &memory_id)
+                    build_todo_memory_graph(&state_clone, &user_id, experience, &memory_id).await
                 {
                     tracing::debug!(
                         "Graph processing failed for todo memory {}: {}",
@@ -1897,7 +1915,8 @@ async fn update_todo_core(
 
                 if let Ok(Ok(memory_id)) = memory_result {
                     if let Err(e) =
-                        state_clone.process_experience_into_graph(&user_id, &experience, &memory_id)
+                        build_todo_memory_graph(&state_clone, &user_id, experience, &memory_id)
+                            .await
                     {
                         tracing::debug!(
                             "Graph processing failed for todo update memory {}: {}",
@@ -2041,7 +2060,8 @@ async fn complete_todo_core(
 
                 if let Ok(Ok(memory_id)) = memory_result {
                     if let Err(e) =
-                        state_clone.process_experience_into_graph(&user_id, &experience, &memory_id)
+                        build_todo_memory_graph(&state_clone, &user_id, experience, &memory_id)
+                            .await
                     {
                         tracing::debug!(
                             "Graph processing failed for todo completion memory {}: {}",
@@ -2664,7 +2684,7 @@ pub async fn add_todo_comment(
 
         if let Ok(Ok(memory_id)) = memory_result {
             if let Err(e) =
-                state.process_experience_into_graph(&req.user_id, &experience, &memory_id)
+                build_todo_memory_graph(&state, &req.user_id, experience, &memory_id).await
             {
                 tracing::debug!(
                     "Graph processing failed for todo comment memory {}: {}",

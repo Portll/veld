@@ -626,7 +626,8 @@ pub async fn recall(
         .map_err(AppError::Internal)?;
 
     let _graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let limit = req.limit;
@@ -1379,7 +1380,8 @@ pub async fn proactive_context(
         .map_err(AppError::Internal)?;
 
     let graph_memory = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let t_init = op_start.elapsed();
@@ -2700,7 +2702,8 @@ pub async fn surface_relevant(
         .await
         .map_err(AppError::Internal)?;
     let graph_memory = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let engine = state.relevance_engine.clone();
     let feedback_store = state.feedback_store.clone();

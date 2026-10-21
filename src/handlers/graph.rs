@@ -50,9 +50,11 @@ pub async fn get_graph_stats(
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let stats = state
-        .get_user_graph_stats(&user_id)
+    let graph = state
+        .get_user_graph_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
+    let stats = blocking(move || graph.read().get_stats()).await?;
 
     Ok(Json(stats))
 }
@@ -72,7 +74,8 @@ pub async fn find_entity(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let entity_name = req.entity_name;
@@ -97,7 +100,8 @@ pub async fn traverse_graph(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let entity_name = req.entity_name.clone();
@@ -138,7 +142,8 @@ pub async fn get_episode(
         })?;
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let episode = blocking(move || graph.read().get_episode(&episode_uuid)).await?;
@@ -201,7 +206,8 @@ pub async fn get_all_entities(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let entities = blocking(move || graph.read().get_all_entities()).await?;
@@ -308,7 +314,8 @@ pub async fn get_entity_frequency(
     };
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let result = blocking(move || {
@@ -338,7 +345,10 @@ pub async fn get_memory_universe(
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
+    let graph = state
+        .get_user_graph_async(&user_id)
+        .await
+        .map_err(AppError::Internal)?;
 
     let universe = blocking(move || graph.read().get_universe()).await?;
 
@@ -390,7 +400,10 @@ pub async fn delete_entity(
         reason: "must be a UUID".to_string(),
     })?;
 
-    let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
+    let graph = state
+        .get_user_graph_async(&user_id)
+        .await
+        .map_err(AppError::Internal)?;
     let deleted = blocking(move || graph.write().delete_entity(&uuid)).await?;
 
     // Audited whether or not it removed anything. A deletion attempt is a security-relevant act
@@ -441,7 +454,10 @@ pub async fn clear_user_graph(
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
+    let graph = state
+        .get_user_graph_async(&user_id)
+        .await
+        .map_err(AppError::Internal)?;
     let (entities, relationships, episodes) = blocking(move || graph.write().clear_all()).await?;
 
     info!(
@@ -487,7 +503,10 @@ pub async fn rebuild_user_graph(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     // First, clear existing graph data
-    let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
+    let graph = state
+        .get_user_graph_async(&user_id)
+        .await
+        .map_err(AppError::Internal)?;
     if let Err(e) = blocking(move || graph.write().clear_all()).await {
         tracing::debug!("Graph clear before rebuild failed for {}: {:?}", user_id, e);
     }
@@ -497,32 +516,37 @@ pub async fn rebuild_user_graph(
         .get_user_memory_async(&user_id)
         .await
         .map_err(AppError::Internal)?;
-    let memories: Vec<(MemoryId, Experience)> = {
-        let memory_guard = memory_sys.read();
-        memory_guard
-            .get_all_memories()
-            .map_err(AppError::Internal)?
-            .into_iter()
-            .map(|m| (m.id.clone(), m.experience.clone()))
-            .collect()
+    // Re-process each memory through entity extraction, then read the final stats. Each memory
+    // is a graph write, and the graph lookup inside can reopen an evicted graph.
+    let (total_memories, processed, stats) = {
+        let state = state.clone();
+        let user_id = user_id.clone();
+        blocking(move || {
+            let memories: Vec<(MemoryId, Experience)> = memory_sys
+                .read()
+                .get_all_memories()?
+                .into_iter()
+                .map(|m| (m.id.clone(), m.experience.clone()))
+                .collect();
+            let total_memories = memories.len();
+            let mut processed = 0;
+            for (memory_id, experience) in memories {
+                if let Err(e) =
+                    state.process_experience_into_graph(&user_id, &experience, &memory_id)
+                {
+                    tracing::debug!("Failed to process memory {}: {}", memory_id.0, e);
+                } else {
+                    processed += 1;
+                }
+            }
+            Ok((
+                total_memories,
+                processed,
+                state.get_user_graph_stats(&user_id)?,
+            ))
+        })
+        .await?
     };
-
-    let total_memories = memories.len();
-    let mut processed = 0;
-
-    // Re-process each memory through entity extraction
-    for (memory_id, experience) in memories {
-        if let Err(e) = state.process_experience_into_graph(&user_id, &experience, &memory_id) {
-            tracing::debug!("Failed to process memory {}: {}", memory_id.0, e);
-        } else {
-            processed += 1;
-        }
-    }
-
-    // Get final stats
-    let stats = state
-        .get_user_graph_stats(&user_id)
-        .map_err(AppError::Internal)?;
     let entities_created = stats.entity_count;
     let relationships_created = stats.relationship_count;
 
@@ -577,7 +601,8 @@ pub async fn invalidate_relationship(
         })?;
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     blocking(move || graph.write().invalidate_relationship(&rel_uuid)).await?;

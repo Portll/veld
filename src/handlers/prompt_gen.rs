@@ -189,7 +189,8 @@ pub async fn prompt_gen(
         .map_err(AppError::Internal)?;
 
     let graph_memory = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let todo_store = state.todo_store.clone();
@@ -559,7 +560,8 @@ pub async fn resolve_entity(
     validation::validate_entities(&req.names).map_validation_err("names")?;
 
     let graph_memory = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let names = req.names.clone();
@@ -616,7 +618,8 @@ pub async fn set_entity_attribute(
     validation::validate_content(&req.value, false).map_validation_err("value")?;
 
     let graph_memory = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let entity_name = req.entity_name.clone();
@@ -675,7 +678,8 @@ pub async fn merge_entities(
     validation::validate_entity(&req.target_name).map_validation_err("target_name")?;
 
     let graph_memory = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let source_name = req.source_name.clone();
@@ -816,7 +820,8 @@ pub async fn add_entity_alias(
     validation::validate_entity(&req.alias).map_validation_err("alias")?;
 
     let graph_memory = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let entity_name = req.entity_name.clone();

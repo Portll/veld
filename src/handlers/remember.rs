@@ -921,6 +921,25 @@ pub(crate) fn mention_counts_for(
     out
 }
 
+/// [`mention_counts_for`] for async code. Its lookup can open the tenant's graph and its counts
+/// are graph store reads, so it runs on the blocking pool. A task that fails reads as an
+/// unavailable graph: no counts, so arrival order.
+pub(crate) async fn mention_counts_for_async(
+    state: &AppState,
+    user_id: &str,
+    candidates: &[String],
+) -> std::collections::HashMap<String, usize> {
+    let state = state.clone();
+    let user_id = user_id.to_string();
+    let candidates = candidates.to_vec();
+    tokio::task::spawn_blocking(move || mention_counts_for(&state, &user_id, &candidates))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("entity cap: mention count task failed: {e}");
+            std::collections::HashMap::new()
+        })
+}
+
 /// What a single write brings to its tag list: the request's own fields and what NER and YAKE
 /// found in its content.
 pub(crate) struct TagInputs<'a> {
@@ -1177,24 +1196,41 @@ pub async fn remember(
         }
     };
 
-    let AssembledTags {
-        entities: merged_entities,
-        labelled: labelled_tags,
-        ner_entities,
-    } = assemble_tags(
-        &state,
-        &req.user_id,
-        &mut declared,
-        TagInputs {
-            content: &req.content,
-            filename: req.filename.as_deref(),
-            tags: &req.tags,
-            intent_tags: &req.intent_tags,
-            ingest_tags: &ingest_tags,
+    // Tag assembly reads the tenant's graph, whose lookup can open it, so it leaves the worker.
+    let (
+        AssembledTags {
+            entities: merged_entities,
+            labelled: labelled_tags,
             ner_entities,
-            keywords: extracted_keywords,
         },
-    );
+        declared,
+    ) = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        let content = req.content.clone();
+        let filename = req.filename.clone();
+        let tags = req.tags.clone();
+        let intent_tags = req.intent_tags.clone();
+        tokio::task::spawn_blocking(move || {
+            let assembled = assemble_tags(
+                &state,
+                &user_id,
+                &mut declared,
+                TagInputs {
+                    content: &content,
+                    filename: filename.as_deref(),
+                    tags: &tags,
+                    intent_tags: &intent_tags,
+                    ingest_tags: &ingest_tags,
+                    ner_entities,
+                    keywords: extracted_keywords,
+                },
+            );
+            (assembled, declared)
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("tag assembly task failed: {e}")))?
+    };
 
     let experience_type_str = format!("{:?}", experience_type);
 
@@ -1506,7 +1542,7 @@ pub async fn remember(
 
             // Task 4: Infer causal lineage (runs after graph processing)
             {
-                let graph_arc = state.get_user_graph(&user_id).ok();
+                let graph_arc = state.get_user_graph_async(&user_id).await.ok();
                 let memory_arc = memory.clone();
                 let uid = user_id.clone();
                 let mid = memory_id.clone();
@@ -2258,7 +2294,7 @@ pub async fn batch_remember(
             // Task 4: Infer causal lineage for each memory
             for (_, id_str, _, _) in &memory_results_bg {
                 if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
-                    let graph_arc = state.get_user_graph(&user_id).ok();
+                    let graph_arc = state.get_user_graph_async(&user_id).await.ok();
                     let memory_arc = memory.clone();
                     let uid = user_id.clone();
                     let mid = crate::memory::MemoryId(uuid);
@@ -2361,7 +2397,7 @@ pub async fn batch_remember(
             // Memories submitted in the same batch share temporal+topical context,
             // so we create co-occurrence edges between their episodic nodes.
             if create_edges && batch_memory_ids.len() > 1 {
-                if let Ok(graph_arc) = state.get_user_graph(&user_id) {
+                if let Ok(graph_arc) = state.get_user_graph_async(&user_id).await {
                     let graph_guard = graph_arc.read();
                     let now = chrono::Utc::now();
 
@@ -2546,19 +2582,8 @@ pub async fn upsert_memory(
     crate::declared_entities::retain_unredacted(&mut declared);
     let redacted_tags = merged_entities.clone();
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        // Selectivity-ordered, same as the store path. See crate::entity_cap. The mention
-        // counts are graph reads, so they are taken off the async workers too.
-        let mentions = {
-            let state = state.clone();
-            let user_id = req.user_id.clone();
-            let candidates = merged_entities.clone();
-            tokio::task::spawn_blocking(move || mention_counts_for(&state, &user_id, &candidates))
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!("entity cap: mention count task failed: {e}");
-                    std::collections::HashMap::new()
-                })
-        };
+        // Selectivity-ordered, same as the store path. See crate::entity_cap.
+        let mentions = mention_counts_for_async(&state, &req.user_id, &merged_entities).await;
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,

@@ -394,8 +394,12 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         // Selectivity-ordered, same as the HTTP paths. `manager` IS the AppState type, so the same
         // helper serves — a fourth door to one graph gets the same rule as the other three.
-        let mentions =
-            crate::handlers::remember::mention_counts_for(&manager, &req.user_id, &merged_entities);
+        let mentions = crate::handlers::remember::mention_counts_for_async(
+            &manager,
+            &req.user_id,
+            &merged_entities,
+        )
+        .await;
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,
@@ -619,10 +623,20 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     let user_id = req.user_id.clone();
     let parent_id = req.parent_id.clone();
     tokio::spawn(async move {
-        let graph_pass = if rebuild_graph {
-            state.rebuild_experience_graph(&user_id, &experience, &memory_id)
-        } else {
-            state.process_experience_into_graph(&user_id, &experience, &memory_id)
+        // The graph pass can open the tenant's graph and writes it, so it leaves the worker.
+        let graph_pass = {
+            let user_id = user_id.clone();
+            let experience = experience.clone();
+            let memory_id = memory_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if rebuild_graph {
+                    state.rebuild_experience_graph(&user_id, &experience, &memory_id)
+                } else {
+                    state.process_experience_into_graph(&user_id, &experience, &memory_id)
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("graph task panicked: {e}")))
         };
         if let Err(e) = graph_pass {
             debug!("Graph processing failed (non-fatal): {}", e);
