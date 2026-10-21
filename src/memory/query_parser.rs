@@ -1360,14 +1360,21 @@ fn split_temporal_phrases(text: &str) -> Vec<String> {
 fn extract_explicit_dates(text: &str) -> Vec<(NaiveDate, String, usize)> {
     use regex::Regex;
 
+    // Pattern: "Month Day, Year" (e.g., "May 7, 2023")
+    static MONTH_DAY_YEAR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})")
+            .expect("month-day-year regex")
+    });
+    // Pattern: "YYYY-MM-DD"
+    static ISO_DATE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(\d{4})-(\d{2})-(\d{2})").expect("iso date regex"));
+    // Pattern: "MM/DD/YYYY" or "DD/MM/YYYY" (assume US format MM/DD)
+    static SLASH_DATE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(\d{1,2})/(\d{1,2})/(\d{4})").expect("slash date regex"));
+
     let mut results = Vec::new();
 
-    // Pattern: "Month Day, Year" (e.g., "May 7, 2023")
-    let month_day_year =
-        Regex::new(r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})")
-            .unwrap();
-
-    for cap in month_day_year.captures_iter(text) {
+    for cap in MONTH_DAY_YEAR.captures_iter(text) {
         let month_str = &cap[1];
         let day: u32 = cap[2].parse().unwrap_or(1);
         let year: i32 = cap[3].parse().unwrap_or(2000);
@@ -1379,9 +1386,7 @@ fn extract_explicit_dates(text: &str) -> Vec<(NaiveDate, String, usize)> {
         }
     }
 
-    // Pattern: "YYYY-MM-DD"
-    let iso_date = Regex::new(r"(\d{4})-(\d{2})-(\d{2})").unwrap();
-    for cap in iso_date.captures_iter(text) {
+    for cap in ISO_DATE.captures_iter(text) {
         let year: i32 = cap[1].parse().unwrap_or(2000);
         let month: u32 = cap[2].parse().unwrap_or(1);
         let day: u32 = cap[3].parse().unwrap_or(1);
@@ -1392,9 +1397,7 @@ fn extract_explicit_dates(text: &str) -> Vec<(NaiveDate, String, usize)> {
         }
     }
 
-    // Pattern: "MM/DD/YYYY" or "DD/MM/YYYY" (assume US format MM/DD)
-    let slash_date = Regex::new(r"(\d{1,2})/(\d{1,2})/(\d{4})").unwrap();
-    for cap in slash_date.captures_iter(text) {
+    for cap in SLASH_DATE.captures_iter(text) {
         let month: u32 = cap[1].parse().unwrap_or(1);
         let day: u32 = cap[2].parse().unwrap_or(1);
         let year: i32 = cap[3].parse().unwrap_or(2000);
@@ -5595,6 +5598,41 @@ fn clean_sub_query(part: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three shapes, each with its text and position, in pattern order; the compiled
+    /// patterns are shared across calls, so a second call reads the same.
+    #[test]
+    fn explicit_dates_resolve_each_shape_on_every_call() {
+        let text = "Met on May 7, 2023, again 2023-06-01, and last on 07/04/2023.";
+        for _ in 0..2 {
+            let found = extract_explicit_dates(text);
+            let got: Vec<(NaiveDate, &str, usize)> = found
+                .iter()
+                .map(|(date, matched, pos)| (*date, matched.as_str(), *pos))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    (
+                        NaiveDate::from_ymd_opt(2023, 5, 7).unwrap(),
+                        "May 7, 2023",
+                        7
+                    ),
+                    (
+                        NaiveDate::from_ymd_opt(2023, 6, 1).unwrap(),
+                        "2023-06-01",
+                        26
+                    ),
+                    (
+                        NaiveDate::from_ymd_opt(2023, 7, 4).unwrap(),
+                        "07/04/2023",
+                        50
+                    ),
+                ]
+            );
+        }
+        assert!(extract_explicit_dates("no dates here").is_empty());
+    }
 
     #[test]
     fn test_noun_detection() {

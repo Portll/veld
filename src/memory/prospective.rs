@@ -361,7 +361,12 @@ impl ProspectiveStore {
         user_id: &str,
         status_filter: Option<ProspectiveTaskStatus>,
     ) -> Result<Vec<ProspectiveTask>> {
-        let prefix = format!("user:{}:", user_id);
+        // With a status filter only the tasks the status index lists under it are read;
+        // a task's record is still checked, so a row left by a status change is skipped.
+        let prefix = match status_filter {
+            Some(status) => format!("status:{:?}:{}:", status, user_id),
+            None => format!("user:{}:", user_id),
+        };
         let mut tasks = Vec::new();
 
         // scan_cf enforces the prefix bound.
@@ -371,17 +376,12 @@ impl ProspectiveStore {
         {
             let key_str = String::from_utf8_lossy(&key);
 
-            // Extract task_id from key: user:{user_id}:{task_id}
+            // Extract task_id from key: {prefix}{task_id}
             if let Some(task_id_str) = key_str.strip_prefix(&prefix) {
                 if let Ok(uuid) = uuid::Uuid::parse_str(task_id_str) {
                     let task_id = ProspectiveTaskId(uuid);
                     if let Some(task) = self.get(user_id, &task_id)? {
-                        // Apply status filter if specified
-                        if let Some(filter) = status_filter {
-                            if task.status == filter {
-                                tasks.push(task);
-                            }
-                        } else {
+                        if status_filter.is_none_or(|filter| task.status == filter) {
                             tasks.push(task);
                         }
                     }
@@ -815,6 +815,45 @@ mod tests {
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.content, "Remember to push code");
         assert_eq!(retrieved.status, ProspectiveTaskStatus::Pending);
+    }
+
+    /// A status-filtered listing reads the status index: it returns exactly the tasks in
+    /// that status, newest first, and skips a row a status change left behind.
+    #[test]
+    fn a_status_filtered_listing_returns_only_that_status() {
+        let (_temp, store) = setup_store();
+        let at = |minutes: i64| ProspectiveTrigger::AfterDuration {
+            seconds: 3600,
+            from: Utc::now() + chrono::Duration::minutes(minutes),
+        };
+        let mut older = ProspectiveTask::new("u".to_string(), "older".to_string(), at(0));
+        older.created_at = Utc::now() - chrono::Duration::hours(2);
+        let newer = ProspectiveTask::new("u".to_string(), "newer".to_string(), at(1));
+        let mut fired = ProspectiveTask::new("u".to_string(), "fired".to_string(), at(2));
+        let other_user = ProspectiveTask::new("v".to_string(), "theirs".to_string(), at(3));
+        for task in [&older, &newer, &fired, &other_user] {
+            store.store(task).unwrap();
+        }
+        // Re-stored with a new status, the task keeps its old `status:Pending` row.
+        fired.mark_triggered();
+        store.store(&fired).unwrap();
+
+        let pending: Vec<String> = store
+            .list_for_user("u", Some(ProspectiveTaskStatus::Pending))
+            .unwrap()
+            .into_iter()
+            .map(|t| t.content)
+            .collect();
+        assert_eq!(pending, vec!["newer".to_string(), "older".to_string()]);
+
+        let triggered: Vec<String> = store
+            .list_for_user("u", Some(ProspectiveTaskStatus::Triggered))
+            .unwrap()
+            .into_iter()
+            .map(|t| t.content)
+            .collect();
+        assert_eq!(triggered, vec!["fired".to_string()]);
+        assert_eq!(store.list_for_user("u", None).unwrap().len(), 3);
     }
 
     #[test]

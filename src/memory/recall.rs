@@ -4738,20 +4738,27 @@ impl super::MemorySystem {
                 recue.query_text = None;
                 if let Ok(ids) = self.retriever.search_ids(&recue, query.max_results * 4) {
                     let recue_score = if floor.is_finite() { floor * 0.9 } else { 0.0 };
-                    for (id, _sim) in ids {
-                        if memories.len() >= query.max_results {
-                            break;
-                        }
-                        if seen_ids.contains(&id) {
-                            continue;
-                        }
-                        if let Ok(mut m) = self.retriever.get_from_storage(&id) {
+                    let unseen: Vec<MemoryId> = ids
+                        .into_iter()
+                        .map(|(id, _sim)| id)
+                        .filter(|id| !seen_ids.contains(id))
+                        .collect();
+                    // Read in order, as many at a time as the result still has room for: each
+                    // read adds at most one memory, so no read is wasted on a list that fills.
+                    let mut next = 0;
+                    while memories.len() < query.max_results && next < unseen.len() {
+                        let room = query.max_results - memories.len();
+                        let batch = &unseen[next..(next + room).min(unseen.len())];
+                        next += batch.len();
+                        let reads = self.retriever.get_many_from_storage(batch);
+                        for (id, read) in batch.iter().zip(reads) {
+                            let Ok(mut m) = read else { continue };
                             let valid = match recue.as_of {
                                 Some(t) => m.is_valid_at(t),
                                 None => !m.is_expired(),
                             };
                             if valid && self.retriever.matches_filters(&m, &recue) {
-                                seen_ids.insert(id);
+                                seen_ids.insert(id.clone());
                                 m.set_score(recue_score);
                                 memories.push(Arc::new(m));
                             }

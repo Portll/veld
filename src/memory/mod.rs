@@ -4084,9 +4084,20 @@ impl MemorySystem {
     /// Compute embedding for arbitrary text (for external use like prospective memory).
     ///
     /// This is the *document* side. For search input use `compute_query_embedding`
-    /// so asymmetric models (Nomic) apply the query-specific transform.
+    /// so asymmetric models (Nomic) apply the query-specific transform. Served from the
+    /// content cache the write path fills, so a reminder's text checked on every recall is
+    /// encoded once.
     pub fn compute_embedding(&self, text: &str) -> Result<Vec<f32>> {
-        self.embedder.encode(text)
+        let content_hash = Self::sha256_hash(text);
+        if let Some(cached) = self.content_cache.get(&content_hash) {
+            EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
+            return Ok(cached);
+        }
+        EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
+        let embedding = self.embedder.encode(text)?;
+        self.content_cache.insert(content_hash, embedding.clone());
+        EMBEDDING_CACHE_CONTENT_SIZE.set(self.content_cache.entry_count() as i64);
+        Ok(embedding)
     }
 
     /// Compute a *query* embedding for arbitrary text (retrieval side).
