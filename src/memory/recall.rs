@@ -1862,6 +1862,10 @@ impl super::MemorySystem {
             // contributed to each memory's ranking for adaptive weight learning.
             let mut attr: std::collections::HashMap<MemoryId, SignalAttribution> =
                 std::collections::HashMap::new();
+            // Attribution carries BM25 on the query's own scale; Layer 4.527's threshold was
+            // set on Tantivy's raw score, so it reads that.
+            let mut bm25_raw: std::collections::HashMap<MemoryId, f32> =
+                std::collections::HashMap::new();
 
             // ---------------------------------------------------------------
             // BM25 CONCEPT EXPANSION: Expand abstract/meta-reasoning query
@@ -1885,12 +1889,20 @@ impl super::MemorySystem {
                     query.rerank_count, // FIX-11: per-query rerank count override
                 )
                 .map(|r| {
+                    let bm25_max = crate::memory::hybrid_search::SignalScores::query_bm25_max(&r);
                     r.into_iter()
                         .map(|x| {
+                            if let Some(raw) = x.bm25_score {
+                                bm25_raw.insert(x.memory_id.clone(), raw);
+                            }
                             attr.insert(
                                 x.memory_id.clone(),
                                 SignalAttribution {
-                                    bm25_contribution: x.bm25_score.unwrap_or(0.0),
+                                    bm25_contribution: x.bm25_score.map_or(0.0, |raw| {
+                                        crate::memory::hybrid_search::SignalScores::normalized_bm25(
+                                            raw, bm25_max,
+                                        )
+                                    }),
                                     vector_contribution: x.vector_score.unwrap_or(0.0),
                                     graph_contribution: x.graph_score.unwrap_or(0.0),
                                     cross_encoder_contribution: x.rerank_score.unwrap_or(0.0),
@@ -2327,9 +2339,8 @@ impl super::MemorySystem {
                 let mut discounted = 0usize;
                 let ids: Vec<MemoryId> = fused.keys().cloned().collect();
                 for id in &ids {
-                    let a = attr.get(id);
-                    let has_entity_overlap = a.map(|a| a.entity_overlap).unwrap_or(false);
-                    let bm25 = a.map(|a| a.bm25_contribution).unwrap_or(0.0);
+                    let has_entity_overlap = attr.get(id).is_some_and(|a| a.entity_overlap);
+                    let bm25 = bm25_raw.get(id).copied().unwrap_or(0.0);
                     // Very high BM25 (>0.5) but no entity overlap = peripheral mention
                     if bm25 > 0.5 && !has_entity_overlap {
                         if let Some(score) = fused.get_mut(id) {
