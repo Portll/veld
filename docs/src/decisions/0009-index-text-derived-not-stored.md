@@ -36,8 +36,16 @@ recomputes it from the same inputs.
   two-hour session gap, ordered by sequence number where both turns carry one. When the fallback
   resolves a prior, its id is written into `preceding_memory_id` so the deferred embed path and a
   later re-index derive the same text. That is threading metadata, not content.
-- Only `ExperienceType::Conversation` records are contextualised. Every other record keeps the
-  enriched searchable text it had.
+- Every index derives from the stored record through `index_text::for_stored`: the direct BM25
+  write, the intent log's BM25 projection (live, on replay, and on a replication follower, through
+  the tenant's `Bm25DocumentSource`), the in-memory backfill and the deferred embed. The successor
+  index that neighbour expansion reads is recorded from the same `preceding_memory_id`, so a
+  follower applying the leader's snapshots builds the leader's rows.
+- Linked records are contextualised: `ExperienceType::Conversation` turns, and any record its
+  writer threaded into an episode (`episode_id` or `preceding_memory_id`), such as the Claude Code
+  hook's task and error memories and the prompts `proactive_context` ingests. Every other record
+  keeps the enriched searchable text it had. (Amended 2026-10-21: the first version contextualised
+  conversation turns only, which no production writer produces.)
 - The behaviour is behind the `turn_context` dial (`None` = on, `Some(false)` = off,
   `VELD_DIALS_TURN_CONTEXT`), so a gate run can measure it both ways.
 - Prior-turn source is counted in `veld_turn_context_total{source}`.
@@ -45,7 +53,7 @@ recomputes it from the same inputs.
 ## Consequences
 
 - No `Memory` schema change. On-disk records are unchanged and the persisted-layout test stands.
-- What the embedder is fed changes for conversation turns, so a pinned model tape would miss;
+- What the embedder is fed changes for linked records, so a pinned model tape would miss;
   none is pinned today (`tests/recall/model-tape.json` is absent).
 - Memories embedded before this decision carry a bare-content embedding. Re-embedding them during
   consolidation, keyed on an index-text version that includes the prior turn's id, is WP 1.7.

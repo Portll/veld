@@ -126,9 +126,9 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub rerank_count: Option<usize>,
 
-    /// Override ingest-time contextualisation of conversation turns: the embedding
-    /// and BM25 document of a `Conversation` memory carry its date and the turn
-    /// that preceded it (see `memory::index_text`). `None` keeps the engine
+    /// Override ingest-time contextualisation of linked memories (conversation turns and
+    /// episode-threaded memories): the embedding and BM25 document carry the memory's date
+    /// and the memory that preceded it (see `memory::index_text`). `None` keeps the engine
     /// default, which is on; `Some(false)` indexes the bare content.
     #[serde(default)]
     pub turn_context: Option<bool>,
@@ -141,8 +141,8 @@ pub struct CognitiveDials {
     pub turn_context_embedding: Option<bool>,
 
     /// Whether recall runs neighbour expansion: for each of the top
-    /// `neighbour_expansion_top` fused candidates that is a conversation turn, the turn
-    /// recorded as following it (`memory::turn_successors`) joins the pre-rerank pool at
+    /// `neighbour_expansion_top` fused candidates that is a linked memory (a conversation
+    /// turn or an episode-threaded memory), the memory recorded as following it (`memory::turn_successors`) joins the pre-rerank pool at
     /// the parent's fused score times a decay, so the cross-encoder judges it on its own
     /// text. `None` keeps the engine default, which is on.
     #[serde(default)]
@@ -791,7 +791,7 @@ impl CognitiveDials {
         !self.disabled_signals.contains(id)
     }
 
-    /// Whether conversation turns are contextualised at ingest (`turn_context`;
+    /// Whether linked memories are contextualised at ingest (`turn_context`;
     /// the engine default is on).
     #[inline]
     pub fn turn_context_enabled(&self) -> bool {

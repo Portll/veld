@@ -1,10 +1,14 @@
-//! Index text for conversation turns: what the embedder and the BM25 index see.
+//! Index text for linked memories: what the embedder and the BM25 index see.
 //!
-//! A conversation turn on its own is often unretrievable: "I've had them for 3
-//! years" carries nothing that a query like "how long has Nate had his turtles"
-//! can match, and a date that lives only in `created_at` never reaches either
-//! index. This module derives the text the two indexes receive from the turn,
-//! its `created_at` and the turn that preceded it in the same conversation.
+//! A linked memory is one of a sequence: a conversation turn, or anything a writer
+//! threaded into an episode, such as an agent session's task, the error it hit and
+//! the fix that followed. On its own such a memory is often unretrievable: "I've
+//! had them for 3 years" carries nothing that a query like "how long has Nate had
+//! his turtles" can match, "Pinned the dependency, build is green" says nothing of
+//! the E0308 it fixed, and a date that lives only in `created_at` never reaches
+//! either index. This module derives the text the two indexes receive from the
+//! memory, its `created_at` and the memory that preceded it in the same sequence;
+//! "turn" below means any linked memory.
 //!
 //! Index text is derived from content and never stored as content: the record's
 //! `content` is unchanged, there is no schema change, and a re-index recomputes
@@ -110,9 +114,24 @@ pub struct ChainTail {
     pub sequence_number: Option<u32>,
 }
 
-/// True when this experience is a conversation turn that gets contextualised.
+/// True when this experience is a linked memory that gets contextualised: a
+/// conversation turn, or any memory its writer threaded into an episode (an
+/// `episode_id` or a `preceding_memory_id`), whatever its type. The Claude Code hook
+/// threads its task and error memories this way and the server threads the prompts it
+/// ingests, so adjacency is not limited to dialogue.
 pub fn applies(experience: &Experience) -> bool {
     matches!(experience.experience_type, ExperienceType::Conversation)
+        || experience.context.as_ref().is_some_and(|ctx| {
+            ctx.episode
+                .episode_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+                || ctx
+                    .episode
+                    .preceding_memory_id
+                    .as_deref()
+                    .is_some_and(|id| !id.trim().is_empty())
+        })
 }
 
 /// The key that groups turns into one conversation: the episode id when set,
@@ -470,14 +489,40 @@ mod tests {
     }
 
     #[test]
-    fn only_conversation_turns_apply() {
+    fn conversation_turns_and_episode_threaded_memories_apply() {
         assert!(applies(&turn("hi", &[])));
-        let learning = Experience {
+        let standalone = Experience {
             experience_type: ExperienceType::Learning,
-            content: "hi".into(),
+            content: "Prefer cargo check over cargo build".into(),
             ..Default::default()
         };
-        assert!(!applies(&learning));
+        assert!(!applies(&standalone), "an unthreaded memory stays bare");
+
+        let threaded = |episode: EpisodeContext| {
+            let mut ctx = crate::memory::session_detect::rich_context_with_session();
+            ctx.episode = episode;
+            Experience {
+                experience_type: ExperienceType::Error,
+                content: "rustc E0308: mismatched types in recall.rs".into(),
+                context: Some(ctx),
+                ..Default::default()
+            }
+        };
+        assert!(applies(&threaded(EpisodeContext {
+            episode_id: Some("session-1".into()),
+            ..Default::default()
+        })));
+        assert!(applies(&threaded(EpisodeContext {
+            preceding_memory_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..Default::default()
+        })));
+        assert!(
+            !applies(&threaded(EpisodeContext {
+                episode_id: Some("  ".into()),
+                ..Default::default()
+            })),
+            "a blank episode id links nothing"
+        );
     }
 
     #[test]

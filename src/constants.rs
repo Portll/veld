@@ -2367,6 +2367,12 @@ pub const COMPETITION_MAX_PAIRS: usize = 20;
 /// Minimum shared-entity overlap required before two memories can compete.
 pub const COMPETITION_ENTITY_OVERLAP_MIN: usize = 1;
 
+/// Score multiplier for the loser of a retrieval-time competition. The loser stays in the
+/// results below its winner rather than leaving them: one shared entity (a speaker, a
+/// project) and a high pool-relative cosine also pair two memories that are both answers,
+/// and deleting one cost recall that ranking order alone would have kept.
+pub const COMPETITION_LOSER_DEMOTION: f32 = 0.85;
+
 /// How far above a candidate pool's own median pair cosine, as a share of the way to 1, a
 /// pair must sit to compete. The absolute bar ([`INTERFERENCE_SIMILARITY_THRESHOLD`]) was set
 /// on MiniLM, whose unrelated LoCoMo turns sit at a median cosine of 0.39 and cross 0.85 in
