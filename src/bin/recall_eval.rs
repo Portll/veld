@@ -41,10 +41,13 @@ enum Suite {
     /// tune against; this is the one CI gates on.
     Smoke,
     /// LoCoMo recall suite — 5,882 dialogue-turn corpus + 1,531 questions with
-    /// gold evidence dia-ids (snap-research/locomo). The HELD-OUT set: none of
-    /// the pipeline changes were diagnosed against it, so recall@k here tests
-    /// generalization, not fit. Not gated — diagnostic only.
+    /// gold evidence dia-ids (snap-research/locomo). It contains every gate
+    /// question, so it measures fit as well as generalisation. Not gated.
     Locomo,
+    /// `Locomo` without the gate's conversation: 5,253 turns, 1,332 questions
+    /// over nine conversations nothing is tuned against. The number to report.
+    /// Not gated.
+    LocomoHoldout,
     /// LoCoMo-100 fast CI gate — 100 real LoCoMo cases against one
     /// conversation's 629-turn corpus. The per-PR recall-regression gate that
     /// replaced the synthetic smoke suite. Fast (~1-2 min), real data.
@@ -56,6 +59,7 @@ impl Suite {
         match self {
             Suite::Smoke => "smoke",
             Suite::Locomo => "locomo",
+            Suite::LocomoHoldout => "locomo-holdout",
             Suite::LocomoGate => "locomo-gate",
         }
     }
@@ -69,6 +73,10 @@ impl Suite {
             Suite::Locomo => Some((
                 fx::manifest_path(fx::LOCOMO_CORPUS_PATH),
                 fx::manifest_path(fx::LOCOMO_CASES_PATH),
+            )),
+            Suite::LocomoHoldout => Some((
+                fx::manifest_path(fx::LOCOMO_HOLDOUT_CORPUS_PATH),
+                fx::manifest_path(fx::LOCOMO_HOLDOUT_CASES_PATH),
             )),
             Suite::LocomoGate => Some((
                 fx::manifest_path(fx::LOCOMO_GATE_CORPUS_PATH),
