@@ -19,8 +19,8 @@ pub use restart::{
     RestartRequest,
 };
 pub use snapshot::{
-    ActivityEntry, ContextSession, GraphStats, ReachState, ServerHealth, StatusSnapshot,
-    TierStats, TodoStats,
+    ActivityEntry, ContextSession, GraphStats, ReachState, ServerHealth, StatusSnapshot, TierStats,
+    TodoStats,
 };
 
 use thiserror::Error;

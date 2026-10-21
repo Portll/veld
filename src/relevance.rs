@@ -670,7 +670,6 @@ pub struct RelevanceEngine {
     /// user's graph. Populated lazily by `ensure_entity_index`.
     entity_index: Arc<RwLock<HashMap<usize, GraphEntityIndex>>>,
 
-
     /// Learned weights for score fusion, adapted via feedback
     learned_weights: Arc<RwLock<LearnedWeights>>,
 
@@ -1349,7 +1348,10 @@ impl RelevanceEngine {
             let mut candidate_ids: HashMap<Uuid, (f32, Vec<String>)> = HashMap::new();
             for (name_lower, entity, weight) in &entity_lookup {
                 let memory_ids = self.indexed_memory_ids(key, name_lower).or_else(|| {
-                    let node = graph.find_entity_by_name_strict(name_lower).ok().flatten()?;
+                    let node = graph
+                        .find_entity_by_name_strict(name_lower)
+                        .ok()
+                        .flatten()?;
                     let episodes = graph
                         .get_episodes_by_entity_limited(&node.uuid, ENTITY_EPISODE_LIMIT)
                         .ok()?;

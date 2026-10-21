@@ -1187,9 +1187,13 @@ pub fn print_env_help() {
     println!("  VELD_PORT             - Server port (default: 3030)");
     println!("  VELD_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/veld/)");
     println!("  VELD_STORAGE_BACKEND  - Storage engine: rocksdb (default, ADR 0007) or redb");
-    println!("  VELD_REPLICATE_FROM   - Base URL of a veld instance to follow (live memory replication)");
+    println!(
+        "  VELD_REPLICATE_FROM   - Base URL of a veld instance to follow (live memory replication)"
+    );
     println!("  VELD_REPLICATE_ADMIN_KEY - That instance's admin key (its VELD_ADMIN_API_KEY)");
-    println!("  VELD_REPLICATE_API_KEY - That instance's API key (default: this server's own first key)");
+    println!(
+        "  VELD_REPLICATE_API_KEY - That instance's API key (default: this server's own first key)"
+    );
     println!("  VELD_REPLICATE_INTERVAL_SECS - Poll interval while following (default: 2)");
     println!("  VELD_API_KEYS         - Comma-separated API keys (required in production)");
     println!(
@@ -1494,7 +1498,11 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("config.toml");
-        std::fs::write(&file, "auto_compress = false\ngraph_mirror_sync_secs = 900\n").unwrap();
+        std::fs::write(
+            &file,
+            "auto_compress = false\ngraph_mirror_sync_secs = 900\n",
+        )
+        .unwrap();
         env::remove_var("VELD_AUTO_COMPRESS");
         env::remove_var("VELD_GRAPH_MIRROR_SYNC_SECS");
 

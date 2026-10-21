@@ -1174,7 +1174,10 @@ impl StreamingMemoryExtractor {
 
     /// One NER pass over the whole batch; falls back to per-message extraction when
     /// the batch call fails so a single bad input cannot drop the batch's entities.
-    fn extract_entities_batch(ner: &NeuralNer, messages: &[BufferedMessage]) -> Vec<Vec<NerEntity>> {
+    fn extract_entities_batch(
+        ner: &NeuralNer,
+        messages: &[BufferedMessage],
+    ) -> Vec<Vec<NerEntity>> {
         let texts: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
         match ner.extract_batch(&texts) {
             Ok(sets) if sets.len() == texts.len() => sets,

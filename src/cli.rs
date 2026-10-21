@@ -1291,9 +1291,7 @@ fn tenant_size_warning(entry: &str, bytes: u64) -> Option<&'static str> {
         "slow_store.db-wal" if bytes > 128 * MIB => {
             Some("a passive checkpoint runs after the next slow-store mirror rebuild")
         }
-        "intent.log" if bytes > 1024 * MIB => {
-            Some("intent-log rotation is not implemented yet")
-        }
+        "intent.log" if bytes > 1024 * MIB => Some("intent-log rotation is not implemented yet"),
         _ => None,
     }
 }

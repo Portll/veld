@@ -1213,8 +1213,7 @@ mod tests {
             .gather()
             .iter()
             .any(|f| f.name() == "veld_write_stage_duration_seconds"));
-        let timeouts =
-            WRITE_STAGE_TIMEOUTS_TOTAL.with_label_values(&["remember", "journal"]);
+        let timeouts = WRITE_STAGE_TIMEOUTS_TOTAL.with_label_values(&["remember", "journal"]);
         timeouts.inc();
         assert!(timeouts.get() >= 1);
         assert!(
