@@ -215,18 +215,21 @@ impl SleepTimeOrchestrator {
     /// `Err` if the manager has been dropped (orchestrator outliving its
     /// owner — should only happen during shutdown) or if the user has no
     /// user memory yet.
-    pub(super) fn user_memory(&self, user_id: &str) -> Result<SharedUserMemory> {
+    ///
+    /// The workers are tokio tasks, so a tenant not yet open is opened on the
+    /// blocking pool ([`MultiUserMemoryManager::get_user_memory_async`]).
+    pub(super) async fn user_memory_async(&self, user_id: &str) -> Result<SharedUserMemory> {
         let manager = self
             .manager
             .upgrade()
             .context("MultiUserMemoryManager dropped; orchestrator cannot resolve user memory")?;
-        manager.get_user_memory(user_id)
+        manager.get_user_memory_async(user_id).await
     }
 
     /// Resolve the per-user [`GraphMemory`] handle. Used by the worker to
-    /// apply REM edge proposals (R43). Same drop-resilience pattern as
-    /// [`Self::user_memory`].
-    pub(super) fn user_graph(
+    /// apply REM edge proposals (R43). Same drop-resilience pattern, and the
+    /// same blocking-pool open, as [`Self::user_memory_async`].
+    pub(super) async fn user_graph_async(
         &self,
         user_id: &str,
     ) -> Result<Arc<parking_lot::RwLock<crate::graph_memory::GraphMemory>>> {
@@ -234,7 +237,7 @@ impl SleepTimeOrchestrator {
             .manager
             .upgrade()
             .context("MultiUserMemoryManager dropped; orchestrator cannot resolve user graph")?;
-        manager.get_user_graph(user_id)
+        manager.get_user_graph_async(user_id).await
     }
 
     pub(super) fn block_store(&self) -> &Arc<ContextBlockStore> {

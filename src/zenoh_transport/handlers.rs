@@ -19,8 +19,11 @@ use zenoh::query::Query;
 use zenoh::sample::Sample;
 
 use crate::errors::ValidationErrorExt;
+use crate::handlers::crud::journal_bulk_forget;
 use crate::handlers::recall::recall_memory_view;
-use crate::handlers::remember::{build_rich_context, parse_experience_type};
+use crate::handlers::remember::{
+    build_rich_context, parse_experience_type, remember_journaled, WriteOrigin,
+};
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::handlers::types::{MemoryEvent, RecallFact, RecallMemory, RecallResponse, RecallTodo};
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
@@ -391,8 +394,12 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         // Selectivity-ordered, same as the HTTP paths. `manager` IS the AppState type, so the same
         // helper serves — a fourth door to one graph gets the same rule as the other three.
-        let mentions =
-            crate::handlers::remember::mention_counts_for(&manager, &req.user_id, &merged_entities);
+        let mentions = crate::handlers::remember::mention_counts_for_async(
+            &manager,
+            &req.user_id,
+            &merged_entities,
+        )
+        .await;
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,
@@ -418,6 +425,7 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
         req.sequence_number,
         req.preceding_memory_id.clone(),
         req.writer.clone(),
+        None,
     );
 
     let experience = Experience {
@@ -462,15 +470,24 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     let user_mem_clone = user_mem.clone();
     let agent_id = req.agent_id.clone();
     let run_id = req.run_id.clone();
+    let external_id = req.external_id.clone();
     let created_at = req.created_at;
 
+    let journal = Arc::clone(&manager);
+    let journal_user_id = req.user_id.clone();
     let outcome = match tokio::task::spawn_blocking(move || {
-        let guard = user_mem_clone.read();
-        if agent_id.is_some() || run_id.is_some() {
-            guard.remember_with_agent_detailed(exp_clone, created_at, agent_id, run_id)
-        } else {
-            guard.remember_detailed(exp_clone, created_at)
-        }
+        remember_journaled(
+            &journal,
+            &user_mem_clone,
+            &journal_user_id,
+            exp_clone,
+            created_at,
+            WriteOrigin {
+                agent_id,
+                run_id,
+                external_id,
+            },
+        )
     })
     .await
     {
@@ -606,10 +623,20 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     let user_id = req.user_id.clone();
     let parent_id = req.parent_id.clone();
     tokio::spawn(async move {
-        let graph_pass = if rebuild_graph {
-            state.rebuild_experience_graph(&user_id, &experience, &memory_id)
-        } else {
-            state.process_experience_into_graph(&user_id, &experience, &memory_id)
+        // The graph pass can open the tenant's graph and writes it, so it leaves the worker.
+        let graph_pass = {
+            let user_id = user_id.clone();
+            let experience = experience.clone();
+            let memory_id = memory_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if rebuild_graph {
+                    state.rebuild_experience_graph(&user_id, &experience, &memory_id)
+                } else {
+                    state.process_experience_into_graph(&user_id, &experience, &memory_id)
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("graph task panicked: {e}")))
         };
         if let Err(e) = graph_pass {
             debug!("Graph processing failed (non-fatal): {}", e);
@@ -747,11 +774,16 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
             terrain_type,
             ..Default::default()
         };
-        guard.recall(&mq).unwrap_or_default()
+        guard.recall(&mq)
     })
     .await
     {
-        Ok(memories) => memories,
+        Ok(Ok(memories)) => memories,
+        Ok(Err(e)) => {
+            error!(user_id = %user_id, "Recall failed: {e:#}");
+            reply_error(&query, "Recall failed").await;
+            return;
+        }
         Err(e) => {
             error!("Recall task panicked: {:?}", e);
             reply_error(&query, "Internal error during recall").await;
@@ -1026,9 +1058,14 @@ pub async fn handle_forget(sample: Sample, manager: Arc<MultiUserMemoryManager>)
     };
 
     let mid = MemoryId(memory_uuid);
+    let journal = Arc::clone(&manager);
+    let journal_user_id = user_id.clone();
     match tokio::task::spawn_blocking(move || {
-        let guard = user_mem.read();
-        guard.forget(ForgetCriteria::ById(mid))
+        let count = user_mem
+            .read()
+            .forget_journaled(ForgetCriteria::ById(mid.clone()))?;
+        journal_bulk_forget(&journal, &journal_user_id, [mid]);
+        anyhow::Ok(count)
     })
     .await
     {
@@ -1095,11 +1132,11 @@ pub async fn handle_stream_message(
     message: StreamMessage,
     session_id: &str,
     memory: SharedUserMemory,
-    manager: &MultiUserMemoryManager,
+    manager: &Arc<MultiUserMemoryManager>,
 ) {
     let result = manager
         .streaming_extractor()
-        .process_message(session_id, message, memory)
+        .process_message(session_id, message, memory, Arc::clone(manager))
         .await;
 
     match result {
@@ -1223,8 +1260,9 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
 
     let mission_id = req.mission_id.clone();
     let robot_id = req.robot_id.clone();
+    let journal = Arc::clone(&manager);
+    let journal_user_id = user_id.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let guard = user_mem.read();
         let experience = Experience {
             content,
             mission_id: Some(mission_id),
@@ -1233,7 +1271,14 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
             entities: vec!["mission".to_string(), "mission_start".to_string()],
             ..Default::default()
         };
-        guard.remember(experience, None)
+        remember_journaled(
+            &journal,
+            &user_mem,
+            &journal_user_id,
+            experience,
+            None,
+            WriteOrigin::default(),
+        )
     })
     .await;
 
@@ -1323,8 +1368,9 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
     let robot_id = req.robot_id.clone();
     let outcome_type = req.outcome.clone();
     let reward = req.reward;
+    let journal = Arc::clone(&manager);
+    let journal_user_id = user_id.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let guard = user_mem.read();
         let experience = Experience {
             content,
             mission_id: Some(mission_id),
@@ -1335,7 +1381,14 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
             entities: vec!["mission".to_string(), "mission_end".to_string()],
             ..Default::default()
         };
-        guard.remember(experience, None)
+        remember_journaled(
+            &journal,
+            &user_mem,
+            &journal_user_id,
+            experience,
+            None,
+            WriteOrigin::default(),
+        )
     })
     .await;
 

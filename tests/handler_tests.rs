@@ -1007,6 +1007,218 @@ async fn an_upsert_without_provenance_behaves_as_before() {
     assert_eq!(stored.agent_id, None);
 }
 
+// ── repo scoping ──
+
+fn repo_of(memory: &veld::memory::Memory) -> Option<String> {
+    memory
+        .experience
+        .context
+        .as_ref()
+        .and_then(|c| c.repo_slug())
+        .map(str::to_string)
+}
+
+fn ids_in(body: &serde_json::Value) -> Vec<String> {
+    body["memories"]
+        .as_array()
+        .expect("memories")
+        .iter()
+        .map(|m| m["id"].as_str().expect("id").to_string())
+        .collect()
+}
+
+/// Three memories sharing a phrase: one in acme/one, one in acme/two, one in no repo.
+/// Returns their ids in that order, once their embeddings have landed.
+async fn remember_across_repos(h: &Harness, user: &str) -> [String; 3] {
+    let writes = [
+        (
+            Some("acme/one"),
+            "Quokka lantern protocol: the billing worker retries three times before paging.",
+        ),
+        (
+            Some("acme/two"),
+            "Quokka lantern protocol: dashboards refresh every ninety seconds once the cache warms.",
+        ),
+        (
+            None,
+            "Quokka lantern protocol: the release checklist requires a signed changelog entry.",
+        ),
+    ];
+    let mut ids = Vec::new();
+    for (repo, content) in writes {
+        let mut req = json!({"user_id": user, "content": content});
+        if let Some(repo) = repo {
+            req["repo"] = json!(repo);
+        }
+        let (status, body) = json_of(h.app(), authed_post("/api/remember", req)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        ids.push(body["id"].as_str().expect("id").to_string());
+    }
+    wait_for_background_work(h).await;
+    ids.try_into().unwrap()
+}
+
+#[tokio::test]
+async fn recall_with_repo_returns_only_that_repos_memories() {
+    let h = Harness::new();
+    let user = "repo-recall";
+    let [one, two, none] = remember_across_repos(&h, user).await;
+
+    let stored = {
+        let memory = h.mgr.get_user_memory(user).expect("memory");
+        let guard = memory.read();
+        guard
+            .get_memory(&veld::memory::MemoryId(
+                veld::uuid::Uuid::parse_str(&one).unwrap(),
+            ))
+            .expect("stored")
+    };
+    assert_eq!(repo_of(&stored).as_deref(), Some("acme/one"));
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/recall",
+            json!({"user_id": user, "query": "quokka lantern protocol", "limit": 10,
+                   "repo": "Acme/One", "competition_mode": "coexist"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids_in(&body), vec![one.clone()], "{body:#}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/recall",
+            json!({"user_id": user, "query": "quokka lantern protocol", "limit": 10,
+                   "competition_mode": "coexist"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let unscoped = ids_in(&body);
+    for id in [&one, &two, &none] {
+        assert!(unscoped.contains(id), "{id} missing unscoped: {body:#}");
+    }
+}
+
+#[tokio::test]
+async fn proactive_context_with_repo_surfaces_no_other_repo() {
+    let h = Harness::new();
+    let user = "repo-proactive";
+    let [one, two, none] = remember_across_repos(&h, user).await;
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/proactive_context",
+            json!({"user_id": user, "repo": "acme/one", "max_results": 10,
+                   "context": "Remind me how the quokka lantern protocol handles billing and dashboards."}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let surfaced = ids_in(&body);
+    assert!(surfaced.contains(&one), "{body:#}");
+    assert!(!surfaced.contains(&two), "acme/two leaked: {body:#}");
+    assert!(
+        !surfaced.contains(&none),
+        "unscoped memory leaked: {body:#}"
+    );
+}
+
+#[tokio::test]
+async fn upsert_stores_repo_and_an_update_without_one_keeps_it() {
+    let h = Harness::new();
+    let user = "repo-upsert";
+    let upsert = |content: &str, repo: Option<&str>| {
+        let mut req = json!({"user_id": user, "external_id": "ext-repo", "content": content});
+        if let Some(repo) = repo {
+            req["repo"] = json!(repo);
+        }
+        authed_post("/api/upsert", req)
+    };
+
+    let (status, body) = json_of(h.app(), upsert("First pass.", Some(" acme/one "))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        repo_of(&the_one(&h, user, "ext-repo")).as_deref(),
+        Some("acme/one")
+    );
+
+    let (status, body) = json_of(h.app(), upsert("Second pass.", None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["was_update"], json!(true), "{body}");
+    assert_eq!(
+        repo_of(&the_one(&h, user, "ext-repo")).as_deref(),
+        Some("acme/one")
+    );
+
+    let (status, body) = json_of(h.app(), upsert("Third pass.", Some("acme/two"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = the_one(&h, user, "ext-repo");
+    assert_eq!(repo_of(&stored).as_deref(), Some("acme/two"));
+    let repos = stored
+        .experience
+        .context
+        .as_ref()
+        .unwrap()
+        .place
+        .places
+        .iter()
+        .filter(|p| matches!(p, veld::memory::facets::Place::Repo { .. }))
+        .count();
+    assert_eq!(repos, 1, "a provided repo replaces the stored one");
+}
+
+#[tokio::test]
+async fn an_invalid_repo_is_rejected() {
+    let h = Harness::new();
+    let user = "repo-invalid";
+    let too_long = "r".repeat(201);
+    for bad in ["", "   ", too_long.as_str(), "acme/\u{7}one"] {
+        for (uri, req) in [
+            (
+                "/api/remember",
+                json!({"user_id": user, "content": "Scoped badly.", "repo": bad}),
+            ),
+            (
+                "/api/upsert",
+                json!({"user_id": user, "external_id": "ext-bad", "content": "Scoped badly.",
+                       "repo": bad}),
+            ),
+            (
+                "/api/recall",
+                json!({"user_id": user, "query": "scoped", "repo": bad}),
+            ),
+            (
+                "/api/proactive_context",
+                json!({"user_id": user, "context": "What was scoped badly here?", "repo": bad}),
+            ),
+        ] {
+            let (status, body) = json_of(h.app(), authed_post(uri, req)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {bad:?}: {body}");
+        }
+    }
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember/batch",
+            json!({"user_id": user, "memories": [
+                {"content": "Batch item scoped badly.", "repo": ""},
+                {"content": "Batch item scoped well.", "repo": "acme/one"}
+            ]}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(body["created"], json!(1), "{body}");
+    assert_eq!(body["failed"], json!(1), "{body}");
+    assert_eq!(body["errors"][0]["index"], json!(0), "{body}");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // recall.rs
 // ═══════════════════════════════════════════════════════════════════════

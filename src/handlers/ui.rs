@@ -1346,7 +1346,7 @@ pub async fn ui_knows(
         .get_user_memory_async(&user_id)
         .await
         .map_err(AppError::Internal)?;
-    let graph = state.get_user_graph(&user_id);
+    let graph = state.get_user_graph_async(&user_id).await;
     let uid = user_id.clone();
     let knows = tokio::task::spawn_blocking(move || {
         let guard = memory.read();

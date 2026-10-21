@@ -1616,6 +1616,26 @@ impl MultiUserMemoryManager {
             .clone()
     }
 
+    /// The lock `get_user_graph` opens `user_id`'s graph under, for the same use as
+    /// [`Self::user_memory_init_lock`].
+    #[cfg(test)]
+    pub(crate) fn user_graph_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
+        self.user_graph_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
+    /// The lock `get_user_journaled_writer` opens `user_id`'s intent log and replays its
+    /// projections under, for the same use as [`Self::user_memory_init_lock`].
+    #[cfg(test)]
+    pub(crate) fn journaled_writer_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
+        self.journaled_writer_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
     /// Does NOT delete data — used before restore to release file locks.
     /// Evict the tenant and close its memory and graph stores before files are restored under
@@ -1964,6 +1984,9 @@ impl MultiUserMemoryManager {
     ///
     /// Uses the same per-user creation lock as get_user_memory to prevent
     /// concurrent RocksDB open races on the graph directory.
+    ///
+    /// A miss opens the graph store on the calling thread. Async code calls
+    /// [`Self::get_user_graph_async`] instead, for the reason given on [`Self::get_user_memory`].
     pub fn get_user_graph(&self, user_id: &str) -> Result<Arc<parking_lot::RwLock<GraphMemory>>> {
         // Fast path: already cached
         if let Some(graph) = self.graph_memories.get(user_id) {
@@ -2081,10 +2104,32 @@ impl MultiUserMemoryManager {
         Ok(graph_arc)
     }
 
+    /// [`Self::get_user_graph`] for async code. A miss opens the graph store, or waits on its
+    /// init lock behind an open already running, and graph-only routes reach it before anything
+    /// has opened the tenant's memory; on a tokio worker that is one fewer worker for the probes
+    /// until it is done. A cached graph comes back at once; an open runs on the blocking pool.
+    /// A request dropped mid-open leaves the open to finish and cache the graph for the next one.
+    pub async fn get_user_graph_async(
+        self: &Arc<Self>,
+        user_id: &str,
+    ) -> Result<Arc<parking_lot::RwLock<GraphMemory>>> {
+        if let Some(graph) = self.graph_memories.get(user_id) {
+            return Ok(graph);
+        }
+        let manager = Arc::clone(self);
+        let user_id = user_id.to_string();
+        tokio::task::spawn_blocking(move || manager.get_user_graph(&user_id))
+            .await
+            .context("graph open task did not complete")?
+    }
+
     /// Get or create a cached SlowStore for a user.
     ///
     /// SlowStores are cached per-user to avoid reopening SQLite on every request
     /// and to ensure the sync TTL actually works across calls.
+    ///
+    /// A miss opens SQLite and creates its schema on the calling thread. Async code calls
+    /// [`Self::get_user_slow_store_async`] instead.
     pub fn get_user_slow_store(
         &self,
         user_id: &str,
@@ -2103,6 +2148,23 @@ impl MultiUserMemoryManager {
         )?);
         self.slow_stores.insert(user_id.to_string(), store.clone());
         Ok(store)
+    }
+
+    /// [`Self::get_user_slow_store`] for async code, on the [`Self::get_user_graph_async`] model:
+    /// a cached store comes back at once; an open, which waits up to SQLite's busy timeout
+    /// while another connection holds the file, runs on the blocking pool.
+    pub async fn get_user_slow_store_async(
+        self: &Arc<Self>,
+        user_id: &str,
+    ) -> Result<std::sync::Arc<crate::memory::slow_store::SlowStore>> {
+        if let Some(store) = self.slow_stores.get(user_id) {
+            return Ok(store.clone());
+        }
+        let manager = Arc::clone(self);
+        let user_id = user_id.to_string();
+        tokio::task::spawn_blocking(move || manager.get_user_slow_store(&user_id))
+            .await
+            .context("slow store open task did not complete")?
     }
 
     /// Get or create the per-tenant `Arc<BM25Index>`.
@@ -2265,12 +2327,12 @@ impl MultiUserMemoryManager {
         // embedder is stable for a tenant's corpus), so this is correct
         // by construction.
         //
-        // All five kinds are registered eagerly. The cost of an empty,
-        // un-materialised projection is one in-memory `HashMap` and one
-        // checkpoint-store row — negligible. Kinds that never see a
-        // matching field stay pending and never allocate a Vamana
-        // graph, so there's no I/O penalty for tenants that only ever
-        // store text memories.
+        // The text kinds are always registered. An image, audio or video kind is
+        // registered only for a tenant whose log has already given it a vector: no
+        // write path produces those embeddings, so for every other tenant the
+        // projection would decode each frame's snapshot, on every write and on every
+        // replay, only to skip it. A producer of those embeddings must register its
+        // kind unconditionally.
         let vamana_root = user_path.join("vamana_projection");
         std::fs::create_dir_all(&vamana_root).with_context(|| {
             format!(
@@ -2280,6 +2342,9 @@ impl MultiUserMemoryManager {
         })?;
         let mut vamana_projections: Vec<crate::vector_db::VamanaProjection> = Vec::new();
         for &kind in crate::vector_db::VamanaEmbeddingKind::all() {
+            if !kind.is_text() && !kind.has_persisted_vectors(&checkpoint_store.lock()) {
+                continue;
+            }
             let kind_dir = vamana_root.join(kind.dir_component());
             std::fs::create_dir_all(&kind_dir).with_context(|| {
                 format!(
@@ -4658,15 +4723,35 @@ impl MultiUserMemoryManager {
         let extract_predicates: bool = std::env::var("SHODH_GRAPH_EXTRACTED_PREDICATES")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
             .unwrap_or(true);
-        // A name contained in a co-mentioned name ("Mor" in "the Morwen incident") is a
-        // recognizer fragment; a causal edge on it welds unrelated chains together.
+        // A name contained in a longer co-mentioned name ("Mor" in "the Morwen incident"), or
+        // whose mention overlaps one in the text (the keyword "incident set" straddling "the
+        // Morwen incident set ..."), is a fragment, not a participant; a causal edge on it welds
+        // every chain that repeats the phrase together. Mentions are located as
+        // `extract_directed_predicate` locates them: the first occurrence, ASCII-lowercased.
+        let content_lower = experience.content.to_ascii_lowercase();
+        let mention_spans: Vec<Option<std::ops::Range<usize>>> = entity_uuids
+            .iter()
+            .map(|(name, _)| {
+                let name = name.to_ascii_lowercase();
+                content_lower
+                    .find(&name)
+                    .map(|start| start..start + name.len())
+            })
+            .collect();
         let fragment_of_comention: Vec<bool> = (0..entity_uuids.len())
             .map(|k| {
                 let name_k = entity_uuids[k].0.to_lowercase();
                 entity_uuids.iter().enumerate().any(|(m, other)| {
                     m != k && {
                         let name_m = other.0.to_lowercase();
-                        name_m.len() > name_k.len() && name_m.contains(name_k.as_str())
+                        let overlaps = match (&mention_spans[k], &mention_spans[m]) {
+                            (Some(span_k), Some(span_m)) => {
+                                span_k.start < span_m.end && span_m.start < span_k.end
+                            }
+                            _ => false,
+                        };
+                        name_m.len() > name_k.len()
+                            && (name_m.contains(name_k.as_str()) || overlaps)
                     }
                 })
             })
@@ -4801,6 +4886,9 @@ pub const GENERIC_DERIVED_ENTITY_WORDS: &[&str] = &[
 /// a direct name match. Each call clones the index `Arc` out and releases
 /// the writer mutex immediately; the ANN search runs under the index's
 /// own `RwLock`, never under the writer lock.
+///
+/// A writer not yet open is opened here, which replays the tenant's intent
+/// log; the querier calls these on the blocking pool for that reason.
 impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
     fn index(
         &self,
@@ -4836,7 +4924,8 @@ impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
 /// The memory↔entity link lives on the `Memory` itself (its `entity_refs`
 /// set), not in `GraphMemory`, so these primitives read the tenant's
 /// `UserMemory`. Each returns owned ids and releases the `UserMemory` read lock
-/// before returning — the querier never holds it across an `await`.
+/// before returning — the querier never holds it across an `await`. Each also
+/// opens a tenant not yet open, so the querier calls them on the blocking pool.
 ///
 /// `memory_ids_with_entity` / `memory_ids_in_episode` scan the tenant's
 /// live memory set (`get_all_memories`); that is `O(n)` in the corpus.
@@ -5883,11 +5972,12 @@ impl MultiUserMemoryManager {
                 continue;
             }
             let drain = memory.read().drain_embed_queue_journaled(batch);
-            crate::handlers::remember::journal_absorptions(
+            crate::handlers::remember::journal_stored(
                 self,
                 &memory,
                 &user_id,
-                &drain.absorbed,
+                &drain.rewritten,
+                crate::handlers::remember::SnapshotKind::Update,
             );
             drained += drain.taken;
         }
@@ -5916,12 +6006,23 @@ impl MultiUserMemoryManager {
                     continue;
                 }
             }
-            let result = guard.drain_embedding_backlog(limit_per_user);
+            let result = guard.drain_embedding_backlog_journaled(limit_per_user);
             if let Ok(report) = guard.embedding_backlog_report() {
                 crate::metrics::EMBEDDING_BACKLOG_PENDING
                     .with_label_values(&[user_id.as_str()])
                     .set(report.pending as i64);
             }
+            drop(guard);
+            let result = result.map(|(report, rewritten)| {
+                crate::handlers::remember::journal_stored(
+                    self,
+                    &memory,
+                    &user_id,
+                    &rewritten,
+                    crate::handlers::remember::SnapshotKind::Update,
+                );
+                report
+            });
             out.push((user_id, result));
         }
         out

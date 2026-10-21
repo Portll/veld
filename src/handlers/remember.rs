@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use axum::{extract::State, response::Json};
 
 use super::health::AppState;
+use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
 use crate::declared_entities::{DeclaredEntity, DeclaredEntityInput};
 use crate::errors::{AppError, ValidationErrorExt};
@@ -189,6 +190,139 @@ pub(crate) fn journal_batch(
     }
 }
 
+/// Journal `Update` (or `Remember`) snapshots of `ids` as the store holds them
+/// now, in one batch. Blocking.
+pub(crate) fn journal_stored(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    ids: &[crate::memory::MemoryId],
+    kind: SnapshotKind,
+) {
+    let payloads: Vec<_> = {
+        let guard = memory.read();
+        ids.iter()
+            .filter_map(|id| match guard.get_memory(id) {
+                Ok(stored) => snapshot_payload(user_id, &stored, kind),
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %id.0,
+                        "snapshot not journaled, memory unreadable: {e}"
+                    );
+                    None
+                }
+            })
+            .collect()
+    };
+    journal_batch(state, user_id, &payloads);
+}
+
+/// Complete a journaled write's deferred embedding and journal a snapshot of
+/// each record the pass rewrote: the memory once its vectors landed (a replica
+/// gets them from that frame), a write-gate survivor, and memories interference
+/// weakened. Run it only after the memory's `Remember` frame is journaled, or
+/// the absorbed snapshot could take the lower LSN and replay would bring back
+/// the unflagged memory. Blocking.
+pub(crate) fn embed_journaled(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    memory_id: &crate::memory::MemoryId,
+) {
+    let outcome = memory.read().embed_and_index_journaled(memory_id);
+    match outcome {
+        Ok(outcome) => journal_stored(
+            state,
+            memory,
+            user_id,
+            &outcome.rewritten,
+            SnapshotKind::Update,
+        ),
+        Err(e) => {
+            tracing::warn!(memory_id = %memory_id.0, "Background embed_and_index failed: {e}")
+        }
+    }
+}
+
+/// The writer of a memory and the caller's own id for it, as `/api/remember` takes them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WriteOrigin {
+    pub agent_id: Option<String>,
+    pub run_id: Option<String>,
+    pub external_id: Option<String>,
+}
+
+/// Store `experience` journaled, embedding included: the `Remember` frame, then
+/// [`embed_journaled`]. For write paths that answer after the vectors land.
+/// Blocking.
+pub(crate) fn remember_journaled(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    experience: crate::memory::Experience,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    origin: WriteOrigin,
+) -> anyhow::Result<crate::memory::RememberOutcome> {
+    let WriteOrigin {
+        agent_id,
+        run_id,
+        external_id,
+    } = origin;
+    let outcome = {
+        let guard = memory.read();
+        if agent_id.is_some() || run_id.is_some() {
+            guard.remember_with_agent_deferred_detailed_journaled(
+                experience,
+                created_at,
+                agent_id,
+                run_id,
+                external_id,
+            )?
+        } else {
+            guard.remember_deferred_detailed_journaled(experience, created_at, external_id)?
+        }
+    };
+    journal_stored(
+        state,
+        memory,
+        user_id,
+        std::slice::from_ref(&outcome.id),
+        SnapshotKind::Remember,
+    );
+    embed_journaled(state, memory, user_id, &outcome.id);
+    Ok(outcome)
+}
+
+/// [`crate::memory::MemorySystem::upsert`], journaled: a `Remember` frame for a
+/// create, an `Update` for an update, then the memory joins the embed queue, whose
+/// drain journals the record again once its vectors land. Blocking.
+pub(crate) fn upsert_journaled(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    external_id: String,
+    experience: crate::memory::Experience,
+    change_type: crate::memory::types::ChangeType,
+    changed_by: Option<String>,
+) -> anyhow::Result<(crate::memory::MemoryId, bool)> {
+    let (id, was_update) = memory.read().upsert_with_provenance_journaled(
+        external_id,
+        experience,
+        change_type,
+        changed_by,
+        None,
+        crate::memory::UpsertProvenance::default(),
+    )?;
+    let kind = if was_update {
+        SnapshotKind::Update
+    } else {
+        SnapshotKind::Remember
+    };
+    journal_stored(state, memory, user_id, std::slice::from_ref(&id), kind);
+    memory.read().enqueue_embedding(&id);
+    Ok((id, was_update))
+}
+
 /// Queue a journaled write's memory for its vectors and drain the queue in the background.
 /// Call it only once the memory's frame is journaled: when the write gate absorbs the memory
 /// into an existing one, both records change and their snapshots are journaled by the drain,
@@ -213,38 +347,17 @@ fn spawn_embed_queue_drain(state: &AppState, memory: &SharedUserMemory, user_id:
     let user_id = user_id.to_string();
     state.clone().task_tracker.spawn_blocking(move || loop {
         let drained = memory.read().drain_embed_queue_journaled(64);
-        journal_absorptions(&state, &memory, &user_id, &drained.absorbed);
+        journal_stored(
+            &state,
+            &memory,
+            &user_id,
+            &drained.rewritten,
+            SnapshotKind::Update,
+        );
         if drained.taken == 0 {
             break;
         }
     });
-}
-
-/// Journal an `Update` snapshot of each absorbed memory and of the memory that absorbed it:
-/// the write gate changed both records in the store.
-pub(crate) fn journal_absorptions(
-    state: &super::state::MultiUserMemoryManager,
-    memory: &SharedUserMemory,
-    user_id: &str,
-    absorbed: &[(crate::memory::MemoryId, crate::memory::MemoryId)],
-) {
-    if absorbed.is_empty() {
-        return;
-    }
-    let guard = memory.read();
-    for (absorbed_id, survivor) in absorbed {
-        for id in [absorbed_id, survivor] {
-            match guard.get_memory(id) {
-                Ok(memory) => {
-                    journal_memory_snapshot(state, user_id, &memory, SnapshotKind::Update)
-                }
-                Err(e) => tracing::warn!(
-                    memory_id = %id.0,
-                    "write-gate absorption: snapshot not journaled, memory unreadable: {e}"
-                ),
-            }
-        }
-    }
 }
 
 // =============================================================================
@@ -312,6 +425,11 @@ pub struct RememberRequest {
     /// [0, 1], or more than 50), exempt from the derived-entity cut, and stored as authored tags.
     #[serde(default)]
     pub entities: Vec<DeclaredEntityInput>,
+    /// Repository slug this memory belongs to, e.g. `"Portll/veld"`. Stored as the leading
+    /// [`crate::memory::facets::Place::Repo`]; a recall with `repo` set returns only memories
+    /// scoped to it.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 /// Remember response
@@ -382,6 +500,9 @@ pub struct BatchMemoryItem {
     /// fails its item, as an unknown memory type does.
     #[serde(default)]
     pub entities: Vec<DeclaredEntityInput>,
+    /// Per-item repository — see [`RememberRequest::repo`]. An invalid one fails its item.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 /// Error detail for batch item
@@ -430,6 +551,9 @@ pub struct UpsertRequest {
     /// See [`RememberRequest::entities`]. On an update the graph episode is rebuilt from these.
     #[serde(default)]
     pub entities: Vec<DeclaredEntityInput>,
+    /// See [`RememberRequest::repo`]. On update a provided repo replaces the stored one.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 fn default_change_type() -> String {
@@ -572,6 +696,7 @@ pub fn build_rich_context(
     sequence_number: Option<u32>,
     preceding_memory_id: Option<String>,
     declared_writer: Option<crate::memory::facets::DeclaredWriter>,
+    repo: Option<String>,
 ) -> Option<RichContext> {
     let has_explicit_context = emotional_valence.is_some()
         || emotional_arousal.is_some()
@@ -595,6 +720,9 @@ pub fn build_rich_context(
     // write, so it is attached to every write.
     if let Some(declared) = declared_writer {
         ctx.session.declared = declared;
+    }
+    if let Some(repo) = repo {
+        ctx.set_repo(repo);
     }
     // The server's own half. `received_at` is the one writer fact that needs no
     // trust at all — this process observed it. It is deliberately not the
@@ -797,7 +925,7 @@ pub async fn file_answer(
 /// accident, and it must not fail the write either; losing selectivity ordering is a worse outcome
 /// than nothing only if you cannot tell it happened, which is what the warn is for.
 pub(crate) fn mention_counts_for(
-    state: &AppState,
+    state: &MultiUserMemoryManager,
     user_id: &str,
     candidates: &[String],
 ) -> std::collections::HashMap<String, usize> {
@@ -815,6 +943,175 @@ pub(crate) fn mention_counts_for(
     out
 }
 
+/// [`mention_counts_for`] for async code. Its lookup can open the tenant's graph and its counts
+/// are graph store reads, so it runs on the blocking pool. A task that fails reads as an
+/// unavailable graph: no counts, so arrival order.
+pub(crate) async fn mention_counts_for_async(
+    state: &AppState,
+    user_id: &str,
+    candidates: &[String],
+) -> std::collections::HashMap<String, usize> {
+    let state = state.clone();
+    let user_id = user_id.to_string();
+    let candidates = candidates.to_vec();
+    tokio::task::spawn_blocking(move || mention_counts_for(&state, &user_id, &candidates))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("entity cap: mention count task failed: {e}");
+            std::collections::HashMap::new()
+        })
+}
+
+/// What a single write brings to its tag list: the request's own fields and what NER and YAKE
+/// found in its content.
+pub(crate) struct TagInputs<'a> {
+    /// The content as the caller sent it, before ingest extraction.
+    pub(crate) content: &'a str,
+    pub(crate) filename: Option<&'a str>,
+    pub(crate) tags: &'a [String],
+    pub(crate) intent_tags: &'a [String],
+    pub(crate) ingest_tags: &'a [String],
+    pub(crate) ner_entities: Vec<NerEntityRecord>,
+    pub(crate) keywords: Vec<String>,
+}
+
+/// A write's tag list, the source of each entry, and the NER records kept for graph insertion.
+pub(crate) struct AssembledTags {
+    pub(crate) entities: Vec<String>,
+    pub(crate) labelled: TagSources,
+    pub(crate) ner_entities: Vec<NerEntityRecord>,
+}
+
+/// Assemble a single write's tag list the way `remember` stores it.
+///
+/// The recall harness ingests through this as well, so the tags it measures are the tags
+/// production stores; a harness that took NER output alone lost every keyword, and under the
+/// neural NER every date and event too.
+pub(crate) fn assemble_tags(
+    state: &MultiUserMemoryManager,
+    user_id: &str,
+    declared: &mut Vec<DeclaredEntity>,
+    inputs: TagInputs<'_>,
+) -> AssembledTags {
+    let ner_entities =
+        drop_person_location_in_code(inputs.ner_entities, inputs.filename, inputs.content);
+
+    let (mut merged_entities, mut tag_sources) = authored_tags(declared, inputs.tags);
+    // FIX-10: Merge semantic intent tags with "intent:" prefix for importance boost
+    for tag in inputs.intent_tags {
+        merged_entities.push(format!("intent:{tag}"));
+        tag_sources.push(TagSource::Intent);
+    }
+    // Everything appended from here on is DERIVED — nobody chose it. The split is what lets the cap
+    // protect the writer's own tags while ranking the rest, and it has to be taken here because
+    // after this point the list is one flat Vec with no record of where authorship ended.
+    let authored_entity_count = merged_entities.len();
+    let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
+    // Merge ingest-derived entity hints (JSON keys, CSV columns, code symbols)
+    for tag in inputs.ingest_tags {
+        if seen.insert(tag.to_lowercase()) {
+            merged_entities.push(tag.clone());
+            tag_sources.push(TagSource::Ingest);
+        }
+    }
+    for record in &ner_entities {
+        if seen.insert(record.text.to_lowercase()) {
+            merged_entities.push(record.text.clone());
+            tag_sources.push(TagSource::Ner);
+        }
+    }
+    for keyword in inputs.keywords {
+        if seen.insert(keyword.to_lowercase()) {
+            merged_entities.push(keyword);
+            tag_sources.push(TagSource::Yake);
+        }
+    }
+
+    // Cold-start entity extraction: when the graph is sparse and NER found few entities,
+    // use aggressive heuristics (proper nouns, CamelCase, acronyms, file paths, versions)
+    let graph_entity_count = state
+        .get_user_graph(user_id)
+        .ok()
+        .map(|g| g.read().get_stats().map(|s| s.entity_count).unwrap_or(0))
+        .unwrap_or(0);
+    if graph_entity_count < crate::constants::ENTITY_COLD_START_THRESHOLD && ner_entities.len() < 2
+    {
+        let cold_entities =
+            crate::embeddings::ner::cold_start_extract_entities(inputs.content, &merged_entities);
+        if !cold_entities.is_empty() {
+            tracing::debug!(
+                "Cold-start extraction found {} additional entities (graph has {})",
+                cold_entities.len(),
+                graph_entity_count
+            );
+            for e in cold_entities {
+                if seen.insert(e.text.to_lowercase()) {
+                    merged_entities.push(e.text);
+                    tag_sources.push(TagSource::ColdStart);
+                }
+            }
+        }
+    }
+
+    // Redact BEFORE the cap. An entity is a one-way door — delete_entity() is not routed and the
+    // forget path does not touch the graph — so this is the only point the decision can be made.
+    // Order matters twice over: filtering after truncate would mean a credential had already
+    // displaced a legitimate entity, and the cap cuts by arrival order rather than by relevance.
+    let assembled_tags = merged_entities.clone();
+    let redaction = crate::redaction::redact_entities(&mut merged_entities);
+    crate::declared_entities::retain_unredacted(declared);
+    let redacted_tags = merged_entities.clone();
+    if redaction.total() > 0 {
+        // Counts and classes only. The value is never logged — that would move the disclosure from
+        // the graph into the log, which is not a fix.
+        tracing::info!(
+            key = redaction.key,
+            private_key = redaction.private_key,
+            token = redaction.token,
+            login = redaction.login,
+            secret = redaction.secret,
+            path = redaction.path,
+            "Redacted credential-shaped entities before graph entry"
+        );
+    }
+
+    if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
+        // Ordered by SELECTIVITY before the cut, not by arrival. Measured 2026-08-27: the tail this
+        // used to discard was 19x more selective than the head it kept, because arrival order is
+        // uncorrelated with worth. See crate::entity_cap.
+        let mentions = mention_counts_for(state, user_id, &merged_entities);
+        let (kept, report) = crate::entity_cap::cap_by_selectivity(
+            std::mem::take(&mut merged_entities),
+            authored_entity_count,
+            validation::MAX_ENTITIES_PER_MEMORY,
+            &mentions,
+        );
+        merged_entities = kept;
+        tracing::debug!(
+            considered = report.considered,
+            authored = report.authored,
+            dropped = report.dropped,
+            // A persistent zero here means the ordering is inert and should be questioned rather
+            // than trusted — which is why it is logged rather than assumed.
+            rescued_by_ordering = report.rescued_by_ordering,
+            "Capped entities by selectivity"
+        );
+    }
+    let labelled = TagSources::label(
+        &tag_sources,
+        &assembled_tags,
+        &redacted_tags,
+        &merged_entities,
+        &redaction,
+    );
+
+    AssembledTags {
+        entities: merged_entities,
+        labelled,
+        ner_entities,
+    }
+}
+
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn remember(
     State(state): State<AppState>,
@@ -827,6 +1124,12 @@ pub async fn remember(
 
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.content, false).map_validation_err("content")?;
+    let repo = req
+        .repo
+        .as_deref()
+        .map(validation::validate_repo)
+        .transpose()
+        .map_validation_err("repo")?;
 
     // ── Ingest pipeline: extract clean text from structured formats ──────
     let (processed_content, ingest_tags) = if req.filename.is_some() || {
@@ -903,8 +1206,6 @@ pub async fn remember(
             Vec::new()
         }
     };
-    let ner_entities =
-        drop_person_location_in_code(ner_entities, req.filename.as_deref(), &req.content);
     let extracted_keywords = match yake_result {
         Ok(keywords) => keywords,
         Err(e) => {
@@ -917,114 +1218,41 @@ pub async fn remember(
         }
     };
 
-    let (mut merged_entities, mut tag_sources) = authored_tags(&declared, &req.tags);
-    // FIX-10: Merge semantic intent tags with "intent:" prefix for importance boost
-    for tag in &req.intent_tags {
-        merged_entities.push(format!("intent:{tag}"));
-        tag_sources.push(TagSource::Intent);
-    }
-    // Everything appended from here on is DERIVED — nobody chose it. The split is what lets the cap
-    // protect the writer's own tags while ranking the rest, and it has to be taken here because
-    // after this point the list is one flat Vec with no record of where authorship ended.
-    let authored_entity_count = merged_entities.len();
-    let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
-    // Merge ingest-derived entity hints (JSON keys, CSV columns, code symbols)
-    for tag in &ingest_tags {
-        if seen.insert(tag.to_lowercase()) {
-            merged_entities.push(tag.clone());
-            tag_sources.push(TagSource::Ingest);
-        }
-    }
-    for record in &ner_entities {
-        if seen.insert(record.text.to_lowercase()) {
-            merged_entities.push(record.text.clone());
-            tag_sources.push(TagSource::Ner);
-        }
-    }
-    for keyword in extracted_keywords {
-        if seen.insert(keyword.to_lowercase()) {
-            merged_entities.push(keyword);
-            tag_sources.push(TagSource::Yake);
-        }
-    }
-
-    // Cold-start entity extraction: when the graph is sparse and NER found few entities,
-    // use aggressive heuristics (proper nouns, CamelCase, acronyms, file paths, versions)
-    let graph_entity_count = state
-        .get_user_graph(&req.user_id)
-        .ok()
-        .map(|g| g.read().get_stats().map(|s| s.entity_count).unwrap_or(0))
-        .unwrap_or(0);
-    if graph_entity_count < crate::constants::ENTITY_COLD_START_THRESHOLD && ner_entities.len() < 2
-    {
-        let cold_entities =
-            crate::embeddings::ner::cold_start_extract_entities(&req.content, &merged_entities);
-        if !cold_entities.is_empty() {
-            tracing::debug!(
-                "Cold-start extraction found {} additional entities (graph has {})",
-                cold_entities.len(),
-                graph_entity_count
+    // Tag assembly reads the tenant's graph, whose lookup can open it, so it leaves the worker.
+    let (
+        AssembledTags {
+            entities: merged_entities,
+            labelled: labelled_tags,
+            ner_entities,
+        },
+        declared,
+    ) = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        let content = req.content.clone();
+        let filename = req.filename.clone();
+        let tags = req.tags.clone();
+        let intent_tags = req.intent_tags.clone();
+        tokio::task::spawn_blocking(move || {
+            let assembled = assemble_tags(
+                &state,
+                &user_id,
+                &mut declared,
+                TagInputs {
+                    content: &content,
+                    filename: filename.as_deref(),
+                    tags: &tags,
+                    intent_tags: &intent_tags,
+                    ingest_tags: &ingest_tags,
+                    ner_entities,
+                    keywords: extracted_keywords,
+                },
             );
-            for e in cold_entities {
-                if seen.insert(e.text.to_lowercase()) {
-                    merged_entities.push(e.text);
-                    tag_sources.push(TagSource::ColdStart);
-                }
-            }
-        }
-    }
-
-    // Redact BEFORE the cap. An entity is a one-way door — delete_entity() is not routed and the
-    // forget path does not touch the graph — so this is the only point the decision can be made.
-    // Order matters twice over: filtering after truncate would mean a credential had already
-    // displaced a legitimate entity, and the cap cuts by arrival order rather than by relevance.
-    let assembled_tags = merged_entities.clone();
-    let redaction = crate::redaction::redact_entities(&mut merged_entities);
-    crate::declared_entities::retain_unredacted(&mut declared);
-    let redacted_tags = merged_entities.clone();
-    if redaction.total() > 0 {
-        // Counts and classes only. The value is never logged — that would move the disclosure from
-        // the graph into the log, which is not a fix.
-        tracing::info!(
-            key = redaction.key,
-            private_key = redaction.private_key,
-            token = redaction.token,
-            login = redaction.login,
-            secret = redaction.secret,
-            path = redaction.path,
-            "Redacted credential-shaped entities before graph entry"
-        );
-    }
-
-    if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        // Ordered by SELECTIVITY before the cut, not by arrival. Measured 2026-08-27: the tail this
-        // used to discard was 19x more selective than the head it kept, because arrival order is
-        // uncorrelated with worth. See crate::entity_cap.
-        let mentions = mention_counts_for(&state, &req.user_id, &merged_entities);
-        let (kept, report) = crate::entity_cap::cap_by_selectivity(
-            std::mem::take(&mut merged_entities),
-            authored_entity_count,
-            validation::MAX_ENTITIES_PER_MEMORY,
-            &mentions,
-        );
-        merged_entities = kept;
-        tracing::debug!(
-            considered = report.considered,
-            authored = report.authored,
-            dropped = report.dropped,
-            // A persistent zero here means the ordering is inert and should be questioned rather
-            // than trusted — which is why it is logged rather than assumed.
-            rescued_by_ordering = report.rescued_by_ordering,
-            "Capped entities by selectivity"
-        );
-    }
-    let labelled_tags = TagSources::label(
-        &tag_sources,
-        &assembled_tags,
-        &redacted_tags,
-        &merged_entities,
-        &redaction,
-    );
+            (assembled, declared)
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("tag assembly task failed: {e}")))?
+    };
 
     let experience_type_str = format!("{:?}", experience_type);
 
@@ -1038,6 +1266,7 @@ pub async fn remember(
         req.sequence_number,
         req.preceding_memory_id.clone(),
         req.writer.clone(),
+        repo,
     );
 
     let experience = Experience {
@@ -1335,7 +1564,7 @@ pub async fn remember(
 
             // Task 4: Infer causal lineage (runs after graph processing)
             {
-                let graph_arc = state.get_user_graph(&user_id).ok();
+                let graph_arc = state.get_user_graph_async(&user_id).await.ok();
                 let memory_arc = memory.clone();
                 let uid = user_id.clone();
                 let mid = memory_id.clone();
@@ -1632,13 +1861,28 @@ pub async fn batch_remember(
         Vec::new();
 
     let mut seen_content: HashSet<u64> = HashSet::new();
-    for (index, item) in req.memories.into_iter().enumerate() {
+    for (index, mut item) in req.memories.into_iter().enumerate() {
         if let Err(e) = validation::validate_content(&item.content, false) {
             validation_errors.push(BatchErrorItem {
                 index,
                 error: e.to_string(),
             });
             continue;
+        }
+        match item
+            .repo
+            .as_deref()
+            .map(validation::validate_repo)
+            .transpose()
+        {
+            Ok(repo) => item.repo = repo,
+            Err(e) => {
+                validation_errors.push(BatchErrorItem {
+                    index,
+                    error: e.to_string(),
+                });
+                continue;
+            }
         }
         // Deduplicate within the batch: skip items with identical content
         let content_hash = {
@@ -1817,6 +2061,7 @@ pub async fn batch_remember(
                     item.sequence_number,
                     item.preceding_memory_id.clone(),
                     item.writer.clone(),
+                    item.repo.clone(),
                 );
 
                 let experience = Experience {
@@ -2079,7 +2324,7 @@ pub async fn batch_remember(
             // Task 4: Infer causal lineage for each memory
             for (_, id_str, _, _) in &memory_results_bg {
                 if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
-                    let graph_arc = state.get_user_graph(&user_id).ok();
+                    let graph_arc = state.get_user_graph_async(&user_id).await.ok();
                     let memory_arc = memory.clone();
                     let uid = user_id.clone();
                     let mid = crate::memory::MemoryId(uuid);
@@ -2182,7 +2427,7 @@ pub async fn batch_remember(
             // Memories submitted in the same batch share temporal+topical context,
             // so we create co-occurrence edges between their episodic nodes.
             if create_edges && batch_memory_ids.len() > 1 {
-                if let Ok(graph_arc) = state.get_user_graph(&user_id) {
+                if let Ok(graph_arc) = state.get_user_graph_async(&user_id).await {
                     let graph_guard = graph_arc.read();
                     let now = chrono::Utc::now();
 
@@ -2293,6 +2538,12 @@ pub async fn upsert_memory(
             reason: "external_id is required for upsert".to_string(),
         });
     }
+    let repo = req
+        .repo
+        .as_deref()
+        .map(validation::validate_repo)
+        .transpose()
+        .map_validation_err("repo")?;
 
     let experience_type = parse_experience_type(req.memory_type.as_ref())?;
 
@@ -2362,19 +2613,8 @@ pub async fn upsert_memory(
     crate::declared_entities::retain_unredacted(&mut declared);
     let redacted_tags = merged_entities.clone();
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        // Selectivity-ordered, same as the store path. See crate::entity_cap. The mention
-        // counts are graph reads, so they are taken off the async workers too.
-        let mentions = {
-            let state = state.clone();
-            let user_id = req.user_id.clone();
-            let candidates = merged_entities.clone();
-            tokio::task::spawn_blocking(move || mention_counts_for(&state, &user_id, &candidates))
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!("entity cap: mention count task failed: {e}");
-                    std::collections::HashMap::new()
-                })
-        };
+        // Selectivity-ordered, same as the store path. See crate::entity_cap.
+        let mentions = mention_counts_for_async(&state, &req.user_id, &merged_entities).await;
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,
@@ -2400,7 +2640,7 @@ pub async fn upsert_memory(
 
     // Built the way `remember` builds it, so an upsert-created record carries the same
     // AgentSession facet, declared writer, received_at stamp and episode context. Only the
-    // episode id and writer are fields upsert accepts; the other hints stay unset.
+    // episode id, writer and repo are fields upsert accepts; the other hints stay unset.
     let context = build_rich_context(
         None,
         None,
@@ -2411,6 +2651,7 @@ pub async fn upsert_memory(
         None,
         None,
         req.writer.clone(),
+        repo.clone(),
     );
 
     let experience = Experience {
@@ -2436,6 +2677,7 @@ pub async fn upsert_memory(
         created_at: req.created_at,
         episode_id: req.episode_id.clone(),
         writer: req.writer.clone(),
+        repo,
     };
 
     let store_start = std::time::Instant::now();
@@ -2703,7 +2945,10 @@ mod client_source_type_tests {
 
 #[cfg(test)]
 mod declared_and_ner_tests {
-    use super::{authored_tags, content_is_code_or_markdown, drop_person_location_in_code};
+    use super::{
+        assemble_tags, authored_tags, content_is_code_or_markdown, drop_person_location_in_code,
+        TagInputs,
+    };
     use crate::declared_entities::{validate, DeclaredEntityInput};
     use crate::memory::tag_sources::TagSource;
     use crate::memory::types::NerEntityRecord;
@@ -2777,5 +3022,30 @@ mod declared_and_ner_tests {
             4,
             "plain prose keeps every NER type"
         );
+    }
+
+    #[test]
+    fn a_write_keeps_its_keywords_and_cold_start_entities_beside_ner() {
+        let harness = crate::handlers::test_helpers::TestHarness::new();
+        let assembled = assemble_tags(
+            &harness.manager,
+            "tag-assembly",
+            &mut Vec::new(),
+            TagInputs {
+                content: "Caroline joined the LGBTQ support group.",
+                filename: None,
+                tags: &tags(&["conversation"]),
+                intent_tags: &[],
+                ingest_tags: &[],
+                ner_entities: vec![record("Caroline", "PER")],
+                keywords: tags(&["support group", "caroline"]),
+            },
+        );
+        assert_eq!(
+            assembled.entities,
+            tags(&["conversation", "Caroline", "support group", "LGBTQ"]),
+            "caller tag, NER, a YAKE keyword NER lacked, then cold start on an empty graph"
+        );
+        assert_eq!(assembled.ner_entities.len(), 1);
     }
 }

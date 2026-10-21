@@ -376,7 +376,7 @@ async fn handle_streaming_socket(
         // Process message
         let result = state
             .streaming_extractor
-            .process_message(&session_id, stream_msg, user_memory.clone())
+            .process_message(&session_id, stream_msg, user_memory.clone(), state.clone())
             .await;
 
         // Send result
@@ -550,7 +550,7 @@ async fn handle_context_monitor_socket(
         }
     };
 
-    let graph_memory = match state.get_user_graph(&user_id) {
+    let graph_memory = match state.get_user_graph_async(&user_id).await {
         Ok(g) => g,
         Err(e) => {
             tracing::error!("Failed to get user graph: {}", e);

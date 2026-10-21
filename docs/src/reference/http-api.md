@@ -6,7 +6,7 @@
 
 # HTTP API
 
-Veld exposes **230** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
+Veld exposes **231** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
 
 > Warning: 2 route(s) used a non-literal path string and were skipped by the generator. Inspect [src/handlers/router.rs](https://github.com/Portll/veld/blob/main/src/handlers/router.rs) directly for those.
 
@@ -290,6 +290,7 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 
 | Method | Path | Handler |
 |---|---|---|
+| `GET` | `/api/memory/by-external-id` | `crud::get_memory_by_external_id` |
 | `POST` | `/api/memory/compress` | `compression::compress_memory` |
 | `POST` | `/api/memory/decompress` | `compression::decompress_memory` |
 | `POST` | `/api/memory/merge` | `memory_ops::merge_memories` |

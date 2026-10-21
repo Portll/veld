@@ -329,6 +329,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         // MEMORY CRUD OPERATIONS
         // =================================================================
+        .route(
+            "/api/memory/by-external-id",
+            get(crud::get_memory_by_external_id),
+        )
         .route("/api/memory/{memory_id}", get(crud::get_memory))
         .route("/api/memories/{memory_id}", get(crud::get_memory)) // Cloudflare compat alias
         .route(

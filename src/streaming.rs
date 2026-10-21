@@ -42,6 +42,8 @@ use uuid::Uuid;
 
 use crate::embeddings::{NerEntity, NeuralNer};
 use crate::graph_memory::GraphMemory;
+use crate::handlers::remember::{embed_journaled, journal_stored, SnapshotKind};
+use crate::handlers::state::MultiUserMemoryManager;
 use crate::memory::{Experience, ExperienceType, MemoryId, Query as MemoryQuery};
 use crate::similarity::cosine_similarity;
 use crate::user_memory::SharedUserMemory;
@@ -714,8 +716,8 @@ type SessionHandle = Arc<Mutex<StreamSession>>;
 
 /// Result of running one drained buffer through NER and the deferred write path.
 struct BatchOutcome {
-    /// Every id the store returned, as strings for the wire result.
-    memory_ids: Vec<String>,
+    /// Every id the store returned; each owes the intent log a `Remember` frame.
+    memory_ids: Vec<MemoryId>,
     /// Ids that still need their embedding computed and vector indexing done.
     pending_index: Vec<MemoryId>,
     entities: Vec<DetectedEntity>,
@@ -811,6 +813,7 @@ impl StreamingMemoryExtractor {
         session_id: &str,
         message: StreamMessage,
         memory_system: SharedUserMemory,
+        manager: Arc<MultiUserMemoryManager>,
     ) -> ExtractionResult {
         let handle = match self.session(session_id) {
             Some(h) => h,
@@ -849,7 +852,7 @@ impl StreamingMemoryExtractor {
                 };
 
                 if should_extract {
-                    return self.extract_memories(&handle, memory_system).await;
+                    return self.extract_memories(&handle, memory_system, manager).await;
                 }
 
                 ExtractionResult::Ack {
@@ -894,7 +897,7 @@ impl StreamingMemoryExtractor {
                 handle.lock().buffer_message(msg);
 
                 if is_trigger {
-                    return self.extract_memories(&handle, memory_system).await;
+                    return self.extract_memories(&handle, memory_system, manager).await;
                 }
 
                 ExtractionResult::Ack {
@@ -934,7 +937,7 @@ impl StreamingMemoryExtractor {
 
                 // Sensors use time-based extraction primarily
                 if should_extract {
-                    return self.extract_memories(&handle, memory_system).await;
+                    return self.extract_memories(&handle, memory_system, manager).await;
                 }
 
                 ExtractionResult::Ack {
@@ -943,7 +946,7 @@ impl StreamingMemoryExtractor {
                 }
             }
 
-            StreamMessage::Flush => self.extract_memories(&handle, memory_system).await,
+            StreamMessage::Flush => self.extract_memories(&handle, memory_system, manager).await,
 
             StreamMessage::Ping => ExtractionResult::Ack {
                 message_type: "ping".to_string(),
@@ -952,7 +955,7 @@ impl StreamingMemoryExtractor {
 
             StreamMessage::Close => {
                 // Final extraction before closing
-                let final_result = self.extract_memories(&handle, memory_system).await;
+                let final_result = self.extract_memories(&handle, memory_system, manager).await;
 
                 // Get total count and remove session
                 let total = handle.lock().total_memories_created;
@@ -983,10 +986,11 @@ impl StreamingMemoryExtractor {
         &self,
         handle: &SessionHandle,
         memory_system: SharedUserMemory,
+        manager: Arc<MultiUserMemoryManager>,
     ) -> ExtractionResult {
         let start = std::time::Instant::now();
 
-        let (messages, config, user_metadata, mode) = {
+        let (messages, config, user_metadata, mode, user_id) = {
             let mut session = handle.lock();
             let messages = session.drain_buffer();
             (
@@ -994,6 +998,7 @@ impl StreamingMemoryExtractor {
                 session.config.clone(),
                 session.metadata.clone(),
                 session.mode,
+                session.user_id.clone(),
             )
         };
 
@@ -1010,15 +1015,25 @@ impl StreamingMemoryExtractor {
 
         let ner = self.neural_ner.clone();
         let memory_for_batch = memory_system.clone();
+        let manager_for_batch = Arc::clone(&manager);
+        let user_id_for_batch = user_id.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            Self::process_batch(
+            let outcome = Self::process_batch(
                 &ner,
                 &memory_for_batch,
                 messages,
                 mode,
                 &config,
                 &user_metadata,
-            )
+            );
+            journal_stored(
+                &manager_for_batch,
+                &memory_for_batch,
+                &user_id_for_batch,
+                &outcome.memory_ids,
+                SnapshotKind::Remember,
+            );
+            outcome
         })
         .await;
 
@@ -1042,15 +1057,12 @@ impl StreamingMemoryExtractor {
 
         handle.lock().total_memories_created += memory_ids.len();
 
-        // The memories are already persisted and keyword-searchable; embedding and
-        // vector indexing finish in the background, as on the HTTP remember path.
+        // The memories are already persisted, journaled and keyword-searchable; embedding
+        // and vector indexing finish in the background, as on the HTTP remember path.
         if !pending_index.is_empty() {
             let embed = move || {
                 for id in pending_index {
-                    let guard = memory_system.read();
-                    if let Err(e) = guard.embed_and_index(&id) {
-                        tracing::warn!(memory_id = %id.0, "Background embed_and_index failed: {e}");
-                    }
+                    embed_journaled(&manager, &memory_system, &user_id, &id);
                 }
             };
             match &self.task_tracker {
@@ -1065,7 +1077,7 @@ impl StreamingMemoryExtractor {
 
         ExtractionResult::Extraction {
             memories_created: memory_ids.len(),
-            memory_ids,
+            memory_ids: memory_ids.iter().map(|id| id.0.to_string()).collect(),
             entities_detected: entities,
             dedupe_skipped,
             processing_time_ms: start.elapsed().as_millis() as u64,
@@ -1074,7 +1086,9 @@ impl StreamingMemoryExtractor {
     }
 
     /// Run a drained buffer through importance filtering, one batched NER pass and
-    /// the deferred write path. Blocking: call from `spawn_blocking`.
+    /// the deferred, journaled write path: the caller journals a `Remember` frame for
+    /// each of [`BatchOutcome::memory_ids`], whose BM25 projection indexes it.
+    /// Blocking: call from `spawn_blocking`.
     fn process_batch(
         ner: &NeuralNer,
         memory_system: &SharedUserMemory,
@@ -1155,9 +1169,13 @@ impl StreamingMemoryExtractor {
             };
 
             // Message timestamp is the memory's creation time
-            match memory_sys.remember_deferred_detailed(experience, Some(msg.timestamp), None) {
+            match memory_sys.remember_deferred_detailed_journaled(
+                experience,
+                Some(msg.timestamp),
+                None,
+            ) {
                 Ok(stored) => {
-                    outcome.memory_ids.push(stored.id.0.to_string());
+                    outcome.memory_ids.push(stored.id.clone());
                     // A merged duplicate already has its embedding and index entry.
                     if !stored.deduped {
                         outcome.pending_index.push(stored.id);
@@ -1714,7 +1732,7 @@ mod tests {
         assert_eq!(outcome.memory_ids.len(), 5);
         assert_eq!(outcome.pending_index.len(), 5);
         assert_eq!(outcome.dedupe_skipped, 1);
-        let unique: HashSet<&String> = outcome.memory_ids.iter().collect();
+        let unique: HashSet<&MemoryId> = outcome.memory_ids.iter().collect();
         assert_eq!(unique.len(), 5);
     }
 

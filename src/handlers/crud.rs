@@ -678,6 +678,87 @@ pub async fn update_memory(
 }
 
 // =============================================================================
+// LOOKUP BY EXTERNAL ID
+// =============================================================================
+
+/// What veld holds under an external id: enough to tell whether a write whose response
+/// never arrived (a 408) landed, without reading the record.
+#[derive(Debug, Serialize)]
+pub struct ExternalIdRecord {
+    pub id: String,
+    pub external_id: String,
+    pub version: u32,
+    /// SHA-256 (hex) of the content as written. `None` when a lossy compressor replaced
+    /// the body, so no written content can be compared with it.
+    pub content_sha256: Option<String>,
+    pub forgotten: bool,
+}
+
+/// GET /api/memory/by-external-id?user_id=..&external_id=.. - the record an upsert keyed
+/// by `external_id` wrote, or 404.
+#[tracing::instrument(skip(state, params))]
+pub async fn get_memory_by_external_id(
+    State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<ExternalIdRecord>, AppError> {
+    use sha2::{Digest, Sha256};
+
+    let user_id = resolve_request_user_id(
+        params.get("user_id").map(String::as_str),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
+    let external_id = params
+        .get("external_id")
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .ok_or_else(|| AppError::InvalidInput {
+            field: "external_id".to_string(),
+            reason: "required".to_string(),
+        })?;
+
+    let memory = state
+        .get_user_memory_async(&user_id)
+        .await
+        .map_err(AppError::Internal)?;
+    let lookup_id = external_id.clone();
+    let record = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let guard = memory.read();
+        let Some(stored) = guard.find_by_external_id(&lookup_id)? else {
+            return Ok(None);
+        };
+        let content = if !stored.compressed {
+            Some(stored.experience.content.clone())
+        } else if guard.memory_is_lossless(&stored) {
+            Some(guard.decompress_memory(&stored)?.experience.content)
+        } else {
+            None
+        };
+        let content_sha256 = content.map(|content| hex::encode(Sha256::digest(content.as_bytes())));
+        Ok(Some((
+            stored.id.0.to_string(),
+            stored.version,
+            content_sha256,
+            stored.is_forgotten(),
+        )))
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("external id lookup task failed: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    let (id, version, content_sha256, forgotten) =
+        record.ok_or_else(|| AppError::MemoryNotFound(external_id.clone()))?;
+    Ok(Json(ExternalIdRecord {
+        id,
+        external_id,
+        version,
+        content_sha256,
+        forgotten,
+    }))
+}
+
+// =============================================================================
 // DELETE MEMORY HANDLER
 // =============================================================================
 
@@ -914,8 +995,8 @@ pub async fn patch_memory(
 /// errors are swallowed (the frame is durable; replay retries on restart).
 /// Journaled in chunks, one writer lock and one fsync each, so a large forget
 /// does not pay an fsync per id.
-fn journal_bulk_forget(
-    state: &AppState,
+pub(crate) fn journal_bulk_forget(
+    state: &super::state::MultiUserMemoryManager,
     user_id: &str,
     removed: impl IntoIterator<Item = memory::MemoryId>,
 ) {
@@ -2276,6 +2357,297 @@ mod tests {
         );
 
         assert_eq!(keyword_hits(&engine, "sweepterm"), vec![ids[2].clone()]);
+    }
+
+    /// The snapshots of `id` in the tenant's log, oldest first: whether each frame is an
+    /// `Update`, and the memory it carries.
+    fn journaled_snapshots(
+        harness: &TestHarness,
+        user_id: &str,
+        id: &str,
+    ) -> Vec<(bool, crate::memory::Memory)> {
+        use crate::intent_log::IntentPayload;
+        let writer = harness.manager.get_user_journaled_writer(user_id).unwrap();
+        let writer = writer.lock();
+        writer
+            .log()
+            .iter()
+            .unwrap()
+            .map(|record| crate::intent_log::payload::decode_record(&record.unwrap()).unwrap())
+            .filter_map(|(_, payload)| match payload {
+                IntentPayload::Remember {
+                    memory_id,
+                    memory_bincode,
+                    ..
+                } if memory_id == id => Some((false, memory_bincode)),
+                IntentPayload::Update {
+                    memory_id,
+                    memory_bincode,
+                    ..
+                } if memory_id == id => Some((true, memory_bincode)),
+                _ => None,
+            })
+            .map(|(is_update, bytes)| {
+                let memory = crate::memory::storage::decode_memory_snapshot(&bytes).unwrap();
+                (is_update, memory)
+            })
+            .collect()
+    }
+
+    /// A deferred embedding lands after the memory's `Remember` frame, so the memory is
+    /// journaled again once its vectors are stored: a replica gets them from that frame.
+    #[tokio::test]
+    async fn a_remember_is_journaled_again_once_its_vectors_land() {
+        let harness = TestHarness::new();
+        let user_id = "journal-embed-user";
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let outcome = crate::handlers::remember::remember_journaled(
+            &harness.manager,
+            &memory,
+            user_id,
+            Experience {
+                content: "The ferrous lighthouse logs its beam every evening".to_string(),
+                ..Default::default()
+            },
+            None,
+            crate::handlers::remember::WriteOrigin::default(),
+        )
+        .unwrap();
+
+        let frames = journaled_snapshots(&harness, user_id, &outcome.id.0.to_string());
+        let shape: Vec<(bool, bool)> = frames
+            .iter()
+            .map(|(is_update, m)| (*is_update, m.experience.embeddings.is_some()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(false, false), (true, true)],
+            "a Remember without vectors, then an Update carrying them"
+        );
+    }
+
+    /// The backlog drain embeds what an earlier pass left without vectors; each memory it
+    /// embeds is journaled with them, as the request path's own embedding is.
+    #[tokio::test]
+    async fn a_backlog_drain_journals_the_vectors_it_lands() {
+        let harness = TestHarness::new();
+        let user_id = "journal-backlog-user";
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let outcome = memory
+            .read()
+            .remember_deferred_detailed_journaled(
+                Experience {
+                    content: "The quartzheron gate stays shut until spring".to_string(),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        crate::handlers::remember::journal_stored(
+            &harness.manager,
+            &memory,
+            user_id,
+            std::slice::from_ref(&outcome.id),
+            crate::handlers::remember::SnapshotKind::Remember,
+        );
+
+        let (status, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::post_json(
+                "/api/embeddings/backlog/drain",
+                &serde_json::json!({ "user_id": user_id, "reconcile": true }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["drained"]["drained"], 1, "{body}");
+
+        let shape: Vec<(bool, bool)> =
+            journaled_snapshots(&harness, user_id, &outcome.id.0.to_string())
+                .iter()
+                .map(|(is_update, m)| (*is_update, m.experience.embeddings.is_some()))
+                .collect();
+        assert_eq!(shape, vec![(false, false), (true, true)]);
+    }
+
+    /// An import stores through `remember_with_id`, which writes no BM25 document: the
+    /// `Remember` frame is how the import reaches keyword search, and a replica.
+    #[tokio::test]
+    async fn a_mif_import_is_journaled_and_keyword_findable() {
+        let harness = TestHarness::new();
+        remember_n(
+            &harness,
+            "mif-source",
+            &["The basaltquill archive opens at dawn".to_string()],
+        );
+        let (status, doc) = test_helpers::send(
+            harness.router(),
+            test_helpers::post_json(
+                "/api/export/mif",
+                &serde_json::json!({ "user_id": "mif-source" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{doc}");
+
+        let user_id = "mif-target";
+        let engine = keyword_engine(&harness, user_id);
+        let (status, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::post_json(
+                "/api/import/mif",
+                &serde_json::json!({ "user_id": user_id, "data": doc }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"]["memories_imported"], 1, "{body}");
+
+        let hits = keyword_hits(&engine, "basaltquill");
+        assert_eq!(hits.len(), 1, "the import is keyword-findable");
+        assert_eq!(journaled_snapshots(&harness, user_id, &hits[0]).len(), 1);
+    }
+
+    /// A webhook or sync upsert journals its create as `Remember` and its update as
+    /// `Update`; keyword search follows the update through the projection.
+    #[tokio::test]
+    async fn an_integration_upsert_is_journaled_on_create_and_update() {
+        let harness = TestHarness::new();
+        let user_id = "journal-upsert-user";
+        let engine = keyword_engine(&harness, user_id);
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let upsert = |content: &str| {
+            crate::handlers::remember::upsert_journaled(
+                &harness.manager,
+                &memory,
+                user_id,
+                "linear:ENG-7".to_string(),
+                Experience {
+                    content: content.to_string(),
+                    ..Default::default()
+                },
+                crate::memory::types::ChangeType::ContentUpdated,
+                Some("linear-bulk-sync".to_string()),
+            )
+            .unwrap()
+        };
+
+        let (id, created_as_update) = upsert("ENG-7: the cobaltwren importer drops rows");
+        let (same_id, updated) = upsert("ENG-7: the umberfinch importer drops rows");
+        assert!(!created_as_update && updated);
+        assert_eq!(id, same_id);
+
+        let kinds: Vec<bool> = journaled_snapshots(&harness, user_id, &id.0.to_string())
+            .into_iter()
+            .map(|(is_update, _)| is_update)
+            .collect();
+        assert_eq!(kinds, vec![false, true]);
+        assert!(keyword_hits(&engine, "cobaltwren").is_empty());
+        assert_eq!(keyword_hits(&engine, "umberfinch"), vec![id.0.to_string()]);
+    }
+
+    /// A caller whose upsert timed out reads back by its own key what veld holds: the
+    /// version and a hash of the content to compare with what it sent.
+    #[tokio::test]
+    async fn an_upsert_reads_back_by_external_id() {
+        use sha2::{Digest, Sha256};
+
+        let harness = TestHarness::new();
+        let user_id = "external-id-reader";
+        let content = "spine plan veld-features: the lookup answers by key";
+        for _ in 0..2 {
+            let (status, body) = test_helpers::send(
+                harness.router(),
+                test_helpers::post_json(
+                    "/api/upsert",
+                    &serde_json::json!({
+                        "user_id": user_id,
+                        "external_id": "spine:plan:veld-features",
+                        "content": content,
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        let (status, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!(
+                "/api/memory/by-external-id?user_id={user_id}&external_id=spine:plan:veld-features"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["external_id"], "spine:plan:veld-features");
+        assert_eq!(
+            body["content_sha256"],
+            hex::encode(Sha256::digest(content.as_bytes()))
+        );
+        assert_eq!(body["forgotten"], false);
+        assert!(body["version"].as_u64().unwrap() >= 1, "{body}");
+
+        // A caller tells "nothing stored" from "route not mounted" (a bare 404) by this body.
+        let (status, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!(
+                "/api/memory/by-external-id?user_id={user_id}&external_id=spine:plan:never-written"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "MEMORY_NOT_FOUND", "{body}");
+
+        let (status, _) = test_helpers::send(
+            harness.router(),
+            test_helpers::get(&format!("/api/memory/by-external-id?user_id={user_id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// `/api/stream` stores through the deferred path; each stored memory is journaled,
+    /// so keyword search finds it through the projection.
+    #[tokio::test]
+    async fn streamed_memories_are_journaled_and_keyword_findable() {
+        use crate::streaming::{ExtractionResult, StreamMessage};
+
+        let harness = TestHarness::new();
+        let user_id = "journal-stream-user";
+        let engine = keyword_engine(&harness, user_id);
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let extractor = harness.manager.streaming_extractor();
+        let session = extractor
+            .create_session(
+                serde_json::from_value(serde_json::json!({ "user_id": user_id })).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let content: StreamMessage = serde_json::from_value(serde_json::json!({
+            "type": "content",
+            "content": "The tinselgrove relay rebooted after the storm",
+            "importance": 0.9,
+        }))
+        .unwrap();
+        let mut stored = Vec::new();
+        for message in [content, StreamMessage::Flush] {
+            let result = extractor
+                .process_message(&session, message, memory.clone(), harness.state())
+                .await;
+            if let ExtractionResult::Extraction { memory_ids, .. } = result {
+                stored.extend(memory_ids);
+            }
+        }
+
+        assert_eq!(stored.len(), 1, "one memory stored");
+        assert_eq!(keyword_hits(&engine, "tinselgrove"), stored);
+        let frames = journaled_snapshots(&harness, user_id, &stored[0]);
+        assert!(
+            frames.first().is_some_and(|(is_update, _)| !is_update),
+            "journaled as a Remember first"
+        );
     }
 
     /// `auth_middleware` binds a tenant key only by patching a JSON body and inserting

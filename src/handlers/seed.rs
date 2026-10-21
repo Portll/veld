@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::remember::{remember_journaled, WriteOrigin};
 use super::state::MultiUserMemoryManager;
 use crate::constants::{
     SEED_DEFAULT_MAX_FILES, SEED_IMPORTANCE_CONFIG, SEED_IMPORTANCE_README, SEED_IMPORTANCE_SOURCE,
@@ -16,7 +17,7 @@ use crate::constants::{
 use crate::errors::{AppError, ValidationErrorExt};
 #[cfg(feature = "pdf")]
 use crate::ingest;
-use crate::memory::{Experience, ExperienceType};
+use crate::memory::{Experience, ExperienceType, ForgetCriteria};
 use crate::validation;
 
 type AppState = Arc<MultiUserMemoryManager>;
@@ -462,20 +463,17 @@ pub async fn seed_project(
         // Idempotent: delete old _seed tagged memories before re-seeding
         {
             let seed_tags = vec!["_seed".to_string()];
-            let guard = memory.read();
-            match guard.recall_by_tags(&seed_tags, 10_000) {
-                Ok(old_seeds) if !old_seeds.is_empty() => {
-                    let count = old_seeds.len();
-                    // Use forget_by_tags to clean up existing seed memories
-                    drop(guard);
-                    let guard = memory.read();
-                    if let Err(e) = guard.forget_by_tags(&seed_tags) {
-                        tracing::warn!("Failed to clean old seed memories: {e}");
-                    } else {
+            let forgotten = memory
+                .read()
+                .forget_collecting_removed(ForgetCriteria::ByTags(seed_tags));
+            match forgotten {
+                Ok((count, removed)) => {
+                    super::crud::journal_bulk_forget(&state, &user_id, removed);
+                    if count > 0 {
                         tracing::info!("Cleaned {} old seed memories for re-seeding", count);
                     }
                 }
-                _ => {}
+                Err(e) => tracing::warn!("Failed to clean old seed memories: {e}"),
             }
         }
 
@@ -511,13 +509,16 @@ pub async fn seed_project(
                 ..Default::default()
             };
 
-            let guard = memory.read();
-            match guard.remember(experience, None) {
-                Ok(_id) => {
+            match remember_journaled(
+                &state,
+                &memory,
+                &user_id,
+                experience,
+                None,
+                WriteOrigin::default(),
+            ) {
+                Ok(_) => {
                     memories_created += 1;
-                    // Boost importance to README level
-                    // The experience was stored with calculated importance;
-                    // the write gate may have adjusted it
                 }
                 Err(e) => {
                     tracing::debug!("Failed to create project overview memory: {e}");
@@ -583,9 +584,15 @@ pub async fn seed_project(
                 ..Default::default()
             };
 
-            let guard = memory.read();
-            match guard.remember(experience, None) {
-                Ok(_id) => {
+            match remember_journaled(
+                &state,
+                &memory,
+                &user_id,
+                experience,
+                None,
+                WriteOrigin::default(),
+            ) {
+                Ok(_) => {
                     memories_created += 1;
                 }
                 Err(e) => {
