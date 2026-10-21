@@ -6998,6 +6998,58 @@ mod neighbour_expansion_tests {
             "{funnel:?}"
         );
     }
+
+    /// A follower stores the leader's snapshots without resolving anything, and still
+    /// builds the successor index, because the leader threaded each turn's prior into
+    /// the record it replicates.
+    #[test]
+    fn a_follower_applying_snapshots_records_the_leaders_successors() {
+        let (leader, _leader_tmp) = fresh_system();
+        let (question, reply, follow_up) = conversation(&leader);
+        let snapshots: Vec<Memory> = [&question, &reply, &follow_up]
+            .into_iter()
+            .map(|id| leader.get_memory(id).expect("stored on the leader"))
+            .collect();
+        let (follower, _follower_tmp) = fresh_system();
+        follower
+            .upsert_memories(&snapshots)
+            .expect("snapshots applied");
+        assert_eq!(follower.turn_successors(&question), vec![reply.clone()]);
+        assert_eq!(follower.turn_successors(&reply), vec![follow_up]);
+    }
+
+    /// The source a journaled BM25 projection reads derives a stored turn's document from
+    /// the record alone: its date, and the entities of the turn it follows.
+    #[test]
+    fn the_projection_source_derives_a_stored_turns_document() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let source = sys.bm25_document_source();
+        let stored_reply = sys.get_memory(&reply).expect("reply stored");
+        let text = source
+            .turn_text(&stored_reply)
+            .expect("a conversation turn is contextualised");
+        assert!(text.bm25_content.contains("20 May 2023"), "{text:?}");
+        assert!(
+            text.bm25_entities.iter().any(|e| e == "Joanna"),
+            "the prior turn's speaker: {text:?}"
+        );
+        let first_turn = sys.get_memory(&question).expect("question stored");
+        let opening = source.turn_text(&first_turn).expect("contextualised");
+        assert!(
+            !opening.bm25_content.contains("(previous:"),
+            "the opening turn follows nothing: {opening:?}"
+        );
+
+        sys.set_cognitive_dials(CognitiveDials {
+            turn_context: Some(false),
+            ..Default::default()
+        });
+        assert!(
+            source.turn_text(&stored_reply).is_none(),
+            "the dial off indexes the bare content on both paths"
+        );
+    }
 }
 
 #[cfg(test)]

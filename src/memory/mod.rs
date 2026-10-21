@@ -169,7 +169,9 @@ pub fn set_shared_zenoh_session(session: zenoh::Session) {
 }
 // pub use crate::memory::vector_storage::{VectorIndexedMemoryStorage, StorageStats};  // Disabled
 use crate::embeddings::Embedder;
-pub use crate::memory::bm25_projection::{Bm25Projection, Bm25ProjectionError};
+pub use crate::memory::bm25_projection::{
+    Bm25DocumentSlot, Bm25DocumentSource, Bm25Projection, Bm25ProjectionError,
+};
 use crate::memory::compression::CompressionPipeline;
 pub use crate::memory::compression::{
     CausalFactLink, ConsolidationResult, FactCluster, FactType, PurgeReason, SemanticConsolidator,
@@ -906,6 +908,32 @@ pub enum Bm25Sync {
     Journaled,
 }
 
+/// The contextualised BM25 text of a stored record, or `None` when it is indexed with
+/// its own content: it is not a conversation turn, or the `turn_context` dial is off.
+fn stored_turn_text(
+    store: &dyn crate::storage::PrimaryMemoryStore,
+    dials: &parking_lot::RwLock<dials::CognitiveDials>,
+    memory: &Memory,
+) -> Option<index_text::TurnIndexText> {
+    if !index_text::applies(&memory.experience) || !dials.read().turn_context_enabled() {
+        return None;
+    }
+    Some(index_text::for_stored(memory, |id| store.get(id).ok()))
+}
+
+/// [`Bm25DocumentSource`] over a tenant's store and dials, for its journaled projection.
+struct StoredTurnText {
+    store: std::sync::Weak<dyn crate::storage::PrimaryMemoryStore>,
+    dials: Arc<parking_lot::RwLock<dials::CognitiveDials>>,
+}
+
+impl Bm25DocumentSource for StoredTurnText {
+    fn turn_text(&self, memory: &Memory) -> Option<index_text::TurnIndexText> {
+        let store = self.store.upgrade()?;
+        stored_turn_text(store.as_ref(), &self.dials, memory)
+    }
+}
+
 /// What [`MemorySystem::embed_and_index_journaled`] did beyond indexing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbedIndexOutcome {
@@ -1045,12 +1073,7 @@ impl MemorySystem {
         }
         let mut indexed = 0usize;
         for memory in self.long_term_memory.get_all()? {
-            self.hybrid_search.index_memory(
-                &memory.id,
-                &memory.experience.content,
-                &memory.experience.tags,
-                &memory.experience.entities,
-            )?;
+            self.bm25_index_record(&memory)?;
             indexed += 1;
         }
         self.hybrid_search.commit_and_reload()?;
@@ -2141,7 +2164,7 @@ impl MemorySystem {
         let turn = self.turn_index_text(&mut experience, created_at);
         let embed_input: std::borrow::Cow<'_, str> = match &turn {
             Some(turn) if self.cognitive_dials.read().turn_context_embedding_enabled() => {
-                std::borrow::Cow::Owned(turn.text.embedding.clone())
+                std::borrow::Cow::Owned(turn.embedding.clone())
             }
             _ => std::borrow::Cow::Borrowed(experience.content.as_str()),
         };
@@ -2265,30 +2288,9 @@ impl MemorySystem {
         // entity embedding for concept-level dedup. Doing it here too would cause
         // double entity inserts and inflated mention_counts.
 
-        // A contextualised turn's BM25 document carries its date and the prior turn's
-        // entities. A journaled write is indexed by the intent log's BM25 projection from
-        // the stored record, which holds the bare content.
-        match (&turn, bm25) {
-            (Some(turn), Bm25Sync::Direct) => {
-                if let Err(e) = self.hybrid_search.index_memory(
-                    &memory.id,
-                    &turn.text.bm25_content,
-                    &memory.experience.tags,
-                    &turn.text.bm25_entities,
-                ) {
-                    tracing::warn!("Failed to index memory {} in BM25: {}", memory.id.0, e);
-                }
-            }
-            _ => self.bm25_index_direct(&memory, bm25),
-        }
+        self.bm25_index_direct(&memory, bm25);
         self.record_turn_chain(&memory);
-        if let Some(prior) = turn.as_ref().and_then(|turn| turn.prior.as_ref()) {
-            // The memory is stored either way; a missing row only costs this turn its
-            // place in neighbour expansion, so the write is not allowed to fail the call.
-            if let Err(e) = self.turn_successors.record(prior, &memory.id) {
-                tracing::warn!("Failed to record turn successor {}: {e:#}", memory.id.0);
-            }
-        }
+        self.record_turn_successor(&memory);
 
         // PIPE-2: Register memory for pattern-triggered replay
         // Tracks entity co-occurrence, salience spikes, and temporal clusters
@@ -2510,13 +2512,54 @@ impl MemorySystem {
         if bm25 == Bm25Sync::Journaled {
             return;
         }
-        if let Err(e) = self.hybrid_search.index_memory(
-            &memory.id,
-            &memory.experience.content,
-            &memory.experience.tags,
-            &memory.experience.entities,
-        ) {
+        if let Err(e) = self.bm25_index_record(memory) {
             tracing::warn!("Failed to index memory {} in BM25: {}", memory.id.0, e);
+        }
+    }
+
+    /// Write `memory`'s BM25 document: its contextualised text when it has one (the same
+    /// text the journaled projection derives through [`Self::bm25_document_source`]),
+    /// else its own content, tags and entities.
+    fn bm25_index_record(&self, memory: &Memory) -> Result<()> {
+        let turn = stored_turn_text(
+            self.long_term_memory.as_ref(),
+            &self.cognitive_dials,
+            memory,
+        );
+        let (content, entities) = match &turn {
+            Some(turn) => (turn.bm25_content.as_str(), turn.bm25_entities.as_slice()),
+            None => (
+                memory.experience.content.as_str(),
+                memory.experience.entities.as_slice(),
+            ),
+        };
+        self.hybrid_search
+            .index_memory(&memory.id, content, &memory.experience.tags, entities)
+    }
+
+    /// The source this tenant's journaled BM25 projection reads contextualised text from.
+    /// It holds the store weakly, so an evicted tenant's store still closes.
+    pub fn bm25_document_source(&self) -> Arc<dyn Bm25DocumentSource> {
+        Arc::new(StoredTurnText {
+            store: Arc::downgrade(&self.long_term_memory),
+            dials: Arc::clone(&self.cognitive_dials),
+        })
+    }
+
+    /// Record `memory` as the successor of the turn its `preceding_memory_id` names.
+    /// Derived from the record alone, so a follower applying replicated snapshots builds
+    /// the same index as the leader that resolved the prior turn.
+    fn record_turn_successor(&self, memory: &Memory) {
+        if !index_text::applies(&memory.experience) {
+            return;
+        }
+        let Some(prior) = index_text::preceding_memory_id(&memory.experience) else {
+            return;
+        };
+        // The memory is stored either way; a missing row only costs this turn its place
+        // in neighbour expansion, so the write is not allowed to fail the call.
+        if let Err(e) = self.turn_successors.record(&prior, &memory.id) {
+            tracing::warn!("Failed to record turn successor {}: {e:#}", memory.id.0);
         }
     }
 
@@ -2736,13 +2779,13 @@ impl MemorySystem {
     ///
     /// When the writer sent no `preceding_memory_id` and the prior turn was resolved
     /// from the conversation key, the episode context is threaded with the resolved id
-    /// so the deferred embed path and a later re-index derive the same text. The
-    /// resolved prior is returned with the text for the successor index.
+    /// so the deferred embed path, the BM25 projection, a follower and a later re-index
+    /// derive the same text, and the successor index can be built from the record.
     fn turn_index_text(
         &self,
         experience: &mut Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Option<index_text::ContextualisedTurn> {
+    ) -> Option<index_text::TurnIndexText> {
         if !index_text::applies(experience) || !self.cognitive_dials.read().turn_context_enabled() {
             return None;
         }
@@ -2761,15 +2804,12 @@ impl MemorySystem {
                 .get_or_insert_with(|| index_text::threaded_context(created_at));
             ctx.episode.preceding_memory_id = Some(prior.id.0.to_string());
         }
-        Some(index_text::ContextualisedTurn {
-            text: index_text::build(
-                &experience.content,
-                created_at,
-                &experience.entities,
-                prior.as_ref(),
-            ),
-            prior: prior.map(|prior| prior.id),
-        })
+        Some(index_text::build(
+            &experience.content,
+            created_at,
+            &experience.entities,
+            prior.as_ref(),
+        ))
     }
 
     /// The turn `experience` follows: the writer's `preceding_memory_id` when it names a
@@ -2910,18 +2950,8 @@ impl MemorySystem {
         if index_text::applies(&memory.experience)
             && self.cognitive_dials.read().turn_context_embedding_enabled()
         {
-            let prior = index_text::preceding_memory_id(&memory.experience)
-                .and_then(|id| self.long_term_memory.get(&id).ok())
-                .map(|prior| {
-                    index_text::PriorTurn::from_memory(&prior, index_text::PriorSource::PrecedingId)
-                });
-            return index_text::build(
-                &memory.experience.content,
-                memory.created_at,
-                &memory.experience.entities,
-                prior.as_ref(),
-            )
-            .embedding;
+            return index_text::for_stored(memory, |id| self.long_term_memory.get(id).ok())
+                .embedding;
         }
         crate::memory::retrieval::RetrievalEngine::extract_searchable_text(memory)
     }
@@ -5981,6 +6011,7 @@ impl MemorySystem {
                     );
                 }
             }
+            self.record_turn_successor(memory);
             let shared = std::sync::Arc::new(memory.clone());
             {
                 let mut working = self.working_memory.write();

@@ -102,14 +102,6 @@ pub struct TurnIndexText {
     pub bm25_entities: Vec<String>,
 }
 
-/// What ingest resolved for one turn: the text its indexes receive and the turn it
-/// was found to follow, which `remember` records in the successor index.
-#[derive(Debug, Clone)]
-pub struct ContextualisedTurn {
-    pub text: TurnIndexText,
-    pub prior: Option<MemoryId>,
-}
-
 /// Tail of the per-conversation chain: the latest turn seen for a conversation key.
 #[derive(Debug, Clone)]
 pub struct ChainTail {
@@ -331,6 +323,28 @@ pub fn build(
         bm25_content,
         bm25_entities,
     }
+}
+
+/// The index text of a stored turn, from the record and the turn its
+/// `preceding_memory_id` names, read through `prior_of`.
+///
+/// Ingest threads the prior it resolved into `preceding_memory_id`, so every index that
+/// derives from the stored record (the direct BM25 write, the journaled BM25 projection
+/// on a leader or a follower, a replay, a backfill, the deferred embed) sees the same
+/// text. A prior that no longer resolves leaves the date and the turn's own text.
+pub fn for_stored(
+    memory: &Memory,
+    prior_of: impl FnOnce(&MemoryId) -> Option<Memory>,
+) -> TurnIndexText {
+    let prior = preceding_memory_id(&memory.experience)
+        .and_then(|id| prior_of(&id))
+        .map(|prior| PriorTurn::from_memory(&prior, PriorSource::PrecedingId));
+    build(
+        &memory.experience.content,
+        memory.created_at,
+        &memory.experience.entities,
+        prior.as_ref(),
+    )
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
