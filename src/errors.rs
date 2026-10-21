@@ -44,6 +44,9 @@ fn sanitize_id(id: &str) -> String {
 const WRITE_LATCHED_CLIENT_MESSAGE: &str =
     "Storage is not accepting writes (no space left on device); retry later";
 
+const SHUTTING_DOWN_CLIENT_MESSAGE: &str =
+    "The server is shutting down and wrote nothing for this request; retry once it is back";
+
 /// Application error types with proper categorization
 #[derive(Debug)]
 pub enum AppError {
@@ -139,10 +142,22 @@ impl AppError {
         }
     }
 
+    /// Whether a tenant's write gate refused this request at shutdown. Classified over
+    /// the chain for the same reason as [`Self::is_write_latched`].
+    fn is_shutting_down(&self) -> bool {
+        match self {
+            Self::Internal(err) => crate::memory::write_gate::chain_is_writes_closed(err),
+            _ => false,
+        }
+    }
+
     /// Get error code for client identification
     pub fn code(&self) -> &'static str {
         if self.is_write_latched() {
             return "STORAGE_WRITE_LATCHED";
+        }
+        if self.is_shutting_down() {
+            return "SHUTTING_DOWN";
         }
         match self {
             Self::InvalidInput { .. } => "INVALID_INPUT",
@@ -172,7 +187,7 @@ impl AppError {
 
     /// Get HTTP status code
     pub fn status_code(&self) -> StatusCode {
-        if self.is_write_latched() {
+        if self.is_write_latched() || self.is_shutting_down() {
             return StatusCode::SERVICE_UNAVAILABLE;
         }
         match self {
@@ -218,6 +233,9 @@ impl AppError {
             };
             tracing::error!(error = %chain, "Storage write latched");
             return WRITE_LATCHED_CLIENT_MESSAGE.to_string();
+        }
+        if self.is_shutting_down() {
+            return SHUTTING_DOWN_CLIENT_MESSAGE.to_string();
         }
         match self {
             Self::InvalidInput { field, reason } => {
@@ -442,6 +460,20 @@ mod tests {
             !err.message().contains("000585.log"),
             "a 503 body reaches the client and must not carry store paths"
         );
+    }
+
+    /// The upsert handler wraps the refusal as `upsert_memory` returns it, inside
+    /// `AppError::Internal`.
+    #[test]
+    fn a_closed_write_gate_answers_a_retryable_503() {
+        let err = AppError::Internal(
+            anyhow::Error::new(crate::memory::write_gate::WritesClosed)
+                .context("upsert claude-memory/veld/x"),
+        );
+
+        assert_eq!(err.code(), "SHUTTING_DOWN");
+        assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message(), SHUTTING_DOWN_CLIENT_MESSAGE);
     }
 
     #[test]
