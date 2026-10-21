@@ -1,9 +1,10 @@
 //! Gap-Based Session Detection
 //!
 //! Detects natural session boundaries from memory creation timestamps using
-//! inter-memory gap thresholding. The fixed-threshold variant uses a configurable
-//! gap duration; the adaptive variant uses partition-theoretic analysis
-//! (Hardy-Ramanujan-Rademacher modular correction) to find the optimal split.
+//! inter-memory gap thresholding. The fixed-threshold variant splits at gaps over
+//! `SESSION_GAP_THRESHOLD_SECS`; the adaptive variant splits at the largest
+//! relative jump in the sorted gap distribution, searched inside a plausible
+//! session-break window.
 //!
 //! This enables ordinal resolution: "second meeting" -> session[1]'s memories.
 
@@ -31,9 +32,9 @@ pub struct DetectedSession {
 
 /// Statistics from the adaptive session detection algorithm.
 ///
-/// Reports what the partition-theoretic gap analysis computed, including
-/// whether the adaptive threshold was used or the algorithm fell back
-/// to the fixed `SESSION_GAP_THRESHOLD_SECS` constant.
+/// Reports what the gap analysis computed, including whether the adaptive
+/// threshold was used or the algorithm fell back to the fixed
+/// `SESSION_GAP_THRESHOLD_SECS` constant.
 #[derive(Debug, Clone)]
 pub struct SessionDetectionStats {
     /// The threshold (in seconds) used to split sessions.
@@ -45,11 +46,11 @@ pub struct SessionDetectionStats {
     pub gap_count: usize,
     /// Median inter-memory gap in seconds.
     pub median_gap_secs: f64,
-    /// Index in the sorted gap array where the natural partition split occurred.
-    /// Only meaningful when `adaptive` is `true`.
+    /// Index in the sorted gap array of the last within-session gap: the split
+    /// falls between it and the next gap. Only meaningful when `adaptive` is `true`.
     pub partition_index: usize,
-    /// Magnitude of the relative jump at the partition index.
-    /// Only meaningful when `adaptive` is `true`.
+    /// Relative jump `(hi - lo) / lo` across the split, both gaps clamped to
+    /// [300 s, 28 800 s]. Only meaningful when `adaptive` is `true`.
     pub relative_jump: f64,
 }
 
@@ -142,21 +143,14 @@ pub fn detect_sessions(memories: &[(MemoryId, DateTime<Utc>)]) -> SessionMap {
     }
 }
 
-/// Modular correction from partition function asymptotics.
-///
-/// The Hardy-Ramanujan-Rademacher formula for p(n) contains the term
-/// `exp(pi * sqrt(2n/3)) / (4n * sqrt(3))` with a correction factor
-/// involving `1/24`. Multiplying the adaptive threshold by `(1 - 1/24)`
-/// shifts the boundary slightly inward, empirically improving session
-/// boundary detection.
-const PARTITION_MODULAR_CORRECTION: f64 = 1.0 - 1.0 / 24.0;
-
-/// Minimum adaptive threshold (seconds). Sessions shorter than 5 minutes
-/// are not meaningful interaction boundaries.
+/// Minimum adaptive threshold (seconds). A pause shorter than 5 minutes is not
+/// a meaningful interaction boundary, so gaps below it are searched as if they
+/// were exactly 5 minutes long.
 const ADAPTIVE_THRESHOLD_MIN_SECS: f64 = 300.0;
 
-/// Maximum adaptive threshold (seconds). Gaps beyond 8 hours almost
-/// certainly represent separate sessions regardless of distribution.
+/// Maximum adaptive threshold (seconds). Gaps beyond 8 hours almost certainly
+/// separate sessions whatever the distribution, so gaps above it are searched
+/// as if they were exactly 8 hours long.
 const ADAPTIVE_THRESHOLD_MAX_SECS: f64 = 28800.0;
 
 /// Minimum number of inter-memory gaps required to run the adaptive
@@ -164,21 +158,18 @@ const ADAPTIVE_THRESHOLD_MAX_SECS: f64 = 28800.0;
 /// reliable partition detection, so we fall back to the fixed threshold.
 const ADAPTIVE_MIN_GAPS: usize = 10;
 
-/// Detect session boundaries using partition-theoretic adaptive thresholding.
+/// Detect session boundaries with a threshold adapted to the gap distribution.
 ///
 /// Instead of the fixed 7200s gap used by [`detect_sessions`], this function
-/// computes the distribution of inter-memory gaps and finds the natural
-/// "partition gap" — the point in the sorted gap sequence where the largest
-/// relative jump occurs. This split point separates within-session gaps from
-/// between-session gaps.
-///
-/// The adaptive threshold is the midpoint of the two gaps surrounding the
-/// partition gap, corrected by the modular factor `(1 - 1/24)` from
-/// partition function asymptotics. The result is clamped to [300s, 28800s].
+/// sorts the inter-memory gaps and splits them where consecutive sorted gaps
+/// jump the most, relative to the smaller: everything at or below the jump is
+/// within a session, everything above it separates two. The search clamps each
+/// gap to [300 s, 28 800 s] first (see [`partition_split`]), and the threshold is
+/// the geometric mean of the clamped pair.
 ///
 /// Falls back to `SESSION_GAP_THRESHOLD_SECS` when:
 /// - Fewer than 10 inter-memory gaps exist (distribution too sparse)
-/// - The computed adaptive threshold falls outside the clamp range
+/// - No two gaps differ once clamped to the window (nothing to split on)
 ///
 /// Returns both the `SessionMap` and a `SessionDetectionStats` struct
 /// documenting the algorithm's decisions.
@@ -214,56 +205,26 @@ pub fn detect_sessions_adaptive(
 
     let gap_count = gaps.len();
 
-    // Compute median gap
-    let median_gap_secs = if gaps.is_empty() {
+    let mut sorted_gaps = gaps.clone();
+    sorted_gaps.sort_unstable();
+
+    let median_gap_secs = if sorted_gaps.is_empty() {
         0.0
+    } else if sorted_gaps.len().is_multiple_of(2) {
+        let mid = sorted_gaps.len() / 2;
+        (sorted_gaps[mid - 1] + sorted_gaps[mid]) as f64 / 2.0
     } else {
-        let mut sorted_gaps = gaps.clone();
-        sorted_gaps.sort_unstable();
-        if sorted_gaps.len().is_multiple_of(2) {
-            let mid = sorted_gaps.len() / 2;
-            (sorted_gaps[mid - 1] + sorted_gaps[mid]) as f64 / 2.0
-        } else {
-            sorted_gaps[sorted_gaps.len() / 2] as f64
-        }
+        sorted_gaps[sorted_gaps.len() / 2] as f64
     };
 
-    // Determine threshold
-    let (threshold_secs, adaptive, partition_index, relative_jump) = if gap_count
-        < ADAPTIVE_MIN_GAPS
-    {
-        (SESSION_GAP_THRESHOLD_SECS, false, 0, 0.0)
+    let split = if gap_count < ADAPTIVE_MIN_GAPS {
+        None
     } else {
-        // Sort gaps to find the partition point
-        let mut sorted_gaps: Vec<i64> = gaps.clone();
-        sorted_gaps.sort_unstable();
-
-        // Find the index i that maximizes (g_{i+1} - g_i) / g_i
-        let mut best_index = 0;
-        let mut best_jump: f64 = 0.0;
-        for i in 0..sorted_gaps.len() - 1 {
-            let g_i = sorted_gaps[i] as f64;
-            if g_i <= 0.0 {
-                continue;
-            }
-            let g_next = sorted_gaps[i + 1] as f64;
-            let jump = (g_next - g_i) / g_i;
-            if jump > best_jump {
-                best_jump = jump;
-                best_index = i;
-            }
-        }
-
-        // Adaptive threshold: midpoint of the two bounding gaps, with modular correction
-        let g_lo = sorted_gaps[best_index] as f64;
-        let g_hi = sorted_gaps[best_index + 1] as f64;
-        let raw_threshold = (g_lo + g_hi) / 2.0 * PARTITION_MODULAR_CORRECTION;
-
-        if !(ADAPTIVE_THRESHOLD_MIN_SECS..=ADAPTIVE_THRESHOLD_MAX_SECS).contains(&raw_threshold) {
-            (SESSION_GAP_THRESHOLD_SECS, false, best_index, best_jump)
-        } else {
-            (raw_threshold as i64, true, best_index, best_jump)
-        }
+        partition_split(&sorted_gaps)
+    };
+    let (threshold_secs, adaptive, partition_index, relative_jump) = match split {
+        Some(split) => (split.threshold_secs, true, split.index, split.relative_jump),
+        None => (SESSION_GAP_THRESHOLD_SECS, false, 0, 0.0),
     };
 
     // Build session map using the computed threshold
@@ -331,6 +292,54 @@ pub fn detect_sessions_adaptive(
     };
 
     (map, stats)
+}
+
+/// Where [`detect_sessions_adaptive`] splits a sorted gap sequence.
+struct PartitionSplit {
+    /// Index of the last gap below the split.
+    index: usize,
+    /// `(hi - lo) / lo` across the split, on the clamped gaps.
+    relative_jump: f64,
+    /// Gaps strictly above this separate sessions.
+    threshold_secs: i64,
+}
+
+/// The largest relative jump between consecutive gaps of `sorted_gaps`, each
+/// clamped to [`ADAPTIVE_THRESHOLD_MIN_SECS`, `ADAPTIVE_THRESHOLD_MAX_SECS`], and
+/// the threshold for it: the geometric mean of the clamped pair, floored.
+/// `None` when no pair differs once clamped.
+///
+/// Clamping before comparing is what keeps out-of-window noise from winning. On
+/// raw gaps a burst of 1 s writes beside 30 s ones is a relative jump of 29, which
+/// outranks the 11 from 5 minutes to an hour and puts the split far below any
+/// session break; a week-long absence beside a 2 h break does the same at the top.
+/// Clamped, every gap under 5 minutes reads as 5 minutes and every gap over 8
+/// hours as 8 hours, so those pairs jump by nothing.
+///
+/// The floored geometric mean of a clamped pair `lo < hi` lies in `[lo, hi)`, and
+/// a positive jump means the raw pair is at least that far apart (raw `lo` no
+/// larger, raw `hi` no smaller), so the threshold keeps exactly the gaps up to
+/// the chosen index inside sessions. Any value in that interval gives the same
+/// partition; the geometric mean is reported because the jump is measured as a
+/// ratio, and on that scale it sits midway between the pair.
+fn partition_split(sorted_gaps: &[i64]) -> Option<PartitionSplit> {
+    let clamp =
+        |gap: i64| (gap as f64).clamp(ADAPTIVE_THRESHOLD_MIN_SECS, ADAPTIVE_THRESHOLD_MAX_SECS);
+    let mut best: Option<(usize, f64)> = None;
+    for (index, pair) in sorted_gaps.windows(2).enumerate() {
+        let (lo, hi) = (clamp(pair[0]), clamp(pair[1]));
+        let jump = (hi - lo) / lo;
+        if jump > best.map_or(0.0, |(_, best_jump)| best_jump) {
+            best = Some((index, jump));
+        }
+    }
+    let (index, relative_jump) = best?;
+    let (lo, hi) = (clamp(sorted_gaps[index]), clamp(sorted_gaps[index + 1]));
+    Some(PartitionSplit {
+        index,
+        relative_jump,
+        threshold_secs: (lo * hi).sqrt().floor() as i64,
+    })
 }
 
 /// Parse an English ordinal word or numeric ordinal (e.g., "1st") to a 1-based index.
@@ -584,9 +593,8 @@ mod tests {
 
     #[test]
     fn test_adaptive_uniform_gaps_falls_back() {
-        // All gaps identical (60s). The relative jump is 0.0 everywhere, so
-        // the raw threshold becomes (60+60)/2 * correction = ~57.5s, which is
-        // below the 300s minimum clamp, triggering fallback.
+        // All gaps identical (60s): clamped to the 300s floor they are all equal,
+        // so there is no jump to split on and the fixed threshold applies.
         let base = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
         let mut memories = Vec::new();
         for i in 0..20 {
@@ -597,7 +605,7 @@ mod tests {
 
         assert!(
             !stats.adaptive,
-            "Uniform gaps should produce threshold below min clamp, triggering fallback"
+            "Uniform gaps have no jump to split on, triggering fallback"
         );
         assert_eq!(stats.gap_count, 19);
         assert_eq!(stats.threshold_secs, SESSION_GAP_THRESHOLD_SECS);
@@ -661,40 +669,98 @@ mod tests {
         assert_eq!(stats.gap_count, 0);
     }
 
-    #[test]
-    fn test_adaptive_modular_correction_applied() {
-        // Verify the 1/24 correction shifts the threshold inward.
-        // Create a distribution where the midpoint is known: gaps of 600s and 7200s.
-        // Midpoint = (600 + 7200) / 2 = 3900
-        // After correction: 3900 * (1 - 1/24) = 3900 * 0.958333... = 3737.5
+    /// Gaps for `sessions` sessions with `within` inside each and the
+    /// `between[i]` gap before session `i + 1`, as memories from a fixed base.
+    fn memories_with_gaps(
+        sessions: usize,
+        within: &[i64],
+        between: &[i64],
+    ) -> Vec<(MemoryId, DateTime<Utc>)> {
         let base = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
-        let mut memories = Vec::new();
         let mut offset: i64 = 0;
-
-        // 6 sessions: 3 memories each with 600s internal gaps, 7200s between sessions
-        for session_idx in 0..6 {
+        let mut memories = vec![mem_at(base, offset)];
+        for session_idx in 0..sessions {
             if session_idx > 0 {
-                offset += 7200;
+                offset += between[session_idx - 1];
+                memories.push(mem_at(base, offset));
             }
-            for mem_idx in 0..3 {
-                if mem_idx > 0 {
-                    offset += 600;
-                }
+            for gap in within {
+                offset += gap;
                 memories.push(mem_at(base, offset));
             }
         }
+        memories
+    }
 
-        let (_, stats) = detect_sessions_adaptive(&memories);
+    #[test]
+    fn test_adaptive_threshold_is_geometric_mean() {
+        // 6 sessions of 3 memories, 600s apart inside a session, 7200s between.
+        // The split is 600 -> 7200; its geometric mean is sqrt(4_320_000) = 2078.46.
+        let memories = memories_with_gaps(6, &[600, 600], &[7200; 5]);
 
-        if stats.adaptive {
-            // The corrected threshold should be less than the uncorrected midpoint
-            let uncorrected_midpoint = (600 + 7200) / 2;
-            assert!(
-                stats.threshold_secs < uncorrected_midpoint,
-                "Corrected threshold {} should be less than uncorrected midpoint {}",
-                stats.threshold_secs,
-                uncorrected_midpoint
-            );
+        let (map, stats) = detect_sessions_adaptive(&memories);
+
+        assert!(stats.adaptive);
+        assert_eq!(stats.threshold_secs, 2078);
+        assert!((stats.relative_jump - 11.0).abs() < 1e-9);
+        assert_eq!(map.sessions.len(), 6);
+    }
+
+    #[test]
+    fn test_adaptive_ignores_sub_window_noise() {
+        // 4 sessions an hour apart. Inside each, bursts of 1s writes among
+        // 30-240s pauses. Unrestricted, the largest relative jump is 1s -> 30s
+        // (29, against 240s -> 3600s at 14); its threshold of ~15s lies below the
+        // 300s floor, so the search fell back to the fixed 7200s and kept all
+        // four hours in one session.
+        let within = [1, 1, 30, 60, 1, 120, 240, 1, 30];
+        let memories = memories_with_gaps(4, &within, &[3600; 3]);
+
+        let mut raw: Vec<i64> = memories
+            .windows(2)
+            .map(|w| (w[1].1 - w[0].1).num_seconds())
+            .collect();
+        raw.sort_unstable();
+        let unrestricted = (0..raw.len() - 1)
+            .filter(|&i| raw[i] > 0)
+            .max_by(|&a, &b| {
+                let jump = |i: usize| (raw[i + 1] - raw[i]) as f64 / raw[i] as f64;
+                jump(a).total_cmp(&jump(b))
+            })
+            .unwrap();
+        assert_eq!((raw[unrestricted], raw[unrestricted + 1]), (1, 30));
+        assert_eq!(detect_sessions(&memories).sessions.len(), 1);
+
+        let (map, stats) = detect_sessions_adaptive(&memories);
+
+        assert!(
+            stats.adaptive,
+            "the 240s -> 3600s jump is inside the window"
+        );
+        assert_eq!(stats.gap_count, 39);
+        // Clamped pair 300 -> 3600: jump 11, threshold floor(sqrt(1_080_000)).
+        assert_eq!(stats.partition_index, 35);
+        assert!((stats.relative_jump - 11.0).abs() < 1e-9);
+        assert_eq!(stats.threshold_secs, 1039);
+        assert_eq!(map.sessions.len(), 4);
+        for session in &map.sessions {
+            assert_eq!(session.count, 10);
         }
+    }
+
+    #[test]
+    fn test_adaptive_ignores_beyond_window_outlier() {
+        // 4 sessions of 2-minute gaps, two of them 2h apart and one ten days
+        // apart. Unrestricted, 7200s -> 864000s (119) outranks 120s -> 7200s (59)
+        // and its threshold lies past 8h, so the search fell back to 7200s, which
+        // a 7200s gap does not exceed: only the ten-day gap split.
+        let memories = memories_with_gaps(4, &[120; 7], &[7200, 864_000, 7200]);
+
+        let (map, stats) = detect_sessions_adaptive(&memories);
+
+        assert!(stats.adaptive);
+        // Clamped pair 300 -> 7200: threshold floor(sqrt(2_160_000)).
+        assert_eq!(stats.threshold_secs, 1469);
+        assert_eq!(map.sessions.len(), 4);
     }
 }
