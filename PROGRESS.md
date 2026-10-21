@@ -66,6 +66,26 @@
 - [x] Rips filtration + persistent homology in Sleight
 - [x] 30+ evaluation artifacts (Bifocal, Overlook, Overloop, Supernova)
 
+### Embedding spaces (branch `feat/embedding-spaces`, plan `docs/EXECUTION-embedding-spaces-2026-10-19.md`)
+
+Built and compiling on the default and redb-only builds. Not measured: unit tests are compiled
+but not executed, the recall gate and CI have not run on the branch, and the bench
+(`benches/embedding_spaces.rs`) has no rows yet. Each step's done-when is open until those run.
+See [docs/src/architecture/embedding-spaces.md](docs/src/architecture/embedding-spaces.md).
+
+- [x] 1. Every stored vector names its space (`<model>@<dimension>`); refusals become backlog rows
+- [x] 2. One index per space; the slot invariant (a slot holds its own space or nothing)
+- [x] 3. Maps between spaces, fitted from the corpus, weighed by held-out cosine
+- [x] 4. A replication follower with another embedder converges and searches its own space
+- [x] 5. A change of embedder is a resumable background drain
+- [x] 6. Per-space fusion weights, score calibration and attribution
+- [x] 7. Caches, chunking and a registry keyed by space
+- [x] 8. The space crosses every boundary a vector does (MIF, dumps, the intent log)
+- [x] 9. Writes queue for batched embedding; no request waits on the embedder
+- [x] 10. The query embedded once per space; every space's leg beside the rest of recall
+- [x] 11. Non-primary spaces hold PQ codes reranked against the records' vectors
+- [ ] 12. Bench rows before and after each step (harness built, not run)
+
 ---
 
 ## Remaining Work (prioritized)
