@@ -129,6 +129,13 @@ retrieval quality. The same goes for the MRR 0.917 "warm-veld" snapshot (`6dae51
 LoCoMo itself (1,531 questions over 10 conversations, 2026-10-20, `3faec074`), veld scores MRR
 0.492, p@1 0.406, recall@10 0.589 and nDCG@10 0.493.
 
+These are retrieval metrics: whether the gold turn was ranked, and where. They are not
+end-to-end answer accuracy. Published LoCoMo figures for Mem0, Zep, Letta and others are
+LLM-judged answer accuracy ("J"), so the two are on different scales and do not compare. The
+1,531 questions also include the 100-question gate (conversation conv-42) that recall changes are
+tuned against, so the run is not a fully held-out measurement; a held-out set without conv-42,
+with confidence intervals, is task 7 of plan `veld-review-remediation-20261020`.
+
 | Version | MRR | Temporal | Single-hop | Multi-hop | Open | R@5 | R@10 | P@5 | Composite |
 |---------|-----|----------|------------|-----------|------|-----|------|-----|-----------|
 | v0.5.0 | 0.880 | 0.767 | 0.900 | 0.900 | — | — | — | — | 74.4% |
