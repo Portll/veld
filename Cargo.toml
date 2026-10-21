@@ -106,11 +106,9 @@ exclude = [
 [lib]
 name = "veld"
 path = "src/lib.rs"
-# rlib: for Rust library usage (tests, benchmarks, binary)
-# cdylib: for Python bindings (PyO3/maturin needs shared library)
-# The cdylib gives this lib an unhashed filename, which is why [profile.release] must not set
-# `panic`: see the note there.
-crate-type = ["rlib", "cdylib"]
+# rlib only. The Python cdylib is the `veld-py` workspace member: a cdylib here was linked on
+# every build beside the binary, for an artifact only maturin consumes.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "veld"
@@ -455,12 +453,16 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true  # Reduce binary size
-# No `panic = "abort"` while [lib] builds a cdylib. A cdylib lib is emitted under one unhashed
-# filename, and abort makes cargo build the lib twice whenever a test harness is in the graph
-# (harnesses need unwind): both variants write the same rlib, one clobbers the other, and the
-# consumer links against the wrong one (rust-lang/cargo#6313), so `cargo test --release` cannot
-# build. Unwinding also keeps a panicking request on its own task: tokio turns it into a
-# JoinError instead of the panic ending the server.
+# No `panic = "abort"`: unwinding keeps a panicking request on its own task, so tokio turns it
+# into a JoinError instead of the panic ending the server. (The cdylib clobbering that also
+# forbade it, rust-lang/cargo#6313, went with the cdylib to the veld-py crate.)
+
+# The local install loop: `cargo build --profile local --bin veld`. Thin LTO over 16 codegen
+# units instead of release's fat LTO over one; tagged releases keep [profile.release].
+[profile.local]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
 
 [profile.bench]
 # Inherits release.
@@ -564,6 +566,7 @@ rocksdb = { version = "0.24", default-features = false, features = ["lz4", "jema
 rocksdb = { version = "0.24", default-features = false, features = ["lz4"], optional = true }
 
 [workspace]
+members = ["veld-py"]
 # Standalone workspace - not part of parent kalki-v2
 # status-core keeps its own workspace and lockfile, as the monitor and the status
 # TUI and widget that also depend on it do; a path dependency inside this directory
