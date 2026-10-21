@@ -387,6 +387,10 @@ pub struct ProactiveContextRequest {
     /// Emotional arousal for auto-ingested memories (FIX-05)
     #[serde(default)]
     pub emotional_arousal: Option<f32>,
+    /// Surface only memories scoped to this repository slug, and scope auto-ingested
+    /// memories to it. Todos, reminders and facts are not scoped.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 fn default_proactive_max_results() -> usize {
@@ -609,6 +613,12 @@ pub async fn recall(
     let op_start = std::time::Instant::now();
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_max_results(req.limit).map_validation_err("limit")?;
+    let repo_for_recall = req
+        .repo
+        .as_deref()
+        .map(validation::validate_repo)
+        .transpose()
+        .map_validation_err("repo")?;
 
     let memory = state
         .get_user_memory_async(&req.user_id)
@@ -616,7 +626,8 @@ pub async fn recall(
         .map_err(AppError::Internal)?;
 
     let _graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let limit = req.limit;
@@ -730,6 +741,7 @@ pub async fn recall(
                 rerank_count: req.rerank_count,
                 as_of: req.as_of,
                 tags: tags_for_recall,
+                repo: repo_for_recall,
                 layers: layers_for_recall,
                 evidence_source: Some(evidence_source),
                 query_embedding: recall_embedding_opt,
@@ -1106,6 +1118,13 @@ pub async fn recall(
     // M3: assemble the query-level feeling-of-knowing readout. Advisory and
     // terminal — it never feeds back into scoring or adaptive weight learning.
     let meta_opt = memory.read().last_query_metacognition();
+    // Outside the closure below, so a slow store not yet open is opened on the blocking pool.
+    let gap_store = match &meta_opt {
+        Some(meta) if !meta.focal_entities.is_empty() => {
+            state.get_user_slow_store_async(&req.user_id).await.ok()
+        }
+        _ => None,
+    };
     let metacognition = meta_opt.map(|mut meta| {
         let top = recall_memories
             .first()
@@ -1125,7 +1144,7 @@ pub async fn recall(
         meta.answerability = if top > 0.0 { top / (top + 1.0) } else { 0.0 };
         // M5 link: does the query sit in a known unresolved knowledge gap?
         if !meta.focal_entities.is_empty() {
-            if let Ok(store) = state.get_user_slow_store(&req.user_id) {
+            if let Some(store) = &gap_store {
                 if let Ok(hits) =
                     store.gaps_touching_entities(&req.user_id, &meta.focal_entities, 1)
                 {
@@ -1308,6 +1327,12 @@ pub async fn proactive_context(
         .map_validation_err("entity_match_weight")?;
     validation::validate_weight("recency_weight", req.recency_weight)
         .map_validation_err("recency_weight")?;
+    req.repo = req
+        .repo
+        .as_deref()
+        .map(validation::validate_repo)
+        .transpose()
+        .map_validation_err("repo")?;
     let evidence_source = state
         .session_store
         .get_or_create_session(&req.user_id)
@@ -1362,7 +1387,8 @@ pub async fn proactive_context(
         .map_err(AppError::Internal)?;
 
     let graph_memory = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let t_init = op_start.elapsed();
@@ -1772,6 +1798,7 @@ pub async fn proactive_context(
     let recency_weight = req.recency_weight;
     let semantic_threshold = req.semantic_threshold;
     let rrf_k_for_context = req.rrf_k.map(|k| k.clamp(1.0, 200.0));
+    let repo_for_query = req.repo.clone();
     let embedding_for_query = context_embedding.clone();
     let memories: Vec<ProactiveSurfacedMemory> = {
         let memory = memory_system.clone();
@@ -1802,6 +1829,7 @@ pub async fn proactive_context(
                 prospective_signals,
                 competition_mode: req.competition_mode,
                 evidence_source: Some(evidence_source_for_recall),
+                repo: repo_for_query,
                 ..Default::default()
             };
             // See the note at the first recall site: a failure must not present as
@@ -2101,6 +2129,7 @@ pub async fn proactive_context(
             if is_meaningful {
                 let response_text_owned = response_text.to_string();
                 let memory = memory_system.clone();
+                let response_repo = req.repo.clone();
                 tokio::task::spawn(async move {
                     if let Err(e) = tokio::task::spawn_blocking(move || {
                         let memory_guard = memory.read();
@@ -2120,6 +2149,12 @@ pub async fn proactive_context(
                                     "assistant-response".to_string(),
                                     "auto-captured".to_string(),
                                 ],
+                                context: response_repo.clone().map(|slug| {
+                                    let mut ctx =
+                                        crate::memory::session_detect::rich_context_with_session();
+                                    ctx.set_repo(slug);
+                                    ctx
+                                }),
                                 ..Default::default()
                             };
                             if let Err(e) = memory_guard.remember(experience, None) {
@@ -2177,6 +2212,7 @@ pub async fn proactive_context(
         let ingest_seq = req.sequence_number;
         let ingest_valence = req.emotional_valence;
         let ingest_arousal = req.emotional_arousal;
+        let ingest_repo = req.repo.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -2203,6 +2239,7 @@ pub async fn proactive_context(
                         // records are distinguishable from ones where a writer
                         // was asked for and did not answer.
                         None,
+                        ingest_repo.clone(),
                     );
                     let experience = Experience {
                         content: segment.content,
@@ -2672,7 +2709,8 @@ pub async fn surface_relevant(
         .await
         .map_err(AppError::Internal)?;
     let graph_memory = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let engine = state.relevance_engine.clone();
     let feedback_store = state.feedback_store.clone();

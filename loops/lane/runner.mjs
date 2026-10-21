@@ -34,13 +34,14 @@ const MAX_ROUNDS = 2;
 const LOW_BUFFER_MIN = 240;
 const args = process.argv.slice(2);
 const HOST = args.includes('--host') ? args[args.indexOf('--host') + 1] : 'local';
-// Two lanes per machine against one LM Studio slot: while one lane gates a draft or waits on veld,
-// the other's request is already queued, so the model never waits for the next one.
+// Two lanes per machine: while one lane gates a draft or waits on veld, the other's request is
+// already queued. `spine` names the host in spine's lane config, which holds its URL, ssh tunnel and
+// Keychain token; every call waits for one of that host's slots, shared with spine's own lanes.
 const HOSTS = {
-  local: { url: 'http://127.0.0.1:1234/v1', key: 'LMSTUDIO_LOCAL_API_KEY' },
-  'local-b': { url: 'http://127.0.0.1:1234/v1', key: 'LMSTUDIO_LOCAL_API_KEY' },
-  m4: { url: 'http://192.168.1.4:1234/v1', key: 'LMSTUDIO_M4PRO_API_KEY' },
-  'm4-b': { url: 'http://192.168.1.4:1234/v1', key: 'LMSTUDIO_M4PRO_API_KEY' },
+  local: { spine: 'local' },
+  'local-b': { spine: 'local' },
+  m4: { spine: 'm4' },
+  'm4-b': { spine: 'm4' },
   // Groq takes only jobs that name it; the LM Studio lanes leave those alone.
   groq: { provider: 'groq' },
 };
@@ -74,7 +75,12 @@ function httpFetch(url, { method = 'GET', headers = {}, body, signal } = {}) {
 
 const jobs = () => readdirSync(join(ROOT, 'bank')).filter((f) => f.endsWith('.json')).map((f) => readJson(join(ROOT, 'bank', f))).filter(Boolean);
 const stateOf = (id) => readJson(join(ROOT, 'state', `${id}.json`), { status: 'pending' });
-const setState = (id, patch) => writeFileSync(join(ROOT, 'state', `${id}.json`), JSON.stringify({ ...stateOf(id), ...patch, updatedAt: now() }, null, 1));
+// The spine queue (spine-queue.mjs), or null when the store will not open and the files are the queue.
+let SQ = null;
+const setState = (id, patch) => {
+  writeFileSync(join(ROOT, 'state', `${id}.json`), JSON.stringify({ ...stateOf(id), ...patch, updatedAt: now() }, null, 1));
+  if (SQ) try { SQ.mirror(id, stateOf(id)); } catch (e) { log(`spine mirror ${id}: ${e.message}`); }
+};
 const DONE = new Set(['landed', 'dropped']);
 
 // A knowledge-base job needs veld up and its sources ingested; health is asked at most once a minute.
@@ -189,6 +195,10 @@ async function exportLaneLoop(status) {
 function take(job) {
   const lock = join(ROOT, 'state', `${job.id}.lock`);
   try { closeSync(openSync(lock, 'wx')); } catch { return false; }
+  if (SQ && !SQ.claim(job.id, HOST)) {
+    rmSync(lock, { force: true });
+    return false;
+  }
   setState(job.id, { status: 'running', host: HOST, startedAt: now() });
   return true;
 }
@@ -515,19 +525,25 @@ function draftGroq(job) {
   return runPrompt({ tool: trackOf(job).template, context: context(job), provider: 'groq', model, reasoning: job.reasoning || (model.startsWith('openai/') ? 'low' : 'none'), env });
 }
 
+/** The host's URL (the M4's through its tunnel), token and timeouts, from spine's lane config. */
+async function spineRun(extraEnv = {}) {
+  const { loadConfig } = await import(join(PATHS.SPINE_REPO, 'lane', 'config.mjs'));
+  const { localRun } = await import(join(PATHS.SPINE_REPO, 'lane', 'hosts.mjs'));
+  const cfg = loadConfig();
+  const id = HOSTS[HOST].spine;
+  return { id, slots: Number(cfg.hosts[id]?.slots) || 1, run: await localRun(cfg, id, 'qwen/qwen3.8-27b', extraEnv) };
+}
+
 async function draft(job) {
-  const host = HOSTS[HOST];
-  if (host.provider === 'groq') return draftGroq(job);
-  const key = execFileSync('security', ['find-generic-password', '-s', host.key, '-w'], { encoding: 'utf8' }).trim();
-  const env = {
-    ...process.env,
-    SPINE_LLM_URL: host.url, SPINE_LLM_MODEL: 'qwen/qwen3.8-27b', SPINE_LLM_API_KEY: key,
+  if (HOSTS[HOST].provider === 'groq') return draftGroq(job);
+  const { run } = await spineRun({
+    SPINE_LLM_HOST: HOSTS[HOST].spine, SPINE_LLM_LABEL: `veld ${trackOf(job).name} ${job.id}`, SPINE_LLM_PRIORITY: String(job.priority || 0),
     SPINE_LLM_TIMEOUT_MS: String(75 * 60 * 1000), SPINE_LLM_MAX_TOKENS: String(job.maxTokens || (/^(p-|f\d)/.test(job.id) ? 6000 : 16000)),
     SPINE_PROMPTS_DIR: PATHS.SPINE_PROMPTS_DIR, SPINE_LLM_TEMPERATURE: '0.2',
     // Drafts are not copied into veld: each is 30-60 KB of prompt and reply, and veld chunks every one.
     VELD_API_URL: 'http://127.0.0.1:9',
-  };
-  return runPrompt({ tool: trackOf(job).template, context: context(job), env, fetchImpl: httpFetch, reasoning: 'none' });
+  });
+  return runPrompt({ tool: trackOf(job).template, context: context(job), reasoning: 'none', ...run });
 }
 
 function queueRepair(job, reason) {
@@ -559,12 +575,15 @@ function refillIfLow(status) {
 // with no repair round. veld going away leaves it pending for later.
 async function runKb(job) {
   const t0 = Date.now();
-  const host = HOSTS[HOST];
-  const key = execFileSync('security', ['find-generic-password', '-s', host.key, '-w'], { encoding: 'utf8' }).trim();
   const row = { id: job.id, type: 'kb', round: 0, host: HOST, startedAt: new Date(t0).toISOString() };
   try {
     const { runKbJob } = await import(join(KB, 'kbgen.mjs'));
-    const r = await runKbJob(job, { url: host.url, key });
+    const { withSlot } = await import(join(PATHS.SPINE_REPO, 'slots.mjs'));
+    const { open } = await import(join(PATHS.SPINE_REPO, 'db.mjs'));
+    const { id, slots, run } = await spineRun();
+    // kbgen calls the host itself, so the job holds one slot for all of its attempts.
+    const r = await withSlot(open(), { host: id, capacity: slots, priority: job.priority || 0, label: `veld kb ${job.id}` },
+      () => runKbJob(job, { url: run.env.SPINE_LLM_URL, key: run.env.SPINE_LLM_API_KEY }));
     const sec = Math.round((Date.now() - t0) / 1000);
     // A target the source no longer has (a section renamed or removed) closes the job; gen-kb.mjs
     // writes jobs for the targets that replaced it.
@@ -592,6 +611,12 @@ async function once() {
   const { ready, status } = queue();
   writeStatus();
   refillIfLow(status);
+  if (SQ) {
+    try {
+      const filed = SQ.sync(jobs(), stateOf);
+      if (filed) log(`filed ${filed} jobs in spine's queue`);
+    } catch (e) { log(`spine sync failed: ${e.message}`); }
+  }
   const pick = ready.find(({ j }) => mine(j) && take(j));
   if (!pick) return false;
   const job = pick.j;
@@ -650,6 +675,8 @@ const STOP = join(ROOT, 'STOP');
 const RESTART = join(ROOT, 'RESTART');
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   log(`runner up on ${HOST}, pid ${process.pid}`);
+  const { spineQueue } = await import('./spine-queue.mjs');
+  SQ = await spineQueue().catch((e) => { log(`spine queue unavailable, the files are the queue: ${e.message}`); return null; });
   for (;;) {
     if (existsSync(STOP) || existsSync(`${STOP}-${HOST}`)) { log('STOP file present; exiting'); break; }
     if (existsSync(`${RESTART}-${HOST}`)) { rmSync(`${RESTART}-${HOST}`, { force: true }); log('RESTART file present; exiting for the supervisor to restart'); break; }

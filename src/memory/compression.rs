@@ -1477,9 +1477,12 @@ impl SemanticConsolidator {
 
         for marker in def_markers {
             if let Some(pos) = lower.find(marker) {
-                let subject_start =
-                    content[..pos].rfind(|c: char| !c.is_alphanumeric() && c != '_');
-                let subject_start = subject_start.map(|i| i + 1).unwrap_or(0);
+                let subject_start = content[..pos]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| !c.is_alphanumeric() && *c != '_')
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
                 let subject = &content[subject_start..pos];
 
                 if subject.len() < 3
@@ -1495,9 +1498,10 @@ impl SemanticConsolidator {
                 }
 
                 let def_end = content[pos + marker.len()..].find(['.', '!', '?', ',']);
-                let def_end = def_end
-                    .map(|i| pos + marker.len() + i)
-                    .unwrap_or(content.len().min(pos + marker.len() + 100));
+                let def_end = def_end.map(|i| pos + marker.len() + i).unwrap_or_else(|| {
+                    let cap = content.len().min(pos + marker.len() + 100);
+                    content.floor_char_boundary(cap)
+                });
 
                 let definition = &content[pos + marker.len()..def_end];
                 if definition.trim().len() >= 10 {
@@ -2617,6 +2621,23 @@ mod tests {
         assert!(SemanticConsolidator::is_fact_shaped(
             "the scheduler drains one worker at a time during rolling restarts."
         ));
+    }
+
+    #[test]
+    fn definition_extraction_slices_on_char_boundaries() {
+        let consolidator = SemanticConsolidator::new();
+        let dash_before_subject =
+            "Background \u{2014}Vamana is a graph index for nearest neighbours";
+        assert_eq!(
+            consolidator
+                .extract_definition(dash_before_subject)
+                .as_deref(),
+            Some("Vamana is a graph index for nearest neighbours")
+        );
+        let long_definition = format!("Vamana is {}\u{2014}{}", "x".repeat(98), "y".repeat(20));
+        let extracted = consolidator.extract_definition(&long_definition).unwrap();
+        assert!(extracted.starts_with("Vamana is xxx"));
+        assert!(!extracted.contains('\u{2014}'));
     }
 
     #[test]

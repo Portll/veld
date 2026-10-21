@@ -1320,6 +1320,7 @@ impl super::MemorySystem {
             anomalies_only: query.anomalies_only,
             severity: query.severity.clone(),
             tags: query.tags.clone(),
+            repo: query.repo.clone(),
             pattern_id: query.pattern_id.clone(),
             terrain_type: query.terrain_type.clone(),
             confidence_range: query.confidence_range,
@@ -1424,6 +1425,7 @@ impl super::MemorySystem {
                     anomalies_only: query.anomalies_only,
                     severity: query.severity.clone(),
                     tags: query.tags.clone(),
+                    repo: query.repo.clone(),
                     pattern_id: query.pattern_id.clone(),
                     terrain_type: query.terrain_type.clone(),
                     confidence_range: query.confidence_range,
@@ -3980,6 +3982,13 @@ impl super::MemorySystem {
                             for sid in &target.memory_ids {
                                 if !existing_ids.contains(sid) && injected < 5 {
                                     if let Ok(mem) = self.get_memory(sid) {
+                                        // An injected member must pass the caller's filters
+                                        // (tags, repo, ...); unfiltered recall injects as before.
+                                        if vector_query.has_selective_filters()
+                                            && !self.retriever.matches_filters(&mem, &vector_query)
+                                        {
+                                            continue;
+                                        }
                                         memories.push(Arc::new(mem));
                                         injected += 1;
                                     }
@@ -4287,6 +4296,15 @@ impl super::MemorySystem {
                                     }
                                     // Load and score the fact-source memory
                                     if let Some(view) = candidates.get(src_id) {
+                                        // As for ordinal-session members: a fact source the
+                                        // caller's filters exclude is not injected.
+                                        if vector_query.has_selective_filters()
+                                            && !self
+                                                .retriever
+                                                .matches_filters(&view.memory, &vector_query)
+                                        {
+                                            continue;
+                                        }
                                         if view.tier == CandidateTier::LongTerm {
                                             let mut scored = view.memory.as_ref().clone();
                                             // Score slightly below top result to avoid
@@ -4913,11 +4931,15 @@ impl super::MemorySystem {
             *self.spreading_path_credit.lock() = retrieval_stats.path_credit_edges;
         }
 
-        // Extract SharedMemory from ActivatedMemory, preserving score ordering
+        // Extract SharedMemory from ActivatedMemory, preserving score ordering. The graph walk
+        // applies no query filter, so a caller filter is applied here; unfiltered recall is as
+        // before.
+        let filtered = query.has_selective_filters();
         let memories: Vec<SharedMemory> = activated_memories
             .into_iter()
-            .take(query.max_results)
             .map(|am| am.memory)
+            .filter(|memory| !filtered || query.matches(memory))
+            .take(query.max_results)
             .collect();
 
         Ok(memories)
@@ -5130,6 +5152,8 @@ impl super::MemorySystem {
                     memories[left_idx].experience.embeddings.as_ref(),
                     memories[right_idx].experience.embeddings.as_ref(),
                 ) {
+                    // Raw cosine: `similarity_floor` is measured on this pool's own raw
+                    // cosines, which already adapts the bar to the embedder.
                     (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => {
                         crate::similarity::cosine_similarity(left, right)
                     }

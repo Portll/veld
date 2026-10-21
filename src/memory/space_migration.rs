@@ -160,4 +160,7 @@ pub struct MigrationStep {
     pub finished: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<String>,
+    /// The memories it rewrote in the store, for a caller that journals them.
+    #[serde(skip)]
+    pub rewritten: Vec<MemoryId>,
 }

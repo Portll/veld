@@ -202,7 +202,7 @@ pub async fn consolidate_memories(
 
         // Direction 1: Edge strengthening + promotion boost propagation
         if !maintenance_result.edge_boosts.is_empty() {
-            if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+            if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
                 let graph_guard = graph.read();
                 match graph_guard.strengthen_memory_edges(
                     &maintenance_result.edge_boosts,
@@ -231,7 +231,7 @@ pub async fn consolidate_memories(
 
         // Direction 3: Entity-entity Hebbian reinforcement for replayed memories
         if !maintenance_result.replay_memory_ids.is_empty() {
-            if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+            if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
                 let graph_guard = graph.read();
                 for mem_id_str in &maintenance_result.replay_memory_ids {
                     if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
@@ -251,7 +251,7 @@ pub async fn consolidate_memories(
         }
 
         // Direction 2: Lazy decay — flush opportunistic pruning queue
-        if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+        if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
             let graph_guard = graph.read();
             if let Err(e) = graph_guard.flush_pending_maintenance() {
                 tracing::warn!(user_id = %user_id, "Failed to flush pending maintenance: {e}");
@@ -265,7 +265,7 @@ pub async fn consolidate_memories(
         let mut dream_edges_created: usize = 0;
         {
             let memory_clone = memory.clone();
-            let graph_arc = state_clone.get_user_graph(&user_id).ok();
+            let graph_arc = state_clone.get_user_graph_async(&user_id).await.ok();
             let uid = user_id.clone();
             match tokio::task::spawn_blocking(move || -> usize {
                 use crate::constants::{
@@ -328,7 +328,8 @@ pub async fn consolidate_memories(
                         continue;
                     };
 
-                    let sim = cosine_similarity(emb_a, emb_b);
+                    let sim =
+                        crate::similarity::scale::to_reference(cosine_similarity(emb_a, emb_b));
                     metrics::DREAM_REPLAY_PAIRS_EVALUATED.inc();
 
                     // Discovery band: interesting but not already-connected similarity
@@ -430,8 +431,8 @@ pub async fn consolidate_memories(
         // in flight, TTL since the last); when it is skipped, detection runs
         // on the existing mirror.
         if let (Ok(graph), Ok(store)) = (
-            state_clone.get_user_graph(&user_id),
-            state_clone.get_user_slow_store(&user_id),
+            state_clone.get_user_graph_async(&user_id).await,
+            state_clone.get_user_slow_store_async(&user_id).await,
         ) {
             let scope = user_id.clone();
             let ttl = state_clone.server_config().graph_mirror_sync_ttl();
@@ -626,7 +627,7 @@ pub async fn sleep_phase_consolidation(
         // Phase 3: Edge strengthening from replay
         if let Some(ref maint) = maintenance_result {
             if !maint.edge_boosts.is_empty() {
-                if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+                if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
                     let graph_guard = graph.read();
                     match graph_guard
                         .strengthen_memory_edges(&maint.edge_boosts, "consolidation:sleep")
@@ -652,7 +653,7 @@ pub async fn sleep_phase_consolidation(
 
             // Phase 4: Entity-entity Hebbian reinforcement
             if !maint.replay_memory_ids.is_empty() {
-                if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+                if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
                     let graph_guard = graph.read();
                     for mem_id_str in &maint.replay_memory_ids {
                         if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
@@ -671,7 +672,7 @@ pub async fn sleep_phase_consolidation(
         }
 
         // Phase 5: Flush pending maintenance (opportunistic edge pruning)
-        if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+        if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
             let graph_guard = graph.read();
             if let Err(e) = graph_guard.flush_pending_maintenance() {
                 tracing::warn!(
@@ -684,7 +685,7 @@ pub async fn sleep_phase_consolidation(
         // Phase 6: Dream replay with enlarged batch
         {
             let memory_clone = memory.clone();
-            let graph_arc = state_clone.get_user_graph(&user_id).ok();
+            let graph_arc = state_clone.get_user_graph_async(&user_id).await.ok();
             let uid = user_id.clone();
             if let Err(e) = tokio::task::spawn_blocking(move || -> usize {
                 use crate::constants::{
@@ -729,7 +730,7 @@ pub async fn sleep_phase_consolidation(
 
                     let (Some(emb_a), Some(emb_b)) = (&mem_a.experience.embeddings, &mem_b.experience.embeddings) else { continue };
 
-                    let sim = cosine_similarity(emb_a, emb_b);
+                    let sim = crate::similarity::scale::to_reference(cosine_similarity(emb_a, emb_b));
                     if !(DREAM_REPLAY_SIMILARITY_THRESHOLD..=DREAM_REPLAY_SIMILARITY_CEILING).contains(&sim) { continue; }
 
                     let entities_a: Vec<uuid::Uuid> = mem_a.entity_refs.iter().map(|e| e.entity_id).collect();
@@ -786,8 +787,8 @@ pub async fn sleep_phase_consolidation(
         // without it, and detect on the existing mirror when the rebuild is
         // skipped.
         if let (Ok(graph), Ok(store)) = (
-            state_clone.get_user_graph(&user_id),
-            state_clone.get_user_slow_store(&user_id),
+            state_clone.get_user_graph_async(&user_id).await,
+            state_clone.get_user_slow_store_async(&user_id).await,
         ) {
             let scope = user_id.clone();
             let ttl = state_clone.server_config().graph_mirror_sync_ttl();
@@ -1036,9 +1037,16 @@ pub async fn create_backup(
 ) -> Result<Json<BackupResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let result = state
-        .create_user_backup(&req.user_id)
-        .map_err(AppError::Internal);
+    // Off the async runtime: a backup copies the stores, and opens the tenant and its graph
+    // when they are not cached.
+    let result = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        tokio::task::spawn_blocking(move || state.create_user_backup(&user_id))
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("backup task failed: {e}")))?
+            .map_err(AppError::Internal)
+    };
 
     match result {
         Ok(metadata) => {
@@ -1358,14 +1366,25 @@ pub async fn drain_embedding_backlog(
         .await
         .map_err(AppError::Internal)?;
     let reconcile = req.reconcile;
+    let user_id = req.user_id.clone();
     let (reconciled, drained) = tokio::task::spawn_blocking(move || {
-        let guard = memory.read();
-        let reconciled = if reconcile {
-            Some(guard.reconcile_embedding_backlog()?)
-        } else {
-            None
+        let (reconciled, drained, rewritten) = {
+            let guard = memory.read();
+            let reconciled = if reconcile {
+                Some(guard.reconcile_embedding_backlog()?)
+            } else {
+                None
+            };
+            let (drained, rewritten) = guard.drain_embedding_backlog_journaled(limit)?;
+            (reconciled, drained, rewritten)
         };
-        let drained = guard.drain_embedding_backlog(limit)?;
+        super::remember::journal_stored(
+            &state,
+            &memory,
+            &user_id,
+            &rewritten,
+            super::remember::SnapshotKind::Update,
+        );
         anyhow::Ok((reconciled, drained))
     })
     .await

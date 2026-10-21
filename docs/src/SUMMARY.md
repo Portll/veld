@@ -73,6 +73,7 @@
 - [0005 — Facts purge and narratives](decisions/0005-facts-purge-and-narratives.md)
 - [0006 — Backend parity and on-demand migration](decisions/0006-backend-parity-and-on-demand-migration.md)
 - [0007 — RocksDB default engine](decisions/0007-rocksdb-default-engine.md)
+  - [0007 — redb live soak log](decisions/0007-redb-soak-log.md)
 - [0008 — Local IPC transport](decisions/0008-local-ipc-transport.md)
 
 ---

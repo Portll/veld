@@ -679,6 +679,7 @@ impl RetrievalEngine {
                 step.failed += 1;
                 continue;
             }
+            step.rewritten.push(memory.id.clone());
             if reindex.contains(&i) || (reembed && !self.is_indexed(&memory.id)) {
                 if let Err(e) = self.reindex_memory(memory) {
                     if !is_space_mismatch(&e) {

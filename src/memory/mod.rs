@@ -812,18 +812,21 @@ pub struct UpsertProvenance {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub episode_id: Option<String>,
     pub writer: Option<crate::memory::facets::DeclaredWriter>,
+    /// Repository slug, already validated. Replaces the stored repository when provided.
+    pub repo: Option<String>,
 }
 
-/// Write a declared episode id and writer onto a record's context, creating the context from
-/// `fallback` (or the detected session) when the record has none. Fields left `None` are not
-/// touched, so an update that omits them keeps what is stored.
+/// Write a declared episode id, writer and repository onto a record's context, creating the
+/// context from `fallback` (or the detected session) when the record has none. Fields left
+/// `None` are not touched, so an update that omits them keeps what is stored.
 fn overlay_declared_context(
     slot: &mut Option<types::RichContext>,
     fallback: Option<types::RichContext>,
     episode_id: Option<String>,
     writer: Option<crate::memory::facets::DeclaredWriter>,
+    repo: Option<String>,
 ) {
-    if episode_id.is_none() && writer.is_none() {
+    if episode_id.is_none() && writer.is_none() && repo.is_none() {
         return;
     }
     let ctx = slot.get_or_insert_with(|| {
@@ -834,6 +837,9 @@ fn overlay_declared_context(
     }
     if let Some(writer) = writer {
         ctx.session.declared = writer;
+    }
+    if let Some(repo) = repo {
+        ctx.set_repo(repo);
     }
 }
 
@@ -901,12 +907,21 @@ pub enum Bm25Sync {
 /// What [`MemorySystem::embed_and_index_journaled`] did beyond indexing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbedIndexOutcome {
-    /// Set when the write gate absorbed the memory being indexed into a stored one
-    /// that already says everything it does; holds that memory's id. Both records
-    /// changed in the store (the absorbed one is kept, flagged forgotten; the survivor
-    /// took its tags and an importance boost), so a journaled caller owes the intent
-    /// log an `Update` snapshot of each. Neither is a `Forget`: no key was removed.
-    pub absorbed_by: Option<String>,
+    /// The records this pass rewrote in the store, each once: the memory itself when
+    /// its vectors or importance landed, the stored memory the write gate absorbed it
+    /// into (it took the tags and an importance boost; the absorbed one is kept,
+    /// flagged forgotten, so neither is a `Forget`), and older memories interference
+    /// weakened. A journaled caller owes the intent log an `Update` snapshot of each,
+    /// or a replica keeps the memory without vectors and the others at their old state.
+    pub rewritten: Vec<MemoryId>,
+}
+
+impl EmbedIndexOutcome {
+    fn note_rewritten(&mut self, id: &MemoryId) {
+        if !self.rewritten.contains(id) {
+            self.rewritten.push(id.clone());
+        }
+    }
 }
 
 /// Replicated vectors seen in one space this corpus does not index.
@@ -926,9 +941,8 @@ const REPLICA_BRIDGE_FIRST_FIT: usize = 256;
 pub struct EmbedDrain {
     /// Memories taken off the queue.
     pub taken: usize,
-    /// `(absorbed, survivor)`: memories the write gate folded into a stored one. Both records
-    /// changed in the store.
-    pub absorbed: Vec<(MemoryId, MemoryId)>,
+    /// Every record the drain rewrote ([`EmbedIndexOutcome::rewritten`] across the batch).
+    pub rewritten: Vec<MemoryId>,
 }
 
 /// How a new memory's vectors fared in [`MemorySystem::store_new_memory`].
@@ -1399,6 +1413,7 @@ impl MemorySystem {
         let embedder = Arc::new(crate::embeddings::competitive::CompetitiveEmbedder::new(
             primary, secondary,
         ));
+        crate::similarity::scale::set_active_embedder(embedder.id());
 
         // Create consolidation event buffer first so we can share it with retriever
         let consolidation_events = Arc::new(RwLock::new(ConsolidationEventBuffer::new()));
@@ -2720,10 +2735,9 @@ impl MemorySystem {
             .map(|_| ())
     }
 
-    /// [`Self::embed_and_index`] for a caller that journals: when the write
-    /// gate absorbs the memory into an existing one (reported in
-    /// [`EmbedIndexOutcome::absorbed_by`]), the caller MUST journal `Update`
-    /// snapshots of the absorbed memory and its survivor.
+    /// [`Self::embed_and_index`] for a caller that journals: the caller MUST
+    /// journal an `Update` snapshot of every memory in
+    /// [`EmbedIndexOutcome::rewritten`].
     pub fn embed_and_index_journaled(&self, memory_id: &MemoryId) -> Result<EmbedIndexOutcome> {
         self.embed_and_index_with(memory_id, None, Bm25Sync::Journaled, EmbedPurpose::Write)
     }
@@ -2744,6 +2758,7 @@ impl MemorySystem {
             return Err(write_gate::WritesClosed.into());
         }
         let start = std::time::Instant::now();
+        let mut outcome = EmbedIndexOutcome::default();
 
         // Load fresh from storage (owned Memory, so we can mutate experience.embeddings)
         let mut memory = self
@@ -2853,8 +2868,9 @@ impl MemorySystem {
                 if let Some(ctx) = fresh.experience.context.as_mut() {
                     ctx.binding = binding;
                 }
-                if let Err(e) = self.long_term_memory.update(&fresh) {
-                    tracing::warn!("Failed to persist background embedding: {e}");
+                match self.long_term_memory.update(&fresh) {
+                    Ok(()) => outcome.note_rewritten(memory_id),
+                    Err(e) => tracing::warn!("Failed to persist background embedding: {e}"),
                 }
                 memory = fresh;
             }
@@ -2884,8 +2900,11 @@ impl MemorySystem {
                 // Persist so restarts retain the secondary embedding (parity with
                 // the primary, which is persisted above). No-op for the no-secondary
                 // common case since this branch is skipped entirely.
-                if let Err(e) = self.long_term_memory.update(&memory) {
-                    tracing::warn!("Failed to persist background secondary embedding: {e}");
+                match self.long_term_memory.update(&memory) {
+                    Ok(()) => outcome.note_rewritten(memory_id),
+                    Err(e) => {
+                        tracing::warn!("Failed to persist background secondary embedding: {e}")
+                    }
                 }
             }
         }
@@ -2919,7 +2938,8 @@ impl MemorySystem {
                             self.retriever.get_from_storage(id).ok().map(|m| {
                                 (
                                     id.0.to_string(),
-                                    *similarity,
+                                    // Interference's bars are MiniLM-tuned; read on that scale.
+                                    crate::similarity::scale::to_reference(*similarity),
                                     m.importance(),
                                     m.created_at,
                                     m.experience.content.chars().take(50).collect::<String>(),
@@ -2933,6 +2953,8 @@ impl MemorySystem {
                     // candidate: similar vectors can carry different facts, and
                     // the caller already holds this memory's id. It is absorbed
                     // only when its text adds nothing the neighbour lacks.
+                    // `similar_memories` already holds cosines on MiniLM's scale, so the
+                    // MiniLM-tuned bar applies as is; mapping `best_sim` again would double it.
                     let total_memories = self.stats.read().total_memories;
                     if total_memories >= crate::constants::WRITE_GATE_COLD_START_BYPASS {
                         if let Some((best_id, best_sim, _, _, _)) =
@@ -2953,6 +2975,8 @@ impl MemorySystem {
                                         )
                                 });
                             if let Some(survivor) = survivor {
+                                outcome.note_rewritten(memory_id);
+                                outcome.note_rewritten(&survivor.id);
                                 self.absorb_redundant_memory(
                                     &memory_arc,
                                     survivor,
@@ -2963,9 +2987,7 @@ impl MemorySystem {
                                 let elapsed = start.elapsed();
                                 crate::metrics::EMBED_BACKGROUND_DURATION
                                     .observe(elapsed.as_secs_f64());
-                                return Ok(EmbedIndexOutcome {
-                                    absorbed_by: Some(best_id.clone()),
-                                });
+                                return Ok(outcome);
                             }
                         }
                     }
@@ -2989,13 +3011,14 @@ impl MemorySystem {
                                 {
                                     let before = old_memory.importance();
                                     old_memory.decay_importance(*decay_amount);
-                                    if self.long_term_memory.update(&old_memory).is_ok()
-                                        && !old_memory.is_forgotten()
-                                    {
-                                        self.note_importance_change(
-                                            before,
-                                            old_memory.importance(),
-                                        );
+                                    if self.long_term_memory.update(&old_memory).is_ok() {
+                                        outcome.note_rewritten(&old_memory.id);
+                                        if !old_memory.is_forgotten() {
+                                            self.note_importance_change(
+                                                before,
+                                                old_memory.importance(),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -3005,6 +3028,7 @@ impl MemorySystem {
                             let before = memory_arc.importance();
                             memory_arc.decay_importance(interference_result.proactive_decay);
                             if self.long_term_memory.update(&memory_arc).is_ok() {
+                                outcome.note_rewritten(memory_id);
                                 self.note_importance_change(before, memory_arc.importance());
                             }
                         }
@@ -3021,6 +3045,7 @@ impl MemorySystem {
                             let before = memory_arc.importance();
                             memory_arc.decay_importance(0.99);
                             if self.long_term_memory.update(&memory_arc).is_ok() {
+                                outcome.note_rewritten(memory_id);
                                 self.note_importance_change(before, memory_arc.importance());
                             }
                         }
@@ -3053,7 +3078,7 @@ impl MemorySystem {
         );
         crate::metrics::EMBED_BACKGROUND_DURATION.observe(elapsed.as_secs_f64());
 
-        Ok(EmbedIndexOutcome::default())
+        Ok(outcome)
     }
 
     /// Fold a redundant new memory into `survivor`: the survivor gains importance and
@@ -6435,6 +6460,7 @@ impl MemorySystem {
     fn embed_backlog_outcome(
         &self,
         key: &embedding_backlog::BacklogKey,
+        rewritten: &mut Vec<MemoryId>,
     ) -> embedding_backlog::EmbedOutcome {
         use embedding_backlog::EmbedOutcome;
         let memory_id = &key.memory;
@@ -6452,15 +6478,20 @@ impl MemorySystem {
         match &key.space {
             None => {}
             Some(space) if self.retriever.secondary_index_space() == Some(space) => {
-                return self.embed_secondary_outcome(memory)
+                return self.embed_secondary_outcome(memory, rewritten)
             }
             Some(space) => return EmbedOutcome::Failed(format!("no embedder here writes {space}")),
         }
-        if let Err(e) = self.embed_and_index(memory_id) {
-            if write_gate::chain_is_writes_closed(&e) {
-                return EmbedOutcome::WritesClosed;
+        match self.embed_and_index_journaled(memory_id) {
+            Ok(outcome) => {
+                for id in outcome.rewritten {
+                    if !rewritten.contains(&id) {
+                        rewritten.push(id);
+                    }
+                }
             }
-            return EmbedOutcome::Failed(e.to_string());
+            Err(e) if write_gate::chain_is_writes_closed(&e) => return EmbedOutcome::WritesClosed,
+            Err(e) => return EmbedOutcome::Failed(e.to_string()),
         }
         if self.retriever.is_indexed(memory_id) {
             return EmbedOutcome::Indexed;
@@ -6481,7 +6512,11 @@ impl MemorySystem {
     }
 
     /// Give a memory a secondary vector in the secondary index's space and index it there.
-    fn embed_secondary_outcome(&self, mut memory: Memory) -> embedding_backlog::EmbedOutcome {
+    fn embed_secondary_outcome(
+        &self,
+        mut memory: Memory,
+        rewritten: &mut Vec<MemoryId>,
+    ) -> embedding_backlog::EmbedOutcome {
         use embedding_backlog::EmbedOutcome;
         let text = crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
         let vector = match self.embedder.encode_secondary(&text) {
@@ -6500,6 +6535,9 @@ impl MemorySystem {
         memory.experience.set_secondary_vector(vector, space);
         if let Err(e) = self.long_term_memory.update(&memory) {
             return EmbedOutcome::Failed(format!("persisting the secondary vector: {e}"));
+        }
+        if !rewritten.contains(&memory.id) {
+            rewritten.push(memory.id.clone());
         }
         let Some(space) = memory.experience.embedding_space_secondary.clone() else {
             return EmbedOutcome::Failed("the secondary vector names no space".to_string());
@@ -6613,7 +6651,7 @@ impl MemorySystem {
     }
 
     /// [`Self::drain_embed_queue`] for a caller that journals: it MUST journal an `Update`
-    /// snapshot of both memories in every pair of [`EmbedDrain::absorbed`].
+    /// snapshot of every memory in [`EmbedDrain::rewritten`].
     pub fn drain_embed_queue_journaled(&self, max: usize) -> EmbedDrain {
         self.drain_embed_queue_with(max, Bm25Sync::Journaled)
     }
@@ -6622,7 +6660,7 @@ impl MemorySystem {
         let batch = self.embed_queue.lock().take(max);
         let mut drain = EmbedDrain {
             taken: batch.len(),
-            absorbed: Vec::new(),
+            rewritten: Vec::new(),
         };
         if batch.is_empty() {
             return drain;
@@ -6630,11 +6668,10 @@ impl MemorySystem {
         for (id, result) in self.embed_and_index_batch(&batch, bm25) {
             match result {
                 Ok(outcome) => {
-                    if let Some(survivor) = outcome
-                        .absorbed_by
-                        .and_then(|survivor| Uuid::parse_str(&survivor).ok())
-                    {
-                        drain.absorbed.push((id, MemoryId(survivor)));
+                    for rewritten in outcome.rewritten {
+                        if !drain.rewritten.contains(&rewritten) {
+                            drain.rewritten.push(rewritten);
+                        }
                     }
                 }
                 Err(e) => tracing::warn!(memory_id = %id.0, "Queued embed_and_index failed: {e}"),
@@ -6738,6 +6775,7 @@ impl MemorySystem {
             t.failed += step.failed;
             t.finished = step.finished;
             t.stopped = step.stopped.clone();
+            t.rewritten.extend(step.rewritten.iter().cloned());
             if step.finished || step.stopped.is_some() || started.elapsed() >= budget {
                 break;
             }
@@ -6766,8 +6804,21 @@ impl MemorySystem {
     }
 
     /// Embed and index up to `limit` backlogged memories, oldest first, after a time-boxed run
-    /// of any pending space migration.
-    pub fn drain_embedding_backlog(&self, limit: usize) -> Result<embedding_backlog::DrainReport> {
+    /// of any pending space migration. Returns the drain's report and every memory the tick
+    /// rewrote (re-embedded by the migration, or [`EmbedIndexOutcome::rewritten`] across the
+    /// batch): the caller MUST journal an `Update` snapshot of each.
+    pub fn drain_embedding_backlog_journaled(
+        &self,
+        limit: usize,
+    ) -> Result<(embedding_backlog::DrainReport, Vec<MemoryId>)> {
+        let mut rewritten: Vec<MemoryId> = Vec::new();
+        let note = |ids: Vec<MemoryId>, rewritten: &mut Vec<MemoryId>| {
+            for id in ids {
+                if !rewritten.contains(&id) {
+                    rewritten.push(id);
+                }
+            }
+        };
         let batch = std::env::var("VELD_SPACE_MIGRATION_BATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -6780,14 +6831,17 @@ impl MemorySystem {
                 .unwrap_or(20),
         );
         match self.run_space_migration(batch, budget) {
-            Ok(Some(step)) => tracing::info!(
-                walked = step.walked,
-                changed = step.changed,
-                failed = step.failed,
-                finished = step.finished,
-                stopped = step.stopped.as_deref().unwrap_or(""),
-                "Embedding space migration tick"
-            ),
+            Ok(Some(step)) => {
+                tracing::info!(
+                    walked = step.walked,
+                    changed = step.changed,
+                    failed = step.failed,
+                    finished = step.finished,
+                    stopped = step.stopped.as_deref().unwrap_or(""),
+                    "Embedding space migration tick"
+                );
+                note(step.rewritten, &mut rewritten);
+            }
             Ok(None) => {}
             Err(e) => tracing::warn!("Embedding space migration tick failed: {e:#}"),
         }
@@ -6806,11 +6860,15 @@ impl MemorySystem {
             .map(|(_, id)| (id, EmbedPurpose::Write))
             .collect();
         if !ids.is_empty() {
-            let _ = self.embed_and_index_batch(&ids, Bm25Sync::Direct);
+            for (_, outcome) in self.embed_and_index_batch(&ids, Bm25Sync::Journaled) {
+                if let Ok(outcome) = outcome {
+                    note(outcome.rewritten, &mut rewritten);
+                }
+            }
         }
         let report = self
             .embedding_backlog
-            .drain_with(limit, |key| self.embed_backlog_outcome(key))?;
+            .drain_with(limit, |key| self.embed_backlog_outcome(key, &mut rewritten))?;
         if let Err(e) = self.refresh_space_registry() {
             tracing::warn!("space registry: could not write: {e}");
         }
@@ -6819,7 +6877,7 @@ impl MemorySystem {
                 tracing::warn!("embedding backlog: index save after drain failed: {e}");
             }
         }
-        Ok(report)
+        Ok((report, rewritten))
     }
 
     /// Save vector index to disk (shutdown persistence)
@@ -7298,6 +7356,7 @@ impl MemorySystem {
                 experience.context.take(),
                 provenance.episode_id,
                 provenance.writer,
+                provenance.repo,
             );
 
             // Update entities if provided
@@ -7395,6 +7454,7 @@ impl MemorySystem {
                 None,
                 provenance.episode_id,
                 provenance.writer,
+                provenance.repo,
             );
 
             // Create memory with external_id

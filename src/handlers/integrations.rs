@@ -119,6 +119,8 @@ pub async fn linear_webhook(
 
     let (memory_id, was_update) = {
         let memory = memory_system.clone();
+        let state = state.clone();
+        let user_id = user_id.clone();
         let ext_id = external_id.clone();
         let exp = experience.clone();
         let ct = change_type_enum;
@@ -129,8 +131,15 @@ pub async fn linear_webhook(
             .unwrap_or_else(|| "linear-webhook".to_string());
 
         tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            memory_guard.upsert(ext_id, exp, ct, Some(actor_name), None)
+            super::remember::upsert_journaled(
+                &state,
+                &memory,
+                &user_id,
+                ext_id,
+                exp,
+                ct,
+                Some(actor_name),
+            )
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
@@ -203,17 +212,20 @@ pub async fn linear_sync(
 
         let result = {
             let memory = memory_system.clone();
+            let state = state.clone();
+            let user_id = req.user_id.clone();
             let ext_id = external_id.clone();
             let exp = experience;
 
             tokio::task::spawn_blocking(move || {
-                let memory_guard = memory.read();
-                memory_guard.upsert(
+                super::remember::upsert_journaled(
+                    &state,
+                    &memory,
+                    &user_id,
                     ext_id,
                     exp,
                     memory::types::ChangeType::ContentUpdated,
                     Some("linear-bulk-sync".to_string()),
-                    None,
                 )
             })
             .await
@@ -361,6 +373,8 @@ pub async fn github_webhook(
 
     let (memory_id, was_update) = {
         let memory = memory_system.clone();
+        let state = state.clone();
+        let user_id = user_id.clone();
         let ext_id = external_id.clone();
         let exp = experience.clone();
         let ct = change_type_enum;
@@ -371,8 +385,15 @@ pub async fn github_webhook(
             .unwrap_or_else(|| "github-webhook".to_string());
 
         tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            memory_guard.upsert(ext_id, exp, ct, Some(actor_name), None)
+            super::remember::upsert_journaled(
+                &state,
+                &memory,
+                &user_id,
+                ext_id,
+                exp,
+                ct,
+                Some(actor_name),
+            )
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
@@ -446,17 +467,20 @@ pub async fn github_sync(
 
             let result = {
                 let memory = memory_system.clone();
+                let state = state.clone();
+                let user_id = req.user_id.clone();
                 let ext_id = external_id.clone();
                 let exp = experience;
 
                 tokio::task::spawn_blocking(move || {
-                    let memory_guard = memory.read();
-                    memory_guard.upsert(
+                    super::remember::upsert_journaled(
+                        &state,
+                        &memory,
+                        &user_id,
                         ext_id,
                         exp,
                         memory::types::ChangeType::ContentUpdated,
                         Some("github-bulk-sync".to_string()),
-                        None,
                     )
                 })
                 .await
@@ -504,17 +528,20 @@ pub async fn github_sync(
 
             let result = {
                 let memory = memory_system.clone();
+                let state = state.clone();
+                let user_id = req.user_id.clone();
                 let ext_id = external_id.clone();
                 let exp = experience;
 
                 tokio::task::spawn_blocking(move || {
-                    let memory_guard = memory.read();
-                    memory_guard.upsert(
+                    super::remember::upsert_journaled(
+                        &state,
+                        &memory,
+                        &user_id,
                         ext_id,
                         exp,
                         memory::types::ChangeType::ContentUpdated,
                         Some("github-bulk-sync".to_string()),
-                        None,
                     )
                 })
                 .await

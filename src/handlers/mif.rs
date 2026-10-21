@@ -66,7 +66,12 @@ pub async fn export_mif(
     };
 
     let graph = if req.include_graph {
-        Some(state.get_user_graph(&user_id).map_err(AppError::Internal)?)
+        Some(
+            state
+                .get_user_graph_async(&user_id)
+                .await
+                .map_err(AppError::Internal)?,
+        )
     } else {
         None
     };
@@ -230,14 +235,35 @@ pub async fn import_mif(
             .get_user_memory_async(&req.user_id)
             .await
             .map_err(AppError::Internal)?;
-        let guard = memory_sys.read();
-
-        for (memory_id, experience, created_at) in prepared_memories {
-            match guard.remember_with_id(memory_id, experience, created_at) {
-                Ok(_) => result.memories_imported += 1,
-                Err(e) => result.errors.push(format!("Memory: {e}")),
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        // remember_with_id writes no BM25 document: these frames are how the imports reach
+        // keyword search, and replicas.
+        let (imported, errors) = tokio::task::spawn_blocking(move || {
+            let mut imported = Vec::new();
+            let mut errors = Vec::new();
+            {
+                let guard = memory_sys.read();
+                for (memory_id, experience, created_at) in prepared_memories {
+                    match guard.remember_with_id(memory_id, experience, created_at) {
+                        Ok(id) => imported.push(id),
+                        Err(e) => errors.push(format!("Memory: {e}")),
+                    }
+                }
             }
-        }
+            super::remember::journal_stored(
+                &state,
+                &memory_sys,
+                &user_id,
+                &imported,
+                super::remember::SnapshotKind::Remember,
+            );
+            (imported.len(), errors)
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("MIF import task panicked: {e}")))?;
+        result.memories_imported += imported;
+        result.errors.extend(errors);
     }
 
     // Import projects first (todos may reference them)
@@ -272,7 +298,8 @@ pub async fn import_mif(
     // Import knowledge graph
     if let Some(ref kg) = doc.knowledge_graph {
         let graph_arc = state
-            .get_user_graph(&req.user_id)
+            .get_user_graph_async(&req.user_id)
+            .await
             .map_err(AppError::Internal)?;
         let graph_guard = graph_arc.read();
 
@@ -354,7 +381,8 @@ pub async fn add_entity(
     validation::validate_entity(&req.label).map_validation_err("label")?;
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let graph_guard = graph.write();
 
@@ -430,7 +458,8 @@ pub async fn add_relationship(
     validation::validate_entity(&req.to_entity).map_validation_err("to_entity")?;
 
     let graph = state
-        .get_user_graph(&req.user_id)
+        .get_user_graph_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let graph_guard = graph.write();
 
