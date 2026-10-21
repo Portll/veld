@@ -110,11 +110,14 @@ impl SmokeCategory {
 pub const LOCOMO_CORPUS_PATH: &str = "tests/recall/corpora/locomo.jsonl";
 pub const LOCOMO_CASES_PATH: &str = "tests/recall/locomo_cases.jsonl";
 
-/// The full LoCoMo suite without the gate's conversation, written by
-/// `scripts/build_locomo_holdout.py`; read by `recall-eval --suite locomo-holdout`.
-/// Nothing is tuned against it, so it is the suite whose numbers are reported.
+/// The full LoCoMo suite without the gate's conversation, and without the cases in
+/// [`LOCOMO_HOLDOUT_SPENT_PATH`], written by `scripts/build_locomo_holdout.py`; read by
+/// `recall-eval --suite locomo-holdout`. Nothing is tuned against it, so it is the suite whose
+/// numbers are reported.
 pub const LOCOMO_HOLDOUT_CORPUS_PATH: &str = "tests/recall/corpora/locomo-holdout.jsonl";
 pub const LOCOMO_HOLDOUT_CASES_PATH: &str = "tests/recall/locomo-holdout-cases.jsonl";
+/// Hold-out case ids whose individual results someone has examined, one per line, `#` comments.
+pub const LOCOMO_HOLDOUT_SPENT_PATH: &str = "tests/recall/locomo-holdout-spent.txt";
 
 /// The frozen LoCoMo-100 gate suite: 100 category-balanced real LoCoMo cases against a single
 /// conversation's 629-turn corpus. `recall-eval --suite locomo-gate` reads it, and
@@ -341,8 +344,15 @@ mod tests {
     /// The hold-out files are exactly the full suite with the gate's conversations removed,
     /// in source order, so a stale or hand-edited hold-out cannot pass for a held-out measurement.
     #[test]
-    fn locomo_holdout_is_the_full_suite_without_the_gate_conversations() {
+    fn locomo_holdout_is_the_full_suite_without_the_gate_conversations_or_spent_cases() {
         use std::collections::HashSet;
+        let spent_text = std::fs::read_to_string(manifest_path(LOCOMO_HOLDOUT_SPENT_PATH))
+            .expect("spent list loads");
+        let spent: HashSet<&str> = spent_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
         let conversation =
             |id: &str, sep: char| id.split(sep).next().unwrap_or_default().to_string();
         let gate =
@@ -368,6 +378,7 @@ mod tests {
             .iter()
             .map(|case| case.id.as_str())
             .filter(|id| !gate_conversations.contains(&conversation(id, '_')))
+            .filter(|id| !spent.contains(id))
             .collect();
         let turns: Vec<&str> = holdout_corpus.iter().map(|item| item.id.as_str()).collect();
         let held: Vec<&str> = holdout_cases.iter().map(|case| case.id.as_str()).collect();

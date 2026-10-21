@@ -30,8 +30,8 @@ on:
           locomo-gate is the 100-case gate. locomo is all 1,531 LoCoMo cases, for a question the
           gate is too coarse to settle: whole-case metrics move in steps of 1/n, 0.01 overall and
           0.04 on multi_hop at n=100, both above a 2% allowance. locomo contains the gate's
-          conversation; locomo-holdout (1,332 cases) leaves it out and is the number to report.
-          Neither is gated.
+          conversation; locomo-holdout leaves it out, and every case someone has examined, and
+          is the number to report. Neither is gated.
         required: false
         default: 'locomo-gate'
         type: choice
@@ -131,9 +131,9 @@ jobs:
     name: Recall gate (${{ matrix.engine }})
     runs-on: ubuntu-latest
     # A recording runs every model live on every call, then scores the rest of the 100 x 629
-    # cross-encoder table, so it gets longer. The full and held-out suites (1,531 and 1,332
-    # questions over 5,882 and 5,253 turns, reranked) get the job maximum: upstream's runs of the
-    # full suite were cancelled at 60 minutes.
+    # cross-encoder table, so it gets longer. The full and held-out suites (5,882 and 5,253
+    # turns, over a thousand questions each, reranked) get the job maximum: upstream's runs of
+    # the full suite were cancelled at 60 minutes.
     timeout-minutes: ${{ (github.event.inputs.suite == 'locomo' || github.event.inputs.suite == 'locomo-holdout') && 360 || github.event.inputs.model_tape == 'record' && 180 || 90 }}
     strategy:
       fail-fast: false
