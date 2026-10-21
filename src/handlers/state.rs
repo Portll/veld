@@ -6082,6 +6082,94 @@ mod reserved_dir_tests {
 }
 
 #[cfg(test)]
+mod bm25_rebuild_replay_tests {
+    use super::*;
+    use crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION;
+    use crate::intent_log::IntentPayload;
+    use crate::memory::types::Experience;
+
+    fn manager(root: &std::path::Path) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: root.to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(root.to_path_buf(), config).unwrap()
+    }
+
+    fn lighthouse_hits(manager: &MultiUserMemoryManager) -> usize {
+        manager
+            .get_user_bm25_index("u")
+            .unwrap()
+            .search("lighthouse", 5)
+            .unwrap()
+            .len()
+    }
+
+    /// The BM25 checkpoint describes the index `BM25Index::new` discarded, so a writer open
+    /// that finds the rebuild marker must replay the log from its start, not resume.
+    #[test]
+    fn a_rebuilt_index_is_refilled_from_the_whole_log_and_its_marker_cleared() {
+        let root = tempfile::TempDir::new().unwrap();
+        {
+            let manager = manager(root.path());
+            let user_mem = manager.get_user_memory("u").unwrap();
+            let id = user_mem
+                .read()
+                .remember(
+                    Experience {
+                        content: "the lighthouse keeper writes letters every winter".into(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let mem = user_mem.read().get_memory(&id).unwrap();
+            let memory_bincode =
+                bincode::serde::encode_to_vec(&mem, bincode::config::standard()).unwrap();
+            manager
+                .journal_and_apply(
+                    "u",
+                    &IntentPayload::Remember {
+                        user_id: "u".into(),
+                        memory_id: id.0.to_string(),
+                        memory_bincode,
+                        schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+                    },
+                )
+                .unwrap();
+        }
+        let bm25_path = {
+            // This open's replay commits the index and persists a checkpoint past the record.
+            let manager = manager(root.path());
+            manager.get_user_journaled_writer("u").unwrap();
+            assert_eq!(lighthouse_hits(&manager), 1);
+            manager
+                .user_dir("u")
+                .unwrap()
+                .join(crate::memory::BM25_INDEX_DIR)
+        };
+
+        // A start that died after `BM25Index::new` recreated the index and before the replay
+        // committed: an empty index under the current schema, the marker still present.
+        std::fs::remove_dir_all(&bm25_path).unwrap();
+        crate::memory::BM25Index::new(&bm25_path).unwrap();
+        let marker =
+            bm25_path.with_file_name(format!("{}.rebuild-pending", crate::memory::BM25_INDEX_DIR));
+        std::fs::write(&marker, b"").unwrap();
+
+        let manager = manager(root.path());
+        manager.get_user_journaled_writer("u").unwrap();
+        assert_eq!(
+            lighthouse_hits(&manager),
+            1,
+            "resuming from the checkpoint would leave the rebuilt index empty"
+        );
+        assert!(!marker.exists(), "the marker outlived a committed replay");
+    }
+}
+
+#[cfg(test)]
 mod reconcile_restore_tests {
     use super::*;
     use crate::intent_log::payload::{live_memory_ids, CURRENT_PAYLOAD_SCHEMA_VERSION};
