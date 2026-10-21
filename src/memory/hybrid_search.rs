@@ -1032,13 +1032,17 @@ impl CrossEncoderReranker {
         let model = match selected {
             None => Arc::clone(&self.env_model),
             Some(id) => {
-                if let Some(m) = self.loaded.read().get(id) {
-                    Arc::clone(m)
-                } else {
-                    let m = crate::embeddings::cross_encoder::load_cross_encoder(Some(id))?;
-                    crate::embeddings::cross_encoder::prewarm(Arc::clone(&m));
-                    self.loaded.write().insert(id.to_string(), Arc::clone(&m));
-                    m
+                // Bound first: under edition 2021 a guard taken in an `if let` condition lives
+                // through the else branch, and the write below would wait on it forever.
+                let cached = self.loaded.read().get(id).cloned();
+                match cached {
+                    Some(m) => m,
+                    None => {
+                        let m = crate::embeddings::cross_encoder::load_cross_encoder(Some(id))?;
+                        crate::embeddings::cross_encoder::prewarm(Arc::clone(&m));
+                        self.loaded.write().insert(id.to_string(), Arc::clone(&m));
+                        m
+                    }
                 }
             }
         };
@@ -2742,6 +2746,48 @@ mod tests {
         assert!(
             delta.abs() < 1e-6,
             "delta must be zero when learned == static; got {delta}"
+        );
+    }
+
+    /// Selecting a reranker the reranker has not loaded yet must return, and a second
+    /// selection must reuse it. Under edition 2021 a read guard held across the load
+    /// deadlocked the first selection: every gate arm that set rerank_model hung until the
+    /// job limit.
+    #[test]
+    fn selecting_a_reranker_not_yet_loaded_returns_and_is_reused() {
+        struct FixedEmbedder;
+        impl Embedder for FixedEmbedder {
+            fn encode(&self, _text: &str) -> Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0])
+            }
+            fn dimension(&self) -> usize {
+                2
+            }
+            fn id(&self) -> &str {
+                "fixed"
+            }
+        }
+        let env_model = crate::embeddings::cross_encoder::load_cross_encoder(None).unwrap();
+        let reranker = Arc::new(CrossEncoderReranker::with_cross_encoder(
+            Arc::new(FixedEmbedder),
+            env_model,
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&reranker);
+        std::thread::spawn(move || {
+            let id = crate::embeddings::cross_encoder::MS_MARCO_MINILM_L6_ID;
+            let selected = worker
+                .select_model(Some(id))
+                .and_then(|_| worker.select_model(Some(id)))
+                .map(|_| worker.model().id().to_string());
+            let _ = tx.send(selected.ok());
+        });
+        let selected = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("select_model deadlocked");
+        assert_eq!(
+            selected.as_deref(),
+            Some(crate::embeddings::cross_encoder::MS_MARCO_MINILM_L6_ID)
         );
     }
 }
