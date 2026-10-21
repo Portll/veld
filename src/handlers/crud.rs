@@ -2343,6 +2343,51 @@ mod tests {
         );
     }
 
+    /// The backlog drain embeds what an earlier pass left without vectors; each memory it
+    /// embeds is journaled with them, as the request path's own embedding is.
+    #[tokio::test]
+    async fn a_backlog_drain_journals_the_vectors_it_lands() {
+        let harness = TestHarness::new();
+        let user_id = "journal-backlog-user";
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let outcome = memory
+            .read()
+            .remember_deferred_detailed_journaled(
+                Experience {
+                    content: "The quartzheron gate stays shut until spring".to_string(),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        crate::handlers::remember::journal_stored(
+            &harness.manager,
+            &memory,
+            user_id,
+            std::slice::from_ref(&outcome.id),
+            crate::handlers::remember::SnapshotKind::Remember,
+        );
+
+        let (status, body) = test_helpers::send(
+            harness.router(),
+            test_helpers::post_json(
+                "/api/embeddings/backlog/drain",
+                &serde_json::json!({ "user_id": user_id, "reconcile": true }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["drained"]["drained"], 1, "{body}");
+
+        let shape: Vec<(bool, bool)> =
+            journaled_snapshots(&harness, user_id, &outcome.id.0.to_string())
+                .iter()
+                .map(|(is_update, m)| (*is_update, m.experience.embeddings.is_some()))
+                .collect();
+        assert_eq!(shape, vec![(false, false), (true, true)]);
+    }
+
     /// An import stores through `remember_with_id`, which writes no BM25 document: the
     /// `Remember` frame is how the import reaches keyword search, and a replica.
     #[tokio::test]

@@ -1359,14 +1359,25 @@ pub async fn drain_embedding_backlog(
         .await
         .map_err(AppError::Internal)?;
     let reconcile = req.reconcile;
+    let user_id = req.user_id.clone();
     let (reconciled, drained) = tokio::task::spawn_blocking(move || {
-        let guard = memory.read();
-        let reconciled = if reconcile {
-            Some(guard.reconcile_embedding_backlog()?)
-        } else {
-            None
+        let (reconciled, drained, rewritten) = {
+            let guard = memory.read();
+            let reconciled = if reconcile {
+                Some(guard.reconcile_embedding_backlog()?)
+            } else {
+                None
+            };
+            let (drained, rewritten) = guard.drain_embedding_backlog_journaled(limit)?;
+            (reconciled, drained, rewritten)
         };
-        let drained = guard.drain_embedding_backlog(limit)?;
+        super::remember::journal_stored(
+            &state,
+            &memory,
+            &user_id,
+            &rewritten,
+            super::remember::SnapshotKind::Update,
+        );
         anyhow::Ok((reconciled, drained))
     })
     .await
