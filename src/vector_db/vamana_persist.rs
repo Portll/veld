@@ -41,7 +41,8 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use tracing::info;
 
-use super::vamana::{DistanceMetric, VamanaConfig, VamanaIndex, VamanaNode, VectorStorage};
+use super::vamana::{DistanceMetric, VamanaConfig, VamanaIndex, VamanaNode};
+use super::vamana_store::VectorStore;
 
 const MAGIC: [u8; 4] = *b"VAMA";
 const VERSION: u32 = 1;
@@ -303,20 +304,7 @@ impl VamanaIndex {
             let graph = self.graph.read();
             let vectors = self.vectors.read();
             let deleted_ids = self.deleted_ids.read();
-            let vector_data: Vec<f32> = match &*vectors {
-                VectorStorage::Memory(vecs) => vecs.iter().flatten().copied().collect(),
-                VectorStorage::Mmap {
-                    mmap,
-                    dimension,
-                    num_vectors,
-                } => {
-                    let total_floats = dimension * num_vectors;
-                    mmap[..total_floats * 4]
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect()
-                }
-            };
+            let vector_data: Vec<f32> = vectors.to_flat();
             let neighbor_counts: Vec<u16> = graph
                 .iter()
                 .map(|node| node.neighbors.len() as u16)
@@ -500,40 +488,33 @@ impl VamanaIndex {
             "vector section",
         )?;
 
-        // Read vectors into memory (could also keep mmap'd)
-        let vectors_bytes = &mmap[vectors_offset..vectors_offset + vector_section_size];
-        let mut vectors = Vec::with_capacity(num_vectors);
-        for i in 0..num_vectors {
-            let start = checked_mul(
-                checked_mul(i, dimension, "vector row offset")?,
-                4,
-                "vector row byte offset",
-            )?;
-            let end = checked_add(
-                start,
-                checked_mul(dimension, 4, "vector row byte length")?,
-                "vector row end",
-            )?;
-            let vec: Vec<f32> = vectors_bytes[start..end]
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect();
-            vectors.push(vec);
-        }
+        // Where the file's little-endian floats are the machine's own, the vector section is
+        // read in place: loading copies nothing, and pages a search never reads stay on disk.
+        // Saves replace the file by rename, which leaves a mapped inode intact on unix; a
+        // Windows rename cannot replace a mapped file, so there the section is copied.
+        let vectors = if cfg!(all(unix, target_endian = "little")) {
+            VectorStore::mapped(dimension, mmap, vectors_offset, num_vectors)?
+        } else {
+            VectorStore::from_le_bytes(
+                dimension,
+                &mmap[vectors_offset..vectors_offset + vector_section_size],
+                num_vectors,
+            )?
+        };
 
         let config = VamanaConfig {
             max_degree: header.max_degree as usize,
             search_list_size: 75, // Default, not persisted
             alpha: 1.2,           // Default, not persisted
             dimension,
-            use_mmap: false, // Loaded into memory
+            use_mmap: false, // A rebuild of a loaded index keeps its vectors on the heap
             distance_metric: header.distance_metric_enum(),
         };
 
         let index = VamanaIndex {
             config,
             graph: std::sync::Arc::new(parking_lot::RwLock::new(graph)),
-            vectors: std::sync::Arc::new(parking_lot::RwLock::new(VectorStorage::Memory(vectors))),
+            vectors: std::sync::Arc::new(parking_lot::RwLock::new(vectors)),
             medoid: std::sync::Arc::new(parking_lot::RwLock::new(header.medoid)),
             num_vectors: std::sync::atomic::AtomicUsize::new(num_vectors),
             storage_path: Some(path.to_path_buf()),
@@ -546,9 +527,10 @@ impl VamanaIndex {
         };
 
         info!(
-            "Loaded Vamana index: {} vectors in {:?}",
+            "Loaded Vamana index: {} vectors in {:?} (read in place: {})",
             num_vectors,
-            start.elapsed()
+            start.elapsed(),
+            index.vectors.read().is_mapped()
         );
 
         Ok(index)
@@ -635,6 +617,54 @@ mod tests {
         let results = loaded.search(&query, 3).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, 0); // Should find vector 0 first
+    }
+
+    /// A loaded index reads its vectors in place where the platform allows, searches exactly as
+    /// the saved one did, and takes inserts without copying the mapped rows.
+    #[test]
+    fn a_loaded_index_searches_like_the_saved_one() {
+        use rand::{Rng, SeedableRng};
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("loaded.vamana");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        let vectors: Vec<Vec<f32>> = (0..400)
+            .map(|_| {
+                let v: Vec<f32> = (0..12).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.into_iter().map(|x| x / norm).collect()
+            })
+            .collect();
+        let mut saved = VamanaIndex::new(VamanaConfig {
+            dimension: 12,
+            use_mmap: false,
+            ..Default::default()
+        })
+        .unwrap();
+        saved.build(vectors.clone()).unwrap();
+        saved.mark_deleted(7);
+        saved.save_to_file(&path).unwrap();
+
+        let mut loaded = VamanaIndex::load_from_file(&path).unwrap();
+        assert_eq!(
+            loaded.vectors.read().is_mapped(),
+            cfg!(all(unix, target_endian = "little"))
+        );
+        for exact_max in [usize::MAX, 0] {
+            saved.set_exact_search_max(exact_max);
+            loaded.set_exact_search_max(exact_max);
+            for q in vectors.iter().step_by(23) {
+                assert_eq!(loaded.search(q, 8).unwrap(), saved.search(q, 8).unwrap());
+            }
+        }
+
+        let id = loaded.add_vector(vectors[0].clone()).unwrap();
+        assert_eq!(id, 400);
+        assert_eq!(
+            loaded.vectors.read().is_mapped(),
+            cfg!(all(unix, target_endian = "little"))
+        );
+        assert_eq!(loaded.vector(id).unwrap(), vectors[0]);
+        assert_eq!(loaded.vector(5).unwrap(), vectors[5]);
     }
 
     #[test]
