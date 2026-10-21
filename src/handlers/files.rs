@@ -3,7 +3,7 @@
 //! Handlers for codebase file indexing and search.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,8 @@ use tracing::info;
 use super::state::MultiUserMemoryManager;
 use super::todos::TodoQuery;
 use super::types::MemoryEvent;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{FileMemoryStats, IndexingResult, ProjectId};
 use crate::validation;
@@ -212,6 +214,13 @@ fn confine_codebase_path(
     if canonical.starts_with(&storage_root) || storage_root.starts_with(&canonical) {
         return Err(invalid(
             "A codebase path may not contain or lie inside veld's data directory".to_string(),
+        ));
+    }
+    if crate::path_guard::is_private_home_path(&canonical) {
+        return Err(invalid(
+            "A codebase path may not be the home directory or one of its credential or \
+             application-data roots (dot-directories, Library, AppData)"
+                .to_string(),
         ));
     }
     Ok(canonical)
@@ -437,13 +446,18 @@ pub async fn search_project_files(
 /// GET /api/files/stats - Get file memory statistics
 pub async fn get_file_stats(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(query): Query<TodoQuery>,
 ) -> Result<Json<FileStatsResponse>, AppError> {
-    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+    let user_id = resolve_request_user_id(
+        Some(&query.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let stats = state
         .file_store
-        .stats(&query.user_id)
+        .stats(&user_id)
         .map_err(AppError::Internal)?;
 
     Ok(Json(FileStatsResponse {

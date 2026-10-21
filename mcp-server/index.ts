@@ -781,7 +781,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "recall_by_tags",
         description:
-          "Find memories by tags. Returns memories matching ANY of the provided tags, e.g. 'tool:Edit', 'file:src/main.rs', 'source:hook', 'error', 'session-summary'.",
+          "Find memories by tags, newest first. Returns memories whose writer gave them ANY of the provided tags, e.g. 'decision', 'learning', 'error', 'project:veld'.",
         inputSchema: {
           type: "object",
           properties: {
@@ -795,6 +795,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Maximum number of results (default: 50)",
               default: 50,
+            },
+            include_derived: {
+              type: "boolean",
+              description:
+                "Also match tags veld derived from the content (names, keywords), not only the writer's own (default: false)",
+              default: false,
             },
           },
           required: ["tags"],
@@ -1009,7 +1015,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "proactive_context",
         description:
-          "REQUIRED: Call this tool with EVERY user message to surface relevant memories and build conversation history. Pass the user's message as context. This enables: (1) retrieving memories relevant to what the user is asking, (2) building persistent memory of the conversation for future sessions. The system analyzes entities, semantic similarity, and recency to find contextually appropriate memories. Auto-ingest stores the context automatically. USAGE: Always call this FIRST when you receive a user message, passing their message as the context parameter.",
+          "Surface memories relevant to the current task or question, ranked by entities, semantic similarity and recency. Call it when the task turns to something past sessions may have covered (a decision, a prior bug, a preference); it takes one to several seconds, so do not call it on every message. Pass the task or question as context. Set auto_ingest to true only when the context itself is worth remembering; hooks already record conversation turns.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1050,8 +1056,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             auto_ingest: {
               type: "boolean",
               description:
-                "Automatically store the context as a Conversation memory (default: true). Set to false to only surface memories without storing.",
-              default: true,
+                "Also store the context as a Conversation memory (default: false).",
+              default: false,
             },
             rrf_k: {
               type: "number",
@@ -2205,9 +2211,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "recall_by_tags": {
-        const { tags, limit: rawTagLimit = 50 } = args as {
+        const {
+          tags,
+          limit: rawTagLimit = 50,
+          include_derived = false,
+        } = args as {
           tags: string[];
           limit?: number;
+          include_derived?: boolean;
         };
 
         if (!Array.isArray(tags) || tags.length === 0) {
@@ -2226,7 +2237,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const tagResult = await apiCall<{ memories: Memory[]; count: number }>(
           "/api/recall/tags",
           "POST",
-          { user_id: USER_ID, tags, limit: tagLimit },
+          { user_id: USER_ID, tags, limit: tagLimit, include_derived },
         );
         const tagMemories = tagResult.memories || [];
 
@@ -2826,7 +2837,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           recency_weight = 0.2,
           max_results = 5,
           memory_types = [],
-          auto_ingest = true,
+          auto_ingest = false,
           rrf_k,
         } = args as {
           context: string;
@@ -5314,6 +5325,10 @@ async function ensureServerRunning(): Promise<void> {
     "VELD_MAX_CONCURRENT",
     "VELD_REQUEST_TIMEOUT",
     "VELD_WRITE_MODE",
+    "VELD_STORAGE_DURABILITY",
+    "VELD_REDB_CACHE_BYTES",
+    "VELD_ROCKSDB_WRITE_BUFFER_BYTES",
+    "VELD_ROCKSDB_BLOCK_CACHE_BYTES",
     "VELD_OFFLINE",
     "VELD_LAZY_LOAD",
     "VELD_ONNX_THREADS",

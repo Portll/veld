@@ -30,7 +30,7 @@ use super::report::{
     aggregate_category, aggregate_layer, median, AblationCaseRow, AblationReport, AblationRow,
     CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure, LayerReport,
     LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord,
-    ReachabilityCategory, ReachabilityReport, Report, RerankSetting, SMOKE_K,
+    ReachabilityCategory, ReachabilityReport, Report, RerankSetting, RetrievalDials, SMOKE_K,
 };
 
 /// Embedder identifier emitted in the report. Matches the model wired into
@@ -318,7 +318,12 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
             tape_growth.push((i, added));
         }
     }
-    let tape_failures = finish_model_tape(&corpus, &tape_growth, &inputs.git_sha);
+    let tape_failures = finish_model_tape(
+        &corpus,
+        &tape_growth,
+        &inputs.git_sha,
+        passes[0].rerank.model.as_deref(),
+    );
 
     // ------------------------------------------------------------------
     // Determinism check across repeats. Two passes against the same
@@ -336,6 +341,15 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
                 detail: format!(
                     "repeat {i} reranked under {:?}, repeat 0 under {:?}",
                     pass.rerank, passes[0].rerank
+                ),
+            });
+        }
+        if pass.retrieval_dials != passes[0].retrieval_dials {
+            failures.push(Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "repeat {i} ran under retrieval dials {:?}, repeat 0 under {:?}",
+                    pass.retrieval_dials, passes[0].retrieval_dials
                 ),
             });
         }
@@ -434,6 +448,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         suite: inputs.suite.clone(),
         embedder,
         rerank: Some(passes[0].rerank.clone()),
+        retrieval_dials: Some(passes[0].retrieval_dials.clone()),
         model_tape: crate::embeddings::model_tape::replay_digest(),
         git_sha: inputs.git_sha.clone(),
         timestamp: chrono::Utc::now(),
@@ -577,6 +592,7 @@ struct OnePassResult {
     per_mode: BTreeMap<LayerMode, ModePassResult>,
     failures: Vec<Failure>,
     rerank: RerankSetting,
+    retrieval_dials: RetrievalDials,
 }
 
 /// Run a single ingest pass, then run the case loop once per `LayerMode`.
@@ -947,10 +963,12 @@ fn run_one_pass(
     }
 
     let rerank = RerankSetting::of(&system.read(), cross_encoder);
+    let retrieval_dials = RetrievalDials::of(&system.read().cognitive_dials());
     Ok(OnePassResult {
         per_mode,
         failures,
         rerank,
+        retrieval_dials,
     })
 }
 
@@ -967,6 +985,7 @@ fn finish_model_tape(
     corpus: &[CorpusItem],
     growth: &[(usize, usize)],
     git_sha: &str,
+    rerank_model: Option<&str>,
 ) -> Vec<Failure> {
     use crate::embeddings::model_tape as tape;
     let mut failures = Vec::new();
@@ -984,7 +1003,7 @@ fn finish_model_tape(
         )));
     }
     if tape::recording() {
-        match fill_cross_encoder_table(corpus) {
+        match fill_cross_encoder_table(corpus, rerank_model) {
             Ok(n) => eprintln!("  model tape: scored {n} cross-encoder pairs the run did not"),
             Err(e) => failures.push(infra(format!("{e:#}"))),
         }
@@ -1027,12 +1046,16 @@ fn finish_model_tape(
 /// pairs that only load the model (the harness's probe and the background pre-warm):
 /// if one is not a corpus item, candidates are built some other way and the corpus
 /// cannot complete the table.
-fn fill_cross_encoder_table(corpus: &[CorpusItem]) -> Result<usize> {
+///
+/// `model` is the registry id the run reranked with (its `RerankSetting`), so the table is
+/// completed by the model the `rerank_model` dial selected and not by whatever the
+/// environment names.
+fn fill_cross_encoder_table(corpus: &[CorpusItem], model: Option<&str>) -> Result<usize> {
     use crate::embeddings::cross_encoder::WARMUP_TEXT;
     use crate::embeddings::model_tape as tape;
     use crate::memory::hybrid_search::CROSS_ENCODER_PROBE;
     let loads_only = |t: &str| t == CROSS_ENCODER_PROBE || t == WARMUP_TEXT;
-    let ce = crate::embeddings::cross_encoder::load_cross_encoder_from_env();
+    let ce = crate::embeddings::cross_encoder::load_cross_encoder(model)?;
     let mut seen = std::collections::HashSet::new();
     let docs: Vec<&str> = corpus
         .iter()
@@ -1112,6 +1135,12 @@ fn pin_harness_threads() {
         // some near-tie flips weeks after it was generated.
         if std::env::var_os("SHODH_EVAL_NOW").is_none() {
             std::env::set_var("SHODH_EVAL_NOW", HARNESS_CLOCK_ANCHOR);
+        }
+        // The cross-encoder is one instance per process, so its pair-score cache outlives a
+        // repeat's MemorySystem and would serve repeats 2..n from memory. Off, each repeat's
+        // latency is the model's; the scores are the same either way.
+        if std::env::var_os("VELD_CROSS_ENCODER_CACHE").is_none() {
+            std::env::set_var("VELD_CROSS_ENCODER_CACHE", "0");
         }
     }
 }

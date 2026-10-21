@@ -12,6 +12,7 @@
 //! model-fetch --status          # what is present, decide from that
 //! model-fetch --minilm          # the embedder recall actually depends on
 //! model-fetch --ner --nomic
+//! model-fetch --arctic-xs       # snowflake-arctic-embed-xs, the alternative selected by VELD_EMBEDDER
 //! model-fetch --cross-encoder   # the reranker, pinned and verified like the rest
 //! ```
 
@@ -37,6 +38,11 @@ struct Args {
     /// nomic-embed-text-v1.5 — 768-dim, 8192-token context.
     #[arg(long)]
     nomic: bool,
+
+    /// snowflake-arctic-embed-xs (Apache-2.0) — 384-dim, MiniLM-L6's architecture trained for
+    /// retrieval. Used only when VELD_EMBEDDER=arctic-embed-xs selects it.
+    #[arg(long)]
+    arctic_xs: bool,
 
     /// mxbai-rerank-xsmall-v1 — the default cross-encoder that reranks recall's candidates.
     /// Without it recall keeps its fused order and logs that the reranker is unavailable.
@@ -75,12 +81,17 @@ fn progress() -> downloader::ProgressCallback {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let any = args.minilm || args.ner || args.nomic || args.cross_encoder || args.onnxruntime;
+    let any = args.minilm
+        || args.ner
+        || args.nomic
+        || args.arctic_xs
+        || args.cross_encoder
+        || args.onnxruntime;
     if args.status || !any {
         report();
         if !args.status {
             println!(
-                "\nnothing selected; pass --minilm / --ner / --nomic / --cross-encoder / --onnxruntime to fetch."
+                "\nnothing selected; pass --minilm / --ner / --nomic / --arctic-xs / --cross-encoder / --onnxruntime to fetch."
             );
         }
         return Ok(());
@@ -104,6 +115,11 @@ fn main() -> Result<()> {
     if args.nomic {
         println!("nomic:");
         let path = downloader::download_nomic_models(Some(progress()))?;
+        println!("\r    done: {}", path.display());
+    }
+    if args.arctic_xs {
+        println!("arctic-embed-xs:");
+        let path = downloader::download_arctic_xs_models(Some(progress()))?;
         println!("\r    done: {}", path.display());
     }
     if args.cross_encoder {
@@ -138,6 +154,11 @@ fn report() {
             "nomic  ",
             downloader::are_nomic_models_downloaded(),
             downloader::get_nomic_models_dir(),
+        ),
+        (
+            "arctic ",
+            downloader::are_arctic_xs_models_downloaded(),
+            downloader::get_arctic_xs_models_dir(),
         ),
         ("rerank ", reranker.is_cached(), reranker.cache_dir()),
         (

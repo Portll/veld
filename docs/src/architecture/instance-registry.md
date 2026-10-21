@@ -36,6 +36,7 @@ Each instance writes one JSON file named `<instance_id>.json` containing:
 | `last_heartbeat` | Updated by the heartbeat task |
 | `version` | The veld version string |
 | `feature_flags` | Optional list of compile-time features for filtering |
+| `launch` | Optional: `exe`, `args`, `cwd` and the *names* of the `VELD_*` variables the server started with. Lets the Veld Monitor's "Restart server" relaunch it the same way; values are never written |
 
 Writes are atomic (`write-to-tempfile + rename`) so a reader never sees a
 half-written entry.
@@ -81,7 +82,7 @@ keep calling `.list_live()` on whichever provider was injected.
 
 | Consumer | What it does with the registry |
 |---|---|
-| Veld Monitor | Renders the fleet in its dashboard — each instance with version, bind address, dial overrides |
+| Veld Monitor | Renders the fleet in its dashboard — each instance with version, bind address, dial overrides, and the server's uptime from `started_at` beside the time the monitor has watched it |
 | Claude statusline (`hooks/statusline.ts`) | Picks the local instance to talk to without the user setting `VELD_API_URL` |
 | `veld tui` | Connects to the discovered instance instead of hard-coding `127.0.0.1:3030` |
 

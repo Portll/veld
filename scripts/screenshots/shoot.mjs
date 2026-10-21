@@ -5,8 +5,9 @@
 
 import { newScreen, feed, toHtml } from './capture.mjs';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -70,20 +71,31 @@ if (!REPLAY) writeFileSync(rowFile, JSON.stringify({ profile: PROFILE, row: idx 
 const plan = [
   { waitMs: 1300, shot: 'splash' },
   // The splash runs about three seconds and swallows a keypress, so the auth screen needs its own
-  // Enter afterwards: a single Enter went to the splash and every later shot was the auth screen.
-  { waitMs: 2700, keys: '\r' },
+  // Enter afterwards.
+  { waitMs: 2300, keys: '\r' },
   { waitMs: 1200, shot: 'auth' },
-  { waitMs: 100, keys: '\r' },
-  { waitMs: 2500, keys: 'j'.repeat(idx) },
+  // Accepting the auth option loads the profiles AND moves focus to the list, so no Tab: a Tab here
+  // moves focus back to the auth pane, where j and k mean nothing and the cursor sits on row 0.
+  { waitMs: 200, keys: '\r' },
+  { waitMs: 4000, keys: 'j'.repeat(idx) },
   { waitMs: 900, shot: 'profiles' },
-  { waitMs: 100, keys: '\r' },
+  { waitMs: 200, keys: '\r' },
   { waitMs: 3500, shot: 'dashboard' },
   { waitMs: 300, keys: '2' },
   { waitMs: 2200, shot: 'projects-todos' },
   { waitMs: 300, keys: '4' },
   { waitMs: 2400, shot: 'graph-map' },
   { waitMs: 300, keys: '3' },
-  { waitMs: 2200, shot: 'activity' },
+  { waitMs: 2000, shot: 'activity' },
+  // Recall: `/` opens search, the query runs on Enter, and the results carry relevance scores.
+  { waitMs: 300, keys: '1' },
+  { waitMs: 1200, keys: '/' },
+  // Tab switches the search mode. Keyword alone returns the one row that contains the phrase, which
+  // is a thin picture of hybrid retrieval; the semantic mode ranks the neighbourhood and shows scores.
+  { waitMs: 600, keys: '\t' },
+  { waitMs: 600, keys: 'how does veld decide what to keep' },
+  { waitMs: 800, keys: '\r' },
+  { waitMs: 4000, shot: 'recall' },
 ];
 
 const rec = `${OUT}/stream.jsonl`;
@@ -98,13 +110,34 @@ if (REPLAY) {
   console.log(`recorded ${summary.chunks} chunks, ${summary.bytes} bytes`);
 }
 
+// One TextDecoder across the whole stream, in streaming mode. Decoding each read on its own turns
+// any multi-byte character that straddles a read boundary into U+FFFD: the grass sheaf is four bytes
+// and came out as replacement characters, which looked like a missing font rather than mojibake.
+const decoder = new TextDecoder('utf-8');
 const chunks = readFileSync(rec, 'utf8').trim().split('\n').filter(Boolean)
-  .map((l) => { const o = JSON.parse(l); return { at: o.at, data: Buffer.from(o.data, 'base64').toString('utf8') }; });
+  .map((l) => {
+    const o = JSON.parse(l);
+    return { at: o.at, data: decoder.decode(Buffer.from(o.data, 'base64'), { stream: true }) };
+  });
 
 // Shot times are the cumulative plan offsets, matching how record.py paced itself.
 let t = 0;
 const marks = [];
 for (const step of plan) { t += step.waitMs; if (step.shot) marks.push({ name: step.shot, at: t }); }
+
+// The dashboard header is the honest witness that a capture is of the intended profile: it prints
+// that profile's own counts. Checking the selector's cursor does not work — the list shows about
+// five rows and does not scroll to follow the selection, so choosing a row further down leaves no
+// visible cursor while the selection is perfectly correct.
+function assertProfilePopulated(html) {
+  const text = html.replace(/<[^>]*>/g, '');
+  const header = /(\d[\d,]*)\s+memories/.exec(text);
+  if (!header) throw new Error('dashboard: no memory count in the header, so this is not a dashboard frame');
+  if (Number(header[1].replace(/,/g, '')) === 0) {
+    throw new Error('dashboard: the selected profile holds 0 memories. Seed it with '
+      + '`node scripts/seed-demo.mjs --reset`, or the profile moved in the list and another account was picked.');
+  }
+}
 
 const INK = 24;  // a frame of nothing is a failed capture, not a screenshot
 for (const mark of marks) {
@@ -113,8 +146,13 @@ for (const mark of marks) {
   const ink = s.grid.flat().filter((cell) => cell.ch !== ' ').length;
   const html = `${OUT}/${mark.name}.html`;
   writeFileSync(html, toHtml(s));
+  if (mark.name === 'dashboard') assertProfilePopulated(toHtml(s));
   const png = `${OUT}/${mark.name}.png`;
   execFileSync(CHROME, ['--headless', '--disable-gpu', `--screenshot=${png}`, '--window-size=1240,700',
-    '--hide-scrollbars', '--force-device-scale-factor=2', `file://${resolve(html)}`], { stdio: 'ignore' });
+    '--hide-scrollbars', '--force-device-scale-factor=2',
+    // Its own profile directory: concurrent headless runs contend over the default one and the
+    // loser exits non-zero with nothing written.
+    `--user-data-dir=${mkdtempSync(join(tmpdir(), 'veld-shot-chrome-'))}`,
+    `file://${resolve(html)}`], { stdio: 'ignore' });
   console.log(`${mark.name.padEnd(16)} t+${String(mark.at).padStart(5)}ms  ink ${String(ink).padStart(5)} ${ink < INK ? 'BLANK — capture failed' : ''}`);
 }

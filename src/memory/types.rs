@@ -13,9 +13,9 @@ pub use super::facets::{
     WhoFacet, WhyFacet, KNOWN_AGENT_BRANDS,
 };
 use crate::constants::{
-    DEFAULT_MAX_RESULTS, IMPORTANCE_FLOOR, RECENCY_FULL_DAYS, RECENCY_HIGH_DAYS,
-    RECENCY_HIGH_WEIGHT, RECENCY_LOW_WEIGHT, RECENCY_MEDIUM_DAYS, RECENCY_MEDIUM_WEIGHT,
-    SALIENCE_RECENCY_WEIGHT,
+    ANCHOR_IMPORTANCE_FLOOR, DEFAULT_MAX_RESULTS, IMPORTANCE_FLOOR, RECENCY_FULL_DAYS,
+    RECENCY_HIGH_DAYS, RECENCY_HIGH_WEIGHT, RECENCY_LOW_WEIGHT, RECENCY_MEDIUM_DAYS,
+    RECENCY_MEDIUM_WEIGHT, SALIENCE_RECENCY_WEIGHT,
 };
 
 /// Unified scoring signals extracted from a memory for ranking.
@@ -2372,8 +2372,14 @@ impl Memory {
 
     /// Set the anchored flag on this memory's metadata.
     /// Anchored memories resist decay — importance cannot fall below ANCHOR_IMPORTANCE_FLOOR.
+    /// Anchoring lifts importance to the floor at once; releasing leaves importance where
+    /// it is, to decay from there.
     pub fn set_anchored(&self, anchored: bool) {
-        self.metadata.lock().anchored = anchored;
+        let mut meta = self.metadata.lock();
+        meta.anchored = anchored;
+        if anchored {
+            meta.importance = meta.importance.max(ANCHOR_IMPORTANCE_FLOOR);
+        }
     }
 
     /// Demote to previous tier (for decay)
@@ -2591,7 +2597,10 @@ impl Memory {
     ///
     /// Uses multiplicative decay clamped to [IMPORTANCE_FLOOR, 1.0]:
     /// - decay of 0.10 = -10% (memory was misleading)
-    /// - Never drops below IMPORTANCE_FLOOR (0.05) to allow recovery
+    /// - Never drops below IMPORTANCE_FLOOR (0.12) to allow recovery
+    /// - An anchored memory never drops below ANCHOR_IMPORTANCE_FLOOR (0.5); one
+    ///   already below it, anchored before the floor was enforced, is held where it
+    ///   is rather than raised
     ///
     /// The floor prevents complete forgetting, mimicking the "savings effect"
     /// in human memory - relearning is faster than initial learning.
@@ -2599,7 +2608,12 @@ impl Memory {
     /// Example: memory with importance 0.6 - decay 0.10 -> 0.54
     pub fn decay_importance(&self, decay: f32) {
         let mut meta = self.metadata.lock();
-        meta.importance = (meta.importance * (1.0 - decay)).max(IMPORTANCE_FLOOR);
+        let decayed = (meta.importance * (1.0 - decay)).max(IMPORTANCE_FLOOR);
+        meta.importance = if meta.anchored {
+            decayed.max(meta.importance.min(ANCHOR_IMPORTANCE_FLOOR))
+        } else {
+            decayed
+        };
     }
 
     /// Update Bayesian confidence based on retrieval outcome
@@ -3714,6 +3728,28 @@ impl Query {
         }
 
         true
+    }
+
+    /// Whether this query carries a caller filter that [`Self::matches`] applies, beyond the
+    /// default exclusions (forgotten memories, intentions). Recall widens its candidate scan
+    /// when it does, because a selective filter can discard most of a fixed-size pool.
+    pub fn has_selective_filters(&self) -> bool {
+        self.importance_threshold.is_some()
+            || self.experience_types.is_some()
+            || self.time_range.is_some()
+            || self.robot_id.is_some()
+            || self.mission_id.is_some()
+            || self.geo_filter.is_some()
+            || self.action_type.is_some()
+            || self.reward_range.is_some()
+            || self.outcome_type.is_some()
+            || self.failures_only
+            || self.anomalies_only
+            || self.severity.is_some()
+            || self.tags.as_ref().is_some_and(|t| !t.is_empty())
+            || self.pattern_id.is_some()
+            || self.terrain_type.is_some()
+            || self.confidence_range.is_some()
     }
 
     /// Create a builder for Query
@@ -5824,6 +5860,65 @@ pub struct GraphDecayResult {
 
 #[cfg(test)]
 mod tests {
+    use crate::constants::{ANCHOR_IMPORTANCE_FLOOR, IMPORTANCE_FLOOR};
+
+    fn memory_at(importance: f32) -> Memory {
+        Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                content: "rotate the signing key every ninety days".into(),
+                ..Default::default()
+            },
+            importance,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn anchoring_lifts_importance_to_the_floor_and_releasing_keeps_it() {
+        let memory = memory_at(0.3);
+        memory.set_anchored(true);
+        assert_eq!(memory.importance(), ANCHOR_IMPORTANCE_FLOOR);
+        memory.set_anchored(false);
+        assert_eq!(memory.importance(), ANCHOR_IMPORTANCE_FLOOR);
+
+        let high = memory_at(0.9);
+        high.set_anchored(true);
+        assert_eq!(high.importance(), 0.9, "anchoring never lowers importance");
+    }
+
+    #[test]
+    fn an_anchored_memory_decays_to_the_floor_and_no_further() {
+        let memory = memory_at(0.9);
+        memory.set_anchored(true);
+        for _ in 0..20 {
+            memory.decay_importance(0.5);
+        }
+        assert_eq!(memory.importance(), ANCHOR_IMPORTANCE_FLOOR);
+
+        memory.set_anchored(false);
+        for _ in 0..20 {
+            memory.decay_importance(0.5);
+        }
+        assert_eq!(
+            memory.importance(),
+            IMPORTANCE_FLOOR,
+            "released, it decays past the anchor floor"
+        );
+    }
+
+    #[test]
+    fn decay_neither_raises_nor_lowers_an_anchored_memory_already_below_the_floor() {
+        let memory = memory_at(0.9);
+        memory.set_anchored(true);
+        memory.set_importance(0.3);
+        memory.decay_importance(0.5);
+        assert_eq!(memory.importance(), 0.3);
+    }
+
     // ── LayerMode ablation ──
 
     /// The ladder must be strictly ordered, or `allows` silently admits a stage
@@ -6159,5 +6254,30 @@ mod enrichment_merge_tests {
                 .any(|p| matches!(p, Place::Geo { .. }))
         });
         assert!(place_is_geo, "a filled geo fix reaches the WHERE facet too");
+    }
+}
+
+#[cfg(test)]
+mod query_filter_tests {
+    use super::Query;
+
+    #[test]
+    fn has_selective_filters_ignores_defaults_and_empty_tags() {
+        assert!(!Query::default().has_selective_filters());
+        let q = Query {
+            tags: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(!q.has_selective_filters());
+        let q = Query {
+            tags: Some(vec!["storage".into()]),
+            ..Default::default()
+        };
+        assert!(q.has_selective_filters());
+        let q = Query {
+            failures_only: true,
+            ..Default::default()
+        };
+        assert!(q.has_selective_filters());
     }
 }

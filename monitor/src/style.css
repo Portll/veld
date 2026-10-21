@@ -524,8 +524,9 @@ main {
   font-size: 12px; color: #cdd6dd; cursor: default;
 }
 
-/* Security overlay: keys, recovery and logins */
-#security-overlay {
+/* Security overlay (keys, recovery, logins) and Data overlay (backups, export,
+   backend) share one look: the sec-* classes are the overlay-panel vocabulary. */
+#security-overlay, #data-overlay {
   position: fixed;
   inset: 0;
   z-index: 500;
@@ -534,8 +535,8 @@ main {
   background: var(--bg);
   overflow: auto;
 }
-#security-overlay.hidden, #sec-modal.hidden, .sec-flash.hidden { display: none; }
-#security-bar {
+#security-overlay.hidden, #data-overlay.hidden, #sec-modal.hidden, #data-modal.hidden, .sec-flash.hidden { display: none; }
+#security-bar, #data-bar {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -547,8 +548,8 @@ main {
   top: 0;
   z-index: 1;
 }
-#sec-nav { display: flex; gap: 4px; flex: 1; }
-.sec-tab, #security-close {
+#sec-nav, #data-nav { display: flex; gap: 4px; flex: 1; }
+.sec-tab, #security-close, #data-close {
   background: #2b2d3c;
   color: #c8c8d4;
   border: 1px solid #3a3d4f;
@@ -558,7 +559,7 @@ main {
   font-size: 12px;
 }
 .sec-tab.active { background: var(--accent); color: #111; border-color: var(--accent); }
-#sec-body { padding: 12px; display: grid; gap: 12px; }
+#sec-body, #data-body { padding: 12px; display: grid; gap: 12px; }
 .sec-card {
   background: var(--card);
   border: 1px solid var(--border);
@@ -571,7 +572,8 @@ main {
 .sec-table td { padding: 5px 6px; border-bottom: 1px solid #1f2131; vertical-align: middle; }
 .sec-row-actions { display: flex; flex-wrap: wrap; gap: 4px; }
 .sec-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-#security-overlay button:not(.sec-tab):not(#security-close) {
+#security-overlay button:not(.sec-tab):not(#security-close),
+#data-overlay button:not(.sec-tab):not(#data-close) {
   background: var(--blue);
   color: #0b0d14;
   border: 0;
@@ -580,14 +582,14 @@ main {
   font-size: 12px;
   cursor: pointer;
 }
-#security-overlay button:disabled { opacity: .45; cursor: default; }
-#security-overlay button.sec-secondary { background: #2b2d3c; color: var(--fg); }
-#security-overlay button.sec-danger { background: var(--red); color: #fff; }
-#security-overlay button.sec-small { padding: 2px 8px; font-size: 11px; }
-#security-overlay button.sec-link { background: none; color: var(--blue); padding: 0; }
+#security-overlay button:disabled, #data-overlay button:disabled { opacity: .45; cursor: default; }
+#security-overlay button.sec-secondary, #data-overlay button.sec-secondary { background: #2b2d3c; color: var(--fg); }
+#security-overlay button.sec-danger, #data-overlay button.sec-danger { background: var(--red); color: #fff; }
+#security-overlay button.sec-small, #data-overlay button.sec-small { padding: 2px 8px; font-size: 11px; }
+#security-overlay button.sec-link, #data-overlay button.sec-link { background: none; color: var(--blue); padding: 0; }
 .sec-form { display: grid; gap: 8px; }
 .sec-form label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
-.sec-form input, .sec-form select {
+.sec-form input, .sec-form select, .sec-form textarea {
   background: #0f1019;
   color: var(--fg);
   border: 1px solid var(--border);
@@ -595,6 +597,14 @@ main {
   padding: 6px 8px;
   font-size: 13px;
 }
+.sec-form textarea { font: 12px/1.4 ui-monospace, Menlo, monospace; resize: vertical; }
+.sec-form label.sec-check { display: flex; align-items: center; gap: 8px; color: var(--fg); }
+.sec-kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; font-size: 12px; margin: 6px 0; }
+.sec-kv dt { color: var(--muted); }
+.sec-kv dd { margin: 0; word-break: break-all; }
+.sec-form label.sec-check input { width: auto; padding: 0; margin: 0; }
+.sec-form button[type="submit"] { justify-self: start; }
+.sec-actions .sec-mono { align-self: center; word-break: break-all; }
 .sec-signin { max-width: 340px; margin: 24px auto; }
 .sec-note { color: var(--muted); font-size: 12px; margin: 4px 0; }
 .sec-code {
@@ -612,7 +622,7 @@ main {
 .sec-flash.ok { color: var(--green); }
 .sec-flash.warn, .sec-warn { color: var(--yellow); }
 .sec-flash.error, .sec-bad { color: var(--red); }
-#sec-modal {
+#sec-modal, #data-modal {
   position: fixed;
   inset: 0;
   z-index: 600;

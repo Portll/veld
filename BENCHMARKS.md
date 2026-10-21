@@ -233,6 +233,75 @@ This benchmark document keeps measured runtime and systems numbers. Product-leve
 
 ---
 
+## Store-Size Latency Lane
+
+`bench/store_size_latency_probe.py`, run by `.github/workflows/store-size-latency.yml` (nightly and on demand; not a PR gate).
+
+The 20-memory recall guard (`bench/recall_latency_guard.py`) cannot see store-size scaling: a path that costs O(N) per request costs the same on 20 memories before and after a fix. The lane seeds one tenant to N memories (default 10 000, through `POST /api/remember/batch`), creates a fresh tenant in the same run, and measures p50/p95 over 20 calls per route on each:
+
+| Route | Large-tenant p95 limit |
+|---|---|
+| `POST /api/remember` | 2.0 s |
+| `POST /api/recall` | 2.0 s |
+| `GET /api/memory/{id}` | 0.2 s |
+| `POST /api/relevant` | 1.0 s |
+| `GET /api/users/{id}/stats` | 0.2 s |
+| `GET /api/health/index` (per tenant) and `GET /health/index` (public) | 0.2 s |
+
+The job fails when any large-tenant p95 exceeds its limit, when the large/fresh p95 ratio exceeds 5 (`--max-ratio`; fresh p95 is floored at 50 ms in the ratio), or when any call errors or hits the 60 s timeout. A failed call is charged at 60 s in the percentiles, never dropped. Limits can be overridden with `--thresholds <json>`. The JSON result records the commit sha, store size and timestamps and is uploaded as the `store-size-latency` artifact.
+
+Reference point: a 15.6k-memory tenant measured `POST /api/remember` timing out at 60 s and `POST /api/recall` at 8-10 s, against 1.1 s for a write on a fresh tenant.
+
+---
+
+## Engine comparison (RocksDB vs redb)
+
+Not yet measured on this branch. The table below is empty on purpose: run the commands, then paste the script output into it. Do not quote numbers from other machines or from the older sections of this document for this comparison.
+
+### Commands
+
+End-to-end through the HTTP API, one run per memory count. Build the release binary first, then:
+
+```bash
+VELD_BIN=target/release/veld scripts/bench/http_engine_compare.sh --memories 10000
+VELD_BIN=target/release/veld scripts/bench/http_engine_compare.sh --memories 100000
+```
+
+The script starts `veld server` once per engine (default `rocksdb redb`) on a fresh temporary data dir and a free port, seeds the memories through `POST /api/remember`, runs `POST /api/recall` twice over the same deterministic queries (cold, then warm), runs `POST /api/proactive_context` with `auto_ingest` off, and records server RSS after seeding and after recall plus the data dir size. It writes one JSON file per engine to `bench-results/<timestamp>/` and prints the side-by-side table.
+
+Flags: `--engines "A B"`, `--memories N` (default 10000), `--queries N` (default 2000), `--proactive-queries N` (default 200), `--concurrency C` (default 16), `--results-dir DIR`, `--bin PATH`, `--api-key KEY`, `--corpus-seed N`. Run `scripts/bench/http_engine_compare.sh --help` for the full text.
+
+Tuning variables set in the calling environment are passed to the server unchanged: `VELD_STORAGE_DURABILITY` (`immediate` or `eventual`), `VELD_REDB_CACHE_BYTES`, `VELD_ROCKSDB_WRITE_BUFFER_BYTES`, `VELD_ROCKSDB_BLOCK_CACHE_BYTES`, plus the embedder selection `VELD_EMBEDDER` and `VELD_EMBEDDING_API_URL`. Record the values you used next to the results. The values are also saved in each JSON file.
+
+Micro and cold-start benches, which isolate the engines from the HTTP and embedding layers:
+
+```bash
+cargo bench --bench storage_engine_benchmarks
+cargo bench --bench cold_start_benchmarks
+```
+
+### What the numbers include
+
+No deterministic or network-free embedder exists, so remember throughput and cold recall include the cost of embedding each request, and both engines pay it equally. Warm recall repeats the same queries and is served from the query embedding cache, so it is the closest end-to-end figure to storage and index cost. Use one embedder for every run and compare engines with each other on the same machine, not against other hardware. The Criterion benches above are the storage-only numbers.
+
+### Results
+
+Paste the script table for each run below. Columns are filled per engine and memory count.
+
+| Metric | RocksDB 10k | redb 10k | RocksDB 100k | redb 100k |
+|---|---|---|---|---|
+| remember req/s | | | | |
+| remember p95 | | | | |
+| recall cold req/s | | | | |
+| recall warm req/s | | | | |
+| recall p95 warm | | | | |
+| proactive_context req/s | | | | |
+| RSS after seed | | | | |
+| RSS after recall | | | | |
+| data dir size | | | | |
+
+---
+
 ## Running Benchmarks
 
 ```bash

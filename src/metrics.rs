@@ -100,6 +100,107 @@ pub static MEMORY_STORE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     .expect("MEMORY_STORE_DURATION metric must be valid at compile time")
 });
 
+/// Per-stage duration of the write endpoints (remember, upsert, batch_remember).
+/// Buckets span 1 ms to 60 s because the request timeout is 60 s and the
+/// incident this exists for sat in the 10-60 s range.
+pub static WRITE_STAGE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "veld_write_stage_duration_seconds",
+            "Duration of each stage of the memory write path",
+        )
+        .buckets(vec![
+            0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 20.0, 30.0, 45.0, 60.0,
+        ]),
+        &["endpoint", "stage"],
+    )
+    .expect("WRITE_STAGE_DURATION metric must be valid at compile time")
+});
+
+/// Write-path stages that ran longer than [`WRITE_STAGE_TIMEOUT_THRESHOLD`].
+pub static WRITE_STAGE_TIMEOUTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_write_stage_timeouts_total",
+            "Write-path stages that exceeded 30 seconds",
+        ),
+        &["endpoint", "stage"],
+    )
+    .expect("WRITE_STAGE_TIMEOUTS_TOTAL metric must be valid at compile time")
+});
+
+/// A single stage this slow is counted as a timeout (the request timeout is 60 s).
+pub const WRITE_STAGE_TIMEOUT_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Total write time above which one warning with every stage timing is logged.
+pub const WRITE_SLOW_TOTAL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Observe one write-path stage into the histogram and, past the threshold,
+/// the timeout counter. For stages that run detached from the request.
+pub fn observe_write_stage(endpoint: &str, stage: &str, elapsed: std::time::Duration) {
+    WRITE_STAGE_DURATION
+        .with_label_values(&[endpoint, stage])
+        .observe(elapsed.as_secs_f64());
+    if elapsed > WRITE_STAGE_TIMEOUT_THRESHOLD {
+        WRITE_STAGE_TIMEOUTS_TOTAL
+            .with_label_values(&[endpoint, stage])
+            .inc();
+    }
+}
+
+/// Collects stage timings for one write request. Dropping it emits the single
+/// slow-request warning, so early returns and `?` exits are still reported.
+pub struct WriteStageTimer {
+    endpoint: &'static str,
+    started: std::time::Instant,
+    stages: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl WriteStageTimer {
+    pub fn new(endpoint: &'static str) -> Self {
+        Self {
+            endpoint,
+            started: std::time::Instant::now(),
+            stages: Vec::with_capacity(5),
+        }
+    }
+
+    /// Record a stage that began at `since`. Repeated stages accumulate.
+    pub fn record(&mut self, stage: &'static str, since: std::time::Instant) {
+        let elapsed = since.elapsed();
+        observe_write_stage(self.endpoint, stage, elapsed);
+        match self.stages.iter_mut().find(|(name, _)| *name == stage) {
+            Some((_, total)) => *total += elapsed,
+            None => self.stages.push((stage, elapsed)),
+        }
+    }
+
+    fn stage_ms(&self, stage: &str) -> u64 {
+        self.stages
+            .iter()
+            .find(|(name, _)| *name == stage)
+            .map_or(0, |(_, d)| d.as_millis() as u64)
+    }
+}
+
+impl Drop for WriteStageTimer {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        if total > WRITE_SLOW_TOTAL_THRESHOLD {
+            tracing::warn!(
+                endpoint = self.endpoint,
+                total_ms = total.as_millis() as u64,
+                extract_ms = self.stage_ms("extract"),
+                store_ms = self.stage_ms("store"),
+                tag_sources_ms = self.stage_ms("tag_sources"),
+                journal_ms = self.stage_ms("journal"),
+                graph_ms = self.stage_ms("graph"),
+                "slow write request"
+            );
+        }
+    }
+}
+
 /// Memory retrieve operations
 pub static MEMORY_RETRIEVE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
@@ -170,6 +271,50 @@ pub static ONTOLOGICAL_FALLBACK_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
         "Queries where ontological intent was below confidence threshold",
     )
     .expect("ONTOLOGICAL_FALLBACK_TOTAL metric must be valid at compile time")
+});
+
+/// Queries that named a calendar day or month-year and ran the date window candidate leg
+pub static RECALL_DATE_WINDOW_QUERIES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_recall_date_window_queries_total",
+        "Queries that named a calendar day or month-year and ran the date window candidate leg",
+    )
+    .expect("RECALL_DATE_WINDOW_QUERIES_TOTAL metric must be valid at compile time")
+});
+
+/// Candidates the date window leg handed to RRF fusion
+pub static RECALL_DATE_WINDOW_CANDIDATES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_recall_date_window_candidates_total",
+        "Candidates the date window leg handed to RRF fusion",
+    )
+    .expect("RECALL_DATE_WINDOW_CANDIDATES_TOTAL metric must be valid at compile time")
+});
+
+/// Cross-encoder (query, document) pairs by where their score came from: `model` for a
+/// forward pass, `cache` for a repeat of a pair already scored by the same reranker.
+pub static CROSS_ENCODER_PAIRS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_cross_encoder_pairs_total",
+            "Cross-encoder pairs scored, by source (model or cache)",
+        ),
+        &["source"],
+    )
+    .expect("CROSS_ENCODER_PAIRS_TOTAL metric must be valid at compile time")
+});
+
+/// ONNX sessions a cross-encoder has open. A second one opens only when two recalls
+/// reranked at once, and each holds its own copy of the model's weights.
+pub static CROSS_ENCODER_SESSIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "veld_cross_encoder_sessions",
+            "Open ONNX sessions per cross-encoder model",
+        ),
+        &["model"],
+    )
+    .expect("CROSS_ENCODER_SESSIONS metric must be valid at compile time")
 });
 
 /// Queries where ontological filtering was disabled due to high graph density
@@ -919,6 +1064,8 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     // Memory operation metrics
     register!(MEMORY_STORE_TOTAL, "MEMORY_STORE_TOTAL");
     register!(MEMORY_STORE_DURATION, "MEMORY_STORE_DURATION");
+    register!(WRITE_STAGE_DURATION, "WRITE_STAGE_DURATION");
+    register!(WRITE_STAGE_TIMEOUTS_TOTAL, "WRITE_STAGE_TIMEOUTS_TOTAL");
     register!(MEMORY_RETRIEVE_TOTAL, "MEMORY_RETRIEVE_TOTAL");
     register!(MEMORY_RETRIEVE_DURATION, "MEMORY_RETRIEVE_DURATION");
     register!(MEMORY_RETRIEVE_RESULTS, "MEMORY_RETRIEVE_RESULTS");
@@ -933,6 +1080,16 @@ fn do_register_metrics() -> Result<(), MetricsError> {
         "ONTOLOGICAL_RERANK_BOOST_APPLIED"
     );
     register!(ONTOLOGICAL_FALLBACK_TOTAL, "ONTOLOGICAL_FALLBACK_TOTAL");
+    register!(
+        RECALL_DATE_WINDOW_QUERIES_TOTAL,
+        "RECALL_DATE_WINDOW_QUERIES_TOTAL"
+    );
+    register!(
+        RECALL_DATE_WINDOW_CANDIDATES_TOTAL,
+        "RECALL_DATE_WINDOW_CANDIDATES_TOTAL"
+    );
+    register!(CROSS_ENCODER_PAIRS_TOTAL, "CROSS_ENCODER_PAIRS_TOTAL");
+    register!(CROSS_ENCODER_SESSIONS, "CROSS_ENCODER_SESSIONS");
     register!(LTR_TRACE_LABEL_JOIN_MISS, "LTR_TRACE_LABEL_JOIN_MISS");
     register!(LTR_TRACE_GRADUATED_TOTAL, "LTR_TRACE_GRADUATED_TOTAL");
     register!(
@@ -1109,5 +1266,39 @@ mod tests {
         assert_eq!(metric.get_histogram().get_sample_count(), 1);
         // Duration should be at least 10ms
         assert!(metric.get_histogram().get_sample_sum() >= 0.01);
+    }
+
+    #[test]
+    fn test_write_stage_metrics_register_and_accept_labels() {
+        let _ = register_metrics();
+        for endpoint in ["remember", "upsert", "batch_remember"] {
+            let mut timer = WriteStageTimer::new(endpoint);
+            for stage in ["extract", "store", "tag_sources", "journal", "graph"] {
+                timer.record(stage, std::time::Instant::now());
+            }
+        }
+        // Vec metrics only appear in gather() once a child exists.
+        assert!(METRICS_REGISTRY
+            .gather()
+            .iter()
+            .any(|f| f.name() == "veld_write_stage_duration_seconds"));
+        let timeouts = WRITE_STAGE_TIMEOUTS_TOTAL.with_label_values(&["remember", "journal"]);
+        timeouts.inc();
+        assert!(timeouts.get() >= 1);
+        assert!(
+            WRITE_STAGE_DURATION
+                .with_label_values(&["upsert", "graph"])
+                .get_sample_count()
+                >= 1
+        );
+    }
+
+    #[test]
+    fn test_write_stage_timer_accumulates_repeated_stage() {
+        let mut timer = WriteStageTimer::new("batch_remember");
+        let t0 = std::time::Instant::now();
+        timer.record("store", t0);
+        timer.record("store", t0);
+        assert_eq!(timer.stages.len(), 1);
     }
 }

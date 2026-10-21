@@ -5,8 +5,8 @@ use bincode;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "rocksdb")]
 use rocksdb::{
-    Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions,
-    DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBCompressionType,
+    IteratorMode, Options, ReadOptions, WriteBatch, WriteBufferManager, WriteOptions, DB,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "rocksdb")]
@@ -41,27 +41,84 @@ where
     }
 }
 
-/// Write mode for storage operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteMode {
-    /// Sync writes - fsync() on every write (durable but slow: 2-10ms per write)
-    /// Use for: shutdown, critical data, compliance requirements
-    Sync,
-    /// Async writes - no fsync(), data buffered in OS page cache (fast: <1ms per write)
-    /// Use for: robotics, edge, high-throughput scenarios
-    /// Data survives process crashes but NOT power loss before next fsync
-    Async,
+/// Prefixes of the rocksdb default-family rows that are not memories even when their
+/// key happens to be 16 bytes long: the subsystems that share the family.
+#[cfg(feature = "rocksdb")]
+pub(crate) const NON_MEMORY_PREFIXES: &[&[u8]] = &[
+    b"stats:",
+    b"vmapping:",
+    b"interference:",
+    b"interference_meta:",
+    b"_watermark:",
+    b"facts:",
+    b"facts_by_entity:",
+    b"facts_by_type:",
+    b"facts_embedding:",
+    b"temporal_facts:",
+    b"temporal_by_time:",
+    b"temporal_by_entity:",
+    b"lineage:",
+    b"learning:",
+    b"geo:",
+];
+
+/// Whether a default-family key is a memory record's: its 16 id bytes, and under no
+/// prefix another subsystem writes with.
+#[cfg(feature = "rocksdb")]
+pub(crate) fn is_memory_key(key: &[u8]) -> bool {
+    key.len() == 16 && !NON_MEMORY_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
-impl Default for WriteMode {
-    fn default() -> Self {
-        // Default to async for robotics-grade latency
-        // Override with VELD_WRITE_MODE=sync for durability-critical deployments
-        match std::env::var("VELD_WRITE_MODE") {
-            Ok(mode) if mode.to_lowercase() == "sync" => WriteMode::Sync,
-            _ => WriteMode::Async,
-        }
+/// Precision of the geohash every `geo:` index row is keyed by (~1.2 m x 0.6 m cells).
+#[cfg(feature = "rocksdb")]
+const GEO_INDEX_PRECISION: usize = 10;
+
+/// The geohash cells, all of one precision, that together hold every point within
+/// `radius_meters` of the centre: the centre's cell and its eight neighbours, at the
+/// finest precision whose cells are at least as tall and as wide as the circle reaches
+/// from anywhere inside the centre cell. `None` when no precision is coarse enough —
+/// the circle reaches a pole, or the centre lies off the globe — and the whole index
+/// is read instead.
+///
+/// The reach is the haversine's own bound: two points `d` apart differ in latitude by
+/// at most `d / R`, and in longitude by at most `2·asin(sin(d / 2R) / cos φ)`, φ the
+/// greatest latitude either can hold. A cell grid chosen from a nominal cell size
+/// instead missed memories inside the radius whenever the circle crossed more than
+/// one neighbour, which redb's latitude band never does.
+#[cfg(feature = "rocksdb")]
+fn covering_geohash_cells(lat: f64, lon: f64, radius_meters: f64) -> Option<Vec<String>> {
+    use super::types::{geohash_encode, geohash_neighbors};
+
+    if !(-90.0..=90.0).contains(&lat) {
+        return None;
     }
+    let lon = (lon + 180.0).rem_euclid(360.0) - 180.0;
+    let lat_reach = (radius_meters / EARTH_RADIUS_METRES).to_degrees();
+    let polar_lat = lat.abs() + lat_reach;
+    if polar_lat.is_nan() || polar_lat >= 90.0 {
+        return None;
+    }
+    let lon_reach_sine =
+        (radius_meters / (2.0 * EARTH_RADIUS_METRES)).sin() / polar_lat.to_radians().cos();
+    if lon_reach_sine.is_nan() || lon_reach_sine >= 1.0 {
+        return None;
+    }
+    let lon_reach = (2.0 * lon_reach_sine.asin()).to_degrees();
+
+    (1..=GEO_INDEX_PRECISION).rev().find_map(|precision| {
+        let lat_bits = (5 * precision / 2) as i32;
+        let lon_bits = 5 * precision as i32 - lat_bits;
+        let lat_span = 180.0 / 2f64.powi(lat_bits);
+        let lon_span = 360.0 / 2f64.powi(lon_bits);
+        (lat_span >= lat_reach && lon_span >= lon_reach).then(|| {
+            let centre = geohash_encode(lat, lon, precision);
+            let mut cells = geohash_neighbors(&centre);
+            cells.push(centre);
+            cells.sort();
+            cells.dedup();
+            cells
+        })
+    })
 }
 
 // ============================================================================
@@ -589,6 +646,7 @@ impl LegacyMemoryV2 {
 /// was in a legacy format and should be re-written for future performance.
 /// Content in the retired field-level format is opened here and the record flagged,
 /// so the lazy migration rewrites it sealed under the keystore.
+#[cfg(feature = "rocksdb")]
 fn open_legacy_field((mut memory, needs_migration): (Memory, bool)) -> Result<(Memory, bool)> {
     match crate::legacy_field_encryption::open_legacy_content(&memory.experience.content)? {
         Some(plain) => {
@@ -824,8 +882,12 @@ impl LegacyMemoryFlatV3 {
     }
 }
 
+// The four `...PreWriter...` shapes below are decoded only for the byte offset where
+// their end falls, so bincode must walk every field and none is read: hence the allows.
+
 /// `AgentSession` as persisted before 4a54053 (2026-09-10) appended `declared` and `verified`.
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct LegacyAgentSessionPreWriter {
     worktree_path: Option<PathBuf>,
     branch: Option<String>,
@@ -838,6 +900,7 @@ struct LegacyAgentSessionPreWriter {
 /// The record up to the end of a pre-4a54053 session: decoding this and nothing more yields the
 /// offset where the missing bytes belong. Trailing bytes are the rest of the record.
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct LegacyRichContextThroughPreWriterSession {
     id: ContextId,
     conversation: ConversationContext,
@@ -858,12 +921,14 @@ struct LegacyRichContextThroughPreWriterSession {
     session: LegacyAgentSessionPreWriter,
 }
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct LegacyExperienceThroughPreWriterSession {
     experience_type: ExperienceType,
     content: String,
     context: Option<LegacyRichContextThroughPreWriterSession>,
 }
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct LegacyMemoryThroughPreWriterSession {
     id: MemoryId,
     experience: LegacyExperienceThroughPreWriterSession,
@@ -1253,12 +1318,50 @@ const CF_INDEX: &str = "memory_index";
 /// Sentinel (in `CF_INDEX`) holding the last-seen keystore generation; rollback guard.
 #[cfg(feature = "rocksdb")]
 const KEYSTORE_GENERATION_KEY: &[u8] = crate::keystore::GENERATION_SENTINEL_KEY;
+/// Marker (in `CF_INDEX`) that the content-hash rows are one per memory. A `meta:` key,
+/// so `rebuild_index` keeps it.
+#[cfg(feature = "rocksdb")]
+const CONTENT_HASH_LAYOUT_MARKER: &[u8] = b"meta:content_hash_rows_per_memory";
 /// General-purpose key-value column family for small per-user blobs (e.g. the
 /// `CognitiveDials` tuning surface) that don't fit the memory/index schemas.
 /// Created on open via `create_missing_column_families`, so it materializes on
 /// existing databases too.
 #[cfg(feature = "rocksdb")]
 const CF_KV: &str = "kv";
+/// `CF_INDEX` time index of the memories compression has not reached yet:
+/// `uncompressed:{sortable created_at millis}:{uuid}`. Lets the compression pass seek to
+/// its candidates instead of decoding the whole store.
+#[cfg(feature = "rocksdb")]
+const UNCOMPRESSED_INDEX_PREFIX: &str = "uncompressed:";
+/// Set once the uncompressed time index also covers records written before it existed.
+/// A `meta:` key, so `rebuild_index` keeps it while re-deriving the index entries.
+#[cfg(feature = "rocksdb")]
+const UNCOMPRESSED_INDEX_SENTINEL: &[u8] = b"meta:uncompressed_index_v1";
+
+/// Index key of a memory in the uncompressed time index. Millis are mapped onto `u64` with
+/// the sign bit flipped, so zero-padded decimal order is chronological order, pre-1970
+/// timestamps included.
+#[cfg(feature = "rocksdb")]
+fn uncompressed_index_key(created_at: DateTime<Utc>, id: &MemoryId) -> String {
+    format!(
+        "{UNCOMPRESSED_INDEX_PREFIX}{:020}:{}",
+        sortable_millis(created_at),
+        id.0
+    )
+}
+
+#[cfg(feature = "rocksdb")]
+fn sortable_millis(at: DateTime<Utc>) -> u64 {
+    (at.timestamp_millis() as u64) ^ (1u64 << 63)
+}
+
+/// Whether a whole-store scan returns forgotten (soft-deleted) records.
+#[cfg(feature = "rocksdb")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncludeForgotten {
+    Yes,
+    No,
+}
 
 #[cfg(feature = "rocksdb")]
 /// Storage engine for long-term memory persistence
@@ -1270,8 +1373,8 @@ pub struct MemoryStorage {
     db: Arc<DB>,
     /// Base storage path for all memory data
     storage_path: PathBuf,
-    /// Write mode (sync vs async) - affects latency vs durability tradeoff
-    write_mode: WriteMode,
+    /// Whether every write syncs the write-ahead log: `StorageDurability::Immediate`.
+    sync_writes: bool,
     /// Optional record-level encryptor (AES-256-GCM envelope, encryption-v2).
     /// When present, the whole serialized record is encrypted before storage and
     /// decrypted on read. Backed by the keystore (`storage_path/keystore.json`),
@@ -1283,6 +1386,61 @@ pub struct MemoryStorage {
     /// index terms (tag/entity/…) are stored as HMAC tokens, not plaintext.
     /// Derived from the master key alongside `record_cryptors`.
     index_blinder: Option<crate::keystore::IndexBlinder>,
+    /// See [`Self::undecodable_records_skipped`].
+    undecodable_skipped: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "rocksdb")]
+/// Total memtable memory all per-user and shared RocksDB instances may hold.
+const PROCESS_WRITE_BUFFER_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
+#[cfg(feature = "rocksdb")]
+/// Table options every column family uses: the shared block cache, a 10-bit full bloom
+/// filter (about 1% false positives), and index/filter blocks held in that cache with
+/// the L0 ones pinned so point lookups never page them back in.
+///
+/// No prefix extractor is installed on the index family on purpose. Its key families
+/// (`tag:`, `inbound_ref:`, `date:`, `geo:`, `content_hash:` ...) have no common
+/// length, and the scans over it seek with arbitrary-length bounds; with a prefix bloom
+/// RocksDB may skip SST files for a seek whose bound is not the extractor's prefix,
+/// silently dropping rows. The whole-key bloom serves the point lookups that dominate.
+pub fn block_based_options(cache: &Cache) -> BlockBasedOptions {
+    let mut block_opts = BlockBasedOptions::default();
+    block_opts.set_bloom_filter(10.0, false);
+    block_opts.set_block_cache(cache);
+    block_opts.set_cache_index_and_filter_blocks(true);
+    block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    block_opts
+}
+
+#[cfg(feature = "rocksdb")]
+/// Options for a secondary column family (index, KV): Lz4, two memtables of
+/// `write_buffer_bytes`, and [`block_based_options`] over `cache`.
+pub fn column_family_options(cache: &Cache, write_buffer_bytes: usize) -> Options {
+    let mut cf_opts = Options::default();
+    cf_opts.create_if_missing(true);
+    cf_opts.set_compression_type(DBCompressionType::Lz4);
+    cf_opts.set_max_write_buffer_number(2);
+    cf_opts.set_write_buffer_size(write_buffer_bytes);
+    cf_opts.set_block_based_table_factory(&block_based_options(cache));
+    cf_opts
+}
+
+#[cfg(feature = "rocksdb")]
+/// The one write buffer manager every shared-cache RocksDB instance in the process
+/// attaches to (`Options::set_write_buffer_manager`), capping total memtable memory at
+/// 256 MiB and charging it to the cache. Writers are not stalled at the limit; RocksDB
+/// flushes instead. The first caller's cache is the one charged, so every caller must
+/// pass the same process-wide cache.
+pub fn shared_write_buffer_manager(cache: &Cache) -> &'static WriteBufferManager {
+    static MANAGER: std::sync::OnceLock<WriteBufferManager> = std::sync::OnceLock::new();
+    MANAGER.get_or_init(|| {
+        WriteBufferManager::new_write_buffer_manager_with_cache(
+            PROCESS_WRITE_BUFFER_LIMIT_BYTES,
+            false,
+            cache.clone(),
+        )
+    })
 }
 
 #[cfg(feature = "rocksdb")]
@@ -1305,7 +1463,17 @@ impl MemoryStorage {
     /// the shared LRU cache (recommended for multi-tenant server mode). When
     /// `None`, a small per-instance cache is created (standalone / test use).
     pub fn new(path: &Path, shared_cache: Option<&Cache>) -> Result<Self> {
-        Self::open(path, shared_cache, true)
+        Self::new_with_tuning(path, shared_cache, crate::config::StorageTuning::process())
+    }
+
+    /// [`Self::new`] with explicit durability, write-buffer and block-cache settings in
+    /// place of the process's.
+    pub fn new_with_tuning(
+        path: &Path,
+        shared_cache: Option<&Cache>,
+        tuning: crate::config::StorageTuning,
+    ) -> Result<Self> {
+        Self::open(path, shared_cache, true, tuning)
     }
 
     /// Open the store with the keystore already beside it, if any, and never create one:
@@ -1314,15 +1482,22 @@ impl MemoryStorage {
         path: &Path,
         shared_cache: Option<&crate::storage::SharedBlockCache>,
     ) -> Result<Self> {
-        Self::open(path, shared_cache, false)
+        Self::open(
+            path,
+            shared_cache,
+            false,
+            crate::config::StorageTuning::process(),
+        )
     }
 
     fn open(
         path: &Path,
         shared_cache: Option<&crate::storage::SharedBlockCache>,
         create_keystore: bool,
+        tuning: crate::config::StorageTuning,
     ) -> Result<Self> {
-        use crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES;
+        let write_buffer_bytes = tuning.rocksdb_write_buffer_bytes;
+        let sync_writes = tuning.rocksdb_sync_writes();
 
         // Create directories if they don't exist
         let storage_path = path.join("storage");
@@ -1332,25 +1507,25 @@ impl MemoryStorage {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
 
         // ========================================================================
         // DURABILITY SETTINGS - Critical for data persistence across restarts
         // ========================================================================
         //
         // RocksDB data flow: Write → WAL → Memtable → SST files
-        // Without proper sync, data in memtable can be lost on crash/restart
         //
-        // Our approach: Sync WAL on every write (most durable option)
-        // This ensures data survives even if process crashes before memtable flush
+        // Every write reaches the WAL before it returns (manual WAL flush is off),
+        // so it survives a process crash. Whether it also survives a power loss
+        // is `StorageDurability`: `sync_writes` syncs the WAL on every write.
         // ========================================================================
 
         // WAL stays in default location (same as data dir) - avoids corruption issues
         opts.set_manual_wal_flush(false); // Auto-flush WAL entries
 
-        // Write performance — sized for edge deployment (tune up via env for heavy workloads)
+        // Write performance — sized for edge deployment (VELD_ROCKSDB_WRITE_BUFFER_BYTES for heavy workloads)
         opts.set_max_write_buffer_number(2);
-        opts.set_write_buffer_size(ROCKSDB_MEMORY_WRITE_BUFFER_BYTES);
+        opts.set_write_buffer_size(write_buffer_bytes);
         opts.set_level_zero_file_num_compaction_trigger(4);
         opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SST files
         opts.set_max_bytes_for_level_base(256 * 1024 * 1024); // 256MB L1
@@ -1358,58 +1533,55 @@ impl MemoryStorage {
         opts.set_level_compaction_dynamic_level_bytes(true);
 
         // Read performance — shared block cache for multi-tenant, small local for standalone
-        use rocksdb::{BlockBasedOptions, Cache};
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_bloom_filter(10.0, false); // 10 bits/key = ~1% FPR
+        use Cache;
         let local_cache;
         let cache = match shared_cache {
             Some(c) => c,
             None => {
-                local_cache = Cache::new_lru_cache(16 * 1024 * 1024); // 16MB standalone
+                local_cache = Cache::new_lru_cache(tuning.rocksdb_standalone_block_cache_bytes());
                 &local_cache
             }
         };
-        block_opts.set_block_cache(cache);
-        block_opts.set_cache_index_and_filter_blocks(true);
-        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true); // Pin L0 for fast reads
-        opts.set_block_based_table_factory(&block_opts);
+        opts.set_block_based_table_factory(&block_based_options(cache));
+        // Memtable memory is capped process-wide, and only where a shared cache exists:
+        // a standalone store has a private 16MB cache that the manager must not be charged to.
+        if shared_cache.is_some() {
+            opts.set_write_buffer_manager(shared_write_buffer_manager(cache));
+        }
 
-        // Open single database with column families (index CF uses lighter settings)
+        // Open single database with column families. Every family gets the same table
+        // options (shared cache, bloom filter, pinned L0 metadata); the index and KV
+        // families only differ from the record family in carrying no tuned file sizes.
         let main_opts = opts.clone();
+        let index_cache = cache.clone();
         let db = Arc::new(Self::open_or_repair_cf(&opts, &storage_path, move || {
             vec![
                 ColumnFamilyDescriptor::new("default", main_opts.clone()),
-                ColumnFamilyDescriptor::new(CF_INDEX, {
-                    let mut idx_opts = Options::default();
-                    idx_opts.create_if_missing(true);
-                    idx_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-                    idx_opts.set_max_write_buffer_number(2);
-                    idx_opts.set_write_buffer_size(ROCKSDB_MEMORY_WRITE_BUFFER_BYTES);
-                    idx_opts
-                }),
-                ColumnFamilyDescriptor::new(CF_KV, {
-                    let mut kv_opts = Options::default();
-                    kv_opts.create_if_missing(true);
-                    kv_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-                    kv_opts.set_max_write_buffer_number(2);
-                    kv_opts.set_write_buffer_size(ROCKSDB_MEMORY_WRITE_BUFFER_BYTES);
-                    kv_opts
-                }),
+                ColumnFamilyDescriptor::new(
+                    CF_INDEX,
+                    column_family_options(&index_cache, write_buffer_bytes),
+                ),
+                ColumnFamilyDescriptor::new(
+                    CF_KV,
+                    column_family_options(&index_cache, write_buffer_bytes),
+                ),
             ]
         })?);
 
         // Migrate from old separate-DB layout if needed
-        Self::migrate_from_separate_dbs(path, &db)?;
+        Self::migrate_from_separate_dbs(path, &db, sync_writes)?;
+        let converted = Self::convert_single_holder_content_hash_rows(&db, sync_writes)?;
+        if converted > 0 {
+            tracing::info!(
+                rows = converted,
+                "content-hash index converted to one row per memory"
+            );
+        }
 
-        let write_mode = WriteMode::default();
         tracing::info!(
-            "Storage initialized with {:?} write mode (latency: {})",
-            write_mode,
-            if write_mode == WriteMode::Sync {
-                "2-10ms per write"
-            } else {
-                "<1ms per write"
-            }
+            durability = %tuning.durability,
+            sync_writes,
+            "Storage initialized"
         );
 
         // Record-level encryption (encryption-v2): the keystore lives next to the
@@ -1418,7 +1590,7 @@ impl MemoryStorage {
         // passphrase is a hard error (it would otherwise serve ciphertext as
         // plaintext). No keystore + no passphrase = plaintext (backward compatible).
         let (record_cryptors, index_blinder) =
-            match Self::open_record_cryptor(&db, &storage_path, create_keystore)? {
+            match Self::open_record_cryptor(&db, &storage_path, create_keystore, sync_writes)? {
                 Some((cryptors, blinder)) => (Some(cryptors), Some(blinder)),
                 None => (None, None),
             };
@@ -1427,10 +1599,54 @@ impl MemoryStorage {
         Ok(Self {
             db,
             storage_path: path.to_path_buf(),
-            write_mode,
+            sync_writes,
             record_cryptors,
             index_blinder,
+            undecodable_skipped: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Memory records an enumeration has skipped because they would not decode, since
+    /// this store opened.
+    pub fn undecodable_records_skipped(&self) -> u64 {
+        self.undecodable_skipped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A record an enumeration read at `key`, decoded; `None`, logged and counted, when
+    /// it will not decode. Skipped rather than failing the enumeration, on both engines:
+    /// one bad record would otherwise make every listing of the store fail, and
+    /// `cleanup_corrupted` is the path that removes it.
+    fn decode_or_skip(&self, key: &[u8], value: &[u8], read: &'static str) -> Option<Memory> {
+        match self.decode_stored(key, value) {
+            Ok((memory, _)) => Some(memory),
+            Err(e) => {
+                self.note_undecodable(key, &e, read);
+                None
+            }
+        }
+    }
+
+    fn note_undecodable(&self, key: &[u8], error: &anyhow::Error, read: &'static str) {
+        let skipped = self
+            .undecodable_skipped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let memory_id = uuid::Uuid::from_slice(key)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|_| hex::encode(key));
+        tracing::warn!(
+            memory_id = %memory_id,
+            read,
+            skipped_since_open = skipped,
+            error = %error,
+            "memory record does not decode; skipped"
+        );
+    }
+
+    /// Options for a write at this store's durability.
+    fn write_options(&self) -> WriteOptions {
+        crate::storage::rocksdb_write_options(self.sync_writes)
     }
 
     /// Load — or, on first run, create — the record encryptor + index blinder from the keystore.
@@ -1439,6 +1655,7 @@ impl MemoryStorage {
         db: &DB,
         storage_path: &Path,
         create_keystore: bool,
+        sync_writes: bool,
     ) -> Result<
         Option<(
             crate::keystore::RecordCryptors,
@@ -1452,13 +1669,13 @@ impl MemoryStorage {
         let Some(keys) = crate::keystore::open_record_keys(&keystore)? else {
             return Ok(None);
         };
-        Self::check_keystore_generation(db, keys.generation)?;
+        Self::check_keystore_generation(db, keys.generation, sync_writes)?;
         Ok(Some((keys.cryptors, keys.blinder)))
     }
 
     /// Rollback guard: refuse a keystore whose generation is older than the last
     /// one this database observed; advance the stored sentinel otherwise.
-    fn check_keystore_generation(db: &DB, generation: u64) -> Result<()> {
+    fn check_keystore_generation(db: &DB, generation: u64, sync_writes: bool) -> Result<()> {
         let cf = db
             .cf_handle(CF_INDEX)
             .ok_or_else(|| anyhow!("memory_index CF missing for keystore generation sentinel"))?;
@@ -1469,8 +1686,13 @@ impl MemoryStorage {
             .map(u64::from_le_bytes)
             .unwrap_or(0);
         if let Some(next) = crate::keystore::keystore_generation_sentinel(stored, generation)? {
-            db.put_cf(cf, KEYSTORE_GENERATION_KEY, next.to_le_bytes())
-                .context("write keystore generation sentinel")?;
+            db.put_cf_opt(
+                cf,
+                KEYSTORE_GENERATION_KEY,
+                next.to_le_bytes(),
+                &crate::storage::rocksdb_write_options(sync_writes),
+            )
+            .context("write keystore generation sentinel")?;
         }
         Ok(())
     }
@@ -1596,7 +1818,8 @@ impl MemoryStorage {
     /// Detects whether old directories exist and the new CFs are empty, then bulk-copies
     /// all data into the unified DB. Old directories are renamed to *.pre_cf_migration
     /// for rollback safety.
-    fn migrate_from_separate_dbs(base_path: &Path, db: &DB) -> Result<()> {
+    fn migrate_from_separate_dbs(base_path: &Path, db: &DB, sync_writes: bool) -> Result<()> {
+        let write_opts = crate::storage::rocksdb_write_options(sync_writes);
         let old_memories_dir = base_path.join("memories");
         let old_index_dir = base_path.join("memory_index");
 
@@ -1624,12 +1847,12 @@ impl MemoryStorage {
                         batch.put(&key, &value);
                         count += 1;
                         if count.is_multiple_of(10_000) {
-                            db.write(std::mem::take(&mut batch))?;
+                            db.write_opt(std::mem::take(&mut batch), &write_opts)?;
                             tracing::info!("  memories: migrated {count} entries...");
                         }
                     }
                     if !batch.is_empty() {
-                        db.write(batch)?;
+                        db.write_opt(batch, &write_opts)?;
                     }
                     drop(old_db);
                     total_migrated += count;
@@ -1667,12 +1890,12 @@ impl MemoryStorage {
                         batch.put_cf(&index_cf, &key, &value);
                         count += 1;
                         if count.is_multiple_of(10_000) {
-                            db.write(std::mem::take(&mut batch))?;
+                            db.write_opt(std::mem::take(&mut batch), &write_opts)?;
                             tracing::info!("  index: migrated {count} entries...");
                         }
                     }
                     if !batch.is_empty() {
-                        db.write(batch)?;
+                        db.write_opt(batch, &write_opts)?;
                     }
                     drop(old_db);
                     total_migrated += count;
@@ -1711,65 +1934,86 @@ impl MemoryStorage {
     ///
     /// `op` is called at most twice, so it must be replayable.
     fn guarded_write<T>(&self, op: impl Fn() -> Result<T>) -> Result<T> {
-        let latch = crate::storage::write_latch::global();
-        match op() {
-            Ok(value) => {
-                latch.note_write_ok(&self.storage_path);
-                Ok(value)
-            }
-            Err(err) => crate::storage::write_latch::recover_write(
-                latch,
-                &self.db,
-                &self.storage_path,
-                err,
-                op,
-            ),
-        }
+        crate::storage::write_latch::guard(&self.db, op)
     }
 
-    /// Store a memory with configurable write durability
-    ///
-    /// ROBOTICS OPTIMIZATION: Write mode is configurable via VELD_WRITE_MODE env var.
-    /// - Async (default): <1ms per write, data survives process crashes
-    /// - Sync: 2-10ms per write, data survives power loss
-    ///
-    /// For robotics/edge: Use async mode + periodic flush() calls for best latency.
-    /// For compliance/critical: Set VELD_WRITE_MODE=sync for full durability.
-    pub fn store(&self, memory: &Memory) -> Result<()> {
-        let key = memory.id.0.as_bytes();
+    /// [`Self::guarded_write`] for a batch already built.
+    fn guarded_batch(&self, batch: &WriteBatch, opts: &WriteOptions) -> Result<()> {
+        crate::storage::write_latch::guard_batch(&self.db, batch, opts)
+    }
 
-        // Serialize memory (encrypts content field if encryptor is configured)
+    /// Store a memory at the store's durability (`VELD_STORAGE_DURABILITY`).
+    /// - eventual (default): <1ms per write, data survives process crashes
+    /// - immediate: 2-10ms per write, data survives power loss
+    ///
+    /// For robotics/edge: Use eventual + periodic flush() calls for best latency.
+    /// For compliance/critical: Set VELD_STORAGE_DURABILITY=immediate.
+    ///
+    /// The record, the removal of every index row the version it replaces owned, and
+    /// the new version's index rows are one atomic write, so a store over a live id
+    /// never leaves lookups answering for values the memory no longer has.
+    pub fn store(&self, memory: &Memory) -> Result<()> {
         let value = self
             .serialize_memory(memory)
             .context(format!("Failed to serialize memory {}", memory.id.0))?;
 
-        // Use write mode based on configuration
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-
-        // Store in main database
+        // Rebuilt per attempt: `write_opt` consumes the batch and the write latch may replay it.
+        let build = || {
+            let mut batch = WriteBatch::default();
+            self.queue_replaced_index_removals(&memory.id, &mut batch);
+            batch.put(memory.id.0.as_bytes(), &value);
+            self.queue_index_writes(memory, &mut batch);
+            batch
+        };
+        let opts = self.write_options();
         self.guarded_write(|| {
             self.db
-                .put_opt(key, &value, &write_opts)
-                .with_context(|| format!("Failed to put memory {} in RocksDB", memory.id.0))
-        })?;
+                .write_opt(build(), &opts)
+                .with_context(|| format!("Failed to write memory {} to RocksDB", memory.id.0))
+        })
+    }
 
-        // Update indices - rollback main write on failure for consistency
-        if let Err(e) = self.update_indices(memory) {
-            // Rollback: delete the memory we just wrote
-            if let Err(del_err) = self.db.delete(key) {
-                tracing::error!(
-                    "Index write failed AND rollback failed for memory {}: index_err={}, delete_err={}",
-                    memory.id.0, e, del_err
-                );
-            }
-            return Err(e.context(format!(
-                "Failed to update indices for memory {} (rolled back)",
-                memory.id.0
-            )));
+    /// [`Self::store`] for many memories in one atomic write. Each record's replaced
+    /// index rows are read from the store as it stands before the write, so a memory
+    /// should appear once.
+    pub fn store_many(&self, memories: &[Memory]) -> Result<()> {
+        if memories.is_empty() {
+            return Ok(());
         }
+        let values = memories
+            .iter()
+            .map(|memory| {
+                self.serialize_memory(memory)
+                    .context(format!("Failed to serialize memory {}", memory.id.0))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        Ok(())
+        // Rebuilt per attempt: `write_opt` consumes the batch and the write latch may replay it.
+        let build = || {
+            let mut batch = WriteBatch::default();
+            for (memory, value) in memories.iter().zip(&values) {
+                self.queue_replaced_index_removals(&memory.id, &mut batch);
+                batch.put(memory.id.0.as_bytes(), value);
+                self.queue_index_writes(memory, &mut batch);
+            }
+            batch
+        };
+        let opts = self.write_options();
+        self.guarded_write(|| {
+            self.db
+                .write_opt(build(), &opts)
+                .with_context(|| format!("Failed to write {} memories to RocksDB", memories.len()))
+        })
+    }
+
+    /// Queue the removal of the index rows of whatever version is stored under `id`.
+    /// Its rows are named by its fields, so it is read before the write that replaces it.
+    fn queue_replaced_index_removals(&self, id: &MemoryId, batch: &mut WriteBatch) {
+        match self.get_if_present(id) {
+            Ok(Some(previous)) => self.queue_index_removals(id, &previous, batch),
+            Ok(None) => {}
+            Err(e) => self.remove_undecodable_inbound_refs(id, &e),
+        }
     }
 
     /// Update secondary indices for efficient retrieval
@@ -1790,11 +2034,13 @@ impl MemoryStorage {
         for k in &stale {
             batch.delete_cf(idx, k.as_ref());
         }
-        self.db
-            .write(batch)
+        self.guarded_batch(&batch, &self.write_options())
             .context("Failed to clear stale index entries during rebuild")?;
 
-        let memories = self.get_all()?;
+        // Forgotten memories too: a soft delete rewrites the record and leaves its index
+        // rows, so a rebuild that skipped them would answer differently from the store
+        // it replaces, and from redb's rebuild.
+        let memories = self.decode_all_memories(IncludeForgotten::Yes);
         for memory in &memories {
             self.update_indices(memory)?;
         }
@@ -1803,8 +2049,14 @@ impl MemoryStorage {
     }
 
     fn update_indices(&self, memory: &Memory) -> Result<()> {
-        let idx = self.index_cf();
         let mut batch = WriteBatch::default();
+        self.queue_index_writes(memory, &mut batch);
+        self.guarded_batch(&batch, &self.write_options())
+    }
+
+    /// Add to `batch` every index row `memory` owns.
+    fn queue_index_writes(&self, memory: &Memory, batch: &mut WriteBatch) {
+        let idx = self.index_cf();
 
         // === Standard Indices ===
 
@@ -1878,22 +2130,14 @@ impl MemoryStorage {
         // Index by robot_id (for multi-robot systems). Read via
         // resolved_robot_id so the W3 WhoFacet SelfAgent indexes too.
         if let Some(robot_id) = memory.experience.resolved_robot_id() {
-            let robot_key = format!(
-                "robot:{}:{}",
-                self.blind_term(&robot_id.to_string()),
-                memory.id.0
-            );
+            let robot_key = format!("robot:{}:{}", self.blind_term(robot_id), memory.id.0);
             batch.put_cf(idx, robot_key.as_bytes(), b"1");
         }
 
         // Index by mission_id (for mission context retrieval). Read via
         // resolved_mission_id so the W3 WhyFacet goal_stack first entry counts.
         if let Some(mission_id) = memory.experience.resolved_mission_id() {
-            let mission_key = format!(
-                "mission:{}:{}",
-                self.blind_term(&mission_id.to_string()),
-                memory.id.0
-            );
+            let mission_key = format!("mission:{}:{}", self.blind_term(mission_id), memory.id.0);
             batch.put_cf(idx, mission_key.as_bytes(), b"1");
         }
 
@@ -1909,8 +2153,7 @@ impl MemoryStorage {
         // the index CF to anyone who can read it — same class as the date/type/
         // importance range keys. See docs/ENCRYPTION-SECURITY.md.
         if let Some((lat, lon, _alt)) = memory.experience.resolved_geo() {
-            // Precision 10 — warehouse-level accuracy (~1.2m cells).
-            let geohash = super::types::geohash_encode(lat, lon, 10);
+            let geohash = super::types::geohash_encode(lat, lon, GEO_INDEX_PRECISION);
             let geo_key = format!("geo:{}:{}", geohash, memory.id.0);
             batch.put_cf(idx, geo_key.as_bytes(), b"1");
         }
@@ -1934,18 +2177,10 @@ impl MemoryStorage {
             batch.put_cf(idx, reward_key.as_bytes(), b"1");
         }
 
-        // === Content Hash Index (idempotency) ===
-        // Index by SHA256 content hash for dedup (issue #109)
-        // Key format: content_hash:{hex} -> memory_id (16 bytes UUID)
-        // Enables O(1) duplicate detection on remember()
-        {
-            let content_hash = Self::sha256_content_hash(&memory.experience.content);
-            let hash_key = format!(
-                "content_hash:{}",
-                self.blind_term(&content_hash.to_string())
-            );
-            batch.put_cf(idx, hash_key.as_bytes(), memory.id.0.as_bytes());
-        }
+        // === Content Hash Index (idempotency, issue #109) ===
+        // One row per memory, `content_hash:{hash}:{memory_id}`, so memories that share
+        // content each keep a row and deleting one never hides the others.
+        batch.put_cf(idx, self.content_hash_row(memory).as_bytes(), b"1");
 
         // === External Linking Index ===
         // Index by external_id for upsert operations (Linear, GitHub, etc.)
@@ -1984,19 +2219,24 @@ impl MemoryStorage {
         // De-duplicated so a memory that references the same target twice (e.g.
         // both related_memories and a CausalLink) yields a single entry.
         for target in memory.forward_ref_targets() {
-            let inbound_key = format!(
-                "inbound_ref:{}:{}",
-                self.blind_term(&target.0.to_string()),
-                memory.id.0
-            );
+            let inbound_key = self.inbound_ref_key(&target, &memory.id);
             batch.put_cf(idx, inbound_key.as_bytes(), memory.id.0.as_bytes());
         }
 
-        // Use write mode based on configuration
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db.write_opt(batch, &write_opts)?;
-        Ok(())
+        if !memory.compressed && !memory.is_forgotten() {
+            let key = uncompressed_index_key(memory.created_at, &memory.id);
+            batch.put_cf(idx, key.as_bytes(), b"1");
+        }
+    }
+
+    /// `inbound_ref:{blinded(target)}:{holder}`, the reverse-index entry recording that
+    /// `holder` points at `target`.
+    fn inbound_ref_key(&self, target: &MemoryId, holder: &MemoryId) -> String {
+        format!(
+            "inbound_ref:{}:{}",
+            self.blind_term(&target.0.to_string()),
+            holder.0
+        )
     }
 
     /// Public query API (R7) — enumerate the holders that still point AT `target`.
@@ -2171,31 +2411,113 @@ impl MemoryStorage {
         hex::encode(hasher.finalize())
     }
 
+    /// `content_hash:{blinded sha256}:`, the prefix every content-hash row for `content`
+    /// shares.
+    fn content_hash_prefix(&self, content: &str) -> String {
+        format!(
+            "content_hash:{}:",
+            self.blind_term(&Self::sha256_content_hash(content))
+        )
+    }
+
+    fn content_hash_row(&self, memory: &Memory) -> String {
+        self.content_hash_prefix(&memory.experience.content) + &memory.id.0.to_string()
+    }
+
     /// Look up an existing memory by content hash (idempotency dedup, issue #109).
-    /// Returns the MemoryId if identical content was already stored.
+    ///
+    /// When several memories hold this content the lowest id answers, which is the
+    /// first row in key order (a hyphenated uuid sorts as its bytes do) and redb's
+    /// answer. The record is read to confirm the content, so a digest collision cannot
+    /// answer, and rows whose memory is gone or rewritten are removed. A candidate that
+    /// will not decode answers `None`, as on redb.
     pub fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
-        let content_hash = Self::sha256_content_hash(content);
-        let hash_key = format!(
-            "content_hash:{}",
-            self.blind_term(&content_hash.to_string())
-        );
+        let prefix = self.content_hash_prefix(content);
         let idx = self.index_cf();
-        match self.db.get_cf(idx, hash_key.as_bytes()) {
-            Ok(Some(value)) if value.len() == 16 => {
-                let uuid = uuid::Uuid::from_slice(&value).ok()?;
-                // Verify the memory still exists (might have been deleted)
-                let memory_id = MemoryId(uuid);
-                match self.get(&memory_id) {
-                    Ok(_) => Some(memory_id),
-                    Err(_) => {
-                        // Stale index entry — memory was deleted, clean up
-                        let _ = self.db.delete_cf(idx, hash_key.as_bytes());
-                        None
-                    }
+
+        let mut found = None;
+        let mut dangling: Vec<Box<[u8]>> = Vec::new();
+        for (key, _value) in self
+            .db
+            .prefix_iterator_cf(idx, prefix.as_bytes())
+            .log_errors()
+        {
+            let Some(id_bytes) = key.strip_prefix(prefix.as_bytes()) else {
+                break;
+            };
+            let Some(id) = std::str::from_utf8(id_bytes)
+                .ok()
+                .and_then(|id_str| uuid::Uuid::parse_str(id_str).ok())
+                .map(MemoryId)
+            else {
+                continue;
+            };
+            match self.get_if_present(&id).ok()? {
+                Some(memory) if memory.experience.content == content => {
+                    found = Some(id);
+                    break;
                 }
+                _ => dangling.push(key),
             }
-            _ => None,
         }
+
+        if !dangling.is_empty() {
+            let mut batch = WriteBatch::default();
+            for key in &dangling {
+                batch.delete_cf(idx, key);
+            }
+            if let Err(e) = self.guarded_batch(&batch, &self.write_options()) {
+                tracing::warn!(
+                    rows = dangling.len(),
+                    error = %e,
+                    "could not remove content-hash index rows that name no matching memory"
+                );
+            }
+        }
+
+        found
+    }
+
+    /// Rewrite the content-hash rows of a store written before they were one per
+    /// memory, `content_hash:{hash}` holding the id of the memory stored last, into
+    /// `content_hash:{hash}:{id}`. One batch, so a crash leaves the old layout whole.
+    /// The marker is written only into a store that holds rows, so an opened empty
+    /// store stays empty for the boot guard and for `veld migrate`.
+    fn convert_single_holder_content_hash_rows(db: &DB, sync_writes: bool) -> Result<usize> {
+        let Some(idx) = db.cf_handle(CF_INDEX) else {
+            return Ok(0);
+        };
+        if db.get_cf(idx, CONTENT_HASH_LAYOUT_MARKER)?.is_some() {
+            return Ok(0);
+        }
+
+        let prefix = b"content_hash:";
+        let mut saw_rows = false;
+        let mut batch = WriteBatch::default();
+        let mut converted = 0usize;
+        for (key, value) in db.prefix_iterator_cf(idx, prefix).log_errors() {
+            let Some(rest) = key.strip_prefix(prefix.as_slice()) else {
+                break;
+            };
+            saw_rows = true;
+            if rest.contains(&b':') {
+                continue;
+            }
+            batch.delete_cf(idx, &key);
+            if let Ok(holder) = uuid::Uuid::from_slice(&value) {
+                let mut row = key.to_vec();
+                row.push(b':');
+                row.extend_from_slice(holder.to_string().as_bytes());
+                batch.put_cf(idx, row, b"1");
+                converted += 1;
+            }
+        }
+        if saw_rows {
+            batch.put_cf(idx, CONTENT_HASH_LAYOUT_MARKER, b"1");
+            db.write_opt(batch, &crate::storage::rocksdb_write_options(sync_writes))
+                .context("Failed to convert content-hash index rows to one row per memory")?;
+        }
+        Ok(converted)
     }
 
     /// Retrieve a memory by ID
@@ -2203,26 +2525,30 @@ impl MemoryStorage {
     /// Performs lazy migration: if memory is in legacy format, re-writes it
     /// in current format for faster future reads.
     pub fn get(&self, id: &MemoryId) -> Result<Memory> {
+        self.get_if_present(id)?
+            .ok_or_else(|| anyhow!("Memory not found: {id:?}"))
+    }
+
+    /// [`Self::get`], answering an absent record with `None` instead of an error, so a
+    /// caller can tell a missing memory from one that will not decode.
+    fn get_if_present(&self, id: &MemoryId) -> Result<Option<Memory>> {
         let key = id.0.as_bytes();
-        match self.db.get(key)? {
-            Some(value) => {
-                let (memory, needs_migration) =
-                    self.decode_stored(key, &value).with_context(|| {
-                        format!("Failed to decode memory {} ({} bytes)", id.0, value.len())
-                    })?;
+        let Some(value) = self.db.get(key)? else {
+            return Ok(None);
+        };
+        let (memory, needs_migration) = self
+            .decode_stored(key, &value)
+            .with_context(|| format!("Failed to decode memory {} ({} bytes)", id.0, value.len()))?;
 
-                // Lazy migration: re-write legacy formats in current format
-                if needs_migration {
-                    if let Err(e) = self.migrate_memory_format(key, &memory) {
-                        // Migration failure is non-fatal - log and continue
-                        tracing::debug!("Lazy migration skipped for memory {}: {}", memory.id.0, e);
-                    }
-                }
-
-                Ok(memory)
+        // Lazy migration: re-write legacy formats in current format
+        if needs_migration {
+            if let Err(e) = self.migrate_memory_format(key, &memory) {
+                // Migration failure is non-fatal - log and continue
+                tracing::debug!("Lazy migration skipped for memory {}: {}", memory.id.0, e);
             }
-            None => Err(anyhow!("Memory not found: {id:?}")),
         }
+
+        Ok(Some(memory))
     }
 
     /// Re-write a memory in current format (lazy migration helper). Writes only under the key
@@ -2242,7 +2568,7 @@ impl MemoryStorage {
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(false); // Async is fine for migration
 
-        self.db.put_opt(key, &value, &write_opts)?;
+        self.guarded_write(|| Ok(self.db.put_opt(key, &value, &write_opts)?))?;
         tracing::debug!("Migrated memory {} to current format", memory.id.0);
         Ok(())
     }
@@ -2251,78 +2577,75 @@ impl MemoryStorage {
     ///
     /// Returns the memory if found, None if no memory with this external_id exists.
     /// Used for upsert operations when syncing from external sources.
+    ///
+    /// An index row naming a memory that is gone, or that no longer carries this
+    /// external id, is skipped and removed: the record is the truth, as it is for redb.
     pub fn find_by_external_id(&self, external_id: &str) -> Result<Option<Memory>> {
         // Index key format: external:{external_id}:{memory_id}
-        let prefix = format!("external:{}:", self.blind_term(&external_id.to_string()));
+        let prefix = format!("external:{}:", self.blind_term(external_id));
+        let idx = self.index_cf();
 
         let iter = self.db.iterator_cf(
-            self.index_cf(),
+            idx,
             IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
         );
 
+        let mut found = None;
+        let mut dangling: Vec<Box<[u8]>> = Vec::new();
         for (key, _value) in iter.log_errors() {
-            let key_str = String::from_utf8_lossy(&key);
-            if !key_str.starts_with(&prefix) {
+            let Some(id_bytes) = key.strip_prefix(prefix.as_bytes()) else {
                 break;
-            }
-            // Extract memory_id from key (format: external:{external_id}:{memory_id})
-            if let Some(id_str) = key_str.strip_prefix(&prefix) {
-                if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
-                    return Ok(Some(self.get(&MemoryId(uuid))?));
+            };
+            let Some(id) = std::str::from_utf8(id_bytes)
+                .ok()
+                .and_then(|id_str| uuid::Uuid::parse_str(id_str).ok())
+                .map(MemoryId)
+            else {
+                continue;
+            };
+            match self.get_if_present(&id)? {
+                Some(memory) if memory.external_id.as_deref() == Some(external_id) => {
+                    found = Some(memory);
+                    break;
                 }
+                _ => dangling.push(key),
             }
         }
 
-        Ok(None)
+        if !dangling.is_empty() {
+            let mut batch = WriteBatch::default();
+            for key in &dangling {
+                batch.delete_cf(idx, key);
+            }
+            if let Err(e) = self.guarded_batch(&batch, &self.write_options()) {
+                tracing::warn!(
+                    rows = dangling.len(),
+                    error = %e,
+                    "could not remove external-id index rows that name no matching memory"
+                );
+            }
+        }
+
+        Ok(found)
     }
 
-    /// Update an existing memory
-    ///
-    /// ALGO-004 FIX: Re-indexes memory after update to handle importance drift.
-    /// When Hebbian feedback changes importance, the old bucket index becomes stale.
-    /// We remove old indices before storing to ensure index consistency.
+    /// Update an existing memory: [`Self::store`], which replaces the previous version's
+    /// index rows in the write that replaces the record (ALGO-004: Hebbian feedback
+    /// moves importance between buckets, and a stale bucket row would keep answering).
     pub fn update(&self, memory: &Memory) -> Result<()> {
-        // Remove old indices first (they may have stale importance buckets)
-        self.remove_from_indices(&memory.id)?;
-        // Store with fresh indices
         self.store(memory)
     }
 
-    /// Delete a memory with configurable durability
-    #[allow(unused)] // Public API - available for memory management
+    /// Delete a memory, its vector mapping and its index rows: [`Self::delete_with_vectors`].
     pub fn delete(&self, id: &MemoryId) -> Result<()> {
-        // Clean up indices FIRST while the memory still exists in the main DB,
-        // since remove_from_indices() needs to read the memory to reconstruct index keys.
-        self.remove_from_indices(id)?;
-
-        // Then delete from main database
-        let key = id.0.as_bytes();
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db.delete_opt(key, &write_opts)?;
-
-        // Delete vector mapping if present
-        let mapping_key = format!("vmapping:{}", id.0);
-        let _ = self.db.delete_opt(mapping_key.as_bytes(), &write_opts);
-
-        Ok(())
+        self.delete_with_vectors(id)
     }
 
-    /// Remove memory from all indices
+    /// Add to `batch` the deletion of every index row `memory`, stored under `id`, owns.
     /// BUG-005 FIX: Direct key deletion instead of O(n) scan with contains()
     /// We reconstruct index keys from memory metadata for O(k) deletion
-    fn remove_from_indices(&self, id: &MemoryId) -> Result<()> {
-        // Fetch memory to reconstruct index keys
-        let memory = match self.get(id) {
-            Ok(m) => m,
-            Err(_) => {
-                tracing::debug!("Memory {} not found, skipping index cleanup", id.0);
-                return Ok(());
-            }
-        };
-
+    fn queue_index_removals(&self, id: &MemoryId, memory: &Memory, batch: &mut WriteBatch) {
         let idx = self.index_cf();
-        let mut batch = WriteBatch::default();
 
         // Reconstruct and delete all index keys directly (O(k) instead of O(n))
 
@@ -2377,23 +2700,19 @@ impl MemoryStorage {
 
         // Robot index — must mirror update_indices's resolved_robot_id read.
         if let Some(robot_id) = memory.experience.resolved_robot_id() {
-            let robot_key = format!("robot:{}:{}", self.blind_term(&robot_id.to_string()), id.0);
+            let robot_key = format!("robot:{}:{}", self.blind_term(robot_id), id.0);
             batch.delete_cf(idx, robot_key.as_bytes());
         }
 
         // Mission index — must mirror update_indices's resolved_mission_id read.
         if let Some(mission_id) = memory.experience.resolved_mission_id() {
-            let mission_key = format!(
-                "mission:{}:{}",
-                self.blind_term(&mission_id.to_string()),
-                id.0
-            );
+            let mission_key = format!("mission:{}:{}", self.blind_term(mission_id), id.0);
             batch.delete_cf(idx, mission_key.as_bytes());
         }
 
         // Geo index — must mirror update_indices's resolved_geo read.
         if let Some((lat, lon, _alt)) = memory.experience.resolved_geo() {
-            let geohash = super::types::geohash_encode(lat, lon, 10);
+            let geohash = super::types::geohash_encode(lat, lon, GEO_INDEX_PRECISION);
             let geo_key = format!("geo:{}:{}", geohash, id.0);
             batch.delete_cf(idx, geo_key.as_bytes());
         }
@@ -2416,15 +2735,10 @@ impl MemoryStorage {
             batch.delete_cf(idx, reward_key.as_bytes());
         }
 
-        // Content hash index (idempotency dedup)
-        {
-            let content_hash = Self::sha256_content_hash(&memory.experience.content);
-            let hash_key = format!(
-                "content_hash:{}",
-                self.blind_term(&content_hash.to_string())
-            );
-            batch.delete_cf(idx, hash_key.as_bytes());
-        }
+        batch.delete_cf(
+            idx,
+            self.content_hash_prefix(&memory.experience.content) + &id.0.to_string(),
+        );
 
         // External linking index
         if let Some(ref external_id) = memory.external_id {
@@ -2447,42 +2761,68 @@ impl MemoryStorage {
         }
 
         // === Inbound-Reference Reverse Index teardown (R7 / F2) ===
-        // Remove every reverse entry whose HOLDER is this memory, regardless of
-        // target. Keys are `inbound_ref:{blinded(target)}:{holder}`, so the holder
-        // is NOT a prefix — we scan the whole `inbound_ref:` keyspace and match on
-        // the holder suffix. This is the update-diff–safe teardown (Option b): we
-        // do NOT reconstruct the OLD memory's targets, so entries for targets that
-        // an update DROPPED are also removed. `storage.update()` calls
-        // remove_from_indices(old) then store(new); removing by holder-suffix here
-        // guarantees no stale `inbound_ref` survives the diff. The reverse entries
-        // for which this memory is the TARGET (i.e. other holders pointing AT it)
-        // are intentionally left — those holders still reference it.
-        {
-            let holder_suffix = format!(":{}", id.0);
-            let scan_prefix = b"inbound_ref:";
-            let inbound_iter = self.db.iterator_cf(
-                idx,
-                IteratorMode::From(scan_prefix, rocksdb::Direction::Forward),
-            );
-            for (key, _value) in inbound_iter.log_errors() {
-                if !key.starts_with(scan_prefix) {
-                    break;
-                }
-                if key.ends_with(holder_suffix.as_bytes()) {
-                    batch.delete_cf(idx, key.as_ref());
-                }
-            }
+        // `memory` is the record as stored, read before the write that replaces it, so its
+        // targets are exactly the entries `queue_index_writes` wrote for it: targets an update DROPS are among them and are removed here, and the
+        // new version's targets are written fresh by the store that follows. Entries
+        // for which this memory is the TARGET belong to other holders and stay.
+        for target in memory.forward_ref_targets() {
+            batch.delete_cf(idx, self.inbound_ref_key(&target, id).as_bytes());
         }
 
-        // Use write mode based on configuration
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db.write_opt(batch, &write_opts)?;
-        Ok(())
+        batch.delete_cf(
+            idx,
+            uncompressed_index_key(memory.created_at, id).as_bytes(),
+        );
     }
 
-    /// Search memories by various criteria
+    /// A stored record that does not decode cannot name its index rows. Its inbound_ref
+    /// entries can still be found by their holder suffix, so those are removed by scan;
+    /// the rest stay until `rebuild_index`.
+    fn remove_undecodable_inbound_refs(&self, id: &MemoryId, error: &anyhow::Error) {
+        tracing::warn!(
+            memory_id = %id.0,
+            error = %error,
+            "stored record does not decode; removing its inbound_ref entries by scan"
+        );
+        if let Err(e) = self.remove_inbound_refs_by_holder_scan(id) {
+            tracing::warn!(memory_id = %id.0, error = %e, "inbound_ref scan removal failed");
+        }
+    }
+
+    /// Remove every `inbound_ref:*:{holder}` entry by scanning the whole reverse index.
+    /// The holder is the key's suffix, not its prefix, so this is O(index); it is only for
+    /// a holder whose stored record cannot be decoded to name its targets.
+    fn remove_inbound_refs_by_holder_scan(&self, holder: &MemoryId) -> Result<()> {
+        let idx = self.index_cf();
+        let holder_suffix = format!(":{}", holder.0);
+        let scan_prefix = b"inbound_ref:";
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        let iter = self.db.iterator_cf_opt(
+            idx,
+            read_opts,
+            IteratorMode::From(scan_prefix, rocksdb::Direction::Forward),
+        );
+        let mut batch = WriteBatch::default();
+        for (key, _value) in iter.log_errors() {
+            if !key.starts_with(scan_prefix) {
+                break;
+            }
+            if key.ends_with(holder_suffix.as_bytes()) {
+                batch.delete_cf(idx, key.as_ref());
+            }
+        }
+        self.guarded_batch(&batch, &self.write_options())
+    }
+
+    /// Search memories by various criteria.
+    ///
+    /// The index scans below generate candidates — whole UTC days, importance tenths,
+    /// reward twentieths, geohash cells — and every candidate is then held to
+    /// [`SearchCriteria::matches`], the exact predicate redb answers with, so a bound
+    /// inside a bucket returns what it names and nothing else in the bucket.
     pub fn search(&self, criteria: SearchCriteria) -> Result<Vec<Memory>> {
+        let exact = criteria.clone();
         let mut memory_ids = Vec::new();
 
         match criteria {
@@ -2570,13 +2910,20 @@ impl MemoryStorage {
             }
         }
 
-        // Fetch full memories, filtering out forgotten ones
+        // Fetch full memories, filtering out forgotten ones. A row whose memory is gone
+        // is stale and passed over; one whose memory will not decode is counted.
+        let mut seen = std::collections::HashSet::new();
         let mut memories = Vec::new();
         for id in memory_ids {
-            if let Ok(memory) = self.get(&id) {
-                if !memory.is_forgotten() {
-                    memories.push(memory);
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            match self.get_if_present(&id) {
+                Ok(Some(memory)) if !memory.is_forgotten() && exact.matches(&memory) => {
+                    memories.push(memory)
                 }
+                Ok(_) => {}
+                Err(e) => self.note_undecodable(id.0.as_bytes(), &e, "search"),
             }
         }
 
@@ -2725,9 +3072,8 @@ impl MemoryStorage {
             }
         }
 
-        // A HashSet has no order, and recall_by_tags truncates what this returns — so with more
-        // matches than the limit, WHICH records came back changed between identical calls.
-        // Sorted by id the truncation is at least repeatable; callers wanting recency sort again.
+        // A HashSet has no order; sorted by id the result is repeatable. recall_by_tags orders by
+        // recency itself before it truncates.
         let mut ids: Vec<MemoryId> = all_ids.into_iter().collect();
         ids.sort();
         Ok(ids)
@@ -2737,7 +3083,7 @@ impl MemoryStorage {
     /// Returns all memories in the specified episode
     fn search_by_episode(&self, episode_id: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("episode:{}:", self.blind_term(&episode_id.to_string()));
+        let prefix = format!("episode:{}:", self.blind_term(episode_id));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2817,7 +3163,7 @@ impl MemoryStorage {
     /// Search memories by robot/drone identifier
     fn search_by_robot(&self, robot_id: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("robot:{}:", self.blind_term(&robot_id.to_string()));
+        let prefix = format!("robot:{}:", self.blind_term(robot_id));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2841,7 +3187,7 @@ impl MemoryStorage {
     /// Search memories by mission identifier
     fn search_by_mission(&self, mission_id: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("mission:{}:", self.blind_term(&mission_id.to_string()));
+        let prefix = format!("mission:{}:", self.blind_term(mission_id));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2866,63 +3212,54 @@ impl MemoryStorage {
     ///
     /// Performance: O(k) where k = memories in ~9 geohash cells covering the radius
     /// Previous approach was O(n) where n = all geo-indexed memories
+    /// Candidates for a radius search: every memory indexed in a geohash cell the
+    /// circle can reach, each held to the exact haversine by `search`.
     fn search_by_location(
         &self,
         center_lat: f64,
         center_lon: f64,
         radius_meters: f64,
     ) -> Result<Vec<MemoryId>> {
-        use super::types::{geohash_decode, geohash_search_prefixes, GeoFilter};
+        let finite_query = center_lat.is_finite()
+            && center_lon.is_finite()
+            && !radius_meters.is_nan()
+            && radius_meters >= 0.0;
+        if !finite_query {
+            return Ok(Vec::new());
+        }
+        let cells = covering_geohash_cells(center_lat, center_lon, radius_meters)
+            .unwrap_or_else(|| vec![String::new()]);
 
-        let geo_filter = GeoFilter::new(center_lat, center_lon, radius_meters);
         let mut ids = Vec::new();
-
-        // Get geohash prefixes for center + neighbors at appropriate precision
-        let prefixes = geohash_search_prefixes(center_lat, center_lon, radius_meters);
-
-        // Scan only the relevant geohash cells (9 cells = center + 8 neighbors)
-        for geohash_prefix in prefixes {
-            // Use prefix WITHOUT trailing colon so shorter search prefixes (e.g. precision 6)
-            // still match longer stored geohashes (precision 10).
-            // Stored keys: "geo:s02jksd91f:{uuid}", search prefix: "geo:s02jks"
-            let prefix = format!("geo:{}", geohash_prefix);
+        for cell in cells {
+            // No trailing colon: a coarse cell prefixes every stored precision-10 hash in it.
+            let prefix = format!("geo:{cell}");
             let iter = self.db.iterator_cf(
                 self.index_cf(),
                 IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
             );
-
             for (key, _value) in iter.log_errors() {
                 let key_str = String::from_utf8_lossy(&key);
                 if !key_str.starts_with(&prefix) {
                     break;
                 }
-
                 // Key format: geo:GEOHASH:memory_id
-                let parts: Vec<&str> = key_str.split(':').collect();
-                if parts.len() >= 3 {
-                    let geohash = parts[1];
-                    // Decode geohash to get approximate lat/lon for distance check
-                    let (min_lat, min_lon, max_lat, max_lon) = geohash_decode(geohash);
-                    let approx_lat = (min_lat + max_lat) / 2.0;
-                    let approx_lon = (min_lon + max_lon) / 2.0;
-
-                    // Final haversine check for edge cases at cell boundaries
-                    if geo_filter.contains(approx_lat, approx_lon) {
-                        if let Ok(uuid) = uuid::Uuid::parse_str(parts[2]) {
-                            ids.push(MemoryId(uuid));
-                        }
-                    }
+                if let Some(uuid) = key_str
+                    .rsplit(':')
+                    .next()
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                {
+                    ids.push(MemoryId(uuid));
                 }
             }
         }
-
         Ok(ids)
     }
 
     /// Search memories by action type
     fn search_by_action_type(&self, action_type: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("action:{}:", self.blind_term(&action_type.to_string()));
+        let prefix = format!("action:{}:", self.blind_term(action_type));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -3095,17 +3432,17 @@ impl MemoryStorage {
         Ok(result)
     }
 
-    /// Get all memory IDs without loading full Memory objects.
+    /// Every memory key under `prefix`, values not loaded.
     ///
-    /// Returns only 16-byte UUID keys (lightweight). Use with `get()` to load
-    /// individual memories in batches to avoid OOM on large datasets.
-    /// Every key under `prefix`, values not loaded.
+    /// Memory keys only — the 16-byte ids `get_all_ids` reads — although the default
+    /// family also holds vector mappings, counters, facts and KV rows: redb keeps
+    /// memories in a table of their own, and `PrimaryMemoryStore::scan_prefix_keys`
+    /// answers the same keys on both engines. The default keyspace is read through
+    /// `default_key_value_store`.
     ///
     /// The prefix bound is enforced HERE. rocksdb's `prefix_iterator` may run past
     /// the prefix, so callers were carrying `if !key.starts_with(p) { break }` by
-    /// hand — a guard whose absence deletes keys nobody asked about, and one of the
-    /// call sites is a GDPR erasure path. `PrimaryMemoryStore::scan_prefix_keys`
-    /// delegates here, so the concrete and trait paths cannot diverge.
+    /// hand — a guard whose absence deletes keys nobody asked about.
     pub fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut keys = Vec::new();
         for item in self.db.prefix_iterator(prefix) {
@@ -3113,7 +3450,9 @@ impl MemoryStorage {
             if !key.starts_with(prefix) {
                 break;
             }
-            keys.push(key.to_vec());
+            if is_memory_key(&key) {
+                keys.push(key.to_vec());
+            }
         }
         Ok(keys)
     }
@@ -3124,12 +3463,17 @@ impl MemoryStorage {
         // flight, and a file-level `use` of the trait would put two same-named
         // things one glance apart in a 4000-line file.
         use crate::storage::BatchWriter as _;
-        crate::storage::RocksDbBatchWriter::new(self.db()).write_batch(batch)
+        crate::storage::RocksDbBatchWriter::with_sync_writes(self.db(), self.sync_writes)
+            .write_batch(batch)
     }
 
+    /// Get all memory IDs without loading full Memory objects.
+    ///
+    /// Returns only 16-byte UUID keys (lightweight). Use with `get()` to load
+    /// individual memories in batches to avoid OOM on large datasets.
     pub fn get_all_ids(&self) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
         for (key, _) in iter.flatten() {
@@ -3141,15 +3485,21 @@ impl MemoryStorage {
         Ok(ids)
     }
 
-    /// Get all memories from long-term storage
+    /// Every live memory in long-term storage: forgotten (soft-deleted) records are
+    /// left out, as `PrimaryMemoryStore::get_all` documents for every engine.
     ///
     /// Only returns entries with valid 16-byte UUID keys (consistent with get_stats)
     pub fn get_all(&self) -> Result<Vec<Memory>> {
+        Ok(self.decode_all_memories(IncludeForgotten::No))
+    }
+
+    /// Every decodable memory record, in key order.
+    fn decode_all_memories(&self, forgotten: IncludeForgotten) -> Vec<Memory> {
         let mut memories = Vec::new();
 
         // fill_cache(false) prevents this maintenance scan from polluting
         // the block cache with cold data, reducing C++ peak memory
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
         for (key, value) in iter.flatten() {
@@ -3157,34 +3507,128 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
-                if !memory.is_forgotten() {
+            if let Some(memory) = self.decode_or_skip(&key, &value, "memory scan") {
+                if forgotten == IncludeForgotten::Yes || !memory.is_forgotten() {
                     memories.push(memory);
                 }
             }
+        }
+
+        memories
+    }
+
+    /// Memories not yet compressed or forgotten, created before `cutoff`.
+    ///
+    /// A range seek over the uncompressed time index that decodes only the candidates.
+    /// Entries the index still holds for a record that has since been compressed,
+    /// forgotten or deleted are dropped as they are met.
+    pub fn get_uncompressed_older_than(&self, cutoff: DateTime<Utc>) -> Result<Vec<Memory>> {
+        self.ensure_uncompressed_index()?;
+
+        let idx = self.index_cf();
+        let prefix = UNCOMPRESSED_INDEX_PREFIX.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        read_opts.set_iterate_upper_bound(format!(
+            "{UNCOMPRESSED_INDEX_PREFIX}{:020}",
+            sortable_millis(cutoff)
+        ));
+        let iter = self.db.iterator_cf_opt(
+            idx,
+            read_opts,
+            IteratorMode::From(prefix, rocksdb::Direction::Forward),
+        );
+
+        let mut memories = Vec::new();
+        let mut stale = WriteBatch::default();
+        for (key, _) in iter.log_errors() {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let Some(id) = std::str::from_utf8(&key)
+                .ok()
+                .and_then(|k| k.rsplit(':').next())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                .map(MemoryId)
+            else {
+                stale.delete_cf(idx, key.as_ref());
+                continue;
+            };
+            match self.get_uncached(&id) {
+                Ok(Some(memory)) => {
+                    let current = !memory.compressed
+                        && !memory.is_forgotten()
+                        && uncompressed_index_key(memory.created_at, &id).as_bytes() == &key[..];
+                    if !current {
+                        stale.delete_cf(idx, key.as_ref());
+                    } else if memory.created_at < cutoff {
+                        memories.push(memory);
+                    }
+                }
+                Ok(None) => stale.delete_cf(idx, key.as_ref()),
+                Err(e) => {
+                    tracing::debug!("compression candidate {} skipped: {e}", id.0);
+                }
+            }
+        }
+        if !stale.is_empty() {
+            self.guarded_batch(&stale, &self.write_options())?;
         }
 
         Ok(memories)
     }
 
-    pub fn get_uncompressed_older_than(&self, cutoff: DateTime<Utc>) -> Result<Vec<Memory>> {
-        let mut memories = Vec::new();
+    /// Read and decode one record without filling the block cache or rewriting legacy
+    /// encodings: for maintenance passes that visit records nobody asked for.
+    fn get_uncached(&self, id: &MemoryId) -> Result<Option<Memory>> {
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        let key = id.0.as_bytes();
+        match self.db.get_opt(key, &read_opts)? {
+            Some(value) => Ok(Some(self.decode_stored(key, &value)?.0)),
+            None => Ok(None),
+        }
+    }
 
-        // Iterate through all memories
-        let iter = self.db.iterator(IteratorMode::Start);
-        for (key, value) in iter.flatten() {
-            // Only process valid 16-byte UUID keys
+    /// Index every record written before the uncompressed time index existed, once.
+    /// A write racing the backfill can leave an entry for a record that is compressed by
+    /// the time it lands; `get_uncompressed_older_than` drops such entries when it meets
+    /// them.
+    fn ensure_uncompressed_index(&self) -> Result<()> {
+        let idx = self.index_cf();
+        if self.db.get_cf(idx, UNCOMPRESSED_INDEX_SENTINEL)?.is_some() {
+            return Ok(());
+        }
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        let mut batch = WriteBatch::default();
+        let mut indexed = 0usize;
+        for (key, value) in self
+            .db
+            .iterator_opt(IteratorMode::Start, read_opts)
+            .log_errors()
+        {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
-                if !memory.compressed && !memory.is_forgotten() && memory.created_at < cutoff {
-                    memories.push(memory);
+            if let Some(memory) = self.decode_or_skip(&key, &value, "ensure_uncompressed_index") {
+                if !memory.compressed && !memory.is_forgotten() {
+                    let index_key = uncompressed_index_key(memory.created_at, &memory.id);
+                    batch.put_cf(idx, index_key.as_bytes(), b"1");
+                    indexed += 1;
+                    if batch.len() >= 10_000 {
+                        self.guarded_batch(&std::mem::take(&mut batch), &self.write_options())
+                            .context("Failed to write the uncompressed time index backfill")?;
+                    }
                 }
             }
         }
-
-        Ok(memories)
+        batch.put_cf(idx, UNCOMPRESSED_INDEX_SENTINEL, b"1");
+        self.guarded_batch(&batch, &self.write_options())
+            .context("Failed to write the uncompressed time index backfill")?;
+        tracing::info!(indexed, "Backfilled the uncompressed-memory time index");
+        Ok(())
     }
 
     /// Mark memories as forgotten (soft delete) with atomic batch write.
@@ -3218,6 +3662,10 @@ impl MemoryStorage {
 
                         let updated_value = self.serialize_memory(&memory)?;
                         batch.put(&key, updated_value);
+                        batch.delete_cf(
+                            self.index_cf(),
+                            uncompressed_index_key(memory.created_at, &memory.id).as_bytes(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -3232,7 +3680,7 @@ impl MemoryStorage {
         if !flagged_ids.is_empty() {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);
-            self.db.write_opt(batch, &write_opts)?;
+            self.guarded_batch(&batch, &write_opts)?;
         }
 
         Ok(flagged_ids)
@@ -3269,6 +3717,10 @@ impl MemoryStorage {
 
                         let updated_value = self.serialize_memory(&memory)?;
                         batch.put(&key, updated_value);
+                        batch.delete_cf(
+                            self.index_cf(),
+                            uncompressed_index_key(memory.created_at, &memory.id).as_bytes(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -3283,7 +3735,7 @@ impl MemoryStorage {
         if !flagged_ids.is_empty() {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);
-            self.db.write_opt(batch, &write_opts)?;
+            self.guarded_batch(&batch, &write_opts)?;
         }
 
         Ok(flagged_ids)
@@ -3338,7 +3790,9 @@ impl MemoryStorage {
         let mut deserialize_errors = 0;
         let stats_prefix = b"stats:";
 
-        let iter = self.db.iterator(IteratorMode::Start);
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
         for item in iter {
             match item {
                 Ok((key, value)) => {
@@ -3437,103 +3891,85 @@ impl MemoryStorage {
         const RETRIEVAL_KEY: &[u8] = b"stats:total_retrievals";
         let current = self.get_retrieval_count().unwrap_or(0);
         let new_count = current + 1;
-        self.db.put(RETRIEVAL_KEY, new_count.to_le_bytes())?;
+        let opts = self.write_options();
+        self.guarded_write(|| {
+            Ok(self
+                .db
+                .put_opt(RETRIEVAL_KEY, new_count.to_le_bytes(), &opts)?)
+        })?;
         Ok(new_count)
     }
 
-    /// Remove corrupted memories that fail to deserialize even with legacy fallbacks
-    /// Returns the number of entries deleted
+    /// Remove memory records that fail to deserialize even with legacy fallbacks, with
+    /// their index rows, in one atomic write. Returns the number of records deleted.
     ///
-    /// This function safely cleans up:
-    /// 1. Entries with keys that are not valid 16-byte UUIDs (corrupted/misplaced)
-    /// 2. Entries with valid UUID keys but corrupted values that fail ALL format fallbacks
+    /// Only memory keys ([`is_memory_key`]) are inspected. The default family is shared with
+    /// vector mappings, counters, facts, lineage, ACLs, merge audit and tombstone rows
+    /// and KV rows written through `default_key_value_store`; none of them is a memory,
+    /// so none of them can be a corrupted one, and a skip list of their prefixes
+    /// deleted every subsystem it had not heard of. redb's cleanup reads its memories
+    /// table alone, and the two answer the same.
     ///
-    /// It preserves:
-    /// - Valid Memory entries (any format - current or legacy)
-    /// - Stats entries (keys starting with "stats:")
+    /// A sealed record that will not open is never deleted: wrong key, missing key
+    /// and tamper are indistinguishable under AES-GCM, and deleting on a key
+    /// misconfiguration would destroy data a restored keystore opens.
     pub fn cleanup_corrupted(&self) -> Result<usize> {
-        let mut to_delete = Vec::new();
-
-        // Known non-memory prefixes in the default CF that must be preserved.
-        // These are legitimate data entries stored by subsystems that share the
-        // default column family via storage.db(): SemanticFactStore, TemporalFactStore,
-        // LineageGraph, LearningHistoryStore, plus vector mappings and interference.
-        let skip_prefixes: &[&[u8]] = &[
-            b"stats:",
-            b"vmapping:",
-            b"interference:",
-            b"interference_meta:",
-            b"_watermark:",
-            b"facts:",
-            b"facts_by_entity:",
-            b"facts_by_type:",
-            b"facts_embedding:",
-            b"temporal_facts:",
-            b"temporal_by_time:",
-            b"temporal_by_entity:",
-            b"lineage:",
-            b"learning:",
-            b"geo:",
-        ];
-
-        let iter = self.db.iterator(IteratorMode::Start);
-        for (key, value) in iter.flatten() {
-            // Skip known non-memory prefixed entries
-            if skip_prefixes.iter().any(|p| key.starts_with(p)) {
+        let mut doomed: Vec<uuid::Uuid> = Vec::new();
+        for (key, value) in self.db.iterator(IteratorMode::Start).flatten() {
+            if !is_memory_key(&key) {
                 continue;
             }
-
-            // Valid memory keys should be exactly 16 bytes (UUID bytes)
-            let is_valid_memory_key = key.len() == 16;
-
-            if !is_valid_memory_key {
-                // Key is not a valid UUID - this is a corrupted or misplaced entry
-                tracing::debug!(
-                    "Marking for deletion: invalid key length {} (expected 16)",
-                    key.len()
-                );
-                to_delete.push(key.to_vec());
-            } else if !crate::keystore::is_encrypted_record(&value)
-                && deserialize_memory(&value).is_err()
-            {
-                // Plaintext record that fails all format fallbacks — truly corrupted.
-                tracing::debug!(
-                    "Marking for deletion: corrupted plaintext value ({} bytes)",
-                    value.len()
-                );
-                to_delete.push(key.to_vec());
-            } else if crate::keystore::is_encrypted_record(&value)
-                && self.decode_stored(&key, &value).is_err()
-            {
-                // An encrypted record that won't decode means wrong/missing key or
-                // tamper — indistinguishable in AES-GCM. NEVER auto-delete (that would
-                // risk mass data loss on a key misconfiguration); surface for a human.
-                tracing::warn!(
-                    "Encrypted record fails to decode (wrong/missing key or tamper); \
-                     NOT auto-deleting ({} bytes)",
-                    value.len()
-                );
-            }
-        }
-
-        let count = to_delete.len();
-        if count > 0 {
-            tracing::info!("Cleaning up {} corrupted memory entries", count);
-
-            let mut write_opts = WriteOptions::default();
-            write_opts.set_sync(self.write_mode == WriteMode::Sync);
-
-            for key in to_delete {
-                if let Err(e) = self.db.delete_opt(&key, &write_opts) {
-                    tracing::warn!("Failed to delete corrupted entry: {}", e);
+            let Ok(id) = uuid::Uuid::from_slice(&key) else {
+                continue;
+            };
+            if crate::keystore::is_encrypted_record(&value) {
+                if self.decode_stored(&key, &value).is_err() {
+                    tracing::warn!(
+                        memory_id = %id,
+                        bytes = value.len(),
+                        "sealed record does not open (wrong/missing key or tamper); not deleting it"
+                    );
                 }
+            } else if deserialize_memory(&value).is_err() {
+                tracing::debug!(memory_id = %id, bytes = value.len(), "record does not decode; deleting it");
+                doomed.push(id);
             }
-
-            // Flush to persist deletions
-            self.flush()?;
         }
 
-        Ok(count)
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        tracing::info!(
+            records = doomed.len(),
+            "cleaning up corrupted memory records"
+        );
+        let mut batch = WriteBatch::default();
+        for id in &doomed {
+            batch.delete(id.as_bytes());
+        }
+        self.queue_index_rows_naming(&doomed, &mut batch);
+        self.guarded_batch(&batch, &self.write_options())?;
+        self.flush()?;
+        Ok(doomed.len())
+    }
+
+    /// Queue the removal of every index row that names one of `ids`, read from the index
+    /// itself: a record that will not decode cannot say which rows were its own. Every
+    /// row key ends `:{id}`.
+    fn queue_index_rows_naming(&self, ids: &[uuid::Uuid], batch: &mut WriteBatch) {
+        let named: std::collections::HashSet<uuid::Uuid> = ids.iter().copied().collect();
+        let idx = self.index_cf();
+        for (key, _value) in self.db.iterator_cf(idx, IteratorMode::Start).log_errors() {
+            let names_one = key
+                .rsplit(|byte| *byte == b':')
+                .next()
+                .and_then(|suffix| std::str::from_utf8(suffix).ok())
+                .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok())
+                .is_some_and(|id| named.contains(&id));
+            if names_one {
+                batch.delete_cf(idx, key.as_ref());
+            }
+        }
     }
 
     /// Migrate legacy memories to current format for improved performance
@@ -3598,13 +4034,14 @@ impl MemoryStorage {
                 to_migrate.len()
             );
 
-            let mut write_opts = WriteOptions::default();
-            write_opts.set_sync(self.write_mode == WriteMode::Sync);
+            let write_opts = self.write_options();
 
             for (key, memory) in to_migrate {
                 match self.serialize_memory(&memory) {
                     Ok(serialized) => {
-                        if let Err(e) = self.db.put_opt(&key, &serialized, &write_opts) {
+                        if let Err(e) = self.guarded_write(|| {
+                            Ok(self.db.put_opt(&key, &serialized, &write_opts)?)
+                        }) {
                             tracing::warn!("Failed to migrate memory: {e}");
                             failed += 1;
                         } else {
@@ -3678,12 +4115,21 @@ impl MemoryStorage {
     /// column family. Data written before the column families exists here, and
     /// moving it is a migration, not a refactor — see the type's own note.
     pub fn default_key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
-        Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(self.db.clone()))
+        Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::with_sync_writes(
+                self.db.clone(),
+                self.sync_writes,
+            ),
+        )
     }
 
     pub fn key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
         Arc::new(
-            crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(self.db.clone(), CF_KV),
+            crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::with_sync_writes(
+                self.db.clone(),
+                CF_KV,
+                self.sync_writes,
+            ),
         )
     }
 }
@@ -3737,6 +4183,10 @@ pub enum SearchCriteria {
     },
 
     // === Compound Criteria ===
+    /// Memories every listed criterion matches. An empty list matches nothing on every
+    /// engine: `POST /api/search/advanced` refuses a search with no criterion rather
+    /// than answering it with the whole corpus, and an empty `Combined` is that same
+    /// search reached another way.
     Combined(Vec<SearchCriteria>),
 
     // === Hierarchy Criteria ===
@@ -3744,6 +4194,111 @@ pub enum SearchCriteria {
     ByParent(MemoryId),
     /// Filter for root memories (no parent)
     RootsOnly,
+}
+
+/// Mean Earth radius the spatial criteria measure with, in metres.
+pub(crate) const EARTH_RADIUS_METRES: f64 = 6_371_000.0;
+
+/// Great-circle distance in metres (haversine).
+pub(crate) fn haversine_metres(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let (phi1, phi2) = (lat1.to_radians(), lat2.to_radians());
+    let delta_phi = (lat2 - lat1).to_radians();
+    let delta_lambda = (lon2 - lon1).to_radians();
+    let a = (delta_phi / 2.0).sin().powi(2)
+        + phi1.cos() * phi2.cos() * (delta_lambda / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_METRES * a.sqrt().asin()
+}
+
+impl SearchCriteria {
+    /// Whether `memory` satisfies these criteria, exactly.
+    ///
+    /// The one definition every engine's `search` answers with: an index only narrows
+    /// the candidates — RocksDB's day, tenth, twentieth and geohash-cell buckets, redb's
+    /// value-ordered rows — and every memory `search` returns has passed this, so a
+    /// coarse bucket or a stale row can cost a read but never change a result.
+    pub fn matches(&self, memory: &Memory) -> bool {
+        let episode = memory
+            .experience
+            .context
+            .as_ref()
+            .map(|context| &context.episode);
+        match self {
+            SearchCriteria::ByDate { start, end } => {
+                memory.created_at >= *start && memory.created_at <= *end
+            }
+            SearchCriteria::ByType(experience_type) => {
+                &memory.experience.experience_type == experience_type
+            }
+            SearchCriteria::ByImportance { min, max } => {
+                let importance = memory.importance();
+                importance >= *min && importance <= *max
+            }
+            SearchCriteria::ByEntity(entity) => {
+                let needle = entity.to_lowercase();
+                memory
+                    .experience
+                    .entities
+                    .iter()
+                    .any(|candidate| candidate.to_lowercase() == needle)
+            }
+            SearchCriteria::ByTags(tags) => {
+                let owned: std::collections::HashSet<String> = memory
+                    .experience
+                    .tags
+                    .iter()
+                    .map(|tag| tag.to_lowercase())
+                    .collect();
+                tags.iter().any(|tag| owned.contains(&tag.to_lowercase()))
+            }
+            SearchCriteria::ByEpisode(episode_id) => {
+                episode.and_then(|e| e.episode_id.as_deref()) == Some(episode_id.as_str())
+            }
+            SearchCriteria::ByEpisodeSequence {
+                episode_id,
+                min_sequence,
+                max_sequence,
+            } => {
+                if episode.and_then(|e| e.episode_id.as_deref()) != Some(episode_id.as_str()) {
+                    return false;
+                }
+                match episode.and_then(|e| e.sequence_number) {
+                    Some(sequence) => {
+                        min_sequence.is_none_or(|lo| sequence >= lo)
+                            && max_sequence.is_none_or(|hi| sequence <= hi)
+                    }
+                    None => false,
+                }
+            }
+            SearchCriteria::ByRobot(robot_id) => {
+                memory.experience.resolved_robot_id() == Some(robot_id.as_str())
+            }
+            SearchCriteria::ByMission(mission_id) => {
+                memory.experience.resolved_mission_id() == Some(mission_id.as_str())
+            }
+            SearchCriteria::ByLocation {
+                lat,
+                lon,
+                radius_meters,
+            } => match memory.experience.resolved_geo() {
+                Some((memory_lat, memory_lon, _alt)) => {
+                    haversine_metres(*lat, *lon, memory_lat, memory_lon) <= *radius_meters
+                }
+                None => false,
+            },
+            SearchCriteria::ByActionType(action_type) => {
+                memory.experience.action_type.as_deref() == Some(action_type.as_str())
+            }
+            SearchCriteria::ByReward { min, max } => match memory.experience.reward {
+                Some(reward) => reward >= *min && reward <= *max,
+                None => false,
+            },
+            SearchCriteria::Combined(criterias) => {
+                !criterias.is_empty() && criterias.iter().all(|criteria| criteria.matches(memory))
+            }
+            SearchCriteria::ByParent(parent_id) => memory.parent_id.as_ref() == Some(parent_id),
+            SearchCriteria::RootsOnly => memory.parent_id.is_none(),
+        }
+    }
 }
 
 /// Storage statistics
@@ -3968,6 +4523,9 @@ impl MemoryStorage {
     ///
     /// MULTIMODALITY READY: Supports text, image, audio, video modalities.
     /// Each modality is stored separately, allowing cross-modal search.
+    ///
+    /// The record, its mapping, and the replacement of its index rows are one atomic
+    /// write, as [`Self::store`] makes them.
     pub fn store_with_multimodal_vectors(
         &self,
         memory: &Memory,
@@ -3981,7 +4539,9 @@ impl MemoryStorage {
         let memory_value = self
             .serialize_memory(memory)
             .context(format!("Failed to serialize memory {}", memory.id.0))?;
+        self.queue_replaced_index_removals(&memory.id, &mut batch);
         batch.put(memory_key, &memory_value);
+        self.queue_index_writes(memory, &mut batch);
 
         // 2. Serialize vector mapping with modality support
         let mapping_key = format!("vmapping:{}", memory.id.0);
@@ -3997,18 +4557,8 @@ impl MemoryStorage {
                 .context("Failed to serialize vector mapping")?;
         batch.put(mapping_key.as_bytes(), &mapping_value);
 
-        // 3. Atomic write - both succeed or both fail
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db
-            .write_opt(batch, &write_opts)
-            .context("Atomic write of memory + vector mapping failed")?;
-
-        // 4. Update secondary indices (separate operation, but non-critical)
-        if let Err(e) = self.update_indices(memory) {
-            tracing::warn!("Secondary index update failed (non-fatal): {}", e);
-        }
-
+        self.guarded_batch(&batch, &self.write_options())
+            .context("Atomic write of memory, vector mapping and index rows failed")?;
         Ok(())
     }
 
@@ -4071,13 +4621,28 @@ impl MemoryStorage {
         Ok(mappings)
     }
 
+    /// Replace a memory's whole vector mapping, every modality at once.
+    pub fn put_vector_mapping(
+        &self,
+        memory_id: &MemoryId,
+        mapping: &VectorMappingEntry,
+    ) -> Result<()> {
+        let mapping_key = format!("vmapping:{}", memory_id.0);
+        let mapping_value = bincode::serde::encode_to_vec(mapping, bincode::config::standard())
+            .context("Failed to serialize vector mapping")?;
+        let opts = self.write_options();
+        self.guarded_write(|| {
+            self.db
+                .put_opt(mapping_key.as_bytes(), &mapping_value, &opts)
+                .context("Failed to write vector mapping")
+        })
+    }
+
     /// Delete vector mapping for a memory (called when deleting memory)
     pub fn delete_vector_mapping(&self, memory_id: &MemoryId) -> Result<()> {
         let mapping_key = format!("vmapping:{}", memory_id.0);
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db.delete_opt(mapping_key.as_bytes(), &write_opts)?;
-        Ok(())
+        let write_opts = self.write_options();
+        self.guarded_write(|| Ok(self.db.delete_opt(mapping_key.as_bytes(), &write_opts)?))
     }
 
     /// Update text vector mapping for a memory (for reindex operations)
@@ -4107,35 +4672,31 @@ impl MemoryStorage {
         let mapping_value =
             bincode::serde::encode_to_vec(&mapping_entry, bincode::config::standard())?;
 
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db
-            .put_opt(mapping_key.as_bytes(), &mapping_value, &write_opts)?;
-        Ok(())
+        let write_opts = self.write_options();
+        self.guarded_write(|| {
+            Ok(self
+                .db
+                .put_opt(mapping_key.as_bytes(), &mapping_value, &write_opts)?)
+        })
     }
 
-    /// Delete memory and its vector mapping atomically
+    /// Delete a memory, its vector mapping and its index rows in one atomic write.
     pub fn delete_with_vectors(&self, id: &MemoryId) -> Result<()> {
         let mut batch = WriteBatch::default();
 
-        // 1. Delete memory
-        batch.delete(id.0.as_bytes());
+        // The record is read before anything is deleted: its index rows are named by its
+        // fields, so once it is gone nothing can say which rows were its own.
+        match self.get_if_present(id) {
+            Ok(Some(memory)) => self.queue_index_removals(id, &memory, &mut batch),
+            Ok(None) => {}
+            Err(e) => self.remove_undecodable_inbound_refs(id, &e),
+        }
 
-        // 2. Delete vector mapping
+        batch.delete(id.0.as_bytes());
         let mapping_key = format!("vmapping:{}", id.0);
         batch.delete(mapping_key.as_bytes());
 
-        // 3. Atomic delete
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db.write_opt(batch, &write_opts)?;
-
-        // 4. Clean up indices (non-critical)
-        if let Err(e) = self.remove_from_indices(id) {
-            tracing::warn!("Index cleanup failed (non-fatal): {}", e);
-        }
-
-        Ok(())
+        self.guarded_batch(&batch, &self.write_options())
     }
 
     /// Count memories with vector mappings (for health checks)
@@ -4239,13 +4800,12 @@ impl MemoryStorage {
         let value =
             serde_json::to_vec(records).context("Failed to serialize interference records")?;
 
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db
-            .put_opt(key.as_bytes(), &value, &write_opts)
-            .context("Failed to persist interference records")?;
-
-        Ok(())
+        let write_opts = self.write_options();
+        self.guarded_write(|| {
+            self.db
+                .put_opt(key.as_bytes(), &value, &write_opts)
+                .context("Failed to persist interference records")
+        })
     }
 
     /// Load all interference records from storage on startup
@@ -4312,28 +4872,28 @@ impl MemoryStorage {
     /// Delete interference records for a single memory (called on forget/delete)
     pub fn delete_interference_records(&self, memory_id: &str) -> Result<()> {
         let key = format!("interference:{memory_id}");
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db
-            .delete_opt(key.as_bytes(), &write_opts)
-            .context("Failed to delete interference records")?;
-        Ok(())
+        let write_opts = self.write_options();
+        self.guarded_write(|| {
+            self.db
+                .delete_opt(key.as_bytes(), &write_opts)
+                .context("Failed to delete interference records")
+        })
     }
 
     /// Persist the total interference event count
     ///
     /// Key: `interference_meta:total` → 8-byte little-endian u64
     pub fn save_interference_event_count(&self, count: usize) -> Result<()> {
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db
-            .put_opt(
-                b"interference_meta:total",
-                (count as u64).to_le_bytes(),
-                &write_opts,
-            )
-            .context("Failed to persist interference event count")?;
-        Ok(())
+        let write_opts = self.write_options();
+        self.guarded_write(|| {
+            self.db
+                .put_opt(
+                    b"interference_meta:total",
+                    (count as u64).to_le_bytes(),
+                    &write_opts,
+                )
+                .context("Failed to persist interference event count")
+        })
     }
 
     /// Load the fact extraction watermark for a user.
@@ -4355,12 +4915,12 @@ impl MemoryStorage {
     /// Key: `_watermark:fact_extraction:{user_id}` → 8-byte little-endian i64 (unix millis)
     pub fn set_fact_watermark(&self, user_id: &str, timestamp_millis: i64) {
         let key = format!("_watermark:fact_extraction:{user_id}");
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        if let Err(e) = self
-            .db
-            .put_opt(key.as_bytes(), timestamp_millis.to_le_bytes(), &write_opts)
-        {
+        let write_opts = self.write_options();
+        if let Err(e) = self.guarded_write(|| {
+            Ok(self
+                .db
+                .put_opt(key.as_bytes(), timestamp_millis.to_le_bytes(), &write_opts)?)
+        }) {
             tracing::warn!("Failed to persist fact extraction watermark: {e}");
         }
     }
@@ -4388,9 +4948,8 @@ impl MemoryStorage {
         }
 
         if count > 0 {
-            let mut write_opts = WriteOptions::default();
-            write_opts.set_sync(self.write_mode == WriteMode::Sync);
-            self.db.write_opt(batch, &write_opts)?;
+            let write_opts = self.write_options();
+            self.guarded_batch(&batch, &write_opts)?;
         }
 
         Ok(count)
@@ -4812,7 +5371,10 @@ mod tests {
     /// Probe-only: AgentSession as written before 4a54053 appended `declared`/`verified`.
     /// bincode is positional, so `#[serde(default)]` on the appended fields does nothing for
     /// records already on disk with a populated context.
+    // Every `Probe...` shape is decoded only to see whether a record parses as that layout,
+    // and how far: no field is read.
     #[derive(Deserialize)]
+    #[allow(dead_code)]
     struct ProbeAgentSessionPreWriter {
         worktree_path: Option<PathBuf>,
         branch: Option<String>,
@@ -4823,6 +5385,7 @@ mod tests {
     }
     #[cfg(feature = "rocksdb")]
     #[derive(Deserialize)]
+    #[allow(dead_code)]
     struct ProbeRichContextPreWriter {
         id: ContextId,
         conversation: ConversationContext,
@@ -4849,6 +5412,7 @@ mod tests {
     }
     #[cfg(feature = "rocksdb")]
     #[derive(Deserialize)]
+    #[allow(dead_code)]
     struct ProbeExperiencePreWriter {
         experience_type: ExperienceType,
         content: String,
@@ -4900,6 +5464,7 @@ mod tests {
     /// LegacyMemoryFlatV3 (before edfb43f inserted `persistent` mid-struct on 2026-09-02) plus the
     /// W3.4 trailing facets, so full consumption can be required.
     #[derive(Deserialize)]
+    #[allow(dead_code)]
     struct ProbeMemoryFlatPreWriter {
         id: MemoryId,
         experience: ProbeExperiencePreWriter,
@@ -4940,6 +5505,7 @@ mod tests {
     /// had (embeddings_secondary, embedding_degraded), inside the V3 memory shape. A record that
     /// decodes here and nowhere else was written by an upstream-layout binary.
     #[derive(Deserialize)]
+    #[allow(dead_code)]
     struct ProbeExperienceNoSecondary {
         experience_type: ExperienceType,
         content: String,
@@ -4964,6 +5530,7 @@ mod tests {
     }
     #[cfg(feature = "rocksdb")]
     #[derive(Deserialize)]
+    #[allow(dead_code)]
     struct ProbeMemoryNoSecondary {
         id: MemoryId,
         experience: ProbeExperienceNoSecondary,
@@ -4996,7 +5563,7 @@ mod tests {
             let v = records
                 .get(id.0.as_bytes().as_slice())
                 .expect("record present in default CF");
-            let verdict = match deserialize_memory(&v) {
+            let verdict = match deserialize_memory(v) {
                 Ok((m, legacy)) => format!(
                     "DECODES legacy={legacy} content_len={}",
                     m.experience.content.len()
@@ -5005,26 +5572,26 @@ mod tests {
                     let mut parts = Vec::new();
                     parts.push(format!(
                         "Memory: {}",
-                        bincode::serde::decode_from_slice::<Memory, _>(&v, cfg)
+                        bincode::serde::decode_from_slice::<Memory, _>(v, cfg)
                             .err()
                             .map(|e| e.to_string())
                             .unwrap_or_else(|| "ok".into())
                     ));
                     parts.push(format!(
                         "V3: {}",
-                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, cfg)
+                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(v, cfg)
                             .map(|(_, n)| format!("ok consumed {n}/{}", v.len()))
                             .unwrap_or_else(|e| e.to_string())
                     ));
                     parts.push(format!(
                         "V2: {}",
-                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV2, _>(&v, cfg)
+                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV2, _>(v, cfg)
                             .map(|(_, n)| format!("ok consumed {n}/{}", v.len()))
                             .unwrap_or_else(|e| e.to_string())
                     ));
                     parts.push(format!(
                         "bincode1 V1: {}",
-                        bincode1::deserialize::<LegacyMemoryV1>(&v)
+                        bincode1::deserialize::<LegacyMemoryV1>(v)
                             .map(|_| "ok".to_string())
                             .unwrap_or_else(|e| e.to_string())
                     ));
@@ -5034,7 +5601,7 @@ mod tests {
                     let leg = bincode::config::legacy().with_limit::<BINCODE_ALLOC_LIMIT>();
                     parts.push(format!(
                         "Memory FIXINT: {}",
-                        bincode::serde::decode_from_slice::<Memory, _>(&v, fix)
+                        bincode::serde::decode_from_slice::<Memory, _>(v, fix)
                             .map(|(m, n)| format!(
                                 "ok consumed {n}/{} content_len={}",
                                 v.len(),
@@ -5044,13 +5611,13 @@ mod tests {
                     ));
                     parts.push(format!(
                         "V3 FIXINT: {}",
-                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, fix)
+                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(v, fix)
                             .map(|(_, n)| format!("ok consumed {n}/{}", v.len()))
                             .unwrap_or_else(|e| e.to_string())
                     ));
                     parts.push(format!(
                         "Memory LEGACY(bincode1-compatible): {}",
-                        bincode::serde::decode_from_slice::<Memory, _>(&v, leg)
+                        bincode::serde::decode_from_slice::<Memory, _>(v, leg)
                             .map(|(m, n)| format!(
                                 "ok consumed {n}/{} content_len={}",
                                 v.len(),
@@ -5060,14 +5627,14 @@ mod tests {
                     ));
                     parts.push(format!(
                         "V3 LEGACY: {}",
-                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(&v, leg)
+                        bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(v, leg)
                             .map(|(_, n)| format!("ok consumed {n}/{}", v.len()))
                             .unwrap_or_else(|e| e.to_string())
                     ));
-                    parts.push(format!("V3 + PRE-WRITER AgentSession (before edfb43f and 4a54053): {}", bincode::serde::decode_from_slice::<ProbeMemoryFlatPreWriter, _>(&v, cfg).map(|(m, n)| format!("ok consumed {n}/{} content_len={} emb={} emb2={} created={} session_started={}", v.len(), m.experience.content.len(), m.experience.embeddings.as_ref().map(|e| e.len()).unwrap_or(0), m.experience.embeddings_secondary.as_ref().map(|e| e.len()).unwrap_or(0), m.created_at.format("%Y-%m-%d"), m.experience.context.as_ref().and_then(|c| c.session.started_at).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "none".into()))).unwrap_or_else(|e| e.to_string())));
+                    parts.push(format!("V3 + PRE-WRITER AgentSession (before edfb43f and 4a54053): {}", bincode::serde::decode_from_slice::<ProbeMemoryFlatPreWriter, _>(v, cfg).map(|(m, n)| format!("ok consumed {n}/{} content_len={} emb={} emb2={} created={} session_started={}", v.len(), m.experience.content.len(), m.experience.embeddings.as_ref().map(|e| e.len()).unwrap_or(0), m.experience.embeddings_secondary.as_ref().map(|e| e.len()).unwrap_or(0), m.created_at.format("%Y-%m-%d"), m.experience.context.as_ref().and_then(|c| c.session.started_at).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "none".into()))).unwrap_or_else(|e| e.to_string())));
                     parts.push(format!(
                         "recover_pre_writer_session: {}",
-                        recover_pre_writer_session(&v)
+                        recover_pre_writer_session(v)
                             .map(|(m, branch)| format!(
                                 "{branch} content_len={} kind={:?} when.encoded_at={}",
                                 m.experience.content.len(),
@@ -5081,7 +5648,7 @@ mod tests {
                     ));
                     parts.push(format!(
                         "V3 with an Experience lacking embeddings_secondary/embedding_degraded: {}",
-                        bincode::serde::decode_from_slice::<ProbeMemoryNoSecondary, _>(&v, cfg)
+                        bincode::serde::decode_from_slice::<ProbeMemoryNoSecondary, _>(v, cfg)
                             .map(|(m, n)| format!(
                                 "ok consumed {n}/{} content_len={} entities={}",
                                 v.len(),
@@ -5116,10 +5683,10 @@ mod tests {
                         }
                     }
                     let mut i = 0usize;
-                    let uuid_len = varint(&v, &mut i);
+                    let uuid_len = varint(v, &mut i);
                     i += uuid_len as usize;
-                    let etype = varint(&v, &mut i);
-                    let clen = varint(&v, &mut i);
+                    let etype = varint(v, &mut i);
+                    let clen = varint(v, &mut i);
                     i += clen as usize;
                     // Deeper walk past Some(RichContext { id }): 48 bytes, printable runs masked.
                     let deep = &v[(i + 2 + 16).min(v.len())..(i + 2 + 16 + 48).min(v.len())];
@@ -5160,8 +5727,8 @@ mod tests {
                     use crate::memory::facets::{
                         AgentSession, EngramBinding, WhereFacet, WhoFacet, WhyFacet,
                     };
-                    fn step<'a, T: serde::de::DeserializeOwned>(
-                        v: &'a [u8],
+                    fn step<T: serde::de::DeserializeOwned>(
+                        v: &[u8],
                         off: &mut usize,
                         name: &str,
                         log: &mut Vec<String>,
@@ -5192,135 +5759,135 @@ mod tests {
                     }
                     let mut log = Vec::new();
                     let mut off = i + 1;
-                    let ok = step::<ContextId>(&v, &mut off, "ctx.id", &mut log)
-                        && step::<ConversationContext>(&v, &mut off, "conversation", &mut log)
-                        && step::<UserContext>(&v, &mut off, "user", &mut log)
-                        && step::<ProjectContext>(&v, &mut off, "project", &mut log)
-                        && step::<TemporalContext>(&v, &mut off, "temporal", &mut log)
-                        && step::<SemanticContext>(&v, &mut off, "semantic", &mut log)
-                        && step::<CodeContext>(&v, &mut off, "code", &mut log)
-                        && step::<DocumentContext>(&v, &mut off, "document", &mut log)
-                        && step::<EnvironmentContext>(&v, &mut off, "environment", &mut log)
-                        && step::<EmotionalContext>(&v, &mut off, "emotional", &mut log)
-                        && step::<SourceContext>(&v, &mut off, "source", &mut log)
-                        && step::<EpisodeContext>(&v, &mut off, "episode", &mut log)
-                        && step::<WhereFacet>(&v, &mut off, "place", &mut log)
-                        && step::<WhoFacet>(&v, &mut off, "who", &mut log)
-                        && step::<WhyFacet>(&v, &mut off, "why", &mut log)
-                        && step::<EngramBinding>(&v, &mut off, "binding", &mut log)
-                        && (step::<AgentSession>(&v, &mut off, "session", &mut log)
+                    let ok = step::<ContextId>(v, &mut off, "ctx.id", &mut log)
+                        && step::<ConversationContext>(v, &mut off, "conversation", &mut log)
+                        && step::<UserContext>(v, &mut off, "user", &mut log)
+                        && step::<ProjectContext>(v, &mut off, "project", &mut log)
+                        && step::<TemporalContext>(v, &mut off, "temporal", &mut log)
+                        && step::<SemanticContext>(v, &mut off, "semantic", &mut log)
+                        && step::<CodeContext>(v, &mut off, "code", &mut log)
+                        && step::<DocumentContext>(v, &mut off, "document", &mut log)
+                        && step::<EnvironmentContext>(v, &mut off, "environment", &mut log)
+                        && step::<EmotionalContext>(v, &mut off, "emotional", &mut log)
+                        && step::<SourceContext>(v, &mut off, "source", &mut log)
+                        && step::<EpisodeContext>(v, &mut off, "episode", &mut log)
+                        && step::<WhereFacet>(v, &mut off, "place", &mut log)
+                        && step::<WhoFacet>(v, &mut off, "who", &mut log)
+                        && step::<WhyFacet>(v, &mut off, "why", &mut log)
+                        && step::<EngramBinding>(v, &mut off, "binding", &mut log)
+                        && (step::<AgentSession>(v, &mut off, "session", &mut log)
                             || step::<ProbeAgentSessionPreWriter>(
-                                &v,
+                                v,
                                 &mut off,
                                 "session(pre-writer)",
                                 &mut log,
                             ))
-                        && step::<Option<Box<RichContext>>>(&v, &mut off, "parent", &mut log)
-                        && step::<Option<Vec<f32>>>(&v, &mut off, "ctx.embeddings", &mut log)
-                        && step::<f32>(&v, &mut off, "decay_rate", &mut log)
-                        && step::<DateTime<Utc>>(&v, &mut off, "ctx.created_at", &mut log)
-                        && step::<DateTime<Utc>>(&v, &mut off, "ctx.updated_at", &mut log)
-                        && step::<Vec<String>>(&v, &mut off, "entities", &mut log)
+                        && step::<Option<Box<RichContext>>>(v, &mut off, "parent", &mut log)
+                        && step::<Option<Vec<f32>>>(v, &mut off, "ctx.embeddings", &mut log)
+                        && step::<f32>(v, &mut off, "decay_rate", &mut log)
+                        && step::<DateTime<Utc>>(v, &mut off, "ctx.created_at", &mut log)
+                        && step::<DateTime<Utc>>(v, &mut off, "ctx.updated_at", &mut log)
+                        && step::<Vec<String>>(v, &mut off, "entities", &mut log)
                         && step::<std::collections::HashMap<String, String>>(
-                            &v, &mut off, "metadata", &mut log,
+                            v, &mut off, "metadata", &mut log,
                         )
-                        && step::<Option<Vec<f32>>>(&v, &mut off, "embeddings", &mut log)
-                        && step::<Option<Vec<f32>>>(&v, &mut off, "embeddings_secondary", &mut log)
-                        && step::<bool>(&v, &mut off, "embedding_degraded", &mut log)
-                        && step::<Option<Vec<f32>>>(&v, &mut off, "image_embeddings", &mut log)
-                        && step::<Option<Vec<f32>>>(&v, &mut off, "audio_embeddings", &mut log)
-                        && step::<Option<Vec<f32>>>(&v, &mut off, "video_embeddings", &mut log)
-                        && step::<Vec<MediaRef>>(&v, &mut off, "media_refs", &mut log)
-                        && step::<Vec<MemoryId>>(&v, &mut off, "related_memories", &mut log)
-                        && step::<Vec<MemoryId>>(&v, &mut off, "causal_chain", &mut log)
-                        && step::<Vec<String>>(&v, &mut off, "outcomes", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "robot_id", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "mission_id", &mut log)
-                        && step::<Option<[f64; 3]>>(&v, &mut off, "geo_location", &mut log)
-                        && step::<Option<[f32; 3]>>(&v, &mut off, "local_position", &mut log)
-                        && step::<Option<f32>>(&v, &mut off, "heading", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "action_type", &mut log)
-                        && step::<Option<f32>>(&v, &mut off, "reward", &mut log)
-                        && step::<HashMap<String, f64>>(&v, &mut off, "sensor_data", &mut log)
+                        && step::<Option<Vec<f32>>>(v, &mut off, "embeddings", &mut log)
+                        && step::<Option<Vec<f32>>>(v, &mut off, "embeddings_secondary", &mut log)
+                        && step::<bool>(v, &mut off, "embedding_degraded", &mut log)
+                        && step::<Option<Vec<f32>>>(v, &mut off, "image_embeddings", &mut log)
+                        && step::<Option<Vec<f32>>>(v, &mut off, "audio_embeddings", &mut log)
+                        && step::<Option<Vec<f32>>>(v, &mut off, "video_embeddings", &mut log)
+                        && step::<Vec<MediaRef>>(v, &mut off, "media_refs", &mut log)
+                        && step::<Vec<MemoryId>>(v, &mut off, "related_memories", &mut log)
+                        && step::<Vec<MemoryId>>(v, &mut off, "causal_chain", &mut log)
+                        && step::<Vec<String>>(v, &mut off, "outcomes", &mut log)
+                        && step::<Option<String>>(v, &mut off, "robot_id", &mut log)
+                        && step::<Option<String>>(v, &mut off, "mission_id", &mut log)
+                        && step::<Option<[f64; 3]>>(v, &mut off, "geo_location", &mut log)
+                        && step::<Option<[f32; 3]>>(v, &mut off, "local_position", &mut log)
+                        && step::<Option<f32>>(v, &mut off, "heading", &mut log)
+                        && step::<Option<String>>(v, &mut off, "action_type", &mut log)
+                        && step::<Option<f32>>(v, &mut off, "reward", &mut log)
+                        && step::<HashMap<String, f64>>(v, &mut off, "sensor_data", &mut log)
                         && step::<Option<HashMap<String, String>>>(
-                            &v,
+                            v,
                             &mut off,
                             "decision_context",
                             &mut log,
                         )
                         && step::<Option<HashMap<String, String>>>(
-                            &v,
+                            v,
                             &mut off,
                             "action_params",
                             &mut log,
                         )
-                        && step::<Option<String>>(&v, &mut off, "outcome_type", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "outcome_details", &mut log)
-                        && step::<Option<f32>>(&v, &mut off, "confidence", &mut log)
-                        && step::<Vec<String>>(&v, &mut off, "alternatives_considered", &mut log)
+                        && step::<Option<String>>(v, &mut off, "outcome_type", &mut log)
+                        && step::<Option<String>>(v, &mut off, "outcome_details", &mut log)
+                        && step::<Option<f32>>(v, &mut off, "confidence", &mut log)
+                        && step::<Vec<String>>(v, &mut off, "alternatives_considered", &mut log)
                         && step::<Option<HashMap<String, String>>>(
-                            &v, &mut off, "weather", &mut log,
+                            v, &mut off, "weather", &mut log,
                         )
-                        && step::<Option<String>>(&v, &mut off, "terrain_type", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "lighting", &mut log)
+                        && step::<Option<String>>(v, &mut off, "terrain_type", &mut log)
+                        && step::<Option<String>>(v, &mut off, "lighting", &mut log)
                         && step::<Vec<HashMap<String, String>>>(
-                            &v,
+                            v,
                             &mut off,
                             "nearby_agents",
                             &mut log,
                         )
-                        && step::<bool>(&v, &mut off, "is_failure", &mut log)
-                        && step::<bool>(&v, &mut off, "is_anomaly", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "severity", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "recovery_action", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "root_cause", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "pattern_id", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "predicted_outcome", &mut log)
-                        && step::<Option<bool>>(&v, &mut off, "prediction_accurate", &mut log)
-                        && step::<Vec<String>>(&v, &mut off, "tags", &mut log)
-                        && step::<Vec<String>>(&v, &mut off, "temporal_refs", &mut log)
-                        && step::<Vec<NerEntityRecord>>(&v, &mut off, "ner_entities", &mut log)
+                        && step::<bool>(v, &mut off, "is_failure", &mut log)
+                        && step::<bool>(v, &mut off, "is_anomaly", &mut log)
+                        && step::<Option<String>>(v, &mut off, "severity", &mut log)
+                        && step::<Option<String>>(v, &mut off, "recovery_action", &mut log)
+                        && step::<Option<String>>(v, &mut off, "root_cause", &mut log)
+                        && step::<Option<String>>(v, &mut off, "pattern_id", &mut log)
+                        && step::<Option<String>>(v, &mut off, "predicted_outcome", &mut log)
+                        && step::<Option<bool>>(v, &mut off, "prediction_accurate", &mut log)
+                        && step::<Vec<String>>(v, &mut off, "tags", &mut log)
+                        && step::<Vec<String>>(v, &mut off, "temporal_refs", &mut log)
+                        && step::<Vec<NerEntityRecord>>(v, &mut off, "ner_entities", &mut log)
                         && step::<Vec<(String, String)>>(
-                            &v,
+                            v,
                             &mut off,
                             "cooccurrence_pairs",
                             &mut log,
                         )
-                        && step::<f32>(&v, &mut off, "importance", &mut log)
-                        && step::<u32>(&v, &mut off, "access_count", &mut log)
-                        && step::<DateTime<Utc>>(&v, &mut off, "created_at", &mut log)
-                        && step::<DateTime<Utc>>(&v, &mut off, "last_accessed", &mut log)
-                        && step::<bool>(&v, &mut off, "compressed", &mut log)
-                        && step::<MemoryTier>(&v, &mut off, "tier", &mut log)
-                        && step::<Vec<EntityRef>>(&v, &mut off, "entity_refs", &mut log)
-                        && step::<f32>(&v, &mut off, "activation", &mut log)
-                        && step::<Option<uuid::Uuid>>(&v, &mut off, "last_retrieval_id", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "agent_id", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "run_id", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "actor_id", &mut log)
-                        && step::<f32>(&v, &mut off, "temporal_relevance", &mut log)
-                        && step::<Option<f32>>(&v, &mut off, "score", &mut log)
-                        && step::<Option<String>>(&v, &mut off, "external_id", &mut log)
-                        && step::<u32>(&v, &mut off, "version", &mut log)
-                        && step::<Vec<MemoryRevision>>(&v, &mut off, "history", &mut log)
-                        && step::<Vec<TodoId>>(&v, &mut off, "related_todo_ids", &mut log)
-                        && step::<Option<MemoryId>>(&v, &mut off, "parent_id", &mut log)
-                        && step::<bool>(&v, &mut off, "anchored", &mut log)
-                        && step::<Option<f32>>(&v, &mut off, "calibrated_confidence", &mut log)
-                        && step::<Option<f32>>(&v, &mut off, "confidence_alpha", &mut log)
-                        && step::<Option<f32>>(&v, &mut off, "confidence_beta", &mut log)
-                        && step::<Option<DateTime<Utc>>>(&v, &mut off, "valid_until", &mut log)
+                        && step::<f32>(v, &mut off, "importance", &mut log)
+                        && step::<u32>(v, &mut off, "access_count", &mut log)
+                        && step::<DateTime<Utc>>(v, &mut off, "created_at", &mut log)
+                        && step::<DateTime<Utc>>(v, &mut off, "last_accessed", &mut log)
+                        && step::<bool>(v, &mut off, "compressed", &mut log)
+                        && step::<MemoryTier>(v, &mut off, "tier", &mut log)
+                        && step::<Vec<EntityRef>>(v, &mut off, "entity_refs", &mut log)
+                        && step::<f32>(v, &mut off, "activation", &mut log)
+                        && step::<Option<uuid::Uuid>>(v, &mut off, "last_retrieval_id", &mut log)
+                        && step::<Option<String>>(v, &mut off, "agent_id", &mut log)
+                        && step::<Option<String>>(v, &mut off, "run_id", &mut log)
+                        && step::<Option<String>>(v, &mut off, "actor_id", &mut log)
+                        && step::<f32>(v, &mut off, "temporal_relevance", &mut log)
+                        && step::<Option<f32>>(v, &mut off, "score", &mut log)
+                        && step::<Option<String>>(v, &mut off, "external_id", &mut log)
+                        && step::<u32>(v, &mut off, "version", &mut log)
+                        && step::<Vec<MemoryRevision>>(v, &mut off, "history", &mut log)
+                        && step::<Vec<TodoId>>(v, &mut off, "related_todo_ids", &mut log)
+                        && step::<Option<MemoryId>>(v, &mut off, "parent_id", &mut log)
+                        && step::<bool>(v, &mut off, "anchored", &mut log)
+                        && step::<Option<f32>>(v, &mut off, "calibrated_confidence", &mut log)
+                        && step::<Option<f32>>(v, &mut off, "confidence_alpha", &mut log)
+                        && step::<Option<f32>>(v, &mut off, "confidence_beta", &mut log)
+                        && step::<Option<DateTime<Utc>>>(v, &mut off, "valid_until", &mut log)
                         && step::<Option<Vec<DateTime<Utc>>>>(
-                            &v,
+                            v,
                             &mut off,
                             "access_history",
                             &mut log,
                         )
-                        && step::<Option<f32>>(&v, &mut off, "elaboration_score", &mut log)
-                        && step::<Option<f32>>(&v, &mut off, "fragment_demotion", &mut log)
-                        && step::<RecordKind>(&v, &mut off, "kind", &mut log)
-                        && step::<WhatFacet>(&v, &mut off, "what", &mut log)
-                        && step::<WhenFacet>(&v, &mut off, "when", &mut log);
+                        && step::<Option<f32>>(v, &mut off, "elaboration_score", &mut log)
+                        && step::<Option<f32>>(v, &mut off, "fragment_demotion", &mut log)
+                        && step::<RecordKind>(v, &mut off, "kind", &mut log)
+                        && step::<WhatFacet>(v, &mut off, "what", &mut log)
+                        && step::<WhenFacet>(v, &mut off, "when", &mut log);
                     log.push(format!("END off={off} of {}", v.len()));
                     parts.push(format!("fieldwalk ok={ok} [{}]", log.join(" ")));
                     format!("UNDECODABLE — {}", parts.join(" | "))
@@ -5342,7 +5909,7 @@ mod tests {
                 continue;
             }
             good += 1;
-            let has_context = match deserialize_memory(&v) {
+            let has_context = match deserialize_memory(v) {
                 Err(_) => {
                     good_bad += 1;
                     false
@@ -5357,16 +5924,16 @@ mod tests {
             let fix = bincode::config::standard()
                 .with_fixed_int_encoding()
                 .with_limit::<BINCODE_ALLOC_LIMIT>();
-            if bincode::serde::decode_from_slice::<Memory, _>(&v, fix).is_ok() {
+            if bincode::serde::decode_from_slice::<Memory, _>(v, fix).is_ok() {
                 good_fixint += 1;
             }
             // The two layouts only differ inside a populated context, so ambiguity is measured there.
             if has_context
-                && matches!(bincode::serde::decode_from_slice::<ProbeMemoryFlatPreWriter, _>(&v, cfg), Ok((_, n)) if n == v.len())
+                && matches!(bincode::serde::decode_from_slice::<ProbeMemoryFlatPreWriter, _>(v, cfg), Ok((_, n)) if n == v.len())
             {
                 good_prewriter += 1;
             }
-            if recover_pre_writer_session(&v).is_some() {
+            if recover_pre_writer_session(v).is_some() {
                 good_recovered += 1;
             }
         }
@@ -5393,13 +5960,6 @@ mod tests {
         assert_eq!(decoded.id, id);
         assert!(is_legacy);
         assert_eq!(after, before + 1);
-    }
-
-    #[test]
-    fn test_write_mode_default_async() {
-        std::env::remove_var("VELD_WRITE_MODE");
-        let mode = WriteMode::default();
-        assert_eq!(mode, WriteMode::Async);
     }
 
     #[test]
@@ -5721,7 +6281,7 @@ mod tests {
         let m = MemoryId(uuid::Uuid::new_v4());
 
         storage
-            .store(&memory_referencing(m.clone(), &[a.clone()]))
+            .store(&memory_referencing(m.clone(), std::slice::from_ref(&a)))
             .unwrap();
         assert!(storage.has_inbound_refs(&a).unwrap());
 
@@ -5735,9 +6295,10 @@ mod tests {
 
     #[cfg(feature = "rocksdb")]
     /// (3) update M to DROP ref to A → inbound_refs(A) no longer contains M.
-    /// This is the update-diff hazard: update() does remove_from_indices(old)
-    /// then store(new); Option-b teardown (remove all inbound_ref:*:{M}) must
-    /// purge the stale A-entry even though the NEW memory no longer names A.
+    /// This is the update-diff hazard: update() queues the old version's removals
+    /// and the new version's rows in one batch; Option-b teardown (remove all
+    /// inbound_ref:*:{M}) must purge the stale A-entry even though the NEW memory
+    /// no longer names A.
     #[test]
     fn r7_update_drop_ref_clears_stale_inbound() {
         let (storage, _dir) = test_storage();
@@ -5754,7 +6315,7 @@ mod tests {
 
         // Update M to reference only B (drops A).
         storage
-            .update(&memory_referencing(m.clone(), &[b.clone()]))
+            .update(&memory_referencing(m.clone(), std::slice::from_ref(&b)))
             .unwrap();
 
         assert!(
@@ -5783,10 +6344,16 @@ mod tests {
         let holder_b = MemoryId(uuid::Uuid::new_v4());
 
         store_a
-            .store(&memory_referencing(holder_a.clone(), &[target.clone()]))
+            .store(&memory_referencing(
+                holder_a.clone(),
+                std::slice::from_ref(&target),
+            ))
             .unwrap();
         store_b
-            .store(&memory_referencing(holder_b.clone(), &[target.clone()]))
+            .store(&memory_referencing(
+                holder_b.clone(),
+                std::slice::from_ref(&target),
+            ))
             .unwrap();
 
         let a_holders = store_a.inbound_refs(&target).unwrap();
@@ -5930,6 +6497,594 @@ mod tests {
         assert!(
             !storage.has_any_inbound_refs(&orphan, "test-user").unwrap(),
             "completely unreferenced memory must report false"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn removing_one_holder_leaves_the_other_holders_of_a_target() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let m1 = MemoryId(uuid::Uuid::new_v4());
+        let m2 = MemoryId(uuid::Uuid::new_v4());
+        let m3 = MemoryId(uuid::Uuid::new_v4());
+
+        storage
+            .store(&memory_referencing(m1.clone(), std::slice::from_ref(&a)))
+            .unwrap();
+        storage
+            .store(&memory_referencing(m2.clone(), &[a.clone(), b.clone()]))
+            .unwrap();
+        storage
+            .store(&memory_referencing(m3.clone(), std::slice::from_ref(&a)))
+            .unwrap();
+
+        storage.delete(&m1).unwrap();
+        let mut holders = storage.inbound_refs(&a).unwrap();
+        holders.sort_by_key(|h| h.0);
+        let mut expected = vec![m2.clone(), m3.clone()];
+        expected.sort_by_key(|h| h.0);
+        assert_eq!(holders, expected, "only m1's entry for A goes");
+
+        storage
+            .update(&memory_referencing(m2.clone(), std::slice::from_ref(&b)))
+            .unwrap();
+        assert_eq!(storage.inbound_refs(&a).unwrap(), vec![m3.clone()]);
+        assert_eq!(storage.inbound_refs(&b).unwrap(), vec![m2]);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn an_undecodable_holder_still_has_its_inbound_refs_removed() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let m = MemoryId(uuid::Uuid::new_v4());
+        let other = MemoryId(uuid::Uuid::new_v4());
+
+        storage
+            .store(&memory_referencing(m.clone(), std::slice::from_ref(&a)))
+            .unwrap();
+        storage
+            .store(&memory_referencing(other.clone(), std::slice::from_ref(&a)))
+            .unwrap();
+        storage.db.put(m.0.as_bytes(), [0xffu8; 3]).unwrap();
+        assert!(storage.get(&m).is_err(), "the fixture must be undecodable");
+
+        storage.delete(&m).unwrap();
+        assert_eq!(storage.inbound_refs(&a).unwrap(), vec![other]);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn aged_memory(age_days: i64, compressed: bool) -> Memory {
+        let mut memory = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+        memory.created_at = Utc::now() - chrono::Duration::days(age_days);
+        memory.compressed = compressed;
+        memory
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn uncompressed_candidates_come_from_the_time_index() {
+        let (storage, _dir) = test_storage();
+        let old = aged_memory(30, false);
+        let young = aged_memory(1, false);
+        let old_compressed = aged_memory(30, true);
+        for memory in [&old, &young, &old_compressed] {
+            storage.store(memory).unwrap();
+        }
+        let cutoff = Utc::now() - chrono::Duration::days(7);
+
+        let found: Vec<MemoryId> = storage
+            .get_uncompressed_older_than(cutoff)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(found, vec![old.id.clone()]);
+
+        let mut compressed = old.clone();
+        compressed.compressed = true;
+        storage.update(&compressed).unwrap();
+        assert!(storage
+            .get_uncompressed_older_than(cutoff)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn records_written_before_the_time_index_are_backfilled_once() {
+        let (storage, _dir) = test_storage();
+        let old = aged_memory(30, false);
+        storage.store(&old).unwrap();
+        let idx = storage.index_cf();
+        storage
+            .db
+            .delete_cf(
+                idx,
+                uncompressed_index_key(old.created_at, &old.id).as_bytes(),
+            )
+            .unwrap();
+        storage
+            .db
+            .delete_cf(idx, UNCOMPRESSED_INDEX_SENTINEL)
+            .unwrap();
+
+        let cutoff = Utc::now() - chrono::Duration::days(7);
+        let found = storage.get_uncompressed_older_than(cutoff).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, old.id);
+        assert!(storage
+            .db
+            .get_cf(idx, UNCOMPRESSED_INDEX_SENTINEL)
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn a_stale_time_index_entry_is_dropped_when_met() {
+        let (storage, _dir) = test_storage();
+        let old = aged_memory(30, false);
+        storage.store(&old).unwrap();
+        let mut compressed = old.clone();
+        compressed.compressed = true;
+        storage.store(&compressed).unwrap();
+        let key = uncompressed_index_key(old.created_at, &old.id);
+        let idx = storage.index_cf();
+        // What a write racing the backfill leaves behind (see `ensure_uncompressed_index`).
+        storage.db.put_cf(idx, key.as_bytes(), b"1").unwrap();
+
+        let cutoff = Utc::now() - chrono::Duration::days(7);
+        assert!(storage
+            .get_uncompressed_older_than(cutoff)
+            .unwrap()
+            .is_empty());
+        assert!(storage.db.get_cf(idx, key.as_bytes()).unwrap().is_none());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn the_time_index_orders_pre_epoch_timestamps_first() {
+        let before = DateTime::<Utc>::from_timestamp_millis(-1).unwrap();
+        let epoch = DateTime::<Utc>::from_timestamp_millis(0).unwrap();
+        let after = DateTime::<Utc>::from_timestamp_millis(1).unwrap();
+        assert!(sortable_millis(before) < sortable_millis(epoch));
+        assert!(sortable_millis(epoch) < sortable_millis(after));
+        let id = MemoryId(uuid::Uuid::nil());
+        assert!(uncompressed_index_key(before, &id) < uncompressed_index_key(after, &id));
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn index_has(storage: &MemoryStorage, key: &str) -> bool {
+        storage
+            .db
+            .get_cf(storage.index_cf(), key.as_bytes())
+            .unwrap()
+            .is_some()
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn index_keys_for(memory: &Memory) -> Vec<String> {
+        vec![
+            format!(
+                "date:{}:{}",
+                memory.created_at.format("%Y%m%d"),
+                memory.id.0
+            ),
+            format!(
+                "type:{:?}:{}",
+                memory.experience.experience_type, memory.id.0
+            ),
+            format!(
+                "importance:{}:{}",
+                (memory.importance() * 10.0) as u32,
+                memory.id.0
+            ),
+            uncompressed_index_key(memory.created_at, &memory.id),
+        ]
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn store_commits_record_and_indices_together() {
+        let (storage, _dir) = test_storage();
+        let target = MemoryId(uuid::Uuid::new_v4());
+        let m = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[target.clone()]);
+
+        storage.store(&m).unwrap();
+
+        assert!(storage.db.get(m.id.0.as_bytes()).unwrap().is_some());
+        for key in index_keys_for(&m) {
+            assert!(
+                index_has(&storage, &key),
+                "index key {key} missing after store"
+            );
+        }
+        assert!(storage.has_inbound_refs(&target).unwrap());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn update_rewrites_record_and_indices_in_one_commit() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let id = MemoryId(uuid::Uuid::new_v4());
+        storage
+            .store(&memory_referencing(id.clone(), &[a.clone()]))
+            .unwrap();
+
+        let updated = memory_referencing(id.clone(), &[b.clone()]);
+        storage.update(&updated).unwrap();
+
+        assert!(
+            !storage.has_inbound_refs(&a).unwrap(),
+            "dropped ref must go"
+        );
+        assert!(storage.has_inbound_refs(&b).unwrap(), "new ref must land");
+        for key in index_keys_for(&updated) {
+            assert!(
+                index_has(&storage, &key),
+                "index key {key} missing after update"
+            );
+        }
+        assert!(storage.get(&id).is_ok());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn multimodal_store_commits_mapping_and_indices_together() {
+        let (storage, _dir) = test_storage();
+        let m = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+
+        storage
+            .store_with_multimodal_vectors(&m, Modality::Text, vec![7, 8])
+            .unwrap();
+
+        assert!(storage.get(&m.id).is_ok());
+        assert!(storage.get_vector_mapping(&m.id).unwrap().is_some());
+        for key in index_keys_for(&m) {
+            assert!(index_has(&storage, &key), "index key {key} missing");
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn shared_cache_and_write_buffer_manager_open_round_trips_data() {
+        let cache = Cache::new_lru_cache(8 * 1024 * 1024);
+        let dir = tempfile::TempDir::new().unwrap();
+        let m = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+        {
+            let storage = MemoryStorage::new(dir.path(), Some(&cache)).unwrap();
+            storage.store(&m).unwrap();
+            storage.flush().unwrap();
+        }
+        let storage = MemoryStorage::new(dir.path(), Some(&cache)).unwrap();
+        assert!(storage.get(&m.id).is_ok());
+        for key in index_keys_for(&m) {
+            assert!(
+                index_has(&storage, &key),
+                "index key {key} lost across reopen"
+            );
+        }
+        assert!(super::shared_write_buffer_manager(&cache).enabled());
+    }
+
+    // ========================================================================
+    // Deletion, external-id lookup and tuning
+    // ========================================================================
+
+    #[cfg(feature = "rocksdb")]
+    /// A memory carrying a row in every keyed index: external id, episode and sequence,
+    /// tags, entities, parent (which is also an inbound reference).
+    fn fully_indexed_memory(parent: &MemoryId, external_id: &str) -> Memory {
+        let episode = EpisodeContext {
+            episode_id: Some("episode-under-delete".to_string()),
+            sequence_number: Some(3),
+            ..Default::default()
+        };
+        let mut memory = sample_memory(MemoryId(uuid::Uuid::new_v4()), "indexed everywhere");
+        memory.experience.tags = vec!["Doomed".to_string(), "kept-tag".to_string()];
+        memory.experience.entities = vec!["Wellington".to_string()];
+        memory.experience.context = Some(
+            crate::memory::context::ContextBuilder::new()
+                .with_episode(episode)
+                .build(),
+        );
+        memory.parent_id = Some(parent.clone());
+        memory.external_id = Some(external_id.to_string());
+        memory
+    }
+
+    #[cfg(feature = "rocksdb")]
+    /// Every `memory_index` key that ends with `id` — the rows the memory owns.
+    fn index_rows_naming(storage: &MemoryStorage, id: &MemoryId) -> Vec<String> {
+        let suffix = format!(":{}", id.0);
+        storage
+            .db
+            .iterator_cf(storage.index_cf(), IteratorMode::Start)
+            .log_errors()
+            .map(|(key, _)| String::from_utf8_lossy(&key).into_owned())
+            .filter(|key| key.ends_with(&suffix))
+            .collect()
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn delete_with_vectors_removes_every_index_row_the_memory_owned() {
+        let (storage, _dir) = test_storage();
+        let parent = sample_memory(MemoryId(uuid::Uuid::new_v4()), "the parent");
+        storage.store(&parent).unwrap();
+        let memory = fully_indexed_memory(&parent.id, "linear:SHO-1");
+        storage.store_with_vectors(&memory, vec![7]).unwrap();
+        assert!(
+            !index_rows_naming(&storage, &memory.id).is_empty(),
+            "the fixture wrote no index rows to remove"
+        );
+
+        storage.delete_with_vectors(&memory.id).unwrap();
+
+        assert_eq!(
+            index_rows_naming(&storage, &memory.id),
+            Vec::<String>::new()
+        );
+        assert!(storage
+            .find_by_external_id("linear:SHO-1")
+            .unwrap()
+            .is_none());
+        assert!(storage.get_children(&parent.id).unwrap().is_empty());
+        assert!(!storage.has_inbound_refs(&parent.id).unwrap());
+        assert!(storage
+            .search(SearchCriteria::ByTags(vec!["doomed".to_string()]))
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .search(SearchCriteria::ByEpisode(
+                "episode-under-delete".to_string()
+            ))
+            .unwrap()
+            .is_empty());
+        assert!(storage.get_vector_mapping(&memory.id).unwrap().is_none());
+        assert!(storage.get_by_content_hash("indexed everywhere").is_none());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn a_single_holder_content_hash_row_is_converted_on_open() {
+        let dir = tempfile::TempDir::new().expect("create tempdir");
+        let stored = sample_memory(MemoryId(uuid::Uuid::new_v4()), "written by an older veld");
+        {
+            let storage = MemoryStorage::new(dir.path(), None).expect("open storage");
+            storage.store(&stored).unwrap();
+            let idx = storage.index_cf();
+            let row = storage.content_hash_row(&stored);
+            let single_holder = row
+                .strip_suffix(&format!(":{}", stored.id.0))
+                .expect("row ends with its id")
+                .to_string();
+            let mut batch = WriteBatch::default();
+            batch.delete_cf(idx, row.as_bytes());
+            batch.delete_cf(idx, CONTENT_HASH_LAYOUT_MARKER);
+            batch.put_cf(idx, single_holder.as_bytes(), stored.id.0.as_bytes());
+            storage.db.write(batch).unwrap();
+            assert_eq!(
+                storage.get_by_content_hash("written by an older veld"),
+                None,
+                "the fixture holds only the old row"
+            );
+        }
+
+        let storage = MemoryStorage::new(dir.path(), None).expect("reopen storage");
+        assert_eq!(
+            storage.get_by_content_hash("written by an older veld"),
+            Some(stored.id.clone())
+        );
+        let idx = storage.index_cf();
+        let content_rows: Vec<String> = storage
+            .db
+            .prefix_iterator_cf(idx, b"content_hash:")
+            .log_errors()
+            .map(|(key, _)| String::from_utf8_lossy(&key).into_owned())
+            .take_while(|key| key.starts_with("content_hash:"))
+            .collect();
+        assert_eq!(content_rows, vec![storage.content_hash_row(&stored)]);
+        assert!(storage
+            .db
+            .get_cf(idx, CONTENT_HASH_LAYOUT_MARKER)
+            .unwrap()
+            .is_some());
+
+        drop(storage);
+        let reopened = MemoryStorage::new(dir.path(), None).expect("open a third time");
+        assert_eq!(
+            reopened.get_by_content_hash("written by an older veld"),
+            Some(stored.id.clone()),
+            "the conversion is idempotent"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn a_store_over_a_live_id_replaces_the_previous_versions_index_rows() {
+        type Write = fn(&MemoryStorage, &Memory) -> Result<()>;
+        let writes: [(&str, Write); 3] = [
+            ("store", |storage, memory| storage.store(memory)),
+            ("update", |storage, memory| storage.update(memory)),
+            ("store_with_vectors", |storage, memory| {
+                storage.store_with_vectors(memory, vec![3])
+            }),
+        ];
+        for (path, write) in writes {
+            let (storage, _dir) = test_storage();
+            let parent = sample_memory(MemoryId(uuid::Uuid::new_v4()), "the parent");
+            storage.store(&parent).unwrap();
+            let original = fully_indexed_memory(&parent.id, "linear:SHO-7");
+            storage.store(&original).unwrap();
+
+            let mut rewritten = sample_memory(original.id.clone(), "rewritten content");
+            rewritten.experience.tags = vec!["kept-tag".to_string()];
+            write(&storage, &rewritten).unwrap();
+
+            let (fresh, _fresh_dir) = test_storage();
+            fresh.store(&rewritten).unwrap();
+            let mut expected = index_rows_naming(&fresh, &rewritten.id);
+            expected.sort();
+            let mut held = index_rows_naming(&storage, &original.id);
+            held.sort();
+            assert_eq!(
+                held, expected,
+                "{path}: the index holds rows only the previous version had"
+            );
+            assert!(
+                storage
+                    .find_by_external_id("linear:SHO-7")
+                    .unwrap()
+                    .is_none(),
+                "{path}"
+            );
+            assert!(
+                storage.get_children(&parent.id).unwrap().is_empty(),
+                "{path}"
+            );
+            assert!(!storage.has_inbound_refs(&parent.id).unwrap(), "{path}");
+            assert!(
+                storage
+                    .search(SearchCriteria::ByTags(vec!["doomed".to_string()]))
+                    .unwrap()
+                    .is_empty(),
+                "{path}"
+            );
+            assert!(
+                storage
+                    .search(SearchCriteria::ByEpisode(
+                        "episode-under-delete".to_string()
+                    ))
+                    .unwrap()
+                    .is_empty(),
+                "{path}"
+            );
+            assert_eq!(
+                storage.get_by_content_hash("indexed everywhere"),
+                None,
+                "{path}"
+            );
+            assert_eq!(
+                storage.get_by_content_hash("rewritten content"),
+                Some(original.id.clone()),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn find_by_external_id_answers_none_for_a_row_whose_memory_is_gone_and_removes_it() {
+        let (storage, _dir) = test_storage();
+        let parent = sample_memory(MemoryId(uuid::Uuid::new_v4()), "the parent");
+        let memory = fully_indexed_memory(&parent.id, "github:pr-9");
+        storage.store(&memory).unwrap();
+        // A record removed without its index rows: what delete_with_vectors left behind
+        // before it read the record first, and what any write bypassing the store leaves.
+        storage.db.delete(memory.id.0.as_bytes()).unwrap();
+        let dangling = |storage: &MemoryStorage| {
+            index_rows_naming(storage, &memory.id)
+                .into_iter()
+                .filter(|key| key.starts_with("external:"))
+                .count()
+        };
+        assert_eq!(dangling(&storage), 1);
+
+        assert!(storage
+            .find_by_external_id("github:pr-9")
+            .unwrap()
+            .is_none());
+        assert_eq!(dangling(&storage), 0, "the dangling row was left in place");
+        assert!(storage
+            .find_by_external_id("github:pr-9")
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn find_by_external_id_reaches_the_live_memory_past_a_dangling_row() {
+        let (storage, _dir) = test_storage();
+        let parent = MemoryId(uuid::Uuid::new_v4());
+        let gone = fully_indexed_memory(&parent, "github:issue-4");
+        let live = fully_indexed_memory(&parent, "github:issue-4");
+        storage.store(&gone).unwrap();
+        storage.store(&live).unwrap();
+        storage.db.delete(gone.id.0.as_bytes()).unwrap();
+
+        let found = storage
+            .find_by_external_id("github:issue-4")
+            .unwrap()
+            .expect("the live memory with this external id");
+        assert_eq!(found.id, live.id);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn a_store_opened_with_explicit_tuning_reads_back_after_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tuned = crate::config::StorageTuning {
+            durability: crate::config::StorageDurability::Immediate,
+            redb_cache_bytes: 1024 * 1024,
+            rocksdb_write_buffer_bytes: 1024 * 1024,
+            rocksdb_block_cache_bytes: Some(1024 * 1024),
+        };
+        let memory = sample_memory(MemoryId(uuid::Uuid::new_v4()), "survives the reopen");
+        {
+            let storage = MemoryStorage::new_with_tuning(dir.path(), None, tuned).unwrap();
+            assert!(storage.sync_writes);
+            storage.store_with_vectors(&memory, vec![1, 2]).unwrap();
+        }
+        let eventual = crate::config::StorageTuning {
+            durability: crate::config::StorageDurability::Eventual,
+            ..tuned
+        };
+        let reopened = MemoryStorage::new_with_tuning(dir.path(), None, eventual).unwrap();
+        assert!(!reopened.sync_writes);
+        assert_eq!(
+            reopened.get(&memory.id).unwrap().experience.content,
+            "survives the reopen"
+        );
+        assert!(reopened.get_vector_mapping(&memory.id).unwrap().is_some());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rebuild_index_keeps_the_rows_of_forgotten_memories() {
+        let (storage, _dir) = test_storage();
+        let parent = MemoryId(uuid::Uuid::new_v4());
+        let memory = fully_indexed_memory(&parent, "linear:SHO-77");
+        storage.store(&memory).unwrap();
+        memory.set_importance(0.01);
+        storage.update(&memory).unwrap();
+        assert_eq!(
+            storage.mark_forgotten_by_importance(0.5).unwrap(),
+            vec![memory.id.clone()]
+        );
+        let before = {
+            let mut rows = index_rows_naming(&storage, &memory.id);
+            rows.sort();
+            rows
+        };
+
+        storage.rebuild_index().unwrap();
+
+        let mut after = index_rows_naming(&storage, &memory.id);
+        after.sort();
+        assert_eq!(after, before);
+        assert!(storage.get_all().unwrap().is_empty());
+        assert_eq!(
+            storage
+                .find_by_external_id("linear:SHO-77")
+                .unwrap()
+                .map(|m| m.id),
+            Some(memory.id)
         );
     }
 }

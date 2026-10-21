@@ -55,6 +55,19 @@
 //! stops there, and the file can be truncated to the offset where that frame
 //! started. Everything before that offset is durable and verifiable.
 //!
+//! ## Frame offset index
+//!
+//! The log is append-only, so a reader that only needs the frames above some
+//! LSN would otherwise walk every frame from the start. [`FrameIndex`] maps
+//! LSNs to byte offsets: the latest frame plus one sparse entry every
+//! [`FRAME_INDEX_STRIDE`] frames. The log keeps it current as it appends; the
+//! journaled writer persists it as checkpoint-store side data so the next
+//! open starts its tail scan at the latest frame and replay seeks straight to
+//! the first frame it needs. An entry is trusted only after the frame at its
+//! offset reads back with the recorded LSN and CRC; anything else falls back
+//! to a scan from the start of the frame region, so a stale or corrupt index
+//! costs time, never correctness.
+//!
 //! ## What this module is NOT
 //!
 //! This is the storage primitive only. The `Projection` trait, replay driver,
@@ -63,7 +76,7 @@
 //! projection depends on it.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::metrics::{
@@ -84,7 +97,7 @@ pub use header::{HeaderError, IntentLogHeader, CURRENT_FORMAT_VERSION, HEADER_BY
 pub use journal::{ApplyError, JournalError, JournaledWriter, TypedProjection, WriteOutcome};
 pub use migrations::{migrate_payload, MigrationError};
 pub use payload::{IntentPayload, PayloadError};
-pub use projection::{replay, Projection, ReplayError};
+pub use projection::{replay, replay_all, Projection, ReplayError, ReplayTarget};
 
 /// A log sequence number — the position assigned to a record at append time.
 ///
@@ -150,13 +163,192 @@ pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_HEADER_BYTES: usize = 4 + 8; // len + lsn
 const FRAME_TRAILER_BYTES: usize = 4; // crc
 
+/// Frames between sparse [`FrameIndex`] entries: an entry is kept for every
+/// LSN that is a multiple of this.
+pub const FRAME_INDEX_STRIDE: u64 = 1024;
+
+/// Read-buffer capacity for frame scans. Large enough that a scan of small
+/// frames costs one `read` syscall per few hundred frames.
+const READ_BUFFER_BYTES: usize = 256 * 1024;
+
+const FRAME_INDEX_ENCODING_VERSION: u8 = 1;
+
+/// Encoded size of one [`FramePosition`].
+pub const FRAME_POSITION_BYTES: usize = 8 + 8 + 4;
+
+/// Where one frame lives: its LSN, the byte offset its header starts at, and
+/// its stored CRC. The CRC is what lets a reader confirm that the frame found
+/// at `offset` is the very frame this position was recorded for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramePosition {
+    pub lsn: Lsn,
+    pub offset: u64,
+    pub crc: u32,
+}
+
+impl FramePosition {
+    /// Wire form: `[lsn u64][offset u64][crc u32]`, little-endian.
+    pub fn to_bytes(&self) -> [u8; FRAME_POSITION_BYTES] {
+        let mut out = [0u8; FRAME_POSITION_BYTES];
+        out[0..8].copy_from_slice(&self.lsn.0.to_le_bytes());
+        out[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        out[16..20].copy_from_slice(&self.crc.to_le_bytes());
+        out
+    }
+
+    /// Inverse of [`to_bytes`](Self::to_bytes); `None` unless `bytes` is
+    /// exactly one encoded position.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != FRAME_POSITION_BYTES {
+            return None;
+        }
+        Some(Self {
+            lsn: Lsn(u64::from_le_bytes(bytes[0..8].try_into().ok()?)),
+            offset: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            crc: u32::from_le_bytes(bytes[16..20].try_into().ok()?),
+        })
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_bytes());
+    }
+}
+
+/// LSN → byte-offset hints for one log file: the latest frame, and every
+/// [`FRAME_INDEX_STRIDE`]-th frame. See the module docs for how the hints
+/// are verified before use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrameIndex {
+    sparse: Vec<FramePosition>,
+    latest: Option<FramePosition>,
+}
+
+impl FrameIndex {
+    /// Note a frame that was just appended or scanned. Positions must arrive
+    /// in LSN order; an out-of-order position replaces nothing in the sparse
+    /// list but still becomes the latest frame.
+    pub fn record(&mut self, pos: FramePosition) {
+        if pos.lsn.0.is_multiple_of(FRAME_INDEX_STRIDE)
+            && self
+                .sparse
+                .last()
+                .is_none_or(|last| last.lsn < pos.lsn && last.offset < pos.offset)
+        {
+            self.sparse.push(pos);
+        }
+        self.latest = Some(pos);
+    }
+
+    /// The most recently recorded frame.
+    pub fn latest(&self) -> Option<FramePosition> {
+        self.latest
+    }
+
+    /// Sparse entries, in LSN order.
+    pub fn sparse(&self) -> &[FramePosition] {
+        &self.sparse
+    }
+
+    /// The recorded frame with the greatest LSN at or below `target`.
+    pub fn seek_hint(&self, target: Lsn) -> Option<FramePosition> {
+        if let Some(latest) = self.latest {
+            if latest.lsn <= target {
+                return Some(latest);
+            }
+        }
+        let below = self.sparse.partition_point(|p| p.lsn <= target);
+        below.checked_sub(1).map(|i| self.sparse[i])
+    }
+
+    /// Forget every frame starting at or after `end_offset` (a truncation
+    /// point, always a frame boundary). `last` becomes the latest frame when
+    /// the caller knows which frame now ends the file.
+    fn truncate_at(&mut self, end_offset: u64, last: Option<FramePosition>) {
+        self.sparse.retain(|p| p.offset < end_offset);
+        self.latest = match last {
+            Some(pos) => Some(pos),
+            None => self.latest.filter(|p| p.offset < end_offset),
+        };
+    }
+
+    /// Keep only what lies at or below `pos`, which becomes the latest frame.
+    fn keep_through(&mut self, pos: FramePosition) {
+        self.sparse
+            .retain(|p| (p.lsn < pos.lsn && p.offset < pos.offset) || *p == pos);
+        self.latest = Some(pos);
+    }
+
+    /// Move every offset by `delta` bytes (a header was prepended).
+    fn shift(&mut self, delta: u64) {
+        for p in &mut self.sparse {
+            p.offset += delta;
+        }
+        if let Some(p) = self.latest.as_mut() {
+            p.offset += delta;
+        }
+    }
+
+    /// Wire form: `[version u8][has_latest u8][latest?][count u32][sparse…]`,
+    /// little-endian, each position `[lsn u64][offset u64][crc u32]`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + FRAME_POSITION_BYTES * (self.sparse.len() + 1) + 4);
+        out.push(FRAME_INDEX_ENCODING_VERSION);
+        match self.latest {
+            Some(pos) => {
+                out.push(1);
+                pos.encode_into(&mut out);
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&(self.sparse.len() as u32).to_le_bytes());
+        for pos in &self.sparse {
+            pos.encode_into(&mut out);
+        }
+        out
+    }
+
+    /// Inverse of [`encode`](Self::encode). `None` for anything malformed or
+    /// of an unknown version — the caller then simply has no hints.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&version, rest) = bytes.split_first()?;
+        if version != FRAME_INDEX_ENCODING_VERSION {
+            return None;
+        }
+        let (&has_latest, mut rest) = rest.split_first()?;
+        let latest = match has_latest {
+            0 => None,
+            1 => {
+                let pos = FramePosition::from_bytes(rest.get(..FRAME_POSITION_BYTES)?)?;
+                rest = &rest[FRAME_POSITION_BYTES..];
+                Some(pos)
+            }
+            _ => return None,
+        };
+        let count = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let rest = &rest[4..];
+        if rest.len() != count.checked_mul(FRAME_POSITION_BYTES)? {
+            return None;
+        }
+        let sparse: Vec<FramePosition> = rest
+            .as_chunks::<FRAME_POSITION_BYTES>()
+            .0
+            .iter()
+            .map(|chunk| FramePosition::from_bytes(chunk))
+            .collect::<Option<_>>()?;
+        if sparse.windows(2).any(|w| w[0].lsn >= w[1].lsn) {
+            return None;
+        }
+        Some(Self { sparse, latest })
+    }
+}
+
 /// Append-only durable intent log.
 ///
 /// One file per log. Opens in append mode; reads scan from the start.
 /// `append` writes are buffered; call `sync` to force them to disk.
 pub struct IntentLog {
     path: PathBuf,
-    writer: BufWriter<File>,
+    writer: BufWriter<LogFile>,
     next_lsn: Lsn,
     /// File offset (in bytes from start) of the byte *after* the last
     /// successfully-written frame. Used by `truncate_corrupt_tail` and to
@@ -164,6 +356,17 @@ pub struct IntentLog {
     /// extra fstat. Includes any header bytes — `durable_end_offset` is
     /// always relative to byte 0 of the file.
     durable_end_offset: u64,
+    /// `next_lsn` and `durable_end_offset` as of the last successful `sync`
+    /// (or open, or truncation). No caller has been told the frames past
+    /// this point are durable, so a failed append or sync rolls back to it.
+    synced_next_lsn: Lsn,
+    synced_end_offset: u64,
+    /// The index's latest frame as of the same sync, which a rollback restores.
+    synced_index_latest: Option<FramePosition>,
+    /// A failed write left bytes past `synced_end_offset` that could not be
+    /// cut yet. `append` and `sync` retry the cut before writing anything,
+    /// so no frame ever lands after a torn one.
+    cut_pending: bool,
     /// Versioning mode this log file is in. `Versioned { .. }` means the
     /// file starts with a valid [`IntentLogHeader`]; `Legacy` means it
     /// was created before headers existed and frames start at offset 0.
@@ -175,6 +378,58 @@ pub struct IntentLog {
     /// the slow store. The CRC is computed over the on-disk (sealed) bytes, so
     /// `scan_for_tail` validates frames without decrypting.
     cryptor: Option<crate::keystore::SecretCryptor>,
+    /// Offset hints for the frames in this file, kept current by `append`
+    /// and the truncation paths. See the module docs.
+    index: FrameIndex,
+}
+
+/// The file under the log's `BufWriter`. A newtype rather than a bare `File`
+/// so a test can make a write stop part-way through a frame, as ENOSPC does,
+/// on a filesystem that has room.
+struct LogFile {
+    file: File,
+    /// Bytes later writes may still put on disk before each one fails with
+    /// `StorageFull`. `None` means no fault is armed.
+    #[cfg(test)]
+    write_budget: Option<usize>,
+}
+
+impl LogFile {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            #[cfg(test)]
+            write_budget: None,
+        }
+    }
+}
+
+impl Write for LogFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(left) = self.write_budget {
+            if left == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "injected: no space left on device",
+                ));
+            }
+            let n = self.file.write(&buf[..buf.len().min(left)])?;
+            self.write_budget = Some(left - n);
+            return Ok(n);
+        }
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Open `path` for appending, behind the log's write buffer.
+fn append_writer(path: &Path) -> io::Result<BufWriter<LogFile>> {
+    let file = OpenOptions::new().read(true).append(true).open(path)?;
+    Ok(BufWriter::new(LogFile::new(file)))
 }
 
 /// Versioning mode for an open intent log.
@@ -210,11 +465,13 @@ impl LogMode {
 
 impl IntentLog {
     /// Open (create if missing) the log file at `path`. Scans the existing
-    /// file to compute the next LSN and the durable-end offset. If the file
-    /// ends in a partial or CRC-bad frame, **does not** auto-truncate — the
-    /// caller decides whether to `truncate_corrupt_tail()` or to bail. This
-    /// avoids silently destroying data when the file is unexpectedly short
-    /// (e.g. disk full mid-write that's about to be retried).
+    /// file to compute the next LSN and the durable-end offset.
+    ///
+    /// A torn tail (the partial or CRC-bad last frame a crash or a full disk
+    /// leaves) is cut with `truncate_corrupt_tail()`, because the first
+    /// append would otherwise land after it where no reader reaches. A
+    /// corrupt frame with intact frames after it is left for an operator and
+    /// reported by `iter()`: cutting there would drop acknowledged records.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IntentLogError> {
         Self::open_with_cryptor(path, None)
     }
@@ -225,6 +482,19 @@ impl IntentLog {
     pub fn open_with_cryptor<P: AsRef<Path>>(
         path: P,
         cryptor: Option<crate::keystore::SecretCryptor>,
+    ) -> Result<Self, IntentLogError> {
+        Self::open_with_index(path, cryptor, None)
+    }
+
+    /// Like [`open_with_cryptor`](Self::open_with_cryptor), starting the tail
+    /// scan at `hint`'s latest frame instead of the first one when that frame
+    /// still reads back with the recorded LSN and CRC. A hint that does not
+    /// verify is ignored and the whole file is scanned, exactly as without
+    /// one.
+    pub fn open_with_index<P: AsRef<Path>>(
+        path: P,
+        cryptor: Option<crate::keystore::SecretCryptor>,
+        hint: Option<FrameIndex>,
     ) -> Result<Self, IntentLogError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -239,7 +509,8 @@ impl IntentLog {
         // Now scan frames from the appropriate offset to discover next
         // LSN + durable_end. A corrupt or truncated tail is reported via
         // the returned offset — open() does not truncate.
-        let (next_lsn, durable_end) = scan_for_tail(&path, mode.frame_region_start())?;
+        let (next_lsn, durable_end, index) =
+            scan_for_tail(&path, mode.frame_region_start(), hint.as_ref())?;
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -281,14 +552,41 @@ impl IntentLog {
         INTENT_LOG_NEXT_LSN.set(next_lsn.0 as i64);
         INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(durable_end as i64);
 
-        Ok(Self {
+        let mut log = Self {
             path,
-            writer: BufWriter::new(file),
+            writer: BufWriter::new(LogFile::new(file)),
             next_lsn,
             durable_end_offset: durable_end,
+            synced_next_lsn: next_lsn,
+            synced_end_offset: durable_end,
+            synced_index_latest: index.latest(),
+            cut_pending: false,
             mode,
             cryptor,
-        })
+            index,
+        };
+        if actual_len > durable_end {
+            if tail_is_torn(&log.path, durable_end, actual_len, next_lsn)? {
+                tracing::warn!(
+                    path = %log.path.display(),
+                    torn_bytes = actual_len - durable_end,
+                    "intent log ends in a torn frame; cutting it",
+                );
+                log.truncate_corrupt_tail()?;
+            } else {
+                tracing::error!(
+                    path = %log.path.display(),
+                    offset = durable_end,
+                    "intent log has a corrupt frame with intact frames after it; left in place",
+                );
+            }
+        }
+        Ok(log)
+    }
+
+    /// Offset hints for the frames currently in the file.
+    pub fn frame_index(&self) -> &FrameIndex {
+        &self.index
     }
 
     /// Versioning mode this log was opened in. Callers that need the
@@ -318,7 +616,7 @@ impl IntentLog {
         // record the caller has written. Upgrade then reads the file
         // contents and prepends a header in a side file.
         self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
+        self.writer.get_ref().file.sync_data()?;
 
         let header = IntentLogHeader::new_current();
         let header_bytes = header.to_bytes();
@@ -339,18 +637,17 @@ impl IntentLog {
         // to rename over an open file with an exclusive append handle.
         // We replace `self.writer` with a handle on the tmp file in the
         // interim, then swing it back after the rename completes.
-        let staged = OpenOptions::new().read(true).append(true).open(&tmp_path)?;
-        self.writer = BufWriter::new(staged);
+        self.writer = append_writer(&tmp_path)?;
         std::fs::rename(&tmp_path, &self.path)?;
-        let live = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        self.writer = BufWriter::new(live);
+        self.writer = append_writer(&self.path)?;
 
         // The frame region just shifted by HEADER_BYTES, so durable_end
         // moves with it.
         self.durable_end_offset += HEADER_BYTES as u64;
+        self.index.shift(HEADER_BYTES as u64);
+        self.synced_next_lsn = self.next_lsn;
+        self.synced_end_offset = self.durable_end_offset;
+        self.synced_index_latest = self.index.latest();
         self.mode = LogMode::Versioned {
             format_version: header.format_version,
             created_unix_secs: header.created_unix_secs,
@@ -361,6 +658,11 @@ impl IntentLog {
     /// Append a record. Returns the LSN assigned to it. Writes go through a
     /// `BufWriter` — call `sync` for durability before returning to a caller
     /// that requires the record to survive a crash.
+    ///
+    /// If the write fails, every frame appended since the last successful
+    /// `sync` is dropped from the buffer and cut from the file, and
+    /// `next_lsn` rewinds to the first of them: the log ends at a frame
+    /// boundary, so the next append is readable.
     #[tracing::instrument(
         level = "info",
         name = "intent_log.append",
@@ -389,15 +691,18 @@ impl IntentLog {
             );
             return Err(err);
         }
+        if self.cut_pending {
+            self.cut_unsynced()?;
+        }
 
         let lsn = self.next_lsn;
         // Seal the payload at rest (encryption-v2) when a journal cryptor is
         // configured; len + CRC + the durable-offset accounting all use the
         // sealed (on-disk) bytes, so scan_for_tail validates frames without a key.
         let sealed: Vec<u8> = match &self.cryptor {
-            Some(c) => c.encrypt_bytes(payload, b"").map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("journal seal failed: {e}"))
-            })?,
+            Some(c) => c
+                .encrypt_bytes(payload, b"")
+                .map_err(|e| io::Error::other(format!("journal seal failed: {e}")))?,
             None => payload.to_vec(),
         };
         let len = sealed.len() as u32;
@@ -423,10 +728,16 @@ impl IntentLog {
                 lsn = lsn.0,
                 "intent log append failed: I/O error",
             );
+            self.roll_back_unsynced();
             return Err(IntentLogError::Io(e));
         }
 
         self.next_lsn = lsn.next();
+        self.index.record(FramePosition {
+            lsn,
+            offset: self.durable_end_offset,
+            crc,
+        });
         self.durable_end_offset += (FRAME_HEADER_BYTES + sealed.len() + FRAME_TRAILER_BYTES) as u64;
 
         INTENT_LOG_APPEND_TOTAL.with_label_values(&["ok"]).inc();
@@ -437,7 +748,9 @@ impl IntentLog {
     }
 
     /// Flush the BufWriter and fsync the file. After this returns, every
-    /// frame `append`-ed since the last `sync` is durable.
+    /// frame `append`-ed since the last `sync` is durable. If it fails, those
+    /// frames are rolled back as for a failed `append`, so a record the
+    /// caller was told failed cannot become durable with a later sync.
     #[tracing::instrument(
         level = "info",
         name = "intent_log.sync",
@@ -449,17 +762,61 @@ impl IntentLog {
     )]
     pub fn sync(&mut self) -> Result<(), IntentLogError> {
         let _timer = Timer::new(INTENT_LOG_SYNC_DURATION.clone());
+        if self.cut_pending {
+            self.cut_unsynced()?;
+        }
         if let Err(e) = self.writer.flush() {
             INTENT_LOG_SYNC_TOTAL.with_label_values(&["io_error"]).inc();
             tracing::error!(error = %e, "intent log sync failed: flush error");
+            self.roll_back_unsynced();
             return Err(IntentLogError::Io(e));
         }
-        if let Err(e) = self.writer.get_ref().sync_data() {
+        if let Err(e) = self.writer.get_ref().file.sync_data() {
             INTENT_LOG_SYNC_TOTAL.with_label_values(&["io_error"]).inc();
             tracing::error!(error = %e, "intent log sync failed: fsync error");
+            self.roll_back_unsynced();
             return Err(IntentLogError::Io(e));
         }
+        self.synced_next_lsn = self.next_lsn;
+        self.synced_end_offset = self.durable_end_offset;
+        self.synced_index_latest = self.index.latest();
         INTENT_LOG_SYNC_TOTAL.with_label_values(&["ok"]).inc();
+        Ok(())
+    }
+
+    /// Forget every frame since the last successful sync and cut its bytes,
+    /// after an append or sync failed part-way through them.
+    fn roll_back_unsynced(&mut self) {
+        self.next_lsn = self.synced_next_lsn;
+        self.durable_end_offset = self.synced_end_offset;
+        self.index
+            .truncate_at(self.synced_end_offset, self.synced_index_latest);
+        INTENT_LOG_NEXT_LSN.set(self.next_lsn.0 as i64);
+        INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(self.durable_end_offset as i64);
+        self.cut_pending = true;
+        if let Err(e) = self.cut_unsynced() {
+            tracing::error!(
+                error = %e,
+                end_offset = self.synced_end_offset,
+                "intent log could not cut a failed write back to the last synced frame; \
+                 appends are refused until it can",
+            );
+        }
+    }
+
+    fn cut_unsynced(&mut self) -> io::Result<()> {
+        // Swap the handle before cutting so no later flush can write the
+        // stale bytes: `into_parts` discards them, where dropping the
+        // BufWriter would flush them.
+        let stale = std::mem::replace(&mut self.writer, append_writer(&self.path)?);
+        drop(stale.into_parts());
+        // A transient read+write handle, as in `truncate_corrupt_tail`.
+        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        if file.metadata()?.len() > self.synced_end_offset {
+            file.set_len(self.synced_end_offset)?;
+        }
+        file.sync_data()?;
+        self.cut_pending = false;
         Ok(())
     }
 
@@ -492,6 +849,45 @@ impl IntentLog {
         )
     }
 
+    /// Like [`iter`](Self::iter), but positioned at the indexed frame with
+    /// the greatest LSN at or below `target`, so a reader that needs only the
+    /// frames from `target` on skips the bulk of the file. Frames below
+    /// `target` may still be yielded (the index is sparse); callers filter by
+    /// LSN. When no index entry applies, or the frame at the entry's offset
+    /// does not carry the recorded LSN and CRC, iteration starts at the first
+    /// frame.
+    pub fn iter_from(&self, target: Lsn) -> Result<IntentLogIter, IntentLogError> {
+        let region_start = self.mode.frame_region_start();
+        if let Some(pos) = self.index.seek_hint(target) {
+            if pos.offset > region_start && pos.offset < self.durable_end_offset {
+                if let Some(iter) = self.iter_at(pos)? {
+                    return Ok(iter);
+                }
+                tracing::warn!(
+                    path = %self.path.display(),
+                    lsn = pos.lsn.0,
+                    offset = pos.offset,
+                    "intent log offset hint did not verify; reading from the first frame",
+                );
+            }
+        }
+        IntentLogIter::open(&self.path, region_start, self.cryptor.clone())
+    }
+
+    /// An iterator positioned at `pos`, or `None` when the frame found there
+    /// is not the one `pos` describes.
+    pub fn iter_at(&self, pos: FramePosition) -> Result<Option<IntentLogIter>, IntentLogError> {
+        if pos.offset < self.mode.frame_region_start() || pos.offset >= self.durable_end_offset {
+            return Ok(None);
+        }
+        let mut iter = IntentLogIter::open(&self.path, pos.offset, self.cryptor.clone())?;
+        if iter.verify_and_rewind(pos)? {
+            Ok(Some(iter))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Truncate the file so its length equals `durable_end_offset`. Used to
     /// recover from a torn-tail crash where the trailing bytes are partial
     /// or CRC-bad. After this returns, `iter()` will read cleanly to EOF.
@@ -513,11 +909,12 @@ impl IntentLog {
         drop(trunc_handle);
 
         // Reopen so BufWriter's seek matches the new EOF.
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        self.writer = BufWriter::new(file);
+        self.writer = append_writer(&self.path)?;
+        self.index.truncate_at(target, None);
+        self.synced_next_lsn = self.next_lsn;
+        self.synced_end_offset = target;
+        self.synced_index_latest = self.index.latest();
+        self.cut_pending = false;
         INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL.inc();
         INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(target as i64);
         tracing::info!(target_offset = target, "intent log truncated corrupt tail",);
@@ -549,49 +946,42 @@ impl IntentLog {
         // dropped before we attempt the truncate. Windows refuses
         // `set_len` while another read handle is open against the same
         // file, even though POSIX is happy with it.
-        let (last_good_offset, _highest_seen) = {
+        let (last_good_offset, last_frame) = {
             let mut iter = IntentLogIter::open_for_scan(&self.path)?;
-            let mut last_good_offset = 0u64;
-            let mut found = false;
+            let mut found: Option<(u64, FramePosition)> = None;
             let mut highest_seen: Option<Lsn> = None;
-            loop {
-                match iter.next() {
-                    None => break,
-                    Some(Ok(rec)) => {
-                        highest_seen = Some(rec.lsn);
-                        let frame_end = iter.current_offset();
-                        if rec.lsn == max_lsn {
-                            last_good_offset = frame_end;
-                            found = true;
-                            break;
-                        }
-                        if rec.lsn.0 > max_lsn.0 {
-                            // Walked past target without finding an exact match.
-                            // The caller's max_lsn is between frames, which is
-                            // not allowed — LSNs are dense.
-                            return Err(IntentLogError::Io(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!(
-                                    "max_lsn={} is not present in intent log (highest seen so far: {})",
-                                    max_lsn.0, rec.lsn.0
-                                ),
-                            )));
-                        }
-                    }
-                    Some(Err(e)) => return Err(e),
+            while let Some(frame) = iter.read_frame()? {
+                highest_seen = Some(frame.lsn);
+                if frame.lsn == max_lsn {
+                    found = Some((iter.current_offset(), frame.position()));
+                    break;
+                }
+                if frame.lsn.0 > max_lsn.0 {
+                    // Walked past target without finding an exact match.
+                    // The caller's max_lsn is between frames, which is
+                    // not allowed — LSNs are dense.
+                    return Err(IntentLogError::Io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "max_lsn={} is not present in intent log (highest seen so far: {})",
+                            max_lsn.0, frame.lsn.0
+                        ),
+                    )));
                 }
             }
-            if !found {
-                return Err(IntentLogError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "max_lsn={} not found in intent log (highest LSN present: {})",
-                        max_lsn.0,
-                        highest_seen.map(|l| l.0 as i128).unwrap_or(-1),
-                    ),
-                )));
+            match found {
+                Some(found) => found,
+                None => {
+                    return Err(IntentLogError::Io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "max_lsn={} not found in intent log (highest LSN present: {})",
+                            max_lsn.0,
+                            highest_seen.map(|l| l.0 as i128).unwrap_or(-1),
+                        ),
+                    )));
+                }
             }
-            (last_good_offset, highest_seen)
             // `iter` dropped here, releasing its read handle.
         };
 
@@ -607,13 +997,14 @@ impl IntentLog {
 
         // Reopen so BufWriter's append position matches the new EOF, and
         // refresh the in-memory tail bookkeeping.
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        self.writer = BufWriter::new(file);
+        self.writer = append_writer(&self.path)?;
         self.durable_end_offset = last_good_offset;
         self.next_lsn = max_lsn.next();
+        self.index.truncate_at(last_good_offset, Some(last_frame));
+        self.synced_next_lsn = self.next_lsn;
+        self.synced_end_offset = last_good_offset;
+        self.synced_index_latest = self.index.latest();
+        self.cut_pending = false;
         Ok(last_good_offset)
     }
 }
@@ -625,17 +1016,51 @@ pub struct IntentRecord {
     pub payload: Vec<u8>,
 }
 
+/// Header facts of one CRC-verified frame read by
+/// [`IntentLogIter::read_frame`]. The frame's payload, still sealed if the
+/// journal is encrypted, stays in the iterator until the next read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameMeta {
+    pub lsn: Lsn,
+    /// Byte offset of the frame's header.
+    pub offset: u64,
+    /// Stored (and verified) CRC.
+    pub crc: u32,
+    /// On-disk payload length.
+    pub len: usize,
+}
+
+impl FrameMeta {
+    /// This frame's [`FramePosition`].
+    pub fn position(&self) -> FramePosition {
+        FramePosition {
+            lsn: self.lsn,
+            offset: self.offset,
+            crc: self.crc,
+        }
+    }
+}
+
 /// Forward-only iterator over the frames in an intent log file. Stops at
 /// EOF or the first corrupt/truncated frame; in the latter case yields one
 /// `Err(...)` and then `None`. The byte offset reported in errors lets the
 /// caller line up `truncate_corrupt_tail`.
+///
+/// Reads go through a buffered reader into one reused body buffer. Callers
+/// that only need some frames use [`read_frame`](Self::read_frame), which
+/// verifies a frame's CRC over its on-disk bytes without opening the payload,
+/// and [`take_payload`](Self::take_payload) for the frames they keep.
 pub struct IntentLogIter {
-    file: File,
+    reader: BufReader<File>,
     offset: u64,
     finished: bool,
     /// Opens (decrypts) each frame's sealed payload before yielding. `None` =
     /// payloads yielded as-is (plaintext journal, or a structural-only scan).
     cryptor: Option<crate::keystore::SecretCryptor>,
+    /// Payload then CRC of the frame last read.
+    body: Vec<u8>,
+    /// Payload length of the frame in `body`.
+    body_len: usize,
 }
 
 impl IntentLogIter {
@@ -661,10 +1086,12 @@ impl IntentLogIter {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(start_offset))?;
         Ok(Self {
-            file,
+            reader: BufReader::with_capacity(READ_BUFFER_BYTES, file),
             offset: start_offset,
             finished: false,
             cryptor,
+            body: Vec::new(),
+            body_len: 0,
         })
     }
 
@@ -674,222 +1101,298 @@ impl IntentLogIter {
     pub fn current_offset(&self) -> u64 {
         self.offset
     }
+
+    /// Read and CRC-check the next frame without opening its payload.
+    /// `Ok(None)` at a clean end of file. After an error the iterator is
+    /// finished and [`current_offset`](Self::current_offset) is the start of
+    /// the bad frame.
+    pub fn read_frame(&mut self) -> Result<Option<FrameMeta>, IntentLogError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = self.read_frame_inner();
+        if !matches!(result, Ok(Some(_))) {
+            self.finished = true;
+        }
+        result
+    }
+
+    fn read_frame_inner(&mut self) -> Result<Option<FrameMeta>, IntentLogError> {
+        let frame_start = self.offset;
+
+        let mut header = [0u8; FRAME_HEADER_BYTES];
+        let read = read_full(&mut self.reader, &mut header)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if read < FRAME_HEADER_BYTES {
+            return Err(IntentLogError::TruncatedFrame {
+                offset: frame_start,
+                expected: FRAME_HEADER_BYTES,
+                actual: read,
+            });
+        }
+
+        let len = u32::from_le_bytes(header[0..4].try_into().expect("4-byte slice")) as usize;
+        let lsn = u64::from_le_bytes(header[4..12].try_into().expect("8-byte slice"));
+
+        // Reject obviously-wild lengths to avoid huge allocations from
+        // misinterpreted garbage bytes.
+        if len > MAX_PAYLOAD_BYTES {
+            return Err(IntentLogError::TruncatedFrame {
+                offset: frame_start,
+                expected: len,
+                actual: 0,
+            });
+        }
+
+        self.body.resize(len + FRAME_TRAILER_BYTES, 0);
+        self.body_len = len;
+        let read = read_full(&mut self.reader, &mut self.body)?;
+        if read < len {
+            return Err(IntentLogError::TruncatedFrame {
+                offset: frame_start,
+                expected: FRAME_HEADER_BYTES + len,
+                actual: FRAME_HEADER_BYTES + read,
+            });
+        }
+        if read < len + FRAME_TRAILER_BYTES {
+            return Err(IntentLogError::TruncatedFrame {
+                offset: frame_start,
+                expected: FRAME_HEADER_BYTES + len + FRAME_TRAILER_BYTES,
+                actual: FRAME_HEADER_BYTES + read,
+            });
+        }
+
+        let stored_crc = u32::from_le_bytes(self.body[len..].try_into().expect("4-byte slice"));
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header);
+        hasher.update(&self.body[..len]);
+        let computed_crc = hasher.finalize();
+        if stored_crc != computed_crc {
+            return Err(IntentLogError::CrcMismatch {
+                offset: frame_start,
+                stored: stored_crc,
+                computed: computed_crc,
+            });
+        }
+
+        self.offset += (FRAME_HEADER_BYTES + len + FRAME_TRAILER_BYTES) as u64;
+        Ok(Some(FrameMeta {
+            lsn: Lsn(lsn),
+            offset: frame_start,
+            crc: stored_crc,
+            len,
+        }))
+    }
+
+    /// On-disk (sealed, if encrypted) payload of the frame last read.
+    pub fn sealed_payload(&self) -> &[u8] {
+        &self.body[..self.body_len]
+    }
+
+    /// The plaintext payload of the frame last read, decrypting it when the
+    /// iterator holds a journal key and the payload is sealed. The body
+    /// buffer is handed over for plaintext payloads; give it back with
+    /// [`recycle`](Self::recycle) to keep reusing it.
+    pub fn take_payload(&mut self) -> Result<Vec<u8>, IntentLogError> {
+        let frame_start = self
+            .offset
+            .saturating_sub((FRAME_HEADER_BYTES + self.body_len + FRAME_TRAILER_BYTES) as u64);
+        let opened = match &self.cryptor {
+            Some(c) if crate::keystore::SecretCryptor::is_encrypted(self.sealed_payload()) => {
+                note_payload_decrypt();
+                c.decrypt_bytes(self.sealed_payload(), b"")
+            }
+            _ => {
+                let mut payload = std::mem::take(&mut self.body);
+                payload.truncate(self.body_len);
+                self.body_len = 0;
+                return Ok(payload);
+            }
+        };
+        opened.map_err(|e| {
+            self.finished = true;
+            IntentLogError::Io(io::Error::other(format!(
+                "journal payload open failed at offset {frame_start}: {e}"
+            )))
+        })
+    }
+
+    /// Return a buffer from [`take_payload`](Self::take_payload) for reuse.
+    pub fn recycle(&mut self, mut buf: Vec<u8>) {
+        if buf.capacity() > self.body.capacity() {
+            buf.clear();
+            self.body = buf;
+        }
+    }
+
+    /// Read the frame at the current offset and check it is the frame `pos`
+    /// records; on success rewind so that frame is read again next.
+    fn verify_and_rewind(&mut self, pos: FramePosition) -> Result<bool, IntentLogError> {
+        let matches = match self.read_frame() {
+            Ok(Some(meta)) => meta.position() == pos,
+            Ok(None) | Err(_) => false,
+        };
+        if matches {
+            self.reader.seek(SeekFrom::Start(pos.offset))?;
+            self.offset = pos.offset;
+            self.finished = false;
+        }
+        Ok(matches)
+    }
 }
 
 impl Iterator for IntentLogIter {
     type Item = Result<IntentRecord, IntentLogError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
+        match self.read_frame() {
+            Ok(None) => None,
+            Ok(Some(meta)) => Some(self.take_payload().map(|payload| IntentRecord {
+                lsn: meta.lsn,
+                payload,
+            })),
+            Err(e) => Some(Err(e)),
         }
-
-        let frame_start = self.offset;
-
-        // Read header (12 bytes). A short read here = EOF or torn tail.
-        let mut header = [0u8; FRAME_HEADER_BYTES];
-        match read_exact_or_eof(&mut self.file, &mut header) {
-            Ok(true) => {} // full read
-            Ok(false) => {
-                // EOF exactly at frame boundary — clean end.
-                self.finished = true;
-                return None;
-            }
-            Err(ReadOutcome::ShortRead { read }) => {
-                self.finished = true;
-                return Some(Err(IntentLogError::TruncatedFrame {
-                    offset: frame_start,
-                    expected: FRAME_HEADER_BYTES,
-                    actual: read,
-                }));
-            }
-            Err(ReadOutcome::Io(e)) => {
-                self.finished = true;
-                return Some(Err(IntentLogError::Io(e)));
-            }
-        }
-
-        let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-        let lsn = u64::from_le_bytes(header[4..12].try_into().unwrap());
-
-        // Reject obviously-wild lengths to avoid huge allocations from
-        // misinterpreted garbage bytes.
-        if len > MAX_PAYLOAD_BYTES {
-            self.finished = true;
-            return Some(Err(IntentLogError::TruncatedFrame {
-                offset: frame_start,
-                expected: len,
-                actual: 0,
-            }));
-        }
-
-        let mut payload = vec![0u8; len];
-        if !payload.is_empty() {
-            match read_exact_or_eof(&mut self.file, &mut payload) {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.finished = true;
-                    return Some(Err(IntentLogError::TruncatedFrame {
-                        offset: frame_start,
-                        expected: FRAME_HEADER_BYTES + len,
-                        actual: FRAME_HEADER_BYTES,
-                    }));
-                }
-                Err(ReadOutcome::ShortRead { read }) => {
-                    self.finished = true;
-                    return Some(Err(IntentLogError::TruncatedFrame {
-                        offset: frame_start,
-                        expected: FRAME_HEADER_BYTES + len,
-                        actual: FRAME_HEADER_BYTES + read,
-                    }));
-                }
-                Err(ReadOutcome::Io(e)) => {
-                    self.finished = true;
-                    return Some(Err(IntentLogError::Io(e)));
-                }
-            }
-        }
-
-        let mut crc_bytes = [0u8; FRAME_TRAILER_BYTES];
-        match read_exact_or_eof(&mut self.file, &mut crc_bytes) {
-            Ok(true) => {}
-            Ok(false) => {
-                self.finished = true;
-                return Some(Err(IntentLogError::TruncatedFrame {
-                    offset: frame_start,
-                    expected: FRAME_HEADER_BYTES + len + FRAME_TRAILER_BYTES,
-                    actual: FRAME_HEADER_BYTES + len,
-                }));
-            }
-            Err(ReadOutcome::ShortRead { read }) => {
-                self.finished = true;
-                return Some(Err(IntentLogError::TruncatedFrame {
-                    offset: frame_start,
-                    expected: FRAME_HEADER_BYTES + len + FRAME_TRAILER_BYTES,
-                    actual: FRAME_HEADER_BYTES + len + read,
-                }));
-            }
-            Err(ReadOutcome::Io(e)) => {
-                self.finished = true;
-                return Some(Err(IntentLogError::Io(e)));
-            }
-        }
-
-        let stored_crc = u32::from_le_bytes(crc_bytes);
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&header[0..4]);
-        hasher.update(&header[4..12]);
-        hasher.update(&payload);
-        let computed_crc = hasher.finalize();
-
-        if stored_crc != computed_crc {
-            self.finished = true;
-            return Some(Err(IntentLogError::CrcMismatch {
-                offset: frame_start,
-                stored: stored_crc,
-                computed: computed_crc,
-            }));
-        }
-
-        self.offset += (FRAME_HEADER_BYTES + len + FRAME_TRAILER_BYTES) as u64;
-
-        // Open (decrypt) the sealed payload when a journal cryptor is configured.
-        // Plaintext frames (no cryptor, or pre-encryption journals) pass through.
-        let payload = match &self.cryptor {
-            Some(c) if crate::keystore::SecretCryptor::is_encrypted(&payload) => {
-                match c.decrypt_bytes(&payload, b"") {
-                    Ok(pt) => pt,
-                    Err(e) => {
-                        self.finished = true;
-                        return Some(Err(IntentLogError::Io(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("journal payload open failed at offset {frame_start}: {e}"),
-                        ))));
-                    }
-                }
-            }
-            _ => payload,
-        };
-
-        Some(Ok(IntentRecord {
-            lsn: Lsn(lsn),
-            payload,
-        }))
     }
 }
 
-/// Distinguishes clean EOF from "read started but didn't finish".
-enum ReadOutcome {
-    ShortRead { read: usize },
-    Io(io::Error),
+#[cfg(test)]
+thread_local! {
+    static PAYLOAD_DECRYPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Returns `Ok(true)` if `buf` was fully filled; `Ok(false)` if EOF was hit
-/// before any bytes were read (clean frame boundary); `Err(ShortRead)` if
-/// some bytes were read before EOF (torn tail).
-fn read_exact_or_eof(file: &mut File, buf: &mut [u8]) -> Result<bool, ReadOutcome> {
+/// Count of frame payloads this thread has decrypted, for tests that check a
+/// reader never opens frames it does not need.
+#[cfg(test)]
+pub(crate) fn payload_decrypts_on_this_thread() -> u64 {
+    PAYLOAD_DECRYPTS.with(|c| c.get())
+}
+
+#[inline]
+fn note_payload_decrypt() {
+    #[cfg(test)]
+    PAYLOAD_DECRYPTS.with(|c| c.set(c.get() + 1));
+}
+
+/// Fill `buf` from `reader`, stopping early only at end of file. Returns the
+/// number of bytes read: `buf.len()` for a full read, less at end of file.
+fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut read = 0;
     while read < buf.len() {
-        match file.read(&mut buf[read..]) {
+        match reader.read(&mut buf[read..]) {
             Ok(0) => break,
             Ok(n) => read += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(ReadOutcome::Io(e)),
+            Err(e) => return Err(e),
         }
     }
-    if read == buf.len() {
-        Ok(true)
-    } else if read == 0 {
-        Ok(false)
-    } else {
-        Err(ReadOutcome::ShortRead { read })
-    }
+    Ok(read)
 }
 
 /// Walk an existing log file (if any) starting at `frame_region_start`
 /// (immediately past the header, for versioned files; 0 for legacy) to
-/// compute the next LSN and the byte offset immediately after the last
-/// valid frame. A corrupt or truncated tail is reported via the returned
-/// offset — open() does not truncate.
-fn scan_for_tail(path: &Path, frame_region_start: u64) -> Result<(Lsn, u64), IntentLogError> {
+/// compute the next LSN, the byte offset immediately after the last valid
+/// frame, and the frame index. A corrupt or truncated tail is reported via
+/// the returned offset — open() does not truncate.
+///
+/// With a `hint` whose latest frame verifies, the walk starts there: the
+/// frames before it were validated by the scan or append that recorded the
+/// hint.
+fn scan_for_tail(
+    path: &Path,
+    frame_region_start: u64,
+    hint: Option<&FrameIndex>,
+) -> Result<(Lsn, u64, FrameIndex), IntentLogError> {
     if !path.exists() {
         // No file yet → frames will start at frame_region_start once a
         // header is written. Report that as the durable end so the
         // caller's bookkeeping is consistent.
-        return Ok((Lsn::ZERO, frame_region_start));
+        return Ok((Lsn::ZERO, frame_region_start, FrameIndex::default()));
     }
     let file_len = std::fs::metadata(path)?.len();
     if file_len <= frame_region_start {
         // File exists but has nothing after the header — clean empty log.
-        return Ok((Lsn::ZERO, frame_region_start));
+        return Ok((Lsn::ZERO, frame_region_start, FrameIndex::default()));
     }
+
     // Tail scan only needs frame structure (lsn/offset/CRC), not payload content,
     // so it reads sealed payloads as-is (no key required).
-    let mut iter = IntentLogIter::open(path, frame_region_start, None)?;
-    let mut last_lsn = None;
-    let mut last_good_offset = frame_region_start;
-    loop {
-        let off = iter.current_offset();
-        match iter.next() {
-            None => break,
-            Some(Ok(rec)) => {
-                last_lsn = Some(rec.lsn);
-                last_good_offset = iter.current_offset();
+    if let Some(pos) = hint.and_then(FrameIndex::latest) {
+        if pos.offset >= frame_region_start && pos.offset < file_len {
+            let mut iter = IntentLogIter::open(path, pos.offset, None)?;
+            if iter.verify_and_rewind(pos)? {
+                let mut index = hint.cloned().unwrap_or_default();
+                index.keep_through(pos);
+                return walk_to_tail(iter, index);
             }
-            Some(Err(_)) => {
-                // Stop at first corruption. `last_good_offset` is the
-                // truncate target; `next_lsn` continues from the last
-                // *good* lsn we saw.
-                last_good_offset = off;
-                break;
-            }
+            tracing::warn!(
+                path = %path.display(),
+                lsn = pos.lsn.0,
+                offset = pos.offset,
+                "intent log tail hint did not verify; scanning the whole log",
+            );
         }
     }
-    let next_lsn = match last_lsn {
-        Some(lsn) => lsn.next(),
-        None => Lsn::ZERO,
-    };
-    Ok((next_lsn, last_good_offset))
+    let iter = IntentLogIter::open(path, frame_region_start, None)?;
+    walk_to_tail(iter, FrameIndex::default())
+}
+
+fn walk_to_tail(
+    mut iter: IntentLogIter,
+    mut index: FrameIndex,
+) -> Result<(Lsn, u64, FrameIndex), IntentLogError> {
+    let mut last_good_offset = iter.current_offset();
+    loop {
+        match iter.read_frame() {
+            Ok(Some(frame)) => {
+                index.record(frame.position());
+                last_good_offset = iter.current_offset();
+            }
+            Ok(None) => break,
+            // Stop at first corruption. `last_good_offset` is the truncate
+            // target; `next_lsn` continues from the last *good* lsn we saw.
+            Err(_) => break,
+        }
+    }
+    let next_lsn = index.latest().map_or(Lsn::ZERO, |p| p.lsn.next());
+    Ok((next_lsn, last_good_offset, index))
+}
+
+/// Whether the bytes past the last valid frame, `start..end`, are a torn
+/// tail: what a write cut short by a crash or a full disk leaves. That is at
+/// most one frame long and holds no complete frame. Anything else is a
+/// corrupt frame with frames after it that callers were told are durable.
+fn tail_is_torn(path: &Path, start: u64, end: u64, next_lsn: Lsn) -> io::Result<bool> {
+    let len = end - start;
+    if len > (FRAME_HEADER_BYTES + MAX_PAYLOAD_BYTES + FRAME_TRAILER_BYTES) as u64 {
+        return Ok(false);
+    }
+    let mut tail = vec![0u8; len as usize];
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut tail)?;
+    // A frame after the bad one carries a later LSN, and no more of them fit
+    // than empty frames would; that window keeps the CRC checks to a few.
+    let min_frame = (FRAME_HEADER_BYTES + FRAME_TRAILER_BYTES) as u64;
+    let lsns = next_lsn.0..=next_lsn.0.saturating_add(len / min_frame);
+    Ok(!(0..tail.len()).any(|at| frame_starts_at(&tail[at..], &lsns)))
+}
+
+/// Whether `bytes` begins with a complete, CRC-valid frame whose LSN is in `lsns`.
+fn frame_starts_at(bytes: &[u8], lsns: &std::ops::RangeInclusive<u64>) -> bool {
+    if bytes.len() < FRAME_HEADER_BYTES + FRAME_TRAILER_BYTES {
+        return false;
+    }
+    let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let lsn = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+    let body = FRAME_HEADER_BYTES + len;
+    if len > MAX_PAYLOAD_BYTES || !lsns.contains(&lsn) || bytes.len() < body + FRAME_TRAILER_BYTES {
+        return false;
+    }
+    let stored = u32::from_le_bytes(bytes[body..body + FRAME_TRAILER_BYTES].try_into().unwrap());
+    crc32fast::hash(&bytes[..body]) == stored
 }
 
 /// Probe a log file's versioning mode.
@@ -924,10 +1427,7 @@ fn probe_mode(path: &Path) -> Result<LogMode, IntentLogError> {
 
     let mut file = File::open(path)?;
     let mut magic_buf = [0u8; 8];
-    let n = match read_n_or_short(&mut file, &mut magic_buf) {
-        Ok(n) => n,
-        Err(e) => return Err(IntentLogError::Io(e)),
-    };
+    let n = read_full(&mut file, &mut magic_buf)?;
 
     // Too short to even hold the magic — treat as legacy (whoever owns
     // this file can take it from there).
@@ -954,22 +1454,6 @@ fn probe_mode(path: &Path) -> Result<LogMode, IntentLogError> {
         format_version: header.format_version,
         created_unix_secs: header.created_unix_secs,
     })
-}
-
-/// `read` up to `buf.len()` bytes, returning the number actually read.
-/// Used by the probe path which is fine with partial reads (a 3-byte
-/// file is unambiguously not a versioned log).
-fn read_n_or_short(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
-    let mut read = 0;
-    while read < buf.len() {
-        match file.read(&mut buf[read..]) {
-            Ok(0) => break,
-            Ok(n) => read += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(read)
 }
 
 #[cfg(test)]
@@ -1092,9 +1576,8 @@ mod tests {
             f.sync_data().unwrap();
         }
 
-        // Reopen — should see two good records and a TruncatedFrame error.
-        let mut log = IntentLog::open(&path).unwrap();
-        let mut iter = log.iter().unwrap();
+        // A scan sees two good records and a TruncatedFrame error.
+        let mut iter = IntentLogIter::open_for_scan(&path).unwrap();
         let r0 = iter.next().unwrap().unwrap();
         assert_eq!(r0.payload, b"first");
         let r1 = iter.next().unwrap().unwrap();
@@ -1102,9 +1585,13 @@ mod tests {
         let err = iter.next().unwrap().unwrap_err();
         assert!(matches!(err, IntentLogError::TruncatedFrame { .. }));
         assert!(iter.next().is_none());
+        drop(iter);
 
-        // durable_end_offset should point to end of the second good frame.
+        // Open cuts the file to the end of the second good frame; cutting
+        // again finds nothing more to remove.
+        let mut log = IntentLog::open(&path).unwrap();
         let good_end = log.durable_end_offset();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_end);
         let truncated_to = log.truncate_corrupt_tail().unwrap();
         assert_eq!(truncated_to, good_end);
 
@@ -1119,6 +1606,205 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The bytes `append` writes for `payload` at `lsn`, for hand-built logs.
+    fn encode_frame(lsn: u64, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&lsn.to_le_bytes());
+        frame.extend_from_slice(payload);
+        let crc = crc32fast::hash(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        frame
+    }
+
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        let mut f = OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_data().unwrap();
+    }
+
+    fn read_all(path: &Path) -> Vec<(u64, Vec<u8>)> {
+        let log = IntentLog::open(path).unwrap();
+        log.iter()
+            .unwrap()
+            .map(|r| r.map(|r| (r.lsn.0, r.payload)))
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_torn_frame_before_later_frames() {
+        // Larger than the BufWriter's 8 KiB, so append itself reaches the file.
+        const BIG: usize = 10_000;
+        let frame = FRAME_HEADER_BYTES + BIG + FRAME_TRAILER_BYTES;
+        // Where the disk fills: before the frame, inside and after len+lsn,
+        // inside the payload, and before and inside the CRC. append buffers
+        // the CRC, so the last two surface as a failed sync instead.
+        let cuts = [
+            0,
+            5,
+            FRAME_HEADER_BYTES,
+            FRAME_HEADER_BYTES + 100,
+            frame - FRAME_TRAILER_BYTES,
+            frame - 1,
+        ];
+        for budget in cuts {
+            let path = tmp_log_path(&format!("failed_write_{budget}"));
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"first").unwrap();
+            log.sync().unwrap();
+
+            log.writer.get_mut().write_budget = Some(budget);
+            let failed = log.append(&[0xAB; BIG]).and_then(|_| log.sync());
+            assert!(failed.is_err(), "cut at {budget}: the write should fail");
+            log.writer.get_mut().write_budget = None;
+
+            assert_eq!(log.append(b"second").unwrap(), Lsn(1), "cut at {budget}");
+            log.sync().unwrap();
+            assert_eq!(log.append(b"third").unwrap(), Lsn(2), "cut at {budget}");
+            log.sync().unwrap();
+            let end = log.durable_end_offset();
+            drop(log);
+
+            assert_eq!(
+                read_all(&path),
+                vec![
+                    (0, b"first".to_vec()),
+                    (1, b"second".to_vec()),
+                    (2, b"third".to_vec())
+                ],
+                "cut at {budget}",
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                end,
+                "cut at {budget}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn a_failed_write_whose_cut_also_fails_blocks_appends_until_it_succeeds() {
+        let path = tmp_log_path("cut_fails");
+        let away = path.with_extension("away");
+        let mut log = IntentLog::open(&path).unwrap();
+        log.append(b"first").unwrap();
+        log.sync().unwrap();
+
+        // With the file moved, the writer's handle still reaches it but the
+        // cut, which reopens the path, cannot.
+        std::fs::rename(&path, &away).unwrap();
+        log.writer.get_mut().write_budget = Some(5);
+        assert!(log.append(&[0xAB; 10_000]).is_err());
+        assert!(
+            log.append(b"second").is_err(),
+            "an append after an uncut failed write must not write"
+        );
+        assert!(log.sync().is_err());
+
+        std::fs::rename(&away, &path).unwrap();
+        assert_eq!(log.append(b"second").unwrap(), Lsn(1));
+        log.sync().unwrap();
+        drop(log);
+        assert_eq!(
+            read_all(&path),
+            vec![(0, b"first".to_vec()), (1, b"second".to_vec())]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_cuts_a_torn_tail_so_the_next_append_is_readable() {
+        // A frame cut short at each point: inside len+lsn, after them, and
+        // inside the payload.
+        for keep in [3, FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + 4] {
+            let path = tmp_log_path(&format!("torn_open_{keep}"));
+            {
+                let mut log = IntentLog::open(&path).unwrap();
+                log.append(b"first").unwrap();
+                log.sync().unwrap();
+            }
+            append_raw(&path, &encode_frame(1, b"never-finished")[..keep]);
+
+            let mut log = IntentLog::open(&path).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                log.durable_end_offset(),
+                "keep {keep}: open should cut the torn frame",
+            );
+            assert_eq!(log.append(b"second").unwrap(), Lsn(1));
+            log.sync().unwrap();
+            drop(log);
+            assert_eq!(
+                read_all(&path),
+                vec![(0, b"first".to_vec()), (1, b"second".to_vec())],
+                "keep {keep}",
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn open_cuts_a_full_length_last_frame_that_never_reached_the_disk() {
+        // After a crash the file can keep a frame's length while its blocks
+        // read back as zeros; the frame is whole-sized but CRC-bad.
+        let path = tmp_log_path("zeroed_tail");
+        {
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"first").unwrap();
+            log.sync().unwrap();
+        }
+        let mut zeroed = encode_frame(1, b"lost-in-the-crash");
+        zeroed[FRAME_HEADER_BYTES..].fill(0);
+        append_raw(&path, &zeroed);
+        append_raw(&path, &[0u8; 40]);
+
+        let mut log = IntentLog::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            log.durable_end_offset()
+        );
+        assert_eq!(log.append(b"second").unwrap(), Lsn(1));
+        log.sync().unwrap();
+        drop(log);
+        assert_eq!(
+            read_all(&path),
+            vec![(0, b"first".to_vec()), (1, b"second".to_vec())]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_keeps_a_corrupt_frame_that_intact_frames_follow() {
+        // What a failed write left before this was fixed: a torn frame, then
+        // frames that were acknowledged as durable. Cutting at the torn frame
+        // would drop them, so open must leave the file alone.
+        let path = tmp_log_path("torn_mid_log");
+        {
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"first").unwrap();
+            log.sync().unwrap();
+        }
+        append_raw(
+            &path,
+            &encode_frame(1, &[0xAB; 10_000])[..FRAME_HEADER_BYTES],
+        );
+        append_raw(&path, &encode_frame(1, b"second"));
+        append_raw(&path, &encode_frame(2, b"third"));
+        let len_before = std::fs::metadata(&path).unwrap().len();
+
+        let log = IntentLog::open(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
+        let mut iter = log.iter().unwrap();
+        assert_eq!(iter.next().unwrap().unwrap().payload, b"first");
+        assert!(matches!(
+            iter.next().unwrap().unwrap_err(),
+            IntentLogError::TruncatedFrame { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn crc_corruption_detected() {
         let path = tmp_log_path("crc");
@@ -1126,6 +1812,7 @@ mod tests {
             let mut log = IntentLog::open(&path).unwrap();
             log.append(b"untouched").unwrap();
             log.append(b"will-be-flipped").unwrap();
+            log.append(b"after-the-flip").unwrap();
             log.sync().unwrap();
         }
         // Flip one byte inside the second payload.
@@ -1147,7 +1834,11 @@ mod tests {
             f.write_all(&b).unwrap();
             f.sync_data().unwrap();
         }
+        // An intact frame follows the flipped one, so open leaves the file
+        // as it is.
+        let len_before = std::fs::metadata(&path).unwrap().len();
         let log = IntentLog::open(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
         let mut iter = log.iter().unwrap();
         // First frame still good.
         let r0 = iter.next().unwrap().unwrap();
@@ -1419,6 +2110,182 @@ mod tests {
             Err(other) => panic!("expected TooShort, got {other:?}"),
             Ok(_) => panic!("expected open() to fail when file is shorter than the header"),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ========================================================================
+    // Frame offset index
+    // ========================================================================
+
+    fn append_numbered(log: &mut IntentLog, count: u64) {
+        for i in 0..count {
+            log.append(&i.to_le_bytes()).unwrap();
+        }
+        log.sync().unwrap();
+    }
+
+    fn first_lsn(iter: &mut IntentLogIter) -> Lsn {
+        iter.next().unwrap().unwrap().lsn
+    }
+
+    #[test]
+    fn frame_index_encodes_round_trip_and_seeks_to_the_nearest_entry_below() {
+        let mut index = FrameIndex::default();
+        for lsn in [0u64, 1, 1023, 1024, 1500, 2048, 2050] {
+            index.record(FramePosition {
+                lsn: Lsn(lsn),
+                offset: 100 + lsn * 10,
+                crc: lsn as u32 ^ 0xabcd,
+            });
+        }
+        let lsns: Vec<u64> = index.sparse().iter().map(|p| p.lsn.0).collect();
+        assert_eq!(lsns, vec![0, 1024, 2048]);
+        assert_eq!(index.latest().unwrap().lsn, Lsn(2050));
+        assert_eq!(index.seek_hint(Lsn(1023)).unwrap().lsn, Lsn(0));
+        assert_eq!(index.seek_hint(Lsn(1500)).unwrap().lsn, Lsn(1024));
+        assert_eq!(index.seek_hint(Lsn(2049)).unwrap().lsn, Lsn(2048));
+        assert_eq!(index.seek_hint(Lsn(9000)).unwrap().lsn, Lsn(2050));
+
+        let decoded = FrameIndex::decode(&index.encode()).unwrap();
+        assert_eq!(decoded, index);
+        let mut truncated = index.encode();
+        truncated.pop();
+        assert!(FrameIndex::decode(&truncated).is_none());
+        assert!(FrameIndex::decode(&[9, 0, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn iter_from_resumes_mid_log_at_the_indexed_frame() {
+        let path = tmp_log_path("seek_mid");
+        let mut log = IntentLog::open(&path).unwrap();
+        append_numbered(&mut log, 2100);
+
+        let mut iter = log.iter_from(Lsn(1500)).unwrap();
+        assert_eq!(first_lsn(&mut iter), Lsn(1024), "seeks to the sparse entry");
+        let mut iter = log.iter_from(Lsn(2099)).unwrap();
+        let record = iter.next().unwrap().unwrap();
+        assert_eq!(record.lsn, Lsn(2099), "seeks to the latest frame");
+        assert_eq!(record.payload, 2099u64.to_le_bytes());
+        assert!(iter.next().is_none());
+        let mut iter = log.iter_from(Lsn(10)).unwrap();
+        assert_eq!(first_lsn(&mut iter), Lsn(0));
+
+        // The index rebuilt by a full scan on reopen matches the one the
+        // appends built, and a reopen with it as the hint agrees too.
+        let built = log.frame_index().clone();
+        drop(log);
+        let scanned = IntentLog::open(&path).unwrap();
+        assert_eq!(scanned.frame_index(), &built);
+        let hinted = IntentLog::open_with_index(&path, None, Some(built.clone())).unwrap();
+        assert_eq!(hinted.next_lsn(), Lsn(2100));
+        assert_eq!(hinted.durable_end_offset(), scanned.durable_end_offset());
+        assert_eq!(hinted.frame_index(), &built);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn iter_from_falls_back_to_the_first_frame_on_a_corrupted_hint() {
+        let path = tmp_log_path("seek_bad_hint");
+        let mut log = IntentLog::open(&path).unwrap();
+        append_numbered(&mut log, 2100);
+        let good = log.index.seek_hint(Lsn(1500)).unwrap();
+
+        for bad in [
+            FramePosition {
+                offset: good.offset + 1,
+                ..good
+            },
+            FramePosition {
+                crc: good.crc ^ 1,
+                ..good
+            },
+            FramePosition {
+                lsn: Lsn(1025),
+                ..good
+            },
+        ] {
+            let mut index = FrameIndex::default();
+            index.record(bad);
+            log.index = index;
+            let lsns: Vec<u64> = log
+                .iter_from(Lsn(1500))
+                .unwrap()
+                .map(|r| r.unwrap().lsn.0)
+                .collect();
+            assert_eq!(lsns, (0..2100).collect::<Vec<_>>(), "hint {bad:?}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_with_a_stale_hint_scans_the_whole_log() {
+        let path = tmp_log_path("stale_hint");
+        let mut log = IntentLog::open(&path).unwrap();
+        append_numbered(&mut log, 2100);
+        let stale = log.frame_index().clone();
+        log.truncate_to_lsn(Lsn(1999)).unwrap();
+        assert_eq!(log.frame_index().latest().unwrap().lsn, Lsn(1999));
+        log.append(b"after-truncate").unwrap();
+        log.sync().unwrap();
+        let end = log.durable_end_offset();
+        drop(log);
+
+        let reopened = IntentLog::open_with_index(&path, None, Some(stale)).unwrap();
+        assert_eq!(reopened.next_lsn(), Lsn(2001));
+        assert_eq!(reopened.durable_end_offset(), end);
+        assert_eq!(reopened.frame_index().latest().unwrap().lsn, Lsn(2000));
+        let last = reopened
+            .iter_from(Lsn(2000))
+            .unwrap()
+            .last()
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.payload, b"after-truncate");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrade_shifts_the_frame_index_with_the_frames() {
+        let path = tmp_log_path("upgrade_index");
+        write_legacy_log(&path, &[b"one", b"two"]);
+        let mut log = IntentLog::open(&path).unwrap();
+        log.upgrade_unversioned_to_v1().unwrap();
+        let latest = log.frame_index().latest().unwrap();
+        let record = log
+            .iter_at(latest)
+            .unwrap()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.payload, b"two");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_frame_verifies_without_opening_sealed_payloads() {
+        let path = tmp_log_path("raw_frames");
+        let cryptor = || {
+            Some(crate::keystore::SecretCryptor::new(
+                zeroize::Zeroizing::new([3u8; 32]),
+            ))
+        };
+        let mut log = IntentLog::open_with_cryptor(&path, cryptor()).unwrap();
+        append_numbered(&mut log, 5);
+        let before = payload_decrypts_on_this_thread();
+        let mut iter = log.iter().unwrap();
+        let mut seen = 0;
+        while let Some(frame) = iter.read_frame().unwrap() {
+            assert!(crate::keystore::SecretCryptor::is_encrypted(
+                iter.sealed_payload()
+            ));
+            seen += 1;
+            if frame.lsn == Lsn(3) {
+                assert_eq!(iter.take_payload().unwrap(), 3u64.to_le_bytes());
+            }
+        }
+        assert_eq!(seen, 5);
+        assert_eq!(payload_decrypts_on_this_thread() - before, 1);
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -37,10 +37,6 @@ pub struct FileMemoryStore {
 }
 
 impl FileMemoryStore {
-    /// CF accessor for the files column family
-
-    /// CF accessor for the file_index column family
-
     #[cfg(feature = "rocksdb")]
     /// Return CF descriptors needed by this store. The caller must include
     /// these when opening the shared RocksDB instance.
@@ -237,7 +233,7 @@ impl FileMemoryStore {
         }
 
         // Sort by access count descending (most accessed first)
-        files.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+        files.sort_by_key(|file| std::cmp::Reverse(file.access_count));
 
         Ok(files)
     }
@@ -1192,6 +1188,7 @@ mod tests {
         (store, temp_dir)
     }
 
+    #[cfg(feature = "storage-redb")]
     #[test]
     fn test_with_store_redb_round_trip() {
         // The point of with_store: the same store logic over the other backend.

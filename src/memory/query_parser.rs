@@ -918,6 +918,341 @@ pub fn extract_temporal_refs_with_events(
     augmented
 }
 
+// ============================================================================
+// Calendar windows named in a query
+// ============================================================================
+// `extract_temporal_refs` resolves every date it finds to one `NaiveDate` and
+// cannot say whether "May 2022" meant the month or its first day. The date
+// window leg in recall needs that distinction: it fetches memories by
+// `created_at`, so a month must widen to the whole month and a year must not
+// fire at all (a year of memories is not a candidate list). This extractor
+// reads the calendar granularity straight off the text.
+
+/// How much of the calendar a [`DateWindow`] covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DateWindowGranularity {
+    /// One calendar day: "1 May, 2022", "May 1, 2022", "2022-05-01", "05/01/2022".
+    Day,
+    /// One calendar month: "May 2022", "in April of 2022".
+    Month,
+}
+
+/// A calendar span a query names explicitly, with its year.
+///
+/// `end` is exclusive, so a day is `[d, d+1)` and a month is `[1st, 1st of next month)`.
+/// Year-only mentions ("in 2022") are not windows: they stay with the temporal boost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DateWindow {
+    /// First day covered.
+    pub start: NaiveDate,
+    /// First day NOT covered.
+    pub end: NaiveDate,
+    /// Day or month.
+    pub granularity: DateWindowGranularity,
+    /// The text the window was read from, as written.
+    pub original_text: String,
+}
+
+impl DateWindow {
+    /// The window for one calendar day.
+    pub fn day(date: NaiveDate, original_text: &str) -> Self {
+        Self {
+            start: date,
+            end: date + Duration::days(1),
+            granularity: DateWindowGranularity::Day,
+            original_text: original_text.to_string(),
+        }
+    }
+
+    /// The window for one calendar month. `None` when `month` is not 1..=12.
+    pub fn month(year: i32, month: u32, original_text: &str) -> Option<Self> {
+        let start = NaiveDate::from_ymd_opt(year, month, 1)?;
+        let end = if month == 12 {
+            NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+        } else {
+            NaiveDate::from_ymd_opt(year, month + 1, 1)?
+        };
+        Some(Self {
+            start,
+            end,
+            granularity: DateWindowGranularity::Month,
+            original_text: original_text.to_string(),
+        })
+    }
+
+    /// Whether `date` falls inside the window.
+    pub fn contains(&self, date: NaiveDate) -> bool {
+        date >= self.start && date < self.end
+    }
+}
+
+/// The calendar days and month-years a query names explicitly, in text order.
+///
+/// Recognised day forms: "May 7, 2023", "May 7th 2023", "7 May, 2023", "7th of May 2023",
+/// "2023-05-07" and "05/07/2023" (month first, as `extract_explicit_dates` reads it).
+/// Recognised month forms: "May 2023", "May, 2023", "May of 2023", with month names
+/// spelt out or abbreviated. A month-year that is part of a day form ("7 May, 2023")
+/// is reported once, as the day. Years outside 1900..=2100 are not dates. Two mentions
+/// of the same window are reported once.
+pub fn extract_date_windows(text: &str) -> Vec<DateWindow> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    const MONTH: &str = r"(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)";
+
+    // "May 7, 2023", "May 7th 2023", "Sept. 7, 2023"
+    static MONTH_DAY_YEAR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(
+            r"(?i)\b{MONTH}\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b"
+        ))
+        .expect("month-day-year regex")
+    });
+    // "7 May, 2023", "7th of May 2023"
+    static DAY_MONTH_YEAR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(
+            r"(?i)\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?{MONTH}\.?,?\s+(\d{{4}})\b"
+        ))
+        .expect("day-month-year regex")
+    });
+    // "2023-05-07"
+    static ISO_DAY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b").expect("iso-day regex"));
+    // "05/07/2023", month first.
+    static SLASH_DAY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b").expect("slash-day regex"));
+    // "May 2023", "May, 2023", "May of 2023"
+    static MONTH_YEAR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(r"(?i)\b{MONTH}\.?,?\s+(?:of\s+)?(\d{{4}})\b"))
+            .expect("month-year regex")
+    });
+
+    fn year_in_range(year: i32) -> bool {
+        (1900..=2100).contains(&year)
+    }
+
+    // (start offset, end offset, window)
+    let mut found: Vec<(usize, usize, DateWindow)> = Vec::new();
+    // Every day form's span, recorded whether or not its window is new: a repeated day
+    // still contains a month-year that must not surface as a month on its own.
+    let mut day_spans: Vec<(usize, usize)> = Vec::new();
+    fn push(
+        found: &mut Vec<(usize, usize, DateWindow)>,
+        start: usize,
+        end: usize,
+        window: DateWindow,
+    ) {
+        if !found
+            .iter()
+            .any(|(_, _, w)| w.start == window.start && w.end == window.end)
+        {
+            found.push((start, end, window));
+        }
+    }
+
+    for cap in MONTH_DAY_YEAR.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let month = month_to_num(&cap[1]);
+        let (Ok(day), Ok(year)) = (cap[2].parse::<u32>(), cap[3].parse::<i32>()) else {
+            continue;
+        };
+        if !year_in_range(year) {
+            continue;
+        }
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            day_spans.push((whole.start(), whole.end()));
+            push(
+                &mut found,
+                whole.start(),
+                whole.end(),
+                DateWindow::day(date, whole.as_str()),
+            );
+        }
+    }
+    for cap in DAY_MONTH_YEAR.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let (Ok(day), Ok(year)) = (cap[1].parse::<u32>(), cap[3].parse::<i32>()) else {
+            continue;
+        };
+        let month = month_to_num(&cap[2]);
+        if !year_in_range(year) {
+            continue;
+        }
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            day_spans.push((whole.start(), whole.end()));
+            push(
+                &mut found,
+                whole.start(),
+                whole.end(),
+                DateWindow::day(date, whole.as_str()),
+            );
+        }
+    }
+    for cap in ISO_DAY.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let (Ok(year), Ok(month), Ok(day)) = (
+            cap[1].parse::<i32>(),
+            cap[2].parse::<u32>(),
+            cap[3].parse::<u32>(),
+        ) else {
+            continue;
+        };
+        if !year_in_range(year) {
+            continue;
+        }
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            day_spans.push((whole.start(), whole.end()));
+            push(
+                &mut found,
+                whole.start(),
+                whole.end(),
+                DateWindow::day(date, whole.as_str()),
+            );
+        }
+    }
+    for cap in SLASH_DAY.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let (Ok(month), Ok(day), Ok(year)) = (
+            cap[1].parse::<u32>(),
+            cap[2].parse::<u32>(),
+            cap[3].parse::<i32>(),
+        ) else {
+            continue;
+        };
+        if !year_in_range(year) {
+            continue;
+        }
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            day_spans.push((whole.start(), whole.end()));
+            push(
+                &mut found,
+                whole.start(),
+                whole.end(),
+                DateWindow::day(date, whole.as_str()),
+            );
+        }
+    }
+    // A month-year inside a day form is that day, already recorded.
+    for cap in MONTH_YEAR.captures_iter(text) {
+        let whole = cap.get(0).expect("whole match");
+        let inside_day = day_spans
+            .iter()
+            .any(|(s, e)| whole.start() >= *s && whole.end() <= *e);
+        if inside_day {
+            continue;
+        }
+        let Ok(year) = cap[2].parse::<i32>() else {
+            continue;
+        };
+        if !year_in_range(year) {
+            continue;
+        }
+        let month = month_to_num(&cap[1]);
+        if let Some(window) = DateWindow::month(year, month, whole.as_str()) {
+            push(&mut found, whole.start(), whole.end(), window);
+        }
+    }
+
+    found.sort_by_key(|(start, _, _)| *start);
+    found.into_iter().map(|(_, _, w)| w).collect()
+}
+
+#[cfg(test)]
+mod date_window_tests {
+    use super::{extract_date_windows, DateWindow, DateWindowGranularity};
+    use chrono::NaiveDate;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn a_day_month_year_is_one_day() {
+        let w = extract_date_windows("What movie did Joanna watch on 1 May, 2022?");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].granularity, DateWindowGranularity::Day);
+        assert_eq!(w[0].start, d(2022, 5, 1));
+        assert_eq!(w[0].end, d(2022, 5, 2));
+        assert_eq!(w[0].original_text, "1 May, 2022");
+    }
+
+    #[test]
+    fn every_day_form_reads_as_that_day() {
+        for text in [
+            "on February 7, 2022",
+            "on February 7th, 2022",
+            "on 7 February 2022",
+            "on the 7th of February 2022",
+            "on 2022-02-07",
+            "on 02/07/2022",
+            "on Feb. 7, 2022",
+        ] {
+            let w = extract_date_windows(text);
+            assert_eq!(w.len(), 1, "{text}: {w:?}");
+            assert_eq!(
+                w[0],
+                DateWindow::day(d(2022, 2, 7), &w[0].original_text),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_month_year_is_the_whole_month() {
+        let w =
+            extract_date_windows("What physical transformation did Nate undergo in April 2022?");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].granularity, DateWindowGranularity::Month);
+        assert_eq!(w[0].start, d(2022, 4, 1));
+        assert_eq!(w[0].end, d(2022, 5, 1));
+        assert!(w[0].contains(d(2022, 4, 30)));
+        assert!(!w[0].contains(d(2022, 5, 1)));
+    }
+
+    #[test]
+    fn december_rolls_into_the_next_year() {
+        let w = extract_date_windows("in December of 2021");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].start, d(2021, 12, 1));
+        assert_eq!(w[0].end, d(2022, 1, 1));
+    }
+
+    #[test]
+    fn a_year_alone_is_not_a_window() {
+        assert!(extract_date_windows("What state did Joanna visit in 2021?").is_empty());
+        assert!(extract_date_windows("in summer 2021").is_empty());
+    }
+
+    #[test]
+    fn a_month_inside_a_day_form_is_reported_once_as_the_day() {
+        let w = extract_date_windows("on 25 February, 2022");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].granularity, DateWindowGranularity::Day);
+    }
+
+    #[test]
+    fn a_month_without_a_year_is_not_a_window() {
+        assert!(extract_date_windows("What happened in May?").is_empty());
+        assert!(extract_date_windows("last May").is_empty());
+    }
+
+    #[test]
+    fn impossible_dates_and_out_of_range_years_are_skipped() {
+        assert!(extract_date_windows("on February 30, 2022").is_empty());
+        assert!(extract_date_windows("on May 1, 1066").is_empty());
+        assert!(extract_date_windows("in May 3000").is_empty());
+    }
+
+    #[test]
+    fn windows_come_in_text_order_and_repeats_collapse() {
+        let w = extract_date_windows("between June 2022 and 3 May, 2022, or May 3, 2022");
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert_eq!(w[0].granularity, DateWindowGranularity::Month);
+        assert_eq!(w[0].start, d(2022, 6, 1));
+        assert_eq!(w[1].granularity, DateWindowGranularity::Day);
+        assert_eq!(w[1].start, d(2022, 5, 3));
+    }
+}
+
 /// Classify the type of temporal reference
 fn classify_temporal_ref(text: &str, date: &NaiveDate, now: &DateTime<Utc>) -> TemporalRefType {
     let text_lower = text.to_lowercase();
@@ -1491,6 +1826,291 @@ pub fn classify_query(query: &str) -> QueryType {
 
     // Default to exploratory
     QueryType::Exploratory
+}
+
+/// The shape of a query as far as the Layer 5.3 cross-encoder blend is concerned. Each
+/// shape has its own share in `constants::CE_BLEND_*` and its own dial.
+///
+/// - Grounding shapes (`Identifier`, `Ordinal`, `Keyword`) describe questions whose answer
+///   is decided by exact tokens or position in time, where the reranker adds nothing. They
+///   take precedence over everything else, lowest share first.
+/// - Reasoning shapes (`Attribute`, `Relational`, `Abstract`) describe questions whose
+///   answer needs query-to-passage reading.
+/// - Labels (`Temporal`, `People`) mark a plain question of that kind so its share can be
+///   tuned on its own. They apply only when no other shape does: a date in "what filling
+///   did she use in the cake she made in May 2022" filters, it does not answer, and the
+///   reranker still has to match "filling" to "cake".
+///
+/// Declaration order is default-share order, lowest first; [`classify_rerank_shape`] takes
+/// the minimum among grounding shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RerankShape {
+    Identifier,
+    Ordinal,
+    Keyword,
+    Temporal,
+    People,
+    Exploratory,
+    Attribute,
+    Relational,
+    Abstract,
+}
+
+impl RerankShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Identifier => "identifier",
+            Self::Ordinal => "ordinal",
+            Self::Temporal => "temporal",
+            Self::People => "people",
+            Self::Keyword => "keyword",
+            Self::Exploratory => "exploratory",
+            Self::Attribute => "attribute",
+            Self::Relational => "relational",
+            Self::Abstract => "abstract",
+        }
+    }
+}
+
+/// A "who" / "whom" / "who's" question. "Whose" is not one: "whose config file" asks
+/// about a thing.
+pub fn is_people_question(query: &str) -> bool {
+    let lower = query.trim_start().to_lowercase();
+    ["who ", "whom ", "who's ", "who\u{2019}s ", "who're "]
+        .iter()
+        .any(|p| lower.starts_with(p))
+}
+
+/// How strongly a query asks about people, in `[0, 1]`. A who-question or an explicit
+/// ownership phrase is 1.0; a whole-word people noun ("people", "colleagues") is 0.6. Whole
+/// words only: "owner" and "contact" were left out because "file owner" and "contact form"
+/// are technical, and substring matching is how "recent" inside "recently" once amplified
+/// recency fivefold.
+pub fn people_intent(query: &str) -> f32 {
+    if is_people_question(query) {
+        return 1.0;
+    }
+    let lower = query.to_lowercase();
+    if [
+        "who is responsible",
+        "who owns",
+        "who worked on",
+        "assigned to",
+        "point of contact",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return 1.0;
+    }
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has_word = |w: &str| words.contains(&w);
+    let has_pair = |a: &str, b: &str| words.windows(2).any(|p| p[0] == a && p[1] == b);
+    if ["people", "colleagues", "stakeholders", "teammates", "staff"]
+        .iter()
+        .any(|w| has_word(w))
+        || has_pair("team", "members")
+    {
+        return 0.6;
+    }
+    0.0
+}
+
+/// Words that shape a question rather than name its topic: quantity, duration, reason,
+/// likelihood, recency, kind. An answer almost never repeats them ("How long has she been
+/// doing yoga?" is answered by "about 3 years now"), so query-term coverage must not count
+/// them. On the full 1,531-question LoCoMo suite (2026-10-20) they were behind most of the
+/// coverage layer's lost cases.
+pub const QUESTION_FRAME_WORDS: &[&str] = &[
+    "many",
+    "much",
+    "long",
+    "often",
+    "time",
+    "times",
+    "period",
+    "reason",
+    "reasons",
+    "cause",
+    "likely",
+    "probably",
+    "possibly",
+    "related",
+    "recent",
+    "recently",
+    "kind",
+    "kinds",
+    "type",
+    "types",
+    "sort",
+    "sorts",
+    "way",
+    "ways",
+    "aspect",
+    "aspects",
+    "example",
+    "examples",
+    "specific",
+    "particular",
+    "exactly",
+    "usually",
+    "usual",
+    "currently",
+    "lately",
+];
+
+/// Whether `word` (any case) is in [`QUESTION_FRAME_WORDS`].
+pub fn is_question_frame_word(word: &str) -> bool {
+    let lower = word.to_lowercase();
+    QUESTION_FRAME_WORDS.contains(&lower.as_str())
+}
+
+/// English stems of the non-stopword tokens in `text`, for query-term coverage.
+pub fn content_stems(text: &str) -> HashSet<String> {
+    let stemmer = Stemmer::create(Algorithm::English);
+    tokenize(text)
+        .into_iter()
+        .filter(|w| !is_stop_word(w))
+        .map(|w| stemmer.stem(&w).into_owned())
+        .collect()
+}
+
+/// Pseudo-relevance feedback terms: words shared by at least two of the first pass's top
+/// documents (all of them when only one is given), not stopwords, not already in the query
+/// by stem, alphabetic and at least four letters. Ranked by how many documents share them,
+/// then by total frequency, then alphabetically so the choice is deterministic. Requiring
+/// two documents keeps one off-topic hit from steering the expansion.
+pub fn prf_terms(docs: &[&str], query: &str, n: usize) -> Vec<String> {
+    if docs.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    let stemmer = Stemmer::create(Algorithm::English);
+    let query_stems = content_stems(query);
+    let mut doc_freq: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for doc in docs {
+        let mut seen_here: HashSet<String> = HashSet::new();
+        for word in tokenize(doc) {
+            if word.len() < 4 || !word.chars().all(char::is_alphabetic) || is_stop_word(&word) {
+                continue;
+            }
+            if query_stems.contains(stemmer.stem(&word).as_ref()) {
+                continue;
+            }
+            let entry = doc_freq.entry(word.clone()).or_insert((0, 0));
+            entry.1 += 1;
+            if seen_here.insert(word) {
+                entry.0 += 1;
+            }
+        }
+    }
+    let min_docs = docs.len().min(2);
+    let mut ranked: Vec<(String, usize, usize)> = doc_freq
+        .into_iter()
+        .filter(|(_, (df, _))| *df >= min_docs)
+        .map(|(w, (df, tf))| (w, df, tf))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+    ranked.into_iter().take(n).map(|(w, _, _)| w).collect()
+}
+
+/// Classify a query for the cross-encoder blend. Grounding shapes win, lowest share first;
+/// then reasoning shapes; then the `Temporal` and `People` labels; then `Exploratory`.
+/// `decomposed` is Layer 2's multi-query flag; `query_type` is [`classify_query`]'s result.
+pub fn classify_rerank_shape(query: &str, decomposed: bool, query_type: &QueryType) -> RerankShape {
+    let lower = query.to_lowercase();
+    let mut shapes: Vec<RerankShape> = Vec::with_capacity(3);
+
+    if has_structured_identifier(query)
+        || query
+            .split_whitespace()
+            .any(|w| w.contains('/') || w.contains("::") || w.contains('_'))
+    {
+        shapes.push(RerankShape::Identifier);
+    }
+    // Same trigger as Layer 5.9's ordinal pin, so the share follows what the pipeline does.
+    if lower.contains("first ")
+        || lower.contains("most recent")
+        || lower.contains("latest")
+        || lower.contains("last ")
+    {
+        shapes.push(RerankShape::Ordinal);
+    }
+    let content_tokens = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !is_stop_word(w))
+        .count();
+    if content_tokens < 3 {
+        shapes.push(RerankShape::Keyword);
+    }
+    if let Some(grounding) = shapes.iter().min() {
+        return *grounding;
+    }
+
+    if decomposed {
+        return RerankShape::Abstract;
+    }
+    let trimmed = lower.trim_start();
+    if trimmed.starts_with("how did ")
+        || trimmed.starts_with("how does ")
+        || trimmed.starts_with("how do ")
+        || trimmed.starts_with("how was ")
+        || trimmed.starts_with("why ")
+    {
+        return RerankShape::Relational;
+    }
+    if matches!(query_type, QueryType::Attribute(_)) {
+        return RerankShape::Attribute;
+    }
+    // Labels, not grounding shapes. Measured 2026-10-19: as grounding shapes at 0.10, the
+    // temporal share cost the recall gate a gold document on a dated content question and
+    // the people share overrode the abstract share on decomposed who-questions (LOCOMO-20
+    // Q20 lost a top-5 answer, gate q121 lost rank).
+    if [
+        "last week",
+        "last month",
+        "yesterday",
+        "today",
+        "recently",
+        "recent ",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+        || matches!(
+            detect_temporal_intent(query),
+            TemporalIntent::SpecificTime | TemporalIntent::Ordering
+        )
+    {
+        return RerankShape::Temporal;
+    }
+    if is_people_question(query) {
+        return RerankShape::People;
+    }
+    RerankShape::Exploratory
+}
+
+/// Like [`has_lexical_identifiers`], but a bare all-caps word counts only when it carries a
+/// digit (`E0308`) or is long enough to be a code constant (`ECONNREFUSED`, eight or more
+/// letters). A short acronym in a question (`LGBTQ`, `HTTPS`) names a topic, and treating the
+/// question as an identifier lookup switched its reranker off: on the five LoCoMo questions
+/// with a bare acronym, MRR fell from 0.767 to 0.600.
+pub fn has_structured_identifier(query: &str) -> bool {
+    static STRUCTURED: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
+        vec![
+            regex::Regex::new(r"\b[A-Z]{2,10}-\d{1,6}\b").unwrap(),
+            regex::Regex::new(r"\bv?\d+\.\d+(?:\.\d+)?\b").unwrap(),
+            regex::Regex::new(r"\b[A-Z][A-Z0-9]*\d[A-Z0-9]*\b").unwrap(),
+            regex::Regex::new(r"\b[A-Z]{8,}\b").unwrap(),
+            regex::Regex::new(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+                .unwrap(),
+            regex::Regex::new(r"\b[0-9a-f]{7,40}\b").unwrap(),
+            regex::Regex::new(r"#\d{1,6}\b").unwrap(),
+        ]
+    });
+    STRUCTURED.iter().any(|p| p.is_match(query))
 }
 
 /// Detect whether a query contains lexical identifiers that score poorly on
@@ -5965,5 +6585,198 @@ mod tests {
         assert!(!asks_for_temporal_answer(
             "What did Melanie think about camping?"
         ));
+    }
+
+    fn shape(q: &str, decomposed: bool) -> RerankShape {
+        classify_rerank_shape(q, decomposed, &classify_query(q))
+    }
+
+    #[test]
+    fn rerank_shape_grounding_shapes_win() {
+        assert_eq!(
+            shape("where is admin/serve.mjs loaded", false),
+            RerankShape::Identifier
+        );
+        assert_eq!(
+            shape("what was the first bug we hit", false),
+            RerankShape::Ordinal
+        );
+        assert_eq!(shape("redis cache", false), RerankShape::Keyword);
+        assert_eq!(
+            shape("who fixed the EU checkout last week", false),
+            RerankShape::Ordinal
+        );
+        assert_eq!(
+            shape("how did we fix the latest checkout bug", false),
+            RerankShape::Ordinal
+        );
+        assert_eq!(
+            shape("what was the first bug we hit", true),
+            RerankShape::Ordinal
+        );
+    }
+
+    #[test]
+    fn rerank_shape_labels_apply_only_when_nothing_else_does() {
+        assert_eq!(
+            shape("what did we decide recently about the API", false),
+            RerankShape::Temporal
+        );
+        assert_eq!(
+            shape("who fixed the EU checkout yesterday", false),
+            RerankShape::Temporal
+        );
+        assert_eq!(
+            shape("who are the key people on the team", false),
+            RerankShape::People
+        );
+        assert_eq!(
+            shape("who are the key people on the team", true),
+            RerankShape::Abstract
+        );
+        assert_eq!(
+            shape(
+                "what filling did Joanna use in the cake she made recently",
+                true
+            ),
+            RerankShape::Abstract
+        );
+        assert_eq!(
+            shape(
+                "how did the migration recently change checkout latency",
+                false
+            ),
+            RerankShape::Relational
+        );
+    }
+
+    #[test]
+    fn rerank_shape_reasoning_shapes_only_without_grounding() {
+        assert_eq!(
+            shape(
+                "how did Sarah's Stripe migration fix the EU checkout delay",
+                false
+            ),
+            RerankShape::Relational
+        );
+        assert_eq!(
+            shape(
+                "why did the analytics database run out of disk space",
+                false
+            ),
+            RerankShape::Relational
+        );
+        assert_eq!(
+            shape(
+                "what performance improvements have we achieved across the product",
+                true
+            ),
+            RerankShape::Abstract
+        );
+        assert_eq!(
+            shape(
+                "what caching problems did we have and how were they resolved",
+                false
+            ),
+            RerankShape::Exploratory
+        );
+        assert_eq!(
+            shape("how did we deploy SHO-72 to staging", false),
+            RerankShape::Identifier
+        );
+    }
+
+    #[test]
+    fn structured_identifiers_exclude_short_acronyms() {
+        assert!(!has_structured_identifier(
+            "What LGBTQ+ events has Caroline participated in?"
+        ));
+        assert!(!has_structured_identifier("Did the HTTPS rollout finish?"));
+        assert!(has_structured_identifier(
+            "why does ECONNREFUSED happen on startup"
+        ));
+        assert!(has_structured_identifier("rustc E0308 mismatched types"));
+        assert!(has_structured_identifier("status of SHO-72"));
+        assert!(has_structured_identifier("what changed in v0.8.3"));
+        assert_eq!(
+            shape("What LGBTQ+ events has Caroline participated in?", false),
+            RerankShape::Exploratory
+        );
+    }
+
+    #[test]
+    fn question_frame_words_are_not_topic_words() {
+        for w in ["many", "Long", "reason", "recently", "kind"] {
+            assert!(is_question_frame_word(w), "{w}");
+        }
+        for w in ["yoga", "screenplay", "favorite", "picture"] {
+            assert!(!is_question_frame_word(w), "{w}");
+        }
+    }
+
+    #[test]
+    fn people_intent_grades_and_rejects_technical_words() {
+        assert_eq!(people_intent("Who are the key people on the team?"), 1.0);
+        assert_eq!(
+            people_intent("which tasks are assigned to the platform group"),
+            1.0
+        );
+        assert_eq!(people_intent("what did the team members decide"), 0.6);
+        assert_eq!(people_intent("what happened to the people counter"), 0.6);
+        assert_eq!(people_intent("whose fault was the outage"), 0.0);
+        assert_eq!(people_intent("who's on call this week"), 1.0);
+        assert_eq!(
+            people_intent("change the file owner and the contact form"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn content_stems_match_across_inflections() {
+        let query = content_stems("what caching problems did we have");
+        let memory = content_stems("Raj found the Redis cache invalidation bug");
+        assert!(query.contains("cach"));
+        assert!(memory.contains("cach"));
+        assert!(!query.contains("what"));
+    }
+
+    #[test]
+    fn prf_terms_need_two_documents_and_skip_query_words() {
+        let docs = [
+            "Redis cache invalidation race in the pub/sub listener",
+            "Added distributed locking with Redlock to the Redis listener",
+            "Team lunch at Sakura Sushi",
+        ];
+        let terms = prf_terms(&docs, "what caching problems did we have", 5);
+        assert!(terms.contains(&"redis".to_string()));
+        assert!(terms.contains(&"listener".to_string()));
+        assert!(!terms.contains(&"sushi".to_string()));
+        assert!(!terms.iter().any(|t| t.starts_with("cach")));
+        assert_eq!(prf_terms(&docs, "q", 5), prf_terms(&docs, "q", 5));
+    }
+
+    #[test]
+    fn rerank_shape_is_ordered_by_default_share() {
+        use crate::constants as c;
+        let shares = [
+            (RerankShape::Identifier, c::CE_BLEND_IDENTIFIER),
+            (RerankShape::Ordinal, c::CE_BLEND_ORDINAL),
+            (RerankShape::Keyword, c::CE_BLEND_KEYWORD),
+            (RerankShape::Temporal, c::CE_BLEND_TEMPORAL),
+            (RerankShape::People, c::CE_BLEND_PEOPLE),
+            (RerankShape::Exploratory, c::CE_BLEND_EXPLORATORY),
+            (RerankShape::Attribute, c::CE_BLEND_ATTRIBUTE),
+            (RerankShape::Relational, c::CE_BLEND_RELATIONAL),
+            (RerankShape::Abstract, c::CE_BLEND_ABSTRACT),
+        ];
+        for pair in shares.windows(2) {
+            assert!(pair[0].0 < pair[1].0);
+            assert!(
+                pair[0].1 <= pair[1].1,
+                "{:?} share above {:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
     }
 }
