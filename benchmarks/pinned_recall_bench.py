@@ -21,25 +21,34 @@ Pinned protocol
   (`Conversation`), each prefixed with
   `[Conversation on <Month DD, YYYY at HH:MM AM/PM>] Session N:` derived from
   `haystack_session_datetimes`. Turns are never split mid-turn.
-* Gold sessions per question: sessions whose stored DIALOGUE text (the
-  dt-prefixed chunk texts, summaries excluded) contains ALL gold-answer
-  tokens (answer lowercased, whitespace-split, tokens stripped of
-  `.,!?;:"'()`, substring match against the lowercased session blob).
-  `evidence_locatable` = at least one such session exists.
-* Metric population: multi_hop questions only (321 total; n_loc = 147
-  locatable on the pinned snapshot).
+* Gold sessions per question: the sessions of the question's own LoCoMo
+  evidence turns (`relevant` in tests/recall/locomo_cases.jsonl, D<n> = session
+  n). Before scoring, the run checks that each evidence turn's text appears in
+  the dialogue it stored for that session, and records the mismatches.
+* Metric population: LoCoMo's temporal category, 320 questions, every one
+  locatable. MC10 labels these questions `multi_hop`; the harness used that
+  label until 2026-10-21.
+
+Gold labels before 2026-10-21 were sessions whose dialogue contained every
+answer token as a substring. Date answers matched the `[Conversation on ...]`
+header of whichever session carried the date, so only 87 of the 147
+"locatable" questions shared a session with their real evidence, and 173 of
+321 counted as unlocatable. Numbers measured with those labels (the ~0.76
+anchor below) do not compare with numbers measured with these.
 * Warmup: 5 queries (conv-26 q0/q6/q10/q12/q16) issued and DISCARDED before
   any scored query.
 * Score: evidence recall@10 — a question is a hit when any retrieved memory's
   `Session (\\d+)` header intersects the question's gold sessions.
   Recall mode=hybrid, k=10.
 
-Known baseline (validation anchor): real MiniLM-L6-384 primary embedder,
-rerank OFF (`use_reranking: false`) → evidence recall ~0.76 +/- 0.02.
+Superseded baseline (answer-token labels, multi_hop/temporal population of 147):
+real MiniLM-L6-384 primary embedder, rerank OFF (`use_reranking: false`) →
+evidence recall ~0.76 +/- 0.02. Not comparable with evidence labels.
 
 Usage
 -----
-    # 1. Emit the durable gold labels (pure dataset derivation, no server):
+    # 1. Emit the durable gold labels (from tests/recall/locomo_cases.jsonl, no server
+    #    and no dataset download):
     python3 benchmarks/pinned_recall_bench.py --emit-gold
 
     # 2. Full run, spawning a fresh server on a disposable store:
@@ -67,7 +76,6 @@ import time
 from collections import defaultdict
 from datetime import datetime
 
-import requests
 
 # ---------------------------------------------------------------------------
 # Pinned constants
@@ -77,12 +85,15 @@ PINNED_SNAPSHOT = "7d59a0463d83f97b042684310c0b3d17553004cd"
 TARGET_CHUNK_SIZE = 800
 RECALL_K = 10
 RECALL_MODE = "hybrid"
-METRIC_QUESTION_TYPE = "multi_hop"
+METRIC_CATEGORY = "temporal"
 WARMUP_QIDS = ["conv-26_q0", "conv-26_q6", "conv-26_q10", "conv-26_q12", "conv-26_q16"]
 SESSION_RE = re.compile(r"Session (\d+)")
-TOKEN_STRIP = ".,!?;:\"'()"
 DEFAULT_GOLD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "pinned_gold_labels.json")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCOMO_CASES_PATH = os.path.join(REPO_ROOT, "tests", "recall", "locomo_cases.jsonl")
+LOCOMO_CORPUS_PATH = os.path.join(REPO_ROOT, "tests", "recall", "corpora", "locomo.jsonl")
+EVIDENCE_SESSION_RE = re.compile(r"^conv-\d+:D(\d+):\d+$")
 
 
 # ---------------------------------------------------------------------------
@@ -198,45 +209,55 @@ def build_session_memories(item: dict) -> dict[int, list[tuple[str, str]]]:
 # Gold labels
 # ---------------------------------------------------------------------------
 
-def answer_tokens(answer: str) -> list[str]:
-    return [t for t in (tok.strip(TOKEN_STRIP) for tok in str(answer).lower().split()) if t]
+def evidence_session(corpus_item_id: str) -> int:
+    match = EVIDENCE_SESSION_RE.match(corpus_item_id)
+    if not match:
+        sys.exit(f"unrecognised LoCoMo evidence id {corpus_item_id!r}")
+    return int(match.group(1))
 
 
-def derive_gold(rows: list[dict]) -> dict[str, dict]:
-    """{qid: {gold_sessions, locatable, question, answer}} for every multi_hop
-    question, in pinned conv order. A session is gold when its stored dialogue
-    text (dt-prefixed chunks; summaries EXCLUDED) contains all answer tokens
-    as substrings."""
-    convs = conv_haystacks(rows)
-    session_blobs: dict[str, dict[int, str]] = {}
-    for cid in sorted(convs):
-        mems = build_session_memories(convs[cid])
-        session_blobs[cid] = {
-            sn: " \n ".join(text for kind, text in texts if kind == "dialogue").lower()
-            for sn, texts in mems.items()
-        }
-
+def derive_gold() -> dict[str, dict]:
+    """{qid: {gold_sessions, evidence, locatable, question}} for every question in
+    METRIC_CATEGORY, in id order, from LoCoMo's own evidence labels."""
     gold: dict[str, dict] = {}
-    by_conv: dict[str, list[dict]] = defaultdict(list)
-    for r in rows:
-        if r["question_type"] == METRIC_QUESTION_TYPE:
-            by_conv[conv_id(r["question_id"])].append(r)
-
-    for cid in sorted(by_conv):
-        for q in by_conv[cid]:
-            toks = answer_tokens(q["answer"])
-            sessions = []
-            if toks:
-                for sn, blob in sorted(session_blobs[cid].items()):
-                    if all(t in blob for t in toks):
-                        sessions.append(sn)
-            gold[q["question_id"]] = {
-                "gold_sessions": sessions,
-                "locatable": len(sessions) > 0,
-                "question": q["question"],
-                "answer": q["answer"],
-            }
+    with open(LOCOMO_CASES_PATH, "r", encoding="utf-8") as f:
+        cases = [json.loads(line) for line in f if line.strip()]
+    for case in sorted(cases, key=lambda c: (conv_id(c["id"]), int(c["id"].split("_q")[1]))):
+        if case["category"] != METRIC_CATEGORY:
+            continue
+        evidence = [item["corpus_item_id"] for item in case["relevant"]]
+        gold[case["id"]] = {
+            "gold_sessions": sorted({evidence_session(e) for e in evidence}),
+            "evidence": evidence,
+            "locatable": bool(evidence),
+            "question": case["query"],
+        }
     return gold
+
+
+def evidence_alignment(gold: dict[str, dict], convs: dict[str, dict]) -> list[str]:
+    """Evidence turns whose text is not in the dialogue stored for their session.
+    MC10 numbers sessions by position; this is the check that the numbering matches
+    LoCoMo's D<n>."""
+    turn_text: dict[str, str] = {}
+    with open(LOCOMO_CORPUS_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                item = json.loads(line)
+                turn_text[item["id"]] = item["content"].split(": ", 1)[-1].strip().lower()[:60]
+    blobs = {
+        cid: {sn: " \n ".join(t for kind, t in texts if kind == "dialogue").lower()
+              for sn, texts in build_session_memories(convs[cid]).items()}
+        for cid in convs
+    }
+    missing = []
+    for qid, g in gold.items():
+        for evidence in g["evidence"]:
+            text = turn_text.get(evidence, "")
+            session = blobs.get(conv_id(qid), {}).get(evidence_session(evidence), "")
+            if not text or text not in session:
+                missing.append(evidence)
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +266,9 @@ def derive_gold(rows: list[dict]) -> dict[str, dict]:
 
 class VeldClient:
     def __init__(self, base_url: str, api_key: str):
+        # Imported here so --emit-gold runs without the HTTP dependency installed.
+        import requests
+
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json",
@@ -252,7 +276,7 @@ class VeldClient:
 
     def health(self) -> bool:
         try:
-            return requests.get(f"{self.base_url}/health", timeout=2).status_code == 200
+            return self.session.get(f"{self.base_url}/health", timeout=2).status_code == 200
         except Exception:
             return False
 
@@ -351,7 +375,14 @@ def run_bench(args):
     with open(args.gold, "r", encoding="utf-8") as f:
         gold = json.load(f)
     n_loc = sum(1 for g in gold.values() if g["locatable"])
-    print(f"Gold labels: {len(gold)} {METRIC_QUESTION_TYPE} questions, n_loc={n_loc}")
+    print(f"Gold labels: {len(gold)} LoCoMo {METRIC_CATEGORY} questions, n_loc={n_loc}")
+    misaligned = evidence_alignment(gold, convs)
+    evidence_total = sum(len(g["evidence"]) for g in gold.values())
+    print(f"Evidence turns not found in their labelled session: "
+          f"{len(misaligned)}/{evidence_total}")
+    if evidence_total and len(misaligned) * 2 > evidence_total:
+        sys.exit("Most evidence turns are missing from their labelled session: MC10's session "
+                 "numbering does not match LoCoMo's D<n>, so these labels cannot score this run.")
 
     dials = json.loads(args.dials) if args.dials else {}
     base_url = f"http://127.0.0.1:{args.port}"
@@ -382,7 +413,7 @@ def run_bench(args):
             client.recall(user_for(conv_id(qid)), q["question"], RECALL_K, RECALL_MODE)
         print(f"Warmup done ({len(WARMUP_QIDS)} queries discarded).")
 
-        # Scored pass: multi_hop, locatable only, pinned conv order
+        # Scored pass: METRIC_CATEGORY, pinned conv order
         results = []
         hits = 0
         latencies = []
@@ -408,7 +439,9 @@ def run_bench(args):
         recall_at_k = hits / len(results) if results else 0.0
         latencies.sort()
         out = {
-            "protocol": "pinned-locomo-mc10-evidence-recall",
+            "protocol": "pinned-locomo-mc10-evidence-recall/evidence-labels",
+            "population": f"locomo {METRIC_CATEGORY}",
+            "evidence_turns_misaligned": len(misaligned),
             "snapshot": PINNED_SNAPSHOT,
             "mode": RECALL_MODE, "k": RECALL_K,
             "dials": dials,
@@ -444,8 +477,8 @@ def run_bench(args):
 def main():
     ap = argparse.ArgumentParser(description="Pinned LoCoMo-MC10 evidence-recall harness")
     ap.add_argument("--emit-gold", action="store_true",
-                    help="Derive gold labels from the pinned dataset and write them "
-                         "to --gold (no server needed), then exit")
+                    help="Derive gold labels from LoCoMo's evidence (tests/recall/locomo_cases.jsonl) "
+                         "and write them to --gold (no server or dataset needed), then exit")
     ap.add_argument("--gold", default=DEFAULT_GOLD_PATH,
                     help=f"Gold labels path (default: {DEFAULT_GOLD_PATH})")
     ap.add_argument("--port", type=int, default=4001, help="Server port (default 4001)")
@@ -464,17 +497,13 @@ def main():
     args = ap.parse_args()
 
     if args.emit_gold:
-        rows = load_dataset(find_mc10_dataset())
-        gold = derive_gold(rows)
+        gold = derive_gold()
         n_loc = sum(1 for g in gold.values() if g["locatable"])
         with open(args.gold, "w", encoding="utf-8") as f:
             json.dump(gold, f, indent=1, ensure_ascii=False)
             f.write("\n")
-        print(f"Wrote {len(gold)} {METRIC_QUESTION_TYPE} gold labels to {args.gold} "
+        print(f"Wrote {len(gold)} LoCoMo {METRIC_CATEGORY} gold labels to {args.gold} "
               f"(n_loc={n_loc})")
-        if n_loc != 147:
-            print("WARNING: n_loc != 147 — dataset snapshot or locatability rule "
-                  "has drifted from the pinned protocol.", file=sys.stderr)
         return
 
     run_bench(args)
