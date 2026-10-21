@@ -224,3 +224,19 @@ pub async fn send_typed<T: DeserializeOwned>(app: Router, req: Request<Body>) ->
     });
     (status, value)
 }
+
+/// Holds `lock` on another thread, as an open in progress holds its init lock, until the
+/// returned sender fires or 5 s pass. Join the handle after releasing.
+pub fn hold_init_lock(
+    lock: Arc<parking_lot::Mutex<()>>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let opener = std::thread::spawn(move || {
+        let _open = lock.lock();
+        held_tx.send(()).expect("test waits for the hold");
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+    });
+    held_rx.recv().expect("init lock held");
+    (release_tx, opener)
+}

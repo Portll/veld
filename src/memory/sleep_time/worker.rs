@@ -117,7 +117,7 @@ pub async fn run_worker(
                 );
                 // Best-effort event emission. If the user memory can't be
                 // resolved (deletion race), skip the event but still release.
-                if let Ok(user_mem) = orch.user_memory(&claimed.user_id) {
+                if let Ok(user_mem) = orch.user_memory_async(&claimed.user_id).await {
                     let guard = user_mem.read();
                     emit_aborted(
                         guard.as_memory_system(),
@@ -219,7 +219,7 @@ async fn process_item(
     // guard *only* during the synchronous evidence-assembly and post-LLM
     // application phases — never across an `.await`, because parking_lot's
     // guard is `!Send`.
-    let user_mem = match orch.user_memory(user_id) {
+    let user_mem = match orch.user_memory_async(user_id).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
@@ -294,6 +294,13 @@ async fn process_item(
     // ---- Phase B (async): LLM call — NO user memory guard held --------------------
     let rewriter_result = orch.rewriter().rewrite(&pack).await;
 
+    // Resolved before Phase C takes its guard: a graph not yet open is opened on the
+    // blocking pool, and the guard cannot be held across that await.
+    let edge_graph = match &rewriter_result {
+        Ok(out) if !out.edge_proposals.is_empty() => Some(orch.user_graph_async(user_id).await),
+        _ => None,
+    };
+
     // ---- Phase C (sync): settle spend, apply, persist, emit -----------------
     let user_mem_guard = user_mem.read();
     let mem_sys = user_mem_guard.as_memory_system();
@@ -356,8 +363,8 @@ async fn process_item(
     // their graph edges live by the time downstream retrieval runs.
     // NREM mode produces no edge proposals (filtered at rewriter parse
     // time), so this is a no-op for NREM.
-    if !rewriter_output.edge_proposals.is_empty() {
-        match orch.user_graph(user_id) {
+    if let Some(edge_graph) = edge_graph {
+        match edge_graph {
             Ok(graph) => match super::edge_proposals::apply_edge_proposals(
                 &graph,
                 &rewriter_output.edge_proposals,
@@ -635,10 +642,89 @@ fn trigger_str(trigger: &SleepTimeTrigger) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SleepTimeProfile;
+    use crate::handlers::test_helpers::{hold_init_lock, TestHarness};
+    use crate::handlers::MultiUserMemoryManager;
+    use crate::memory::sleep_time::rewriter::{MockRewriter, Rewriter};
+    use std::time::Duration;
 
     #[test]
     fn process_outcome_eq() {
         assert_eq!(ProcessOutcome::Completed, ProcessOutcome::Completed);
         assert_ne!(ProcessOutcome::Completed, ProcessOutcome::Retryable);
+    }
+
+    fn orchestrator_over(manager: &Arc<MultiUserMemoryManager>) -> Arc<SleepTimeOrchestrator> {
+        Arc::new(
+            SleepTimeOrchestrator::new(
+                SleepTimeProfile::Balanced.to_config(),
+                manager.shared_db.column_store(),
+                Arc::downgrade(manager),
+                Arc::clone(&manager.context_block_store),
+                Rewriter::Mock(MockRewriter::new("mock")),
+            )
+            .expect("orchestrator over the manager's shared database"),
+        )
+    }
+
+    /// The test runtime has one thread, so a pass that opened the tenant on it would stall the
+    /// timeout below until the init lock is let go.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_for_a_tenant_still_opening_leaves_the_runtime_thread_free() {
+        const TENANT: &str = "sleep-tenant-mid-open";
+        let harness = TestHarness::new();
+        let orch = orchestrator_over(&harness.manager);
+        assert!(orch
+            .enqueue(TENANT, SleepMode::Nrem, SleepTimeTrigger::Manual)
+            .expect("enqueue"));
+        let item = next_claim(orch.queue(), "sleep-worker-test", 60)
+            .expect("claim")
+            .expect("the queued item");
+
+        let (release, opener) = hold_init_lock(harness.manager.user_memory_init_lock(TENANT));
+        let pass_orch = Arc::clone(&orch);
+        let mut pass =
+            tokio::spawn(async move { process_item(&pass_orch, "sleep-worker-test", item).await });
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut pass).await;
+        assert!(
+            waited.is_err(),
+            "the pass finished while the tenant's init lock was held, so it held the runtime \
+             thread until the lock was let go"
+        );
+
+        release.send(()).expect("opener waits for release");
+        opener.join().expect("opener thread");
+        assert_eq!(pass.await.expect("pass task"), ProcessOutcome::Completed);
+        assert!(
+            harness.manager.user_memories.get(TENANT).is_some(),
+            "the pass opened the tenant"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_edge_proposal_graph_opens_off_the_runtime_thread() {
+        const TENANT: &str = "sleep-graph-mid-open";
+        let harness = TestHarness::new();
+        let orch = orchestrator_over(&harness.manager);
+
+        let (release, opener) = hold_init_lock(harness.manager.user_graph_init_lock(TENANT));
+        let lookup_orch = Arc::clone(&orch);
+        let mut lookup = tokio::spawn(async move { lookup_orch.user_graph_async(TENANT).await });
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut lookup).await;
+        assert!(
+            waited.is_err(),
+            "the lookup finished while the graph's init lock was held, so it held the runtime \
+             thread until the lock was let go"
+        );
+
+        release.send(()).expect("opener waits for release");
+        opener.join().expect("opener thread");
+        let opened = lookup.await.expect("lookup task").expect("open");
+        let cached = harness
+            .manager
+            .graph_memories
+            .get(TENANT)
+            .expect("the open cached the graph");
+        assert!(Arc::ptr_eq(&opened, &cached));
     }
 }

@@ -1420,4 +1420,75 @@ mod probes_while_a_tenant_opens {
             "the probe went through the graph accessor"
         );
     }
+
+    #[test]
+    fn a_cached_slow_store_comes_back_without_a_blocking_task() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let harness = TestHarness::new();
+        let opened = harness
+            .manager
+            .get_user_slow_store("tenant-s")
+            .expect("open");
+
+        // One poll, outside any runtime, as for the graph above.
+        let mut lookup = std::pin::pin!(harness.manager.get_user_slow_store_async("tenant-s"));
+        let Poll::Ready(cached) = lookup
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("a cached slow store did not come back on the first poll");
+        };
+        assert!(std::sync::Arc::ptr_eq(&opened, &cached.expect("cached")));
+    }
+
+    /// The open waits out SQLite's busy timeout while another connection holds the file
+    /// exclusively. Made on the one runtime thread, it would stall the timeout below until the
+    /// hold ends, after 5 s at most.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_uncached_slow_store_opens_off_the_runtime_thread_and_is_cached() {
+        const SLOW_TENANT: &str = "tenant-slow-store-mid-open";
+        let harness = TestHarness::new();
+        let db_path = harness
+            .manager
+            .user_dir(SLOW_TENANT)
+            .expect("tenant dir")
+            .join("slow_store.db");
+        std::fs::create_dir_all(db_path.parent().expect("tenant dir")).expect("tenant dir");
+
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&db_path).expect("holder connection");
+            conn.execute_batch("BEGIN EXCLUSIVE")
+                .expect("exclusive hold");
+            held_tx.send(()).expect("test waits for the hold");
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            conn.execute_batch("COMMIT").expect("end the hold");
+        });
+        held_rx.recv().expect("file held");
+
+        let manager = harness.manager.clone();
+        let mut lookup =
+            tokio::spawn(async move { manager.get_user_slow_store_async(SLOW_TENANT).await });
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut lookup).await;
+        assert!(
+            waited.is_err(),
+            "the lookup finished while the store's file was held, so it held the runtime thread \
+             until the hold ended"
+        );
+
+        release_tx.send(()).expect("holder waits for release");
+        holder.join().expect("holder thread");
+        let opened = lookup.await.expect("lookup task").expect("open");
+        let cached = std::sync::Arc::clone(
+            &harness
+                .manager
+                .slow_stores
+                .get(SLOW_TENANT)
+                .expect("the open cached the store"),
+        );
+        assert!(std::sync::Arc::ptr_eq(&opened, &cached));
+    }
 }
