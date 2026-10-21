@@ -463,12 +463,11 @@ pub async fn seed_project(
         // Idempotent: delete old _seed tagged memories before re-seeding
         {
             let seed_tags = vec!["_seed".to_string()];
-            let forgotten = memory
-                .read()
-                .forget_collecting_removed(ForgetCriteria::ByTags(seed_tags));
+            let guard = memory.read();
+            let forgotten = guard.forget_collecting_removed(ForgetCriteria::ByTags(seed_tags));
             match forgotten {
                 Ok((count, removed)) => {
-                    super::crud::journal_bulk_forget(&state, &user_id, removed);
+                    super::crud::journal_bulk_forget(&state, &guard, &user_id, removed);
                     if count > 0 {
                         tracing::info!("Cleaned {} old seed memories for re-seeding", count);
                     }

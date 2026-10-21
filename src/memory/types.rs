@@ -241,6 +241,17 @@ pub struct QueryMetacognition {
     pub focal_entities: Vec<String>,
 }
 
+/// What one recall reports beside its results, for the request that made it. Returned
+/// rather than stored on the tenant, where a concurrent recall for the same user would
+/// replace it before the first request read it.
+#[derive(Debug, Clone, Default)]
+pub struct RecallReadout {
+    /// The scoring signals behind each returned memory's rank, by id.
+    pub signal_attributions: std::collections::HashMap<MemoryId, SignalAttribution>,
+    /// The query-level metacognition substrate (M3), from a semantic recall.
+    pub metacognition: Option<QueryMetacognition>,
+}
+
 impl ScoringSignals {
     /// Extract signals from a memory. Requires no external state — all data
     /// comes from the memory itself. External signals (graph_strength,
@@ -4011,22 +4022,25 @@ impl WorkingMemory {
     ///
     /// Uses Query::matches() for filtering - SINGLE source of truth for all filter logic
     pub fn search(&self, query: &Query, limit: usize) -> anyhow::Result<Vec<SharedMemory>> {
-        let mut results: Vec<SharedMemory> = self
+        // Importance and access time are read once: both change under concurrent recalls,
+        // and a comparator that reads them twice can see two orders.
+        let mut keyed: Vec<(f32, DateTime<Utc>, SharedMemory)> = self
             .memories
             .values()
             .filter(|m| query.matches(m))
-            .cloned() // Arc::clone is cheap (just increments ref count)
+            .map(|m| (m.importance(), m.last_accessed(), Arc::clone(m)))
             .collect();
 
-        // Sort by importance and recency
-        results.sort_by(|a, b| {
-            b.importance()
-                .total_cmp(&a.importance())
-                .then(b.last_accessed().cmp(&a.last_accessed()))
+        // Sort by importance and recency; exact ties by content, then id, not hash order.
+        keyed.sort_by(|a, b| {
+            b.0.total_cmp(&a.0)
+                .then(b.1.cmp(&a.1))
+                .then_with(|| a.2.experience.content.cmp(&b.2.experience.content))
+                .then_with(|| a.2.id.cmp(&b.2.id))
         });
 
-        results.truncate(limit);
-        Ok(results)
+        keyed.truncate(limit);
+        Ok(keyed.into_iter().map(|(_, _, memory)| memory).collect())
     }
 
     pub fn size(&self) -> usize {
@@ -4195,15 +4209,27 @@ impl SessionMemory {
     }
 
     fn evict_to_make_space(&mut self, needed_bytes: usize) -> anyhow::Result<()> {
-        let mut sorted: Vec<(MemoryId, f32)> = self
+        let mut sorted: Vec<(MemoryId, f32, &str)> = self
             .memories
             .iter()
-            .map(|(id, entry)| (id.clone(), entry.memory.importance()))
+            .map(|(id, entry)| {
+                (
+                    id.clone(),
+                    entry.memory.importance(),
+                    entry.memory.experience.content.as_str(),
+                )
+            })
             .collect();
 
-        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // Least important first; equal importance by content, then id, not hash order.
+        sorted.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.2.cmp(b.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let sorted: Vec<MemoryId> = sorted.into_iter().map(|(id, _, _)| id).collect();
 
-        for (id, _) in sorted {
+        for id in sorted {
             if self.current_size_bytes + needed_bytes <= self.max_size_mb * 1024 * 1024 {
                 break;
             }
@@ -4228,9 +4254,17 @@ impl SessionMemory {
             .cloned() // Arc::clone is cheap
             .collect();
 
-        results.sort_by(|a, b| b.importance().total_cmp(&a.importance()));
-        results.truncate(limit);
-        Ok(results)
+        // Importance is read once per memory (it changes under concurrent recalls);
+        // exact ties go by content, then id, not hash order.
+        let mut keyed: Vec<(f32, SharedMemory)> =
+            results.drain(..).map(|m| (m.importance(), m)).collect();
+        keyed.sort_by(|a, b| {
+            b.0.total_cmp(&a.0)
+                .then_with(|| a.1.experience.content.cmp(&b.1.experience.content))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        keyed.truncate(limit);
+        Ok(keyed.into_iter().map(|(_, memory)| memory).collect())
     }
 
     pub fn size_mb(&self) -> usize {
@@ -6383,5 +6417,83 @@ mod query_filter_tests {
         assert_eq!(ctx.repo_slug(), Some("acme/two"));
         assert_eq!(ctx.place.places.len(), 2);
         assert!(matches!(ctx.place.places[0], Place::Repo { .. }));
+    }
+}
+
+#[cfg(test)]
+mod tier_tie_order_tests {
+    use super::{Experience, Memory, MemoryId, Query, SessionMemory, SharedMemory, WorkingMemory};
+    use chrono::{DateTime, Utc};
+    use std::sync::Arc;
+
+    /// Added in this order; content order is alpha, bravo, charlie, delta.
+    const NAMES: [&str; 4] = ["delta", "alpha", "charlie", "bravo"];
+
+    fn stored_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// A memory minted with a fresh random id, as each store mints its own.
+    fn memory(content: String) -> SharedMemory {
+        Arc::new(Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                content,
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            Some(stored_at()),
+        ))
+    }
+
+    fn names(memories: &[SharedMemory]) -> Vec<&str> {
+        memories
+            .iter()
+            .map(|m| m.experience.content.split(' ').next().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn equal_importance_searches_by_content_whatever_the_ids() {
+        for _store in 0..2 {
+            let mut working = WorkingMemory::new(10);
+            let mut session = SessionMemory::new(1);
+            for name in NAMES {
+                let shared = memory(format!("{name} note"));
+                working.add_shared(Arc::clone(&shared)).unwrap();
+                session.add_shared(shared).unwrap();
+            }
+            let query = Query::default();
+            assert_eq!(
+                names(&working.search(&query, 2).unwrap()),
+                ["alpha", "bravo"]
+            );
+            assert_eq!(
+                names(&session.search(&query, 2).unwrap()),
+                ["alpha", "bravo"]
+            );
+        }
+    }
+
+    /// Four records of about 300 KB overflow a 1 MB session tier; the one evicted to
+    /// admit the fourth is chosen by content when importance ties.
+    #[test]
+    fn equal_importance_evicts_by_content_whatever_the_ids() {
+        let padding = "x".repeat(300_000);
+        for _store in 0..2 {
+            let mut session = SessionMemory::new(1);
+            for name in NAMES {
+                session
+                    .add_shared(memory(format!("{name} {padding}")))
+                    .unwrap();
+            }
+            let kept = session.search(&Query::default(), 10).unwrap();
+            assert_eq!(names(&kept), ["bravo", "charlie", "delta"]);
+        }
     }
 }

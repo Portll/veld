@@ -19,7 +19,7 @@
 //! teaching the store, both as `recall-eval` pins them.
 //!
 //! Probes compare, per query: the ranked corpus keys, each score, tier and importance, the
-//! `SignalAttribution` recall leaves in `last_signal_attributions`, and the `ScoringFeatures`
+//! `SignalAttribution` recall returns in its readout, and the `ScoringFeatures`
 //! (base score, the additive scoring components, the multiplicative gates, the unified and final
 //! scores) the LTR trace store captures for each returned memory. `ScoringSignals` itself is not
 //! returned by recall; `ScoringFeatures` is the form in which recall exposes those signals.
@@ -475,8 +475,8 @@ impl Tenant {
             .into_iter()
             .map(|trace| trace.trace_id)
             .collect();
-        let results = memory.recall(&query)?;
-        let attributions = memory.last_signal_attributions();
+        let (results, readout) = memory.recall_with_readout(&query)?;
+        let attributions = readout.signal_attributions;
         let traces: Vec<_> = memory
             .retrieval_trace_store()
             .load_pending()

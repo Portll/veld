@@ -753,10 +753,15 @@ fn start_maintenance_scheduler(manager: AppState, interval_secs: u64) {
             if shutting_down() {
                 break;
             }
+            let Some(pass) = manager.try_begin_maintenance_pass() else {
+                tracing::info!("Maintenance tick skipped: the previous pass is still running");
+                continue;
+            };
             // Tracked, so the shutdown drain waits for a pass in progress instead of
             // leaving it to hold the process open after the stores are flushed.
             let manager_clone = Arc::clone(&manager);
             manager.task_tracker.spawn_blocking(move || {
+                let _pass = pass;
                 manager_clone.run_maintenance_all_users();
             });
         }

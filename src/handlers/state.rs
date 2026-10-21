@@ -143,6 +143,16 @@ impl MultiUserMemoryManagerRotationHelper {
     }
 }
 
+/// The claim on the scheduled maintenance pass; dropping it, panic included, frees the
+/// next tick to start one.
+pub struct MaintenancePass(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for MaintenancePass {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Multi-user Veld manager for the server runtime.
 pub struct MultiUserMemoryManager {
     /// Per-user UserMemory handles with LRU eviction.
@@ -242,6 +252,9 @@ pub struct MultiUserMemoryManager {
     /// cycle 0 (mod 6) is heavyweight (graph decay, fact extraction, flush).
     /// At 300s intervals, heavy cycles fire every 30 minutes.
     maintenance_cycle: std::sync::atomic::AtomicU64,
+
+    /// Set while a scheduled maintenance pass runs; see [`Self::try_begin_maintenance_pass`].
+    maintenance_running: Arc<std::sync::atomic::AtomicBool>,
 
     /// Per-user creation locks to prevent TOCTOU races in get_user_memory.
     /// Without this, concurrent first-access requests for the same user_id can both
@@ -367,6 +380,9 @@ pub struct MultiUserMemoryManager {
 /// but absent from the restored store; for a restored tenant that is an
 /// acknowledged delete, not a lost write.
 const RESTORED_FROM_BACKUP_MARKER: &str = ".restored-from-backup";
+
+/// Reconcile backfill frames per append: one writer lock and one fsync each.
+const RECONCILE_BACKFILL_BATCH: usize = 256;
 
 /// User directories under the data root. An unreadable entry is an error, not a
 /// skipped user: the boot guard must see every tenant or refuse.
@@ -725,6 +741,7 @@ impl MultiUserMemoryManager {
             session_store: Arc::new(SessionStore::new()),
             relevance_engine,
             maintenance_cycle: std::sync::atomic::AtomicU64::new(0),
+            maintenance_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             user_memory_init_locks: DashMap::new(),
             user_graph_init_locks: DashMap::new(),
             shared_rocksdb_cache,
@@ -2715,21 +2732,22 @@ impl MultiUserMemoryManager {
         let mid = crate::memory::types::MemoryId(uuid);
         let user_mem = self.get_user_memory(user_id)?;
         let new_content = new_body.trim_end().to_string();
-        let updated_bincode = {
-            let guard = user_mem.read();
-            let mut mem = match guard.get_memory(&mid) {
-                Ok(m) => m,
-                Err(_) => return Ok(false), // unknown memory — ignore
-            };
-            if mem.experience.content == new_content {
-                return Ok(false); // no real change
-            }
-            mem.experience.content = new_content;
-            mem.experience.embeddings = None; // force re-embed / re-index
-            guard.update_memory_journaled(&mem)?;
-            bincode::serde::encode_to_vec(&mem, bincode::config::standard())
-                .map_err(|e| anyhow::anyhow!("wiki edit-back bincode: {e}"))?
+        let guard = user_mem.read();
+        // Held from the read through the journal append: a write to this memory in
+        // between would be overwritten by this copy, or journaled ahead of it.
+        let _gate = guard.journal_section();
+        let mut mem = match guard.get_memory(&mid) {
+            Ok(m) => m,
+            Err(_) => return Ok(false), // unknown memory — ignore
         };
+        if mem.experience.content == new_content {
+            return Ok(false); // no real change
+        }
+        mem.experience.content = new_content;
+        mem.experience.embeddings = None; // force re-embed / re-index
+        guard.update_memory_journaled(&mem)?;
+        let updated_bincode = bincode::serde::encode_to_vec(&mem, bincode::config::standard())
+            .map_err(|e| anyhow::anyhow!("wiki edit-back bincode: {e}"))?;
         let payload = crate::intent_log::IntentPayload::Update {
             user_id: user_id.to_string(),
             memory_id: memory_id.to_string(),
@@ -2794,16 +2812,22 @@ impl MultiUserMemoryManager {
             store_ids.iter().map(|id| id.0.to_string()).collect();
 
         // store-ahead-of-log: snapshot each uncovered memory and backfill a
-        // `Remember` frame so the log is a complete record of the store.
-        let mut remember_frames = Vec::new();
-        for id in &store_ids {
-            let id_str = id.0.to_string();
-            if covered.contains(&id_str) {
-                continue;
-            }
-            let snapshot = {
-                let guard = user_mem.read();
-                match guard.get_memory(id) {
+        // `Remember` frame so the log is a complete record of the store. Each batch
+        // is read and appended under the write gate: the tenant is already serving,
+        // and a snapshot read before a live write but appended after its frame would
+        // leave the log behind the store.
+        let uncovered: Vec<&crate::memory::MemoryId> = store_ids
+            .iter()
+            .filter(|id| !covered.contains(&id.0.to_string()))
+            .collect();
+        let mut backfilled = 0usize;
+        for batch in uncovered.chunks(RECONCILE_BACKFILL_BATCH) {
+            let guard = user_mem.read();
+            let _gate = guard.journal_section();
+            let mut remember_frames = Vec::with_capacity(batch.len());
+            for id in batch {
+                let id_str = id.0.to_string();
+                let snapshot = match guard.get_memory(id) {
                     Ok(mem) => {
                         match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
                             Ok(bytes) => Some(bytes),
@@ -2827,18 +2851,20 @@ impl MultiUserMemoryManager {
                         );
                         None
                     }
-                }
-            };
-            let Some(bytes) = snapshot else { continue };
-            remember_frames.push(crate::intent_log::IntentPayload::Remember {
-                user_id: user_id.to_string(),
-                memory_id: id_str,
-                memory_bincode: bytes,
-                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
-            });
+                };
+                let Some(bytes) = snapshot else { continue };
+                remember_frames.push(crate::intent_log::IntentPayload::Remember {
+                    user_id: user_id.to_string(),
+                    memory_id: id_str,
+                    memory_bincode: bytes,
+                    schema_version: Some(
+                        crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION,
+                    ),
+                });
+            }
+            backfilled +=
+                self.journal_reconcile_backfill(user_id, &writer, remember_frames, "Remember");
         }
-        let backfilled =
-            self.journal_reconcile_backfill(user_id, &writer, remember_frames, "Remember");
 
         // log-ahead-of-store: the log says live, the store has no such memory. Restore it
         // from its last logged snapshot; a memory the log holds no snapshot for gets a
@@ -2876,8 +2902,24 @@ impl MultiUserMemoryManager {
                 }),
             }
         }
-        let forget_backfilled =
-            self.journal_reconcile_backfill(user_id, &writer, forget_frames, "Forget");
+        let forget_backfilled = {
+            // Under the write gate, and only for ids the store still lacks there: see
+            // `crud::journal_bulk_forget`.
+            let guard = user_mem.read();
+            let _gate = guard.journal_section();
+            forget_frames.retain(|frame| match frame {
+                crate::intent_log::IntentPayload::Forget { memory_id, .. } => {
+                    match uuid::Uuid::parse_str(memory_id) {
+                        Ok(uuid) => {
+                            !matches!(guard.is_stored(&crate::memory::MemoryId(uuid)), Ok(true))
+                        }
+                        Err(_) => true,
+                    }
+                }
+                _ => true,
+            });
+            self.journal_reconcile_backfill(user_id, &writer, forget_frames, "Forget")
+        };
         if !restore.is_empty() {
             for memory in &restore {
                 tracing::warn!(
@@ -3012,9 +3054,8 @@ impl MultiUserMemoryManager {
         frames: Vec<crate::intent_log::IntentPayload>,
         kind: &str,
     ) -> usize {
-        const BATCH: usize = 256;
         let mut journaled = 0usize;
-        for batch in frames.chunks(BATCH) {
+        for batch in frames.chunks(RECONCILE_BACKFILL_BATCH) {
             let outcomes = writer.record_and_apply_batch(batch);
             match outcomes {
                 Ok(outcomes) => {
@@ -3048,6 +3089,21 @@ impl MultiUserMemoryManager {
         let graph = self.get_user_graph(user_id)?;
         let graph_guard = graph.read();
         graph_guard.get_stats()
+    }
+
+    /// Claim the scheduled maintenance pass, or `None` while the previous one still
+    /// runs. A pass over many users can outlast the tick interval (10 s at the
+    /// minimum), and a second pass started beside it would run every step twice.
+    pub fn try_begin_maintenance_pass(&self) -> Option<MaintenancePass> {
+        self.maintenance_running
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| MaintenancePass(Arc::clone(&self.maintenance_running)))
     }
 
     /// Run maintenance on all cached user memories
@@ -3089,8 +3145,22 @@ impl MultiUserMemoryManager {
         let mut entity_edges_strengthened = 0;
         let mut total_facts_extracted = 0;
         let mut total_facts_reinforced = 0;
+        let mut users_skipped_busy = 0usize;
 
         for user_id in user_ids {
+            // A manual or sleep-phase consolidation runs this user's maintenance and edge
+            // strengthening itself; running them beside it double-strengthens edges. The
+            // pass leaves the user to it rather than wait behind a long pipeline.
+            let consolidation_lock = super::consolidation::consolidation_lock(&user_id);
+            let Ok(_consolidation_guard) = consolidation_lock.try_lock() else {
+                users_skipped_busy += 1;
+                tracing::info!(
+                    user_id = %user_id,
+                    "Maintenance skipped for user: a consolidation pass is running"
+                );
+                continue;
+            };
+
             let maintenance_result = if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                 let memory = memory_lock.read();
                 #[cfg(feature = "multi-tenant")]
@@ -3440,7 +3510,7 @@ impl MultiUserMemoryManager {
         }
 
         tracing::info!(
-            "Maintenance complete (cycle {}, {}): {} memories processed, {} edges strengthened, {} entity edges strengthened, {} weak edges pruned, {} facts extracted, {} facts reinforced across {} users",
+            "Maintenance complete (cycle {}, {}): {} memories processed, {} edges strengthened, {} entity edges strengthened, {} weak edges pruned, {} facts extracted, {} facts reinforced across {} users ({} skipped mid-consolidation)",
             cycle,
             if is_heavy { "heavy" } else { "light" },
             total_processed,
@@ -3449,7 +3519,8 @@ impl MultiUserMemoryManager {
             edges_decayed,
             total_facts_extracted,
             total_facts_reinforced,
-            user_count
+            user_count,
+            users_skipped_busy
         );
 
         total_processed
@@ -5888,6 +5959,56 @@ mod background_task_tests {
             ..ServerConfig::default()
         };
         MultiUserMemoryManager::new(base.to_path_buf(), config).expect("manager")
+    }
+
+    #[tokio::test]
+    async fn a_maintenance_pass_is_claimed_once_until_it_ends() {
+        let home = tempfile::tempdir().expect("temp home");
+        let state = manager(home.path(), 100);
+        let pass = state
+            .try_begin_maintenance_pass()
+            .expect("no pass is running");
+        assert!(
+            state.try_begin_maintenance_pass().is_none(),
+            "a second pass started beside the first"
+        );
+        drop(pass);
+        assert!(
+            state.try_begin_maintenance_pass().is_some(),
+            "a finished pass still blocks the next"
+        );
+    }
+
+    /// A scheduled pass leaves a user whose consolidation holds the lock alone, and does
+    /// not wait for it: the other users are maintained in the same pass.
+    #[tokio::test]
+    async fn scheduled_maintenance_skips_a_user_mid_consolidation() {
+        use crate::memory::ConsolidationEvent;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let state = manager(home.path(), 100);
+        for user in ["consolidating-user", "idle-user"] {
+            state.get_user_memory(user).expect("user memory");
+        }
+        let lock = crate::handlers::consolidation::consolidation_lock("consolidating-user");
+        let held = lock.try_lock().expect("the lock is free");
+        state.run_maintenance_all_users();
+        drop(held);
+
+        let cycles = |user: &str| {
+            state
+                .get_user_memory(user)
+                .expect("user memory")
+                .read()
+                .get_all_consolidation_events()
+                .iter()
+                .filter(|event| {
+                    matches!(event, ConsolidationEvent::MaintenanceCycleCompleted { .. })
+                })
+                .count()
+        };
+        assert_eq!(cycles("consolidating-user"), 0);
+        assert_eq!(cycles("idle-user"), 1);
     }
 
     #[tokio::test]

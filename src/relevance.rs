@@ -762,11 +762,17 @@ impl RelevanceEngine {
     ///
     /// This is the main entry point for proactive memory surfacing.
     /// Target latency: <30ms
+    ///
+    /// The graph comes as its lock, not a guard: the semantic phase calls
+    /// [`MemorySystem::recall`], which reads the same graph, and a second read
+    /// on a thread already holding one waits forever once a writer queues
+    /// between them (parking_lot's lock is task-fair). The graph is read only
+    /// in short scopes that never call into the memory system.
     pub fn surface_relevant(
         &self,
         context: &str,
         memory_system: &MemorySystem,
-        graph_memory: Option<&GraphMemory>,
+        graph_memory: Option<&RwLock<GraphMemory>>,
         config: &RelevanceConfig,
         feedback_store: Option<&RwLock<FeedbackStore>>,
     ) -> Result<RelevanceResponse> {
@@ -784,7 +790,7 @@ impl RelevanceEngine {
         &self,
         context: &str,
         memory_system: &MemorySystem,
-        graph_memory: Option<&GraphMemory>,
+        graph_memory: Option<&RwLock<GraphMemory>>,
         config: &RelevanceConfig,
         feedback_store: Option<&RwLock<FeedbackStore>>,
         weights_override: Option<LearnedWeights>,
@@ -855,6 +861,7 @@ impl RelevanceEngine {
         // Phase 3: Rank and select top results using learned weights
         let ranking_start = Instant::now();
         let weights = weights_override.unwrap_or_else(|| self.learned_weights.read().clone());
+        let graph = graph_memory.map(|lock| lock.read());
 
         let mut results: Vec<SurfacedMemory> = candidate_memories
             .into_iter()
@@ -885,7 +892,8 @@ impl RelevanceEngine {
                     let access_count = memory.access_count();
 
                     // CTX-3: Get graph Hebbian strength for this memory
-                    let graph_strength = graph_memory
+                    let graph_strength = graph
+                        .as_deref()
                         .and_then(|g| g.get_memory_hebbian_strength(&memory.id))
                         .unwrap_or(0.5); // Neutral default if no graph or no edges
 
@@ -953,6 +961,7 @@ impl RelevanceEngine {
                 },
             )
             .collect();
+        drop(graph);
 
         // Sort by relevance score (descending)
         // Score desc → recency desc → id asc — deterministic when scores collide (RH-10).
@@ -1005,7 +1014,7 @@ impl RelevanceEngine {
         &self,
         context: &str,
         memory_system: &MemorySystem,
-        graph_memory: Option<&GraphMemory>,
+        graph_memory: Option<&RwLock<GraphMemory>>,
         config: &RelevanceConfig,
         momentum_lookup: &HashMap<Uuid, f32>,
     ) -> Result<RelevanceResponse> {
@@ -1070,6 +1079,7 @@ impl RelevanceEngine {
         // Phase 3: Rank with momentum-aware scoring
         let ranking_start = Instant::now();
         let weights = self.learned_weights.read().clone();
+        let graph = graph_memory.map(|lock| lock.read());
 
         let mut results: Vec<SurfacedMemory> = candidate_memories
             .into_iter()
@@ -1100,7 +1110,8 @@ impl RelevanceEngine {
                     let access_count = memory.access_count();
 
                     // CTX-3: Get graph Hebbian strength for this memory
-                    let graph_strength = graph_memory
+                    let graph_strength = graph
+                        .as_deref()
                         .and_then(|g| g.get_memory_hebbian_strength(&memory.id))
                         .unwrap_or(0.5); // Neutral default if no graph or no edges
 
@@ -1160,6 +1171,7 @@ impl RelevanceEngine {
                 },
             )
             .collect();
+        drop(graph);
 
         // Score desc → recency desc → id asc — deterministic when scores collide (RH-10).
         results.sort_by(|a, b| {
@@ -1207,7 +1219,7 @@ impl RelevanceEngine {
         context: &str,
         user_id: &str,
         memory_system: &MemorySystem,
-        graph_memory: Option<&GraphMemory>,
+        graph_memory: Option<&RwLock<GraphMemory>>,
         config: &RelevanceConfig,
         ab_manager: &crate::ab_testing::ABTestManager,
     ) -> Result<(RelevanceResponse, Option<crate::ab_testing::ABTestVariant>)> {
@@ -1323,7 +1335,7 @@ impl RelevanceEngine {
         &self,
         entities: &[DetectedEntity],
         memory_system: &MemorySystem,
-        graph_memory: Option<&GraphMemory>,
+        graph_memory: Option<&RwLock<GraphMemory>>,
         config: &RelevanceConfig,
     ) -> Result<Vec<(Memory, f32, Vec<String>)>> {
         // Pre-compute lowercase entity names and weights for O(1) lookup
@@ -1343,9 +1355,10 @@ impl RelevanceEngine {
         // INDEX PATH: entity name -> memory IDs from the per-graph entity index
         // =====================================================================
         let mut indexed_hits = 0usize;
-        if let Some(graph) = graph_memory {
-            let key = Self::graph_key(graph);
+        if let Some(graph_lock) = graph_memory {
+            let key = Self::graph_lock_key(graph_lock);
             let mut candidate_ids: HashMap<Uuid, (f32, Vec<String>)> = HashMap::new();
+            let graph = graph_lock.read();
             for (name_lower, entity, weight) in &entity_lookup {
                 let memory_ids = self.indexed_memory_ids(key, name_lower).or_else(|| {
                     let node = graph
@@ -1373,6 +1386,7 @@ impl RelevanceEngine {
                         .or_insert((score, vec![entity.name.clone()]));
                 }
             }
+            drop(graph);
 
             // Score desc; tie-break by id asc for deterministic candidate selection (RH-10).
             let mut sorted_candidates: Vec<_> = candidate_ids.into_iter().collect();
@@ -1462,7 +1476,8 @@ impl RelevanceEngine {
 
         // Graph memory lookup with TRAVERSAL for additional entity relationships
         let mut graph_results = results;
-        if let Some(graph) = graph_memory {
+        if let Some(graph_lock) = graph_memory {
+            let graph = graph_lock.read();
             // Build set of already-found memory IDs to avoid duplicates
             let found_ids: HashSet<Uuid> = graph_results.iter().map(|(m, _, _)| m.id.0).collect();
 
@@ -1512,6 +1527,7 @@ impl RelevanceEngine {
                 }
             }
 
+            drop(graph);
             let mut ranked: Vec<_> = graph_candidates.into_iter().collect();
             // Score desc; tie-break by id asc for deterministic candidate selection (RH-10).
             ranked.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
@@ -1636,6 +1652,12 @@ impl RelevanceEngine {
     /// graph handle is not cloned per request, so its address is the key.
     fn graph_key(graph_memory: &GraphMemory) -> usize {
         graph_memory as *const GraphMemory as usize
+    }
+
+    /// [`Self::graph_key`] of the graph behind `lock`, without reading it: the
+    /// lock's data pointer is the address a guard derefs to.
+    fn graph_lock_key(lock: &RwLock<GraphMemory>) -> usize {
+        lock.data_ptr() as usize
     }
 
     /// Rebuild the entity index for one graph.
@@ -1875,7 +1897,7 @@ impl ContextMonitor {
         &self,
         context: &str,
         memory_system: &MemorySystem,
-        graph_memory: Option<&GraphMemory>,
+        graph_memory: Option<&RwLock<GraphMemory>>,
         config: Option<&RelevanceConfig>,
     ) -> Result<Option<RelevanceResponse>> {
         let cfg = config.unwrap_or(&self.default_config);
@@ -2223,5 +2245,95 @@ mod tests {
         let result = weights.fuse_scores_full(0.8, 0.5, 0.3, 0.6, 0.2, 3, 0.4);
         assert!(result.is_finite());
         assert!(result > 0.0);
+    }
+
+    #[test]
+    fn the_lock_key_is_the_address_a_guard_derefs_to() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let graph = RwLock::new(GraphMemory::new(tmp.path(), None).expect("graph"));
+        let through_guard = RelevanceEngine::graph_key(&graph.read());
+        assert_eq!(RelevanceEngine::graph_lock_key(&graph), through_guard);
+    }
+
+    /// The semantic phase recalls through a memory system wired to the same graph, so a
+    /// read held across it would deadlock the first time a writer queued in between.
+    #[test]
+    fn surfacing_completes_while_writers_queue_on_the_graph() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut system = MemorySystem::new(
+            crate::memory::MemoryConfig {
+                storage_path: tmp.path().join("memory"),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("memory system");
+        let graph = Arc::new(RwLock::new(
+            GraphMemory::new(&tmp.path().join("graph"), None).expect("graph"),
+        ));
+        system.set_graph_memory(graph.clone());
+        for content in [
+            "Alice deployed the Atlas service to the Berlin cluster",
+            "Bob reviewed the Atlas rollout plan with Alice",
+            "The Berlin cluster ran out of disk during the Atlas migration",
+        ] {
+            system
+                .remember(
+                    crate::memory::Experience {
+                        content: content.to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .expect("remember");
+        }
+        let system = Arc::new(system);
+        let engine = Arc::new(RelevanceEngine::new(Arc::new(
+            crate::embeddings::NeuralNer::new_fallback(crate::embeddings::NerConfig::default()),
+        )));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let graph = graph.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    drop(graph.write());
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let surfacer = {
+            let graph = graph.clone();
+            std::thread::spawn(move || {
+                let config = RelevanceConfig::default();
+                for _ in 0..50 {
+                    engine
+                        .surface_relevant(
+                            "What did Alice do with Atlas in Berlin?",
+                            &system,
+                            Some(&*graph),
+                            &config,
+                            None,
+                        )
+                        .expect("surface");
+                }
+                done_tx.send(()).expect("report");
+            })
+        };
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(120));
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            finished.is_ok(),
+            "surface_relevant stalled behind a queued graph writer"
+        );
+        surfacer.join().expect("surfacer");
+        writer.join().expect("writer");
     }
 }

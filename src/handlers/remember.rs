@@ -83,11 +83,16 @@ pub(crate) enum SnapshotKind {
 /// the write. The store already holds it durably, so a failure is logged and
 /// the request still succeeds; C2 reconcile on the next open backfills a
 /// frame that never landed. Blocking: run it off the async executor.
+///
+/// `_gate` is the tenant's write gate, held from the store write through this
+/// append: the frame carries the caller's copy, not a fresh read, so a write to
+/// the same memory landing in between would leave the log behind the store.
 pub(crate) fn journal_memory_snapshot(
     state: &super::state::MultiUserMemoryManager,
     user_id: &str,
     memory: &crate::memory::Memory,
     kind: SnapshotKind,
+    _gate: &crate::memory::write_gate::WriteGuard<'_>,
 ) {
     let Some(payload) = snapshot_payload(user_id, memory, kind) else {
         return;
@@ -191,7 +196,10 @@ pub(crate) fn journal_batch(
 }
 
 /// Journal `Update` (or `Remember`) snapshots of `ids` as the store holds them
-/// now, in one batch. Blocking.
+/// now, in one batch. The snapshots are read and appended under the tenant's
+/// write gate, so each frame is the store's state at its place in the log, and
+/// a write that lands after the read journals its own frame after this one.
+/// Blocking.
 pub(crate) fn journal_stored(
     state: &super::state::MultiUserMemoryManager,
     memory: &SharedUserMemory,
@@ -199,21 +207,21 @@ pub(crate) fn journal_stored(
     ids: &[crate::memory::MemoryId],
     kind: SnapshotKind,
 ) {
-    let payloads: Vec<_> = {
-        let guard = memory.read();
-        ids.iter()
-            .filter_map(|id| match guard.get_memory(id) {
-                Ok(stored) => snapshot_payload(user_id, &stored, kind),
-                Err(e) => {
-                    tracing::warn!(
-                        memory_id = %id.0,
-                        "snapshot not journaled, memory unreadable: {e}"
-                    );
-                    None
-                }
-            })
-            .collect()
-    };
+    let guard = memory.read();
+    let _gate = guard.journal_section();
+    let payloads: Vec<_> = ids
+        .iter()
+        .filter_map(|id| match guard.get_memory(id) {
+            Ok(stored) => snapshot_payload(user_id, &stored, kind),
+            Err(e) => {
+                tracing::warn!(
+                    memory_id = %id.0,
+                    "snapshot not journaled, memory unreadable: {e}"
+                );
+                None
+            }
+        })
+        .collect();
     journal_batch(state, user_id, &payloads);
 }
 
@@ -1338,30 +1346,28 @@ pub async fn remember(
         let memory_for_journal = memory.clone();
         let mid = memory_id.clone();
         let journal_join = tokio::task::spawn_blocking(move || {
-            let bincode = {
-                let guard = memory_for_journal.read();
-                match guard.get_memory(&mid) {
-                    Ok(mem) => {
-                        match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::warn!(
-                                    memory_id = %mid.0,
-                                    error = %e,
-                                    "skipping intent-log journal: failed to bincode memory snapshot",
-                                );
-                                return;
-                            }
-                        }
-                    }
+            // Read and appended under the write gate: see `journal_stored`.
+            let guard = memory_for_journal.read();
+            let _gate = guard.journal_section();
+            let bincode = match guard.get_memory(&mid) {
+                Ok(mem) => match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
+                    Ok(bytes) => bytes,
                     Err(e) => {
                         tracing::warn!(
                             memory_id = %mid.0,
                             error = %e,
-                            "skipping intent-log journal: memory not retrievable from primary store",
+                            "skipping intent-log journal: failed to bincode memory snapshot",
                         );
                         return;
                     }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %mid.0,
+                        error = %e,
+                        "skipping intent-log journal: memory not retrievable from primary store",
+                    );
+                    return;
                 }
             };
             let payload = crate::intent_log::IntentPayload::Remember {
@@ -1705,6 +1711,10 @@ fn detect_and_resolve_conflicts(
         }
     }
 
+    // Released before the write gate is taken below: gate holders read this graph, so
+    // a thread holding a graph read while it waits for the gate can deadlock with them.
+    drop(graph);
+
     if candidate_ids.is_empty() {
         return Ok(());
     }
@@ -1713,53 +1723,60 @@ fn detect_and_resolve_conflicts(
     let mut conflicts_resolved = 0usize;
 
     for candidate_id in candidate_ids.iter().take(CONFLICT_MAX_CANDIDATES) {
-        let mut candidate = match memory_guard.get_memory(candidate_id) {
-            Ok(m) => m,
-            Err(_) => continue,
+        // The candidate is read, decayed, stored and journaled under the write gate: a
+        // write to it in between would be overwritten by this copy, or journaled before it.
+        let (sim, text_sim, old_entities) = {
+            let gate = memory_guard.journal_section();
+            let mut candidate = match memory_guard.get_memory(candidate_id) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            // Check cosine similarity — only high-overlap memories can contradict
+            let candidate_embedding = match &candidate.experience.embeddings {
+                Some(emb) => emb,
+                None => continue,
+            };
+
+            let sim = cosine_similarity(&new_embedding, candidate_embedding);
+            if sim < CONFLICT_COSINE_THRESHOLD {
+                continue;
+            }
+
+            // Check for text-level similarity + semantic opposition
+            let text_sim = text_similarity(new_content, &candidate.experience.content);
+            if text_sim < 0.5 {
+                continue; // Not similar enough at text level to be contradictory
+            }
+
+            if !detect_semantic_opposition(new_content, &candidate.experience.content) {
+                continue;
+            }
+
+            // Contradiction detected — create SupersededBy edge and decay old importance
+            tracing::info!(
+                user_id = %user_id,
+                new_memory = %new_memory_id.0,
+                old_memory = %candidate_id.0,
+                cosine = format!("{:.3}", sim),
+                "Conflict detected: creating SupersededBy edge"
+            );
+
+            // Decay old memory importance, set temporal expiry, and persist
+            let old_importance = candidate.importance();
+            candidate.set_importance(old_importance * CONFLICT_IMPORTANCE_DECAY);
+            candidate.set_valid_until(chrono::Utc::now());
+            memory_guard.update_memory_journaled(&candidate)?;
+            journal_memory_snapshot(state, user_id, &candidate, SnapshotKind::Update, &gate);
+
+            let old_entities: Vec<uuid::Uuid> =
+                candidate.entity_refs.iter().map(|e| e.entity_id).collect();
+            (sim, text_sim, old_entities)
         };
-
-        // Check cosine similarity — only high-overlap memories can contradict
-        let candidate_embedding = match &candidate.experience.embeddings {
-            Some(emb) => emb,
-            None => continue,
-        };
-
-        let sim = cosine_similarity(&new_embedding, candidate_embedding);
-        if sim < CONFLICT_COSINE_THRESHOLD {
-            continue;
-        }
-
-        // Check for text-level similarity + semantic opposition
-        let text_sim = text_similarity(new_content, &candidate.experience.content);
-        if text_sim < 0.5 {
-            continue; // Not similar enough at text level to be contradictory
-        }
-
-        if !detect_semantic_opposition(new_content, &candidate.experience.content) {
-            continue;
-        }
-
-        // Contradiction detected — create SupersededBy edge and decay old importance
-        tracing::info!(
-            user_id = %user_id,
-            new_memory = %new_memory_id.0,
-            old_memory = %candidate_id.0,
-            cosine = format!("{:.3}", sim),
-            "Conflict detected: creating SupersededBy edge"
-        );
-
-        // Decay old memory importance, set temporal expiry, and persist
-        let old_importance = candidate.importance();
-        candidate.set_importance(old_importance * CONFLICT_IMPORTANCE_DECAY);
-        candidate.set_valid_until(chrono::Utc::now());
-        memory_guard.update_memory_journaled(&candidate)?;
-        journal_memory_snapshot(state, user_id, &candidate, SnapshotKind::Update);
 
         // Create SupersededBy edge in graph
         let now = chrono::Utc::now();
         // Find entity pairs to link
-        let old_entities: Vec<uuid::Uuid> =
-            candidate.entity_refs.iter().map(|e| e.entity_id).collect();
         if let (Some(&new_ent), Some(&old_ent)) = (focal_entities.first(), old_entities.first()) {
             let edge = crate::graph_memory::RelationshipEdge {
                 uuid: uuid::Uuid::new_v4(),
@@ -1787,7 +1804,7 @@ fn detect_and_resolve_conflicts(
                 strengthening_sources: Default::default(),
                 last_corroborated: None,
             };
-            let _ = graph.add_relationship(edge);
+            let _ = graph_arc.read().add_relationship(edge);
         }
 
         conflicts_resolved += 1;
@@ -2119,22 +2136,23 @@ pub async fn batch_remember(
             .map(crate::memory::MemoryId)
             .collect();
         let journal_join = tokio::task::spawn_blocking(move || {
-            let payloads: Vec<_> = {
-                let guard = memory_for_journal.read();
-                ids.iter()
-                    .filter_map(|mid| match guard.get_memory(mid) {
-                        Ok(stored) => snapshot_payload(&user_id, &stored, SnapshotKind::Remember),
-                        Err(e) => {
-                            tracing::warn!(
-                                memory_id = %mid.0,
-                                error = %e,
-                                "skipping intent-log journal (batch): memory not retrievable from primary store",
-                            );
-                            None
-                        }
-                    })
-                    .collect()
-            };
+            // Read and appended under the write gate: see `journal_stored`.
+            let guard = memory_for_journal.read();
+            let _gate = guard.journal_section();
+            let payloads: Vec<_> = ids
+                .iter()
+                .filter_map(|mid| match guard.get_memory(mid) {
+                    Ok(stored) => snapshot_payload(&user_id, &stored, SnapshotKind::Remember),
+                    Err(e) => {
+                        tracing::warn!(
+                            memory_id = %mid.0,
+                            error = %e,
+                            "skipping intent-log journal (batch): memory not retrievable from primary store",
+                        );
+                        None
+                    }
+                })
+                .collect();
             journal_batch(&state, &user_id, &payloads);
         });
         if let Err(e) = journal_join.await {
@@ -2710,30 +2728,28 @@ pub async fn upsert_memory(
         let mid = memory_id.clone();
         let is_update = was_update;
         let journal_join = tokio::task::spawn_blocking(move || {
-            let bincode = {
-                let guard = memory_system_for_journal.read();
-                match guard.get_memory(&mid) {
-                    Ok(mem) => {
-                        match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::warn!(
-                                    memory_id = %mid.0,
-                                    error = %e,
-                                    "skipping intent-log journal (upsert): bincode encode failed",
-                                );
-                                return;
-                            }
-                        }
-                    }
+            // Read and appended under the write gate: see `journal_stored`.
+            let guard = memory_system_for_journal.read();
+            let _gate = guard.journal_section();
+            let bincode = match guard.get_memory(&mid) {
+                Ok(mem) => match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
+                    Ok(bytes) => bytes,
                     Err(e) => {
                         tracing::warn!(
                             memory_id = %mid.0,
                             error = %e,
-                            "skipping intent-log journal (upsert): memory not retrievable",
+                            "skipping intent-log journal (upsert): bincode encode failed",
                         );
                         return;
                     }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %mid.0,
+                        error = %e,
+                        "skipping intent-log journal (upsert): memory not retrievable",
+                    );
+                    return;
                 }
             };
             let payload = if is_update {

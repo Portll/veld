@@ -212,7 +212,6 @@ pub async fn prompt_gen(
 
     let result = tokio::task::spawn_blocking(move || {
         let memory_guard = memory_system.read();
-        let graph_guard = graph_memory.read();
 
         let mut sections = Vec::new();
         let mut all_entities: Vec<ResolvedEntity> = Vec::new();
@@ -268,6 +267,11 @@ pub async fn prompt_gen(
         }
 
         // ── 2. Resolve entities ────────────────────────────────────
+
+        // Read only after recall returns: recall reads this graph itself, and a second
+        // read on a thread already holding one waits forever once a writer queues
+        // between the two.
+        let graph_guard = graph_memory.read();
 
         // Collect entities from explicitly requested names
         for name in &resolve_entities {

@@ -421,13 +421,13 @@ pub struct MemorySystem {
     /// `None` — inert until explicitly dialed on. See [`dials::CognitiveDials`].
     cognitive_dials: Arc<parking_lot::RwLock<dials::CognitiveDials>>,
 
-    /// Signal attribution from the most recent semantic retrieval.
-    /// Records which scoring signals (BM25, vector, graph, cross-encoder, recency,
-    /// temporal match, entity overlap) contributed to each memory's ranking.
-    /// Populated during Layer 4 (RRF fusion) and Layer 5 (unified scoring).
-    /// Used for adaptive weight learning and retrieval diagnostics.
-    last_signal_attributions:
-        Arc<parking_lot::RwLock<std::collections::HashMap<MemoryId, types::SignalAttribution>>>,
+    /// Signal attribution of recently returned memories, by id: which scoring signals
+    /// (BM25, vector, graph, cross-encoder, recency, temporal match, entity overlap)
+    /// contributed to each memory's ranking. Populated during Layer 4 (RRF fusion) and
+    /// Layer 5 (unified scoring), merged per memory so one recall cannot wipe another's,
+    /// and read by the feedback that names those memories for adaptive weight learning.
+    recent_signal_attributions:
+        Arc<parking_lot::Mutex<lru::LruCache<MemoryId, types::SignalAttribution>>>,
 
     /// R2 (LTR): SHADOW-ONLY retrieval-trace store. Captures the full unified
     /// feature vector + base/final score + query/rank per (recall, memory) at
@@ -451,11 +451,6 @@ pub struct MemorySystem {
     /// infrastructure — the loaded weights are NOT read by the scoring path in
     /// this step; nothing here changes ranking or scoring.
     learned_weights_store: hybrid_search::LearnedWeightsStore,
-
-    /// Query-level metacognition (M3) from the most recent semantic retrieval.
-    /// A terminal feeling-of-knowing readout — never fed back into scoring or
-    /// adaptive weight learning. The handler assembles the final score from this.
-    last_query_metacognition: Arc<parking_lot::RwLock<Option<types::QueryMetacognition>>>,
 
     /// TCM (Temporal Context Model) per-user drift state (E6). A low-dim,
     /// slowly-drifting subjective-context vector, updated ENCODE-side only
@@ -486,12 +481,24 @@ pub struct MemorySystem {
     /// `run_prefetch_tick`; never touched on the recall hot-path.
     prefetch_state: Arc<parking_lot::RwLock<prefetch_tick::PrefetchUserState>>,
 
-    /// S-R5: path-credit pending edges from the most recent spreading-activation
-    /// retrieval.  Populated by `spreading_activation_recall`; drained by
-    /// `reinforce_recall` on a Helpful outcome.  The inner Vec holds
+    /// S-R5: path-credit pending edges of recent spreading-activation retrievals, by
+    /// the memories each delivered. Populated by `spreading_activation_recall`; taken
+    /// by `reinforce_recall` on a Helpful outcome. The edges are
     /// (edge_uuid, raw_contribution) pairs — normalisation to 1.0 happens inside
     /// `GraphMemory::apply_path_credit`.
-    spreading_path_credit: Arc<parking_lot::Mutex<Vec<(uuid::Uuid, f32)>>>,
+    spreading_path_credit: Arc<parking_lot::Mutex<recall::PathCreditLedger>>,
+}
+
+/// Order tier memories read out of a hash map by creation, then content, then id. The
+/// promotions they drive insert into the vector index and the session tier in this order,
+/// and both depend on it, so two stores built from the same corpus have to agree on it.
+fn order_for_promotion(memories: &mut [SharedMemory]) {
+    memories.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.experience.content.cmp(&b.experience.content))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 /// Extract causal entity pairs from memory content.
@@ -1694,9 +1701,9 @@ impl MemorySystem {
             // take effect). KV-persisted per-user override is wired separately.
             cognitive_dials: cognitive_dials_arc,
             // Signal attribution from most recent semantic retrieval
-            last_signal_attributions: Arc::new(parking_lot::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
+            recent_signal_attributions: Arc::new(parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(recall::RECENT_SIGNAL_ATTRIBUTIONS).expect("nonzero"),
+            ))),
             // R2 (LTR): per-user retrieval-trace store over this user's own KV CF.
             retrieval_trace_store: feedback::RetrievalTraceStore::with_kv(
                 primary_store.key_value_store(),
@@ -1721,7 +1728,6 @@ impl MemorySystem {
                 store
             },
             // M3: query-level metacognition readout (terminal; not fed to learner)
-            last_query_metacognition: Arc::new(parking_lot::RwLock::new(None)),
             // E6: TCM drift state (encode-driven; empty until the first embed)
             tcm_context: Arc::new(parking_lot::RwLock::new(Vec::new())),
             // C1: per-user write-path serialization lock
@@ -1732,7 +1738,9 @@ impl MemorySystem {
             prefetch_state: Arc::new(parking_lot::RwLock::new(
                 prefetch_tick::PrefetchUserState::default(),
             )),
-            spreading_path_credit: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            spreading_path_credit: Arc::new(parking_lot::Mutex::new(
+                recall::PathCreditLedger::new(),
+            )),
         })
     }
 
@@ -1885,27 +1893,11 @@ impl MemorySystem {
             })
     }
 
-    /// Get signal attributions from the most recent semantic retrieval.
-    ///
-    /// Returns a snapshot of the attribution map. Each entry maps a MemoryId to
-    /// the scoring signals that contributed to its ranking. Useful for retrieval
-    /// diagnostics and adaptive weight learning.
-    pub fn last_signal_attributions(
-        &self,
-    ) -> std::collections::HashMap<MemoryId, types::SignalAttribution> {
-        self.last_signal_attributions.read().clone()
-    }
-
-    /// Get the query-level metacognition (M3) from the most recent semantic
-    /// retrieval. A terminal feeling-of-knowing readout; advisory only, never
-    /// fed back into scoring or weight learning.
-    pub fn last_query_metacognition(&self) -> Option<types::QueryMetacognition> {
-        self.last_query_metacognition.read().clone()
-    }
-
-    /// Get signal attribution for a specific memory from the most recent retrieval.
+    /// The signal attribution a recent semantic retrieval gave `id`, if it returned the
+    /// memory and the entry has not aged out. A request's own attributions come back
+    /// from [`Self::recall_with_readout`].
     pub fn signal_attribution_for(&self, id: &MemoryId) -> Option<types::SignalAttribution> {
-        self.last_signal_attributions.read().get(id).cloned()
+        self.recent_signal_attributions.lock().peek(id).cloned()
     }
 
     /// R2 (LTR): read-only handle on the per-user retrieval-trace store. Exposed
@@ -3184,6 +3176,11 @@ impl MemorySystem {
         defer_embedding: bool,
         bm25: Bm25Sync,
     ) -> Result<RememberOutcome> {
+        // C1: the per-user write gate, as in remember_impl. The content-hash check below
+        // and the store write have to be one step, or two identical remembers both create,
+        // and a shutdown has to be able to turn this create away like any other.
+        let _write_guard = self.write_lock.enter()?;
+
         // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
         experience.migrate_robotics_to_facets();
 
@@ -4522,7 +4519,7 @@ impl MemorySystem {
         let min_age = chrono::Duration::seconds(TIER_PROMOTION_WORKING_AGE_SECS);
 
         // Find eligible memories (importance + time threshold, with graph-adjusted threshold)
-        let to_promote: Vec<SharedMemory> = {
+        let mut to_promote: Vec<SharedMemory> = {
             let working = self.working_memory.read();
             working
                 .all_memories()
@@ -4536,6 +4533,7 @@ impl MemorySystem {
                 })
                 .collect()
         };
+        order_for_promotion(&mut to_promote);
 
         if to_promote.is_empty() {
             return Ok(());
@@ -4589,7 +4587,7 @@ impl MemorySystem {
         let min_age = chrono::Duration::seconds(TIER_PROMOTION_SESSION_AGE_SECS);
 
         // Find eligible memories (importance + time threshold, with graph-adjusted threshold)
-        let to_promote: Vec<SharedMemory> = {
+        let mut to_promote: Vec<SharedMemory> = {
             let session = self.session_memory.read();
             session
                 .all_memories()
@@ -4603,6 +4601,7 @@ impl MemorySystem {
                 })
                 .collect()
         };
+        order_for_promotion(&mut to_promote);
 
         if to_promote.is_empty() {
             return Ok(());
@@ -5584,6 +5583,19 @@ impl MemorySystem {
 
     pub fn writes_closed(&self) -> bool {
         self.write_lock.is_closed()
+    }
+
+    /// Hold this tenant's write gate whether or not writes are closed: for reading a
+    /// snapshot and appending its frame, and for the update and forget paths, which a
+    /// shutdown never refused. The gated methods called under it enter again on this
+    /// thread; see [`write_gate`] for the ordering it gives the intent log.
+    pub fn journal_section(&self) -> write_gate::WriteGuard<'_> {
+        self.write_lock.hold()
+    }
+
+    /// Whether the long-term store holds a record under `id`, forgotten or not.
+    pub fn is_stored(&self, id: &MemoryId) -> Result<bool> {
+        Ok(self.long_term_memory.get_memory(id)?.is_some())
     }
 
     /// Flush long-term storage to ensure data persistence (critical for graceful shutdown)
@@ -10952,5 +10964,51 @@ mod lifecycle_tests {
                 .is_none());
             assert_eq!(stored_truth(&system).0, 1, "{backend}");
         }
+    }
+}
+
+#[cfg(test)]
+mod promotion_order_tests {
+    use super::{order_for_promotion, Experience, Memory, MemoryId, SharedMemory};
+    use chrono::{DateTime, Utc};
+    use std::sync::Arc;
+
+    fn memory(content: &str, created_at: &str) -> SharedMemory {
+        Arc::new(Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                content: content.to_string(),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            Some(
+                DateTime::parse_from_rfc3339(created_at)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        ))
+    }
+
+    /// Two stores holding the same tier contents under their own random ids promote
+    /// in the same order: by creation, then content.
+    #[test]
+    fn promotions_run_in_one_order_whatever_the_ids() {
+        let orders: Vec<Vec<String>> = (0..2)
+            .map(|_| {
+                let mut tier = vec![
+                    memory("bravo", "2026-01-01T00:00:02Z"),
+                    memory("delta", "2026-01-01T00:00:01Z"),
+                    memory("alpha", "2026-01-01T00:00:02Z"),
+                    memory("charlie", "2026-01-01T00:00:01Z"),
+                ];
+                order_for_promotion(&mut tier);
+                tier.iter().map(|m| m.experience.content.clone()).collect()
+            })
+            .collect();
+        assert_eq!(orders[0], ["charlie", "delta", "alpha", "bravo"]);
+        assert_eq!(orders[0], orders[1]);
     }
 }

@@ -313,10 +313,12 @@ struct SpreadEdge {
 }
 
 /// Per-query adjacency: each entity's edges are read and decayed once, however many hops,
-/// directions or threshold passes reach it.
+/// directions or threshold passes reach it, and so is the name of each entity a frontier
+/// tie has to be broken on.
 struct AdjacencyCache {
     now: DateTime<Utc>,
     edges: HashMap<Uuid, Vec<SpreadEdge>>,
+    names: HashMap<Uuid, String>,
 }
 
 impl AdjacencyCache {
@@ -324,7 +326,20 @@ impl AdjacencyCache {
         Self {
             now,
             edges: HashMap::new(),
+            names: HashMap::new(),
         }
+    }
+
+    /// `entity`'s lowercased name, empty when it cannot be read.
+    fn name_of(&mut self, graph: &GraphMemory, entity: &Uuid) -> &str {
+        self.names.entry(*entity).or_insert_with(|| {
+            graph
+                .get_entity(entity)
+                .ok()
+                .flatten()
+                .map(|node| node.name.to_lowercase())
+                .unwrap_or_default()
+        })
     }
 
     fn edges_of(&mut self, graph: &GraphMemory, entity: &Uuid) -> Result<&[SpreadEdge]> {
@@ -370,19 +385,43 @@ impl AdjacencyCache {
 }
 
 /// The entities a hop expands: not yet expanded, activation at or above `threshold`,
-/// strongest first (uuid breaks ties so the cut is repeatable), at most `cap`.
+/// strongest first, at most `cap`. Exact ties go by lowercased entity name, then uuid:
+/// uuids are minted per store, so ordering by them would make the cut, and the order the
+/// frontier's spread is summed in, differ between two stores holding the same graph.
+/// Names are read only for members of a tied run.
 fn select_frontier(
     activation_map: &HashMap<Uuid, f32>,
     expanded: &HashSet<Uuid>,
     threshold: f32,
     cap: usize,
+    graph: &GraphMemory,
+    adjacency: &mut AdjacencyCache,
 ) -> Vec<(Uuid, f32)> {
     let mut frontier: Vec<(Uuid, f32)> = activation_map
         .iter()
         .filter(|(id, act)| **act >= threshold && !expanded.contains(id))
         .map(|(id, act)| (*id, *act))
         .collect();
-    frontier.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    frontier.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut start = 0;
+    while start < frontier.len() {
+        let bits = frontier[start].1.to_bits();
+        let mut end = start + 1;
+        while end < frontier.len() && frontier[end].1.to_bits() == bits {
+            end += 1;
+        }
+        if end - start > 1 {
+            let mut keyed: Vec<(String, (Uuid, f32))> = frontier[start..end]
+                .iter()
+                .map(|entry| (adjacency.name_of(graph, &entry.0).to_string(), *entry))
+                .collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| (a.1).0.cmp(&(b.1).0)));
+            for (slot, (_, entry)) in frontier[start..end].iter_mut().zip(keyed) {
+                *slot = entry;
+            }
+        }
+        start = end;
+    }
     frontier.truncate(cap);
     frontier
 }
@@ -456,6 +495,8 @@ fn spread_single_direction(
             &expanded,
             threshold,
             SPREADING_FRONTIER_CAP,
+            graph,
+            adjacency,
         );
         if frontier.is_empty() {
             break;
@@ -979,6 +1020,8 @@ pub fn spreading_activation_retrieve_with_stats(
                 &expanded,
                 current_threshold,
                 SPREADING_FRONTIER_CAP,
+                graph,
+                &mut adjacency,
             );
             if frontier.is_empty() {
                 break;
@@ -1097,10 +1140,15 @@ pub fn spreading_activation_retrieve_with_stats(
     stats.graph_time_us = graph_start.elapsed().as_micros() as u64;
     tracing::info!("📊 Final activated entities: {}", activation_map.len());
 
-    // Step 4: Retrieve episodic memories connected to activated entities
+    // Step 4: Retrieve episodic memories connected to activated entities. An episode's
+    // activation is a float sum over its entities, so they are visited by activation, not
+    // in the map's hash order: the sum then comes out the same for any two stores holding
+    // the same graph (equal addends commute exactly). The uuid only makes the order total.
     let mut activated_memories: HashMap<Uuid, (f32, EpisodicNode)> = HashMap::new();
+    let mut by_activation: Vec<(&Uuid, &f32)> = activation_map.iter().collect();
+    by_activation.sort_by(|a, b| a.1.total_cmp(b.1).then_with(|| a.0.cmp(b.0)));
 
-    for (entity_uuid, entity_activation) in &activation_map {
+    for (entity_uuid, entity_activation) in by_activation {
         let episodes = graph.get_episodes_by_entity(entity_uuid)?;
 
         for episode in episodes {
@@ -1217,11 +1265,18 @@ pub fn spreading_activation_retrieve_with_stats(
         crate::metrics::RETRIEVAL_VARIANCE_LINGUISTIC.observe(stats.linguistic_variance_pct as f64);
     }
 
-    // Step 6: Sort by final score (descending), memory id as the tie-break: the truncate below
-    // makes any tie a coin toss over WHICH memories are returned (shodh-memory 6272430).
+    // Step 6: Sort by final score (descending); the truncate below makes any tie a coin toss
+    // over WHICH memories are returned (shodh-memory 6272430). Ties go by content, then id:
+    // ids are minted per store, content is the same in any store built from the same corpus.
     scored_memories.sort_by(|a, b| {
         b.final_score
             .total_cmp(&a.final_score)
+            .then_with(|| {
+                a.memory
+                    .experience
+                    .content
+                    .cmp(&b.memory.experience.content)
+            })
             .then_with(|| a.memory.id.cmp(&b.memory.id))
     });
 
@@ -1918,23 +1973,66 @@ mod spreading_frontier_tests {
 
     #[test]
     fn frontier_is_unexpanded_above_threshold_strongest_first_and_capped() {
-        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let ids: Vec<Uuid> = ["anchor", "zinnia", "Aster", "faint", "spent", "low"]
+            .iter()
+            .map(|name| graph.add_entity(entity(name)).unwrap())
+            .collect();
         let activation: HashMap<Uuid, f32> = ids
             .iter()
             .zip([0.9, 0.5, 0.5, 0.004, 0.7, 0.2])
             .map(|(id, act)| (*id, act))
             .collect();
         let expanded: HashSet<Uuid> = [ids[4]].into_iter().collect();
+        let mut adjacency = AdjacencyCache::new(Utc::now());
 
-        let frontier = select_frontier(&activation, &expanded, 0.005, 3);
-        let mut tied = [ids[1], ids[2]];
-        tied.sort();
+        let frontier = select_frontier(&activation, &expanded, 0.005, 3, &graph, &mut adjacency);
         assert_eq!(
             frontier,
-            vec![(ids[0], 0.9), (tied[0], 0.5), (tied[1], 0.5)],
-            "expanded and below-threshold entities are out; ties order by uuid; cap holds"
+            vec![(ids[0], 0.9), (ids[2], 0.5), (ids[1], 0.5)],
+            "expanded and below-threshold entities are out; ties order by name; cap holds"
         );
-        assert_eq!(select_frontier(&activation, &expanded, 0.005, 10).len(), 4);
+        assert_eq!(
+            select_frontier(&activation, &expanded, 0.005, 10, &graph, &mut adjacency).len(),
+            4
+        );
+        assert_eq!(
+            adjacency.names.len(),
+            2,
+            "names are read only for the tied entities"
+        );
+    }
+
+    /// The same graph built twice mints different uuids; a tie at the frontier cut keeps
+    /// the same entity in both.
+    #[test]
+    fn a_frontier_tie_is_cut_alike_in_two_stores_of_one_graph() {
+        let names = ["delta", "alpha", "charlie", "bravo"];
+        let kept: Vec<Vec<String>> = (0..2)
+            .map(|_| {
+                let temp_dir = tempfile::tempdir().unwrap();
+                let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+                let activation: HashMap<Uuid, f32> = names
+                    .iter()
+                    .map(|name| (graph.add_entity(entity(name)).unwrap(), 0.5))
+                    .collect();
+                let mut adjacency = AdjacencyCache::new(Utc::now());
+                select_frontier(
+                    &activation,
+                    &HashSet::new(),
+                    0.005,
+                    2,
+                    &graph,
+                    &mut adjacency,
+                )
+                .into_iter()
+                .map(|(id, _)| graph.get_entity(&id).unwrap().unwrap().name)
+                .collect()
+            })
+            .collect();
+        assert_eq!(kept[0], vec!["alpha".to_string(), "bravo".to_string()]);
+        assert_eq!(kept[0], kept[1]);
     }
 
     #[test]

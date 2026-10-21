@@ -89,6 +89,16 @@ static CONSOLIDATION_LOCKS: std::sync::LazyLock<
     dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 
+/// `user_id`'s consolidation lock. Scheduled maintenance try-locks it as well: it runs
+/// the same maintenance and edge strengthening, and two passes at once for one user
+/// double-strengthen edges.
+pub(crate) fn consolidation_lock(user_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    CONSOLIDATION_LOCKS
+        .entry(user_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 // =============================================================================
 // SEMANTIC CONSOLIDATION
 // =============================================================================
@@ -117,19 +127,15 @@ pub async fn consolidate_memories(
     let min_age_days = req.min_age_days;
     let state_clone = state.clone();
 
-    // Spawn the entire pipeline as a detached background task.
-    // This survives HTTP timeout cancellation — the work always completes.
-    tokio::task::spawn(async move {
+    // Spawn the entire pipeline as a background task on the manager's tracker: it
+    // survives HTTP timeout cancellation, and the shutdown drain waits for it before the
+    // stores are flushed.
+    state.task_tracker.spawn(async move {
         let op_start = std::time::Instant::now();
 
         // Guard against concurrent consolidation for the same user — concurrent runs
         // can double-strengthen edges and waste resources. Skip if already running.
-        let lock_arc = {
-            let entry = CONSOLIDATION_LOCKS
-                .entry(user_id.clone())
-                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
-            entry.clone()
-        };
+        let lock_arc = consolidation_lock(&user_id);
         let _consolidation_guard = match lock_arc.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -541,17 +547,13 @@ pub async fn sleep_phase_consolidation(
     let replay_multiplier = req.replay_multiplier.unwrap_or(3);
     let state_clone = state.clone();
 
-    tokio::task::spawn(async move {
+    // On the manager's tracker so the shutdown drain waits for it.
+    state.task_tracker.spawn(async move {
         let op_start = std::time::Instant::now();
         tracing::info!(user_id = %user_id, replay_multiplier, "Sleep-phase consolidation starting");
 
         // Guard against concurrent consolidation runs for the same user.
-        let lock_arc = {
-            let entry = CONSOLIDATION_LOCKS
-                .entry(user_id.clone())
-                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
-            entry.clone()
-        };
+        let lock_arc = consolidation_lock(&user_id);
         let _consolidation_guard = match lock_arc.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
