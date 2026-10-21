@@ -233,6 +233,27 @@ This benchmark document keeps measured runtime and systems numbers. Product-leve
 
 ---
 
+## Store-Size Latency Lane
+
+`bench/store_size_latency_probe.py`, run by `.github/workflows/store-size-latency.yml` (nightly and on demand; not a PR gate).
+
+The 20-memory recall guard (`bench/recall_latency_guard.py`) cannot see store-size scaling: a path that costs O(N) per request costs the same on 20 memories before and after a fix. The lane seeds one tenant to N memories (default 10 000, through `POST /api/remember/batch`), creates a fresh tenant in the same run, and measures p50/p95 over 20 calls per route on each:
+
+| Route | Large-tenant p95 limit |
+|---|---|
+| `POST /api/remember` | 2.0 s |
+| `POST /api/recall` | 2.0 s |
+| `GET /api/memory/{id}` | 0.2 s |
+| `POST /api/relevant` | 1.0 s |
+| `GET /api/users/{id}/stats` | 0.2 s |
+| `GET /api/health/index` (per tenant) and `GET /health/index` (public) | 0.2 s |
+
+The job fails when any large-tenant p95 exceeds its limit, when the large/fresh p95 ratio exceeds 5 (`--max-ratio`; fresh p95 is floored at 50 ms in the ratio), or when any call errors or hits the 60 s timeout. A failed call is charged at 60 s in the percentiles, never dropped. Limits can be overridden with `--thresholds <json>`. The JSON result records the commit sha, store size and timestamps and is uploaded as the `store-size-latency` artifact.
+
+Reference point: a 15.6k-memory tenant measured `POST /api/remember` timing out at 60 s and `POST /api/recall` at 8-10 s, against 1.1 s for a write on a fresh tenant.
+
+---
+
 ## Engine comparison (RocksDB vs redb)
 
 Not yet measured on this branch. The table below is empty on purpose: run the commands, then paste the script output into it. Do not quote numbers from other machines or from the older sections of this document for this comparison.

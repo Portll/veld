@@ -988,46 +988,34 @@ impl RetrievalEngine {
 
         let vamana_path = index_path.join(VAMANA_INDEX_FILE);
 
-        // LOCK ORDERING: Always acquire vector_index (1) before id_mapping (2)
+        // LOCK ORDERING: Always acquire vector_index (1) before id_mapping (2). The mapping
+        // is only counted: holding it through the save would stall every insert.
         let vector_index = self.vector_index.read();
-        let id_mapping = self.id_mapping.read();
-        let vector_count = id_mapping.len();
+        let vector_count = self.id_mapping.read().len();
         if vector_count > 0 {
-            // Atomic save: write to .tmp file then rename to avoid partial writes
-            let tmp_path = vamana_path.with_extension("vamana.tmp");
-            match vector_index.save_to_file(&tmp_path) {
+            // save_to_file replaces the file atomically: on a crash the old one survives.
+            match vector_index.save_to_file(&vamana_path) {
                 Ok(()) => {
-                    // Atomic rename — on crash, either the old or new file survives
-                    if let Err(e) = fs::rename(&tmp_path, &vamana_path) {
-                        warn!(
-                            "Failed to rename .vamana.tmp to .vamana: {} (removing tmp)",
-                            e
-                        );
-                        let _ = fs::remove_file(&tmp_path);
-                    } else {
-                        if let Err(e) = fs::write(index_path.join(MAPPINGS_MARKER_FILE), b"") {
-                            warn!("Failed to write the vector mappings marker: {}", e);
-                        }
-                        info!(
-                            "Saved Vamana index: {} memories to {} (instant startup enabled)",
-                            vector_count,
-                            vamana_path.display()
-                        );
+                    if let Err(e) = fs::write(index_path.join(MAPPINGS_MARKER_FILE), b"") {
+                        warn!("Failed to write the vector mappings marker: {}", e);
                     }
+                    info!(
+                        "Saved Vamana index: {} memories to {} (instant startup enabled)",
+                        vector_count,
+                        vamana_path.display()
+                    );
                 }
                 Err(e) => {
                     warn!(
                         "Failed to save Vamana index (will rebuild on restart): {}",
                         e
                     );
-                    let _ = fs::remove_file(&tmp_path);
                 }
             }
         } else {
             info!("Vamana index empty, skipping persistence");
         }
         // Release primary locks before acquiring secondary
-        drop(id_mapping);
         drop(vector_index);
 
         // Save secondary Vamana index if present
@@ -1039,26 +1027,12 @@ impl RetrievalEngine {
 
             let sec_idx = sec_index.read();
             if !sec_idx.is_empty() {
-                let tmp_path = sec_vamana_path.with_extension("vamana.tmp");
-                match sec_idx.save_to_file(&tmp_path) {
-                    Ok(()) => {
-                        if let Err(e) = fs::rename(&tmp_path, &sec_vamana_path) {
-                            warn!(
-                                "Failed to rename secondary .vamana.tmp: {} (removing tmp)",
-                                e
-                            );
-                            let _ = fs::remove_file(&tmp_path);
-                        } else {
-                            info!("Saved secondary Vamana index: {} vectors", sec_idx.len());
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to save secondary Vamana (will rebuild on restart): {}",
-                            e
-                        );
-                        let _ = fs::remove_file(&tmp_path);
-                    }
+                match sec_idx.save_to_file(&sec_vamana_path) {
+                    Ok(()) => info!("Saved secondary Vamana index: {} vectors", sec_idx.len()),
+                    Err(e) => warn!(
+                        "Failed to save secondary Vamana (will rebuild on restart): {}",
+                        e
+                    ),
                 }
             }
         }
@@ -1083,6 +1057,16 @@ impl RetrievalEngine {
             .read()
             .memory_to_vectors
             .contains_key(memory_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vector_ids_of(&self, memory_id: &MemoryId) -> Vec<u32> {
+        self.id_mapping
+            .read()
+            .memory_to_vectors
+            .get(memory_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn get_indexed_memory_ids(&self) -> HashSet<MemoryId> {
@@ -1680,6 +1664,13 @@ impl RetrievalEngine {
     /// Get memory from storage by ID
     pub fn get_from_storage(&self, id: &MemoryId) -> Result<Memory> {
         self.storage.get(id)
+    }
+
+    /// Read `ids` from storage, results in the same order. The one seam recall's candidate
+    /// projection reads through. `PrimaryMemoryStore` has no batch read, so today this is
+    /// one point read per id.
+    pub fn get_many_from_storage(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
+        ids.iter().map(|id| self.storage.get(id)).collect()
     }
 
     /// Search for similar memories by embedding directly (SHO-106)

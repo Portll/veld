@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokenizers::Tokenizer;
 
+use super::minilm::OrtThreading;
 use super::Embedder;
 
 /// The id `VELD_EMBEDDER` selects this embedder by, the corpus marker records, and the recall
@@ -67,7 +68,7 @@ pub fn query_text(query: &str) -> String {
 }
 
 /// Configuration for the arctic-embed-xs embedder
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ArcticConfig {
     /// Path to the ONNX model file
     pub model_path: PathBuf,
@@ -144,26 +145,17 @@ struct LazyArcticModel {
 }
 
 impl LazyArcticModel {
-    fn new(config: &ArcticConfig) -> Result<Self> {
-        let threads = super::minilm::onnx_threads();
+    fn new(config: &ArcticConfig, threading: OrtThreading) -> Result<Self> {
         tracing::info!(
-            "Loading snowflake-arctic-embed-xs from {:?} with {} threads",
+            "Loading snowflake-arctic-embed-xs from {:?} (intra={}, inter={}, spinning={})",
             config.model_path,
-            threads
+            threading.intra,
+            threading.inter,
+            threading.spinning
         );
 
-        // The same session settings as MiniLM, so the two architectures are compared on equal
-        // terms: one inter-op thread and no spinning (the macOS P/E-core deadlock).
-        let session = Session::builder()
-            .context("Failed to create session builder")?
-            .with_intra_threads(threads)
-            .context("Failed to set intra thread count")?
-            .with_inter_threads(1)
-            .context("Failed to set inter thread count")?
-            .with_intra_op_spinning(false)
-            .context("Failed to disable intra-op spinning")?
-            .with_inter_op_spinning(false)
-            .context("Failed to disable inter-op spinning")?
+        let session = threading
+            .apply(Session::builder().context("Failed to create session builder")?)?
             .commit_from_file(&config.model_path)
             .context("Failed to load arctic-embed-xs ONNX model")?;
 
@@ -336,6 +328,7 @@ fn normalized(mut v: Vec<f32>) -> Vec<f32> {
 /// snowflake-arctic-embed-xs embedder with ONNX Runtime and lazy model loading.
 pub struct ArcticEmbedder {
     config: ArcticConfig,
+    threading: OrtThreading,
     lazy_model: OnceLock<Result<Arc<LazyArcticModel>, String>>,
 }
 
@@ -345,6 +338,12 @@ impl ArcticEmbedder {
     /// Missing model files are fetched only with `VELD_AUTO_DOWNLOAD_MODELS=true` and without
     /// `VELD_OFFLINE`; otherwise this is an error naming `model-fetch --arctic-xs`.
     pub fn new(config: ArcticConfig) -> Result<Self> {
+        Self::with_threading(config, OrtThreading::resolve())
+    }
+
+    /// [`Self::new`] with the session threading given rather than resolved, so a shared
+    /// instance is built from exactly the values its spec was keyed on.
+    pub fn with_threading(config: ArcticConfig, threading: OrtThreading) -> Result<Self> {
         let offline = super::offline_mode_enabled();
         super::minilm::ensure_ort_runtime(offline)
             .context("arctic-embed-xs needs the ONNX Runtime")?;
@@ -406,6 +405,7 @@ impl ArcticEmbedder {
         );
         let embedder = Self {
             config,
+            threading,
             lazy_model: OnceLock::new(),
         };
         if !super::minilm::lazy_load_enabled() {
@@ -414,9 +414,15 @@ impl ArcticEmbedder {
         Ok(embedder)
     }
 
+    /// True once a load was attempted and failed; the shared registry then builds a new
+    /// instance instead of handing this one out.
+    pub fn model_load_failed(&self) -> bool {
+        matches!(self.lazy_model.get(), Some(Err(_)))
+    }
+
     fn ensure_model_loaded(&self) -> Result<&Arc<LazyArcticModel>> {
         let loaded = self.lazy_model.get_or_init(|| {
-            LazyArcticModel::new(&self.config)
+            LazyArcticModel::new(&self.config, self.threading)
                 .map(Arc::new)
                 .map_err(|e| format!("{e:#}"))
         });

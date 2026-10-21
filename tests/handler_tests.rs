@@ -3122,7 +3122,7 @@ async fn a_write_without_entities_behaves_as_before() {
 
 #[tokio::test]
 async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
-    use veld::constants::MAX_ENTITY_DEGREE;
+    use veld::constants::{ENTITY_DEGREE_PRUNE_TARGET, MAX_ENTITY_DEGREE};
     use veld::graph_memory::{EntityLabel, EntityNode, RelationType, RelationshipEdge};
 
     let h = Harness::new();
@@ -3245,10 +3245,11 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
         "a derived hub gained or lost an edge"
     );
     let bash_edges = edges_of(&h, user, &bash);
-    assert_eq!(
-        bash_edges.len(),
-        MAX_ENTITY_DEGREE,
-        "the declared hub stays at the cap"
+    // Its first new edge cut it back to the target; the memory's later ones stayed.
+    assert!(
+        (ENTITY_DEGREE_PRUNE_TARGET..MAX_ENTITY_DEGREE).contains(&bash_edges.len()),
+        "the declared hub holds {} edges, outside the prune window",
+        bash_edges.len()
     );
     assert!(
         bash_edges
@@ -3320,6 +3321,8 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
     let target = body["id"].as_str().unwrap().to_string();
     let target_uuid = veld::uuid::Uuid::parse_str(&target).unwrap();
     wait_for_episode_entity(&h, user, target_uuid, &SERVE.to_lowercase()).await;
+    // The embedding is deferred too; ranked before it lands, the target has no vector.
+    wait_for_background_work(&h).await;
 
     for query in [
         "what changed in serve.mjs",

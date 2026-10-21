@@ -5,8 +5,8 @@ use bincode;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "rocksdb")]
 use rocksdb::{
-    Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions,
-    DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBCompressionType,
+    IteratorMode, Options, ReadOptions, WriteBatch, WriteBufferManager, WriteOptions, DB,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "rocksdb")]
@@ -1328,6 +1328,32 @@ const CONTENT_HASH_LAYOUT_MARKER: &[u8] = b"meta:content_hash_rows_per_memory";
 /// existing databases too.
 #[cfg(feature = "rocksdb")]
 const CF_KV: &str = "kv";
+/// `CF_INDEX` time index of the memories compression has not reached yet:
+/// `uncompressed:{sortable created_at millis}:{uuid}`. Lets the compression pass seek to
+/// its candidates instead of decoding the whole store.
+#[cfg(feature = "rocksdb")]
+const UNCOMPRESSED_INDEX_PREFIX: &str = "uncompressed:";
+/// Set once the uncompressed time index also covers records written before it existed.
+/// A `meta:` key, so `rebuild_index` keeps it while re-deriving the index entries.
+#[cfg(feature = "rocksdb")]
+const UNCOMPRESSED_INDEX_SENTINEL: &[u8] = b"meta:uncompressed_index_v1";
+
+/// Index key of a memory in the uncompressed time index. Millis are mapped onto `u64` with
+/// the sign bit flipped, so zero-padded decimal order is chronological order, pre-1970
+/// timestamps included.
+#[cfg(feature = "rocksdb")]
+fn uncompressed_index_key(created_at: DateTime<Utc>, id: &MemoryId) -> String {
+    format!(
+        "{UNCOMPRESSED_INDEX_PREFIX}{:020}:{}",
+        sortable_millis(created_at),
+        id.0
+    )
+}
+
+#[cfg(feature = "rocksdb")]
+fn sortable_millis(at: DateTime<Utc>) -> u64 {
+    (at.timestamp_millis() as u64) ^ (1u64 << 63)
+}
 
 /// Whether a whole-store scan returns forgotten (soft-deleted) records.
 #[cfg(feature = "rocksdb")]
@@ -1362,6 +1388,59 @@ pub struct MemoryStorage {
     index_blinder: Option<crate::keystore::IndexBlinder>,
     /// See [`Self::undecodable_records_skipped`].
     undecodable_skipped: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "rocksdb")]
+/// Total memtable memory all per-user and shared RocksDB instances may hold.
+const PROCESS_WRITE_BUFFER_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
+#[cfg(feature = "rocksdb")]
+/// Table options every column family uses: the shared block cache, a 10-bit full bloom
+/// filter (about 1% false positives), and index/filter blocks held in that cache with
+/// the L0 ones pinned so point lookups never page them back in.
+///
+/// No prefix extractor is installed on the index family on purpose. Its key families
+/// (`tag:`, `inbound_ref:`, `date:`, `geo:`, `content_hash:` ...) have no common
+/// length, and the scans over it seek with arbitrary-length bounds; with a prefix bloom
+/// RocksDB may skip SST files for a seek whose bound is not the extractor's prefix,
+/// silently dropping rows. The whole-key bloom serves the point lookups that dominate.
+pub fn block_based_options(cache: &Cache) -> BlockBasedOptions {
+    let mut block_opts = BlockBasedOptions::default();
+    block_opts.set_bloom_filter(10.0, false);
+    block_opts.set_block_cache(cache);
+    block_opts.set_cache_index_and_filter_blocks(true);
+    block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    block_opts
+}
+
+#[cfg(feature = "rocksdb")]
+/// Options for a secondary column family (index, KV): Lz4, two memtables of
+/// `write_buffer_bytes`, and [`block_based_options`] over `cache`.
+pub fn column_family_options(cache: &Cache, write_buffer_bytes: usize) -> Options {
+    let mut cf_opts = Options::default();
+    cf_opts.create_if_missing(true);
+    cf_opts.set_compression_type(DBCompressionType::Lz4);
+    cf_opts.set_max_write_buffer_number(2);
+    cf_opts.set_write_buffer_size(write_buffer_bytes);
+    cf_opts.set_block_based_table_factory(&block_based_options(cache));
+    cf_opts
+}
+
+#[cfg(feature = "rocksdb")]
+/// The one write buffer manager every shared-cache RocksDB instance in the process
+/// attaches to (`Options::set_write_buffer_manager`), capping total memtable memory at
+/// 256 MiB and charging it to the cache. Writers are not stalled at the limit; RocksDB
+/// flushes instead. The first caller's cache is the one charged, so every caller must
+/// pass the same process-wide cache.
+pub fn shared_write_buffer_manager(cache: &Cache) -> &'static WriteBufferManager {
+    static MANAGER: std::sync::OnceLock<WriteBufferManager> = std::sync::OnceLock::new();
+    MANAGER.get_or_init(|| {
+        WriteBufferManager::new_write_buffer_manager_with_cache(
+            PROCESS_WRITE_BUFFER_LIMIT_BYTES,
+            false,
+            cache.clone(),
+        )
+    })
 }
 
 #[cfg(feature = "rocksdb")]
@@ -1428,7 +1507,7 @@ impl MemoryStorage {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
 
         // ========================================================================
         // DURABILITY SETTINGS - Critical for data persistence across restarts
@@ -1454,9 +1533,7 @@ impl MemoryStorage {
         opts.set_level_compaction_dynamic_level_bytes(true);
 
         // Read performance — shared block cache for multi-tenant, small local for standalone
-        use rocksdb::{BlockBasedOptions, Cache};
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_bloom_filter(10.0, false); // 10 bits/key = ~1% FPR
+        use Cache;
         let local_cache;
         let cache = match shared_cache {
             Some(c) => c,
@@ -1465,32 +1542,29 @@ impl MemoryStorage {
                 &local_cache
             }
         };
-        block_opts.set_block_cache(cache);
-        block_opts.set_cache_index_and_filter_blocks(true);
-        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true); // Pin L0 for fast reads
-        opts.set_block_based_table_factory(&block_opts);
+        opts.set_block_based_table_factory(&block_based_options(cache));
+        // Memtable memory is capped process-wide, and only where a shared cache exists:
+        // a standalone store has a private 16MB cache that the manager must not be charged to.
+        if shared_cache.is_some() {
+            opts.set_write_buffer_manager(shared_write_buffer_manager(cache));
+        }
 
-        // Open single database with column families (index CF uses lighter settings)
+        // Open single database with column families. Every family gets the same table
+        // options (shared cache, bloom filter, pinned L0 metadata); the index and KV
+        // families only differ from the record family in carrying no tuned file sizes.
         let main_opts = opts.clone();
+        let index_cache = cache.clone();
         let db = Arc::new(Self::open_or_repair_cf(&opts, &storage_path, move || {
             vec![
                 ColumnFamilyDescriptor::new("default", main_opts.clone()),
-                ColumnFamilyDescriptor::new(CF_INDEX, {
-                    let mut idx_opts = Options::default();
-                    idx_opts.create_if_missing(true);
-                    idx_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-                    idx_opts.set_max_write_buffer_number(2);
-                    idx_opts.set_write_buffer_size(write_buffer_bytes);
-                    idx_opts
-                }),
-                ColumnFamilyDescriptor::new(CF_KV, {
-                    let mut kv_opts = Options::default();
-                    kv_opts.create_if_missing(true);
-                    kv_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-                    kv_opts.set_max_write_buffer_number(2);
-                    kv_opts.set_write_buffer_size(write_buffer_bytes);
-                    kv_opts
-                }),
+                ColumnFamilyDescriptor::new(
+                    CF_INDEX,
+                    column_family_options(&index_cache, write_buffer_bytes),
+                ),
+                ColumnFamilyDescriptor::new(
+                    CF_KV,
+                    column_family_options(&index_cache, write_buffer_bytes),
+                ),
             ]
         })?);
 
@@ -1905,11 +1979,7 @@ impl MemoryStorage {
         match self.get_if_present(id) {
             Ok(Some(previous)) => self.queue_index_removals(id, &previous, batch),
             Ok(None) => {}
-            Err(e) => tracing::warn!(
-                memory_id = %id.0,
-                error = %e,
-                "stored record does not decode; replacing it without removing its index rows"
-            ),
+            Err(e) => self.remove_undecodable_inbound_refs(id, &e),
         }
     }
 
@@ -2116,13 +2186,24 @@ impl MemoryStorage {
         // De-duplicated so a memory that references the same target twice (e.g.
         // both related_memories and a CausalLink) yields a single entry.
         for target in memory.forward_ref_targets() {
-            let inbound_key = format!(
-                "inbound_ref:{}:{}",
-                self.blind_term(&target.0.to_string()),
-                memory.id.0
-            );
+            let inbound_key = self.inbound_ref_key(&target, &memory.id);
             batch.put_cf(idx, inbound_key.as_bytes(), memory.id.0.as_bytes());
         }
+
+        if !memory.compressed && !memory.is_forgotten() {
+            let key = uncompressed_index_key(memory.created_at, &memory.id);
+            batch.put_cf(idx, key.as_bytes(), b"1");
+        }
+    }
+
+    /// `inbound_ref:{blinded(target)}:{holder}`, the reverse-index entry recording that
+    /// `holder` points at `target`.
+    fn inbound_ref_key(&self, target: &MemoryId, holder: &MemoryId) -> String {
+        format!(
+            "inbound_ref:{}:{}",
+            self.blind_term(&target.0.to_string()),
+            holder.0
+        )
     }
 
     /// Public query API (R7) — enumerate the holders that still point AT `target`.
@@ -2647,32 +2728,58 @@ impl MemoryStorage {
         }
 
         // === Inbound-Reference Reverse Index teardown (R7 / F2) ===
-        // Remove every reverse entry whose HOLDER is this memory, regardless of
-        // target. Keys are `inbound_ref:{blinded(target)}:{holder}`, so the holder
-        // is NOT a prefix — we scan the whole `inbound_ref:` keyspace and match on
-        // the holder suffix. This is the update-diff–safe teardown (Option b): we
-        // do NOT reconstruct the OLD memory's targets, so entries for targets that
-        // an update DROPPED are also removed. `store` queues these removals before the
-        // new version's rows in one batch; removing by holder-suffix here
-        // guarantees no stale `inbound_ref` survives the diff. The reverse entries
-        // for which this memory is the TARGET (i.e. other holders pointing AT it)
-        // are intentionally left — those holders still reference it.
-        {
-            let holder_suffix = format!(":{}", id.0);
-            let scan_prefix = b"inbound_ref:";
-            let inbound_iter = self.db.iterator_cf(
-                idx,
-                IteratorMode::From(scan_prefix, rocksdb::Direction::Forward),
-            );
-            for (key, _value) in inbound_iter.log_errors() {
-                if !key.starts_with(scan_prefix) {
-                    break;
-                }
-                if key.ends_with(holder_suffix.as_bytes()) {
-                    batch.delete_cf(idx, key.as_ref());
-                }
+        // `memory` is the record as stored, read before the write that replaces it, so its
+        // targets are exactly the entries `queue_index_writes` wrote for it: targets an update DROPS are among them and are removed here, and the
+        // new version's targets are written fresh by the store that follows. Entries
+        // for which this memory is the TARGET belong to other holders and stay.
+        for target in memory.forward_ref_targets() {
+            batch.delete_cf(idx, self.inbound_ref_key(&target, id).as_bytes());
+        }
+
+        batch.delete_cf(
+            idx,
+            uncompressed_index_key(memory.created_at, id).as_bytes(),
+        );
+    }
+
+    /// A stored record that does not decode cannot name its index rows. Its inbound_ref
+    /// entries can still be found by their holder suffix, so those are removed by scan;
+    /// the rest stay until `rebuild_index`.
+    fn remove_undecodable_inbound_refs(&self, id: &MemoryId, error: &anyhow::Error) {
+        tracing::warn!(
+            memory_id = %id.0,
+            error = %error,
+            "stored record does not decode; removing its inbound_ref entries by scan"
+        );
+        if let Err(e) = self.remove_inbound_refs_by_holder_scan(id) {
+            tracing::warn!(memory_id = %id.0, error = %e, "inbound_ref scan removal failed");
+        }
+    }
+
+    /// Remove every `inbound_ref:*:{holder}` entry by scanning the whole reverse index.
+    /// The holder is the key's suffix, not its prefix, so this is O(index); it is only for
+    /// a holder whose stored record cannot be decoded to name its targets.
+    fn remove_inbound_refs_by_holder_scan(&self, holder: &MemoryId) -> Result<()> {
+        let idx = self.index_cf();
+        let holder_suffix = format!(":{}", holder.0);
+        let scan_prefix = b"inbound_ref:";
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        let iter = self.db.iterator_cf_opt(
+            idx,
+            read_opts,
+            IteratorMode::From(scan_prefix, rocksdb::Direction::Forward),
+        );
+        let mut batch = WriteBatch::default();
+        for (key, _value) in iter.log_errors() {
+            if !key.starts_with(scan_prefix) {
+                break;
+            }
+            if key.ends_with(holder_suffix.as_bytes()) {
+                batch.delete_cf(idx, key.as_ref());
             }
         }
+        self.guarded_batch(&batch, &self.write_options())
     }
 
     /// Search memories by various criteria.
@@ -3333,7 +3440,7 @@ impl MemoryStorage {
     /// individual memories in batches to avoid OOM on large datasets.
     pub fn get_all_ids(&self) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
         for (key, _) in iter.flatten() {
@@ -3359,7 +3466,7 @@ impl MemoryStorage {
 
         // fill_cache(false) prevents this maintenance scan from polluting
         // the block cache with cold data, reducing C++ peak memory
-        let mut read_opts = rocksdb::ReadOptions::default();
+        let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
         let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
         for (key, value) in iter.flatten() {
@@ -3377,24 +3484,118 @@ impl MemoryStorage {
         memories
     }
 
+    /// Memories not yet compressed or forgotten, created before `cutoff`.
+    ///
+    /// A range seek over the uncompressed time index that decodes only the candidates.
+    /// Entries the index still holds for a record that has since been compressed,
+    /// forgotten or deleted are dropped as they are met.
     pub fn get_uncompressed_older_than(&self, cutoff: DateTime<Utc>) -> Result<Vec<Memory>> {
-        let mut memories = Vec::new();
+        self.ensure_uncompressed_index()?;
 
-        // Iterate through all memories
-        let iter = self.db.iterator(IteratorMode::Start);
-        for (key, value) in iter.flatten() {
-            // Only process valid 16-byte UUID keys
-            if key.len() != 16 {
-                continue;
+        let idx = self.index_cf();
+        let prefix = UNCOMPRESSED_INDEX_PREFIX.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        read_opts.set_iterate_upper_bound(format!(
+            "{UNCOMPRESSED_INDEX_PREFIX}{:020}",
+            sortable_millis(cutoff)
+        ));
+        let iter = self.db.iterator_cf_opt(
+            idx,
+            read_opts,
+            IteratorMode::From(prefix, rocksdb::Direction::Forward),
+        );
+
+        let mut memories = Vec::new();
+        let mut stale = WriteBatch::default();
+        for (key, _) in iter.log_errors() {
+            if !key.starts_with(prefix) {
+                break;
             }
-            if let Some(memory) = self.decode_or_skip(&key, &value, "get_uncompressed_older_than") {
-                if !memory.compressed && !memory.is_forgotten() && memory.created_at < cutoff {
-                    memories.push(memory);
+            let Some(id) = std::str::from_utf8(&key)
+                .ok()
+                .and_then(|k| k.rsplit(':').next())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                .map(MemoryId)
+            else {
+                stale.delete_cf(idx, key.as_ref());
+                continue;
+            };
+            match self.get_uncached(&id) {
+                Ok(Some(memory)) => {
+                    let current = !memory.compressed
+                        && !memory.is_forgotten()
+                        && uncompressed_index_key(memory.created_at, &id).as_bytes() == &key[..];
+                    if !current {
+                        stale.delete_cf(idx, key.as_ref());
+                    } else if memory.created_at < cutoff {
+                        memories.push(memory);
+                    }
+                }
+                Ok(None) => stale.delete_cf(idx, key.as_ref()),
+                Err(e) => {
+                    tracing::debug!("compression candidate {} skipped: {e}", id.0);
                 }
             }
         }
+        if !stale.is_empty() {
+            self.guarded_batch(&stale, &self.write_options())?;
+        }
 
         Ok(memories)
+    }
+
+    /// Read and decode one record without filling the block cache or rewriting legacy
+    /// encodings: for maintenance passes that visit records nobody asked for.
+    fn get_uncached(&self, id: &MemoryId) -> Result<Option<Memory>> {
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        let key = id.0.as_bytes();
+        match self.db.get_opt(key, &read_opts)? {
+            Some(value) => Ok(Some(self.decode_stored(key, &value)?.0)),
+            None => Ok(None),
+        }
+    }
+
+    /// Index every record written before the uncompressed time index existed, once.
+    /// A write racing the backfill can leave an entry for a record that is compressed by
+    /// the time it lands; `get_uncompressed_older_than` drops such entries when it meets
+    /// them.
+    fn ensure_uncompressed_index(&self) -> Result<()> {
+        let idx = self.index_cf();
+        if self.db.get_cf(idx, UNCOMPRESSED_INDEX_SENTINEL)?.is_some() {
+            return Ok(());
+        }
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        let mut batch = WriteBatch::default();
+        let mut indexed = 0usize;
+        for (key, value) in self
+            .db
+            .iterator_opt(IteratorMode::Start, read_opts)
+            .log_errors()
+        {
+            if key.len() != 16 {
+                continue;
+            }
+            if let Some(memory) = self.decode_or_skip(&key, &value, "ensure_uncompressed_index") {
+                if !memory.compressed && !memory.is_forgotten() {
+                    let index_key = uncompressed_index_key(memory.created_at, &memory.id);
+                    batch.put_cf(idx, index_key.as_bytes(), b"1");
+                    indexed += 1;
+                    if batch.len() >= 10_000 {
+                        self.guarded_batch(&std::mem::take(&mut batch), &self.write_options())
+                            .context("Failed to write the uncompressed time index backfill")?;
+                    }
+                }
+            }
+        }
+        batch.put_cf(idx, UNCOMPRESSED_INDEX_SENTINEL, b"1");
+        self.guarded_batch(&batch, &self.write_options())
+            .context("Failed to write the uncompressed time index backfill")?;
+        tracing::info!(indexed, "Backfilled the uncompressed-memory time index");
+        Ok(())
     }
 
     /// Mark memories as forgotten (soft delete) with atomic batch write.
@@ -3428,6 +3629,10 @@ impl MemoryStorage {
 
                         let updated_value = self.serialize_memory(&memory)?;
                         batch.put(&key, updated_value);
+                        batch.delete_cf(
+                            self.index_cf(),
+                            uncompressed_index_key(memory.created_at, &memory.id).as_bytes(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -3479,6 +3684,10 @@ impl MemoryStorage {
 
                         let updated_value = self.serialize_memory(&memory)?;
                         batch.put(&key, updated_value);
+                        batch.delete_cf(
+                            self.index_cf(),
+                            uncompressed_index_key(memory.created_at, &memory.id).as_bytes(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -3548,7 +3757,9 @@ impl MemoryStorage {
         let mut deserialize_errors = 0;
         let stats_prefix = b"stats:";
 
-        let iter = self.db.iterator(IteratorMode::Start);
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
         for item in iter {
             match item {
                 Ok((key, value)) => {
@@ -4445,11 +4656,7 @@ impl MemoryStorage {
         match self.get_if_present(id) {
             Ok(Some(memory)) => self.queue_index_removals(id, &memory, &mut batch),
             Ok(None) => {}
-            Err(e) => tracing::warn!(
-                memory_id = %id.0,
-                error = %e,
-                "memory record does not decode; deleting it without its index rows"
-            ),
+            Err(e) => self.remove_undecodable_inbound_refs(id, &e),
         }
 
         batch.delete(id.0.as_bytes());
@@ -6258,6 +6465,278 @@ mod tests {
             !storage.has_any_inbound_refs(&orphan, "test-user").unwrap(),
             "completely unreferenced memory must report false"
         );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn removing_one_holder_leaves_the_other_holders_of_a_target() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let m1 = MemoryId(uuid::Uuid::new_v4());
+        let m2 = MemoryId(uuid::Uuid::new_v4());
+        let m3 = MemoryId(uuid::Uuid::new_v4());
+
+        storage
+            .store(&memory_referencing(m1.clone(), std::slice::from_ref(&a)))
+            .unwrap();
+        storage
+            .store(&memory_referencing(m2.clone(), &[a.clone(), b.clone()]))
+            .unwrap();
+        storage
+            .store(&memory_referencing(m3.clone(), std::slice::from_ref(&a)))
+            .unwrap();
+
+        storage.delete(&m1).unwrap();
+        let mut holders = storage.inbound_refs(&a).unwrap();
+        holders.sort_by_key(|h| h.0);
+        let mut expected = vec![m2.clone(), m3.clone()];
+        expected.sort_by_key(|h| h.0);
+        assert_eq!(holders, expected, "only m1's entry for A goes");
+
+        storage
+            .update(&memory_referencing(m2.clone(), std::slice::from_ref(&b)))
+            .unwrap();
+        assert_eq!(storage.inbound_refs(&a).unwrap(), vec![m3.clone()]);
+        assert_eq!(storage.inbound_refs(&b).unwrap(), vec![m2]);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn an_undecodable_holder_still_has_its_inbound_refs_removed() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let m = MemoryId(uuid::Uuid::new_v4());
+        let other = MemoryId(uuid::Uuid::new_v4());
+
+        storage
+            .store(&memory_referencing(m.clone(), std::slice::from_ref(&a)))
+            .unwrap();
+        storage
+            .store(&memory_referencing(other.clone(), std::slice::from_ref(&a)))
+            .unwrap();
+        storage.db.put(m.0.as_bytes(), [0xffu8; 3]).unwrap();
+        assert!(storage.get(&m).is_err(), "the fixture must be undecodable");
+
+        storage.delete(&m).unwrap();
+        assert_eq!(storage.inbound_refs(&a).unwrap(), vec![other]);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn aged_memory(age_days: i64, compressed: bool) -> Memory {
+        let mut memory = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+        memory.created_at = Utc::now() - chrono::Duration::days(age_days);
+        memory.compressed = compressed;
+        memory
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn uncompressed_candidates_come_from_the_time_index() {
+        let (storage, _dir) = test_storage();
+        let old = aged_memory(30, false);
+        let young = aged_memory(1, false);
+        let old_compressed = aged_memory(30, true);
+        for memory in [&old, &young, &old_compressed] {
+            storage.store(memory).unwrap();
+        }
+        let cutoff = Utc::now() - chrono::Duration::days(7);
+
+        let found: Vec<MemoryId> = storage
+            .get_uncompressed_older_than(cutoff)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(found, vec![old.id.clone()]);
+
+        let mut compressed = old.clone();
+        compressed.compressed = true;
+        storage.update(&compressed).unwrap();
+        assert!(storage
+            .get_uncompressed_older_than(cutoff)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn records_written_before_the_time_index_are_backfilled_once() {
+        let (storage, _dir) = test_storage();
+        let old = aged_memory(30, false);
+        storage.store(&old).unwrap();
+        let idx = storage.index_cf();
+        storage
+            .db
+            .delete_cf(
+                idx,
+                uncompressed_index_key(old.created_at, &old.id).as_bytes(),
+            )
+            .unwrap();
+        storage
+            .db
+            .delete_cf(idx, UNCOMPRESSED_INDEX_SENTINEL)
+            .unwrap();
+
+        let cutoff = Utc::now() - chrono::Duration::days(7);
+        let found = storage.get_uncompressed_older_than(cutoff).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, old.id);
+        assert!(storage
+            .db
+            .get_cf(idx, UNCOMPRESSED_INDEX_SENTINEL)
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn a_stale_time_index_entry_is_dropped_when_met() {
+        let (storage, _dir) = test_storage();
+        let old = aged_memory(30, false);
+        storage.store(&old).unwrap();
+        let mut compressed = old.clone();
+        compressed.compressed = true;
+        storage.store(&compressed).unwrap();
+        let key = uncompressed_index_key(old.created_at, &old.id);
+        let idx = storage.index_cf();
+        // What a write racing the backfill leaves behind (see `ensure_uncompressed_index`).
+        storage.db.put_cf(idx, key.as_bytes(), b"1").unwrap();
+
+        let cutoff = Utc::now() - chrono::Duration::days(7);
+        assert!(storage
+            .get_uncompressed_older_than(cutoff)
+            .unwrap()
+            .is_empty());
+        assert!(storage.db.get_cf(idx, key.as_bytes()).unwrap().is_none());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn the_time_index_orders_pre_epoch_timestamps_first() {
+        let before = DateTime::<Utc>::from_timestamp_millis(-1).unwrap();
+        let epoch = DateTime::<Utc>::from_timestamp_millis(0).unwrap();
+        let after = DateTime::<Utc>::from_timestamp_millis(1).unwrap();
+        assert!(sortable_millis(before) < sortable_millis(epoch));
+        assert!(sortable_millis(epoch) < sortable_millis(after));
+        let id = MemoryId(uuid::Uuid::nil());
+        assert!(uncompressed_index_key(before, &id) < uncompressed_index_key(after, &id));
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn index_has(storage: &MemoryStorage, key: &str) -> bool {
+        storage
+            .db
+            .get_cf(storage.index_cf(), key.as_bytes())
+            .unwrap()
+            .is_some()
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn index_keys_for(memory: &Memory) -> Vec<String> {
+        vec![
+            format!(
+                "date:{}:{}",
+                memory.created_at.format("%Y%m%d"),
+                memory.id.0
+            ),
+            format!(
+                "type:{:?}:{}",
+                memory.experience.experience_type, memory.id.0
+            ),
+            format!(
+                "importance:{}:{}",
+                (memory.importance() * 10.0) as u32,
+                memory.id.0
+            ),
+            uncompressed_index_key(memory.created_at, &memory.id),
+        ]
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn store_commits_record_and_indices_together() {
+        let (storage, _dir) = test_storage();
+        let target = MemoryId(uuid::Uuid::new_v4());
+        let m = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[target.clone()]);
+
+        storage.store(&m).unwrap();
+
+        assert!(storage.db.get(m.id.0.as_bytes()).unwrap().is_some());
+        for key in index_keys_for(&m) {
+            assert!(
+                index_has(&storage, &key),
+                "index key {key} missing after store"
+            );
+        }
+        assert!(storage.has_inbound_refs(&target).unwrap());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn update_rewrites_record_and_indices_in_one_commit() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let id = MemoryId(uuid::Uuid::new_v4());
+        storage
+            .store(&memory_referencing(id.clone(), &[a.clone()]))
+            .unwrap();
+
+        let updated = memory_referencing(id.clone(), &[b.clone()]);
+        storage.update(&updated).unwrap();
+
+        assert!(
+            !storage.has_inbound_refs(&a).unwrap(),
+            "dropped ref must go"
+        );
+        assert!(storage.has_inbound_refs(&b).unwrap(), "new ref must land");
+        for key in index_keys_for(&updated) {
+            assert!(
+                index_has(&storage, &key),
+                "index key {key} missing after update"
+            );
+        }
+        assert!(storage.get(&id).is_ok());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn multimodal_store_commits_mapping_and_indices_together() {
+        let (storage, _dir) = test_storage();
+        let m = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+
+        storage
+            .store_with_multimodal_vectors(&m, Modality::Text, vec![7, 8])
+            .unwrap();
+
+        assert!(storage.get(&m.id).is_ok());
+        assert!(storage.get_vector_mapping(&m.id).unwrap().is_some());
+        for key in index_keys_for(&m) {
+            assert!(index_has(&storage, &key), "index key {key} missing");
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn shared_cache_and_write_buffer_manager_open_round_trips_data() {
+        let cache = Cache::new_lru_cache(8 * 1024 * 1024);
+        let dir = tempfile::TempDir::new().unwrap();
+        let m = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+        {
+            let storage = MemoryStorage::new(dir.path(), Some(&cache)).unwrap();
+            storage.store(&m).unwrap();
+            storage.flush().unwrap();
+        }
+        let storage = MemoryStorage::new(dir.path(), Some(&cache)).unwrap();
+        assert!(storage.get(&m.id).is_ok());
+        for key in index_keys_for(&m) {
+            assert!(
+                index_has(&storage, &key),
+                "index key {key} lost across reopen"
+            );
+        }
+        assert!(super::shared_write_buffer_manager(&cache).enabled());
     }
 
     // ========================================================================

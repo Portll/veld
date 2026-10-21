@@ -1136,6 +1136,12 @@ fn pin_harness_threads() {
         if std::env::var_os("SHODH_EVAL_NOW").is_none() {
             std::env::set_var("SHODH_EVAL_NOW", HARNESS_CLOCK_ANCHOR);
         }
+        // The cross-encoder is one instance per process, so its pair-score cache outlives a
+        // repeat's MemorySystem and would serve repeats 2..n from memory. Off, each repeat's
+        // latency is the model's; the scores are the same either way.
+        if std::env::var_os("VELD_CROSS_ENCODER_CACHE").is_none() {
+            std::env::set_var("VELD_CROSS_ENCODER_CACHE", "0");
+        }
     }
 }
 

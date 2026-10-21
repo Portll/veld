@@ -516,10 +516,11 @@ pub async fn recall(
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory_for_recall.read();
 
-            // 1. Compute query embedding (reused for prospective + recall + todo search)
-            let query_embedding_opt = memory_guard
-                .compute_query_embedding(&query_for_recall)
-                .ok();
+            // 1. Compute query embedding (reused for prospective + recall + todo search).
+            // The recall pipeline searches with the query-side embedding, the one the
+            // other consumers below want too, so a single cached encode serves them all.
+            let recall_embedding_opt = memory_guard.recall_query_embedding(&query_for_recall).ok();
+            let query_embedding_opt = recall_embedding_opt.clone();
 
             // 2. Semantic prospective matching (fixes C5: was keyword-only)
             // Skip semantic matching if embedding failed — keyword matching still works
@@ -595,6 +596,7 @@ pub async fn recall(
                 tags: tags_for_recall,
                 layers: layers_for_recall,
                 evidence_source: Some(evidence_source),
+                query_embedding: recall_embedding_opt,
                 ..Default::default()
             };
 

@@ -13,12 +13,13 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
+use regex::Regex;
 #[cfg(feature = "rocksdb")]
 use rocksdb::DB;
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::types::MemoryId;
 
@@ -1930,8 +1931,7 @@ fn extract_historical_fact(
     }
 
     // Fallback: bare 4-digit year reference (original behaviour — unchanged).
-    let year_pattern = regex::Regex::new(r"\b(19|20)\d{2}\b").ok()?;
-    let year_match = year_pattern.find(&sentence_lower)?;
+    let year_match = YEAR_PATTERN.find(&sentence_lower)?;
     let year: i32 = year_match.as_str().parse().ok()?;
 
     // Only treat as historical if year is before conversation year
@@ -1999,11 +1999,7 @@ fn extract_event_and_time(sentence: &str, patterns: &[&str]) -> (String, String)
 /// Returns `None` for unrecognised or malformed expressions.
 fn parse_in_n_units(expr: &str) -> Option<(i64, InNUnit)> {
     // Match "in (a|an|N) (day|days|week|weeks|month|months)"
-    let re = regex::Regex::new(
-        r"(?i)\bin\s+(a|an|one|two|three|four|five|six|seven|eight|nine|ten|[0-9]+)\s+(day|days|week|weeks|month|months)\b",
-    )
-    .ok()?;
-    let cap = re.captures(expr)?;
+    let cap = IN_N_UNITS_PATTERN.captures(expr)?;
 
     let n: i64 = match cap[1].to_lowercase().as_str() {
         "a" | "an" | "one" => 1,
@@ -2037,6 +2033,80 @@ enum InNUnit {
     DaysOrWeeks(i64),
 }
 
+/// Month names and abbreviations, longest form first per month (match order matters).
+const MONTHS: [(&str, u32); 24] = [
+    ("january", 1u32),
+    ("jan", 1),
+    ("february", 2),
+    ("feb", 2),
+    ("march", 3),
+    ("mar", 3),
+    ("april", 4),
+    ("apr", 4),
+    ("may", 5),
+    ("june", 6),
+    ("jun", 6),
+    ("july", 7),
+    ("jul", 7),
+    ("august", 8),
+    ("aug", 8),
+    ("september", 9),
+    ("sep", 9),
+    ("sept", 9),
+    ("october", 10),
+    ("oct", 10),
+    ("november", 11),
+    ("nov", 11),
+    ("december", 12),
+    ("dec", 12),
+];
+
+/// The five date shapes tried for one month name, in the order they are tried.
+struct MonthDatePatterns {
+    /// "May 8, 2023" / "May 8 2023"
+    month_day_year: Regex,
+    /// "8 May 2023" / "8 May, 2023"
+    day_month_year: Regex,
+    /// "May 2023"
+    month_year: Regex,
+    /// "May 8"
+    month_day: Regex,
+    /// "8 May"
+    day_month: Regex,
+}
+
+static MONTH_DATE_PATTERNS: LazyLock<Vec<MonthDatePatterns>> = LazyLock::new(|| {
+    MONTHS
+        .iter()
+        .map(|&(name, _)| {
+            let m = regex::escape(name);
+            let build = |pat: String| Regex::new(&pat).expect("month date pattern is valid");
+            MonthDatePatterns {
+                month_day_year: build(format!(r"(?i)\b{m}\s+(\d{{1,2}}),?\s+(\d{{4}})\b")),
+                day_month_year: build(format!(r"(?i)\b(\d{{1,2}})\s+{m},?\s+(\d{{4}})\b")),
+                month_year: build(format!(r"(?i)\b{m}\s+(\d{{4}})\b")),
+                month_day: build(format!(r"(?i)\b{m}\s+(\d{{1,2}})\b")),
+                day_month: build(format!(r"(?i)\b(\d{{1,2}})\s+{m}\b")),
+            }
+        })
+        .collect()
+});
+
+static ISO_DATE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b").expect("valid regex"));
+
+static YEAR_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}\b").expect("valid regex"));
+
+/// "in (a|an|N) (day|week|month)(s)" future expressions. `find` and `captures` agree
+/// on the span, so the parser and the time-expression extractor share it.
+static IN_N_UNITS_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\bin\s+(a|an|one|two|three|four|five|six|seven|eight|nine|ten|[0-9]+)\s+(day|days|week|weeks|month|months)\b",
+    )
+    .expect("valid regex")
+});
+
 /// Parse explicit absolute-date patterns from a sentence.
 ///
 /// Handles (all case-insensitive):
@@ -2051,40 +2121,10 @@ fn extract_explicit_date_from_sentence(
     sentence: &str,
     conversation_date: DateTime<Utc>,
 ) -> Option<(ResolvedTime, String)> {
-    let months = [
-        ("january", 1u32),
-        ("jan", 1),
-        ("february", 2),
-        ("feb", 2),
-        ("march", 3),
-        ("mar", 3),
-        ("april", 4),
-        ("apr", 4),
-        ("may", 5),
-        ("june", 6),
-        ("jun", 6),
-        ("july", 7),
-        ("jul", 7),
-        ("august", 8),
-        ("aug", 8),
-        ("september", 9),
-        ("sep", 9),
-        ("sept", 9),
-        ("october", 10),
-        ("oct", 10),
-        ("november", 11),
-        ("nov", 11),
-        ("december", 12),
-        ("dec", 12),
-    ];
-
     let conv_year = conversation_date.year();
 
     // -- ISO: YYYY-MM-DD --
-    if let Some(cap) = regex::Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b")
-        .ok()?
-        .captures(sentence)
-    {
+    if let Some(cap) = ISO_DATE_PATTERN.captures(sentence) {
         let year: i32 = cap[1].parse().ok()?;
         let month: u32 = cap[2].parse().ok()?;
         let day: u32 = cap[3].parse().ok()?;
@@ -2098,72 +2138,51 @@ fn extract_explicit_date_from_sentence(
     let s_lower = sentence.to_lowercase();
 
     // -- Month Day, Year  OR  Month Day Year  ("May 8, 2023" / "May 8 2023") --
-    for &(month_name, month_num) in &months {
+    for (&(_, month_num), pats) in MONTHS.iter().zip(MONTH_DATE_PATTERNS.iter()) {
         // "May 8, 2023" or "May 8 2023"
-        let pat = format!(
-            r"(?i)\b{}\s+(\d{{1,2}}),?\s+(\d{{4}})\b",
-            regex::escape(month_name)
-        );
-        if let Ok(re) = regex::Regex::new(&pat) {
-            if let Some(cap) = re.captures(&s_lower) {
-                let day: u32 = cap[1].parse().ok()?;
-                let year: i32 = cap[2].parse().ok()?;
-                if (1900..=2100).contains(&year) {
-                    if let Some(d) = NaiveDate::from_ymd_opt(year, month_num, day) {
-                        return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
-                    }
+        if let Some(cap) = pats.month_day_year.captures(&s_lower) {
+            let day: u32 = cap[1].parse().ok()?;
+            let year: i32 = cap[2].parse().ok()?;
+            if (1900..=2100).contains(&year) {
+                if let Some(d) = NaiveDate::from_ymd_opt(year, month_num, day) {
+                    return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
                 }
             }
         }
         // "8 May 2023" or "8 May, 2023"
-        let pat2 = format!(
-            r"(?i)\b(\d{{1,2}})\s+{},?\s+(\d{{4}})\b",
-            regex::escape(month_name)
-        );
-        if let Ok(re) = regex::Regex::new(&pat2) {
-            if let Some(cap) = re.captures(&s_lower) {
-                let day: u32 = cap[1].parse().ok()?;
-                let year: i32 = cap[2].parse().ok()?;
-                if (1900..=2100).contains(&year) {
-                    if let Some(d) = NaiveDate::from_ymd_opt(year, month_num, day) {
-                        return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
-                    }
+        if let Some(cap) = pats.day_month_year.captures(&s_lower) {
+            let day: u32 = cap[1].parse().ok()?;
+            let year: i32 = cap[2].parse().ok()?;
+            if (1900..=2100).contains(&year) {
+                if let Some(d) = NaiveDate::from_ymd_opt(year, month_num, day) {
+                    return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
                 }
             }
         }
         // "May 2023" (month + year, no day)
-        let pat3 = format!(r"(?i)\b{}\s+(\d{{4}})\b", regex::escape(month_name));
-        if let Ok(re) = regex::Regex::new(&pat3) {
-            if let Some(cap) = re.captures(&s_lower) {
-                let year: i32 = cap[1].parse().ok()?;
-                if (1900..=2100).contains(&year) {
-                    return Some((
-                        ResolvedTime::MonthYear {
-                            month: month_num,
-                            year,
-                        },
-                        cap[0].to_string(),
-                    ));
-                }
+        if let Some(cap) = pats.month_year.captures(&s_lower) {
+            let year: i32 = cap[1].parse().ok()?;
+            if (1900..=2100).contains(&year) {
+                return Some((
+                    ResolvedTime::MonthYear {
+                        month: month_num,
+                        year,
+                    },
+                    cap[0].to_string(),
+                ));
             }
         }
         // "May 8" or "8 May" (no year — anchor to conversation year)
-        let pat4 = format!(r"(?i)\b{}\s+(\d{{1,2}})\b", regex::escape(month_name));
-        if let Ok(re) = regex::Regex::new(&pat4) {
-            if let Some(cap) = re.captures(&s_lower) {
-                let day: u32 = cap[1].parse().ok()?;
-                if let Some(d) = NaiveDate::from_ymd_opt(conv_year, month_num, day) {
-                    return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
-                }
+        if let Some(cap) = pats.month_day.captures(&s_lower) {
+            let day: u32 = cap[1].parse().ok()?;
+            if let Some(d) = NaiveDate::from_ymd_opt(conv_year, month_num, day) {
+                return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
             }
         }
-        let pat5 = format!(r"(?i)\b(\d{{1,2}})\s+{}\b", regex::escape(month_name));
-        if let Ok(re) = regex::Regex::new(&pat5) {
-            if let Some(cap) = re.captures(&s_lower) {
-                let day: u32 = cap[1].parse().ok()?;
-                if let Some(d) = NaiveDate::from_ymd_opt(conv_year, month_num, day) {
-                    return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
-                }
+        if let Some(cap) = pats.day_month.captures(&s_lower) {
+            let day: u32 = cap[1].parse().ok()?;
+            if let Some(d) = NaiveDate::from_ymd_opt(conv_year, month_num, day) {
+                return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
             }
         }
     }
@@ -2311,12 +2330,7 @@ fn extract_time_expression(sentence: &str) -> String {
     }
 
     // GAP-2: "in N days/weeks/months" future expressions
-    if let Some(cap) = regex::Regex::new(
-        r"(?i)\bin\s+(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|[0-9]+)\s+(?:day|days|week|weeks|month|months)\b",
-    )
-    .ok()
-    .and_then(|re| re.find(sentence))
-    {
+    if let Some(cap) = IN_N_UNITS_PATTERN.find(sentence) {
         return cap.as_str().to_string();
     }
 
@@ -2889,6 +2903,81 @@ fn parse_ago_unit(expr: &str) -> Option<(i64, AgoUnit)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conv_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+    }
+
+    /// The precompiled date patterns resolve the same shapes, in the same priority
+    /// order, as the per-call regexes they replaced.
+    #[test]
+    fn explicit_date_patterns_resolve_each_shape() {
+        let conv = conv_date(2024, 1, 15);
+        let exact = |s: &str| match extract_explicit_date_from_sentence(s, conv) {
+            Some((ResolvedTime::ExactDate(d), matched)) => Some((d.to_string(), matched)),
+            _ => None,
+        };
+
+        assert_eq!(
+            exact("we met on 2023-05-08 downtown"),
+            Some(("2023-05-08".into(), "2023-05-08".into()))
+        );
+        assert_eq!(
+            exact("It was May 8, 2023 when we met"),
+            Some(("2023-05-08".into(), "may 8, 2023".into()))
+        );
+        assert_eq!(
+            exact("on 8 June 2022 we left"),
+            Some(("2022-06-08".into(), "8 june 2022".into()))
+        );
+        // No year: anchored to the conversation year.
+        assert_eq!(
+            exact("see you on 3 mar"),
+            Some(("2024-03-03".into(), "3 mar".into()))
+        );
+        assert_eq!(
+            exact("the sept 9 meeting"),
+            Some(("2024-09-09".into(), "sept 9".into()))
+        );
+
+        match extract_explicit_date_from_sentence("back in June 2021 it began", conv) {
+            Some((ResolvedTime::MonthYear { month, year }, matched)) => {
+                assert_eq!((month, year, matched.as_str()), (6, 2021, "june 2021"));
+            }
+            other => panic!("expected MonthYear, got {other:?}"),
+        }
+
+        // Word boundaries hold: "mayor" is not "may", and no date means None.
+        assert!(extract_explicit_date_from_sentence("the mayor 12 spoke", conv).is_none());
+        assert!(extract_explicit_date_from_sentence("nothing temporal here", conv).is_none());
+        // An out-of-range year rejects that shape only; the year-less "May 8" shape still
+        // matches and anchors to the conversation year.
+        assert_eq!(
+            exact("May 8, 1850"),
+            Some(("2024-05-08".into(), "may 8".into()))
+        );
+    }
+
+    #[test]
+    fn in_n_units_pattern_serves_parser_and_extractor() {
+        match parse_in_n_units("we ship in two weeks") {
+            Some((n, InNUnit::DaysOrWeeks(days))) => assert_eq!((n, days), (2, 14)),
+            _ => panic!("expected a day/week offset"),
+        }
+        assert!(matches!(
+            parse_in_n_units("due In 3 Months"),
+            Some((3, InNUnit::Months))
+        ));
+        assert!(parse_in_n_units("in the morning").is_none());
+        assert_eq!(
+            extract_time_expression("the launch is in an hour or in 5 days"),
+            "in 5 days"
+        );
+    }
 
     /// Run a store test on every backend.
     ///

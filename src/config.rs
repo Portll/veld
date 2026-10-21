@@ -354,8 +354,11 @@ pub fn load_config_file_into_env() {
     names.sort();
     let _ = VELD_ENV_NAMES_AT_START.set(names);
 
-    let path = config_file_path();
-    let raw = match std::fs::read_to_string(&path) {
+    load_config_path_into_env(&config_file_path());
+}
+
+fn load_config_path_into_env(path: &std::path::Path) {
+    let raw = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(err) => {
@@ -387,6 +390,8 @@ pub fn load_config_file_into_env() {
         ("storage", "VELD_MEMORY_PATH"),
         ("storage_backend", "VELD_STORAGE_BACKEND"),
         ("mcp", "VELD_MCP_ENABLED"),
+        ("auto_compress", "VELD_AUTO_COMPRESS"),
+        ("graph_mirror_sync_secs", "VELD_GRAPH_MIRROR_SYNC_SECS"),
     ];
 
     let mut applied: Vec<&str> = Vec::new();
@@ -746,6 +751,15 @@ pub struct ServerConfig {
     /// Weekly/monthly/yearly rhythms by default; override via VELD_LOG_PERIODIC_SCALES
     /// env var (comma-separated, e.g. "14.0,60.0,365.0" for biweekly/bimonthly/yearly)
     pub log_periodic_scales: Vec<f64>,
+
+    /// Whether the maintenance cycle compresses old memories (default: true).
+    /// Env `VELD_AUTO_COMPRESS`, config.toml key `auto_compress`.
+    pub auto_compress: bool,
+
+    /// Seconds a rebuilt graph mirror (SQLite) is served before a gap request
+    /// rebuilds it again (default: 600, minimum: 30).
+    /// Env `VELD_GRAPH_MIRROR_SYNC_SECS`, config.toml key `graph_mirror_sync_secs`.
+    pub graph_mirror_sync_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -780,11 +794,18 @@ impl Default for ServerConfig {
             backup_enabled: false,         // Disabled by default, auto-enabled in production
             max_entities_per_memory: 10,   // Cap entities per memory (10 → max 45 edges)
             log_periodic_scales: vec![7.0, 30.0, 365.0], // Weekly, monthly, yearly resonance
+            auto_compress: true,
+            graph_mirror_sync_secs: crate::memory::slow_store::MIRROR_SYNC_TTL.as_secs(),
         }
     }
 }
 
 impl ServerConfig {
+    /// The graph-mirror TTL as a `Duration`, for `SlowStore::begin_sync`.
+    pub fn graph_mirror_sync_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.graph_mirror_sync_secs)
+    }
+
     /// Load configuration from environment variables with defaults
     #[allow(clippy::field_reassign_with_default)] // Environment overrides require mutable config
     pub fn from_env() -> Self {
@@ -960,6 +981,39 @@ impl ServerConfig {
                         n
                     );
                 }
+            }
+        }
+
+        if let Ok(val) = env::var("VELD_AUTO_COMPRESS") {
+            match val.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => config.auto_compress = true,
+                "false" | "0" => config.auto_compress = false,
+                _ => tracing::warn!(
+                    "VELD_AUTO_COMPRESS={} is not a boolean, using default {}",
+                    val,
+                    config.auto_compress
+                ),
+            }
+        }
+
+        if let Ok(val) = env::var("VELD_GRAPH_MIRROR_SYNC_SECS") {
+            let min = crate::memory::slow_store::MIRROR_SYNC_TTL_MIN.as_secs();
+            match val.trim().parse::<u64>() {
+                Ok(n) => {
+                    config.graph_mirror_sync_secs = n.max(min);
+                    if n < min {
+                        tracing::warn!(
+                            "VELD_GRAPH_MIRROR_SYNC_SECS={} is below minimum, clamped to {}",
+                            n,
+                            min
+                        );
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    "VELD_GRAPH_MIRROR_SYNC_SECS={} is not a number, using default {}",
+                    val,
+                    config.graph_mirror_sync_secs
+                ),
             }
         }
 
@@ -1150,6 +1204,8 @@ pub fn print_env_help() {
     println!("  VELD_SLOW_STORE_ENCRYPT_GRAPH / _EMBEDDINGS - Also encrypt the slow-store graph content / embeddings (default off; payload on)");
     println!("  VELD_ALLOW_KEYSTORE_ROLLBACK - Accept a restored older keystore.json once, resetting the rollback sentinel (default off)");
     println!("  VELD_MAX_USERS        - Max users in memory LRU (default: 1000)");
+    println!("  VELD_AUTO_COMPRESS    - Compress old memories during maintenance (default: true)");
+    println!("  VELD_GRAPH_MIRROR_SYNC_SECS - Seconds a rebuilt graph mirror is served before the next rebuild (default: 600, min: 30)");
     println!("  VELD_RATE_LIMIT       - Requests per second (default: 0 on localhost/dev, otherwise 4000)");
     println!("  VELD_RATE_BURST       - Burst size (default: 8000)");
     println!("  VELD_MAX_CONCURRENT   - Max concurrent requests (default: 200)");
@@ -1392,6 +1448,76 @@ mod tests {
         env::remove_var("VELD_PORT");
         env::remove_var("VELD_MAX_USERS");
         env::remove_var("VELD_STORAGE_BACKEND");
+    }
+
+    #[test]
+    fn test_auto_compress_and_mirror_ttl_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("VELD_AUTO_COMPRESS");
+        env::remove_var("VELD_GRAPH_MIRROR_SYNC_SECS");
+
+        let config = ServerConfig::from_env();
+        assert!(config.auto_compress);
+        assert_eq!(config.graph_mirror_sync_secs, 600);
+        assert_eq!(
+            config.graph_mirror_sync_ttl(),
+            std::time::Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn test_auto_compress_env_parsing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for (raw, expected) in [("false", false), ("0", false), ("TRUE", true), ("1", true)] {
+            env::set_var("VELD_AUTO_COMPRESS", raw);
+            assert_eq!(ServerConfig::from_env().auto_compress, expected, "{raw}");
+        }
+        env::set_var("VELD_AUTO_COMPRESS", "maybe");
+        assert!(ServerConfig::from_env().auto_compress);
+        env::remove_var("VELD_AUTO_COMPRESS");
+    }
+
+    #[test]
+    fn test_graph_mirror_sync_secs_env_parsing_and_clamp() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("VELD_GRAPH_MIRROR_SYNC_SECS", "1200");
+        assert_eq!(ServerConfig::from_env().graph_mirror_sync_secs, 1200);
+        env::set_var("VELD_GRAPH_MIRROR_SYNC_SECS", "5");
+        assert_eq!(ServerConfig::from_env().graph_mirror_sync_secs, 30);
+        env::set_var("VELD_GRAPH_MIRROR_SYNC_SECS", "0");
+        assert_eq!(ServerConfig::from_env().graph_mirror_sync_secs, 30);
+        env::set_var("VELD_GRAPH_MIRROR_SYNC_SECS", "-3");
+        assert_eq!(ServerConfig::from_env().graph_mirror_sync_secs, 600);
+        env::set_var("VELD_GRAPH_MIRROR_SYNC_SECS", "soon");
+        assert_eq!(ServerConfig::from_env().graph_mirror_sync_secs, 600);
+        env::remove_var("VELD_GRAPH_MIRROR_SYNC_SECS");
+    }
+
+    #[test]
+    fn test_config_file_bridges_new_keys() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(
+            &file,
+            "auto_compress = false\ngraph_mirror_sync_secs = 900\n",
+        )
+        .unwrap();
+        env::remove_var("VELD_AUTO_COMPRESS");
+        env::remove_var("VELD_GRAPH_MIRROR_SYNC_SECS");
+
+        load_config_path_into_env(&file);
+        let config = ServerConfig::from_env();
+        assert!(!config.auto_compress);
+        assert_eq!(config.graph_mirror_sync_secs, 900);
+
+        // An explicit environment variable outranks the file.
+        env::set_var("VELD_GRAPH_MIRROR_SYNC_SECS", "45");
+        load_config_path_into_env(&file);
+        assert_eq!(ServerConfig::from_env().graph_mirror_sync_secs, 45);
+
+        env::remove_var("VELD_AUTO_COMPRESS");
+        env::remove_var("VELD_GRAPH_MIRROR_SYNC_SECS");
     }
 
     #[test]
