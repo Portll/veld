@@ -108,7 +108,8 @@ pub async fn consolidate_memories(
 
     // Validate user exists before spawning background work
     let _ = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
@@ -140,7 +141,7 @@ pub async fn consolidate_memories(
             }
         };
 
-        let memory = match state_clone.get_user_memory(&user_id) {
+        let memory = match state_clone.get_user_memory_async(&user_id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!(user_id = %user_id, "Consolidation: failed to get memory: {e}");
@@ -531,7 +532,8 @@ pub async fn sleep_phase_consolidation(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let _ = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
@@ -560,7 +562,7 @@ pub async fn sleep_phase_consolidation(
             }
         };
 
-        let memory = match state_clone.get_user_memory(&user_id) {
+        let memory = match state_clone.get_user_memory_async(&user_id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!(user_id = %user_id, "Sleep-phase: failed to get memory: {e}");
@@ -852,7 +854,8 @@ pub async fn verify_index_integrity(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -871,7 +874,8 @@ pub async fn repair_vector_index(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -897,7 +901,8 @@ pub async fn cleanup_corrupted(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -936,7 +941,8 @@ pub async fn migrate_legacy(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -978,7 +984,8 @@ pub async fn rebuild_index(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1004,7 +1011,8 @@ pub async fn reembed_all(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1211,7 +1219,8 @@ pub async fn get_consolidation_report(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let now = chrono::Utc::now();
@@ -1267,7 +1276,8 @@ pub async fn get_consolidation_events(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let now = chrono::Utc::now();
@@ -1312,7 +1322,8 @@ pub async fn get_embedding_backlog(
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
     let report = tokio::task::spawn_blocking(move || memory.read().embedding_backlog_report())
         .await
@@ -1343,7 +1354,8 @@ pub async fn drain_embedding_backlog(
         });
     }
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
     let reconcile = req.reconcile;
     let (reconciled, drained) = tokio::task::spawn_blocking(move || {

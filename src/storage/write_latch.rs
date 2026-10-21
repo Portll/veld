@@ -12,6 +12,10 @@
 //! Measured 2026-10-11: 11,088 consecutive `No space left on device` write
 //! failures against a 221 MB store on a volume with 253 GiB free, cleared only
 //! by a restart, while `/health` reported `healthy` throughout.
+//!
+//! redb stores report into the same latch through [`latch_until_reopened`]: a
+//! redb handle refuses every write after its first I/O error, so there is no
+//! retry to attempt there (see `storage::redb_latch`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -67,7 +71,6 @@ pub fn cooldown() -> Duration {
     ))
 }
 
-#[cfg(feature = "rocksdb")]
 fn restart_on_hard_latch() -> bool {
     matches!(
         std::env::var("VELD_WRITE_LATCH_RESTART").as_deref(),
@@ -210,7 +213,7 @@ impl WriteLatch {
                 tracing::warn!(
                     path = %path.display(),
                     reason = %reason,
-                    "storage writes latched: RocksDB reported no space left on device"
+                    "storage writes latched: the store reported no space left on device"
                 );
             }
         }
@@ -360,6 +363,27 @@ impl WriteLatch {
 pub fn global() -> &'static WriteLatch {
     static GLOBAL: OnceLock<WriteLatch> = OnceLock::new();
     GLOBAL.get_or_init(WriteLatch::new)
+}
+
+/// Tests that latch stores in [`global`] share the process with tests that assert
+/// the readiness it drives, and a hard latch standing in one fails the other. A
+/// test that latches holds [`test_serial::latching`] for as long as its latch
+/// stands; a test that needs none standing holds [`test_serial::quiet`].
+#[cfg(test)]
+pub(crate) mod test_serial {
+    use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    static GLOBAL_LATCH: RwLock<()> = RwLock::const_new(());
+
+    /// For a synchronous test: it blocks, so it panics inside an async runtime.
+    pub(crate) fn latching() -> RwLockReadGuard<'static, ()> {
+        GLOBAL_LATCH.blocking_read()
+    }
+
+    /// Async, because the readiness tests that need it hold it across awaits.
+    pub(crate) async fn quiet() -> RwLockWriteGuard<'static, ()> {
+        GLOBAL_LATCH.write().await
+    }
 }
 
 /// ENOSPC is the one subcode RocksDB's error handler refuses to auto-recover
@@ -560,7 +584,12 @@ pub fn recover_write<T>(
 
     if let Err(flush_err) = db.flush() {
         latch.mark_hard(path);
-        report_hard(latch, path, &format!("flush failed: {flush_err}"));
+        report_hard(
+            latch,
+            path,
+            &format!("flush failed: {flush_err}"),
+            ROCKSDB_CANNOT_RESUME,
+        );
         if space_back == Some(true) {
             maybe_restart(path);
         }
@@ -578,7 +607,12 @@ pub fn recover_write<T>(
         }
         Err(retry_err) => {
             latch.mark_hard(path);
-            report_hard(latch, path, &format!("{retry_err:#}"));
+            report_hard(
+                latch,
+                path,
+                &format!("{retry_err:#}"),
+                ROCKSDB_CANNOT_RESUME,
+            );
             if space_back == Some(true) {
                 maybe_restart(path);
             }
@@ -587,8 +621,41 @@ pub fn recover_write<T>(
     }
 }
 
+/// Record a NoSpace failure against a store whose engine refuses every later
+/// write on the same handle until the database is reopened, which is what redb
+/// does after any I/O error. A flush+retry cannot help there, so the latch is
+/// hard at once. `why` is the engine's reason a restart is needed, for the one
+/// ERROR line.
+///
+/// Probes free space on its cooldown, as `recover_write` does for a hard
+/// latch: with `VELD_WRITE_LATCH_RESTART=1` and space back the process exits
+/// for a supervised restart, and the restart is the reopen. Returns whether
+/// `err` was NoSpace, as [`WriteLatch::note_write_error`] does.
+pub fn latch_until_reopened(
+    latch: &WriteLatch,
+    path: &Path,
+    err: &anyhow::Error,
+    why: &str,
+) -> bool {
+    if !latch.note_write_error(path, err) {
+        return false;
+    }
+    latch.mark_hard(path);
+    report_hard(latch, path, &format!("{err:#}"), why);
+    if latch.probe_due(path) && available_bytes(path).is_some_and(|free| free >= min_free_bytes()) {
+        maybe_restart(path);
+    }
+    true
+}
+
+/// Why a hard RocksDB latch needs a restart.
 #[cfg(feature = "rocksdb")]
-fn report_hard(latch: &WriteLatch, path: &Path, detail: &str) {
+const ROCKSDB_CANNOT_RESUME: &str =
+    "RocksDB cannot clear a NoSpace background error in-process: its auto-resume \
+     path excludes that subcode (error_handler.cc:446) and the only alternative \
+     needs an SstFileManager the C API has no setter for (error_handler.cc:541)";
+
+fn report_hard(latch: &WriteLatch, path: &Path, detail: &str, why: &str) {
     // `reason_at` before `claim_hard_notice`: the notice is claimable once, and
     // a clear racing in between would leave the one ERROR line without a cause.
     let latched_by = latch.reason_at(path).unwrap_or_default();
@@ -604,15 +671,11 @@ fn report_hard(latch: &WriteLatch, path: &Path, detail: &str) {
         latched_by = %latched_by,
         detail = %detail,
         exit_code_on_restart = EXIT_WRITE_LATCHED,
-        "storage writes are hard-latched — restart this process to recover. \
-         RocksDB cannot clear a NoSpace background error in-process: its auto-resume \
-         path excludes that subcode (error_handler.cc:446) and the only alternative \
-         needs an SstFileManager the C API has no setter for (error_handler.cc:541)"
+        "storage writes are hard-latched — restart this process to recover. {why}"
     );
 }
 
 /// Opt-in, default off: exiting is a behaviour change an operator chooses.
-#[cfg(feature = "rocksdb")]
 fn maybe_restart(path: &Path) {
     if !restart_on_hard_latch() {
         return;
@@ -844,6 +907,39 @@ mod tests {
         assert!(latch.claim_hard_notice(&store_path()));
     }
 
+    /// What redb's commit returns when the disk refuses a page write.
+    const REDB_NO_SPACE: &str = "I/O error: No space left on device (os error 28)";
+
+    #[test]
+    fn latch_until_reopened_is_hard_at_once_and_counts_each_refusal() {
+        let latch = WriteLatch::new();
+        let err = anyhow!("{REDB_NO_SPACE}");
+
+        assert!(latch_until_reopened(&latch, &store_path(), &err, "test"));
+        let first = latch.snapshot_at(&store_path()).expect("latched");
+        assert!(first.hard, "nothing in-process can clear it, so it is hard");
+        assert_eq!(first.recovery_attempts, 0, "there is no retry to spend");
+        assert_eq!(first.failed_writes, 1);
+        assert!(
+            !latch.claim_hard_notice(&store_path()),
+            "the hard notice was logged by the latch itself"
+        );
+
+        assert!(latch_until_reopened(&latch, &store_path(), &err, "test"));
+        let later = latch.snapshot_at(&store_path()).expect("still latched");
+        assert!(later.hard);
+        assert_eq!(later.failed_writes, 2);
+        assert_eq!(later.since, first.since);
+    }
+
+    #[test]
+    fn latch_until_reopened_passes_over_a_non_enospc_error() {
+        let latch = WriteLatch::new();
+        let err = anyhow!("I/O error: Input/output error (os error 5)");
+        assert!(!latch_until_reopened(&latch, &store_path(), &err, "test"));
+        assert!(!latch.is_latched());
+    }
+
     /// Asserted against the defaults rather than an env override: the env is
     /// process-global and these tests run in parallel with everything else.
     #[test]
@@ -1041,6 +1137,7 @@ mod tests {
         let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(rows, b"k", b"v");
 
+        let _latching = test_serial::latching();
         injected::arm_times(db.path(), 1);
         let outcome = guard_batch(&db, &batch, &rocksdb::WriteOptions::default());
         injected::disarm(db.path());

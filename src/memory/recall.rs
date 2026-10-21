@@ -301,10 +301,37 @@ impl super::MemorySystem {
 
     /// Recall memories by tags (fast, no embedding required)
     ///
-    /// Returns memories that have ANY of the specified tags.
+    /// Returns memories that have ANY of the specified tags, newest first.
     pub fn recall_by_tags(&self, tags: &[String], limit: usize) -> Result<Vec<Memory>> {
+        self.recall_by_tags_matching(tags, limit, false)
+    }
+
+    /// As [`Self::recall_by_tags`], but a memory matches only through a tag its writer chose
+    /// (caller, intent or declared, per the tag-source ledger), never through one veld derived
+    /// from its content. A memory with no ledger row predates the ledger and still matches: its
+    /// sources are unknown, not derived.
+    pub fn recall_by_authored_tags(&self, tags: &[String], limit: usize) -> Result<Vec<Memory>> {
+        self.recall_by_tags_matching(tags, limit, true)
+    }
+
+    fn recall_by_tags_matching(
+        &self,
+        tags: &[String],
+        limit: usize,
+        authored_only: bool,
+    ) -> Result<Vec<Memory>> {
         let criteria = storage::SearchCriteria::ByTags(tags.to_vec());
         let mut memories = self.advanced_search(criteria)?;
+        if authored_only {
+            memories.retain(|memory| self.matches_an_authored_tag(memory, tags));
+        }
+        // A broad tag matches far more than `limit`; truncating in id order returned the same
+        // arbitrary lowest-UUID slice on every call, never the recent memories a caller wants.
+        memories.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         memories.truncate(limit);
         if !super::recall_readonly() {
             if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
@@ -312,6 +339,26 @@ impl super::MemorySystem {
             }
         }
         Ok(memories)
+    }
+
+    fn matches_an_authored_tag(&self, memory: &Memory, tags: &[String]) -> bool {
+        match self.tag_source_store.get(&memory.id) {
+            Ok(Some(sources)) => sources.tags.iter().any(|sourced| {
+                sourced.source.is_authored()
+                    && tags
+                        .iter()
+                        .any(|tag| tag.eq_ignore_ascii_case(&sourced.tag))
+            }),
+            Ok(None) => true,
+            Err(error) => {
+                tracing::warn!(
+                    memory_id = %memory.id.0,
+                    %error,
+                    "tag-source ledger unreadable; matching the memory on any tag"
+                );
+                true
+            }
+        }
     }
 
     /// Recall memories within a date range

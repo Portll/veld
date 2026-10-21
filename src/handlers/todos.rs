@@ -572,7 +572,10 @@ async fn verify_memory_ids(
         return Ok(parsed);
     }
 
-    let memory_system = state.get_user_memory(user_id).map_err(AppError::Internal)?;
+    let memory_system = state
+        .get_user_memory_async(user_id)
+        .await
+        .map_err(AppError::Internal)?;
     let to_check = parsed.clone();
     let missing = tokio::task::spawn_blocking(move || {
         let guard = memory_system.read();
@@ -628,7 +631,10 @@ async fn sync_memory_back_links(
     if add.is_empty() && remove.is_empty() {
         return Ok(());
     }
-    let memory_system = state.get_user_memory(user_id).map_err(AppError::Internal)?;
+    let memory_system = state
+        .get_user_memory_async(user_id)
+        .await
+        .map_err(AppError::Internal)?;
     let todo_id = *todo_id;
     tokio::task::spawn_blocking(move || {
         let guard = memory_system.read();
@@ -731,7 +737,7 @@ pub async fn create_reminder(
 
     // Cache embedding at creation time for context triggers (avoids recomputation on every check)
     if matches!(task.trigger, ProspectiveTrigger::OnContext { .. }) {
-        if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory_system) = state.get_user_memory_async(&req.user_id).await {
             let content_for_embed = task.content.clone();
             let memory_clone = memory_system.clone();
             if let Ok(Ok(embedding)) = tokio::task::spawn_blocking(move || {
@@ -938,7 +944,8 @@ pub async fn check_context_reminders(
     }
 
     let memory_system = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let context_for_embed = req.context.clone();
@@ -1224,7 +1231,7 @@ pub async fn create_todo(
         todo.tags.join(" ")
     );
 
-    if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+    if let Ok(memory_system) = state.get_user_memory_async(&req.user_id).await {
         let memory_clone = memory_system.clone();
         let embedding_text_clone = embedding_text.clone();
 
@@ -1289,7 +1296,7 @@ pub async fn create_todo(
         ..Default::default()
     };
 
-    if let Ok(memory) = state.get_user_memory(&req.user_id) {
+    if let Ok(memory) = state.get_user_memory_async(&req.user_id).await {
         let memory_clone = memory.clone();
         let exp_clone = experience.clone();
         let state_clone = state.clone();
@@ -1393,7 +1400,7 @@ pub async fn list_todos(
             // Semantic and lexical: an exact word match surfaces even when the embedder is
             // down or the todo predates embeddings.
             let query_embedding: Option<Vec<f32>> =
-                if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+                if let Ok(memory_system) = state.get_user_memory_async(&req.user_id).await {
                     let query_clone = query.clone();
                     tokio::task::spawn_blocking(move || {
                         let memory_guard = memory_system.read();
@@ -1761,7 +1768,7 @@ async fn update_todo_core(
             todo.tags.join(" ")
         );
 
-        if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory_system) = state.get_user_memory_async(&req.user_id).await {
             let memory_clone = memory_system.clone();
             let embedding_text_clone = embedding_text.clone();
 
@@ -1874,7 +1881,7 @@ async fn update_todo_core(
             ..Default::default()
         };
 
-        if let Ok(memory) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory) = state.get_user_memory_async(&req.user_id).await {
             let memory_clone = memory.clone();
             let exp_clone = experience.clone();
             let state_clone = state.clone();
@@ -2018,7 +2025,7 @@ async fn complete_todo_core(
             ..Default::default()
         };
 
-        if let Ok(memory) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory) = state.get_user_memory_async(&req.user_id).await {
             let memory_clone = memory.clone();
             let exp_clone = experience.clone();
             let state_clone = state.clone();
@@ -2646,7 +2653,7 @@ pub async fn add_todo_comment(
         ..Default::default()
     };
 
-    if let Ok(memory) = state.get_user_memory(&req.user_id) {
+    if let Ok(memory) = state.get_user_memory_async(&req.user_id).await {
         let memory_clone = memory.clone();
         let exp_clone = experience.clone();
         let memory_result = tokio::task::spawn_blocking(move || {
