@@ -137,10 +137,8 @@ pub fn rewrite_env_var(text: &str, key: &str, value: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
-        let names_key = !line.starts_with('#')
-            && line
-                .split_once('=')
-                .is_some_and(|(k, _)| k.trim() == key);
+        let names_key =
+            !line.starts_with('#') && line.split_once('=').is_some_and(|(k, _)| k.trim() == key);
         if names_key {
             if !replaced {
                 lines.push(format!("{key}={value}"));
@@ -201,7 +199,11 @@ fn capture_env(pid: u32) -> Option<Vec<(String, String)>> {
     Some(
         raw.split(|b| *b == 0)
             .filter_map(|entry| String::from_utf8(entry.to_vec()).ok())
-            .filter_map(|entry| entry.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .filter_map(|entry| {
+                entry
+                    .split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .filter(|(k, _)| carried(k))
             .collect(),
     )
@@ -782,7 +784,12 @@ mod tests {
         let exe = "/Applications/Veld Desktop.app/Contents/MacOS/veld";
         assert_eq!(
             split_cmdline(&format!("{exe} server --port 3031"), Some(exe)).unwrap(),
-            vec![exe.to_string(), "server".into(), "--port".into(), "3031".into()]
+            vec![
+                exe.to_string(),
+                "server".into(),
+                "--port".into(),
+                "3031".into()
+            ]
         );
         assert_eq!(
             split_cmdline("veld server", Some("/other/path")).unwrap(),
@@ -817,7 +824,10 @@ mod tests {
     fn rewrite_keeps_every_other_line() {
         let text = "# live store\nVELD_STORAGE_BACKEND=rocksdb\nVELD_EMBEDDER=http\n";
         let out = rewrite_env_var(text, "VELD_STORAGE_BACKEND", "redb");
-        assert_eq!(out, "# live store\nVELD_STORAGE_BACKEND=redb\nVELD_EMBEDDER=http\n");
+        assert_eq!(
+            out,
+            "# live store\nVELD_STORAGE_BACKEND=redb\nVELD_EMBEDDER=http\n"
+        );
         let appended = rewrite_env_var("VELD_EMBEDDER=http", "VELD_STORAGE_BACKEND", "redb");
         assert_eq!(appended, "VELD_EMBEDDER=http\nVELD_STORAGE_BACKEND=redb\n");
         let deduped = rewrite_env_var("A=1\nA=2\n", "A", "3");
@@ -929,18 +939,31 @@ mod tests {
             .expect("the scratch server is in the registry");
         let old_pid = inst.pid;
         let spec = inspect_process(old_pid).expect("inspect the scratch server");
-        eprintln!("inspected: {} {:?} cwd={:?} env={:?}", spec.exe, spec.args, spec.cwd, spec.env.keys().collect::<Vec<_>>());
+        eprintln!(
+            "inspected: {} {:?} cwd={:?} env={:?}",
+            spec.exe,
+            spec.args,
+            spec.cwd,
+            spec.env.keys().collect::<Vec<_>>()
+        );
         assert!(spec.exe.ends_with("veld"));
         assert_eq!(spec.args, vec!["server".to_string()]);
         assert!(spec.env.contains_key("VELD_PORT"));
 
         let home = std::env::var("HOME").unwrap_or_default();
-        let env_file = PathBuf::from(home).join(".config").join("veld").join("server.env");
+        let env_file = PathBuf::from(home)
+            .join(".config")
+            .join("veld")
+            .join("server.env");
         let out = restart_instance(RestartRequest {
             base_url: key.clone(),
             instance: Some(inst),
             recipe: None,
-            env_files: if env_file.is_file() { vec![env_file] } else { vec![] },
+            env_files: if env_file.is_file() {
+                vec![env_file]
+            } else {
+                vec![]
+            },
             env_overrides: vec![],
             env_remove: vec![],
             log_path: std::env::temp_dir().join("veld-restart-e2e.log"),
@@ -955,7 +978,10 @@ mod tests {
         // Nothing the old process was actually started with may be dropped. Names the
         // server set on itself after exec can show up here from older registry entries.
         for name in &out.missing_env {
-            assert!(!spec.env.contains_key(name), "{name} was in the old environment but not carried");
+            assert!(
+                !spec.env.contains_key(name),
+                "{name} was in the old environment but not carried"
+            );
         }
         assert!(out.carried_env.iter().any(|k| k == "VELD_PORT"));
         let back = discover_instances()
@@ -984,7 +1010,11 @@ mod tests {
         let exe = std::env::current_exe().expect("test binary path");
         let dir = std::env::temp_dir();
         let mut child = Command::new(&exe)
-            .args(["restart::tests::child_waits_for_capture", "--exact", "--ignored"])
+            .args([
+                "restart::tests::child_waits_for_capture",
+                "--exact",
+                "--ignored",
+            ])
             .current_dir(&dir)
             .env("VELD_RESTART_TEST_CHILD", "1")
             .env("VELD_RESTART_TEST_VAR", "two words")
@@ -999,7 +1029,10 @@ mod tests {
         let spec = spec.expect("read the child's command line and environment");
         assert_eq!(spec.exe, exe.to_string_lossy());
         assert_eq!(spec.args[0], "restart::tests::child_waits_for_capture");
-        assert_eq!(spec.env.get("VELD_RESTART_TEST_VAR").map(String::as_str), Some("two words"));
+        assert_eq!(
+            spec.env.get("VELD_RESTART_TEST_VAR").map(String::as_str),
+            Some("two words")
+        );
         assert!(spec.env.keys().all(|k| carried(k)));
         let cwd = spec.cwd.expect("cwd is readable");
         let canonical = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));

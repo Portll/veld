@@ -812,8 +812,12 @@ pub async fn sleep_phase_consolidation(
             .await;
             match gap_step {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(user_id = %user_id, "Sleep-phase gap analysis failed: {e}"),
-                Err(e) => tracing::warn!(user_id = %user_id, "Sleep-phase gap analysis task panicked: {e}"),
+                Ok(Err(e)) => {
+                    tracing::warn!(user_id = %user_id, "Sleep-phase gap analysis failed: {e}")
+                }
+                Err(e) => {
+                    tracing::warn!(user_id = %user_id, "Sleep-phase gap analysis task panicked: {e}")
+                }
             }
         }
 

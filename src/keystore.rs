@@ -2511,7 +2511,11 @@ mod tests {
 
         let before = derivations();
         let (_, created) = open_store_keystore(&path, &pass_creds("pw")).unwrap();
-        assert_eq!(derivations() - before, 2, "create derives once, unseal once");
+        assert_eq!(
+            derivations() - before,
+            2,
+            "create derives once, unseal once"
+        );
 
         let before = derivations();
         let (ks, cached) = open_store_keystore(&path, &pass_creds("pw")).unwrap();
@@ -2644,7 +2648,11 @@ mod tests {
 
         const OPENERS: usize = 8;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tenant").join("storage").join("keystore.json");
+        let path = dir
+            .path()
+            .join("tenant")
+            .join("storage")
+            .join("keystore.json");
         let barrier = Arc::new(Barrier::new(OPENERS));
 
         let openers: Vec<_> = (0..OPENERS)

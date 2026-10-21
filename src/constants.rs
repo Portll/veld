@@ -2713,7 +2713,8 @@ pub const MMR_REDUNDANCY_THRESHOLD: f32 = 0.5;
 /// wins. The previous model was a 14-day window that cut everything older to 0.3-0.5x,
 /// which on LOCOMO-20 put two of the three decisions a "recently" query asked for at ranks
 /// 9 and 10 behind unrelated memories from the last three days.
-pub const RECENTLY_STEPS: &[(i64, f32)] = &[(7, 1.0), (30, 0.95), (90, 0.85), (180, 0.75), (365, 0.65)];
+pub const RECENTLY_STEPS: &[(i64, f32)] =
+    &[(7, 1.0), (30, 0.95), (90, 0.85), (180, 0.75), (365, 0.65)];
 
 /// Factor for memories older than the last [`RECENTLY_STEPS`] bound.
 pub const RECENTLY_FLOOR_MULTIPLIER: f32 = 0.5;
