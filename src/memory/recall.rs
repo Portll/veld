@@ -3516,13 +3516,13 @@ impl super::MemorySystem {
             query_analysis
                 .focal_entities
                 .iter()
-                .filter(|e| !e.negated)
+                .filter(|e| !e.negated && !query_parser::is_question_frame_word(&e.text))
                 .map(|e| (e.stem.clone(), e.ic_weight))
                 .chain(
                     query_analysis
                         .discriminative_modifiers
                         .iter()
-                        .filter(|m| !m.negated)
+                        .filter(|m| !m.negated && !query_parser::is_question_frame_word(&m.text))
                         .map(|m| (m.stem.clone(), m.ic_weight)),
                 )
                 .filter(|(stem, w)| !stem.is_empty() && *w > 0.0 && seen.insert(stem.clone()))
