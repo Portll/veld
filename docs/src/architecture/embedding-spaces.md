@@ -77,15 +77,37 @@ space a query can reach has its own index under `space_indexes/<slug>-<hash>/`:
 
 | File | Holds |
 |---|---|
-| `vamana.idx` | The Vamana graph and vectors |
+| `pq.idx` | The product-quantized codes and codebooks (codec `pq`, the default) |
+| `vamana.idx` | The Vamana graph and full vectors (codec `f32`) |
 | `mapping.bin` | Which memory each vector belongs to, saved with the index |
 | `space` | The space id the directory was built for |
-| `saved.clean` | Present only while the two files above agree; removed by the first change after a save |
+| `saved.clean` | Present only while the index file and the mapping agree; removed by the first change after a save |
 
 An index loads only when the marker is present, the space matches and every mapped vector is
 live. Otherwise it is rebuilt from every memory holding a vector in its space, in one pass over
 the store. Saving the mapping replaced the old secondary index's insertion-order mapping, which
 drifted whenever a vector was added after a save or soft-deleted.
+
+### Codecs
+
+A space other than the primary would otherwise hold its vectors twice: in full in every record,
+and in full again in its index. Its index's codec, `VELD_SPACE_CODEC`, says how it holds them:
+
+- **`pq`** (default): one byte per 8 dimensions, 48 bytes for a 384-dimensional vector instead
+  of 1536 (`src/vector_db/quantized.rs`). A search scores every live code against the query and
+  reranks the best two per result asked for by the cosine to the exact vector, read from the
+  memory's record. Every score a search returns is exact. Until a space holds 4096 vectors they
+  are kept exact and searched exactly, with no reads. At 4096 the quantizer is trained on them,
+  its subspaces in parallel, and from then the index holds codes. The heavy maintenance pass
+  retrains it from the records once the index has grown eightfold since training. A dimension
+  that 8, 4 or 2 does not divide stays exact.
+- **`f32`**: full vectors in a Vamana graph, as before step 11.
+
+The codec of every index is in the registry and `GET /api/spaces` (`codec`), and on
+`GET /api/health/index` under `spaces` with the bytes each index holds its vectors in. An index
+saved under the other codec is rebuilt from the records at the next start. Retiring or migrating
+a space touches only its own directory. The primary index keeps full vectors in its graph: it is
+the leg the rest of recall is ranked against.
 
 Today the indexed spaces are the primary embedder's and the secondary embedder's.
 `RetrievalEngine::search_space` searches any of them. Recall searches every space a query vector

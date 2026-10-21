@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use super::embedding_backlog::{BacklogKey, EmbeddingBacklogStore};
 use super::introspection::ConsolidationEventBuffer;
 pub(crate) use super::space_index::IdMapping;
-use super::space_index::{SpaceIndex, SpaceIndexHealth};
+use super::space_index::{ExactVectors, SpaceCodec, SpaceIndex, SpaceIndexHealth};
 use super::space_legs::{self, Leg, LegDepth, LegHits, LegIndex, LegKind};
 use super::space_migration::{MigrationKind, MigrationStep, SpaceMigration, SpaceMigrationStore};
 use super::storage::SearchCriteria;
@@ -93,6 +93,8 @@ pub struct RetrievalEngine {
     /// Lock order: 3 - One index per space other than the primary's, by space. Today the
     /// secondary embedder's space; any space a query can reach has one.
     space_indexes: RwLock<std::collections::BTreeMap<SpaceId, Arc<SpaceIndex>>>,
+    /// How every space index but the primary holds its vectors.
+    space_codec: SpaceCodec,
     /// The space every vector in `vector_index` is in.
     index_space: SpaceId,
     /// The space the secondary embedder writes, a key of `space_indexes` when configured. The
@@ -233,12 +235,13 @@ impl RetrievalEngine {
         let secondary_index_space = embedder
             .secondary_space()
             .filter(|space| *space != index_space);
+        let space_codec = SpaceCodec::from_env();
         let mut space_indexes = std::collections::BTreeMap::new();
         if let Some(space) = &secondary_index_space {
             space_indexes.insert(
                 space.clone(),
                 Arc::new(
-                    SpaceIndex::open(&storage_path, space.clone())
+                    SpaceIndex::open(&storage_path, space.clone(), space_codec)
                         .with_context(|| format!("Failed to initialize the {space} index"))?,
                 ),
             );
@@ -258,7 +261,7 @@ impl RetrievalEngine {
                 space_indexes.insert(
                     to.clone(),
                     Arc::new(
-                        SpaceIndex::open(&storage_path, to.clone())
+                        SpaceIndex::open(&storage_path, to.clone(), space_codec)
                             .with_context(|| format!("Failed to initialize the {to} index"))?,
                     ),
                 );
@@ -276,6 +279,7 @@ impl RetrievalEngine {
             vector_index: Arc::new(RwLock::new(vector_index)),
             id_mapping: Arc::new(RwLock::new(id_mapping)),
             space_indexes: RwLock::new(space_indexes),
+            space_codec,
             leg_depths: RwLock::new(std::collections::HashMap::new()),
             score_stats: RwLock::new(
                 space::SpaceRegistry::read(&storage_path)
@@ -1592,7 +1596,11 @@ impl RetrievalEngine {
             *from == self.index_space || self.secondary_index_space.as_ref() == Some(from);
         let reaches_new_space = writes_from && !self.spaces().contains(to);
         if reaches_new_space {
-            let index = Arc::new(SpaceIndex::open(&self.storage_path, to.clone())?);
+            let index = Arc::new(SpaceIndex::open(
+                &self.storage_path,
+                to.clone(),
+                self.space_codec,
+            )?);
             self.space_indexes.write().insert(to.clone(), index.clone());
             self.rebuild_space_indexes(vec![index])?;
         }
@@ -2062,9 +2070,12 @@ impl RetrievalEngine {
             self.search_by_embedding(query, limit, None)?
         } else {
             match self.space_index(space) {
-                Some(index) => {
-                    index.search(query, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2, limit)?
-                }
+                Some(index) => index.search(
+                    query,
+                    limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
+                    limit,
+                    &*self.exact_vectors(space.clone()),
+                )?,
                 None => Vec::new(),
             }
         };
@@ -2121,7 +2132,10 @@ impl RetrievalEngine {
                 legs.push(Leg {
                     space: space.clone(),
                     kind: LegKind::Direct,
-                    index: LegIndex::Space(index),
+                    index: LegIndex::Space {
+                        index,
+                        exact: self.exact_vectors(space.clone()),
+                    },
                     map: None,
                     query: query.clone(),
                     limit: limit_for(space),
@@ -2147,18 +2161,72 @@ impl RetrievalEngine {
             };
             legs.push(Leg {
                 limit: limit_for(&to),
+                index: LegIndex::Space {
+                    index,
+                    exact: self.exact_vectors(to.clone()),
+                },
                 space: to,
                 kind: LegKind::Bridged {
                     from,
                     confidence: bridge.confidence,
                 },
-                index: LegIndex::Space(index),
                 map: Some(bridge.alignment),
                 query: query.to_vec(),
                 fallback: false,
             });
         }
         legs
+    }
+
+    /// Reads a memory's exact vector in `space` from its record, as the space's index was built
+    /// from: what a quantized index reranks its candidates against.
+    fn exact_vectors(&self, space: SpaceId) -> ExactVectors {
+        let storage = Arc::clone(&self.storage);
+        let primary = self.index_space.clone();
+        let secondary = self.secondary_index_space.clone();
+        Arc::new(move |memory_id: &MemoryId| {
+            let memory = storage.get(memory_id).ok()?;
+            if memory.is_forgotten() {
+                return None;
+            }
+            memory
+                .experience
+                .vector_in(&space, Some(&primary), secondary.as_ref())
+                .cloned()
+        })
+    }
+
+    /// How each indexed space holds its vectors: the primary's in its graph, every other by the
+    /// configured codec.
+    pub fn index_codecs(&self) -> Vec<(SpaceId, &'static str)> {
+        std::iter::once((self.index_space.clone(), space::CODEC_F32))
+            .chain(
+                self.space_index_list()
+                    .iter()
+                    .map(|index| (index.space().clone(), index.codec().as_str())),
+            )
+            .collect()
+    }
+
+    /// Compact each space index whose deletions call for it, and rebuild from the records any
+    /// whose quantizer has fallen behind what it holds, or whose graph has taken too many
+    /// incremental inserts. For the heavy maintenance pass.
+    pub fn maintain_space_indexes(&self) -> Result<()> {
+        let mut to_rebuild = Vec::new();
+        for index in self.space_index_list() {
+            let health = index.health();
+            if health.needs_rebuild && index.codec() == SpaceCodec::Pq {
+                info!(
+                    space = %health.space,
+                    vectors = health.total_vectors,
+                    "Space index retrains its quantizer from the records"
+                );
+                to_rebuild.push(index);
+            } else if health.needs_compaction || health.needs_rebuild {
+                index.compact()?;
+            }
+        }
+        self.rebuild_space_indexes(to_rebuild)
     }
 
     /// The candidate factor `space`'s record supports.

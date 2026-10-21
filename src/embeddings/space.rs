@@ -160,6 +160,8 @@ pub const REGISTRY_VERSION: u32 = 1;
 
 /// How a space's vectors are held in its index.
 pub const CODEC_F32: &str = "f32";
+/// Product-quantized codes, searched flat and reranked against the stored vectors.
+pub const CODEC_PQ: &str = "pq";
 
 fn default_codec() -> String {
     CODEC_F32.to_string()
@@ -254,6 +256,10 @@ impl SpaceSummary {
     }
 
     fn add(&mut self, other: &Self) {
+        // The codec is an index's; a summary without one has only the default to say.
+        if other.memories > 0 {
+            self.codec = other.codec.clone();
+        }
         self.memories += other.memories;
         self.backlog += other.backlog;
         self.stranded += other.stranded;
@@ -344,6 +350,21 @@ pub fn merge_summaries(summaries: impl IntoIterator<Item = SpaceSummary>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_merged_summary_names_the_codec_of_the_indexes_holding_the_space() {
+        let space = SpaceId::new("minilm-l6-v2", 384);
+        let mut indexed = SpaceSummary::empty(space.clone());
+        indexed.codec = CODEC_PQ.to_string();
+        indexed.memories = 10;
+        let mut queued = SpaceSummary::empty(space);
+        queued.backlog = 3;
+        for order in [vec![indexed.clone(), queued.clone()], vec![queued, indexed]] {
+            let merged = merge_summaries(order);
+            assert_eq!(merged[0].codec, CODEC_PQ);
+            assert_eq!((merged[0].memories, merged[0].backlog), (10, 3));
+        }
+    }
 
     #[test]
     fn a_registry_round_trips_through_its_file() {

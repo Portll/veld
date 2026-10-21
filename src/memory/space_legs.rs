@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 
-use super::space_index::{IdMapping, SpaceIndex};
+use super::space_index::{ExactVectors, IdMapping, SpaceIndex};
 use super::types::MemoryId;
 use crate::constants::VECTOR_SEARCH_CANDIDATE_MULTIPLIER;
 use crate::embeddings::alignment::Alignment;
@@ -97,7 +97,11 @@ pub enum LegKind {
 }
 
 pub(crate) enum LegIndex {
-    Space(Arc<SpaceIndex>),
+    /// Another space's index, and where the exact vectors it reranks against are read.
+    Space {
+        index: Arc<SpaceIndex>,
+        exact: ExactVectors,
+    },
     Primary {
         index: Arc<RwLock<VamanaIndex>>,
         mapping: Arc<RwLock<IdMapping>>,
@@ -129,7 +133,9 @@ impl Leg {
         };
         let candidates = self.limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2;
         match &self.index {
-            LegIndex::Space(index) => index.search(query, candidates, self.limit),
+            LegIndex::Space { index, exact } => {
+                index.search(query, candidates, self.limit, &**exact)
+            }
             LegIndex::Primary { index, mapping } => {
                 search_primary(index, mapping, query, candidates, self.limit)
             }

@@ -14,7 +14,12 @@
 //!   recall the second space's search also overlaps graph traversal and BM25, which this row
 //!   leaves out, so it bounds the overlap from below.
 //! - **footprint**: bytes a space holds as full vectors and as product-quantized codes, and the
-//!   process RSS growth while its index is built.
+//!   process RSS growth while its index is built; per size, what two spaces (the second as
+//!   `pq`, the default codec since step 11) hold against one. Step 11 is done when that is
+//!   under 1.3x at 100 000 memories.
+//! - **quality**: recall@10 of each codec's search against exact search, the `pq` index's
+//!   candidates reranked against the exact vectors as the server does (here read from
+//!   memory, there from the records).
 //! - **write**: inline write cost through the retrieval engine, embedding included, with an
 //!   embedder that sleeps a configurable round trip per call and cost per text.
 //! - **drain**: texts per second per batch size against a real embedder host, when one is set.
@@ -52,7 +57,7 @@ use veld::embeddings::Embedder;
 use veld::memory::retrieval::RetrievalEngine;
 use veld::memory::types::{Experience, Memory, MemoryId};
 use veld::storage::PrimaryMemoryStore;
-use veld::vector_db::pq::{CompressedVectorStore, PQConfig};
+use veld::vector_db::quantized::QuantizedIndex;
 use veld::vector_db::vamana::{VamanaConfig, VamanaIndex};
 
 const PRIMARY_DIM: usize = 768;
@@ -99,6 +104,20 @@ enum Row {
         bytes: usize,
         rss_growth_bytes: Option<u64>,
         build_ms: u64,
+    },
+    TwoSpaces {
+        memories: usize,
+        one_space_bytes: usize,
+        two_spaces_bytes: usize,
+        bytes_ratio: f64,
+        rss_ratio: Option<f64>,
+    },
+    Quality {
+        memories: usize,
+        space: String,
+        codec: &'static str,
+        queries: usize,
+        recall_at_10: f64,
     },
     Write {
         mode: &'static str,
@@ -180,6 +199,31 @@ fn queries_near(corpus: &[Vec<f32>], count: usize, seed: u64) -> Vec<Vec<f32>> {
             normalized(base.iter().map(|x| x + rng.gen_range(-0.1..0.1)).collect())
         })
         .collect()
+}
+
+/// Queries the quality rows score against exact search, which reads every vector per query.
+const QUALITY_QUERIES: usize = 50;
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na * nb > 0.0 {
+        dot / (na * nb)
+    } else {
+        0.0
+    }
+}
+
+/// The `k` vectors nearest `query` by exact cosine.
+fn exact_top(corpus: &[Vec<f32>], query: &[f32], k: usize) -> Vec<u32> {
+    let mut scored: Vec<(u32, f32)> = corpus
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as u32, cosine(query, v)))
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.into_iter().take(k).map(|(i, _)| i).collect()
 }
 
 fn percentile(sorted: &[Duration], p: f64) -> u64 {
@@ -355,38 +399,84 @@ fn measure_search_and_footprint(
         })?;
         rows.push(query_row(n, "two-concurrent", embed, &concurrent, one_p95));
 
-        // What product quantization would make of the secondary space: codes instead of
-        // floats, searched by asymmetric distance over every code.
-        let training: Vec<Vec<f32>> = secondary_vectors
-            .iter()
-            .step_by((n / 4096).max(1))
-            .cloned()
-            .collect();
+        // The secondary space as the default codec holds it: product-quantized codes searched
+        // flat, each search's best candidates reranked against the exact vectors.
         let rss_before_pq = rss_bytes();
         let start = Instant::now();
-        let mut pq = CompressedVectorStore::train_and_create(
-            PQConfig::for_dimension(SECONDARY_DIM),
-            &training,
-        )?;
-        for (id, v) in secondary_vectors.iter().enumerate() {
-            pq.add(id as u32, v)?;
-        }
+        let mut pq = QuantizedIndex::new(SECONDARY_DIM);
+        pq.build(secondary_vectors.clone())?;
         let pq_build = start.elapsed();
+        let rss_pq = rss_before_pq
+            .zip(rss_bytes())
+            .map(|(a, b)| b.saturating_sub(a));
         rows.push(Row::Footprint {
             memories: n,
             space: secondary.to_string(),
             codec: "pq",
-            bytes: pq.storage_bytes(),
-            rss_growth_bytes: rss_before_pq
-                .zip(rss_bytes())
-                .map(|(a, b)| b.saturating_sub(a)),
+            bytes: pq.memory_bytes(),
+            rss_growth_bytes: rss_pq,
             build_ms: pq_build.as_millis() as u64,
         });
+        let one_space_bytes = n * PRIMARY_DIM * 4;
+        let two_spaces_bytes = one_space_bytes + pq.memory_bytes();
+        let rss_one = rss_before
+            .zip(rss_primary)
+            .map(|(a, b)| b.saturating_sub(a));
+        rows.push(Row::TwoSpaces {
+            memories: n,
+            one_space_bytes,
+            two_spaces_bytes,
+            bytes_ratio: two_spaces_bytes as f64 / one_space_bytes.max(1) as f64,
+            rss_ratio: rss_one
+                .zip(rss_pq)
+                .filter(|(one, _)| *one > 0)
+                .map(|(one, pq)| (one + pq) as f64 / one as f64),
+        });
+
+        let leg_limit = RECALL_LIMIT * 8;
+        let pq_search = |q: &[f32]| -> Result<Vec<u32>> {
+            let mut hits: Vec<(u32, f32)> = pq
+                .search(q, leg_limit * 2)?
+                .into_iter()
+                .map(|(id, _)| (id, cosine(q, &secondary_vectors[id as usize])))
+                .collect();
+            hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            hits.truncate(leg_limit);
+            Ok(hits.into_iter().map(|(id, _)| id).collect())
+        };
         let two_pq = timed_searches(&primary_queries, |i| {
             primary_index.search(&primary_queries[i], k)?;
-            pq.search(&secondary_queries[i], k).map(|_| ())
+            pq_search(&secondary_queries[i]).map(|_| ())
         })?;
         rows.push(search_row(n, &[&primary, &secondary], "pq", &two_pq));
+
+        let probes = &secondary_queries[..secondary_queries.len().min(QUALITY_QUERIES)];
+        let mut found_f32 = 0usize;
+        let mut found_pq = 0usize;
+        for q in probes {
+            let truth = exact_top(&secondary_vectors, q, 10);
+            let graph: Vec<u32> = secondary_index
+                .search(q, k)?
+                .into_iter()
+                .take(10)
+                .map(|(id, _)| id)
+                .collect();
+            found_f32 += graph.iter().filter(|id| truth.contains(id)).count();
+            found_pq += pq_search(q)?
+                .into_iter()
+                .take(10)
+                .filter(|id| truth.contains(id))
+                .count();
+        }
+        for (codec, found) in [("f32", found_f32), ("pq", found_pq)] {
+            rows.push(Row::Quality {
+                memories: n,
+                space: secondary.to_string(),
+                codec,
+                queries: probes.len(),
+                recall_at_10: found as f64 / (probes.len() * 10).max(1) as f64,
+            });
+        }
     }
     Ok(rows)
 }
@@ -618,6 +708,25 @@ fn print_table(report: &Report) {
                 bytes / 1024,
                 rss_growth_bytes.map_or_else(|| "?".to_string(), |b| (b / 1024).to_string())
             ),
+            Row::TwoSpaces {
+                memories,
+                one_space_bytes,
+                two_spaces_bytes,
+                bytes_ratio,
+                rss_ratio,
+            } => println!(
+                "two/one   {memories:>7}  {:>8} KiB vs {:>8} KiB stored: {bytes_ratio:.2}x  rss {}",
+                two_spaces_bytes / 1024,
+                one_space_bytes / 1024,
+                rss_ratio.map_or_else(|| "?".to_string(), |r| format!("{r:.2}x"))
+            ),
+            Row::Quality {
+                memories,
+                space,
+                codec,
+                recall_at_10,
+                ..
+            } => println!("quality   {memories:>7}  {space:<48} {codec:<4} recall@10 {recall_at_10:.3}"),
             Row::Write {
                 mode,
                 spaces,

@@ -3655,6 +3655,9 @@ impl MemorySystem {
         for (space, indexed) in self.retriever.indexed_by_space() {
             at(&mut by_space, &space).memories += indexed;
         }
+        for (space, codec) in self.retriever.index_codecs() {
+            at(&mut by_space, &space).codec = codec.to_string();
+        }
         for (key, row) in self.embedding_backlog.rows()? {
             let target = key
                 .space
@@ -6065,6 +6068,10 @@ impl MemorySystem {
             if let Err(e) = self.auto_rebuild_index_if_needed() {
                 tracing::warn!("Index compaction failed: {}", e);
             }
+        }
+
+        if let Err(e) = self.retriever.maintain_space_indexes() {
+            tracing::warn!("Space index maintenance failed: {e:#}");
         }
 
         // Check for orphaned memories (stored but not indexed)

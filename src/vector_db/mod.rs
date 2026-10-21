@@ -38,6 +38,7 @@
 pub mod distance_inline;
 pub mod hnsw;
 pub mod pq;
+pub mod quantized;
 pub mod spann;
 pub mod vamana;
 pub mod vamana_persist;

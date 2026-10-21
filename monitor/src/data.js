@@ -411,13 +411,14 @@ function renderSpacesCard(body, health) {
   if (!spaces.length && !migrations.length) return;
   const card = h("section", { class: "sec-card" },
     h("h3", {}, "Embedding spaces"),
-    table(["Space", "Indexed", "Waiting", "Refused", "Kept"], spaces.map((s) => h("tr", {},
+    table(["Space", "Codec", "Indexed", "Waiting", "Refused", "Kept"], spaces.map((s) => h("tr", {},
       h("td", { class: "sec-mono" }, s.id),
+      h("td", {}, s.memories ? s.codec || "f32" : "—"),
       h("td", {}, String(s.memories)),
       h("td", {}, String(s.backlog)),
       h("td", {}, String(s.stranded)),
       h("td", {}, String(s.kept ?? 0))))),
-    h("p", { class: "sec-note" }, "Across the users in the server's cache. Waiting: memories queued for a vector in the space. Refused: memories stored in it that an index in another space turned away. Kept: memories keeping a vector in it that no index here holds."));
+    h("p", { class: "sec-note" }, "Across the users in the server's cache. Waiting: memories queued for a vector in the space. Refused: memories stored in it that an index in another space turned away. Kept: memories keeping a vector in it that no index here holds. Codec: pq holds codes and reranks against the records' vectors; f32 holds full vectors."));
   if (health.orphaned_corpora) {
     card.append(h("p", { class: "sec-flash warn" }, `${health.orphaned_corpora} corpus(es) have no memory any index here can search by vector: recall is keyword-only there.`));
   }
