@@ -1215,13 +1215,17 @@ impl IntentLog {
         first: usize,
         offset: Option<u64>,
     ) -> Result<IntentLogIter, IntentLogError> {
-        let mut files: VecDeque<(PathBuf, u64)> = self.sealed[first.min(self.sealed.len())..]
-            .iter()
-            .map(|s| (s.path.clone(), s.frame_start))
-            .collect();
-        files.push_back((self.path.clone(), self.mode.frame_region_start()));
-        let (path, start) = files.pop_front().expect("the head is always listed");
-        let mut iter = IntentLogIter::open(&path, offset.unwrap_or(start), self.cryptor.clone())?;
+        // Every file is opened now: a rotation while the iterator is in use
+        // renames the head, and a handle follows its file where a path would
+        // land on the new head.
+        let mut files = VecDeque::new();
+        for segment in &self.sealed[first.min(self.sealed.len())..] {
+            files.push_back(NextFile::open(&segment.path, segment.frame_start)?);
+        }
+        files.push_back(NextFile::open(&self.path, self.mode.frame_region_start())?);
+        let first = files.pop_front().expect("the head is always listed");
+        let start = offset.unwrap_or(first.frame_start);
+        let mut iter = IntentLogIter::from_file(first.file, start, self.cryptor.clone())?;
         iter.rest = files;
         Ok(iter)
     }
@@ -1490,15 +1494,31 @@ pub struct IntentLogIter {
     body: Vec<u8>,
     /// Payload length of the frame in `body`.
     body_len: usize,
-    /// Log files still to read after this one, oldest first, with the offset
-    /// their frames start at.
-    rest: VecDeque<(PathBuf, u64)>,
+    /// Log files still to read after this one, oldest first.
+    rest: VecDeque<NextFile>,
     /// LSN of the last frame read, which the first frame of the next file
     /// must follow.
     last_lsn: Option<Lsn>,
     /// The current file was entered from the previous one and its first
     /// frame has not been read yet.
     entered: Option<PathBuf>,
+}
+
+/// A log file an [`IntentLogIter`] reads after the current one.
+struct NextFile {
+    path: PathBuf,
+    file: File,
+    frame_start: u64,
+}
+
+impl NextFile {
+    fn open(path: &Path, frame_start: u64) -> Result<Self, IntentLogError> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: File::open(path)?,
+            frame_start,
+        })
+    }
 }
 
 impl IntentLogIter {
@@ -1521,7 +1541,14 @@ impl IntentLogIter {
         start_offset: u64,
         cryptor: Option<crate::keystore::SecretCryptor>,
     ) -> Result<Self, IntentLogError> {
-        let mut file = File::open(path)?;
+        Self::from_file(File::open(path)?, start_offset, cryptor)
+    }
+
+    fn from_file(
+        mut file: File,
+        start_offset: u64,
+        cryptor: Option<crate::keystore::SecretCryptor>,
+    ) -> Result<Self, IntentLogError> {
         file.seek(SeekFrom::Start(start_offset))?;
         Ok(Self {
             reader: BufReader::with_capacity(READ_BUFFER_BYTES, file),
@@ -1538,13 +1565,17 @@ impl IntentLogIter {
 
     /// Move to the next log file, or report that there is none.
     fn enter_next_file(&mut self) -> Result<bool, IntentLogError> {
-        let Some((path, start)) = self.rest.pop_front() else {
+        let Some(NextFile {
+            path,
+            mut file,
+            frame_start,
+        }) = self.rest.pop_front()
+        else {
             return Ok(false);
         };
-        let mut file = File::open(&path)?;
-        file.seek(SeekFrom::Start(start))?;
+        file.seek(SeekFrom::Start(frame_start))?;
         self.reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
-        self.offset = start;
+        self.offset = frame_start;
         self.entered = Some(path);
         Ok(true)
     }
