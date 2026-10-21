@@ -1919,6 +1919,55 @@ pub fn people_intent(query: &str) -> f32 {
     0.0
 }
 
+/// Words that shape a question rather than name its topic: quantity, duration, reason,
+/// likelihood, recency, kind. An answer almost never repeats them ("How long has she been
+/// doing yoga?" is answered by "about 3 years now"), so query-term coverage must not count
+/// them. On the full 1,531-question LoCoMo suite (2026-10-20) they were behind most of the
+/// coverage layer's lost cases.
+pub const QUESTION_FRAME_WORDS: &[&str] = &[
+    "many",
+    "much",
+    "long",
+    "often",
+    "time",
+    "times",
+    "period",
+    "reason",
+    "reasons",
+    "cause",
+    "likely",
+    "probably",
+    "possibly",
+    "related",
+    "recent",
+    "recently",
+    "kind",
+    "kinds",
+    "type",
+    "types",
+    "sort",
+    "sorts",
+    "way",
+    "ways",
+    "aspect",
+    "aspects",
+    "example",
+    "examples",
+    "specific",
+    "particular",
+    "exactly",
+    "usually",
+    "usual",
+    "currently",
+    "lately",
+];
+
+/// Whether `word` (any case) is in [`QUESTION_FRAME_WORDS`].
+pub fn is_question_frame_word(word: &str) -> bool {
+    let lower = word.to_lowercase();
+    QUESTION_FRAME_WORDS.contains(&lower.as_str())
+}
+
 /// English stems of the non-stopword tokens in `text`, for query-term coverage.
 pub fn content_stems(text: &str) -> HashSet<String> {
     let stemmer = Stemmer::create(Algorithm::English);
@@ -1975,7 +2024,7 @@ pub fn classify_rerank_shape(query: &str, decomposed: bool, query_type: &QueryTy
     let lower = query.to_lowercase();
     let mut shapes: Vec<RerankShape> = Vec::with_capacity(3);
 
-    if has_lexical_identifiers(query)
+    if has_structured_identifier(query)
         || query
             .split_whitespace()
             .any(|w| w.contains('/') || w.contains("::") || w.contains('_'))
@@ -2041,6 +2090,27 @@ pub fn classify_rerank_shape(query: &str, decomposed: bool, query_type: &QueryTy
         return RerankShape::People;
     }
     RerankShape::Exploratory
+}
+
+/// Like [`has_lexical_identifiers`], but a bare all-caps word counts only when it carries a
+/// digit (`E0308`) or is long enough to be a code constant (`ECONNREFUSED`, eight or more
+/// letters). A short acronym in a question (`LGBTQ`, `HTTPS`) names a topic, and treating the
+/// question as an identifier lookup switched its reranker off: on the five LoCoMo questions
+/// with a bare acronym, MRR fell from 0.767 to 0.600.
+pub fn has_structured_identifier(query: &str) -> bool {
+    static STRUCTURED: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
+        vec![
+            regex::Regex::new(r"\b[A-Z]{2,10}-\d{1,6}\b").unwrap(),
+            regex::Regex::new(r"\bv?\d+\.\d+(?:\.\d+)?\b").unwrap(),
+            regex::Regex::new(r"\b[A-Z][A-Z0-9]*\d[A-Z0-9]*\b").unwrap(),
+            regex::Regex::new(r"\b[A-Z]{8,}\b").unwrap(),
+            regex::Regex::new(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+                .unwrap(),
+            regex::Regex::new(r"\b[0-9a-f]{7,40}\b").unwrap(),
+            regex::Regex::new(r"#\d{1,6}\b").unwrap(),
+        ]
+    });
+    STRUCTURED.iter().any(|p| p.is_match(query))
 }
 
 /// Detect whether a query contains lexical identifiers that score poorly on
@@ -6614,6 +6684,34 @@ mod tests {
             shape("how did we deploy SHO-72 to staging", false),
             RerankShape::Identifier
         );
+    }
+
+    #[test]
+    fn structured_identifiers_exclude_short_acronyms() {
+        assert!(!has_structured_identifier(
+            "What LGBTQ+ events has Caroline participated in?"
+        ));
+        assert!(!has_structured_identifier("Did the HTTPS rollout finish?"));
+        assert!(has_structured_identifier(
+            "why does ECONNREFUSED happen on startup"
+        ));
+        assert!(has_structured_identifier("rustc E0308 mismatched types"));
+        assert!(has_structured_identifier("status of SHO-72"));
+        assert!(has_structured_identifier("what changed in v0.8.3"));
+        assert_eq!(
+            shape("What LGBTQ+ events has Caroline participated in?", false),
+            RerankShape::Exploratory
+        );
+    }
+
+    #[test]
+    fn question_frame_words_are_not_topic_words() {
+        for w in ["many", "Long", "reason", "recently", "kind"] {
+            assert!(is_question_frame_word(w), "{w}");
+        }
+        for w in ["yoga", "screenplay", "favorite", "picture"] {
+            assert!(!is_question_frame_word(w), "{w}");
+        }
     }
 
     #[test]

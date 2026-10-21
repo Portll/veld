@@ -1727,7 +1727,10 @@ impl FeedbackStore {
             return None;
         }
 
-        let similarity = cosine_similarity(&prev.embedding, current_embedding);
+        let similarity = crate::similarity::scale::to_reference(cosine_similarity(
+            &prev.embedding,
+            current_embedding,
+        ));
 
         // ACT-R inspired thresholds
         let is_repetition = similarity > 0.8; // High similarity = re-asking

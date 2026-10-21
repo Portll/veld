@@ -1376,6 +1376,7 @@ impl MemorySystem {
         let embedder = Arc::new(crate::embeddings::competitive::CompetitiveEmbedder::new(
             primary, secondary,
         ));
+        crate::similarity::scale::set_active_embedder(embedder.id());
 
         // Create consolidation event buffer first so we can share it with retriever
         let consolidation_events = Arc::new(RwLock::new(ConsolidationEventBuffer::new()));
@@ -2861,7 +2862,8 @@ impl MemorySystem {
                             self.retriever.get_from_storage(id).ok().map(|m| {
                                 (
                                     id.0.to_string(),
-                                    *similarity,
+                                    // Interference's bars are MiniLM-tuned; read on that scale.
+                                    crate::similarity::scale::to_reference(*similarity),
                                     m.importance(),
                                     m.created_at,
                                     m.experience.content.chars().take(50).collect::<String>(),
@@ -2875,6 +2877,8 @@ impl MemorySystem {
                     // candidate: similar vectors can carry different facts, and
                     // the caller already holds this memory's id. It is absorbed
                     // only when its text adds nothing the neighbour lacks.
+                    // `similar_memories` already holds cosines on MiniLM's scale, so the
+                    // MiniLM-tuned bar applies as is; mapping `best_sim` again would double it.
                     let total_memories = self.stats.read().total_memories;
                     if total_memories >= crate::constants::WRITE_GATE_COLD_START_BYPASS {
                         if let Some((best_id, best_sim, _, _, _)) =

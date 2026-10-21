@@ -165,7 +165,7 @@ pub fn find_merge_candidates(
             if emb_a.len() != emb_b.len() {
                 continue;
             }
-            let sim = cosine_similarity(emb_a, emb_b);
+            let sim = crate::similarity::scale::to_reference(cosine_similarity(emb_a, emb_b));
             if sim >= SEMANTIC_MERGE_SIMILARITY_THRESHOLD {
                 let score_a = a.access_count() as f64 + a.importance() as f64;
                 let score_b = b.access_count() as f64 + b.importance() as f64;

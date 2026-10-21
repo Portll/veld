@@ -328,7 +328,8 @@ pub async fn consolidate_memories(
                         continue;
                     };
 
-                    let sim = cosine_similarity(emb_a, emb_b);
+                    let sim =
+                        crate::similarity::scale::to_reference(cosine_similarity(emb_a, emb_b));
                     metrics::DREAM_REPLAY_PAIRS_EVALUATED.inc();
 
                     // Discovery band: interesting but not already-connected similarity
@@ -729,7 +730,7 @@ pub async fn sleep_phase_consolidation(
 
                     let (Some(emb_a), Some(emb_b)) = (&mem_a.experience.embeddings, &mem_b.experience.embeddings) else { continue };
 
-                    let sim = cosine_similarity(emb_a, emb_b);
+                    let sim = crate::similarity::scale::to_reference(cosine_similarity(emb_a, emb_b));
                     if !(DREAM_REPLAY_SIMILARITY_THRESHOLD..=DREAM_REPLAY_SIMILARITY_CEILING).contains(&sim) { continue; }
 
                     let entities_a: Vec<uuid::Uuid> = mem_a.entity_refs.iter().map(|e| e.entity_id).collect();

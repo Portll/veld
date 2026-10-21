@@ -900,7 +900,10 @@ impl SemanticFactStore {
                 let new_emb = new_embedding.unwrap();
                 match self.get_embedding(user_id, &fact.id) {
                     Ok(Some(existing_emb)) => {
-                        let cosine = cosine_similarity(new_emb, &existing_emb);
+                        let cosine = crate::similarity::scale::to_reference(cosine_similarity(
+                            new_emb,
+                            &existing_emb,
+                        ));
                         if cosine < FACT_DEDUP_COSINE_THRESHOLD {
                             continue;
                         }
@@ -991,7 +994,8 @@ impl SemanticFactStore {
             let Ok(Some(existing_emb)) = self.get_embedding(user_id, &fact.id) else {
                 continue;
             };
-            let cosine = cosine_similarity(new_emb, &existing_emb);
+            let cosine =
+                crate::similarity::scale::to_reference(cosine_similarity(new_emb, &existing_emb));
             if cosine < FACT_DEDUP_COSINE_THRESHOLD {
                 continue;
             }
@@ -1184,7 +1188,10 @@ impl SemanticFactStore {
                     continue;
                 };
 
-                let cosine = cosine_similarity(new_emb, &existing_emb);
+                let cosine = crate::similarity::scale::to_reference(cosine_similarity(
+                    new_emb,
+                    &existing_emb,
+                ));
                 if cosine < FACT_DEDUP_COSINE_THRESHOLD {
                     continue;
                 }

@@ -1,4 +1,3 @@
-{"id": "conv-26_q0", "category": "temporal", "query": "When did Caroline go to the LGBTQ support group?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D1:3", "grade": 3}]}
 {"id": "conv-26_q1", "category": "temporal", "query": "When did Melanie paint a sunrise?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D1:12", "grade": 3}]}
 {"id": "conv-26_q2", "category": "open_domain", "query": "What fields would Caroline be likely to pursue in her educaton?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D1:9", "grade": 3}, {"corpus_item_id": "conv-26:D1:11", "grade": 3}]}
 {"id": "conv-26_q3", "category": "multi_hop", "query": "What did Caroline research?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D2:8", "grade": 3}]}
@@ -19,7 +18,6 @@
 {"id": "conv-26_q20", "category": "temporal", "query": "When did Melanie go to the museum?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D6:4", "grade": 3}]}
 {"id": "conv-26_q21", "category": "temporal", "query": "When did Caroline have a picnic?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D6:11", "grade": 3}]}
 {"id": "conv-26_q22", "category": "open_domain", "query": "Would Caroline likely have Dr. Seuss books on her bookshelf?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D6:9", "grade": 3}]}
-{"id": "conv-26_q25", "category": "temporal", "query": "When did Caroline go to the LGBTQ conference?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D7:1", "grade": 3}]}
 {"id": "conv-26_q27", "category": "open_domain", "query": "Would Caroline pursue writing as a career option?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D7:5", "grade": 3}, {"corpus_item_id": "conv-26:D7:9", "grade": 3}]}
 {"id": "conv-26_q29", "category": "temporal", "query": "When did Melanie go to the pottery workshop?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D8:2", "grade": 3}]}
 {"id": "conv-26_q31", "category": "temporal", "query": "When did Melanie go camping in June?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D4:8", "grade": 3}]}
@@ -76,7 +74,6 @@
 {"id": "conv-26_q94", "category": "single_hop", "query": "What is Melanie's hand-painted bowl a reminder of?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D4:5", "grade": 3}]}
 {"id": "conv-26_q95", "category": "single_hop", "query": "What did Melanie and her family do while camping?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D4:8", "grade": 3}]}
 {"id": "conv-26_q97", "category": "single_hop", "query": "What workshop did Caroline attend recently?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D4:13", "grade": 3}]}
-{"id": "conv-26_q98", "category": "single_hop", "query": "What was discussed in the LGBTQ+ counseling workshop?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D4:13", "grade": 3}]}
 {"id": "conv-26_q99", "category": "single_hop", "query": "What motivated Caroline to pursue counseling?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D4:15", "grade": 3}]}
 {"id": "conv-26_q100", "category": "single_hop", "query": "What kind of place does Caroline want to create for people?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D4:15", "grade": 3}]}
 {"id": "conv-26_q101", "category": "single_hop", "query": "Did Melanie make the black and white bowl in the photo?", "fixture_corpus_id": "locomo", "relevant": [{"corpus_item_id": "conv-26:D5:8", "grade": 3}]}
