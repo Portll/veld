@@ -5081,10 +5081,10 @@ impl super::MemorySystem {
                     memories[left_idx].experience.embeddings.as_ref(),
                     memories[right_idx].experience.embeddings.as_ref(),
                 ) {
+                    // Raw cosine: `similarity_floor` is measured on this pool's own raw
+                    // cosines, which already adapts the bar to the embedder.
                     (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => {
-                        crate::similarity::scale::to_reference(
-                            crate::similarity::cosine_similarity(left, right),
-                        )
+                        crate::similarity::cosine_similarity(left, right)
                     }
                     _ => {
                         let union_count =
