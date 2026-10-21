@@ -5863,12 +5863,23 @@ impl MultiUserMemoryManager {
                     continue;
                 }
             }
-            let result = guard.drain_embedding_backlog(limit_per_user);
+            let result = guard.drain_embedding_backlog_journaled(limit_per_user);
             if let Ok(report) = guard.embedding_backlog_report() {
                 crate::metrics::EMBEDDING_BACKLOG_PENDING
                     .with_label_values(&[user_id.as_str()])
                     .set(report.pending as i64);
             }
+            drop(guard);
+            let result = result.map(|(report, rewritten)| {
+                crate::handlers::remember::journal_stored(
+                    self,
+                    &memory,
+                    &user_id,
+                    &rewritten,
+                    crate::handlers::remember::SnapshotKind::Update,
+                );
+                report
+            });
             out.push((user_id, result));
         }
         out

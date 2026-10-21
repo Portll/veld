@@ -16,14 +16,14 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
+use veld::config::ServerConfig;
 use veld::embeddings::ner::{NerConfig, NeuralNer};
-use veld::memory::MemoryConfig;
-use veld::parking_lot;
+use veld::handlers::state::MultiUserMemoryManager;
 use veld::streaming::{
     contains_ignore_ascii_case, content_hash, ExtractionConfig, StreamHandshake, StreamMessage,
     StreamMode, StreamingMemoryExtractor,
 };
-use veld::user_memory::UserMemory;
+use veld::user_memory::SharedUserMemory;
 
 // ==============================================================================
 // Test Data: Realistic Streaming Content
@@ -99,21 +99,22 @@ const LONG_CONTENT: &str = "During the quarterly planning session at Microsoft h
 // Helper Functions
 // ==============================================================================
 
-fn setup_memory_system() -> (UserMemory, TempDir) {
+/// A tenant on a real manager: the extractor journals what it stores, as `/api/stream` does.
+fn setup_tenant() -> (SharedUserMemory, Arc<MultiUserMemoryManager>, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let config = MemoryConfig {
+    let config = ServerConfig {
         storage_path: temp_dir.path().to_path_buf(),
-        collective_store_dir: None,
-        working_memory_size: 100,
-        session_memory_size_mb: 50,
-        max_heap_per_user_mb: 200,
-        auto_compress: false,
-        compression_age_days: 30,
-        importance_threshold: 0.3,
+        backup_enabled: false,
+        ..ServerConfig::default()
     };
-
-    let memory_system = UserMemory::new(config, None).expect("Failed to create memory system");
-    (memory_system, temp_dir)
+    let manager = Arc::new(
+        MultiUserMemoryManager::new(temp_dir.path().to_path_buf(), config)
+            .expect("Failed to create memory manager"),
+    );
+    let memory = manager
+        .get_user_memory(BENCH_USER)
+        .expect("Failed to open the benchmark tenant");
+    (memory, manager, temp_dir)
 }
 
 fn setup_ner() -> Arc<NeuralNer> {
@@ -126,9 +127,11 @@ fn setup_fallback_ner() -> Arc<NeuralNer> {
     Arc::new(NeuralNer::new_fallback(config))
 }
 
+const BENCH_USER: &str = "benchmark_user";
+
 fn create_handshake(mode: StreamMode) -> StreamHandshake {
     StreamHandshake {
-        user_id: "benchmark_user".to_string(),
+        user_id: BENCH_USER.to_string(),
         mode,
         extraction_config: ExtractionConfig {
             min_importance: 0.3,
@@ -402,8 +405,7 @@ fn bench_message_processing(c: &mut Criterion) {
 
     let rt = Runtime::new().unwrap();
     let ner = setup_ner();
-    let (memory_system, _temp_dir) = setup_memory_system();
-    let memory_arc = Arc::new(parking_lot::RwLock::new(memory_system));
+    let (memory_arc, manager, _temp_dir) = setup_tenant();
 
     let mut group = c.benchmark_group("message_processing");
     group.throughput(Throughput::Elements(1));
@@ -417,7 +419,12 @@ fn bench_message_processing(c: &mut Criterion) {
 
         b.iter(|| {
             let msg = create_content_message(CONVERSATION_MESSAGES[0]);
-            rt.block_on(extractor.process_message(&session_id, msg, Arc::clone(&memory_arc)))
+            rt.block_on(extractor.process_message(
+                &session_id,
+                msg,
+                Arc::clone(&memory_arc),
+                Arc::clone(&manager),
+            ))
         });
     });
 
@@ -431,7 +438,12 @@ fn bench_message_processing(c: &mut Criterion) {
         b.iter(|| {
             let (severity, event, desc) = EVENT_MESSAGES[0];
             let msg = create_event_message(severity, event, desc);
-            rt.block_on(extractor.process_message(&session_id, msg, Arc::clone(&memory_arc)))
+            rt.block_on(extractor.process_message(
+                &session_id,
+                msg,
+                Arc::clone(&memory_arc),
+                Arc::clone(&manager),
+            ))
         });
     });
 
@@ -445,7 +457,12 @@ fn bench_message_processing(c: &mut Criterion) {
         b.iter(|| {
             let (sensor_id, value, unit) = SENSOR_READINGS[0];
             let msg = create_sensor_message(sensor_id, value, unit);
-            rt.block_on(extractor.process_message(&session_id, msg, Arc::clone(&memory_arc)))
+            rt.block_on(extractor.process_message(
+                &session_id,
+                msg,
+                Arc::clone(&memory_arc),
+                Arc::clone(&manager),
+            ))
         });
     });
 
@@ -461,6 +478,7 @@ fn bench_message_processing(c: &mut Criterion) {
                 &session_id,
                 StreamMessage::Ping,
                 Arc::clone(&memory_arc),
+                Arc::clone(&manager),
             ))
         });
     });
@@ -490,8 +508,7 @@ fn bench_batch_throughput(c: &mut Criterion) {
             BenchmarkId::new("conversation_batch", batch_size),
             &batch_size,
             |b, &size| {
-                let (memory_system, _temp_dir) = setup_memory_system();
-                let memory_arc = Arc::new(parking_lot::RwLock::new(memory_system));
+                let (memory_arc, manager, _temp_dir) = setup_tenant();
                 let extractor = StreamingMemoryExtractor::new(Arc::clone(&ner));
                 let session_id = rt
                     .block_on(extractor.create_session(create_handshake(StreamMode::Conversation)))
@@ -515,6 +532,7 @@ fn bench_batch_throughput(c: &mut Criterion) {
                             &session_id,
                             msg,
                             Arc::clone(&memory_arc),
+                            Arc::clone(&manager),
                         ));
                     }
                     // Flush at end
@@ -522,6 +540,7 @@ fn bench_batch_throughput(c: &mut Criterion) {
                         &session_id,
                         StreamMessage::Flush,
                         Arc::clone(&memory_arc),
+                        Arc::clone(&manager),
                     ))
                 });
             },
@@ -617,12 +636,11 @@ fn bench_full_extraction_pipeline(c: &mut Criterion) {
     group.bench_function("complete_pipeline_10_messages", |b| {
         b.iter_batched(
             || {
-                let (memory_system, temp_dir) = setup_memory_system();
-                let memory_arc = Arc::new(parking_lot::RwLock::new(memory_system));
+                let (memory_arc, manager, temp_dir) = setup_tenant();
                 let extractor = StreamingMemoryExtractor::new(Arc::clone(&ner));
-                (extractor, memory_arc, temp_dir)
+                (extractor, memory_arc, manager, temp_dir)
             },
-            |(extractor, memory_arc, _temp_dir)| {
+            |(extractor, memory_arc, manager, _temp_dir)| {
                 rt.block_on(async {
                     // Create session
                     let session_id = extractor
@@ -637,13 +655,19 @@ fn bench_full_extraction_pipeline(c: &mut Criterion) {
                                 &session_id,
                                 create_content_message(msg),
                                 Arc::clone(&memory_arc),
+                                Arc::clone(&manager),
                             )
                             .await;
                     }
 
                     // Flush and extract
                     extractor
-                        .process_message(&session_id, StreamMessage::Flush, memory_arc)
+                        .process_message(
+                            &session_id,
+                            StreamMessage::Flush,
+                            memory_arc,
+                            Arc::clone(&manager),
+                        )
                         .await
                 })
             },
@@ -655,12 +679,11 @@ fn bench_full_extraction_pipeline(c: &mut Criterion) {
     group.bench_function("event_triggered_extraction", |b| {
         b.iter_batched(
             || {
-                let (memory_system, temp_dir) = setup_memory_system();
-                let memory_arc = Arc::new(parking_lot::RwLock::new(memory_system));
+                let (memory_arc, manager, temp_dir) = setup_tenant();
                 let extractor = StreamingMemoryExtractor::new(Arc::clone(&ner));
-                (extractor, memory_arc, temp_dir)
+                (extractor, memory_arc, manager, temp_dir)
             },
-            |(extractor, memory_arc, _temp_dir)| {
+            |(extractor, memory_arc, manager, _temp_dir)| {
                 rt.block_on(async {
                     let session_id = extractor
                         .create_session(create_handshake(StreamMode::Event))
@@ -674,6 +697,7 @@ fn bench_full_extraction_pipeline(c: &mut Criterion) {
                                 &session_id,
                                 create_event_message(severity, event, desc),
                                 Arc::clone(&memory_arc),
+                                Arc::clone(&manager),
                             )
                             .await;
                     }
@@ -684,6 +708,7 @@ fn bench_full_extraction_pipeline(c: &mut Criterion) {
                             &session_id,
                             create_event_message("error", "error", "Critical failure detected"),
                             memory_arc,
+                            Arc::clone(&manager),
                         )
                         .await
                 })
@@ -716,8 +741,7 @@ fn bench_streaming_summary(c: &mut Criterion) {
     let mut ner_times = Vec::new();
 
     for _ in 0..iterations {
-        let (memory_system, _temp_dir) = setup_memory_system();
-        let memory_arc = Arc::new(parking_lot::RwLock::new(memory_system));
+        let (memory_arc, manager, _temp_dir) = setup_tenant();
         let extractor = StreamingMemoryExtractor::new(Arc::clone(&ner));
 
         // Session creation
@@ -734,6 +758,7 @@ fn bench_streaming_summary(c: &mut Criterion) {
                 &session_id,
                 create_content_message(msg),
                 Arc::clone(&memory_arc),
+                Arc::clone(&manager),
             ));
         }
         buffer_times.push(start.elapsed());
@@ -744,6 +769,7 @@ fn bench_streaming_summary(c: &mut Criterion) {
             &session_id,
             StreamMessage::Flush,
             Arc::clone(&memory_arc),
+            Arc::clone(&manager),
         ));
         flush_times.push(start.elapsed());
 

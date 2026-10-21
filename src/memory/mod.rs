@@ -6203,7 +6203,11 @@ impl MemorySystem {
     /// One attempt to give a backlogged memory its vector. The embedder is probed after a
     /// failure so a host that is down stops the drain, while a memory the embedder refuses on
     /// its own merits stays in the queue with its error.
-    fn embed_backlog_outcome(&self, memory_id: &MemoryId) -> embedding_backlog::EmbedOutcome {
+    fn embed_backlog_outcome(
+        &self,
+        memory_id: &MemoryId,
+        rewritten: &mut Vec<MemoryId>,
+    ) -> embedding_backlog::EmbedOutcome {
         use embedding_backlog::EmbedOutcome;
         if self.writes_closed() {
             return EmbedOutcome::WritesClosed;
@@ -6216,11 +6220,16 @@ impl MemorySystem {
             }
             Err(e) => return EmbedOutcome::Failed(e.to_string()),
         }
-        if let Err(e) = self.embed_and_index(memory_id) {
-            if write_gate::chain_is_writes_closed(&e) {
-                return EmbedOutcome::WritesClosed;
+        match self.embed_and_index_journaled(memory_id) {
+            Ok(outcome) => {
+                for id in outcome.rewritten {
+                    if !rewritten.contains(&id) {
+                        rewritten.push(id);
+                    }
+                }
             }
-            return EmbedOutcome::Failed(e.to_string());
+            Err(e) if write_gate::chain_is_writes_closed(&e) => return EmbedOutcome::WritesClosed,
+            Err(e) => return EmbedOutcome::Failed(e.to_string()),
         }
         if self.retriever.is_indexed(memory_id) {
             return EmbedOutcome::Indexed;
@@ -6240,17 +6249,23 @@ impl MemorySystem {
         }
     }
 
-    /// Embed and index up to `limit` backlogged memories, oldest first.
-    pub fn drain_embedding_backlog(&self, limit: usize) -> Result<embedding_backlog::DrainReport> {
+    /// Embed and index up to `limit` backlogged memories, oldest first. Returns the drain's
+    /// report and the memories it rewrote ([`EmbedIndexOutcome::rewritten`] across the
+    /// batch): the caller MUST journal an `Update` snapshot of each.
+    pub fn drain_embedding_backlog_journaled(
+        &self,
+        limit: usize,
+    ) -> Result<(embedding_backlog::DrainReport, Vec<MemoryId>)> {
+        let mut rewritten = Vec::new();
         let report = self
             .embedding_backlog
-            .drain_with(limit, |id| self.embed_backlog_outcome(id))?;
+            .drain_with(limit, |id| self.embed_backlog_outcome(id, &mut rewritten))?;
         if report.drained > 0 {
             if let Err(e) = self.retriever.save() {
                 tracing::warn!("embedding backlog: index save after drain failed: {e}");
             }
         }
-        Ok(report)
+        Ok((report, rewritten))
     }
 
     /// Save vector index to disk (shutdown persistence)
