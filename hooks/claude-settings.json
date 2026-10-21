@@ -3,244 +3,90 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": {},
         "hooks": [
           {
             "type": "command",
             "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts SessionStart",
-            "timeout": 10000
+            "timeout": 15
           }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
-        "matcher": {},
         "hooks": [
           {
             "type": "command",
             "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts UserPromptSubmit",
-            "timeout": 5000
+            "timeout": 10
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": {
-          "tool_name": ["Edit", "Write", "MultiEdit"]
-        },
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Read|Grep|Glob|WebFetch|Agent|Task",
         "hooks": [
           {
             "type": "command",
             "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Bash"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Read"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Task"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Search", "Grep", "Glob"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["WebFetch"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["NotebookEdit"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PreToolUse",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": {
-          "tool_name": ["Edit", "Write", "MultiEdit"]
-        },
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Read|Grep|Glob|WebFetch",
         "hooks": [
           {
             "type": "command",
             "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PostToolUse",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       },
       {
-        "matcher": {
-          "tool_name": ["Bash"]
-        },
+        "matcher": "Agent|Task",
         "hooks": [
           {
             "type": "command",
             "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PostToolUse",
-            "timeout": 5000
+            "timeout": 30
           }
         ]
-      },
+      }
+    ],
+    "PostToolUseFailure": [
       {
-        "matcher": {
-          "tool_name": ["Read"]
-        },
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Task"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["TodoRead", "TodoWrite"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Search", "Grep", "Glob", "ListFiles", "LS"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["WebFetch"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["NotebookEdit"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PostToolUse",
-            "timeout": 5000
+            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts PostToolUseFailure",
+            "timeout": 5
           }
         ]
       }
     ],
     "SubagentStop": [
       {
-        "matcher": {},
         "hooks": [
           {
             "type": "command",
             "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts SubagentStop",
-            "timeout": 5000
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": {},
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts Stop",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }
     ],
     "SessionEnd": [
       {
-        "matcher": {},
         "hooks": [
           {
             "type": "command",
             "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts SessionEnd",
-            "timeout": 5000
+            "timeout": 2
           }
         ]
       }
