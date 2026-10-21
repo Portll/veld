@@ -112,6 +112,15 @@ impl CompetitiveEmbedder {
         }
     }
 
+    /// Encode a query with the secondary model, as a query: the side an asymmetric model
+    /// such as nomic embeds a search with. `Ok(None)` when no secondary model is configured.
+    pub fn encode_secondary_query(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        self.secondary
+            .as_ref()
+            .map(|embedder| embedder.encode_for_query(text))
+            .transpose()
+    }
+
     /// Encode with both models in a single call.
     ///
     /// Returns `(primary_embedding, Option<secondary_embedding>)`.
@@ -541,7 +550,7 @@ mod tests {
     }
 
     /// Defect 3 routing decision: recall routes the secondary leg through the
-    /// aligned path (`search_ids_aligned` / `encode_aligned`) iff
+    /// aligned path (an aligned leg over the primary index) iff
     /// `has_alignment()` is true for the active pair. Before install the gate is
     /// false (recall takes the byte-identical raw-secondary path); after install
     /// it is true (recall takes the aligned, projected-into-primary path), and

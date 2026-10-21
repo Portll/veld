@@ -16,6 +16,7 @@ use crate::memory::introspection::{self, StrengtheningReason};
 use crate::memory::learning_history;
 use crate::memory::query_parser;
 use crate::memory::retrieval::{ReinforcementStats, RetrievalOutcome, TrackedRetrieval};
+use crate::memory::space_legs::{LegKind, PendingLegs};
 use crate::memory::storage::{self, SearchCriteria};
 use crate::memory::temporal_facts;
 use crate::memory::types::*;
@@ -741,55 +742,33 @@ impl super::MemorySystem {
             "recall [layer:0.5-0.7] query analysis + attribute + temporal fact + fact source lookup"
         );
 
-        // PERFORMANCE: Use pre-computed embedding if caller provided one,
-        // otherwise fall back to SHA256-keyed cache (80ms → <1μs for repeated queries)
-        let query_embedding =
-            if let Some(pre) = query.query_embedding.as_ref().filter(|e| !e.is_empty()) {
-                EMBEDDING_CACHE_QUERY
-                    .with_label_values(&["precomputed"])
-                    .inc();
-                tracing::debug!("Query embedding PRECOMPUTED by caller — skipping encode");
-                pre.clone()
-            } else {
-                let query_hash = Self::sha256_hash(query_text);
-                if let Some(cached_embedding) = self.query_cache.get(&query_hash) {
-                    EMBEDDING_CACHE_QUERY.with_label_values(&["hit"]).inc();
-                    tracing::debug!("Query embedding cache HIT for: {}", query_text);
-                    cached_embedding.clone()
-                } else {
-                    EMBEDDING_CACHE_QUERY.with_label_values(&["miss"]).inc();
-                    tracing::debug!(
-                        "Query embedding cache MISS - generating for: {}",
-                        query_text
-                    );
-                    let embedding = self
-                        .embedder
-                        .as_ref()
-                        .encode(query_text)
-                        .context("Failed to generate query embedding")?;
-
-                    self.query_cache.insert(query_hash, embedding.clone());
-                    EMBEDDING_CACHE_QUERY_SIZE.set(self.query_cache.entry_count() as i64);
-                    embedding
-                }
-            };
-
-        // Secondary query embedding for dual-index competition (Nomic 768d)
-        let query_embedding_secondary: Option<Vec<f32>> = if self.embedder.has_secondary() {
-            self.embedder.encode_secondary(query_text).ok().flatten()
-        } else {
-            None
-        };
+        // The query, embedded once in each space an embedder here writes.
+        let (query_embedding, query_embedding_secondary) = self.query_vectors(query_text, query)?;
         // The space each query vector is in. A stored vector is compared with a query only in
         // the space both are in, and every space a query vector exists for is searched.
         let index_space = self.retriever.index_space().clone();
-        let space_queries: Vec<(SpaceId, &Vec<f32>)> = self
+        let space_queries: Vec<(SpaceId, Vec<f32>)> = self
             .retriever
             .secondary_index_space()
             .cloned()
-            .zip(query_embedding_secondary.as_ref())
+            .zip(query_embedding_secondary)
             .into_iter()
             .collect();
+        // Every vector leg beyond the primary index needs only the query vectors, so all of
+        // them start now, beside graph traversal, the primary search and BM25, and are
+        // collected at fusion.
+        let pending_legs = if query.dual_index.unwrap_or(true) {
+            let candidate_dial = self.cognitive_dials.read().space_candidates.clone();
+            PendingLegs::start(self.retriever.space_legs(
+                &query_embedding,
+                &space_queries,
+                query.max_results,
+                &candidate_dial,
+            ))
+        } else {
+            PendingLegs::start(Vec::new())
+        };
+        let mut leg_record: Vec<(SpaceId, Vec<MemoryId>)> = Vec::new();
 
         let t_embedding = recall_start.elapsed();
         tracing::info!(
@@ -798,7 +777,7 @@ impl super::MemorySystem {
                 (t_embedding - t_query_analysis).as_secs_f64() * 1000.0
             ),
             cumulative_ms = format!("{:.2}", t_embedding.as_secs_f64() * 1000.0),
-            has_secondary = query_embedding_secondary.is_some(),
+            has_secondary = !space_queries.is_empty(),
             "recall [layer:embedding] query embedding"
         );
 
@@ -1673,141 +1652,45 @@ impl super::MemorySystem {
                 *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
             }
 
-            // Secondary Vamana (768d) results: 4th RRF signal
-            // RRF is rank-based, so score scale differences between 384d/768d spaces
-            // don't matter. Weight is split from semantic_w to avoid inflating total.
-            let use_dual = query.dual_index.unwrap_or(true);
-            if use_dual {
-                // When a learned secondary→primary alignment is installed for the
-                // active (primary, secondary) pair, route the secondary leg through
-                // the *aligned* path: encode the query with the secondary model,
-                // project it into primary space, and search the PRIMARY index. This
-                // lets the 768d secondary contribute in a space the primary index
-                // actually shares, instead of only competing inside the separate
-                // secondary Vamana. Gated on `has_alignment()` so the no-alignment
-                // path below is byte-identical to before.
-                let aligned_results: Option<Vec<(MemoryId, f32)>> = if self.embedder.has_alignment()
-                {
-                    match self
-                        .retriever
-                        .search_ids_aligned(query_text, query.max_results * 8)
-                    {
-                        Ok(r) if !r.is_empty() => Some(r),
-                        Ok(_) => Some(Vec::new()),
-                        Err(e) => {
-                            tracing::warn!("Aligned secondary search failed (non-fatal): {}", e);
-                            None
-                        }
+            // The legs beyond the primary index. RRF is rank-based, so the spaces' score scales
+            // do not matter; each leg weighs a share of semantic_w, so the total is not inflated:
+            // the secondary ratio, the space's dial weight, and for a leg through a fitted map,
+            // the map's confidence. The leg through the secondary-to-primary map searches the
+            // primary index, so its hits count for the primary space.
+            let finished_legs = pending_legs.finish();
+            self.retriever.observe_leg_scores(&finished_legs);
+            let sec_ratio = self
+                .cognitive_dials
+                .read()
+                .secondary_rrf_ratio
+                .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
+            for leg in &finished_legs {
+                if leg.hits.is_empty() {
+                    continue;
+                }
+                let w = match &leg.kind {
+                    LegKind::Aligned => semantic_w * sec_ratio,
+                    LegKind::Direct => semantic_w * sec_ratio * space_weight(&leg.space),
+                    LegKind::Bridged { confidence, .. } => {
+                        semantic_w * sec_ratio * confidence * space_weight(&leg.space)
                     }
-                } else {
-                    None
                 };
-
-                if let Some(aligned) = aligned_results {
-                    if !aligned.is_empty() {
-                        let sec_ratio = self
-                            .cognitive_dials
-                            .read()
-                            .secondary_rrf_ratio
-                            .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
-                        let sec_w = semantic_w * sec_ratio;
-                        for (r, (id, _)) in aligned.iter().enumerate() {
-                            *fused.entry(id.clone()).or_insert(0.0) += sec_w / (k + (r + 1) as f32);
-                            mark_space(&mut attr, id, &index_space);
-                        }
-                        tracing::debug!(
-                            "Layer 4 RRF: aligned secondary (projected→primary) added {} results (w={:.2})",
-                            aligned.len(),
-                            sec_w
-                        );
-                    }
-                } else {
-                    for (space, sec_emb) in &space_queries {
-                        match self
-                            .retriever
-                            .search_space(space, sec_emb, query.max_results * 8)
-                        {
-                            Ok(sec_results) if !sec_results.is_empty() => {
-                                // Use fraction of semantic weight for secondary — it's a refinement
-                                // signal, not a replacement for primary vector search.
-                                // Precedence: live dial `secondary_rrf_ratio` → const 0.5.
-                                let sec_ratio = self
-                                    .cognitive_dials
-                                    .read()
-                                    .secondary_rrf_ratio
-                                    .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
-                                let sec_w = semantic_w * sec_ratio * space_weight(space);
-                                for (r, (id, _)) in sec_results.iter().enumerate() {
-                                    *fused.entry(id.clone()).or_insert(0.0) +=
-                                        sec_w / (k + (r + 1) as f32);
-                                    mark_space(&mut attr, id, space);
-                                }
-                                tracing::debug!(
-                                    "Layer 4 RRF: {} index added {} results (w={:.2})",
-                                    space,
-                                    sec_results.len(),
-                                    sec_w
-                                );
-                            }
-                            Ok(_) => {} // Empty results — that space's index may be unpopulated
-                            Err(e) => {
-                                tracing::warn!("{} index search failed (non-fatal): {}", space, e);
-                            }
-                        }
-                    }
+                for (r, (id, _)) in leg.hits.iter().enumerate() {
+                    *fused.entry(id.clone()).or_insert(0.0) += w / (k + (r + 1) as f32);
+                    mark_space(&mut attr, id, &leg.space);
                 }
+                tracing::debug!(
+                    "Layer 4 RRF: {:?} leg on {} added {} results (w={:.2})",
+                    leg.kind,
+                    leg.space,
+                    leg.hits.len(),
+                    w
+                );
             }
-
-            // Spaces reached through a fitted map: a query vector in a space the embedder
-            // writes, mapped into an indexed space no embedder here writes — a space kept through
-            // a migration, or another instance's. Each map's results are weighed by its
-            // confidence, its held-out paired cosine.
-            if use_dual {
-                let bridge_ratio = self
-                    .cognitive_dials
-                    .read()
-                    .secondary_rrf_ratio
-                    .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
-                for (from, to, _) in self.embedder.bridges() {
-                    if to == index_space || space_queries.iter().any(|(s, _)| *s == to) {
-                        continue;
-                    }
-                    let query_vec: Option<&Vec<f32>> = if from == index_space {
-                        Some(&query_embedding)
-                    } else {
-                        space_queries
-                            .iter()
-                            .find(|(s, _)| *s == from)
-                            .map(|(_, q)| *q)
-                    };
-                    let Some(q) = query_vec else {
-                        continue;
-                    };
-                    match self
-                        .retriever
-                        .search_bridged(&from, &to, q, query.max_results * 8)
-                    {
-                        Ok((hits, confidence)) if !hits.is_empty() => {
-                            let w = semantic_w * bridge_ratio * confidence * space_weight(&to);
-                            for (r, (id, _)) in hits.iter().enumerate() {
-                                *fused.entry(id.clone()).or_insert(0.0) += w / (k + (r + 1) as f32);
-                                mark_space(&mut attr, id, &to);
-                            }
-                            tracing::debug!(
-                                "Layer 4 RRF: {} reached from {} added {} results (w={:.2})",
-                                to,
-                                from,
-                                hits.len(),
-                                w
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("{from} → {to} search failed (non-fatal): {e}");
-                        }
-                    }
-                }
-            }
+            leg_record.extend(finished_legs.into_iter().map(|leg| {
+                let ranked = leg.hits.into_iter().map(|(id, _)| id).collect();
+                (leg.space, ranked)
+            }));
 
             // ===========================================================================
             // LAYER 4.5: ATTRIBUTE QUERY BOOST
@@ -4515,6 +4398,10 @@ impl super::MemorySystem {
             // per result row. Avoids a full KV prefix scan per insert.
             self.retrieval_trace_store.enforce_pending_bound();
 
+            let returned: Vec<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
+            self.retriever
+                .observe_leg_depths(&leg_record, &returned, query.max_results);
+
             // R3b SHADOW DELTA — compute the learned-weighted score alongside
             // the static score and log the delta.  PURELY READ-ONLY w.r.t. the
             // live result: `memories`, `m.score`, and the returned order are
@@ -4566,6 +4453,91 @@ impl super::MemorySystem {
         }
 
         Ok(memories)
+    }
+
+    /// The query's vector in the primary space and, with a secondary embedder, in the
+    /// secondary's: the caller's or the query cache's when either has one, else embedded, the
+    /// two at once when both must be. The secondary embeds the text as a query, the side an
+    /// asymmetric model such as nomic searches with.
+    fn query_vectors(
+        &self,
+        query_text: &str,
+        query: &Query,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+        let query_hash = Self::sha256_hash(query_text);
+        // PERFORMANCE: Use pre-computed embedding if caller provided one,
+        // otherwise fall back to SHA256-keyed cache (80ms → <1μs for repeated queries)
+        let known_primary =
+            if let Some(pre) = query.query_embedding.as_ref().filter(|e| !e.is_empty()) {
+                EMBEDDING_CACHE_QUERY
+                    .with_label_values(&["precomputed"])
+                    .inc();
+                tracing::debug!("Query embedding PRECOMPUTED by caller — skipping encode");
+                Some(pre.clone())
+            } else if let Some(cached_embedding) = self.query_cache.get(&query_hash) {
+                EMBEDDING_CACHE_QUERY.with_label_values(&["hit"]).inc();
+                tracing::debug!("Query embedding cache HIT for: {}", query_text);
+                Some(cached_embedding)
+            } else {
+                EMBEDDING_CACHE_QUERY.with_label_values(&["miss"]).inc();
+                tracing::debug!(
+                    "Query embedding cache MISS - generating for: {}",
+                    query_text
+                );
+                None
+            };
+
+        let secondary_space = self.embedder.secondary_space();
+        let mut known_secondary = None;
+        let mut secondary_to_embed = None;
+        if let Some(space) = &secondary_space {
+            match self.query_cache.get_in(space, &query_hash) {
+                Some(vector) => known_secondary = Some(vector),
+                None => secondary_to_embed = Some(space),
+            }
+        }
+
+        let embed_primary = || -> Result<Vec<f32>> {
+            let embedding = self
+                .embedder
+                .as_ref()
+                .encode(query_text)
+                .context("Failed to generate query embedding")?;
+            self.query_cache.insert(query_hash, embedding.clone());
+            EMBEDDING_CACHE_QUERY_SIZE.set(self.query_cache.entry_count() as i64);
+            Ok(embedding)
+        };
+        let embed_secondary = |space: &SpaceId| -> Option<Vec<f32>> {
+            match self.embedder.encode_secondary_query(query_text) {
+                Ok(Some(vector)) => {
+                    self.query_cache
+                        .insert_in(space, query_hash, vector.clone());
+                    Some(vector)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("Secondary query embedding failed (non-fatal): {e:#}");
+                    None
+                }
+            }
+        };
+
+        let (primary, embedded_secondary) = match (known_primary, secondary_to_embed) {
+            (Some(primary), to_embed) => (primary, to_embed.and_then(embed_secondary)),
+            (None, None) => (embed_primary()?, None),
+            (None, Some(space)) => {
+                let (primary, secondary) = std::thread::scope(|scope| {
+                    let secondary = scope.spawn(|| embed_secondary(space));
+                    (embed_primary(), secondary.join())
+                });
+                let secondary = secondary.unwrap_or_else(|_| {
+                    tracing::error!("secondary query embedding panicked; recall goes without it");
+                    None
+                });
+                (primary?, secondary)
+            }
+        };
+        Ok((primary, known_secondary.or(embedded_secondary)))
     }
 
     /// Spreading activation recall: graph-driven memory retrieval (V5 toroid closure)

@@ -147,6 +147,12 @@ pub struct CognitiveDials {
     /// weight is `rrf_weights`' second term.
     #[serde(default)]
     pub space_weights: std::collections::BTreeMap<String, f32>,
+    /// Per-space candidate budget of a recall leg beyond the primary index, in multiples of
+    /// the results asked for, keyed by space id. A space with no entry asks for what its own
+    /// record of returned depth supports, 8 until it has one. The primary space's entry
+    /// governs the leg through the secondary-to-primary map, not the primary search.
+    #[serde(default)]
+    pub space_candidates: std::collections::BTreeMap<String, f32>,
     /// BM25 minimum-score floor for lexical candidates. Default 0.1.
     #[serde(default)]
     pub bm25_min_score: Option<f32>,
@@ -408,6 +414,7 @@ impl Default for CognitiveDials {
             rrf_k_inner: None,
             secondary_rrf_ratio: None,
             space_weights: Default::default(),
+            space_candidates: Default::default(),
             bm25_min_score: None,
             onto_rerank_boost: None,
             onto_rerank_max: None,
@@ -456,6 +463,12 @@ impl CognitiveDials {
             .retain(|space, _| crate::embeddings::space::SpaceId::parse(space).is_some());
         for weight in self.space_weights.values_mut() {
             *weight = weight.clamp(0.0, 2.0);
+        }
+        self.space_candidates.retain(|space, factor| {
+            crate::embeddings::space::SpaceId::parse(space).is_some() && factor.is_finite()
+        });
+        for factor in self.space_candidates.values_mut() {
+            *factor = factor.clamp(1.0, crate::memory::space_legs::MAX_CANDIDATE_FACTOR);
         }
         cl(&mut self.bm25_min_score, 0.0, 1.0);
         cl(&mut self.onto_rerank_boost, 0.0, 1.0);
@@ -593,6 +606,26 @@ mod space_weight_tests {
         let dials = dials.sanitized();
         assert_eq!(dials.space_weights.len(), 1);
         assert_eq!(dials.space_weights["minilm-l6-v2@384"], 2.0);
+    }
+
+    #[test]
+    fn space_candidates_keep_valid_spaces_and_clamp() {
+        let mut dials = CognitiveDials::default();
+        for (space, factor) in [
+            ("minilm-l6-v2@384", 0.2),
+            ("nomic-embed-text-v1.5@768", 100.0),
+            ("unrecorded@512", f32::NAN),
+            ("not a space", 4.0),
+        ] {
+            dials.space_candidates.insert(space.to_string(), factor);
+        }
+        let dials = dials.sanitized();
+        assert_eq!(dials.space_candidates.len(), 2);
+        assert_eq!(dials.space_candidates["minilm-l6-v2@384"], 1.0);
+        assert_eq!(
+            dials.space_candidates["nomic-embed-text-v1.5@768"],
+            crate::memory::space_legs::MAX_CANDIDATE_FACTOR
+        );
     }
 }
 

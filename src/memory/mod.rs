@@ -51,6 +51,7 @@ pub mod sessions;
 pub mod sleep_time;
 pub mod slow_store;
 pub mod space_index;
+pub mod space_legs;
 pub mod space_migration;
 pub mod storage;
 pub mod tag_sources;

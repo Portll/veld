@@ -5,7 +5,14 @@
 //! before/after row. Four measurements, each a row in one JSON report:
 //!
 //! - **search**: vector-leg latency (p50/p95/p99) over one space and over two, at each corpus
-//!   size, the way recall pays it today: one index search per space, in sequence.
+//!   size: one index search per space, in sequence.
+//! - **query**: the query path per space, embedding included (the embedder's simulated cost
+//!   per call and per text), over one space and over two: in sequence, as recall paid it
+//!   before step 10, and at once, as it does now: both embeddings together, the second
+//!   space's search on its own thread beside the primary's. Step 10 is done when the
+//!   concurrent row's p95 is within 1.3x of the one-space row's at 100 000 memories. In
+//!   recall the second space's search also overlaps graph traversal and BM25, which this row
+//!   leaves out, so it bounds the overlap from below.
 //! - **footprint**: bytes a space holds as full vectors and as product-quantized codes, and the
 //!   process RSS growth while its index is built.
 //! - **write**: inline write cost through the retrieval engine, embedding included, with an
@@ -74,6 +81,16 @@ enum Row {
         p50_us: u64,
         p95_us: u64,
         p99_us: u64,
+    },
+    Query {
+        memories: usize,
+        mode: &'static str,
+        embed_us: u64,
+        queries: usize,
+        p50_us: u64,
+        p95_us: u64,
+        p99_us: u64,
+        p95_over_one_space: f64,
     },
     Footprint {
         memories: usize,
@@ -229,7 +246,31 @@ fn search_row(
     }
 }
 
-fn measure_search_and_footprint(sizes: &[usize], query_count: usize) -> Result<Vec<Row>> {
+fn query_row(
+    memories: usize,
+    mode: &'static str,
+    embed: Duration,
+    samples: &[Duration],
+    one_space_p95: u64,
+) -> Row {
+    let p95_us = percentile(samples, 0.95);
+    Row::Query {
+        memories,
+        mode,
+        embed_us: embed.as_micros() as u64,
+        queries: samples.len(),
+        p50_us: percentile(samples, 0.50),
+        p95_us,
+        p99_us: percentile(samples, 0.99),
+        p95_over_one_space: p95_us as f64 / one_space_p95.max(1) as f64,
+    }
+}
+
+fn measure_search_and_footprint(
+    sizes: &[usize],
+    query_count: usize,
+    embed: Duration,
+) -> Result<Vec<Row>> {
     let primary = SpaceId::new("bench-primary", PRIMARY_DIM);
     let secondary = SpaceId::new("bench-secondary", SECONDARY_DIM);
     let mut rows = Vec::new();
@@ -281,6 +322,38 @@ fn measure_search_and_footprint(sizes: &[usize], query_count: usize) -> Result<V
             secondary_index.search(&secondary_queries[i], k).map(|_| ())
         })?;
         rows.push(search_row(n, &[&primary, &secondary], "f32", &two));
+
+        let embed_query = || std::thread::sleep(embed);
+        let one_path = timed_searches(&primary_queries, |i| {
+            embed_query();
+            primary_index.search(&primary_queries[i], k).map(|_| ())
+        })?;
+        let one_p95 = percentile(&one_path, 0.95);
+        rows.push(query_row(n, "one-space", embed, &one_path, one_p95));
+        let sequential = timed_searches(&primary_queries, |i| {
+            embed_query();
+            embed_query();
+            primary_index.search(&primary_queries[i], k)?;
+            secondary_index.search(&secondary_queries[i], k).map(|_| ())
+        })?;
+        rows.push(query_row(n, "two-sequential", embed, &sequential, one_p95));
+        let concurrent = timed_searches(&primary_queries, |i| {
+            std::thread::scope(|scope| {
+                let secondary_embed = scope.spawn(embed_query);
+                embed_query();
+                secondary_embed
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the embedding thread panicked"))
+            })?;
+            std::thread::scope(|scope| {
+                let leg =
+                    scope.spawn(|| secondary_index.search(&secondary_queries[i], k).map(|_| ()));
+                primary_index.search(&primary_queries[i], k)?;
+                leg.join()
+                    .map_err(|_| anyhow::anyhow!("the leg thread panicked"))?
+            })
+        })?;
+        rows.push(query_row(n, "two-concurrent", embed, &concurrent, one_p95));
 
         // What product quantization would make of the secondary space: codes instead of
         // floats, searched by asymmetric distance over every code.
@@ -522,6 +595,17 @@ fn print_table(report: &Report) {
                 "search    {memories:>7}  {:<48} {codec:<4} p50 {p50_us:>6}us  p95 {p95_us:>6}us  p99 {p99_us:>6}us",
                 spaces.join(" + ")
             ),
+            Row::Query {
+                memories,
+                mode,
+                p50_us,
+                p95_us,
+                p99_us,
+                p95_over_one_space,
+                ..
+            } => println!(
+                "query     {memories:>7}  {mode:<53} p50 {p50_us:>6}us  p95 {p95_us:>6}us  p99 {p99_us:>6}us  p95 {p95_over_one_space:.2}x one space"
+            ),
             Row::Footprint {
                 memories,
                 space,
@@ -563,7 +647,7 @@ fn main() -> Result<()> {
     let call = Duration::from_micros(env_usize("VELD_BENCH_EMBED_CALL_US", 3000) as u64);
     let text = Duration::from_micros(env_usize("VELD_BENCH_EMBED_TEXT_US", 200) as u64);
 
-    let mut rows = measure_search_and_footprint(&sizes, queries)?;
+    let mut rows = measure_search_and_footprint(&sizes, queries, call + text)?;
     rows.extend(measure_inline_writes(writes, call, text)?);
     let texts: Vec<String> = (0..DRAIN_TEXTS)
         .map(|i| format!("drain text {i}: the embedder sees a paragraph of ordinary length, {i}"))
