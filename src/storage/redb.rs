@@ -1748,17 +1748,14 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         // does not terminate. Dropping a guard because the loop "obviously" ends at a
         // root is how the cycle case becomes a hang instead of a wrong answer.
         let mut ancestors = Vec::new();
-        let mut current = memory_id.clone();
+        let mut parent_id = self.get(memory_id)?.parent_id;
         for _ in 0..100 {
-            let memory = self.get(&current)?;
-            match &memory.parent_id {
-                Some(parent_id) => {
-                    let parent = self.get(parent_id)?;
-                    ancestors.push(parent.clone());
-                    current = parent_id.clone();
-                }
-                None => break,
-            }
+            let Some(id) = parent_id else {
+                break;
+            };
+            let parent = self.get(&id)?;
+            parent_id = parent.parent_id.clone();
+            ancestors.push(parent);
         }
         Ok(ancestors)
     }

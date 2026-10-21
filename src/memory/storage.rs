@@ -3404,18 +3404,17 @@ impl MemoryStorage {
     /// Get the parent chain (ancestors) of a memory
     pub fn get_ancestors(&self, memory_id: &MemoryId) -> Result<Vec<Memory>> {
         let mut ancestors = Vec::new();
-        let mut current_id = memory_id.clone();
+        let mut parent_id = self.get(memory_id)?.parent_id;
 
-        // Walk up the parent chain (max 100 to prevent infinite loops)
+        // Walk up the parent chain (max 100 to prevent infinite loops), reading each
+        // ancestor once: its record carries the next parent id.
         for _ in 0..100 {
-            let memory = self.get(&current_id)?;
-            if let Some(parent_id) = &memory.parent_id {
-                let parent = self.get(parent_id)?;
-                ancestors.push(parent.clone());
-                current_id = parent_id.clone();
-            } else {
+            let Some(id) = parent_id else {
                 break; // Reached root
-            }
+            };
+            let parent = self.get(&id)?;
+            parent_id = parent.parent_id.clone();
+            ancestors.push(parent);
         }
 
         Ok(ancestors)
@@ -6173,6 +6172,38 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    /// Nearest ancestor first up to the root, and a parent cycle stops at the 100-step bound,
+    /// as the redb walk does.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn ancestors_walk_nearest_first_and_a_cycle_stops_at_the_bound() {
+        let (storage, _dir) = test_storage();
+        let root = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+        let mut mid = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+        mid.parent_id = Some(root.id.clone());
+        let mut leaf = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+        leaf.parent_id = Some(mid.id.clone());
+        for m in [&root, &mid, &leaf] {
+            storage.store(m).unwrap();
+        }
+        let ids: Vec<MemoryId> = storage
+            .get_ancestors(&leaf.id)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec![mid.id.clone(), root.id.clone()]);
+        assert!(storage.get_ancestors(&root.id).unwrap().is_empty());
+
+        let mut a = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+        let mut b = memory_referencing(MemoryId(uuid::Uuid::new_v4()), &[]);
+        a.parent_id = Some(b.id.clone());
+        b.parent_id = Some(a.id.clone());
+        storage.store(&a).unwrap();
+        storage.store(&b).unwrap();
+        assert_eq!(storage.get_ancestors(&a.id).unwrap().len(), 100);
     }
 
     #[cfg(feature = "rocksdb")]
