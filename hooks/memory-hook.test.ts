@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -16,6 +17,7 @@ import {
   buildAgentSessionMarker,
   buildPreToolContext,
   detectBinary,
+  detectRepo,
   formatRelativeTime,
   formatMemoriesForContext,
   freshSessionState,
@@ -24,6 +26,7 @@ import {
   loadSessionState,
   pruneSessionStates,
   removeAgentSessionMarker,
+  repoSlugFromRemote,
   saveSessionState,
   sessionStatePath,
   shellErrorText,
@@ -156,6 +159,52 @@ describe("buildPreToolContext", () => {
 
   it("treats PowerShell like Bash", () => {
     expect(buildPreToolContext("PowerShell", { command: "Get-ChildItem" })).toBe("Running command: Get-ChildItem");
+  });
+});
+
+describe("repoSlugFromRemote", () => {
+  it("takes Owner/Repo from https, scp-style and ssh remotes", () => {
+    expect(repoSlugFromRemote("https://github.com/Portll/veld.git")).toBe("Portll/veld");
+    expect(repoSlugFromRemote("git@github.com:Portll/veld.git")).toBe("Portll/veld");
+    expect(repoSlugFromRemote("ssh://git@github.com/Portll/veld")).toBe("Portll/veld");
+    expect(repoSlugFromRemote("https://gitlab.com/group/sub/repo.git/")).toBe("sub/repo");
+  });
+
+  it("refuses a remote with no owner", () => {
+    expect(repoSlugFromRemote("veld")).toBeNull();
+    expect(repoSlugFromRemote("")).toBeNull();
+  });
+});
+
+describe("detectRepo", () => {
+  const saved = process.env.VELD_REPO;
+  let dir: string;
+  beforeEach(() => {
+    delete process.env.VELD_REPO;
+    dir = mkdtempSync(join(tmpdir(), "veld-hook-repo-"));
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.VELD_REPO;
+    else process.env.VELD_REPO = saved;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("prefers VELD_REPO", () => {
+    process.env.VELD_REPO = "acme/declared";
+    expect(detectRepo(dir)).toBe("acme/declared");
+  });
+
+  it("is null outside a repository", () => {
+    expect(detectRepo(dir)).toBeNull();
+  });
+
+  it("uses the origin remote, and the checkout's directory name without one", () => {
+    const checkout = join(dir, "widget");
+    mkdirSync(checkout);
+    Bun.spawnSync(["git", "init", "-q", checkout]);
+    expect(detectRepo(checkout)).toBe("widget");
+    Bun.spawnSync(["git", "-C", checkout, "remote", "add", "origin", "git@github.com:acme/widget.git"]);
+    expect(detectRepo(checkout)).toBe("acme/widget");
   });
 });
 
@@ -568,6 +617,22 @@ describe("hook process against a mock veld server", () => {
     const [surfacing] = to("/api/proactive_context");
     expect(surfacing.body.auto_ingest).toBe(true);
     expect(surfacing.body.sequence_number).toBe(1);
+  });
+
+  it("sends the session's repo on surfacing and on stored memories", async () => {
+    const env = { VELD_REPO: "acme/one" };
+    await runHook({ hook_event_name: "UserPromptSubmit", session_id: "s-repo", prompt: "How do the cargo builds work here?" }, env);
+    await runHook(
+      { hook_event_name: "PostToolUseFailure", session_id: "s-repo", tool_name: "Bash", tool_input: { command: "cargo test" }, error: "Exit code 101\nerror: test failed" },
+      env
+    );
+    expect(to("/api/proactive_context")[0].body.repo).toBe("acme/one");
+    expect(to("/api/remember")[0].body.repo).toBe("acme/one");
+  });
+
+  it("sends no repo outside a repository", async () => {
+    await runHook({ hook_event_name: "UserPromptSubmit", session_id: "s-norepo", prompt: "How do the cargo builds work here?" }, { VELD_REPO: "" });
+    expect(to("/api/proactive_context")[0].body.repo).toBeUndefined();
   });
 
   it("injects nothing on a timeout and does not treat the backend as down", async () => {

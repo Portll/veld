@@ -24,8 +24,9 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 const VELD_API_URL = process.env.VELD_API_URL || "http://127.0.0.1:3030";
 const VELD_API_KEY = resolveApiKey();
@@ -193,6 +194,52 @@ export interface SessionState {
   debounce: Record<string, { at: number; result: string | null }>;
   /** Agent-session marker written at SessionStart; SessionEnd runs in another process */
   markerPath: string | null;
+  /** Repository slug sent as `repo` on every call; null when the working directory is not a repo */
+  repo?: string | null;
+}
+
+// =============================================================================
+// REPOSITORY SCOPE
+// =============================================================================
+
+/** "Owner/Repo" from an https, ssh or scp-style remote URL; null when it has fewer than two path parts. */
+export function repoSlugFromRemote(url: string): string | null {
+  const path = url
+    .trim()
+    .replace(/^[a-z+]+:\/\/[^/]+\//i, "")
+    .replace(/^[^@/:]+@[^:/]+:/, "")
+    .replace(/\.git\/?$/, "")
+    .replace(/\/+$/, "");
+  const parts = path.split("/").filter(Boolean);
+  return parts.length >= 2 ? parts.slice(-2).join("/") : null;
+}
+
+function git(dir: string, args: string[]): string | null {
+  try {
+    return execFileSync("git", ["-C", dir, ...args], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1500,
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The repository a session works in, the same for every worktree of it: VELD_REPO if set, else
+ * the origin remote's "Owner/Repo", else the main checkout's directory name.
+ */
+export function detectRepo(dir: string): string | null {
+  const declared = process.env.VELD_REPO?.trim();
+  if (declared) return declared;
+  const remote = git(dir, ["remote", "get-url", "origin"]);
+  const fromRemote = remote ? repoSlugFromRemote(remote) : null;
+  if (fromRemote) return fromRemote;
+  const commonDir = git(dir, ["rev-parse", "--git-common-dir"]);
+  if (!commonDir) return null;
+  const absolute = isAbsolute(commonDir) ? commonDir : join(dir, commonDir);
+  return basename(dirname(absolute)) || null;
 }
 
 const STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -233,7 +280,8 @@ function isSessionState(value: unknown): value is SessionState {
     isRecord(value.boostCounts) &&
     Array.isArray(value.pendingToolActions) &&
     isRecord(value.debounce) &&
-    (value.markerPath === null || typeof value.markerPath === "string")
+    (value.markerPath === null || typeof value.markerPath === "string") &&
+    (value.repo === undefined || value.repo === null || typeof value.repo === "string")
   );
 }
 
@@ -583,6 +631,7 @@ async function surfaceProactiveContext(
       sequence_number: state.sequence,
       emotional_valence: 0.0,
       emotional_arousal: 0.15,
+      ...(state.repo ? { repo: state.repo } : {}),
       ...(toolActions.length > 0 ? { tool_actions: toolActions } : {}),
       ...feedbackPayload,
     },
@@ -662,6 +711,7 @@ async function rememberInEpisode(
     episode_id: state.episodeId,
     sequence_number: state.sequence,
     ...(state.lastStoredMemoryId ? { preceding_memory_id: state.lastStoredMemoryId } : {}),
+    ...(state.repo ? { repo: state.repo } : {}),
     ...emotion,
   })) as { id?: string } | null;
   if (resp?.id) state.lastStoredMemoryId = resp.id;
@@ -1075,6 +1125,9 @@ async function main(): Promise<void> {
   }
 
   const state = loadSessionState(input.session_id);
+  if (state.repo === undefined) {
+    state.repo = detectRepo(input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd());
+  }
 
   switch (eventName) {
     case "SessionStart":
