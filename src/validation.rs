@@ -9,6 +9,7 @@ pub const MAX_USER_ID_LENGTH: usize = 128;
 pub const MAX_CONTENT_LENGTH: usize = 50_000; // 50KB
 pub const MAX_PATTERN_LENGTH: usize = 256; // Max regex pattern length
 pub const MAX_ENTITY_LENGTH: usize = 256; // Max entity name length
+pub const MAX_REPO_LENGTH: usize = 200; // Max repository slug length, in chars
 #[allow(unused)] // Public API - available for validation
 pub const MAX_METADATA_SIZE: usize = 10_000; // Max metadata JSON size (10KB)
 #[allow(unused)] // Public API - available for validation
@@ -263,6 +264,27 @@ pub fn validate_entity(entity: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a repository slug and return it trimmed.
+pub fn validate_repo(repo: &str) -> Result<String> {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return Err(anyhow!("repo cannot be empty"));
+    }
+
+    let chars = repo.chars().count();
+    if chars > MAX_REPO_LENGTH {
+        return Err(anyhow!(
+            "repo too long: {chars} chars (max: {MAX_REPO_LENGTH})"
+        ));
+    }
+
+    if repo.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("repo contains control characters"));
+    }
+
+    Ok(repo.to_string())
+}
+
 /// Validate entities list
 #[allow(unused)] // Public API - available for validation
 pub fn validate_entities(entities: &[String]) -> Result<()> {
@@ -380,6 +402,22 @@ mod tests {
     fn test_invalid_content() {
         assert!(validate_content("", false).is_err()); // empty not allowed
         assert!(validate_content(&"x".repeat(100_000), false).is_err()); // too long
+    }
+
+    #[test]
+    fn repo_is_trimmed_and_bounded() {
+        assert_eq!(validate_repo("  acme/one\n").unwrap(), "acme/one");
+        assert_eq!(
+            validate_repo(&"é".repeat(MAX_REPO_LENGTH))
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_REPO_LENGTH
+        );
+        assert!(validate_repo("").is_err());
+        assert!(validate_repo(" \t ").is_err());
+        assert!(validate_repo(&"a".repeat(MAX_REPO_LENGTH + 1)).is_err());
+        assert!(validate_repo("acme/\u{0}one").is_err());
     }
 
     #[test]
