@@ -3927,7 +3927,9 @@ mod tests {
         let mut bridges = 0usize;
         eprintln!("DIAG fragment census ({} entities total):", all.len());
         for ent in &all {
-            if ent.name.contains("incident") {
+            // Only the event names themselves are skipped: a phrase that merely contains the
+            // head noun ("incident set") is exactly the kind of entity that bridges chains.
+            if ent.name.starts_with("the ") && ent.name.ends_with(" incident") {
                 continue;
             }
             let edges = g
