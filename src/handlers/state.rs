@@ -4682,15 +4682,35 @@ impl MultiUserMemoryManager {
         let extract_predicates: bool = std::env::var("SHODH_GRAPH_EXTRACTED_PREDICATES")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
             .unwrap_or(true);
-        // A name contained in a co-mentioned name ("Mor" in "the Morwen incident") is a
-        // recognizer fragment; a causal edge on it welds unrelated chains together.
+        // A name contained in a longer co-mentioned name ("Mor" in "the Morwen incident"), or
+        // whose mention overlaps one in the text (the keyword "incident set" straddling "the
+        // Morwen incident set ..."), is a fragment, not a participant; a causal edge on it welds
+        // every chain that repeats the phrase together. Mentions are located as
+        // `extract_directed_predicate` locates them: the first occurrence, ASCII-lowercased.
+        let content_lower = experience.content.to_ascii_lowercase();
+        let mention_spans: Vec<Option<std::ops::Range<usize>>> = entity_uuids
+            .iter()
+            .map(|(name, _)| {
+                let name = name.to_ascii_lowercase();
+                content_lower
+                    .find(&name)
+                    .map(|start| start..start + name.len())
+            })
+            .collect();
         let fragment_of_comention: Vec<bool> = (0..entity_uuids.len())
             .map(|k| {
                 let name_k = entity_uuids[k].0.to_lowercase();
                 entity_uuids.iter().enumerate().any(|(m, other)| {
                     m != k && {
                         let name_m = other.0.to_lowercase();
-                        name_m.len() > name_k.len() && name_m.contains(name_k.as_str())
+                        let overlaps = match (&mention_spans[k], &mention_spans[m]) {
+                            (Some(span_k), Some(span_m)) => {
+                                span_k.start < span_m.end && span_m.start < span_k.end
+                            }
+                            _ => false,
+                        };
+                        name_m.len() > name_k.len()
+                            && (name_m.contains(name_k.as_str()) || overlaps)
                     }
                 })
             })
