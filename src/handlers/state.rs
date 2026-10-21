@@ -298,6 +298,9 @@ pub struct MultiUserMemoryManager {
     /// access; this guards against re-running it on every cache miss.
     reconciled_users: DashMap<String, ()>,
 
+    /// Set by [`Self::close_all_writes`]; a tenant opened after it starts closed.
+    writes_closed: std::sync::atomic::AtomicBool,
+
     /// Callers that missed the tenant cache and do not have their tenant yet: the one
     /// opening it and any queued on its init lock. Non-zero means a tenant is opening,
     /// and `/health/ready` answers 503 until it has.
@@ -731,6 +734,7 @@ impl MultiUserMemoryManager {
             journaled_writers: DashMap::new(),
             journaled_writer_init_locks: DashMap::new(),
             reconciled_users: DashMap::new(),
+            writes_closed: std::sync::atomic::AtomicBool::new(false),
             tenant_open_waiters: std::sync::atomic::AtomicUsize::new(0),
             wiki_watchers: DashMap::new(),
             storage_capabilities,
@@ -1549,6 +1553,11 @@ impl MultiUserMemoryManager {
 
         self.user_memories
             .insert(user_id.to_string(), memory_arc.clone());
+        // Checked after the insert, not before: a close that runs between a check and
+        // the insert would miss this tenant in its cache walk.
+        if self.writes_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            memory_arc.read().close_writes();
+        }
 
         info!("Created memory system for user: {}", user_id);
 
@@ -1770,6 +1779,21 @@ impl MultiUserMemoryManager {
     }
 
     /// Flush all RocksDB databases
+    /// Close every tenant's write gate, waiting for the write in progress in each. Queued
+    /// and later creates and upserts fail with `WritesClosed` (503 to HTTP callers)
+    /// instead of running past the flush. Blocking: call it from the blocking pool.
+    /// Returns how many tenants were closed. Reaches the cached tenants only: one the
+    /// cache evicted while a request still held it keeps its gate open.
+    pub fn close_all_writes(&self) -> usize {
+        self.writes_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let tenants: Vec<SharedUserMemory> = self.user_memories.iter().map(|(_, v)| v).collect();
+        for memory in &tenants {
+            memory.read().close_writes();
+        }
+        tenants.len()
+    }
+
     pub fn flush_all_databases(&self) -> Result<()> {
         info!("Flushing all databases to disk...");
 
