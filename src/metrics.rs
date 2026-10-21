@@ -597,6 +597,15 @@ pub static INTENT_LOG_SYNC_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     .expect("INTENT_LOG_SYNC_DURATION metric must be valid at compile time")
 });
 
+/// Journaled writes another writer's sync made durable
+pub static INTENT_LOG_SYNC_SHARED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::with_opts(Opts::new(
+        "veld_intent_log_sync_shared_total",
+        "Journaled writes that skipped their own sync because another writer's sync covered them",
+    ))
+    .expect("INTENT_LOG_SYNC_SHARED_TOTAL metric must be valid at compile time")
+});
+
 /// Corrupt-tail truncation events
 pub static INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
@@ -1110,6 +1119,7 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(INTENT_LOG_APPEND_DURATION, "INTENT_LOG_APPEND_DURATION");
     register!(INTENT_LOG_SYNC_TOTAL, "INTENT_LOG_SYNC_TOTAL");
     register!(INTENT_LOG_SYNC_DURATION, "INTENT_LOG_SYNC_DURATION");
+    register!(INTENT_LOG_SYNC_SHARED_TOTAL, "INTENT_LOG_SYNC_SHARED_TOTAL");
     register!(
         INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL,
         "INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL"

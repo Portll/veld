@@ -6,7 +6,7 @@
 
 # Metrics Reference
 
-Veld exposes **39** Prometheus metrics on the `/metrics` endpoint. Visibility is configured by `VELD_METRICS_PUBLIC` — when `true`, `/metrics` is unauthenticated; otherwise it requires an API key.
+Veld exposes **40** Prometheus metrics on the `/metrics` endpoint. Visibility is configured by `VELD_METRICS_PUBLIC` — when `true`, `/metrics` is unauthenticated; otherwise it requires an API key.
 
 | Name | Kind | Help | Source |
 |---|---|---|---|
@@ -28,6 +28,7 @@ Veld exposes **39** Prometheus metrics on the `/metrics` endpoint. Visibility is
 | `veld_intent_log_append_duration_seconds` | Histogram | Intent log append duration | `src/metrics.rs` |
 | `veld_intent_log_append_total` | IntCounterVec | Total intent log append operations | `src/metrics.rs` |
 | `veld_intent_log_sync_duration_seconds` | Histogram | Intent log sync (fsync) duration | `src/metrics.rs` |
+| `veld_intent_log_sync_shared_total` | IntCounter | Journaled writes that skipped their own sync because another writer's sync covered them | `src/metrics.rs` |
 | `veld_intent_log_sync_total` | IntCounterVec | Total intent log sync (fsync) operations | `src/metrics.rs` |
 | `veld_legacy_fallback_branch_total` | HistogramVec | Total fallback deserialization branch hits | `src/metrics.rs` |
 | `veld_memories_by_tier` | IntGauge | Total memories by tier | `src/metrics.rs` |

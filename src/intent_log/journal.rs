@@ -57,16 +57,34 @@
 //! the writer persists the log's [`super::FrameIndex`] there after every
 //! [`FRAME_INDEX_STRIDE`]-th record and when it is dropped, so the next open
 //! of the log resumes its tail scan near the end instead of at the start.
+//!
+//! ## Group commit
+//!
+//! Concurrent writers to one tenant share a [`SharedJournal`]. Each write is
+//! encoded and queued before the writer's mutex is taken; whichever thread
+//! next holds the mutex with its own write still queued commits the whole
+//! queue as one group: every record appended, one sync, then every record
+//! dispatched in LSN order. The writes that queued while that sync ran form
+//! the next group. A write another thread committed finds its outcome waiting
+//! when it gets the mutex and returns without a sync of its own.
+//!
+//! Append, sync, rotation and dispatch all still run under the writer's
+//! mutex, so whoever holds it sees a log whose frames are all synced and
+//! applied, projections still apply in LSN order, and no checkpoint can name
+//! an LSN the log has not made durable.
 
 use std::collections::{HashSet, VecDeque};
 use std::error::Error;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
-use crate::metrics::{Timer, PROJECTION_APPLY_DURATION, PROJECTION_APPLY_TOTAL};
+use crate::metrics::{
+    Timer, INTENT_LOG_SYNC_SHARED_TOTAL, PROJECTION_APPLY_DURATION, PROJECTION_APPLY_TOTAL,
+};
 
 use super::checkpoint_store::{CheckpointStore, CheckpointStoreError};
 use super::payload::{self, IntentPayload, PayloadError};
@@ -471,6 +489,10 @@ pub enum JournalError {
     Log(#[from] IntentLogError),
     #[error("payload encode error: {0}")]
     Payload(#[from] PayloadError),
+    /// The thread committing this write's group stopped before it recorded
+    /// the write's outcome, so whether its records are durable is unknown.
+    #[error("journal write unresolved: the thread committing its group stopped before recording its outcome")]
+    Unresolved,
 }
 
 /// Outcome of a successful `record_and_apply`. The LSN is the log
@@ -676,7 +698,7 @@ impl JournaledWriter {
     ///
     ///   1. Encode `payload` to bytes.
     ///   2. Append to the log.
-    ///   3. `sync` (fsync the underlying file).
+    ///   3. `sync` (at the log's durability).
     ///   4. Hand the record to every deferred projection's queue.
     ///   5. Walk every inline projection and call `apply(lsn, payload)`.
     ///
@@ -692,6 +714,9 @@ impl JournaledWriter {
     /// touched, and the record is not in the log: `IntentLog` cuts a failed
     /// write back to the last synced frame and the next record takes its
     /// LSN. A frame torn by a crash is cut by `IntentLog::open`.
+    ///
+    /// Concurrent writers go through [`SharedJournal::record_and_apply`]
+    /// instead, which shares step 3 between them.
     #[tracing::instrument(
         level = "info",
         name = "journal.record_and_apply",
@@ -707,77 +732,26 @@ impl JournaledWriter {
         &mut self,
         payload: &IntentPayload,
     ) -> Result<WriteOutcome, JournalError> {
-        let lsn = match payload::append(&mut self.log, payload) {
-            Ok(lsn) => lsn,
-            Err(PayloadError::Log(e)) => {
-                tracing::error!(
-                    error = %e,
-                    "journal record_and_apply failed: intent log error during append",
-                );
-                return Err(JournalError::Log(e));
-            }
-            Err(
-                e @ (PayloadError::Encode(_)
-                | PayloadError::Decode(_)
-                | PayloadError::UnknownSchemaVersion { .. }
-                | PayloadError::Migration(_)),
-            ) => {
-                // Encode-side: a payload variant this binary cannot
-                // serialise (rare — bincode of #[non_exhaustive] enums
-                // does not fail in practice). Decode-side and the two
-                // schema-version variants are not reachable from
-                // `payload::append` today (that function only encodes)
-                // but we cover them so adding a new payload error
-                // variant upstream is a "fix the match" change, not a
-                // compile-error scramble at every call site.
-                tracing::error!(
-                    error = %e,
-                    "journal record_and_apply failed: payload encode error",
-                );
-                return Err(JournalError::Payload(e));
-            }
-            #[allow(unreachable_patterns)]
-            // defensive: documents decode-side variants on the append path
-            Err(e @ (PayloadError::UnknownSchemaVersion { .. } | PayloadError::Migration(_))) => {
-                // Decode-side variants — shouldn't fire on the append/encode
-                // path. If they do, it's a programming error (someone wired
-                // a decode through the append surface). Surface loudly.
-                tracing::error!(
-                    error = %e,
-                    "journal record_and_apply failed: decode-side payload error on append path \
-                     (likely a programming error — append shouldn't decode)"
-                );
-                return Err(JournalError::Payload(e));
-            }
-        };
-        tracing::Span::current().record("lsn", lsn.0);
-        if let Err(e) = self.log.sync() {
-            tracing::error!(
-                error = %e,
-                lsn = lsn.0,
-                "journal record_and_apply failed: intent log sync error",
-            );
-            return Err(JournalError::Log(e));
-        }
-
-        if lsn.0.is_multiple_of(FRAME_INDEX_STRIDE) {
-            self.persist_frame_index_logged();
-        }
-
-        let apply_errors = self.dispatch(lsn, payload);
-        Ok(WriteOutcome { lsn, apply_errors })
+        let ticket = Arc::new(Ticket::encode(std::slice::from_ref(payload))?);
+        self.commit_group(std::slice::from_ref(&ticket));
+        let outcome = single_outcome(
+            ticket
+                .take_outcome()
+                .unwrap_or(Err(JournalError::Unresolved)),
+        )?;
+        tracing::Span::current().record("lsn", outcome.lsn.0);
+        Ok(outcome)
     }
 
-    /// [`Self::record_and_apply`] for several payloads with one fsync. Every
+    /// [`Self::record_and_apply`] for several payloads with one sync. Every
     /// payload is encoded before anything is appended, so an encode error
     /// appends nothing; then all are appended, the log is synced once, and
     /// each record is dispatched in LSN order exactly as a single write
     /// would be. Returns one outcome per payload, in order.
     ///
-    /// An append or sync error returns `Err` with the same contract as the
-    /// single-record path: nothing is dispatched, and records appended before
-    /// the failure reach the projections through replay once they are
-    /// durable.
+    /// The batch is durable whole or not at all: if any of its records
+    /// cannot be appended, or the sync fails, the call returns `Err`, the
+    /// records it did append are cut from the log, and nothing is dispatched.
     #[tracing::instrument(
         level = "info",
         name = "journal.record_and_apply_batch",
@@ -791,57 +765,113 @@ impl JournaledWriter {
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
-        let encoded = payloads
-            .iter()
-            .map(payload::encode)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut lsns = Vec::with_capacity(encoded.len());
-        for bytes in &encoded {
-            lsns.push(self.log.append(bytes)?);
+        let ticket = Arc::new(Ticket::encode(payloads)?);
+        self.commit_group(std::slice::from_ref(&ticket));
+        ticket
+            .take_outcome()
+            .unwrap_or(Err(JournalError::Unresolved))
+    }
+
+    /// Commit every write in `group` with one sync: append their records in
+    /// order, sync once, dispatch each record in LSN order, and record each
+    /// write's outcome on its ticket.
+    ///
+    /// A write whose record cannot be appended fails alone: the log takes
+    /// back everything appended since its last sync and the rest of the group
+    /// is appended again, so no write is ever left partly in the log and no
+    /// other write's outcome depends on its payload. A failed sync fails every
+    /// write in the group, since the log rolled all of their records back.
+    #[tracing::instrument(
+        level = "debug",
+        name = "journal.commit_group",
+        skip_all,
+        fields(writes = group.len()),
+    )]
+    fn commit_group(&mut self, group: &[Arc<Ticket>]) {
+        let appended = loop {
+            match self.append_group(group) {
+                Ok(appended) => break appended,
+                Err((failed, error)) => {
+                    tracing::error!(
+                        error = %error,
+                        records = group[failed].records.len(),
+                        "journal write failed: intent log append error",
+                    );
+                    self.log.discard_unsynced();
+                    group[failed].resolve(Err(JournalError::Log(error)));
+                }
+            }
+        };
+        if appended.is_empty() {
+            return;
         }
-        if let Err(e) = self.log.sync() {
+        if let Err(error) = self.log.sync() {
             tracing::error!(
-                error = %e,
-                records = lsns.len(),
-                "journal record_and_apply_batch failed: intent log sync error",
+                error = %error,
+                writes = appended.len(),
+                "journal write failed: intent log sync error",
             );
-            return Err(JournalError::Log(e));
+            let copies = appended.len() - 1;
+            for (index, _) in &appended[..copies] {
+                group[*index].resolve(Err(JournalError::Log(copy_log_error(&error))));
+            }
+            group[appended[copies].0].resolve(Err(JournalError::Log(error)));
+            return;
         }
-        if lsns
+        if appended
             .iter()
+            .flat_map(|(_, lsns)| lsns)
             .any(|lsn| lsn.0.is_multiple_of(FRAME_INDEX_STRIDE))
         {
             self.persist_frame_index_logged();
         }
-        Ok(lsns
-            .into_iter()
-            .zip(payloads)
-            .map(|(lsn, payload)| WriteOutcome {
-                lsn,
-                apply_errors: self.dispatch(lsn, payload),
-            })
-            .collect())
+        for (index, lsns) in appended {
+            let ticket = &group[index];
+            let outcomes = lsns
+                .into_iter()
+                .zip(&ticket.records)
+                .map(|(lsn, (_, payload))| WriteOutcome {
+                    lsn,
+                    apply_errors: self.dispatch(lsn, payload),
+                })
+                .collect();
+            ticket.resolve(Ok(outcomes));
+        }
+    }
+
+    /// Append the records of every unresolved write in `group`. On a failed
+    /// append, the index of the write it belonged to and the error.
+    fn append_group(&mut self, group: &[Arc<Ticket>]) -> Result<Appended, (usize, IntentLogError)> {
+        let mut appended = Vec::with_capacity(group.len());
+        for (index, ticket) in group.iter().enumerate() {
+            if ticket.is_resolved() {
+                continue;
+            }
+            let mut lsns = Vec::with_capacity(ticket.records.len());
+            for (bytes, _) in &ticket.records {
+                lsns.push(self.log.append(bytes).map_err(|error| (index, error))?);
+            }
+            appended.push((index, lsns));
+        }
+        Ok(appended)
     }
 
     /// Hand a durable record to every deferred projection and apply it to
     /// every inline projection, collecting the failures.
-    fn dispatch(&mut self, lsn: Lsn, payload: &IntentPayload) -> Vec<ApplyError> {
+    fn dispatch(&mut self, lsn: Lsn, payload: &Arc<IntentPayload>) -> Vec<ApplyError> {
         let mut apply_errors = Vec::new();
-        if !self.deferred.is_empty() {
-            let shared_payload = Arc::new(payload.clone());
-            for lane in &mut self.deferred {
-                if let Err(source) = lane.submit(lsn, Arc::clone(&shared_payload)) {
-                    tracing::error!(
-                        projection = %lane.shared.name,
-                        lsn = lsn.0,
-                        error = %source,
-                        "deferred projection inline apply failed during journaled write",
-                    );
-                    apply_errors.push(ApplyError {
-                        projection: lane.shared.name.clone(),
-                        source,
-                    });
-                }
+        for lane in &mut self.deferred {
+            if let Err(source) = lane.submit(lsn, Arc::clone(payload)) {
+                tracing::error!(
+                    projection = %lane.shared.name,
+                    lsn = lsn.0,
+                    error = %source,
+                    "deferred projection inline apply failed during journaled write",
+                );
+                apply_errors.push(ApplyError {
+                    projection: lane.shared.name.clone(),
+                    source,
+                });
             }
         }
         for p in &mut self.projections {
@@ -849,7 +879,15 @@ impl JournaledWriter {
             let timer = Timer::new(
                 PROJECTION_APPLY_DURATION.with_label_values(&[projection_name.as_str()]),
             );
-            let apply_result = p.apply(lsn, payload);
+            // A panic is contained here because the records after this one,
+            // possibly other writers' in the same group, still have to reach
+            // every projection; it is reported like a failed apply.
+            let apply_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.apply(lsn, payload)))
+                    .unwrap_or_else(|_| {
+                        p.hold_checkpoint_below(lsn);
+                        Err("projection apply panicked".into())
+                    });
             drop(timer);
             match apply_result {
                 Ok(()) => {
@@ -882,6 +920,148 @@ impl Drop for JournaledWriter {
     fn drop(&mut self) {
         self.shutdown_deferred(DEFERRED_DRAIN_TIMEOUT);
         self.persist_frame_index_logged();
+    }
+}
+
+/// The outcome of one write, as [`JournaledWriter::commit_group`] leaves it.
+type TicketOutcome = Result<Vec<WriteOutcome>, JournalError>;
+
+/// Each appended write's index in its group, with the LSNs its records took.
+type Appended = Vec<(usize, Vec<Lsn>)>;
+
+/// One write waiting to be committed: its records, encoded before any lock is
+/// taken, and the outcome the thread that commits it leaves for its owner.
+struct Ticket {
+    records: Vec<(Vec<u8>, Arc<IntentPayload>)>,
+    outcome: Mutex<Option<TicketOutcome>>,
+}
+
+impl Ticket {
+    fn encode(payloads: &[IntentPayload]) -> Result<Self, JournalError> {
+        let records = payloads
+            .iter()
+            .map(|p| Ok((payload::encode(p)?, Arc::new(p.clone()))))
+            .collect::<Result<Vec<_>, PayloadError>>()
+            .map_err(|error| {
+                tracing::error!(error = %error, "journal write failed: payload encode error");
+                JournalError::Payload(error)
+            })?;
+        Ok(Self {
+            records,
+            outcome: Mutex::new(None),
+        })
+    }
+
+    fn resolve(&self, outcome: TicketOutcome) {
+        *self.outcome.lock() = Some(outcome);
+    }
+
+    fn is_resolved(&self) -> bool {
+        self.outcome.lock().is_some()
+    }
+
+    fn take_outcome(&self) -> Option<TicketOutcome> {
+        self.outcome.lock().take()
+    }
+}
+
+/// The outcome of a one-record write.
+fn single_outcome(outcome: TicketOutcome) -> Result<WriteOutcome, JournalError> {
+    outcome?.pop().ok_or(JournalError::Unresolved)
+}
+
+/// The same failure for another write whose records one failed sync rolled
+/// back: `io::Error` cannot be cloned, so its kind and message are carried.
+fn copy_log_error(error: &IntentLogError) -> IntentLogError {
+    let kind = match error {
+        IntentLogError::Io(e) => e.kind(),
+        _ => io::ErrorKind::Other,
+    };
+    IntentLogError::Io(io::Error::new(kind, error.to_string()))
+}
+
+/// A tenant's [`JournaledWriter`], shared by the threads that write to it so
+/// that concurrent writes share one sync (see "Group commit" in the module
+/// docs).
+pub struct SharedJournal {
+    writer: Mutex<JournaledWriter>,
+    /// Writes queued for the next group, in arrival order.
+    queued: Mutex<Vec<Arc<Ticket>>>,
+}
+
+impl SharedJournal {
+    pub fn new(writer: JournaledWriter) -> Self {
+        Self {
+            writer: Mutex::new(writer),
+            queued: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Lock the writer: to read the log or a projection, or to keep writes
+    /// out while the log is copied or swapped. Every write committed before
+    /// the lock was granted is synced and applied.
+    pub fn lock(&self) -> MutexGuard<'_, JournaledWriter> {
+        self.writer.lock()
+    }
+
+    /// [`JournaledWriter::record_and_apply`], committed in one group with
+    /// the other writes queued for this journal.
+    #[tracing::instrument(
+        level = "info",
+        name = "journal.record_and_apply",
+        skip(self, payload),
+        fields(
+            user_id = %payload.user_id(),
+            memory_id = %payload.memory_id(),
+            lsn = tracing::field::Empty,
+        ),
+    )]
+    pub fn record_and_apply(&self, payload: &IntentPayload) -> Result<WriteOutcome, JournalError> {
+        let ticket = Ticket::encode(std::slice::from_ref(payload))?;
+        let outcome = single_outcome(self.commit(ticket))?;
+        tracing::Span::current().record("lsn", outcome.lsn.0);
+        Ok(outcome)
+    }
+
+    /// [`JournaledWriter::record_and_apply_batch`], committed in one group
+    /// with the other writes queued for this journal. The batch's records
+    /// stay contiguous and it remains durable whole or not at all.
+    #[tracing::instrument(
+        level = "info",
+        name = "journal.record_and_apply_batch",
+        skip(self, payloads),
+        fields(records = payloads.len()),
+    )]
+    pub fn record_and_apply_batch(
+        &self,
+        payloads: &[IntentPayload],
+    ) -> Result<Vec<WriteOutcome>, JournalError> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.commit(Ticket::encode(payloads)?)
+    }
+
+    fn commit(&self, ticket: Ticket) -> TicketOutcome {
+        let ticket = Arc::new(ticket);
+        self.queued.lock().push(Arc::clone(&ticket));
+        let mut writer = self.writer.lock();
+        // A group commits under the writer's mutex and records every outcome
+        // before releasing it, so once the mutex is ours this write is either
+        // committed already or still queued, never in another group's hands.
+        if let Some(outcome) = ticket.take_outcome() {
+            drop(writer);
+            if outcome.is_ok() {
+                INTENT_LOG_SYNC_SHARED_TOTAL.inc();
+            }
+            return outcome;
+        }
+        let group = std::mem::take(&mut *self.queued.lock());
+        writer.commit_group(&group);
+        drop(writer);
+        ticket
+            .take_outcome()
+            .unwrap_or(Err(JournalError::Unresolved))
     }
 }
 
@@ -1355,5 +1535,352 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&ckpt);
         let _ = std::fs::remove_file(&side);
+    }
+
+    /// Open and closed flags a test thread waits on, with the condvar both use.
+    #[derive(Default)]
+    struct Gate {
+        /// (a held apply has started, the test let it finish)
+        state: Mutex<(bool, bool)>,
+        cv: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn wait_entered(&self) {
+            let mut st = self.state.lock().unwrap();
+            while !st.0 {
+                st = self.cv.wait(st).unwrap();
+            }
+        }
+
+        fn open(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Inline projection that records the LSN and applying thread of every
+    /// record, and holds the apply of `hold_at` until its gate opens.
+    struct ThreadRecorder {
+        seen: Arc<Mutex<Vec<(Lsn, std::thread::ThreadId)>>>,
+        hold_at: Option<Lsn>,
+        gate: Arc<Gate>,
+    }
+
+    impl TypedProjection for ThreadRecorder {
+        fn name(&self) -> &str {
+            "thread-recorder"
+        }
+        fn apply(
+            &mut self,
+            lsn: Lsn,
+            _payload: &IntentPayload,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
+            if Some(lsn) == self.hold_at {
+                let mut st = self.gate.state.lock().unwrap();
+                st.0 = true;
+                self.gate.cv.notify_all();
+                while !st.1 {
+                    st = self.gate.cv.wait(st).unwrap();
+                }
+            }
+            self.seen
+                .lock()
+                .unwrap()
+                .push((lsn, std::thread::current().id()));
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    type Seen = Arc<Mutex<Vec<(Lsn, std::thread::ThreadId)>>>;
+
+    fn shared_journal(
+        path: &std::path::Path,
+        hold_at: Option<Lsn>,
+    ) -> (Arc<SharedJournal>, Seen, Arc<Gate>) {
+        let mut writer = JournaledWriter::new(IntentLog::open(path).unwrap());
+        let seen: Seen = Arc::default();
+        let gate = Arc::new(Gate::default());
+        writer.add_projection(Box::new(ThreadRecorder {
+            seen: seen.clone(),
+            hold_at,
+            gate: gate.clone(),
+        }));
+        (Arc::new(SharedJournal::new(writer)), seen, gate)
+    }
+
+    /// Wait until `count` writes are queued behind the writer's mutex.
+    fn wait_queued(shared: &SharedJournal, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while shared.queued.lock().len() < count {
+            assert!(Instant::now() < deadline, "{count} writes never queued");
+            std::thread::yield_now();
+        }
+    }
+
+    fn logged_lsns(path: &std::path::Path) -> Vec<u64> {
+        IntentLog::open(path)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|r| r.unwrap().lsn.0)
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_writers_end_durable_with_contiguous_lsns_applied_in_order() {
+        let path = tmp_path("group_concurrent");
+        let (shared, seen, _gate) = shared_journal(&path, None);
+        const THREADS: u64 = 8;
+        const WRITES: u64 = 25;
+        const BATCH: u64 = 3;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    let mut lsns = Vec::new();
+                    for w in 0..WRITES {
+                        let id = t * 1_000 + w * 10;
+                        if t % 2 == 0 {
+                            lsns.push(vec![shared.record_and_apply(&forget(id)).unwrap().lsn]);
+                        } else {
+                            let batch: Vec<_> = (id..id + BATCH).map(forget).collect();
+                            let outcomes = shared.record_and_apply_batch(&batch).unwrap();
+                            lsns.push(outcomes.iter().map(|o| o.lsn).collect());
+                        }
+                    }
+                    lsns
+                })
+            })
+            .collect();
+        let per_write: Vec<Vec<Lsn>> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+
+        for lsns in &per_write {
+            assert!(
+                lsns.windows(2).all(|w| w[1] == w[0].next()),
+                "a batch's records are contiguous: {lsns:?}"
+            );
+        }
+        let mut all: Vec<u64> = per_write.iter().flatten().map(|l| l.0).collect();
+        all.sort_unstable();
+        let total = (THREADS / 2) * WRITES + (THREADS / 2) * WRITES * BATCH;
+        assert_eq!(
+            all,
+            (0..total).collect::<Vec<_>>(),
+            "every LSN once, no gap"
+        );
+
+        let applied: Vec<u64> = seen.lock().unwrap().iter().map(|(l, _)| l.0).collect();
+        assert_eq!(
+            applied,
+            (0..total).collect::<Vec<_>>(),
+            "applied in LSN order"
+        );
+
+        drop(shared);
+        assert_eq!(logged_lsns(&path), (0..total).collect::<Vec<_>>());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn writes_queued_behind_a_commit_share_the_next_sync() {
+        let path = tmp_path("group_shared_sync");
+        let (shared, seen, gate) = shared_journal(&path, Some(Lsn(0)));
+        let shared_before = INTENT_LOG_SYNC_SHARED_TOTAL.get();
+
+        let first = {
+            let shared = shared.clone();
+            std::thread::spawn(move || shared.record_and_apply(&forget(0)).unwrap().lsn)
+        };
+        // The first write now holds the writer's mutex, applying LSN 0.
+        gate.wait_entered();
+        let followers: Vec<_> = (1..=3u64)
+            .map(|i| {
+                let shared = shared.clone();
+                std::thread::spawn(move || shared.record_and_apply(&forget(i)).unwrap().lsn)
+            })
+            .collect();
+        wait_queued(&shared, 3);
+        gate.open();
+
+        assert_eq!(first.join().unwrap(), Lsn(0));
+        let mut lsns: Vec<Lsn> = followers.into_iter().map(|h| h.join().unwrap()).collect();
+        lsns.sort();
+        assert_eq!(lsns, vec![Lsn(1), Lsn(2), Lsn(3)]);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        // One thread committed all three queued writes, after one sync.
+        let committer = seen[1].1;
+        assert!(seen[1..].iter().all(|(_, t)| *t == committer));
+        assert_ne!(committer, seen[0].1);
+        assert!(INTENT_LOG_SYNC_SHARED_TOTAL.get() >= shared_before + 2);
+        drop(seen);
+        drop(shared);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_write_that_cannot_be_appended_fails_alone_in_its_group() {
+        let path = tmp_path("group_fail_alone");
+        let (shared, seen, gate) = shared_journal(&path, Some(Lsn(0)));
+        let first = {
+            let shared = shared.clone();
+            std::thread::spawn(move || shared.record_and_apply(&forget(0)).unwrap().lsn)
+        };
+        gate.wait_entered();
+        let too_large = IntentPayload::Remember {
+            user_id: "u".into(),
+            memory_id: "too-large".into(),
+            memory_bincode: vec![0; crate::intent_log::MAX_PAYLOAD_BYTES],
+            schema_version: None,
+        };
+        // Queued in this order behind the first write: a good write, one the
+        // log refuses, another good one. They commit as one group.
+        let mut writes = Vec::new();
+        for (queued, payload) in [forget(1), too_large, forget(2)].into_iter().enumerate() {
+            let writer = shared.clone();
+            writes.push(std::thread::spawn(move || {
+                writer.record_and_apply(&payload)
+            }));
+            wait_queued(&shared, queued + 1);
+        }
+        gate.open();
+
+        assert_eq!(first.join().unwrap(), Lsn(0));
+        let results: Vec<_> = writes.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results[0].as_ref().unwrap().lsn, Lsn(1));
+        assert!(matches!(
+            results[1],
+            Err(JournalError::Log(IntentLogError::PayloadTooLarge { .. }))
+        ));
+        assert_eq!(results[2].as_ref().unwrap().lsn, Lsn(2));
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .map(|(l, _)| l.0)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        drop(shared);
+        assert_eq!(logged_lsns(&path), vec![0, 1, 2]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_crash_loses_only_the_frames_no_sync_covered() {
+        use std::io::Write as _;
+        let path = tmp_path("group_crash");
+        let (shared, _seen, _gate) = shared_journal(&path, None);
+        let handles: Vec<_> = (0..4u64)
+            .map(|t| {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    for w in 0..10 {
+                        shared.record_and_apply(&forget(t * 100 + w)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let SharedJournal { writer, .. } = Arc::into_inner(shared).expect("writers joined");
+        let mut writer = writer.into_inner();
+        assert_eq!(writer.log.next_lsn(), Lsn(40));
+        let committed = writer.log.durable_end_offset();
+
+        // Two more frames reach the file, but no sync covers them.
+        for i in 0..2 {
+            let bytes = payload::encode(&forget(1_000 + i)).unwrap();
+            writer.log.append(&bytes).unwrap();
+        }
+        writer.log.writer.flush().unwrap();
+        // The crash: the drive kept part of the first unsynced frame, and no
+        // destructor ran.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(committed + 5)
+            .unwrap();
+        std::mem::forget(writer);
+
+        assert_eq!(IntentLog::open(&path).unwrap().next_lsn(), Lsn(40));
+        assert_eq!(logged_lsns(&path), (0..40).collect::<Vec<_>>());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `Forget` whose memory id pads its frame to about 100 bytes.
+    fn padded(i: u64) -> IntentPayload {
+        IntentPayload::Forget {
+            user_id: "u".into(),
+            memory_id: format!("{i:06}-{}", "m".repeat(64)),
+            schema_version: None,
+        }
+    }
+
+    #[test]
+    fn rotation_happens_at_the_threshold_under_concurrent_writes() {
+        const LIMIT: u64 = 4096;
+        const THREADS: u64 = 6;
+        const WRITES: u64 = 40;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("intent.log");
+        let mut log = IntentLog::open(&path).unwrap();
+        log.set_segment_bytes(Some(LIMIT));
+        let shared = Arc::new(SharedJournal::new(JournaledWriter::new(log)));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    for w in 0..WRITES {
+                        shared.record_and_apply(&padded(t * WRITES + w)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let max_frame = (0..THREADS * WRITES)
+            .map(|i| payload::encode(&padded(i)).unwrap().len() as u64 + 16)
+            .max()
+            .unwrap();
+        let sealed = shared.lock().log().sealed().to_vec();
+        assert!(sealed.len() >= 3, "only {} rotations", sealed.len());
+        for segment in &sealed {
+            // A head rotates at the first sync that leaves it at the limit,
+            // and one group adds at most a frame per writer.
+            let len = std::fs::metadata(&segment.path).unwrap().len();
+            assert!(
+                len >= LIMIT,
+                "{:?} sealed below the limit: {len}",
+                segment.path
+            );
+            assert!(
+                len < LIMIT + THREADS * max_frame,
+                "{:?} grew past the limit by more than a group: {len}",
+                segment.path
+            );
+        }
+        drop(shared);
+        assert_eq!(
+            logged_lsns(&path),
+            (0..THREADS * WRITES).collect::<Vec<_>>()
+        );
     }
 }
