@@ -56,6 +56,20 @@ on:
         description: 'Run id whose model-tape-rocksdb artifact to replay (model_tape=replay only)'
         required: false
         default: ''
+      rerank_model:
+        description: >-
+          Cross-encoder registry id for the rerank_model dial (src/embeddings/cross_encoder.rs);
+          empty keeps the shipped default. The baseline was recorded under mxbai-rerank-xsmall-v1,
+          so another model is another pipeline: the gate refuses the comparison, so pair this
+          with record=true and read the diff table as a comparison, not a gate.
+        required: false
+        default: ''
+      rerank_count:
+        description: >-
+          Cross-encoder budget for the rerank_count dial; empty keeps the shipped default (20).
+          As with rerank_model, a different cap is not gated: pair it with record=true.
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -201,6 +215,10 @@ jobs:
           # can be read as rank-low (gold in 11..100) or never retrieved. The headline metrics come
           # from the production-depth query alone (src/recall_harness/runner.rs, diag_k).
           RECALL_DIAG_K: '100'
+          # The reranker dials. Empty is unset: CognitiveDials::from_env keeps None for an
+          # empty model id (sanitized away) and an unparsable count.
+          VELD_DIALS_RERANK_MODEL: ${{ github.event.inputs.rerank_model || '' }}
+          VELD_DIALS_RERANK_COUNT: ${{ github.event.inputs.rerank_count || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
         run: |
