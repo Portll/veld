@@ -403,6 +403,11 @@ pub struct RememberRequest {
     /// [0, 1], or more than 50), exempt from the derived-entity cut, and stored as authored tags.
     #[serde(default)]
     pub entities: Vec<DeclaredEntityInput>,
+    /// Repository slug this memory belongs to, e.g. `"Portll/veld"`. Stored as the leading
+    /// [`crate::memory::facets::Place::Repo`]; a recall with `repo` set returns only memories
+    /// scoped to it.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 /// Remember response
@@ -473,6 +478,9 @@ pub struct BatchMemoryItem {
     /// fails its item, as an unknown memory type does.
     #[serde(default)]
     pub entities: Vec<DeclaredEntityInput>,
+    /// Per-item repository — see [`RememberRequest::repo`]. An invalid one fails its item.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 /// Error detail for batch item
@@ -521,6 +529,9 @@ pub struct UpsertRequest {
     /// See [`RememberRequest::entities`]. On an update the graph episode is rebuilt from these.
     #[serde(default)]
     pub entities: Vec<DeclaredEntityInput>,
+    /// See [`RememberRequest::repo`]. On update a provided repo replaces the stored one.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 fn default_change_type() -> String {
@@ -663,6 +674,7 @@ pub fn build_rich_context(
     sequence_number: Option<u32>,
     preceding_memory_id: Option<String>,
     declared_writer: Option<crate::memory::facets::DeclaredWriter>,
+    repo: Option<String>,
 ) -> Option<RichContext> {
     let has_explicit_context = emotional_valence.is_some()
         || emotional_arousal.is_some()
@@ -686,6 +698,9 @@ pub fn build_rich_context(
     // write, so it is attached to every write.
     if let Some(declared) = declared_writer {
         ctx.session.declared = declared;
+    }
+    if let Some(repo) = repo {
+        ctx.set_repo(repo);
     }
     // The server's own half. `received_at` is the one writer fact that needs no
     // trust at all — this process observed it. It is deliberately not the
@@ -1068,6 +1083,12 @@ pub async fn remember(
 
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.content, false).map_validation_err("content")?;
+    let repo = req
+        .repo
+        .as_deref()
+        .map(validation::validate_repo)
+        .transpose()
+        .map_validation_err("repo")?;
 
     // ── Ingest pipeline: extract clean text from structured formats ──────
     let (processed_content, ingest_tags) = if req.filename.is_some() || {
@@ -1187,6 +1208,7 @@ pub async fn remember(
         req.sequence_number,
         req.preceding_memory_id.clone(),
         req.writer.clone(),
+        repo,
     );
 
     let experience = Experience {
@@ -1781,13 +1803,28 @@ pub async fn batch_remember(
         Vec::new();
 
     let mut seen_content: HashSet<u64> = HashSet::new();
-    for (index, item) in req.memories.into_iter().enumerate() {
+    for (index, mut item) in req.memories.into_iter().enumerate() {
         if let Err(e) = validation::validate_content(&item.content, false) {
             validation_errors.push(BatchErrorItem {
                 index,
                 error: e.to_string(),
             });
             continue;
+        }
+        match item
+            .repo
+            .as_deref()
+            .map(validation::validate_repo)
+            .transpose()
+        {
+            Ok(repo) => item.repo = repo,
+            Err(e) => {
+                validation_errors.push(BatchErrorItem {
+                    index,
+                    error: e.to_string(),
+                });
+                continue;
+            }
         }
         // Deduplicate within the batch: skip items with identical content
         let content_hash = {
@@ -1966,6 +2003,7 @@ pub async fn batch_remember(
                     item.sequence_number,
                     item.preceding_memory_id.clone(),
                     item.writer.clone(),
+                    item.repo.clone(),
                 );
 
                 let experience = Experience {
@@ -2433,6 +2471,12 @@ pub async fn upsert_memory(
             reason: "external_id is required for upsert".to_string(),
         });
     }
+    let repo = req
+        .repo
+        .as_deref()
+        .map(validation::validate_repo)
+        .transpose()
+        .map_validation_err("repo")?;
 
     let experience_type = parse_experience_type(req.memory_type.as_ref())?;
 
@@ -2540,7 +2584,7 @@ pub async fn upsert_memory(
 
     // Built the way `remember` builds it, so an upsert-created record carries the same
     // AgentSession facet, declared writer, received_at stamp and episode context. Only the
-    // episode id and writer are fields upsert accepts; the other hints stay unset.
+    // episode id, writer and repo are fields upsert accepts; the other hints stay unset.
     let context = build_rich_context(
         None,
         None,
@@ -2551,6 +2595,7 @@ pub async fn upsert_memory(
         None,
         None,
         req.writer.clone(),
+        repo.clone(),
     );
 
     let experience = Experience {
@@ -2576,6 +2621,7 @@ pub async fn upsert_memory(
         created_at: req.created_at,
         episode_id: req.episode_id.clone(),
         writer: req.writer.clone(),
+        repo,
     };
 
     let store_start = std::time::Instant::now();
