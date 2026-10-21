@@ -2842,7 +2842,16 @@ impl super::MemorySystem {
             // Phase 2.1: Keep wider candidate pool for cross-encoder reranking.
             // Decomposed queries produce a wider candidate set — widen the budget
             // so more candidates survive into the cross-encoder.
-            let rerank_budget = if decomposed { 50_usize } else { 30_usize }.max(query.max_results);
+            // The `rerank_pool` dial overrides the width; the pool never drops below an explicit
+            // `rerank_count`, or Layer 5.3 would be asked to score candidates already cut.
+            let (pool_dial, rerank_count_dial) = {
+                let d = self.cognitive_dials.read();
+                (d.rerank_pool, d.rerank_count)
+            };
+            let rerank_budget = pool_dial
+                .unwrap_or(if decomposed { 50_usize } else { 30_usize })
+                .max(rerank_count_dial.or(query.rerank_count).unwrap_or(0))
+                .max(query.max_results);
             // Query filters are applied in the Layer 5 scan below, which stops once
             // `rerank_pool` memories pass. Cutting the list here first meant a selective
             // filter (tags, type, time range) judged only the top 30/50 and could discard
@@ -3508,11 +3517,13 @@ impl super::MemorySystem {
                 // Decomposed queries: widen CE budget from 20→30 to exploit the
                 // broader candidate pool from multi-query vector search.
                 let ce_cap = if decomposed { 30 } else { 20 };
-                // rerank_count dial caps the budget when set (query-level or dials-level).
-                let dial_cap = layer53_rerank_count_dial
-                    .or(query.rerank_count)
-                    .unwrap_or(ce_cap);
-                let rerank_budget = memories.len().min(query.max_results * 2).min(dial_cap);
+                // An explicit rerank_count (dial or query) is the budget, so it can reach past
+                // twice max_results to gold the fused order left below rank 20; absent one, the
+                // budget stays bounded by max_results for latency.
+                let rerank_budget = match layer53_rerank_count_dial.or(query.rerank_count) {
+                    Some(explicit) => memories.len().min(explicit),
+                    None => memories.len().min(query.max_results * 2).min(ce_cap),
+                };
                 // Pass each candidate's stored embedding so the reranker's
                 // bi-encoder pass can reuse it instead of re-embedding via the
                 // HTTP embedder (5–6s/call for CPU Nomic). The reranker
