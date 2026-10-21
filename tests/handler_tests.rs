@@ -3321,6 +3321,8 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
     let target = body["id"].as_str().unwrap().to_string();
     let target_uuid = veld::uuid::Uuid::parse_str(&target).unwrap();
     wait_for_episode_entity(&h, user, target_uuid, &SERVE.to_lowercase()).await;
+    // The embedding is deferred too; ranked before it lands, the target has no vector.
+    wait_for_background_work(&h).await;
 
     for query in [
         "what changed in serve.mjs",
