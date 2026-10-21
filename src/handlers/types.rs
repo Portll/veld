@@ -166,6 +166,10 @@ pub struct RecallRequest {
     /// filtered. MemoryQuery already enforced the filter; only the wiring was missing.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Return only memories scoped to this repository slug (ASCII case-insensitive). Todos,
+    /// reminders and facts are not scoped.
+    #[serde(default)]
+    pub repo: Option<String>,
     /// The asking session's transcript id, recorded on the recall event log.
     #[serde(default)]
     pub episode_id: Option<String>,

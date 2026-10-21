@@ -458,6 +458,34 @@ pub struct RichContext {
     pub updated_at: DateTime<Utc>,
 }
 
+impl RichContext {
+    /// The repository this memory belongs to: the slug of the first [`Place::Repo`].
+    pub fn repo_slug(&self) -> Option<&str> {
+        self.place.places.iter().find_map(|place| match place {
+            Place::Repo { slug, .. } => Some(slug.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Scope this memory to `slug`, replacing any repository it was scoped to before.
+    pub fn set_repo(&mut self, slug: String) {
+        self.place
+            .places
+            .retain(|place| !matches!(place, Place::Repo { .. }));
+        self.place.places.insert(
+            0,
+            Place::Repo {
+                slug,
+                branch: None,
+                commit: None,
+                remote: None,
+                pull_request: None,
+                dirty: None,
+            },
+        );
+    }
+}
+
 /// Conversation-specific context
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConversationContext {
@@ -3398,6 +3426,9 @@ pub struct Query {
     pub severity: Option<String>,
     /// Filter by tags (any match)
     pub tags: Option<Vec<String>>,
+    /// Filter by repository slug, ASCII case-insensitive. A memory with no repository does
+    /// not match.
+    pub repo: Option<String>,
     /// Filter by pattern_id (for finding similar situations)
     pub pattern_id: Option<String>,
     /// Filter by terrain type
@@ -3524,6 +3555,7 @@ impl Default for Query {
             anomalies_only: false,
             severity: None,
             tags: None,
+            repo: None,
             pattern_id: None,
             terrain_type: None,
             confidence_range: None,
@@ -3701,6 +3733,17 @@ impl Query {
             }
         }
 
+        if let Some(repo) = &self.repo {
+            let memory_repo = memory
+                .experience
+                .context
+                .as_ref()
+                .and_then(RichContext::repo_slug);
+            if !memory_repo.is_some_and(|slug| slug.eq_ignore_ascii_case(repo)) {
+                return false;
+            }
+        }
+
         // Pattern ID filter
         if let Some(pattern_id) = &self.pattern_id {
             if memory.experience.pattern_id.as_ref() != Some(pattern_id) {
@@ -3747,6 +3790,7 @@ impl Query {
             || self.anomalies_only
             || self.severity.is_some()
             || self.tags.as_ref().is_some_and(|t| !t.is_empty())
+            || self.repo.is_some()
             || self.pattern_id.is_some()
             || self.terrain_type.is_some()
             || self.confidence_range.is_some()
@@ -6259,7 +6303,7 @@ mod enrichment_merge_tests {
 
 #[cfg(test)]
 mod query_filter_tests {
-    use super::Query;
+    use super::{Experience, Memory, MemoryId, Place, Query};
 
     #[test]
     fn has_selective_filters_ignores_defaults_and_empty_tags() {
@@ -6279,5 +6323,65 @@ mod query_filter_tests {
             ..Default::default()
         };
         assert!(q.has_selective_filters());
+        let q = Query {
+            repo: Some("acme/one".into()),
+            ..Default::default()
+        };
+        assert!(q.has_selective_filters());
+    }
+
+    fn memory_in(repo: Option<&str>) -> Memory {
+        let mut ctx = crate::memory::context::ContextBuilder::new().build();
+        if let Some(slug) = repo {
+            ctx.set_repo(slug.to_string());
+        }
+        let experience = Experience {
+            content: "scoped".into(),
+            context: Some(ctx),
+            ..Default::default()
+        };
+        Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            experience,
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn repo_filter_matches_only_that_repo_ignoring_ascii_case() {
+        let q = Query {
+            repo: Some("Acme/One".into()),
+            ..Default::default()
+        };
+        assert!(q.matches(&memory_in(Some("acme/one"))));
+        assert!(!q.matches(&memory_in(Some("acme/two"))));
+        assert!(
+            !q.matches(&memory_in(None)),
+            "an unscoped memory is not in any repo"
+        );
+
+        let mut no_context = memory_in(None);
+        no_context.experience.context = None;
+        assert!(!q.matches(&no_context));
+        assert!(Query::default().matches(&no_context));
+        assert!(Query::default().matches(&memory_in(Some("acme/two"))));
+    }
+
+    #[test]
+    fn set_repo_leads_the_places_and_replaces_an_earlier_repo() {
+        let mut ctx = crate::memory::context::ContextBuilder::new().build();
+        ctx.place.places.push(Place::File {
+            path: "src/lib.rs".into(),
+            symbol: None,
+        });
+        ctx.set_repo("acme/one".into());
+        ctx.set_repo("acme/two".into());
+        assert_eq!(ctx.repo_slug(), Some("acme/two"));
+        assert_eq!(ctx.place.places.len(), 2);
+        assert!(matches!(ctx.place.places[0], Place::Repo { .. }));
     }
 }

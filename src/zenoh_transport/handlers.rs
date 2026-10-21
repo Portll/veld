@@ -418,6 +418,7 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
         req.sequence_number,
         req.preceding_memory_id.clone(),
         req.writer.clone(),
+        None,
     );
 
     let experience = Experience {

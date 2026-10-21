@@ -58,6 +58,7 @@ const __dirname = __filename ? path.dirname(__filename) : process.cwd();
 const API_URL = process.env.VELD_API_URL || "http://127.0.0.1:3030";
 const WS_URL = API_URL.replace(/^http/, "ws") + "/api/stream";
 const USER_ID = process.env.VELD_USER_ID || "claude-code";
+const DEFAULT_REPO = process.env.VELD_REPO?.trim() || undefined;
 
 // Detect whether the server is local (safe for auto-generated keys)
 function isLocalServer(): boolean {
@@ -740,6 +741,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Semantic intent tags that boost importance: 'architectural-decision', 'security-fix', 'performance-optimization', 'bug-fix', 'design-tradeoff'. Stored as 'intent:' prefixed entity tags.",
             },
+            repo: {
+              type: "string",
+              description:
+                "Repository this memory belongs to (e.g. 'Portll/veld'). Defaults to VELD_REPO.",
+            },
           },
           required: ["content"],
         },
@@ -773,6 +779,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description:
                 "RRF (Reciprocal Rank Fusion) k parameter (1.0-200.0, default: 20.0). Higher k = more equal weighting across ranks (democratic). Lower k = sharper discrimination favoring top-ranked results (winner-take-all). Use high k (~60-100) for exploratory queries, low k (~5-15) for precise factual lookups.",
+            },
+            repo: {
+              type: "string",
+              description:
+                "Return only memories from this repository. Defaults to VELD_REPO; todos are not scoped.",
             },
           },
           required: ["query"],
@@ -1063,6 +1074,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description:
                 "RRF k parameter (1.0-200.0, default: 20.0). Higher k = democratic ranking, lower k = sharper top-rank discrimination.",
+            },
+            repo: {
+              type: "string",
+              description:
+                "Surface only memories from this repository. Defaults to VELD_REPO.",
             },
           },
           required: ["context"],
@@ -1904,6 +1920,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           parent_id,
           // FIX-10: Semantic intent tags
           intent_tags = [],
+          repo,
         } = args as {
           content: string;
           type?: string;
@@ -1919,7 +1936,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           preceding_memory_id?: string;
           parent_id?: string;
           intent_tags?: string[];
+          repo?: string;
         };
+        const scopedRepo = repo?.trim() || DEFAULT_REPO;
 
         if (!content || content.length === 0) {
           return {
@@ -1963,6 +1982,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ...(parent_id && { parent_id }),
           // FIX-10: Semantic intent tags
           ...(intent_tags.length > 0 && { intent_tags }),
+          ...(scopedRepo && { repo: scopedRepo }),
         });
 
         // Format response with branded display
@@ -1987,7 +2007,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           limit: rawLimit = 5,
           mode = "hybrid",
           rrf_k,
-        } = args as { query: string; limit?: number; mode?: string; rrf_k?: number };
+          repo,
+        } = args as {
+          query: string;
+          limit?: number;
+          mode?: string;
+          rrf_k?: number;
+          repo?: string;
+        };
+        const scopedRepo = repo?.trim() || DEFAULT_REPO;
 
         if (!query || query.length === 0) {
           return {
@@ -2071,6 +2099,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           limit,
           mode,
           ...(rrf_k !== undefined && { rrf_k: Math.max(1, Math.min(rrf_k, 200)) }),
+          ...(scopedRepo && { repo: scopedRepo }),
         });
 
         const memories = result.memories || [];
@@ -2839,6 +2868,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           memory_types = [],
           auto_ingest = false,
           rrf_k,
+          repo,
         } = args as {
           context: string;
           semantic_threshold?: number;
@@ -2848,7 +2878,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           memory_types?: string[];
           auto_ingest?: boolean;
           rrf_k?: number;
+          repo?: string;
         };
+        const scopedRepo = repo?.trim() || DEFAULT_REPO;
 
         // --- Response types matching ProactiveContextResponse (Rust backend) ---
 
@@ -2967,6 +2999,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             previous_response: lastProactiveResponse || undefined,
             user_followup: lastProactiveResponse ? cleanedContext : undefined,
             ...(rrf_k !== undefined && { rrf_k: Math.max(1, Math.min(rrf_k, 200)) }),
+            ...(scopedRepo && { repo: scopedRepo }),
           },
         );
 

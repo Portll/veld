@@ -802,18 +802,21 @@ pub struct UpsertProvenance {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub episode_id: Option<String>,
     pub writer: Option<crate::memory::facets::DeclaredWriter>,
+    /// Repository slug, already validated. Replaces the stored repository when provided.
+    pub repo: Option<String>,
 }
 
-/// Write a declared episode id and writer onto a record's context, creating the context from
-/// `fallback` (or the detected session) when the record has none. Fields left `None` are not
-/// touched, so an update that omits them keeps what is stored.
+/// Write a declared episode id, writer and repository onto a record's context, creating the
+/// context from `fallback` (or the detected session) when the record has none. Fields left
+/// `None` are not touched, so an update that omits them keeps what is stored.
 fn overlay_declared_context(
     slot: &mut Option<types::RichContext>,
     fallback: Option<types::RichContext>,
     episode_id: Option<String>,
     writer: Option<crate::memory::facets::DeclaredWriter>,
+    repo: Option<String>,
 ) {
-    if episode_id.is_none() && writer.is_none() {
+    if episode_id.is_none() && writer.is_none() && repo.is_none() {
         return;
     }
     let ctx = slot.get_or_insert_with(|| {
@@ -824,6 +827,9 @@ fn overlay_declared_context(
     }
     if let Some(writer) = writer {
         ctx.session.declared = writer;
+    }
+    if let Some(repo) = repo {
+        ctx.set_repo(repo);
     }
 }
 
@@ -6742,6 +6748,7 @@ impl MemorySystem {
                 experience.context.take(),
                 provenance.episode_id,
                 provenance.writer,
+                provenance.repo,
             );
 
             // Update entities if provided
@@ -6879,6 +6886,7 @@ impl MemorySystem {
                 None,
                 provenance.episode_id,
                 provenance.writer,
+                provenance.repo,
             );
 
             // Create memory with external_id
