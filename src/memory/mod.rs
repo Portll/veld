@@ -2864,6 +2864,8 @@ impl MemorySystem {
                     // candidate: similar vectors can carry different facts, and
                     // the caller already holds this memory's id. It is absorbed
                     // only when its text adds nothing the neighbour lacks.
+                    // `similar_memories` already holds cosines on MiniLM's scale, so the
+                    // MiniLM-tuned bar applies as is; mapping `best_sim` again would double it.
                     let total_memories = self.stats.read().total_memories;
                     if total_memories >= crate::constants::WRITE_GATE_COLD_START_BYPASS {
                         if let Some((best_id, best_sim, _, _, _)) =
