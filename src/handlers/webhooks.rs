@@ -620,11 +620,10 @@ async fn handle_context_monitor_socket(
 
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_sys.read();
-                let graph_guard = graph_memory.read();
                 engine.surface_relevant(
                     &context,
                     &memory_guard,
-                    Some(&*graph_guard),
+                    Some(&*graph_memory),
                     &effective_config,
                     None,
                 )

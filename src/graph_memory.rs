@@ -2211,7 +2211,14 @@ pub struct GraphMemory {
         std::collections::HashSet<Uuid>,
         std::collections::VecDeque<Uuid>,
     )>,
+
+    /// Serialises [`Self::add_entity`]'s create-or-update decision per stemmed name,
+    /// sharded so ingests naming different entities do not wait on each other.
+    entity_creation_locks: [parking_lot::Mutex<()>; ENTITY_CREATION_SHARDS],
 }
+
+/// Shards of [`GraphMemory`]'s entity creation lock.
+const ENTITY_CREATION_SHARDS: usize = 64;
 
 impl GraphMemory {
     /// The rocksdb engine handle for backup/checkpoint. Engine-typed by design
@@ -2423,6 +2430,7 @@ impl GraphMemory {
                 std::collections::HashSet::new(),
                 std::collections::VecDeque::new(),
             )),
+            entity_creation_locks: std::array::from_fn(|_| parking_lot::Mutex::new(())),
         };
 
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
@@ -2658,6 +2666,14 @@ impl GraphMemory {
         Ok(index)
     }
 
+    /// The creation lock shard for an entity whose stemmed name is `stemmed_name`.
+    fn entity_creation_lock(&self, stemmed_name: &str) -> &parking_lot::Mutex<()> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        stemmed_name.hash(&mut hasher);
+        &self.entity_creation_locks[(hasher.finish() as usize) % ENTITY_CREATION_SHARDS]
+    }
+
     /// Stem an entity name for linguistic matching
     ///
     /// For multi-word names (e.g., "New York City"), stems each word and joins.
@@ -2832,6 +2848,14 @@ impl GraphMemory {
     ///
     /// BUG-002 FIX: Handles crash recovery for orphaned entities/stale indices
     pub fn add_entity(&self, mut entity: EntityNode) -> Result<Uuid> {
+        let stemmer = Stemmer::create(Algorithm::English);
+        let stemmed_name = Self::stem_entity_name(&stemmer, &entity.name);
+        // The lookups and the write below are one step per name: two ingests that both
+        // found a new name absent would each mint a node, and two updates of one node
+        // would each write the same mention count. Names the exact, case and stem tiers
+        // can merge share a stem, so they share a shard.
+        let _creation = self.entity_creation_lock(&stemmed_name).lock();
+
         // Multi-tier dedup pipeline: exact → case-insensitive → stemmed → embedding
         // Each tier is faster than the next; short-circuits on first match.
 
@@ -2851,8 +2875,6 @@ impl GraphMemory {
         // Tier 3: Stemmed match (O(1)) — "running" matches "run"
         // Skip for proper nouns to prevent "Paris" → "pari" merging with "Parison"
         if existing_uuid.is_none() && !entity.is_proper_noun {
-            let stemmer = Stemmer::create(Algorithm::English);
-            let stemmed_name = Self::stem_entity_name(&stemmer, &entity.name);
             let index = self.entity_stemmed_index.read();
             existing_uuid = index.get(&stemmed_name).cloned();
         }
@@ -12286,5 +12308,70 @@ mod edge_index_tests {
         graph.flush_pending_maintenance().unwrap();
         assert!(graph.get_relationship(&ids[0]).unwrap().is_some());
         assert!(graph.get_relationship(&ids[1]).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod entity_creation_race_tests {
+    use super::*;
+
+    fn mention(name: &str) -> EntityNode {
+        EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        }
+    }
+
+    /// Ingests racing on a name the graph has never seen make one node between them,
+    /// and every mention counts, including those spelled in another case.
+    #[test]
+    fn racing_mentions_of_a_new_name_make_one_entity_and_count_every_mention() {
+        const THREADS: usize = 8;
+        const MENTIONS: usize = 25;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let graph = Arc::new(GraphMemory::new(tmp.path(), None).expect("graph"));
+        let start = Arc::new(std::sync::Barrier::new(THREADS));
+        let ingests: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let graph = Arc::clone(&graph);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let name = if thread % 2 == 0 {
+                        "Zephyrine"
+                    } else {
+                        "zephyrine"
+                    };
+                    start.wait();
+                    (0..MENTIONS)
+                        .map(|_| graph.add_entity(mention(name)).expect("add_entity"))
+                        .collect::<Vec<Uuid>>()
+                })
+            })
+            .collect();
+        let ids: HashSet<Uuid> = ingests
+            .into_iter()
+            .flat_map(|ingest| ingest.join().expect("ingest"))
+            .collect();
+
+        assert_eq!(ids.len(), 1, "one name minted {} nodes", ids.len());
+        let nodes: Vec<EntityNode> = graph
+            .get_all_entities()
+            .expect("entities")
+            .into_iter()
+            .filter(|e| e.name.eq_ignore_ascii_case("zephyrine"))
+            .collect();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].mention_count, THREADS * MENTIONS);
     }
 }

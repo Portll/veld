@@ -24,6 +24,66 @@ use crate::metrics::{
     observe_recall_stage, RecallStage, EMBEDDING_CACHE_QUERY, EMBEDDING_CACHE_QUERY_SIZE,
 };
 
+/// Spreading-activation recalls whose path credit still waits for feedback.
+const PATH_CREDIT_RECALLS: usize = 256;
+/// Memories mapped to the recall that last delivered them.
+const PATH_CREDIT_MEMORIES: usize = 4096;
+/// Recently returned memories whose signal attribution feedback can still read.
+pub(super) const RECENT_SIGNAL_ATTRIBUTIONS: usize = 4096;
+
+/// Path-credit edges of recent spreading-activation recalls, reachable from each memory
+/// the recall delivered. Feedback naming any of those memories applies that recall's
+/// credit once; a concurrent recall that delivered other memories leaves it in place.
+/// Both maps are bounded, oldest out first.
+pub(super) struct PathCreditLedger {
+    next_recall: u64,
+    recalls: lru::LruCache<u64, Vec<(uuid::Uuid, f32)>>,
+    by_memory: lru::LruCache<MemoryId, u64>,
+}
+
+impl PathCreditLedger {
+    pub(super) fn new() -> Self {
+        Self {
+            next_recall: 0,
+            recalls: lru::LruCache::new(
+                std::num::NonZeroUsize::new(PATH_CREDIT_RECALLS).expect("nonzero"),
+            ),
+            by_memory: lru::LruCache::new(
+                std::num::NonZeroUsize::new(PATH_CREDIT_MEMORIES).expect("nonzero"),
+            ),
+        }
+    }
+
+    /// Hold `edges` for the memories one recall delivered.
+    pub(super) fn record(&mut self, delivered: &[MemoryId], edges: Vec<(uuid::Uuid, f32)>) {
+        if delivered.is_empty() || edges.is_empty() {
+            return;
+        }
+        let recall = self.next_recall;
+        self.next_recall += 1;
+        self.recalls.put(recall, edges);
+        for id in delivered {
+            self.by_memory.put(id.clone(), recall);
+        }
+    }
+
+    /// Take the credit of every recall that delivered one of `memory_ids`, summed per
+    /// edge, in edge order. Each recall's credit is taken once.
+    pub(super) fn take(&mut self, memory_ids: &[MemoryId]) -> Vec<(uuid::Uuid, f32)> {
+        let mut credit: std::collections::BTreeMap<uuid::Uuid, f32> =
+            std::collections::BTreeMap::new();
+        for id in memory_ids {
+            let Some(recall) = self.by_memory.pop(id) else {
+                continue;
+            };
+            for (edge, contribution) in self.recalls.pop(&recall).unwrap_or_default() {
+                *credit.entry(edge).or_insert(0.0) += contribution;
+            }
+        }
+        credit.into_iter().collect()
+    }
+}
+
 /// Fraction of semantic_w used for secondary Vamana RRF signal.
 /// Secondary is a refinement signal, not a replacement for primary vector search.
 const SECONDARY_RRF_WEIGHT_RATIO: f32 = 0.5;
@@ -91,10 +151,19 @@ impl super::MemorySystem {
     /// - Non-semantic search: Uses importance * temporal decay
     /// - Zero shortcuts, no TODOs, enterprise-grade
     pub fn recall(&self, query: &Query) -> Result<Vec<SharedMemory>> {
+        self.recall_with_readout(query)
+            .map(|(memories, _)| memories)
+    }
+
+    /// [`Self::recall`] with the readout it reports for this request: each returned
+    /// memory's signal attribution and the query's metacognition.
+    pub fn recall_with_readout(&self, query: &Query) -> Result<(Vec<SharedMemory>, RecallReadout)> {
         let _evidence = crate::graph_memory::EvidenceScope::enter(query.evidence_source.as_deref());
         // Semantic search requires special handling
         if let Some(query_text) = &query.query_text {
-            return self.semantic_retrieve(query_text, query);
+            let mut readout = RecallReadout::default();
+            let memories = self.semantic_retrieve(query_text, query, &mut readout)?;
+            return Ok((memories, readout));
         }
 
         // Non-semantic search: filter-based retrieval
@@ -240,7 +309,7 @@ impl super::MemorySystem {
             }
         }
 
-        Ok(memories)
+        Ok((memories, RecallReadout::default()))
     }
 
     /// Paginated memory recall with "has_more" indicator (SHO-69)
@@ -505,7 +574,12 @@ impl super::MemorySystem {
     /// 3. If not found, check session memory (instant Arc clone)
     /// 4. Only fetch from RocksDB storage as last resort
     /// 5. This eliminates deserialization overhead for cached memories
-    fn semantic_retrieve(&self, query_text: &str, query: &Query) -> Result<Vec<SharedMemory>> {
+    fn semantic_retrieve(
+        &self,
+        query_text: &str,
+        query: &Query,
+        readout: &mut RecallReadout,
+    ) -> Result<Vec<SharedMemory>> {
         let recall_start = std::time::Instant::now();
 
         // ===========================================================================
@@ -1701,7 +1775,10 @@ impl super::MemorySystem {
                 // enter as one more ranked list instead, at the strongest list's weight and
                 // the same k, so they interleave with the Vamana hits by rank.
                 let decomp_rrf_k: f32 = self.cognitive_dials.read().rrf_k_decomp.unwrap_or(20.0);
-                tier_candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                tier_candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+                order_score_ties_by_content(&mut tier_candidates, &|id: &MemoryId| {
+                    candidates.content(id)
+                });
                 for (rank, (id, _)) in tier_candidates.into_iter().enumerate() {
                     vector_results.push((id, 1.0 / (decomp_rrf_k + (rank + 1) as f32)));
                     tier_hits += 1;
@@ -1712,8 +1789,12 @@ impl super::MemorySystem {
             }
 
             if tier_hits > 0 {
-                // Re-sort merged results by similarity descending
+                // Re-sort merged results by similarity descending. The tiers were read in
+                // hash order, so an exact tie at the cut would otherwise keep whichever came first.
                 vector_results.sort_by(|a, b| b.1.total_cmp(&a.1));
+                order_score_ties_by_content(&mut vector_results, &|id: &MemoryId| {
+                    candidates.content(id)
+                });
                 vector_results.truncate(query.max_results * 8);
                 tracing::info!(
                     tier_hits,
@@ -4630,16 +4711,18 @@ impl super::MemorySystem {
             "recall [layer:post] linguistic + competition + coactivation + hierarchy === RECALL COMPLETE ==="
         );
 
-        // Persist signal attributions from this retrieval. Only keep attributions
-        // for memories that survived all filtering/competition stages.
+        // Signal attributions of the memories that survived all filtering/competition
+        // stages: returned to this request, and merged by id into the store a later
+        // feedback request reads, so a concurrent recall cannot wipe them.
         {
             let final_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
-            let mut attr_guard = self.last_signal_attributions.write();
-            attr_guard.clear();
-            for (id, attribution) in signal_attributions {
-                if final_ids.contains(&id) {
-                    attr_guard.insert(id, attribution);
-                }
+            readout.signal_attributions = signal_attributions
+                .into_iter()
+                .filter(|(id, _)| final_ids.contains(id))
+                .collect();
+            let mut recent = self.recent_signal_attributions.lock();
+            for (id, attribution) in &readout.signal_attributions {
+                recent.put(id.clone(), attribution.clone());
             }
         }
 
@@ -4710,23 +4793,22 @@ impl super::MemorySystem {
                     .count();
                 Some(covered as f32 / wanted.len() as f32)
             };
-            *self.last_query_metacognition.write() =
-                Some(crate::memory::types::QueryMetacognition {
-                    fok: 0.0,
-                    label: String::new(),
-                    peak_confidence: 0.0,
-                    answerability: 0.0,
-                    cross_embedder_agreement,
-                    coverage,
-                    in_known_gap: false,
-                    signal_strength: if cross_embedder_agreement.is_some() {
-                        "score+agreement"
-                    } else {
-                        "score"
-                    }
-                    .to_string(),
-                    focal_entities,
-                });
+            readout.metacognition = Some(crate::memory::types::QueryMetacognition {
+                fok: 0.0,
+                label: String::new(),
+                peak_confidence: 0.0,
+                answerability: 0.0,
+                cross_embedder_agreement,
+                coverage,
+                in_known_gap: false,
+                signal_strength: if cross_embedder_agreement.is_some() {
+                    "score+agreement"
+                } else {
+                    "score"
+                }
+                .to_string(),
+                focal_entities,
+            });
         }
 
         // R2 (LTR) SHADOW WRITE-SITE — the SINGLE place a trace row is emitted, so
@@ -4774,29 +4856,29 @@ impl super::MemorySystem {
             //   delta          = learned_signal − static_signal
             //   shadow_score   = static_final_score + delta
             //
-            // The three raw signal contributions come from `last_signal_attributions`
-            // (populated just above; guarded so only surviving memories are present).
+            // The three raw signal contributions come from this recall's readout
+            // (populated just above; only surviving memories are present).
             // If a memory has no attribution (e.g. a re-cued augmentation row) we
             // log delta=0 so the accounting is complete without fabricating data.
             //
             // B8 gate: only log if the gate flag is false (which it always is in
             // this PR), ensuring the comment stays true: live OFF, shadow logged.
             if !crate::constants::R3B_LIVE_APPLICATION_ENABLED {
-                let attr_guard = self.last_signal_attributions.read();
                 for m in memories.iter() {
                     let static_score = m.score.unwrap_or(0.0);
-                    let (delta, learned_score) = if let Some(attr) = attr_guard.get(&m.id) {
-                        let static_signal = r3b_static_bm25 * attr.bm25_contribution
-                            + r3b_static_vector * attr.vector_contribution
-                            + r3b_static_graph * attr.graph_contribution;
-                        let learned_signal = r3b_learned_snapshot.bm25 * attr.bm25_contribution
-                            + r3b_learned_snapshot.vector * attr.vector_contribution
-                            + r3b_learned_snapshot.graph * attr.graph_contribution;
-                        let d = learned_signal - static_signal;
-                        (d, static_score + d)
-                    } else {
-                        (0.0_f32, static_score)
-                    };
+                    let (delta, learned_score) =
+                        if let Some(attr) = readout.signal_attributions.get(&m.id) {
+                            let static_signal = r3b_static_bm25 * attr.bm25_contribution
+                                + r3b_static_vector * attr.vector_contribution
+                                + r3b_static_graph * attr.graph_contribution;
+                            let learned_signal = r3b_learned_snapshot.bm25 * attr.bm25_contribution
+                                + r3b_learned_snapshot.vector * attr.vector_contribution
+                                + r3b_learned_snapshot.graph * attr.graph_contribution;
+                            let d = learned_signal - static_signal;
+                            (d, static_score + d)
+                        } else {
+                            (0.0_f32, static_score)
+                        };
                     tracing::trace!(
                         memory_id = %m.id.0,
                         static_score,
@@ -4923,12 +5005,6 @@ impl super::MemorySystem {
             "recall [spreading_activation] complete"
         );
 
-        // S-R5: Cache path-credit edges for the next reinforce_recall(Helpful) call.
-        // Stash the raw contributions; reinforce_recall will drain and apply them.
-        if !retrieval_stats.path_credit_edges.is_empty() {
-            *self.spreading_path_credit.lock() = retrieval_stats.path_credit_edges;
-        }
-
         // Extract SharedMemory from ActivatedMemory, preserving score ordering. The graph walk
         // applies no query filter, so a caller filter is applied here; unfiltered recall is as
         // before.
@@ -4939,6 +5015,15 @@ impl super::MemorySystem {
             .filter(|memory| !filtered || query.matches(memory))
             .take(query.max_results)
             .collect();
+
+        // S-R5: the raw path-credit contributions wait for a Helpful reinforce that names
+        // any memory this recall delivered; reinforce_recall takes and applies them.
+        if !retrieval_stats.path_credit_edges.is_empty() {
+            let delivered: Vec<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
+            self.spreading_path_credit
+                .lock()
+                .record(&delivered, retrieval_stats.path_credit_edges);
+        }
 
         Ok(memories)
     }
@@ -5469,9 +5554,8 @@ impl super::MemorySystem {
         // delivered the memories.  Credit is normalised to 1.0 inside apply_path_credit.
         if matches!(outcome, RetrievalOutcome::Helpful) {
             if let Some(graph) = &self.graph_memory {
-                // Drain the stashed path-credit edges from the most recent retrieval.
-                let path_edges: Vec<(uuid::Uuid, f32)> =
-                    std::mem::take(&mut *self.spreading_path_credit.lock());
+                // The credit of the recalls that delivered these memories, each taken once.
+                let path_edges = self.spreading_path_credit.lock().take(memory_ids);
                 if !path_edges.is_empty() {
                     match graph.read().apply_path_credit(&path_edges, source) {
                         Ok(n) => {
@@ -5639,22 +5723,26 @@ impl super::MemorySystem {
             let is_helpful = matches!(outcome, RetrievalOutcome::Helpful);
             // Only update on actionable outcomes — Neutral carries no gradient signal.
             if is_helpful || is_negative {
-                let attr_guard = self.last_signal_attributions.read();
-                for id in memory_ids {
-                    if let Some(attr) = attr_guard.get(id) {
-                        let signal_scores =
-                            crate::memory::hybrid_search::SignalScores::from_components(
-                                attr.bm25_contribution,
-                                attr.vector_contribution,
-                                attr.graph_contribution,
-                            );
-                        self.hybrid_search.update_weights_from_feedback(
-                            &signal_scores,
-                            is_helpful,
-                            is_negative,
-                        );
-                    }
+                let attributions: Vec<SignalAttribution> = {
+                    let recent = self.recent_signal_attributions.lock();
+                    memory_ids
+                        .iter()
+                        .filter_map(|id| recent.peek(id).cloned())
+                        .collect()
+                };
+                for attr in &attributions {
+                    let signal_scores = crate::memory::hybrid_search::SignalScores::from_components(
+                        attr.bm25_contribution,
+                        attr.vector_contribution,
+                        attr.graph_contribution,
+                    );
+                    self.hybrid_search.update_weights_from_feedback(
+                        &signal_scores,
+                        is_helpful,
+                        is_negative,
+                    );
                 }
+
                 // Persist the updated weight vector so it survives a restart (R3a).
                 let updated = self.hybrid_search.learned_weight_state();
                 self.learned_weights_store.save(&updated);
@@ -7222,6 +7310,158 @@ mod query_entity_resolution_tests {
         let as_focal = resolve_query_entities(&graph, &["Vornak"], &[], "vornak");
         assert_eq!(as_focal.focal, vec![reactor]);
         assert_eq!(as_focal.all, vec![reactor]);
+    }
+}
+
+#[cfg(test)]
+mod readout_tests {
+    use super::{MemoryId, PathCreditLedger, Query};
+    use crate::memory::{Experience, MemoryConfig, MemorySystem};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn edge(n: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(n)
+    }
+
+    fn memory_id(n: u128) -> MemoryId {
+        MemoryId(uuid::Uuid::from_u128(n))
+    }
+
+    #[test]
+    fn a_recall_cannot_displace_another_recalls_path_credit() {
+        let mut ledger = PathCreditLedger::new();
+        ledger.record(&[memory_id(1), memory_id(2)], vec![(edge(10), 0.5)]);
+        ledger.record(&[memory_id(3)], vec![(edge(20), 0.25)]);
+
+        assert_eq!(ledger.take(&[memory_id(3)]), vec![(edge(20), 0.25)]);
+        assert_eq!(ledger.take(&[memory_id(1)]), vec![(edge(10), 0.5)]);
+    }
+
+    #[test]
+    fn a_recalls_path_credit_is_taken_once() {
+        let mut ledger = PathCreditLedger::new();
+        ledger.record(&[memory_id(1), memory_id(2)], vec![(edge(10), 0.5)]);
+
+        assert_eq!(ledger.take(&[memory_id(1)]), vec![(edge(10), 0.5)]);
+        assert!(
+            ledger.take(&[memory_id(2)]).is_empty(),
+            "feedback on a second memory of the same recall credited its edges again"
+        );
+    }
+
+    #[test]
+    fn credit_from_several_recalls_sums_per_edge() {
+        let mut ledger = PathCreditLedger::new();
+        ledger.record(&[memory_id(1)], vec![(edge(10), 0.5), (edge(11), 0.25)]);
+        ledger.record(&[memory_id(2)], vec![(edge(10), 0.25)]);
+
+        assert_eq!(
+            ledger.take(&[memory_id(1), memory_id(2)]),
+            vec![(edge(10), 0.75), (edge(11), 0.25)]
+        );
+    }
+
+    fn system(dir: &std::path::Path) -> MemorySystem {
+        let system = MemorySystem::new(
+            MemoryConfig {
+                storage_path: dir.to_path_buf(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("memory system");
+        for content in [
+            "The apple orchard harvest starts after the first frost",
+            "Apple orchard pickers sort the harvest by size",
+            "The orchard sells cider from the apple harvest",
+            "The rust compiler rejects the borrow before the move",
+            "A borrow checker error in the rust compiler names the lifetime",
+            "The rust compiler explains each borrow conflict",
+        ] {
+            system
+                .remember(
+                    Experience {
+                        content: content.to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .expect("remember");
+        }
+        system
+    }
+
+    fn ask(text: &str) -> Query {
+        Query {
+            query_text: Some(text.to_string()),
+            max_results: 3,
+            ..Default::default()
+        }
+    }
+
+    /// Each recall's readout names only the memories that recall returned, and a
+    /// second recall leaves the first one's attributions readable by the feedback
+    /// that names its memories.
+    #[test]
+    fn a_readout_belongs_to_its_own_recall_and_survives_the_next() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let system = system(tmp.path());
+
+        let (apples, apple_readout) = system
+            .recall_with_readout(&ask("apple orchard harvest"))
+            .expect("recall");
+        system
+            .recall_with_readout(&ask("rust compiler borrow"))
+            .expect("recall");
+
+        let returned: HashSet<MemoryId> = apples.iter().map(|m| m.id.clone()).collect();
+        assert!(
+            !apple_readout.signal_attributions.is_empty(),
+            "a keyword recall attributes its hits"
+        );
+        assert!(apple_readout
+            .signal_attributions
+            .keys()
+            .all(|id| returned.contains(id)));
+        for id in apple_readout.signal_attributions.keys() {
+            assert!(
+                system.signal_attribution_for(id).is_some(),
+                "the next recall wiped an attribution feedback still needs"
+            );
+        }
+    }
+
+    /// Recalls racing on one tenant each get their own readout back.
+    #[test]
+    fn racing_recalls_keep_their_own_readouts() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let system = Arc::new(system(tmp.path()));
+
+        let workers: Vec<_> = ["apple orchard harvest", "rust compiler borrow"]
+            .into_iter()
+            .map(|text| {
+                let system = Arc::clone(&system);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let (memories, readout) =
+                            system.recall_with_readout(&ask(text)).expect("recall");
+                        let returned: HashSet<MemoryId> =
+                            memories.iter().map(|m| m.id.clone()).collect();
+                        assert!(
+                            readout
+                                .signal_attributions
+                                .keys()
+                                .all(|id| returned.contains(id)),
+                            "a readout named a memory its recall did not return"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker");
+        }
     }
 }
 

@@ -518,10 +518,15 @@ pub fn apply_replicated_page(
             snapshots.push(memory);
         }
     }
-    memory_sys.read().upsert_memories(&snapshots)?;
+    let guard = memory_sys.read();
+    // Held from the first store write through the append, so no local write to these
+    // memories lands between a frame's store write and its place in this log.
+    let _gate = guard.journal_section();
+    guard.upsert_memories(&snapshots)?;
     for (_, payload) in &frames {
         apply_non_snapshot(manager, user_id, payload)?;
     }
+
     // One writer lock, append batch and fsync for the page rather than one per frame.
     // All or nothing: a page that fails journals no frame, and its retry adds no
     // duplicates of the frames before the failure.

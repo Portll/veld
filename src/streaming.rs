@@ -1381,7 +1381,6 @@ impl StreamingMemoryExtractor {
 
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory.read();
-                let graph_guard = graph.read();
                 let now = Utc::now();
 
                 // Semantic query
@@ -1391,6 +1390,10 @@ impl StreamingMemoryExtractor {
                     ..Default::default()
                 };
                 let results = memory_guard.recall(&query).unwrap_or_default();
+                // Read only after recall returns: recall reads this graph itself, and a
+                // second read on a thread already holding one waits forever once a
+                // writer queues between the two.
+                let graph_guard = graph.read();
 
                 // Use scores from unified 5-layer pipeline (PIPE-9: feedback now in pipeline)
                 // Recall already applies: RRF fusion + hebbian + recency + feedback
@@ -1415,8 +1418,10 @@ impl StreamingMemoryExtractor {
                         Some((m, score, semantic, recency, hebbian_strength))
                     })
                     .collect();
+                drop(graph_guard);
 
                 // Sort by score descending
+
                 candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
                 // Filter by threshold, cooldown snapshot, and limit

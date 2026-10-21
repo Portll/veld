@@ -8,10 +8,24 @@
 //! queue off mid-request. Closing the gate lets the writer inside finish and turns
 //! every queued or later writer away with [`WritesClosed`], which the HTTP layer
 //! answers as a retryable 503.
+//!
+//! The gate also orders the tenant's intent log. A write path appends its frame while
+//! it still holds the gate, from a snapshot it read under the gate, so the log takes
+//! the frames for one memory in the order the store took the writes; replication
+//! followers and projections apply in log order, and a frame appended out of that
+//! order leaves them stale or resurrects a deleted memory. Lock order: the gate, then
+//! the journal writer's mutex, then the graph's lock. Nothing that holds the journal
+//! mutex or a graph guard may enter the gate.
+//!
+//! The gate is re-entrant on its thread: a path that holds it across a store write and
+//! the append calls the store's own gated methods, which enter it again.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
+
+/// Proof that the current thread holds a tenant's write gate.
+pub type WriteGuard<'a> = ReentrantMutexGuard<'a, ()>;
 
 /// A writer arrived after the tenant was closed for shutdown. Nothing was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +41,7 @@ impl std::error::Error for WritesClosed {}
 
 #[derive(Debug, Default)]
 pub struct WriteGate {
-    lock: Mutex<()>,
+    lock: ReentrantMutex<()>,
     closed: AtomicBool,
 }
 
@@ -38,12 +52,20 @@ impl WriteGate {
 
     /// Wait for the gate, then refuse if it was closed meanwhile. The check comes after
     /// the lock so a writer that queued before the close cannot slip through after it.
-    pub fn enter(&self) -> Result<MutexGuard<'_, ()>, WritesClosed> {
+    pub fn enter(&self) -> Result<WriteGuard<'_>, WritesClosed> {
         let guard = self.lock.lock();
         if self.closed.load(Ordering::Acquire) {
             return Err(WritesClosed);
         }
         Ok(guard)
+    }
+
+    /// Wait for the gate whether or not it is closed. For appending the intent-log
+    /// frames of writes the store already took, and for the write paths that were never
+    /// refused at shutdown (update, forget): a refusal there would change what those
+    /// requests answer, while the frame of an accepted write still has to land.
+    pub fn hold(&self) -> WriteGuard<'_> {
+        self.lock.lock()
     }
 
     /// Close the gate and wait for the writer inside, if any. The flag is set before
@@ -135,6 +157,41 @@ mod tests {
         for writer in queued {
             assert_eq!(writer.join().unwrap(), Err(WritesClosed));
         }
+    }
+
+    #[test]
+    fn the_holder_enters_again_and_others_wait() {
+        let gate = Arc::new(WriteGate::new());
+        let outer = gate.enter().expect("gate is open");
+        let inner = gate.enter().expect("the holder enters again");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let other = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let _guard = gate.hold();
+                entered_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "another thread entered while the gate was held"
+        );
+        drop(inner);
+        assert!(
+            entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "another thread entered while the outer hold remained"
+        );
+        drop(outer);
+        entered_rx.recv().unwrap();
+        other.join().unwrap();
+    }
+
+    #[test]
+    fn a_closed_gate_is_still_held_for_journaling() {
+        let gate = WriteGate::new();
+        gate.close();
+        assert_eq!(gate.enter().err(), Some(WritesClosed));
+        drop(gate.hold());
     }
 
     #[test]

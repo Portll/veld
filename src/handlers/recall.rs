@@ -659,8 +659,9 @@ pub async fn recall(
         .get_or_create_session(&req.user_id)
         .to_string();
 
-    let (memories, triggered_reminders, _prospective_signals, query_embedding_opt) =
+    let (memories, recall_readout, triggered_reminders, _prospective_signals, query_embedding_opt) =
         tokio::task::spawn_blocking(move || {
+
             let memory_guard = memory_for_recall.read();
 
             // 1. Compute query embedding (reused for prospective + recall + todo search).
@@ -753,9 +754,15 @@ pub async fn recall(
             // distinguish from "you have no matching memories" — so a broken index,
             // an unreadable store or a decode error all presented as a confident
             // negative answer. Propagate; an error is the honest response.
-            let memories = memory_guard.recall(&query)?;
+            let (memories, readout) = memory_guard.recall_with_readout(&query)?;
 
-            Ok::<_, anyhow::Error>((memories, reminders, prospective_signals, query_embedding_opt))
+            Ok::<_, anyhow::Error>((
+                memories,
+                readout,
+                reminders,
+                prospective_signals,
+                query_embedding_opt,
+            ))
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
@@ -1117,7 +1124,7 @@ pub async fn recall(
 
     // M3: assemble the query-level feeling-of-knowing readout. Advisory and
     // terminal — it never feeds back into scoring or adaptive weight learning.
-    let meta_opt = memory.read().last_query_metacognition();
+    let meta_opt = recall_readout.metacognition;
     // Outside the closure below, so a slow store not yet open is opened on the blocking pool.
     let gap_store = match &meta_opt {
         Some(meta) if !meta.focal_entities.is_empty() => {
@@ -2723,11 +2730,10 @@ pub async fn surface_relevant(
 
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory_sys.read();
-            let graph_guard = graph_memory.read();
             engine.surface_relevant(
                 &context,
                 &memory_guard,
-                Some(&*graph_guard),
+                Some(&*graph_memory),
                 &config,
                 Some(&feedback_store),
             )

@@ -19,7 +19,7 @@ use zenoh::query::Query;
 use zenoh::sample::Sample;
 
 use crate::errors::ValidationErrorExt;
-use crate::handlers::crud::journal_bulk_forget;
+use crate::handlers::crud::forget_one_journaled;
 use crate::handlers::recall::recall_memory_view;
 use crate::handlers::remember::{
     build_rich_context, parse_experience_type, remember_journaled, WriteOrigin,
@@ -27,7 +27,7 @@ use crate::handlers::remember::{
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::handlers::types::{MemoryEvent, RecallFact, RecallMemory, RecallResponse, RecallTodo};
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
-use crate::memory::types::{ForgetCriteria, GeoFilter, MemoryId};
+use crate::memory::types::{GeoFilter, MemoryId};
 use crate::memory::{Experience, Query as MemoryQuery, RetrievalMode, SessionEvent, TodoStatus};
 use crate::metrics;
 use crate::streaming::{ExtractionConfig, StreamHandshake, StreamMessage, StreamMode};
@@ -1061,11 +1061,7 @@ pub async fn handle_forget(sample: Sample, manager: Arc<MultiUserMemoryManager>)
     let journal = Arc::clone(&manager);
     let journal_user_id = user_id.clone();
     match tokio::task::spawn_blocking(move || {
-        let count = user_mem
-            .read()
-            .forget_journaled(ForgetCriteria::ById(mid.clone()))?;
-        journal_bulk_forget(&journal, &journal_user_id, [mid]);
-        anyhow::Ok(count)
+        forget_one_journaled(&journal, &user_mem.read(), &journal_user_id, mid)
     })
     .await
     {
