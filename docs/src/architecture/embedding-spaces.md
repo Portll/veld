@@ -88,9 +88,9 @@ the store. Saving the mapping replaced the old secondary index's insertion-order
 drifted whenever a vector was added after a save or soft-deleted.
 
 Today the indexed spaces are the primary embedder's and the secondary embedder's.
-`RetrievalEngine::search_space` searches any of them. Recall embeds the query in every space it
-can, fuses each space's results by RRF, and compares a stored vector with a query only in the
-space both are in. That holds for the brute-force pass over recent memories and for the
+`RetrievalEngine::search_space` searches any of them. Recall searches every space a query vector
+reaches (see below), fuses each space's results by RRF, and compares a stored vector with a
+query only in the space both are in. That holds for the brute-force pass over recent memories and for the
 cross-embedder agreement signal too.
 
 A memory may hold vectors in more spaces than its two slots. `other_vectors`, the last field of
@@ -121,6 +121,33 @@ memory still queued at a crash is stored but unindexed, and the backlog reconcil
 
 `MemorySystem::remember` stays synchronous for library callers and the recall harness, which
 recall what they just wrote. Bulk imports (seed, ingest, MIF) still embed as they write.
+
+## The query once, every space at once
+
+Recall embeds the query once in each space an embedder here writes. When neither vector is in
+the query cache, the primary and secondary embeddings run at the same time. The secondary
+embeds the text as a query, the side an asymmetric model such as nomic searches with. Both are
+cached per space, so a repeated query embeds nothing.
+
+Every index those vectors reach beyond the primary one is a leg (`src/memory/space_legs.rs`):
+
+- another space's index, searched with the query vector in that space;
+- the primary index through the installed secondary-to-primary map, in place of the direct
+  secondary search, which runs only if the mapped one fails;
+- an indexed space no embedder here writes, through a fitted map from a space with a query
+  vector.
+
+A space no query vector reaches is not searched. The read path never embeds into it. The legs
+need only the query vectors, so they start on their own thread as soon as the vectors exist and
+are collected at fusion. Graph traversal, the primary search and BM25 run meanwhile. The
+cross-encoder stays one top-K pass after fusion.
+
+Each leg asks its index for a candidate budget, in multiples of the results asked for. The
+`space_candidates` dial sets it per space, from 1 to 32. A space without an entry learns its
+budget from its own record: how deep into the leg's list the results recall returned lay. That
+is a moving mean and variance, kept in memory per tenant. After 30 recalls the budget is the
+mean plus three deviations, between 2 and the default of 8. A leg whose returned results all
+come from its top asks for less. A learned budget never asks for more than the default.
 
 ## Fusion across spaces
 

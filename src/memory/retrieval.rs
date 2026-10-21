@@ -20,6 +20,7 @@ use super::embedding_backlog::{BacklogKey, EmbeddingBacklogStore};
 use super::introspection::ConsolidationEventBuffer;
 pub(crate) use super::space_index::IdMapping;
 use super::space_index::{SpaceIndex, SpaceIndexHealth};
+use super::space_legs::{self, Leg, LegDepth, LegHits, LegIndex, LegKind};
 use super::space_migration::{MigrationKind, MigrationStep, SpaceMigration, SpaceMigrationStore};
 use super::storage::SearchCriteria;
 use super::types::*;
@@ -102,6 +103,9 @@ pub struct RetrievalEngine {
     /// The distribution of each space's best search similarity, learned from its searches and
     /// seeded from the space registry at start.
     score_stats: RwLock<std::collections::HashMap<SpaceId, space::ScoreStats>>,
+    /// How deep into each space's recall legs the returned results lay; sets the legs'
+    /// candidate budgets.
+    leg_depths: RwLock<std::collections::HashMap<SpaceId, LegDepth>>,
     /// Storage path for persisting vector index and ID mapping
     storage_path: PathBuf,
     /// Lock order: 5 - Acquire last
@@ -272,6 +276,7 @@ impl RetrievalEngine {
             vector_index: Arc::new(RwLock::new(vector_index)),
             id_mapping: Arc::new(RwLock::new(id_mapping)),
             space_indexes: RwLock::new(space_indexes),
+            leg_depths: RwLock::new(std::collections::HashMap::new()),
             score_stats: RwLock::new(
                 space::SpaceRegistry::read(&storage_path)
                     .ok()
@@ -1698,22 +1703,6 @@ impl RetrievalEngine {
         })
     }
 
-    /// Search `to`'s index with a query vector in `from`, mapped through the installed map.
-    /// Returns the results and the map's confidence; empty when no map or no index exists.
-    pub fn search_bridged(
-        &self,
-        from: &SpaceId,
-        to: &SpaceId,
-        query: &[f32],
-        limit: usize,
-    ) -> Result<(Vec<(MemoryId, f32)>, f32)> {
-        let Some(bridge) = self.embedder.alignment_between(from, to) else {
-            return Ok((Vec::new(), 0.0));
-        };
-        let mapped = bridge.alignment.project(query)?;
-        Ok((self.search_space(to, &mapped, limit)?, bridge.confidence))
-    }
-
     /// Re-index an existing memory with updated embeddings
     ///
     /// Used when memory content is updated via upsert() to ensure the vector
@@ -2033,7 +2022,7 @@ impl RetrievalEngine {
     }
 
     /// Fold a search's best similarity into its space's statistics.
-    fn observe_scores(&self, space: &SpaceId, results: &[(MemoryId, f32)]) {
+    pub fn observe_scores(&self, space: &SpaceId, results: &[(MemoryId, f32)]) {
         if let Some((_, best)) = results.first() {
             let mut stats = self.score_stats.write();
             let current = stats.get(space).copied();
@@ -2083,62 +2072,136 @@ impl RetrievalEngine {
         Ok(results)
     }
 
-    /// Search the *primary* Vamana index using a query text encoded with the
-    /// secondary embedder and projected through the installed alignment.
-    ///
-    /// Returns an empty vec if no alignment is installed or no secondary
-    /// embedder is configured — the existing max-score union path is the
-    /// caller's fallback.
-    ///
-    /// Mirrors `search_ids_secondary`: distance is inverted to similarity,
-    /// duplicate `MemoryId`s are kept at max similarity, ties are broken by id
-    /// for deterministic ordering.
-    pub fn search_ids_aligned(
+    /// The legs a query's vectors reach beyond the primary index, in the order recall fuses
+    /// them: the primary through the installed secondary-to-primary map, in place of the direct
+    /// secondary search, which runs only if the mapped one fails; each other space's index a
+    /// query vector in `space_queries` is in; every indexed space a map reaches from a space
+    /// with a query vector, unless a query vector is in it already. `dial` overrides a space's
+    /// candidate factor; a space without an entry asks for what its record supports.
+    pub fn space_legs(
         &self,
-        query_text: &str,
-        limit: usize,
-    ) -> Result<Vec<(MemoryId, f32)>> {
-        use crate::embeddings::competitive::AlignedSide;
-
-        let projected = match self
-            .embedder
-            .encode_aligned(query_text, AlignedSide::Query)?
-        {
-            Some(v) => v,
-            None => return Ok(Vec::new()),
+        primary_query: &[f32],
+        space_queries: &[(SpaceId, Vec<f32>)],
+        results: usize,
+        dial: &std::collections::BTreeMap<String, f32>,
+    ) -> Vec<Leg> {
+        let limit_for = |space: &SpaceId| -> usize {
+            let factor = dial
+                .get(space.as_str())
+                .copied()
+                .unwrap_or_else(|| self.candidate_factor(space));
+            space_legs::budget(factor, results)
         };
+        let mut legs = Vec::new();
 
-        // LOCK ORDERING: primary vector_index (1) before id_mapping (2)
-        let index = self.vector_index.read();
-        let results = index
-            .search(&projected, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
-            .context("Aligned vector search failed")?;
+        let aligned = self.embedder.alignment_snapshot().and_then(|map| {
+            let from = self.embedder.secondary_space()?;
+            let (_, query) = space_queries.iter().find(|(s, _)| *s == from)?;
+            Some(Leg {
+                space: self.index_space.clone(),
+                kind: LegKind::Aligned,
+                index: LegIndex::Primary {
+                    index: Arc::clone(&self.vector_index),
+                    mapping: Arc::clone(&self.id_mapping),
+                },
+                map: Some(map),
+                query: query.clone(),
+                limit: limit_for(&self.index_space),
+                fallback: false,
+            })
+        });
+        let fallback = aligned.is_some();
+        legs.extend(aligned);
 
-        let id_mapping = self.id_mapping.read();
-        let mut best_scores: std::collections::HashMap<MemoryId, f32> =
-            std::collections::HashMap::new();
-
-        for (vector_id, distance) in results {
-            // NormalizedDotProduct: similarity = -distance
-            let similarity = -distance;
-            if let Some(memory_id) = id_mapping.get_memory_id(vector_id) {
-                best_scores
-                    .entry(memory_id.clone())
-                    .and_modify(|score| {
-                        if similarity > *score {
-                            *score = similarity;
-                        }
-                    })
-                    .or_insert(similarity);
+        for (space, query) in space_queries {
+            if *space == self.index_space {
+                continue;
+            }
+            if let Some(index) = self.space_index(space) {
+                legs.push(Leg {
+                    space: space.clone(),
+                    kind: LegKind::Direct,
+                    index: LegIndex::Space(index),
+                    map: None,
+                    query: query.clone(),
+                    limit: limit_for(space),
+                    fallback,
+                });
             }
         }
 
-        // Tie-break by MemoryId for deterministic rank order (RH-10).
-        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        memory_ids.truncate(limit);
+        for (from, to, bridge) in self.embedder.bridges() {
+            if to == self.index_space || space_queries.iter().any(|(s, _)| *s == to) {
+                continue;
+            }
+            let query = if from == self.index_space {
+                Some(primary_query)
+            } else {
+                space_queries
+                    .iter()
+                    .find(|(s, _)| *s == from)
+                    .map(|(_, q)| q.as_slice())
+            };
+            let (Some(query), Some(index)) = (query, self.space_index(&to)) else {
+                continue;
+            };
+            legs.push(Leg {
+                limit: limit_for(&to),
+                space: to,
+                kind: LegKind::Bridged {
+                    from,
+                    confidence: bridge.confidence,
+                },
+                index: LegIndex::Space(index),
+                map: Some(bridge.alignment),
+                query: query.to_vec(),
+                fallback: false,
+            });
+        }
+        legs
+    }
 
-        Ok(memory_ids)
+    /// The candidate factor `space`'s record supports.
+    pub fn candidate_factor(&self, space: &SpaceId) -> f32 {
+        self.leg_depths
+            .read()
+            .get(space)
+            .map_or(space_legs::DEFAULT_CANDIDATE_FACTOR, LegDepth::factor)
+    }
+
+    /// Each space's record of how deep into its legs the returned results lay.
+    pub fn leg_depths(&self) -> std::collections::HashMap<SpaceId, LegDepth> {
+        self.leg_depths.read().clone()
+    }
+
+    /// Record, for each leg, how deep into its list the `returned` results lay, out of the
+    /// `results` the recall asked for.
+    pub fn observe_leg_depths(
+        &self,
+        legs: &[(SpaceId, Vec<MemoryId>)],
+        returned: &[MemoryId],
+        results: usize,
+    ) {
+        if legs.is_empty() {
+            return;
+        }
+        let mut depths = self.leg_depths.write();
+        for (space, ranked) in legs {
+            depths
+                .entry(space.clone())
+                .or_default()
+                .observe(space_legs::returned_depth(ranked, returned, results));
+        }
+    }
+
+    /// Fold finished legs' best similarities into their spaces' score statistics. An aligned
+    /// leg's query is a mapped one, so its scores say nothing of the primary's own scale.
+    pub fn observe_leg_scores(&self, legs: &[LegHits]) {
+        for leg in legs {
+            if leg.kind != LegKind::Aligned {
+                self.observe_scores(&leg.space, &leg.hits);
+            }
+        }
     }
 
     /// Get memory from storage by ID
@@ -4165,11 +4228,36 @@ mod space_tests {
                 "the map's target got an index"
             );
             let (id, content) = &ids[42];
-            let (hits, confidence) = engine
-                .search_bridged(&model_a, &model_b, &a.encode(content).unwrap(), 5)
-                .unwrap();
-            assert!(hits.iter().any(|(h, _)| h == id), "{hits:?}");
+            let legs = engine.space_legs(
+                &a.encode(content).unwrap(),
+                &[],
+                5,
+                &std::collections::BTreeMap::new(),
+            );
+            assert_eq!(legs.len(), 1, "one leg, through the map");
+            assert_eq!(legs[0].space, model_b);
+            assert_eq!(legs[0].limit, 40, "the default budget, 8 per result");
+            let finished = space_legs::PendingLegs::start(legs).finish();
+            let leg = &finished[0];
+            let LegKind::Bridged { from, confidence } = &leg.kind else {
+                panic!("{:?}", leg.kind);
+            };
+            assert_eq!(*from, model_a);
             assert!((confidence - report.held_out_cosine).abs() < 1e-5);
+            assert!(leg.hits.iter().any(|(h, _)| h == id), "{:?}", leg.hits);
+
+            let ranked: Vec<MemoryId> = leg.hits.iter().map(|(h, _)| h.clone()).collect();
+            for _ in 0..space_legs::LegDepth::MIN_SAMPLES {
+                engine.observe_leg_depths(&[(model_b.clone(), ranked.clone())], &ranked[..1], 5);
+            }
+            assert_eq!(
+                engine.candidate_factor(&model_b),
+                space_legs::MIN_CANDIDATE_FACTOR,
+                "a leg whose returned results lie at its top asks for less"
+            );
+            let dial = std::collections::BTreeMap::from([(model_b.to_string(), 3.0)]);
+            let legs = engine.space_legs(&a.encode(content).unwrap(), &[], 5, &dial);
+            assert_eq!(legs[0].limit, 15, "the dial overrides the record");
             assert!(crate::embeddings::alignment_spaces::corpus_alignment_path(
                 tmp.path(),
                 &model_a,

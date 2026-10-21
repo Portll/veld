@@ -125,7 +125,8 @@ Comprehensive performance measurements for Veld - Agentic Memory v0.1.5+.
 ### Embedding spaces (per-space cost, step 12 of the embedding-spaces plan)
 
 `cargo bench --bench embedding_spaces` measures what each embedding space costs: vector-leg
-search latency over one space and over two, the bytes and RSS each space holds as full vectors
+search latency over one space and over two, the query path (embedding included) over one space
+and over two, in sequence and at once, the bytes and RSS each space holds as full vectors
 and as product-quantized codes, inline write cost with an embedder paced like a remote host,
 and drain throughput per batch size against a real host when `VELD_BENCH_EMBEDDER_URL` is set.
 It writes a JSON report under `evaluations/spaces/`. The plan's rows use
@@ -134,10 +135,14 @@ It writes a JSON report under `evaluations/spaces/`. The plan's rows use
 Every later step of the plan re-runs it and adds a row here, so each step has a before and after.
 No numbers are recorded yet: the baseline is the first run, before deferred embedding lands.
 
-| Step | Commit | Memories | Spaces | Search p95 | RSS per space | Write per memory | Drain at 64 |
-|---|---|---|---|---|---|---|---|
-| baseline | | 10k | 1 / 2 | | | | |
-| baseline | | 100k | 1 / 2 | | | | |
+| Step | Commit | Memories | Spaces | Search p95 | Query p95, 2 spaces ÷ 1 | RSS per space | Write per memory | Drain at 64 |
+|---|---|---|---|---|---|---|---|---|
+| baseline | | 10k | 1 / 2 | | | | | |
+| baseline | | 100k | 1 / 2 | | | | | |
+
+Step 10 is done when the query p95 with two spaces at once is within 1.3x of one space at 100k
+memories. The bench's query rows leave out graph traversal and BM25, which the second space's
+search also overlaps in recall.
 
 The LoCoMo gate under each space configuration runs in CI (`.github/workflows/recall.yml`).
 
