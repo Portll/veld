@@ -64,15 +64,37 @@ See [Multi-tenant](multi-tenant.md) for the operational model.
 Veld picks its PRIMARY embedder at startup, in this order, and reports the choice on
 `GET /health` as `embedder` (`id`, `model`, `dimension`, `kind`, `reason`):
 
-1. `VELD_EMBEDDER`, when set: `nomic` (local ONNX), `minilm` (local ONNX), `http`
-   (the endpoint below), or an `http(s)://host:port[#model]` URL. An explicit choice
-   that cannot be honoured fails startup with the endpoint named; it never falls back.
+1. `VELD_EMBEDDER`, when set: `nomic` (local ONNX), `minilm` (local ONNX),
+   `arctic-embed-xs` (local ONNX), `http` (the endpoint below), or an
+   `http(s)://host:port[#model]` URL. An explicit choice that cannot be honoured fails
+   startup with the endpoint named; it never falls back. `arctic-embed-xs` is reached only
+   this way, never by the automatic steps below.
 2. Nomic-embed-text-v1.5 ONNX (768d) when its model files are present
    (`VELD_AUTO_DOWNLOAD_MODELS=true` fetches them).
 3. The OpenAI-compatible HTTP endpoint, when it answers a probe for the configured
    model. This is the same nomic model served by a process that already holds it.
 4. MiniLM-L6 ONNX (384d). With no model files at all veld refuses to start rather than
    run on hash vectors (`VELD_ALLOW_SIMPLIFIED_EMBEDDINGS=1` overrides, for tests only).
+
+The local ONNX embedders are downloaded from Hugging Face by `model-fetch --minilm`,
+`--arctic-xs` or `--nomic`, or on first use with `VELD_AUTO_DOWNLOAD_MODELS=true`.
+MiniLM and arctic-embed-xs are fetched at a pinned commit and checked against a SHA-256
+per file; Nomic still follows the repository's `main` branch without checksums.
+
+| `VELD_EMBEDDER` | Model | Licence | Dim | Window | Pooling | Query prefix |
+|---|---|---|---|---|---|---|
+| `minilm` | `sentence-transformers/all-MiniLM-L6-v2` @ `c9745ed1` | Apache-2.0 | 384 | 256 | mean | none |
+| `arctic-embed-xs` | `Snowflake/snowflake-arctic-embed-xs` @ `d8c86521` | Apache-2.0 | 384 | 512 | `[CLS]` | `Represent this sentence for searching relevant passages: ` |
+| `nomic` | `nomic-ai/nomic-embed-text-v1.5` @ `main` | Apache-2.0 | 768 | 512 | mean | `search_query: ` (documents `search_document: `) |
+
+`arctic-embed-xs` is MiniLM-L6's architecture (6 layers, 384 wide, the same vocabulary)
+trained for retrieval, so it costs about what MiniLM does per token. It runs the int8
+export by default, the precision MiniLM runs at; `VELD_ARCTIC_USE_QUANTIZED=false` loads
+the fp32 one, and `VELD_ARCTIC_MODEL_PATH` points at a directory holding the files. Its
+licence is stated in the model card's License section; the card has no `license:` tag,
+so the Hub's licence filter does not show it. Switching the embedder of an existing store
+re-embeds every memory on the next start, because the corpus marker records which model
+wrote the vectors and a match on dimension alone is not accepted.
 
 The HTTP endpoint is any server speaking `/v1/models` and `/v1/embeddings`. Give the
 BASE URL, without `/v1`; the client appends the path:

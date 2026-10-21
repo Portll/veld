@@ -23,6 +23,7 @@ pub mod alignment_config;
 pub mod alignment_csls;
 pub mod alignment_procrustes;
 pub mod alignment_ridge;
+pub mod arctic;
 pub mod chunking;
 pub mod circuit_breaker;
 pub mod competitive;
@@ -44,10 +45,11 @@ use anyhow::Result;
 
 // Re-export downloader functions for convenience
 pub use downloader::{
-    are_models_downloaded, are_ner_models_downloaded, are_nomic_models_downloaded,
-    download_ner_models, download_nomic_models, ensure_downloaded, get_cache_dir, get_models_dir,
-    get_ner_models_dir, get_nomic_models_dir, get_onnx_runtime_path, is_onnx_runtime_downloaded,
-    print_status,
+    are_arctic_xs_models_downloaded, are_models_downloaded, are_ner_models_downloaded,
+    are_nomic_models_downloaded, download_arctic_xs_models, download_ner_models,
+    download_nomic_models, ensure_downloaded, get_arctic_xs_models_dir, get_cache_dir,
+    get_models_dir, get_ner_models_dir, get_nomic_models_dir, get_onnx_runtime_path,
+    is_onnx_runtime_downloaded, print_status,
 };
 
 // Re-export NER types
@@ -86,6 +88,7 @@ pub use alignment_csls::{csls_adjust, local_means, topk_mean};
 /// Dispatch rules:
 /// - prefix `nomic` → `NomicEmbedder::new(NomicConfig::from_env())`
 /// - prefix `minilm` → `MiniLMEmbedder::new(EmbeddingConfig::default())`
+/// - prefix `arctic` → `ArcticEmbedder::new(ArcticConfig::from_env())`
 /// - `http://` / `https://` URL → `HttpEmbedder::new` with `base_url = id`
 /// - anything else → `bail!`
 pub fn load_primary_embedder(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
@@ -112,6 +115,11 @@ fn load_embedder_by_id(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
         let e = minilm::MiniLMEmbedder::new(cfg)?;
         return Ok(Arc::new(e));
     }
+    if id.starts_with("arctic") {
+        let cfg = arctic::ArcticConfig::from_env();
+        let e = arctic::ArcticEmbedder::new(cfg)?;
+        return Ok(Arc::new(e));
+    }
     if id.starts_with("http://") || id.starts_with("https://") {
         // `<url>` or `<url>#<model>` — the form HttpEmbedder::id() emits.
         let cfg = http_embedder::HttpEmbedderConfig::from_id(id);
@@ -119,7 +127,7 @@ fn load_embedder_by_id(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
         return Ok(Arc::new(e));
     }
     anyhow::bail!(
-        "unknown embedder id: {id} (supported prefixes: nomic*, minilm*, http://, https://)"
+        "unknown embedder id: {id} (supported prefixes: nomic*, minilm*, arctic*, http://, https://)"
     );
 }
 
@@ -132,7 +140,7 @@ pub struct PrimaryEmbedderInfo {
     pub id: String,
     pub model: String,
     pub dimension: usize,
-    /// `nomic-onnx` | `minilm-onnx` | `http` — where the vectors come from.
+    /// `nomic-onnx` | `minilm-onnx` | `arctic-onnx` | `http` — where the vectors come from.
     pub kind: &'static str,
     /// Why this one: the env that asked for it, or the fallback step that reached it.
     pub reason: String,

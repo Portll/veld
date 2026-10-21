@@ -39,6 +39,46 @@ pub fn pre_init_ort_runtime(offline_mode: bool) {
     let _ = ORT_PATH_INIT.get_or_init(|| MiniLMEmbedder::init_ort_path_inner(offline_mode));
 }
 
+/// Locate (or, when allowed, download) the shared ONNX Runtime before any `ort` call.
+pub(crate) fn ensure_ort_runtime(offline_mode: bool) -> Result<()> {
+    MiniLMEmbedder::ensure_onnx_runtime_available(offline_mode)
+}
+
+/// ONNX intra-op threads for the 6-layer MiniLM-architecture embedders (this one and
+/// arctic-embed-xs), so the two run with the same parallelism and their costs compare.
+///
+/// macOS ARM64 (M1/M2/M3) defaults to 1 thread to avoid the Eigen thread pool's
+/// spin-to-block deadlock on heterogeneous P/E cores.
+/// See: https://github.com/microsoft/onnxruntime/issues/10270
+pub(crate) fn onnx_threads() -> usize {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let default_threads = 1;
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let default_threads = 2;
+
+    std::env::var("VELD_ONNX_THREADS")
+        // The recall harness pins the upstream spelling.
+        .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_threads)
+}
+
+/// `VELD_LAZY_LOAD=false` loads a model when its embedder is built instead of on first use.
+pub(crate) fn lazy_load_enabled() -> bool {
+    std::env::var("VELD_LAZY_LOAD")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true)
+}
+
+/// Inference time past which a single embed is logged as slow (`VELD_EMBED_TIMEOUT_MS`).
+pub(crate) fn embed_timeout_ms() -> u64 {
+    std::env::var("VELD_EMBED_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000)
+}
+
 /// Lazily initialized ONNX session and tokenizer
 struct LazyModel {
     session: Mutex<Session>,
@@ -47,20 +87,7 @@ struct LazyModel {
 
 impl LazyModel {
     fn new(config: &EmbeddingConfig) -> Result<Self> {
-        // macOS ARM64 (M1/M2/M3): default to 1 thread to avoid Eigen thread pool
-        // spin-to-block deadlock on heterogeneous P/E cores.
-        // See: https://github.com/microsoft/onnxruntime/issues/10270
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let default_threads = 1;
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let default_threads = 2;
-
-        let num_threads = std::env::var("VELD_ONNX_THREADS")
-            // The recall harness pins the upstream spelling.
-            .or_else(|_| std::env::var("SHODH_ONNX_THREADS"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default_threads);
+        let num_threads = onnx_threads();
 
         tracing::info!(
             "Loading MiniLM-L6-v2 model from {:?} with {} threads",
@@ -182,10 +209,7 @@ impl EmbeddingConfig {
                     .unwrap_or_else(super::downloader::get_models_dir) // Default to cache dir
             });
 
-        let embed_timeout_ms = std::env::var("VELD_EMBED_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5000);
+        let embed_timeout_ms = embed_timeout_ms();
 
         let use_quantized = std::env::var("VELD_USE_QUANTIZED_MODEL")
             .map(|v| v != "0" && v.to_lowercase() != "false")
@@ -374,9 +398,7 @@ impl MiniLMEmbedder {
     /// - If ONNX Runtime not found, downloads from GitHub (~50MB)
     /// - Files cached in ~/.cache/veld/
     pub fn new(config: EmbeddingConfig) -> Result<Self> {
-        let lazy_load = std::env::var("VELD_LAZY_LOAD")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
+        let lazy_load = lazy_load_enabled();
 
         let offline_mode = super::offline_mode_enabled();
 
