@@ -24,8 +24,9 @@ reconsolidation behaves exactly as it did pre-dials.
 ### Ingest dial: `turn_context`
 
 One retrieval dial acts at write time rather than on the recall path.
-`turn_context: Option<bool>` controls whether a `Conversation` memory is
-indexed with its date and the turn it follows (`src/memory/index_text.rs`,
+`turn_context: Option<bool>` controls whether a linked memory (a `Conversation`
+turn, or any memory its writer threaded into an episode with an `episode_id` or
+a `preceding_memory_id`) is indexed with its date and the memory it follows (`src/memory/index_text.rs`,
 [ADR 0009](../decisions/0009-index-text-derived-not-stored.md)). `None`
 keeps the engine default, which is **on**; `Some(false)` indexes the bare
 content. Env seed: `VELD_DIALS_TURN_CONTEXT=0|1`. Flipping it changes what
@@ -39,12 +40,14 @@ An anaphoric reply ("Nate: I've had them for 3 years now!") shares no word
 with the question about it ("How long has Nate had his turtles?"), but the
 turn it answers usually does. Neighbour expansion (recall Layer 4.97, after
 fusion and before the pre-rerank cut) brings the turn that followed a
-well-ranked conversation turn into the pool just below it, and the
-cross-encoder judges it on its own text.
+well-ranked linked memory into the pool just below it, and the
+cross-encoder judges it on its own text. A linked memory is a conversation
+turn or an episode-threaded memory, so an agent session's fix follows the
+error it fixed the way a reply follows its question.
 
 | Dial | Env | Default | What it switches |
 |---|---|---|---|
-| `neighbour_expansion` | `VELD_DIALS_NEIGHBOUR_EXPANSION=0\|1` | `None` (on) | For each of the top `neighbour_expansion_top` fused candidates that is a live conversation turn, the turns recorded as following it (at most two) join the pool at the parent's fused score × `NEIGHBOUR_EXPANSION_SCORE_DECAY` (0.95, `src/constants.rs`). A neighbour already in the pool below that score is lifted to it. A neighbour always scores below its parent, so the top fused candidate does not change. `Some(false)` leaves the pool as fusion built it. |
+| `neighbour_expansion` | `VELD_DIALS_NEIGHBOUR_EXPANSION=0\|1` | `None` (on) | For each of the top `neighbour_expansion_top` fused candidates that is a live linked memory, the memories recorded as following it (at most two) join the pool at the parent's fused score × `NEIGHBOUR_EXPANSION_SCORE_DECAY` (0.95, `src/constants.rs`). A neighbour already in the pool below that score is lifted to it. A neighbour always scores below its parent, so the top fused candidate does not change. `Some(false)` leaves the pool as fusion built it. |
 | `neighbour_expansion_top` | `VELD_DIALS_NEIGHBOUR_EXPANSION_TOP=<n>` | `None` (10) | How many top fused candidates are read as parents. Sanitised to `1..=50` (50 is the widest pre-rerank pool, a decomposed query's). |
 | `neighbour_expansion_predecessor` | `VELD_DIALS_NEIGHBOUR_EXPANSION_PREDECESSOR=0\|1` | `None` (off) | Also brings in the turn each ranked turn follows (its `preceding_memory_id`), at the same score. Has no effect while `neighbour_expansion` is off. |
 

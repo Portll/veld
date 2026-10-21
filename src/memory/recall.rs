@@ -165,7 +165,11 @@ impl super::MemorySystem {
             Some(_) => query.effective_competition_mode(),
             None => CompetitionMode::Coexist,
         };
-        let _ = Self::compete_memories(&mut memories, competition_mode);
+        let demote = self
+            .cognitive_dials
+            .read()
+            .signal_enabled("competition_demote");
+        let _ = Self::compete_memories(&mut memories, competition_mode, demote);
 
         memories.truncate(query.max_results);
 
@@ -2102,7 +2106,15 @@ impl super::MemorySystem {
             // Porter stemming resolves morphological mismatches: "bugs"->"bug",
             // "risks"->"risk", "testing"->"test". Stop word filtering prevents
             // false positives from "the" matching inside "prometheus" etc.
-            // Linear 0.10 per match, capped at 0.40.
+            //
+            // A matched word is weighted by its rarity in the candidate pool and the boost
+            // scales the fused score (x1.00-1.40). A flat +0.10 per word against fused scores
+            // of 0.01-0.05 ranked by match count before meaning, and a word most candidates
+            // carry (a speaker, a project, a repo) moved them all alike. A structured
+            // identifier ("serve.mjs" against a declared `repo:admin/serve.mjs`) keeps its
+            // flat +0.10: it matches at a name boundary or not at all.
+            // [signal: entity_overlap_relative] Gated by disabled_signals dial; default = on.
+            // Off restores the flat per-match boost.
             {
                 use rust_stemmers::{Algorithm, Stemmer};
                 let stemmer = Stemmer::create(Algorithm::English);
@@ -2126,66 +2138,109 @@ impl super::MemorySystem {
                     .collect();
 
                 if !query_stems.is_empty() {
-                    let ids: Vec<MemoryId> = fused.keys().cloned().collect();
-                    for id in &ids {
-                        let view = candidates.get(id);
-                        let entity_stems: Vec<String> = view
-                            .as_ref()
-                            .map(|v| {
-                                v.entities_lower
-                                    .iter()
-                                    .map(|e| stem_query_token(&stemmer, e))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let matched: Vec<&String> = query_stems
-                            .iter()
-                            .filter(|qs| {
-                                entity_stems
-                                    .iter()
-                                    .any(|es| query_token_matches_entity(qs, es))
-                            })
-                            .collect();
+                    let relative = early_dials_snapshot.signal_enabled("entity_overlap_relative");
+                    let per_match = if decomposed { 0.04 } else { 0.10 };
+                    let cap = if decomposed { 0.16 } else { 0.40 };
+                    struct Overlap<'q> {
+                        id: MemoryId,
+                        view: Option<Arc<CandidateView>>,
+                        matched: Vec<&'q String>,
+                    }
+                    let pool: Vec<Overlap> = fused
+                        .keys()
+                        .cloned()
+                        .map(|id| {
+                            let view = candidates.get(&id);
+                            let entity_stems: Vec<String> = view
+                                .as_ref()
+                                .map(|v| {
+                                    v.entities_lower
+                                        .iter()
+                                        .map(|e| stem_query_token(&stemmer, e))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let matched: Vec<&String> = query_stems
+                                .iter()
+                                .filter(|qs| {
+                                    entity_stems
+                                        .iter()
+                                        .any(|es| query_token_matches_entity(qs, es))
+                                })
+                                .collect();
+                            Overlap { id, view, matched }
+                        })
+                        .collect();
+                    let mut entity_df: std::collections::HashMap<&str, usize> =
+                        std::collections::HashMap::new();
+                    let mut content_df: std::collections::HashMap<&str, usize> =
+                        std::collections::HashMap::new();
+                    if relative {
+                        for Overlap { view, matched, .. } in &pool {
+                            for stem in matched {
+                                *entity_df.entry(stem.as_str()).or_default() += 1;
+                            }
+                            if let Some(view) = view {
+                                for stem in &query_stems {
+                                    if view.content_lower.contains(stem.as_str()) {
+                                        *content_df.entry(stem.as_str()).or_default() += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let rarity = |df: usize| pool_rarity(df, pool.len());
+
+                    for Overlap { id, view, matched } in &pool {
                         let overlap = matched.len();
                         if overlap >= 1 {
                             // Dampen entity overlap for abstract/decomposed queries:
                             // generic stems like "perform" match many memories equally,
                             // adding noise rather than signal. Reduce from 0.10 to 0.04.
-                            // An identifier match ("serve.mjs" against a declared
-                            // `repo:admin/serve.mjs`) is not a generic stem — it matches at a
-                            // name boundary or not at all — so it keeps the undampened rate
-                            // whether or not the query was decomposed.
                             let identifiers =
                                 matched.iter().filter(|qs| is_structured_token(qs)).count();
                             let words = overlap - identifiers;
-                            let per_match = if decomposed { 0.04 } else { 0.10 };
-                            let cap = if decomposed { 0.16 } else { 0.40 };
-                            let boost = ((per_match * words as f32).min(cap)
-                                + 0.10 * identifiers as f32)
-                                .min(0.40);
                             if let Some(score) = fused.get_mut(id) {
-                                *score += boost;
+                                if relative {
+                                    let weighted: f32 = matched
+                                        .iter()
+                                        .filter(|qs| !is_structured_token(qs))
+                                        .map(|qs| rarity(entity_df[qs.as_str()]))
+                                        .sum();
+                                    *score *= 1.0 + (per_match * weighted).min(cap);
+                                    *score += (0.10 * identifiers as f32).min(0.40);
+                                } else {
+                                    *score += ((per_match * words as f32).min(cap)
+                                        + 0.10 * identifiers as f32)
+                                        .min(0.40);
+                                }
                             }
                             // Signal attribution: mark entity overlap
                             attr.entry(id.clone()).or_default().entity_overlap = true;
-                        } else if overlap == 0 && !has_any_temporal_intent {
+                        } else if !has_any_temporal_intent {
                             // Content-fallback: when no entity/tag overlap, check
                             // if query stems appear in memory content. Smaller boost
-                            // (+0.05/match, cap 0.20) to keep below tag-match priority.
+                            // (0.05/match, cap 0.20) to keep below tag-match priority.
                             // Gated: skip for temporal queries where content overlap
                             // would boost wrong-session memories indiscriminately.
                             // [signal: content_fallback] Gated by disabled_signals dial; default = always on.
                             if early_dials_snapshot.signal_enabled("content_fallback") {
                                 if let Some(view) = view.as_ref() {
-                                    let content_lower = &view.content_lower;
-                                    let content_overlap = query_stems
+                                    let contained: Vec<&String> = query_stems
                                         .iter()
-                                        .filter(|qs| content_lower.contains(qs.as_str()))
-                                        .count();
-                                    if content_overlap >= 2 {
-                                        let boost = (0.05 * content_overlap as f32).min(0.20);
+                                        .filter(|qs| view.content_lower.contains(qs.as_str()))
+                                        .collect();
+                                    if contained.len() >= 2 {
                                         if let Some(score) = fused.get_mut(id) {
-                                            *score += boost;
+                                            if relative {
+                                                let weighted: f32 = contained
+                                                    .iter()
+                                                    .map(|qs| rarity(content_df[qs.as_str()]))
+                                                    .sum();
+                                                *score *= 1.0 + (0.05 * weighted).min(0.20);
+                                            } else {
+                                                *score += (0.05 * contained.len() as f32).min(0.20);
+                                            }
                                         }
                                     }
                                 }
@@ -2336,10 +2391,13 @@ impl super::MemorySystem {
             // Only the top TEMPORAL_DEDUP_MAX_CANDIDATES by fused score are compared: the pass
             // is all-pairs over the fused set, which runs to hundreds of candidates.
             if has_any_temporal_intent || has_temporal_keywords {
+                // [signal: topic_dedup_topical] Gated by disabled_signals dial; default = on.
+                // Off restores the pairwise, compounding demotion over every shared entity.
                 let demoted = temporal_topic_dedup(
                     &mut fused,
                     &candidates,
                     crate::constants::TEMPORAL_DEDUP_MAX_CANDIDATES,
+                    early_dials_snapshot.signal_enabled("topic_dedup_topical"),
                 );
                 if demoted > 0 {
                     tracing::debug!(
@@ -3382,9 +3440,15 @@ impl super::MemorySystem {
         // Some(false)) fully skips this layer. The `rerank_count` dial caps the
         // candidate budget; absent that, the hardcoded ce_cap applies.
         let rerank_shape = query_parser::classify_rerank_shape(query_text, decomposed, &query_type);
-        let (layer53_use_reranking, layer53_rerank_count_dial, ce_w) = {
+        let (layer53_use_reranking, layer53_rerank_count_dial, ce_w, rerank_context) = {
             let d = self.cognitive_dials.read();
-            (d.use_reranking, d.rerank_count, d.ce_share(rerank_shape))
+            (
+                d.use_reranking,
+                d.rerank_count,
+                d.ce_share(rerank_shape),
+                // [signal: rerank_context] Gated by disabled_signals dial; default = on.
+                d.turn_context_enabled() && d.signal_enabled("rerank_context"),
+            )
         };
         if ce_w < crate::constants::CE_BLEND_SKIP_BELOW {
             tracing::debug!(
@@ -3423,6 +3487,11 @@ impl super::MemorySystem {
                 // entity signal before it. When the query names an identifier the memory
                 // carries as an entity, that entity is put in front of the text the
                 // cross-encoder reads. Nothing changes for a query with no identifier in it.
+                //
+                // A linked memory is read with its context (index_text): its date and the
+                // memory it follows. A reply that names nothing is otherwise judged on its own
+                // words, which is how anaphoric gold reached the pool and still lost the
+                // blend.
                 let query_identifiers: Vec<String> = query_text
                     .split_whitespace()
                     .map(clean_query_token)
@@ -3448,10 +3517,19 @@ impl super::MemorySystem {
                                 .map(String::as_str)
                                 .collect()
                         };
-                        let text = if named.is_empty() {
-                            m.experience.content.clone()
+                        let passage = if rerank_context && super::index_text::applies(&m.experience)
+                        {
+                            super::index_text::for_stored(m, |id| {
+                                self.long_term_memory.get(id).ok()
+                            })
+                            .embedding
                         } else {
-                            format!("{}\n{}", named.join(" "), m.experience.content)
+                            m.experience.content.clone()
+                        };
+                        let text = if named.is_empty() {
+                            passage
+                        } else {
+                            format!("{}\n{}", named.join(" "), passage)
                         };
                         (
                             m.id.clone(),
@@ -4114,8 +4192,14 @@ impl super::MemorySystem {
         // (Linguistic boost moved to Layer 5.85, before ordinal resolution)
 
         let competition_mode = query.effective_competition_mode();
+        // [signal: competition_demote] Gated by disabled_signals dial; default = on.
+        // Off restores deleting each competition's loser from the results.
+        let demote = self
+            .cognitive_dials
+            .read()
+            .signal_enabled("competition_demote");
         let (competitions_detected, memories_eliminated) =
-            Self::compete_memories(&mut memories, competition_mode);
+            Self::compete_memories(&mut memories, competition_mode, demote);
         if competitions_detected > 0 {
             tracing::info!(
                 mode = ?competition_mode,
@@ -5083,8 +5167,19 @@ impl super::MemorySystem {
     }
 
     /// Entity-aware retrieval-time competition for the live recall path.
-    fn compete_memories(memories: &mut Vec<SharedMemory>, mode: CompetitionMode) -> (usize, usize) {
-        use crate::constants::{COMPETITION_ENTITY_OVERLAP_MIN, COMPETITION_MAX_PAIRS};
+    ///
+    /// With `demote`, each loser is kept, scaled by
+    /// [`crate::constants::COMPETITION_LOSER_DEMOTION`] and marked with its opponent, and the
+    /// list is re-sorted; without it the loser is removed. Returns the competitions detected
+    /// and the memories removed.
+    fn compete_memories(
+        memories: &mut Vec<SharedMemory>,
+        mode: CompetitionMode,
+        demote: bool,
+    ) -> (usize, usize) {
+        use crate::constants::{
+            COMPETITION_ENTITY_OVERLAP_MIN, COMPETITION_LOSER_DEMOTION, COMPETITION_MAX_PAIRS,
+        };
 
         if mode == CompetitionMode::Coexist || memories.len() < 2 {
             return (0, 0);
@@ -5103,6 +5198,7 @@ impl super::MemorySystem {
             .collect();
 
         let mut eliminated: HashSet<usize> = HashSet::new();
+        let mut lost_to: Vec<(usize, usize)> = Vec::new();
         let mut competitions_detected = 0;
         let mut pair_count = 0;
         let check_limit = memories.len().min(20);
@@ -5218,6 +5314,7 @@ impl super::MemorySystem {
                     left_idx
                 };
                 eliminated.insert(loser_idx);
+                lost_to.push((loser_idx, winner_idx));
 
                 let shared_entities: Vec<&String> = entity_sets[left_idx]
                     .intersection(&entity_sets[right_idx])
@@ -5235,6 +5332,27 @@ impl super::MemorySystem {
             if pair_count >= COMPETITION_MAX_PAIRS {
                 break;
             }
+        }
+
+        if demote {
+            if lost_to.is_empty() {
+                return (competitions_detected, 0);
+            }
+            for (loser_idx, winner_idx) in lost_to {
+                let mut loser: Memory = memories[loser_idx].as_ref().clone();
+                loser.set_score(loser.score.unwrap_or(0.0) * COMPETITION_LOSER_DEMOTION);
+                loser
+                    .experience
+                    .metadata
+                    .insert("competition_conflict".to_string(), "true".to_string());
+                loser.experience.metadata.insert(
+                    "competition_opponent".to_string(),
+                    memories[winner_idx].id.0.to_string(),
+                );
+                memories[loser_idx] = Arc::new(loser);
+            }
+            memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+            return (competitions_detected, 0);
         }
 
         let memories_eliminated = eliminated.len();
@@ -6148,15 +6266,25 @@ impl<'s, S: CandidateSource + ?Sized> RecallCandidates<'s, S> {
     }
 }
 
-/// Layer 4.54 (temporal topic dedup) over the `cap` highest fused scores: for each pair of
-/// those whose lowercase entity sets have Jaccard > 0.40, the older is demoted ×0.85.
-/// Pairs are visited in content order: when two same-topic memories share a timestamp the
-/// second one visited is demoted, so the order must not come from the map's hash order.
-/// Returns the number of demotions.
+/// Layer 4.54: with recency intent, the older of two same-topic candidates is demoted
+/// (x0.85), so the newer statement of a topic leads.
+///
+/// `topical` (the default) reads topic from the entities that tell candidates apart: an
+/// entity carried by more than a quarter of the compared candidates (a speaker, a
+/// conversation, a project or repo tag) names the setting, not the topic, and is left out
+/// of the overlap. A memory is demoted once however many newer same-topic memories it
+/// has. Without it every shared entity counts and each qualifying pair demotes again, so
+/// in one speaker's conversation or one project's memories the oldest candidate lost 15%
+/// per newer neighbour, which is how temporal questions lost their gold.
+///
+/// Only the `cap` highest fused scores are compared. Pairs are visited in content order:
+/// when two same-topic memories share a timestamp the second one visited is demoted, so
+/// the order must not come from the map's hash order. Returns the number of demotions.
 fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
     fused: &mut std::collections::HashMap<MemoryId, f32>,
     candidates: &RecallCandidates<'_, S>,
     cap: usize,
+    topical: bool,
 ) -> usize {
     let mut entries: Vec<(MemoryId, f32, Arc<CandidateView>)> = fused
         .iter()
@@ -6175,11 +6303,34 @@ fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
     entries.truncate(cap);
     entries.sort_by(by_content);
 
+    let background: HashSet<&str> = if topical {
+        let mut df: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (_, _, view) in &entries {
+            let distinct: HashSet<&str> = view.entities_lower.iter().map(String::as_str).collect();
+            for entity in distinct {
+                *df.entry(entity).or_default() += 1;
+            }
+        }
+        let bar = (entries.len() / 4).max(1);
+        df.into_iter()
+            .filter(|(_, carried)| *carried > bar)
+            .map(|(entity, _)| entity)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let entity_sets: Vec<HashSet<&str>> = entries
         .iter()
-        .map(|(_, _, view)| view.entities_lower.iter().map(String::as_str).collect())
+        .map(|(_, _, view)| {
+            view.entities_lower
+                .iter()
+                .map(String::as_str)
+                .filter(|entity| !background.contains(entity))
+                .collect()
+        })
         .collect();
 
+    let mut older_once: HashSet<usize> = HashSet::new();
     let mut demoted = 0usize;
     for i in 0..entries.len() {
         for j in (i + 1)..entries.len() {
@@ -6193,23 +6344,37 @@ fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
             let union = set_a.len() + set_b.len() - intersection;
             let jaccard = intersection as f32 / union.max(1) as f32;
             if jaccard > 0.40 {
-                let (ts_a, ts_b) = (
-                    entries[i].2.memory.created_at,
-                    entries[j].2.memory.created_at,
-                );
-                let older_id = if ts_a < ts_b {
-                    &entries[i].0
+                let older = if entries[i].2.memory.created_at < entries[j].2.memory.created_at {
+                    i
                 } else {
-                    &entries[j].0
+                    j
                 };
-                if let Some(score) = fused.get_mut(older_id) {
+                if topical {
+                    older_once.insert(older);
+                } else if let Some(score) = fused.get_mut(&entries[older].0) {
                     *score *= 0.85;
                     demoted += 1;
                 }
             }
         }
     }
+    for older in older_once {
+        if let Some(score) = fused.get_mut(&entries[older].0) {
+            *score *= 0.85;
+            demoted += 1;
+        }
+    }
     demoted
+}
+
+/// How much a term tells the candidates in a pool apart: 1 when one candidate carries it,
+/// 0 when every one does (`ln(n / df) / ln(n)`). A pool of one weighs every term fully.
+fn pool_rarity(df: usize, pool: usize) -> f32 {
+    if pool < 2 {
+        return 1.0;
+    }
+    let n = pool as f32;
+    ((n / df.max(1) as f32).ln() / n.ln()).clamp(0.0, 1.0)
 }
 
 /// Query words resolved to graph entities for recall.
@@ -7234,7 +7399,9 @@ mod date_window_leg_tests {
 
 #[cfg(test)]
 mod candidate_projection_tests {
-    use super::{temporal_topic_dedup, CandidateSource, CandidateTier, RecallCandidates};
+    use super::{
+        pool_rarity, temporal_topic_dedup, CandidateSource, CandidateTier, RecallCandidates,
+    };
     use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId, SharedMemory};
     use anyhow::Result;
     use std::cell::RefCell;
@@ -7379,7 +7546,7 @@ mod candidate_projection_tests {
         let before = fused.clone();
         let candidates = RecallCandidates::new(&source);
 
-        let demoted = temporal_topic_dedup(&mut fused, &candidates, 50);
+        let demoted = temporal_topic_dedup(&mut fused, &candidates, 50, false);
         assert_eq!(
             demoted,
             50 * 49 / 2,
@@ -7394,6 +7561,105 @@ mod candidate_projection_tests {
         let oldest_compared = &by_rank[10];
         let expected = before[oldest_compared] * 0.85_f32.powi(49);
         assert!((fused[oldest_compared] - expected).abs() < 1e-4);
+    }
+
+    /// Entities every candidate carries (a speaker, a project) are the setting, not a
+    /// topic: in topical mode they demote nobody.
+    #[test]
+    fn topical_dedup_ignores_entities_the_whole_pool_carries() {
+        let mut source = CountingSource::default();
+        let base = chrono::Utc::now() - chrono::Duration::days(100);
+        let mut fused: HashMap<MemoryId, f32> = HashMap::new();
+        for rank in 0..20 {
+            let mut m = memory(&format!("note {rank:02}"), &["veld", "Nate"]);
+            m.created_at = base + chrono::Duration::days(rank);
+            fused.insert(m.id.clone(), 1.0 + rank as f32);
+            source.stored.insert(m.id.clone(), m);
+        }
+        let before = fused.clone();
+        let candidates = RecallCandidates::new(&source);
+        assert_eq!(temporal_topic_dedup(&mut fused, &candidates, 50, true), 0);
+        assert_eq!(fused, before);
+    }
+
+    /// A topic shared by a few candidates demotes each older one once, however many
+    /// newer statements of it there are.
+    #[test]
+    fn topical_dedup_demotes_an_older_statement_once() {
+        let mut source = CountingSource::default();
+        let base = chrono::Utc::now() - chrono::Duration::days(100);
+        let mut fused: HashMap<MemoryId, f32> = HashMap::new();
+        let mut redis: Vec<MemoryId> = Vec::new();
+        for rank in 0..12 {
+            let topic = if rank < 3 { "redis" } else { "other" };
+            let mut m = memory(&format!("note {rank:02}"), &["veld", topic]);
+            m.created_at = base + chrono::Duration::days(rank);
+            fused.insert(m.id.clone(), 1.0);
+            if rank < 3 {
+                redis.push(m.id.clone());
+            }
+            source.stored.insert(m.id.clone(), m);
+        }
+        let candidates = RecallCandidates::new(&source);
+        temporal_topic_dedup(&mut fused, &candidates, 50, true);
+        assert!(
+            (fused[&redis[0]] - 0.85).abs() < 1e-6,
+            "two newer: demoted once"
+        );
+        assert!((fused[&redis[1]] - 0.85).abs() < 1e-6);
+        assert_eq!(fused[&redis[2]], 1.0, "the newest statement leads");
+    }
+
+    /// Two memories that compete are both often answers ("Nate won the regional
+    /// tournament", "Nate won his third tournament"): the loser stays, below its winner.
+    #[test]
+    fn a_competition_loser_is_demoted_not_dropped() {
+        use crate::constants::COMPETITION_LOSER_DEMOTION;
+        use crate::memory::types::CompetitionMode;
+        let pair = || -> Vec<SharedMemory> {
+            [
+                ("Nate won the regional tournament", 0.9),
+                ("Nate won his third tournament", 0.8),
+            ]
+            .into_iter()
+            .map(|(content, score)| {
+                let mut m = memory(content, &["Nate", "tournament"]);
+                m.experience.embeddings = Some(vec![0.6, 0.8]);
+                m.set_score(score);
+                Arc::new(m)
+            })
+            .collect()
+        };
+
+        let mut demoted = pair();
+        let (detected, removed) = crate::memory::MemorySystem::compete_memories(
+            &mut demoted,
+            CompetitionMode::ResolveStrongest,
+            true,
+        );
+        assert_eq!((detected, removed), (1, 0));
+        assert_eq!(demoted.len(), 2);
+        assert!((demoted[1].score.unwrap() - 0.8 * COMPETITION_LOSER_DEMOTION).abs() < 1e-6);
+        assert_eq!(
+            demoted[1].experience.metadata.get("competition_opponent"),
+            Some(&demoted[0].id.0.to_string())
+        );
+
+        let mut dropped = pair();
+        let (_, removed) = crate::memory::MemorySystem::compete_memories(
+            &mut dropped,
+            CompetitionMode::ResolveStrongest,
+            false,
+        );
+        assert_eq!((removed, dropped.len()), (1, 1));
+    }
+
+    #[test]
+    fn pool_rarity_weighs_a_term_by_how_few_candidates_carry_it() {
+        assert_eq!(pool_rarity(1, 100), 1.0);
+        assert_eq!(pool_rarity(100, 100), 0.0);
+        assert!((pool_rarity(10, 100) - 0.5).abs() < 1e-6);
+        assert_eq!(pool_rarity(1, 1), 1.0, "a pool of one weighs fully");
     }
 }
 
