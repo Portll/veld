@@ -23,6 +23,7 @@
 use super::distance_inline::{
     cosine_similarity_inline, euclidean_squared_inline, normalized_distance_inline,
 };
+use super::vamana_store::VectorStore;
 use anyhow::{anyhow, Result};
 use memmap2::MmapMut;
 use parking_lot::RwLock;
@@ -31,7 +32,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Distance metric for vector similarity
 ///
@@ -125,8 +126,8 @@ pub struct VamanaIndex {
     /// Graph structure: node_id -> neighbors
     pub(crate) graph: Arc<RwLock<Vec<VamanaNode>>>,
 
-    /// Vectors (can be memory-mapped)
-    pub(crate) vectors: Arc<RwLock<VectorStorage>>,
+    /// Vectors, row-major; a mapped prefix is read in place (see [`VectorStore`]).
+    pub(crate) vectors: Arc<RwLock<VectorStore>>,
 
     /// Medoid/centroid as entry point
     pub(crate) medoid: Arc<RwLock<u32>>,
@@ -153,25 +154,6 @@ pub struct VamanaIndex {
     pub(crate) exact_search_max: usize,
 }
 
-/// Vector storage abstraction
-pub(crate) enum VectorStorage {
-    /// In-memory storage
-    Memory(Vec<Vec<f32>>),
-
-    /// Memory-mapped storage
-    Mmap {
-        mmap: MmapMut,
-        dimension: usize,
-        num_vectors: usize,
-    },
-}
-
-impl Default for VectorStorage {
-    fn default() -> Self {
-        VectorStorage::Memory(Vec::new())
-    }
-}
-
 impl VamanaIndex {
     /// Create new Vamana index
     pub fn new(config: VamanaConfig) -> Result<Self> {
@@ -180,10 +162,11 @@ impl VamanaIndex {
 
     /// Create new Vamana index with explicit storage path for mmap
     pub fn with_storage_path(config: VamanaConfig, storage_path: Option<PathBuf>) -> Result<Self> {
+        let vectors = VectorStore::new(config.dimension);
         Ok(Self {
             config,
             graph: Arc::new(RwLock::new(Vec::new())),
-            vectors: Arc::new(RwLock::new(VectorStorage::Memory(Vec::new()))),
+            vectors: Arc::new(RwLock::new(vectors)),
             medoid: Arc::new(RwLock::new(0)),
             num_vectors: std::sync::atomic::AtomicUsize::new(0),
             storage_path,
@@ -213,6 +196,17 @@ impl VamanaIndex {
     pub fn build(&mut self, vectors: Vec<Vec<f32>>) -> Result<()> {
         if vectors.is_empty() {
             return Ok(());
+        }
+        if let Some((id, v)) = vectors
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.len() != self.config.dimension)
+        {
+            anyhow::bail!(
+                "build: vector {id} has dimension {}, the index has {}",
+                v.len(),
+                self.config.dimension
+            );
         }
 
         let n = vectors.len();
@@ -349,7 +343,7 @@ impl VamanaIndex {
     fn store_vectors(&mut self, vectors: Vec<Vec<f32>>) -> Result<()> {
         let mut storage = self.vectors.write();
 
-        if self.config.use_mmap {
+        if self.config.use_mmap && self.config.dimension > 0 {
             // Require explicit storage path for mmap mode
             let mmap_path = self.storage_path
                 .as_ref()
@@ -380,57 +374,29 @@ impl VamanaIndex {
                 );
             }
 
-            // SAFETY CHECK: Verify size is properly aligned for f32 (4-byte alignment)
-            if !file_size.is_multiple_of(std::mem::align_of::<f32>()) {
-                anyhow::bail!(
-                    "File size {} is not aligned to f32 alignment ({})",
-                    file_size,
-                    std::mem::align_of::<f32>()
-                );
-            }
-
             // SAFETY: MmapMut::map_mut is safe because:
             // 1. File handle is valid and exclusively owned
             // 2. File size is non-zero and verified above
             // 3. File permissions allow read+write
             // 4. No other process has this file mapped
             let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-
-            // SAFETY CHECK: Verify pointer alignment before casting to f32*
-            let ptr = mmap.as_mut_ptr();
-            if ptr.align_offset(std::mem::align_of::<f32>()) != 0 {
-                anyhow::bail!(
-                    "Mmap pointer {:?} is not aligned to f32 alignment ({})",
-                    ptr,
-                    std::mem::align_of::<f32>()
-                );
+            for (chunk, vec) in mmap
+                .chunks_exact_mut(self.config.dimension * std::mem::size_of::<f32>())
+                .zip(&vectors)
+            {
+                for (bytes, value) in chunk.chunks_exact_mut(4).zip(vec) {
+                    bytes.copy_from_slice(&value.to_ne_bytes());
+                }
             }
 
-            // SAFETY: from_raw_parts_mut is safe because:
-            // 1. Pointer is properly aligned (verified above)
-            // 2. Memory region is valid for the entire length
-            // 3. Length calculation is correct: vectors.len() * dimension
-            // 4. Mmap is exclusively owned and won't be accessed elsewhere
-            // 5. f32 is Copy, so no double-free issues
-            let float_slice = unsafe {
-                std::slice::from_raw_parts_mut(
-                    ptr as *mut f32,
-                    vectors.len() * self.config.dimension,
-                )
-            };
-
-            for (i, vec) in vectors.iter().enumerate() {
-                let start = i * self.config.dimension;
-                float_slice[start..start + self.config.dimension].copy_from_slice(vec);
-            }
-
-            *storage = VectorStorage::Mmap {
-                mmap,
-                dimension: self.config.dimension,
-                num_vectors: vectors.len(),
-            };
+            *storage = VectorStore::mapped(
+                self.config.dimension,
+                mmap.make_read_only()?,
+                0,
+                vectors.len(),
+            )?;
         } else {
-            *storage = VectorStorage::Memory(vectors);
+            *storage = VectorStore::from_rows(self.config.dimension, vectors)?;
         }
 
         Ok(())
@@ -480,60 +446,7 @@ impl VamanaIndex {
 
     /// Get vector by ID
     fn get_vector(&self, id: u32) -> Result<Vec<f32>> {
-        let storage = self.vectors.read();
-
-        match &*storage {
-            VectorStorage::Memory(vecs) => Ok(vecs
-                .get(id as usize)
-                .ok_or_else(|| anyhow!("Vector {id} not found"))?
-                .clone()),
-            VectorStorage::Mmap {
-                mmap,
-                dimension,
-                num_vectors,
-            } => {
-                // Bounds check
-                if id as usize >= *num_vectors {
-                    return Err(anyhow!(
-                        "Vector {id} out of bounds (num_vectors={})",
-                        num_vectors
-                    ));
-                }
-
-                let start = id as usize * dimension;
-                let end = start + dimension;
-
-                // SAFETY CHECK: Debug assertion for pointer alignment before reading f32 values
-                // This catches alignment issues in debug builds without runtime cost in release
-                let ptr = mmap.as_ptr();
-                debug_assert!(
-                    ptr.align_offset(std::mem::align_of::<f32>()) == 0,
-                    "Mmap pointer {:?} is not aligned to f32 alignment ({}). This is undefined behavior.",
-                    ptr,
-                    std::mem::align_of::<f32>()
-                );
-
-                // SAFETY CHECK: Verify the slice bounds are within the mmap region
-                let total_floats = mmap.len() / std::mem::size_of::<f32>();
-                debug_assert!(
-                    end <= total_floats,
-                    "Vector slice bounds [{}..{}] exceed mmap capacity ({})",
-                    start,
-                    end,
-                    total_floats
-                );
-
-                // SAFETY: from_raw_parts is safe because:
-                // 1. Pointer alignment verified via debug_assert above
-                // 2. Bounds verified: end <= total_floats
-                // 3. Mmap is valid for the lifetime of the returned slice
-                // 4. f32 is Copy, no ownership issues
-                let float_slice =
-                    unsafe { std::slice::from_raw_parts(ptr as *const f32, total_floats) };
-
-                Ok(float_slice[start..end].to_vec())
-            }
-        }
+        Self::get_slice_from_storage(&self.vectors.read(), id).map(<[f32]>::to_vec)
     }
 
     /// Get vector slice by ID from storage reference (zero-copy, no allocation)
@@ -541,37 +454,10 @@ impl VamanaIndex {
     /// This is the performance-critical path for search operations.
     /// Returns a borrowed slice instead of cloning the vector data.
     #[inline]
-    fn get_slice_from_storage(storage: &VectorStorage, id: u32) -> Result<&[f32]> {
-        match storage {
-            VectorStorage::Memory(vecs) => vecs
-                .get(id as usize)
-                .map(|v| v.as_slice())
-                .ok_or_else(|| anyhow!("Vector {id} not found")),
-            VectorStorage::Mmap {
-                mmap,
-                dimension,
-                num_vectors,
-            } => {
-                if id as usize >= *num_vectors {
-                    return Err(anyhow!(
-                        "Vector {id} out of bounds (num_vectors={})",
-                        num_vectors
-                    ));
-                }
-                let start = id as usize * dimension;
-                let end = start + dimension;
-                let ptr = mmap.as_ptr();
-                let total_floats = mmap.len() / std::mem::size_of::<f32>();
-                if end > total_floats {
-                    return Err(anyhow!("Vector slice bounds exceed mmap capacity"));
-                }
-                // SAFETY: Pointer alignment verified during store_vectors().
-                // Bounds checked above. Mmap lifetime outlives returned slice.
-                let float_slice =
-                    unsafe { std::slice::from_raw_parts(ptr as *const f32, total_floats) };
-                Ok(&float_slice[start..end])
-            }
-        }
+    fn get_slice_from_storage(storage: &VectorStore, id: u32) -> Result<&[f32]> {
+        storage
+            .row(id)
+            .ok_or_else(|| anyhow!("Vector {id} out of bounds (num_vectors={})", storage.len()))
     }
 
     /// Greedy search for nearest neighbors
@@ -730,6 +616,14 @@ impl VamanaIndex {
         if n == 0 || k == 0 {
             return Ok(Vec::new());
         }
+        // The kernels stride by the query's length; a longer query would read past a row.
+        if query.len() != self.config.dimension {
+            anyhow::bail!(
+                "search: query dimension {} does not match index dimension {}",
+                query.len(),
+                self.config.dimension
+            );
+        }
         {
             let deleted = self.deleted_ids.read();
             if n.saturating_sub(deleted.len()) <= self.exact_search_max {
@@ -769,7 +663,7 @@ impl VamanaIndex {
         Ok(results)
     }
 
-    /// The k nearest live vectors by scanning all `n`, ties broken by id.
+    /// The k nearest live vectors by scanning all `n` in storage order, ties broken by id.
     fn exact_search(
         &self,
         query: &[f32],
@@ -778,13 +672,22 @@ impl VamanaIndex {
         deleted: &HashSet<u32>,
     ) -> Result<Vec<(u32, f32)>> {
         let storage = self.vectors.read();
+        if storage.len() < n {
+            return Err(anyhow!(
+                "vector store holds {} rows, the index counts {n}",
+                storage.len()
+            ));
+        }
+        let dim = storage.dimension();
         let mut scored = Vec::with_capacity(n.saturating_sub(deleted.len()));
-        for id in 0..n as u32 {
-            if deleted.contains(&id) {
-                continue;
+        for (first, run) in storage.runs(n) {
+            for (offset, vector) in run.chunks_exact(dim).enumerate() {
+                let id = first + offset as u32;
+                if deleted.contains(&id) {
+                    continue;
+                }
+                scored.push((id, self.distance(query, vector)));
             }
-            let vector = Self::get_slice_from_storage(&storage, id)?;
-            scored.push((id, self.distance(query, vector)));
         }
         let nearest_first =
             |a: &(u32, f32), b: &(u32, f32)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
@@ -854,36 +757,8 @@ impl VamanaIndex {
         let current_count = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
         let id = current_count as u32;
 
-        // Add to storage - convert mmap to memory if needed for incremental updates
-        let mut storage = self.vectors.write();
-        match &mut *storage {
-            VectorStorage::Memory(vecs) => {
-                vecs.push(vector.clone());
-            }
-            VectorStorage::Mmap {
-                mmap,
-                num_vectors,
-                dimension,
-            } => {
-                // Convert mmap to memory storage for incremental updates
-                tracing::info!(
-                    "Converting mmap storage ({} vectors) to memory for incremental indexing",
-                    num_vectors
-                );
-                let dim = *dimension;
-                let count = *num_vectors;
-                let ptr = mmap.as_ptr() as *const f32;
-                let mut vecs = Vec::with_capacity(count + 1);
-                for i in 0..count {
-                    let start = i * dim;
-                    let slice = unsafe { std::slice::from_raw_parts(ptr.add(start), dim) };
-                    vecs.push(slice.to_vec());
-                }
-                vecs.push(vector.clone());
-                *storage = VectorStorage::Memory(vecs);
-            }
-        }
-        drop(storage);
+        // A mapped prefix stays mapped: the new row goes to the heap tail.
+        self.vectors.write().push(&vector);
 
         // For the first vector, just create a node with no neighbors
         if current_count == 0 {
@@ -1132,25 +1007,7 @@ impl VamanaIndex {
     /// Brute-force k-NN search (for recall estimation)
     fn brute_force_search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
         let n = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
-        let deleted = self.deleted_ids.read();
-
-        let mut distances: Vec<(u32, f32)> = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let id = i as u32;
-            if deleted.contains(&id) {
-                continue;
-            }
-
-            let vec = self.get_vector(id)?;
-            let dist = self.distance(query, &vec);
-            distances.push((id, dist));
-        }
-
-        distances.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        distances.truncate(k);
-
-        Ok(distances)
+        self.exact_search(query, k, n, &self.deleted_ids.read())
     }
 
     /// Check if index quality has degraded below acceptable threshold
@@ -1202,29 +1059,7 @@ impl VamanaIndex {
     /// Returns a clone of all vectors currently in the index.
     /// Use this before calling `rebuild_from_vectors()`.
     pub fn extract_all_vectors(&self) -> Vec<Vec<f32>> {
-        match &*self.vectors.read() {
-            VectorStorage::Memory(vecs) => vecs.clone(),
-            VectorStorage::Mmap {
-                mmap,
-                dimension,
-                num_vectors,
-            } => {
-                let mut vecs = Vec::with_capacity(*num_vectors);
-                let total_floats = mmap.len() / std::mem::size_of::<f32>();
-                let float_slice = unsafe {
-                    std::slice::from_raw_parts(mmap.as_ptr() as *const f32, total_floats)
-                };
-
-                for i in 0..*num_vectors {
-                    let start = i * dimension;
-                    let end = start + dimension;
-                    if end <= total_floats {
-                        vecs.push(float_slice[start..end].to_vec());
-                    }
-                }
-                vecs
-            }
-        }
+        self.vectors.read().to_rows()
     }
 
     /// Extract only live (non-deleted) vectors for compaction rebuild
@@ -1233,37 +1068,11 @@ impl VamanaIndex {
     /// Use this for compaction to physically remove deleted vectors.
     pub fn extract_live_vectors(&self) -> Vec<Vec<f32>> {
         let deleted = self.deleted_ids.read();
-        match &*self.vectors.read() {
-            VectorStorage::Memory(vecs) => vecs
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !deleted.contains(&(*i as u32)))
-                .map(|(_, v)| v.clone())
-                .collect(),
-            VectorStorage::Mmap {
-                mmap,
-                dimension,
-                num_vectors,
-            } => {
-                let total_floats = mmap.len() / std::mem::size_of::<f32>();
-                let float_slice = unsafe {
-                    std::slice::from_raw_parts(mmap.as_ptr() as *const f32, total_floats)
-                };
-
-                let mut vecs = Vec::with_capacity(num_vectors - deleted.len());
-                for i in 0..*num_vectors {
-                    if deleted.contains(&(i as u32)) {
-                        continue;
-                    }
-                    let start = i * dimension;
-                    let end = start + dimension;
-                    if end <= total_floats {
-                        vecs.push(float_slice[start..end].to_vec());
-                    }
-                }
-                vecs
-            }
-        }
+        let storage = self.vectors.read();
+        (0..storage.len() as u32)
+            .filter(|id| !deleted.contains(id))
+            .filter_map(|id| storage.row(id).map(<[f32]>::to_vec))
+            .collect()
     }
 
     /// Rebuild the index from vectors with full Vamana construction
@@ -1289,7 +1098,7 @@ impl VamanaIndex {
 
         // Clear current state
         self.graph.write().clear();
-        *self.vectors.write() = VectorStorage::Memory(Vec::new());
+        *self.vectors.write() = VectorStore::new(self.config.dimension);
         self.num_vectors
             .store(0, std::sync::atomic::Ordering::Release);
 
@@ -1378,6 +1187,7 @@ impl VamanaIndex {
 
             // 2. Build completely new index (expensive, but doesn't hold any locks on self)
             let config = self.config.clone();
+            let config_dimension = config.dimension;
             let mut new_index = VamanaIndex::new(config)?;
             new_index.build(vectors)?;
 
@@ -1393,7 +1203,10 @@ impl VamanaIndex {
                 *old_graph = new_graph;
 
                 // Swap vectors
-                let new_vectors = std::mem::take(&mut *new_index.vectors.write());
+                let new_vectors = std::mem::replace(
+                    &mut *new_index.vectors.write(),
+                    VectorStore::new(config_dimension),
+                );
                 *old_vectors = new_vectors;
 
                 // Swap medoid
@@ -1451,45 +1264,7 @@ impl VamanaIndex {
             deleted_ids: HashSet<u32>,
         }
 
-        // Collect vectors from storage
-        let vectors = match &*self.vectors.read() {
-            VectorStorage::Memory(vecs) => vecs.clone(),
-            VectorStorage::Mmap {
-                mmap,
-                dimension,
-                num_vectors,
-            } => {
-                // SAFETY CHECK: Debug assertion for pointer alignment
-                let ptr = mmap.as_ptr();
-                debug_assert!(
-                    ptr.align_offset(std::mem::align_of::<f32>()) == 0,
-                    "Mmap pointer {:?} is not aligned to f32 alignment ({})",
-                    ptr,
-                    std::mem::align_of::<f32>()
-                );
-
-                // Read vectors from mmap with alignment-safe approach
-                let mut vecs = Vec::with_capacity(*num_vectors);
-                let total_floats = mmap.len() / std::mem::size_of::<f32>();
-                let float_slice =
-                    unsafe { std::slice::from_raw_parts(ptr as *const f32, total_floats) };
-
-                for i in 0..*num_vectors {
-                    let start = i * dimension;
-                    let end = start + dimension;
-                    debug_assert!(
-                        end <= total_floats,
-                        "Vector {} bounds [{}..{}] exceed mmap capacity ({})",
-                        i,
-                        start,
-                        end,
-                        total_floats
-                    );
-                    vecs.push(float_slice[start..end].to_vec());
-                }
-                vecs
-            }
-        };
+        let vectors = self.vectors.read().to_rows();
 
         let num_vecs = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
         let data = VamanaData {
@@ -1542,30 +1317,14 @@ impl VamanaIndex {
         let data: VamanaData =
             bincode::serde::decode_from_std_read(&mut reader, bincode::config::standard())?;
 
+        let vectors = VectorStore::from_rows(self.config.dimension, data.vectors)?;
+
         // Update internal state
         *self.graph.write() = data.graph;
         *self.medoid.write() = data.medoid;
         self.num_vectors
             .store(data.num_vectors, std::sync::atomic::Ordering::Release);
-
-        // Update vector storage
-        let is_mmap = matches!(*self.vectors.read(), VectorStorage::Mmap { .. });
-        if is_mmap {
-            // Cannot restore mmap from serialized data - converting to in-memory storage
-            warn!(
-                "Loading index into mmap-configured instance: converting {} vectors to in-memory storage. \
-                 This may increase memory usage. To use mmap, rebuild the index with build().",
-                data.num_vectors
-            );
-            *self.vectors.write() = VectorStorage::Memory(data.vectors);
-        } else {
-            match &mut *self.vectors.write() {
-                VectorStorage::Memory(vecs) => {
-                    *vecs = data.vectors;
-                }
-                VectorStorage::Mmap { .. } => unreachable!(),
-            }
-        }
+        *self.vectors.write() = vectors;
 
         // Restore soft-deleted IDs
         if !data.deleted_ids.is_empty() {
@@ -1896,6 +1655,60 @@ mod tests {
         index.build(vectors.clone()).unwrap();
         let recall = self_recall(&index, &vectors);
         assert!(recall >= 0.95, "graph self-recall after build: {recall}");
+    }
+
+    fn neighbor_lists(index: &VamanaIndex) -> Vec<Vec<u32>> {
+        index
+            .graph
+            .read()
+            .iter()
+            .map(|node| node.neighbors.clone())
+            .collect()
+    }
+
+    /// The same vectors behind a mapped prefix plus a heap tail, or all on the heap, build the
+    /// same graph and give the same results, exact or walked; inserts leave the prefix mapped.
+    #[test]
+    fn mapped_and_heap_storage_search_identically() {
+        let vectors = clustered_unit_vectors(1200, 24, 12, 5);
+        let (built, inserted) = vectors.split_at(1000);
+        let dir = tempfile::tempdir().unwrap();
+        let mut mapped = VamanaIndex::with_storage_path(
+            VamanaConfig {
+                use_mmap: true,
+                ..graph_config(24)
+            },
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        let mut heap = VamanaIndex::new(graph_config(24)).unwrap();
+        for index in [&mut mapped, &mut heap] {
+            index.build(built.to_vec()).unwrap();
+            for v in inserted {
+                index.add_vector(v.clone()).unwrap();
+            }
+            index.mark_deleted(3);
+            index.mark_deleted(1100);
+        }
+        assert!(mapped.vectors.read().is_mapped());
+        assert!(!heap.vectors.read().is_mapped());
+        assert_eq!(mapped.vectors.read().len(), 1200);
+        assert_eq!(neighbor_lists(&mapped), neighbor_lists(&heap));
+        for exact_max in [usize::MAX, 0] {
+            mapped.set_exact_search_max(exact_max);
+            heap.set_exact_search_max(exact_max);
+            for q in vectors.iter().step_by(37) {
+                assert_eq!(mapped.search(q, 10).unwrap(), heap.search(q, 10).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn a_query_of_another_dimension_is_refused() {
+        let mut index = VamanaIndex::new(graph_config(16)).unwrap();
+        index.build(clustered_unit_vectors(50, 16, 3, 1)).unwrap();
+        assert!(index.search(&[0.5; 8], 5).is_err());
+        assert!(index.build(vec![vec![0.0; 15]]).is_err());
     }
 
     #[test]

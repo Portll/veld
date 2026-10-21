@@ -42,6 +42,7 @@ pub mod spann;
 pub mod vamana;
 pub mod vamana_persist;
 pub mod vamana_projection;
+pub(crate) mod vamana_store;
 
 // Re-export key types for convenient access
 pub use hnsw::{HnswConfig, HnswIndex};
