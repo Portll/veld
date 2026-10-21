@@ -210,8 +210,9 @@ pub struct ProactiveContextRequest {
     /// Filter to specific memory types
     #[serde(default)]
     pub memory_types: Vec<String>,
-    /// Whether to auto-ingest the context as a Conversation memory
-    #[serde(default = "default_true")]
+    /// Whether to auto-ingest the context as a Conversation memory. Off unless asked: hooks
+    /// already record each turn, and a default ingest stored the same context twice.
+    #[serde(default)]
     pub auto_ingest: bool,
     /// Agent's previous response (for implicit feedback extraction)
     #[serde(default)]
@@ -431,6 +432,15 @@ pub struct RecallByTagsRequest {
     pub tags: Vec<String>,
     /// Maximum number of results (default: 50)
     pub limit: Option<usize>,
+    /// Both embedding vectors are about 17 KB per memory; a caller that reads text does not
+    /// need them.
+    #[serde(default)]
+    pub include_embeddings: bool,
+    /// Also match tags veld derived from the content (NER, keywords, ingest hints). Off by
+    /// default: a keyword such as `handoff` or `decision` pulled out of the text would otherwise
+    /// answer for the writer's own tag of the same name.
+    #[serde(default)]
+    pub include_derived: bool,
 }
 
 /// Recall memories by date range
@@ -2937,15 +2947,24 @@ pub async fn recall_by_tags(
     let memory_guard = memory_sys.read();
     let limit = req.limit.unwrap_or(50);
 
-    // Use recall_by_tags which increments the retrieval counter
-    let raw_memories = memory_guard
-        .recall_by_tags(&req.tags, limit)
-        .map_err(AppError::Internal)?;
+    let raw_memories = if req.include_derived {
+        memory_guard.recall_by_tags(&req.tags, limit)
+    } else {
+        memory_guard.recall_by_authored_tags(&req.tags, limit)
+    }
+    .map_err(AppError::Internal)?;
     let count = raw_memories.len();
 
     // Serialize memories to JSON for response
     let memories: Vec<serde_json::Value> = raw_memories
         .into_iter()
+        .map(|mut m| {
+            if !req.include_embeddings {
+                m.experience.embeddings = None;
+                m.experience.embeddings_secondary = None;
+            }
+            m
+        })
         .filter_map(|m| serde_json::to_value(&m).ok())
         .collect();
 

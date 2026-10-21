@@ -34,7 +34,8 @@ pub async fn compress_memory(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let _memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     // Validate id format
@@ -65,7 +66,8 @@ pub async fn decompress_memory(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_memory_async(&req.user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -122,7 +124,8 @@ pub async fn get_storage_stats(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&user_id)
+        .get_user_memory_async(&user_id)
+        .await
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();

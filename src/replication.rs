@@ -307,15 +307,18 @@ pub fn normalize_source(raw: &str) -> Result<String> {
 
 /// Leader side: every user's log length, by `stat` alone.
 pub fn user_logs(manager: &MultiUserMemoryManager) -> Vec<UserLogInfo> {
+    // Only tenants with a log: `records` answers 404 for the others, so listing them
+    // would leave a follower retrying a tenant it can never be fed.
     let mut out: Vec<UserLogInfo> = manager
         .list_users()
         .into_iter()
         .filter_map(|user_id| {
             let dir = manager.user_dir(&user_id).ok()?;
-            let log_bytes = std::fs::metadata(dir.join("intent.log"))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            Some(UserLogInfo { user_id, log_bytes })
+            let log = std::fs::metadata(dir.join("intent.log")).ok()?;
+            log.is_file().then_some(UserLogInfo {
+                user_id,
+                log_bytes: log.len(),
+            })
         })
         .collect();
     out.sort_by(|a, b| a.user_id.cmp(&b.user_id));
@@ -1627,6 +1630,19 @@ mod tests {
         ];
         let out: Vec<u64> = coalesce(page).into_iter().map(|(l, _)| l).collect();
         assert_eq!(out, vec![2]);
+    }
+
+    #[test]
+    fn the_leader_lists_only_tenants_it_can_feed() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        manager.get_user_journaled_writer("journaled").unwrap();
+        std::fs::create_dir_all(manager.user_dir("copied-aside").unwrap()).unwrap();
+        let listed: Vec<String> = user_logs(&manager).into_iter().map(|u| u.user_id).collect();
+        assert!(listed.contains(&"journaled".to_string()));
+        assert!(
+            !listed.contains(&"copied-aside".to_string()),
+            "a directory with no intent log is not a tenant the feed can serve"
+        );
     }
 
     #[test]

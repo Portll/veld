@@ -465,6 +465,113 @@ async fn remember_with_tags_and_type() {
 }
 
 #[tokio::test]
+async fn recall_by_tags_returns_the_newest_matches_without_embeddings() {
+    let h = Harness::new();
+    for (content, created_at) in [
+        ("January note on the shared tag.", "2026-01-01T00:00:00Z"),
+        ("March note on the shared tag.", "2026-03-01T00:00:00Z"),
+        ("February note on the shared tag.", "2026-02-01T00:00:00Z"),
+    ] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember",
+                json!({
+                    "user_id": "tag-order-user",
+                    "content": content,
+                    "tags": ["shared-tag"],
+                    "created_at": created_at
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "remember failed: {body}");
+    }
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/recall/tags",
+            json!({"user_id": "tag-order-user", "tags": ["shared-tag"], "limit": 2}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "recall by tags failed: {body}");
+    let memories = body["memories"].as_array().expect("memories array");
+    let contents: Vec<&str> = memories
+        .iter()
+        .map(|m| m["experience"]["content"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        contents,
+        [
+            "March note on the shared tag.",
+            "February note on the shared tag."
+        ]
+    );
+    for memory in memories {
+        assert!(memory["experience"]["embeddings"].is_null(), "{memory}");
+        assert!(
+            memory["experience"]["embeddings_secondary"].is_null(),
+            "{memory}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recall_by_tags_matches_derived_tags_only_when_asked() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({
+                "user_id": "derived-tag-user",
+                "content": "The quokka migration moved the quokka ledger onto the quokka cluster in Wellington.",
+                "tags": ["caller-chosen"]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remember failed: {body}");
+
+    let recall = |tags: Vec<&str>, include_derived: bool| {
+        authed_post(
+            "/api/recall/tags",
+            json!({
+                "user_id": "derived-tag-user",
+                "tags": tags,
+                "include_derived": include_derived
+            }),
+        )
+    };
+    let (_, by_caller_tag) = json_of(h.app(), recall(vec!["caller-chosen"], false)).await;
+    assert_eq!(by_caller_tag["count"], 1, "{by_caller_tag}");
+    let stored_tags: Vec<String> = by_caller_tag["memories"][0]["experience"]["tags"]
+        .as_array()
+        .expect("stored tags")
+        .iter()
+        .filter_map(|t| t.as_str().map(str::to_string))
+        .collect();
+    let derived = stored_tags
+        .iter()
+        .find(|t| !t.eq_ignore_ascii_case("caller-chosen"))
+        .unwrap_or_else(|| panic!("no derived tag was stored: {stored_tags:?}"))
+        .clone();
+
+    let (_, default_match) = json_of(h.app(), recall(vec![derived.as_str()], false)).await;
+    assert_eq!(
+        default_match["count"], 0,
+        "derived `{derived}`: {default_match}"
+    );
+    let (_, derived_match) = json_of(h.app(), recall(vec![derived.as_str()], true)).await;
+    assert_eq!(
+        derived_match["count"], 1,
+        "derived `{derived}`: {derived_match}"
+    );
+}
+
+#[tokio::test]
 async fn unknown_memory_type_is_rejected_not_stored_as_observation() {
     let h = Harness::new();
     let (status, body) = json_of(
@@ -935,7 +1042,7 @@ async fn context_summary_empty() {
 #[tokio::test]
 async fn proactive_context() {
     let h = Harness::new();
-    let (status, _) = json_of(
+    let (status, body) = json_of(
         h.app(),
         authed_post(
             "/api/proactive_context",
@@ -947,6 +1054,10 @@ async fn proactive_context() {
     )
     .await;
     assert!(status.is_success());
+    assert!(
+        body.get("ingested_memory_id").is_none(),
+        "a surfacing call stores nothing unless auto_ingest is set: {body}"
+    );
 }
 
 #[tokio::test]
