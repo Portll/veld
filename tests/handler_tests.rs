@@ -3477,6 +3477,13 @@ async fn generic_words_and_hubs_take_no_new_edges_but_declared_entities_do() {
 
 #[tokio::test]
 async fn a_declared_file_path_is_recalled_by_its_file_name() {
+    let reranker = veld::embeddings::cross_encoder::default_cross_encoder();
+    assert!(
+        reranker.is_cached(),
+        "this ranking needs the reranker, and it is not cached at {:?}; \
+         fetch it with `cargo run --bin model-fetch -- --cross-encoder`",
+        reranker.cache_dir()
+    );
     let h = Harness::new();
     let user = "recall-declared";
     let distractors = [
@@ -3529,9 +3536,23 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
     // The embedding is deferred too; ranked before it lands, the target has no vector.
     wait_for_background_work(&h).await;
 
-    // "+bm25" is the fused order before the reranker, which may not be installed; "full" is
-    // the whole pipeline, reranker included when it is.
-    for layers in ["+bm25", "full"] {
+    // With the reranker, then with reranking off. Off, Layer 5.3 is skipped and the fused order
+    // stands: the order a declared path keeps when no cross-encoder can score it, where the
+    // bi-encoder fallback would rank `server.mjs` beside `serve.mjs`.
+    for use_reranking in [true, false] {
+        if !use_reranking {
+            let (status, mut dials) =
+                json_of(h.app(), authed_get(&format!("/api/dials?user_id={user}"))).await;
+            assert_eq!(status, StatusCode::OK, "{dials}");
+            dials["use_reranking"] = json!(false);
+            let (status, body) = json_of(
+                h.app(),
+                authed_put("/api/dials", json!({"user_id": user, "dials": dials})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["use_reranking"], json!(false));
+        }
         for query in [
             "what changed in serve.mjs",
             "what changed in admin/serve.mjs",
@@ -3540,7 +3561,7 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
                 h.app(),
                 authed_post(
                     "/api/recall",
-                    json!({"user_id": user, "query": query, "limit": 5, "layers": layers}),
+                    json!({"user_id": user, "query": query, "limit": 5}),
                 ),
             )
             .await;
@@ -3554,7 +3575,7 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
             assert_eq!(
                 ids.first().copied(),
                 Some(target.as_str()),
-                "{query} at {layers}: {:#}",
+                "{query} with use_reranking={use_reranking}: {:#}",
                 body["memories"]
             );
         }
