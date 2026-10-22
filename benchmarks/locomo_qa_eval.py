@@ -18,25 +18,34 @@ Protocol:
      until GET /api/embeddings/backlog reports nothing pending and GET /api/health/index reports
      the vector and lexical indexes covering every stored memory.
   4. Retrieval: POST /api/recall {user_id, query, limit: k} once per question; context lines are
-     "[<created_at date>] <content>".
-  5. Reader: Mem0's ANSWER_PROMPT. Judge: Mem0's ACCURACY_PROMPT (J). Both run on claude-opus-5-5
-     (reader effort medium, judge effort low, thinking always on, server-side refusal fallbacks
-     on). --runs repeats reader + judge over the same retrieved contexts. J is the share of judged
-     answers labelled CORRECT; mean and sample sd are over runs.
+     "[<created_at date>] <content>". --eval-now pins the server's scoring clock (VELD_EVAL_NOW);
+     unset, recency is scored against the wall clock.
+  5. Reader: Mem0's ANSWER_PROMPT. Judge: Mem0's ACCURACY_PROMPT (J). --runs repeats reader +
+     judge over the same retrieved contexts. J is the share of judged answers labelled CORRECT;
+     mean and sample sd are over runs; a judge reply without a CORRECT/WRONG label is an error
+     row, left unjudged, never counted WRONG.
+     - --provider anthropic (default): claude-opus-5-5 for both (reader effort medium, judge
+       effort low, thinking always on, server-side refusal fallbacks on).
+     - --provider openai-compatible: chat.completions at --base-url with --model (or
+       --reader-model / --judge-model), temperature 0, the prompt as the only user message; the
+       judge runs in JSON mode. The answer is message.content alone; reasoning is never read.
+       Known Groq models carry default reasoning efforts (MODEL_DEFAULTS) and list prices.
 
 Categories (LoCoMo code -> name, the mapping benchmarks/locomo_to_harness.py in shodh-memory used
 to build tests/recall/locomo_cases.jsonl): 1 multi_hop, 2 temporal, 3 open_domain, 4 single_hop,
 5 adversarial. Adversarial questions are excluded, as Mem0 does.
 
-Comparability: claude-opus-5-5 is reader and judge here. Published LoCoMo J figures (Mem0 and the
-systems its paper compares) use gpt-4o-mini for both, so these numbers are not comparable with
-them; compare runs of this harness with each other.
+Comparability: published LoCoMo J figures (Mem0 and the systems its paper compares) use
+gpt-4o-mini as reader and judge. Any other reader or judge makes these numbers incomparable with
+them; compare runs of this harness made with the same models and settings.
 
 Setup (once):
     /opt/homebrew/bin/python3.13 -m venv ~/.venvs/veld-bench
     ~/.venvs/veld-bench/bin/pip install -r benchmarks/requirements-longmemeval.txt
 Credentials: anthropic.Anthropic() reads ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or an
-`ant auth login` profile.
+`ant auth login` profile. openai-compatible: --api-key-keychain NAME reads the macOS keychain
+item NAME at run time, --api-key-env NAME an environment variable; neither, and the SDK reads
+OPENAI_API_KEY.
 
 Usage (from the repository root):
     # Dry run: spawn, ingest, retrieve, print assembled prompts and a token/cost projection.
@@ -52,6 +61,13 @@ Usage (from the repository root):
     # Full: all ten conversations, three runs
     ~/.venvs/veld-bench/bin/python benchmarks/locomo_qa_eval.py --runs 3 \\
         --output ~/.cache/veld-bench/results/locomo_qa_full.json
+
+    # Groq, one model as reader and judge, production retrieval dials, scoring clock pinned
+    ~/.venvs/veld-bench/bin/python benchmarks/locomo_qa_eval.py --runs 3 \\
+        --provider openai-compatible --base-url https://api.groq.com/openai/v1 \\
+        --model openai/gpt-oss-120b --api-key-keychain GROQ_API_KEY \\
+        --copy-env VELD_DIALS_DISABLE_SIGNALS --eval-now auto \\
+        --output ~/.cache/veld-bench/results/locomo_qa_full_gpt-oss-120b.json
 
     # After a crash or Ctrl-C: the same command plus --resume. Stored retrievals are reused and
     # only unjudged (question, run) pairs are sent again.
@@ -98,6 +114,33 @@ JUDGE_MAX_TOKENS = 4000
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 PRICE_PER_MTOK = {"input_tokens": 4.00, "output_tokens": 20.00, "cache_read_input_tokens": 0.20}
 
+OPENAI_MAX_RETRIES = 6
+RATE_LIMIT_ROUNDS = 4
+RATE_LIMIT_MAX_WAIT_S = 900
+# Groq list prices per MTok, read 2026-10-22 from https://console.groq.com/docs/models and
+# https://console.groq.com/docs/model/<model id> (https://groq.com/pricing redirects to the home
+# page). Groq bills cached gpt-oss input at $0.075; it is costed here at the full input price.
+# Efforts per https://console.groq.com/docs/reasoning: gpt-oss takes low/medium/high and refuses
+# reasoning_format; qwen3.8's none is instruct mode, and unless reasoning_format is parsed or
+# hidden it writes its reasoning into message.content.
+MODEL_DEFAULTS = {
+    "openai/gpt-oss-120b": {
+        "price": {"input_tokens": 0.15, "output_tokens": 0.60},
+        "reader_effort": "medium", "judge_effort": "low", "reasoning_format": None,
+    },
+    "qwen/qwen3.8-27b": {
+        "price": {"input_tokens": 0.80, "output_tokens": 4.00},
+        "reader_effort": "medium", "judge_effort": "none", "reasoning_format": "parsed",
+    },
+}
+PRICE_SOURCE = {
+    "anthropic": "Anthropic list price for claude-opus-5-5",
+    "openai-compatible": "https://console.groq.com/docs/models (read 2026-10-22)",
+}
+TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "reasoning_tokens",
+              "cached_input_tokens")
+THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+
 CHARS_PER_TOKEN = 3.5
 EST_READER_OUTPUT_TOKENS = 1500
 EST_JUDGE_OUTPUT_TOKENS = 300
@@ -117,13 +160,6 @@ EMBEDDER_ENV_NAMES = {
     "VELD_ALLOW_SIMPLIFIED_EMBEDDINGS",
 }
 EMBEDDER_ENV_PREFIX = "VELD_EMBEDDING_"
-
-COMPARABILITY_NOTE = (
-    f"Not comparable with published LoCoMo J figures: this run uses {MODEL} as both reader and "
-    f"judge (reader effort {READER_EFFORT}, judge effort {JUDGE_EFFORT}), while every published "
-    "J figure (Mem0 and the systems its paper compares) uses gpt-4o-mini for both. Compare only "
-    "runs of this harness made with the same model settings."
-)
 
 MEM0_COMMIT = "b3ede5b7c0ac0e847b03786a603c107ac943b3ee"
 ANSWER_PROMPT_SOURCE = f"https://github.com/mem0ai/mem0/blob/{MEM0_COMMIT}/evaluation/prompts.py"
@@ -337,7 +373,7 @@ def free_port() -> int:
 
 class ScratchServer:
     def __init__(self, binary, port=None, server_env=SERVER_ENV_PATH,
-                 storage_backend="rocksdb", startup_timeout=180, extra_env=()):
+                 storage_backend="rocksdb", startup_timeout=180, extra_env=(), eval_now=None):
         self.binary = str(Path(binary).expanduser())
         self.port = port or free_port()
         if self.port in LIVE_PORTS:
@@ -346,7 +382,10 @@ class ScratchServer:
         refused = [n for n in extra_env if n.startswith(("VELD_REPLICATE_", "VELD_ADMIN_"))]
         if refused:
             raise SystemExit(f"Refusing to copy replication or admin settings: {refused}")
+        if "VELD_EVAL_NOW" in extra_env:
+            raise SystemExit("Pin the scoring clock with --eval-now, not --copy-env VELD_EVAL_NOW")
         self.extra_env = set(extra_env)
+        self.eval_now = eval_now
         self.server_env = Path(server_env).expanduser()
         self.storage_backend = storage_backend
         self.startup_timeout = startup_timeout
@@ -377,6 +416,8 @@ class ScratchServer:
             "VELD_API_KEY": self.api_key,
             "VELD_INSTANCE_LABEL": f"bench-scratch-{self.port}",
         })
+        if self.eval_now:
+            env["VELD_EVAL_NOW"] = self.eval_now
         return env
 
     def start(self):
@@ -393,6 +434,7 @@ class ScratchServer:
         print(f"Spawned scratch veld pid={self.proc.pid} at {self.url}, data in {self.tmpdir}")
         print(f"  settings copied from {self.server_env}: "
               f"{', '.join(sorted(self.copied_env)) or 'none'}")
+        print(f"  scoring clock: {f'VELD_EVAL_NOW={self.eval_now}' if self.eval_now else 'live'}")
         self.wait_healthy()
         self.version = f"{self.health.get('version')} (build {self.health.get('build')})"
         print(f"  veld {self.version}, backend {self.health.get('effective_storage_backend')}")
@@ -601,10 +643,57 @@ def judge_prompt(row: dict, answer: str) -> str:
                                   generated_answer=answer)
 
 
-def make_client():
-    import anthropic
+def comparability_note(llm: dict) -> str:
+    reader, judge = llm["reader"], llm["judge"]
+    if reader["model"] == judge["model"]:
+        models = (f"{reader['model']} as both reader and judge (reader effort "
+                  f"{reader['effort']}, judge effort {judge['effort']})")
+    else:
+        models = (f"{reader['model']} as reader (effort {reader['effort']}) and "
+                  f"{judge['model']} as judge (effort {judge['effort']})")
+    return (f"Not comparable with published LoCoMo J figures: this run uses {models}, while "
+            "every published J figure (Mem0 and the systems its paper compares) uses gpt-4o-mini "
+            "for both. Compare only runs of this harness made with the same model settings.")
 
-    return anthropic.Anthropic(max_retries=5)
+
+def keychain_secret(name: str) -> str:
+    try:
+        out = subprocess.run(["security", "find-generic-password", "-s", name, "-w"],
+                             capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise SystemExit(f"Keychain item {name!r} is not readable: {e}")
+    return out.stdout.strip()
+
+
+def llm_api_key(args) -> str | None:
+    if args.api_key_keychain:
+        return keychain_secret(args.api_key_keychain)
+    if args.api_key_env:
+        value = os.environ.get(args.api_key_env)
+        if not value:
+            raise SystemExit(f"${args.api_key_env} is not set")
+        return value
+    return None
+
+
+RATE_LIMITED = threading.local()
+
+
+def count_rate_limited(response):
+    if response.status_code == 429:
+        RATE_LIMITED.count = getattr(RATE_LIMITED, "count", 0) + 1
+
+
+def make_client(llm: dict, api_key: str | None):
+    options = {k: v for k, v in (("base_url", llm["base_url"]), ("api_key", api_key)) if v}
+    if llm["provider"] == "anthropic":
+        import anthropic
+
+        return anthropic.Anthropic(max_retries=5, **options)
+    import openai
+
+    return openai.OpenAI(max_retries=OPENAI_MAX_RETRIES, http_client=openai.DefaultHttpxClient(
+        event_hooks={"response": [count_rate_limited]}), **options)
 
 
 def call_claude(client, prompt: str, effort: str, max_tokens: int, schema=None,
@@ -666,23 +755,146 @@ def call_claude(client, prompt: str, effort: str, max_tokens: int, schema=None,
     return record, text
 
 
-def call_cost(record: dict) -> float:
-    return sum(record.get(key, 0) * price for key, price in PRICE_PER_MTOK.items()) / 1e6
+def retry_after_s(error) -> float | None:
+    headers = error.response.headers if error.response is not None else {}
+    for name, scale in (("retry-after-ms", 1000), ("retry-after", 1)):
+        try:
+            return float(headers[name]) / scale
+        except (KeyError, ValueError):
+            continue
+    return None
 
 
-def run_unit(client, row: dict, run: dict, prompt: str,
+def rate_limit_terminal(error) -> str | None:
+    wait = retry_after_s(error)
+    if "Request too large" in error.message:
+        return ("max tokens exceed a per-minute limit; lower --reader-max-tokens or "
+                "--judge-max-tokens")
+    if "per day" in error.message:
+        return "a per-day quota is spent; rerun with --resume once it refills"
+    if wait is not None and wait > RATE_LIMIT_MAX_WAIT_S:
+        return f"retry-after {wait:.0f}s exceeds the {RATE_LIMIT_MAX_WAIT_S}s wait cap"
+    return None
+
+
+def create_completion(client, request: dict):
+    import openai
+
+    for attempt in range(RATE_LIMIT_ROUNDS):
+        try:
+            return client.chat.completions.create(**request)
+        except openai.RateLimitError as e:
+            if rate_limit_terminal(e):
+                raise
+            # The SDK's retries run out under contention, and it gives up on any retry-after
+            # above its own ceiling of one or two minutes.
+            wait = retry_after_s(e)
+            time.sleep(wait if wait is not None else 5 * 2 ** attempt)
+    return client.chat.completions.create(**request)
+
+
+def call_openai_compatible(client, prompt: str, role: dict,
+                           json_mode: bool) -> tuple[dict, str | None]:
+    import openai
+
+    extra = {"reasoning_effort": role["effort"], "reasoning_format": role["reasoning_format"]}
+    request = {
+        "model": role["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_completion_tokens": role["max_tokens"],
+        "extra_body": {k: v for k, v in extra.items() if v is not None},
+    }
+    if json_mode:
+        request["response_format"] = {"type": "json_object"}
+    record = {"model": role["model"], "served_model": None, "request_id": None,
+              "stop_reason": None, "fallback": False, "input_tokens": 0, "output_tokens": 0,
+              "reasoning_tokens": 0, "cached_input_tokens": 0, "rate_limited": 0,
+              "latency_ms": None, "error": None, "fatal": False}
+    text = None
+    RATE_LIMITED.count = 0
+    started = time.perf_counter()
+    try:
+        response = create_completion(client, request)
+    except openai.RateLimitError as e:
+        terminal = rate_limit_terminal(e)
+        record.update(error=f"HTTP 429, {terminal or 'still limited after retries'}: {e.message}",
+                      request_id=e.request_id, fatal=terminal is not None)
+    except openai.BadRequestError as e:
+        parse_failure = json_mode and e.code == "json_validate_failed"
+        record.update(error=f"HTTP {e.status_code} {e.code}: {e.message}",
+                      request_id=e.request_id, fatal=not parse_failure)
+        if parse_failure:
+            record["parse_failure"] = True
+    except (openai.AuthenticationError, openai.PermissionDeniedError,
+            openai.NotFoundError) as e:
+        record.update(error=f"HTTP {e.status_code}: {e.message}", request_id=e.request_id,
+                      fatal=True)
+    except openai.APIStatusError as e:
+        record.update(error=f"HTTP {e.status_code} after retries: {e.message}",
+                      request_id=e.request_id, fatal=e.status_code == 413)
+    except openai.APIConnectionError as e:
+        record.update(error=f"connection error after retries: {e}")
+    else:
+        usage = response.usage
+        output_details = getattr(usage, "completion_tokens_details", None)
+        input_details = getattr(usage, "prompt_tokens_details", None)
+        choice = response.choices[0] if response.choices else None
+        record.update(
+            request_id=getattr(response, "_request_id", None),
+            served_model=response.model,
+            stop_reason=choice.finish_reason if choice else None,
+            input_tokens=(usage.prompt_tokens or 0) if usage else 0,
+            output_tokens=(usage.completion_tokens or 0) if usage else 0,
+            reasoning_tokens=(output_details.reasoning_tokens or 0) if output_details else 0,
+            cached_input_tokens=(input_details.cached_tokens or 0) if input_details else 0,
+        )
+        if choice is None:
+            record["error"] = "response carried no choice"
+        elif choice.finish_reason == "length":
+            record["error"] = f"length: output truncated at {role['max_tokens']} tokens"
+        elif choice.finish_reason == "content_filter":
+            record["error"] = "refusal (content_filter)"
+        elif choice.finish_reason != "stop":
+            record["error"] = f"unexpected finish_reason {choice.finish_reason}"
+        else:
+            text = THINK_BLOCK.sub("", choice.message.content or "").strip()
+            if "<think>" in text:
+                record["error"] = "reasoning is not separated from the answer"
+                text = None
+            elif not text:
+                record["error"] = "response carried no content"
+                text = None
+    record["rate_limited"] = RATE_LIMITED.count
+    record["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    return record, text
+
+
+def call_model(client, llm: dict, kind: str, prompt: str) -> tuple[dict, str | None]:
+    role = llm[kind]
+    if llm["provider"] == "anthropic":
+        return call_claude(client, prompt, role["effort"], role["max_tokens"],
+                           schema=JUDGE_SCHEMA if kind == "judge" else None, model=role["model"])
+    return call_openai_compatible(client, prompt, role, json_mode=kind == "judge")
+
+
+def call_cost(record: dict, prices: dict) -> float:
+    price = prices.get(record.get("model"), {})
+    return sum(record.get(key, 0) * p for key, p in price.items()) / 1e6
+
+
+def run_unit(client, llm: dict, row: dict, run: dict, prompt: str,
              abort: threading.Event) -> tuple[dict, bool]:
     if abort.is_set():
         return run, False
     if run["answer"] is None:
-        record, text = call_claude(client, prompt, READER_EFFORT, READER_MAX_TOKENS)
+        record, text = call_model(client, llm, "reader", prompt)
         run["calls"].append({"kind": "reader", **record})
         if record["error"]:
             return run, record["fatal"]
         run["answer"] = text
         run["answer_fallback"] = record["fallback"]
-    record, text = call_claude(client, judge_prompt(row, run["answer"]), JUDGE_EFFORT,
-                               JUDGE_MAX_TOKENS, schema=JUDGE_SCHEMA)
+    record, text = call_model(client, llm, "judge", judge_prompt(row, run["answer"]))
     call = {"kind": "judge", **record}
     run["calls"].append(call)
     if record["error"]:
@@ -690,10 +902,12 @@ def run_unit(client, row: dict, run: dict, prompt: str,
     try:
         label = json.loads(text)["label"]
     except (json.JSONDecodeError, KeyError, TypeError) as e:
-        call["error"] = f"judge output is not the label schema: {e}: {text[:200]!r}"
+        call.update(error=f"judge output is not the label schema: {e}: {text[:200]!r}",
+                    parse_failure=True)
         return run, False
     if label not in ("CORRECT", "WRONG"):
-        call["error"] = f"judge label {label!r} is neither CORRECT nor WRONG"
+        call.update(error=f"judge label {label!r} is neither CORRECT nor WRONG",
+                    parse_failure=True)
         return run, False
     run["label"] = label
     run["judge_fallback"] = record["fallback"]
@@ -755,15 +969,18 @@ def aggregate(results: dict, qids: list[str], runs: int) -> dict:
 
     latencies = [r["recall_ms"] for r in rows if r.get("recall_ms") is not None]
     calls = [call for row in rows for run in row.get("runs", []) for call in run["calls"]]
-    totals = {key: sum(call.get(key, 0) for call in calls) for key in PRICE_PER_MTOK}
+    totals = {key: sum(call.get(key, 0) for call in calls) for key in TOKEN_KEYS}
     by_kind = {}
     for kind in ("reader", "judge"):
         mine = [call for call in calls if call["kind"] == kind]
         by_kind[kind] = {
             "calls": len(mine),
             "errors": sum(1 for call in mine if call["error"]),
-            "refusals": sum(1 for call in mine if call["stop_reason"] == "refusal"),
-            "truncated": sum(1 for call in mine if call["stop_reason"] == "max_tokens"),
+            "refusals": sum(1 for call in mine
+                            if call["stop_reason"] in ("refusal", "content_filter")),
+            "truncated": sum(1 for call in mine if call["stop_reason"] in ("max_tokens", "length")),
+            "parse_failures": sum(1 for call in mine if call.get("parse_failure")),
+            "rate_limited_responses": sum(call.get("rate_limited", 0) for call in mine),
             "fallback_served": sum(1 for call in mine if call["fallback"]),
         }
     answers_by_fallback = sum(1 for row in rows for run in row.get("runs", [])
@@ -778,7 +995,8 @@ def aggregate(results: dict, qids: list[str], runs: int) -> dict:
         "calls": by_kind,
         "judged_answers_served_by_fallback": answers_by_fallback,
         "tokens": totals,
-        "estimated_cost_usd": round(sum(call_cost(call) for call in calls), 4),
+        "estimated_cost_usd": round(sum(call_cost(call, results["config"]["price_per_mtok"])
+                                        for call in calls), 4),
     }
 
 
@@ -786,13 +1004,22 @@ def fmt(value, pattern="{:.3f}"):
     return "-" if value is None else pattern.format(value)
 
 
+def price_text(prices: dict) -> str:
+    return "; ".join(
+        f"{model} " + " / ".join(f"{key.removesuffix('_tokens')} ${usd:g}"
+                                 for key, usd in price.items())
+        for model, price in prices.items()) + " per MTok"
+
+
 def print_summary(results: dict, agg: dict):
     cfg = results["config"]
     print("\n## LoCoMo QA accuracy (J)\n")
     print(f"veld {results['veld'].get('binary_version')} (repo {results['veld'].get('git')}), "
-          f"top-k {cfg['top_k']}, reader and judge {cfg['model']} "
-          f"(effort {cfg['reader_effort']} / {cfg['judge_effort']}), runs {cfg['runs']}\n")
-    print(f"> {COMPARABILITY_NOTE}\n")
+          f"top-k {cfg['top_k']}, {cfg['provider']} reader {cfg['reader_model']} "
+          f"(effort {cfg['reader_effort']}), judge {cfg['judge_model']} "
+          f"(effort {cfg['judge_effort']}), runs {cfg['runs']}, scoring clock "
+          f"{cfg.get('eval_now') or 'live'}\n")
+    print(f"> {results['comparability_note']}\n")
     print("| Category | n | J mean | J sd | J per run | evidence hit@k |")
     print("|---|---:|---:|---:|---|---:|")
     for c in agg["categories"]:
@@ -805,17 +1032,21 @@ def print_summary(results: dict, agg: dict):
           f"p95 {fmt(lat['p95'], '{:.1f}')} ms (n={lat['n']})")
     for kind, c in agg["calls"].items():
         print(f"{kind.capitalize()} calls: {c['calls']}, errors {c['errors']} "
-              f"(refusals {c['refusals']}, truncated {c['truncated']}), "
+              f"(refusals {c['refusals']}, truncated {c['truncated']}, unparseable "
+              f"{c['parse_failures']}), HTTP 429 responses {c['rate_limited_responses']}, "
               f"served by a fallback model {c['fallback_served']}")
-    print(f"Judged answers written by a fallback model, not {MODEL}: "
-          f"{agg['judged_answers_served_by_fallback']}")
+    if cfg["provider"] == "anthropic":
+        print(f"Judged answers written by a fallback model, not {cfg['reader_model']}: "
+              f"{agg['judged_answers_served_by_fallback']}")
     if any(agg["unjudged_per_run"]):
         print(f"Unjudged questions per run: {agg['unjudged_per_run']} (excluded from J; "
               "rerun with --resume to retry them)")
     t = agg["tokens"]
-    print(f"Tokens: input {t['input_tokens']:,}, output {t['output_tokens']:,}, "
-          f"cache read {t['cache_read_input_tokens']:,}; estimated cost "
-          f"${agg['estimated_cost_usd']:.2f} at $4 / $20 / $0.20 per MTok")
+    print(f"Tokens: input {t['input_tokens']:,} (cached {t['cached_input_tokens']:,}), output "
+          f"{t['output_tokens']:,} (reasoning {t['reasoning_tokens']:,}), cache read "
+          f"{t['cache_read_input_tokens']:,}; estimated cost ${agg['estimated_cost_usd']:.2f} at "
+          f"{price_text(cfg['price_per_mtok'])}"
+          + (", cached input at the full input price" if t["cached_input_tokens"] else ""))
 
 
 def save_results(results: dict, path: Path):
@@ -846,7 +1077,7 @@ def refuse_live_url(url: str):
                          "scratch server.")
 
 
-def project(rows: list[dict], speakers: dict, runs: int, full_questions: int):
+def project(rows: list[dict], speakers: dict, runs: int, full_questions: int, llm: dict):
     reader_chars = [len(reader_prompt(r, speakers[r["conversation"]])) for r in rows]
     judge_chars = [len(judge_prompt(r, "x" * EST_ANSWER_CHARS)) for r in rows]
     reader_in = statistics.mean(reader_chars) / CHARS_PER_TOKEN
@@ -855,8 +1086,18 @@ def project(rows: list[dict], speakers: dict, runs: int, full_questions: int):
         "input_tokens": reader_in + judge_in,
         "output_tokens": EST_READER_OUTPUT_TOKENS + EST_JUDGE_OUTPUT_TOKENS,
     }
-    cost_per_question = call_cost(per_question)
+
+    def cost(kind: str, **tokens) -> float:
+        return call_cost({"model": llm[kind]["model"], **tokens}, llm["prices"])
+
+    cost_per_question = (cost("reader", input_tokens=reader_in,
+                              output_tokens=EST_READER_OUTPUT_TOKENS)
+                         + cost("judge", input_tokens=judge_in,
+                                output_tokens=EST_JUDGE_OUTPUT_TOKENS))
     print("\n## Projection (no API calls made)\n")
+    print(f"{llm['provider']}: reader {llm['reader']['model']} (effort "
+          f"{llm['reader']['effort']}), judge {llm['judge']['model']} (effort "
+          f"{llm['judge']['effort']}), at {price_text(llm['prices'])}.")
     print(f"Mean reader prompt {statistics.mean(reader_chars):,.0f} chars "
           f"(~{reader_in:,.0f} tokens), judge prompt {statistics.mean(judge_chars):,.0f} chars "
           f"(~{judge_in:,.0f} tokens) at {CHARS_PER_TOKEN} chars/token, over {len(rows)} "
@@ -866,13 +1107,14 @@ def project(rows: list[dict], speakers: dict, runs: int, full_questions: int):
           f"judge sees a {EST_ANSWER_CHARS}-char reader answer.")
     for label, count in (("selected", len(rows)), ("full LoCoMo", full_questions)):
         calls = count * runs
-        input_cost = call_cost({"input_tokens": per_question["input_tokens"] * calls})
+        input_cost = (cost("reader", input_tokens=reader_in * calls)
+                      + cost("judge", input_tokens=judge_in * calls))
         print(f"- {label}: {count} questions x {runs} runs = {2 * calls} calls, "
               f"~{per_question['input_tokens'] * calls / 1e6:.2f} M input + "
               f"~{per_question['output_tokens'] * calls / 1e6:.2f} M output tokens, "
               f"~${cost_per_question * calls:.2f} (input alone ~${input_cost:.2f}; every 100 "
-              f"output tokens per question-run adds "
-              f"~${call_cost({'output_tokens': 100 * calls}):.2f})")
+              f"reader output tokens per question-run adds "
+              f"~${cost('reader', output_tokens=100 * calls):.2f})")
     return {"chars_per_token": CHARS_PER_TOKEN,
             "mean_reader_prompt_chars": statistics.mean(reader_chars),
             "mean_judge_prompt_chars": statistics.mean(judge_chars),
@@ -893,7 +1135,7 @@ def retrieval_phase(args, data_by_id: dict, results: dict, todo: list[dict], out
         base_url, api_key = args.url, args.api_key
     else:
         server = ScratchServer(args.binary, args.port, args.server_env, args.storage_backend,
-                               args.startup_timeout, args.copy_env)
+                               args.startup_timeout, args.copy_env, results["config"]["eval_now"])
         server.start()
         base_url, api_key = server.url, server.api_key
         results["veld"].update(binary=server.binary, binary_version=server.version,
@@ -944,7 +1186,8 @@ def retrieval_phase(args, data_by_id: dict, results: dict, todo: list[dict], out
             print(f"  scratch server log kept at {log_copy}")
 
 
-def api_phase(args, results: dict, qids: list[str], speakers: dict, out_path: Path):
+def api_phase(args, results: dict, qids: list[str], speakers: dict, out_path: Path, client,
+              llm: dict):
     rows = results["rows"]
     units = []
     for qid in qids:
@@ -956,10 +1199,12 @@ def api_phase(args, results: dict, qids: list[str], speakers: dict, out_path: Pa
     if not units:
         print("Every (question, run) pair is already judged.")
         return
-    print(f"Running reader + judge for {len(units)} (question, run) pairs on {MODEL}, "
-          f"concurrency {args.concurrency}")
-    client = make_client()
+    print(f"Running reader + judge for {len(units)} (question, run) pairs: reader "
+          f"{llm['reader']['model']}, judge {llm['judge']['model']}, concurrency "
+          f"{args.concurrency}")
     abort = threading.Event()
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = time.perf_counter()
     pool = ThreadPoolExecutor(max_workers=args.concurrency)
     futures = {}
     done = 0
@@ -968,8 +1213,8 @@ def api_phase(args, results: dict, qids: list[str], speakers: dict, out_path: Pa
         for qid, r in units:
             row = rows[qid]
             prompt = reader_prompt(row, speakers[row["conversation"]])
-            futures[pool.submit(run_unit, client, row, copy.deepcopy(row["runs"][r]), prompt,
-                                abort)] = (qid, r)
+            futures[pool.submit(run_unit, client, llm, row, copy.deepcopy(row["runs"][r]),
+                                prompt, abort)] = (qid, r)
         for future in as_completed(futures):
             qid, r = futures[future]
             previous = len(rows[qid]["runs"][r]["calls"])
@@ -1000,6 +1245,11 @@ def api_phase(args, results: dict, qids: list[str], speakers: dict, out_path: Pa
         raise
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+        wall_s = round(time.perf_counter() - started, 1)
+        results.setdefault("api_phase", []).append({
+            "started_at": started_at, "wall_s": wall_s, "units": len(units),
+            "completed": done, "concurrency": args.concurrency})
+        print(f"API phase: {done}/{len(units)} (question, run) pairs in {wall_s}s")
         save_results(results, out_path)
 
 
@@ -1007,6 +1257,81 @@ def default_output(dry_run: bool) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     kind = "dryrun" if dry_run else "run"
     return CACHE_DIR / "results" / f"locomo_qa_{kind}_{stamp}.json"
+
+
+def build_llm(args) -> dict:
+    anthropic = args.provider == "anthropic"
+    if not anthropic and not (args.model or (args.reader_model and args.judge_model)):
+        raise SystemExit("--provider openai-compatible needs --model, or both --reader-model "
+                         "and --judge-model")
+    llm = {"provider": args.provider, "base_url": args.base_url, "prices": {}}
+    for kind, model, effort, max_tokens in (
+            ("reader", args.reader_model, args.reader_effort, args.reader_max_tokens),
+            ("judge", args.judge_model, args.judge_effort, args.judge_max_tokens)):
+        model = model or args.model or MODEL
+        known = {} if anthropic else MODEL_DEFAULTS.get(model, {})
+        if anthropic:
+            default_effort = READER_EFFORT if kind == "reader" else JUDGE_EFFORT
+        else:
+            default_effort = known.get(f"{kind}_effort")
+        llm[kind] = {"model": model, "effort": effort or default_effort,
+                     "max_tokens": max_tokens, "reasoning_format": known.get("reasoning_format")}
+        price = dict(PRICE_PER_MTOK if anthropic else known.get("price", {}))
+        if args.price_in is not None:
+            price["input_tokens"] = args.price_in
+        if args.price_out is not None:
+            price["output_tokens"] = args.price_out
+        if not {"input_tokens", "output_tokens"} <= price.keys():
+            raise SystemExit(f"No list price known for {model}; pass --price-in and --price-out "
+                             "(USD per MTok)")
+        llm["prices"][model] = price
+    return llm
+
+
+def llm_config(llm: dict, price_overridden: bool) -> dict:
+    config = {
+        "provider": llm["provider"], "base_url": llm["base_url"],
+        "reader_model": llm["reader"]["model"], "judge_model": llm["judge"]["model"],
+        "reader_effort": llm["reader"]["effort"], "judge_effort": llm["judge"]["effort"],
+        "reader_max_tokens": llm["reader"]["max_tokens"],
+        "judge_max_tokens": llm["judge"]["max_tokens"],
+        "price_per_mtok": llm["prices"],
+        "price_source": ("--price-in / --price-out" if price_overridden
+                         else PRICE_SOURCE[llm["provider"]]),
+    }
+    if llm["provider"] == "anthropic":
+        config["fallbacks"] = f"default ({FALLBACK_BETA})"
+    else:
+        config.update(temperature=0, judge_response_format="json_object",
+                      reader_reasoning_format=llm["reader"]["reasoning_format"],
+                      judge_reasoning_format=llm["judge"]["reasoning_format"],
+                      max_retries=OPENAI_MAX_RETRIES)
+    return config
+
+
+LLM_IDENTITY = ("provider", "reader_model", "judge_model", "reader_effort", "judge_effort")
+
+
+def stored_llm_identity(config: dict) -> tuple:
+    stored = {"provider": "anthropic", "reader_model": config.get("model"),
+              "judge_model": config.get("model"), **config}
+    return tuple(stored.get(key) for key in LLM_IDENTITY)
+
+
+def resolve_eval_now(raw: str | None, convs: list[dict]) -> str | None:
+    if raw is None:
+        return None
+    if raw == "auto":
+        latest = max(start + timedelta(seconds=len(turns) - 1)
+                     for conv in convs for _, turns, start in conversation_sessions(conv))
+        return rfc3339(latest + timedelta(days=1))
+    try:
+        pinned = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise SystemExit(f"--eval-now {raw!r} is neither ISO 8601 nor auto")
+    if pinned.tzinfo is None:
+        pinned = pinned.replace(tzinfo=timezone.utc)
+    return rfc3339(pinned.astimezone(timezone.utc))
 
 
 def main():
@@ -1043,7 +1368,38 @@ def main():
     ap.add_argument("--url", default=None, help="With --no-spawn: server base URL")
     ap.add_argument("--api-key", default=None, help="With --no-spawn: server API key")
     ap.add_argument("--cache-dir", default=str(CACHE_DIR))
+    ap.add_argument("--eval-now", default=None, metavar="ISO8601|auto",
+                    help="Pin the scratch server's scoring clock (VELD_EVAL_NOW); auto is one "
+                         "day after the latest session of the selected conversations (default: "
+                         "unset, the live clock)")
+    ap.add_argument("--provider", default="anthropic", choices=["anthropic", "openai-compatible"],
+                    help="Reader and judge API")
+    ap.add_argument("--base-url", default=None,
+                    help="API base URL, e.g. https://api.groq.com/openai/v1")
+    ap.add_argument("--model", default=None,
+                    help=f"Reader and judge model (anthropic default {MODEL})")
+    ap.add_argument("--reader-model", default=None, help="Reader model, overriding --model")
+    ap.add_argument("--judge-model", default=None, help="Judge model, overriding --model")
+    ap.add_argument("--reader-effort", default=None,
+                    help="Reader effort / reasoning_effort (default per model)")
+    ap.add_argument("--judge-effort", default=None,
+                    help="Judge effort / reasoning_effort (default per model)")
+    ap.add_argument("--reader-max-tokens", type=int, default=READER_MAX_TOKENS)
+    ap.add_argument("--judge-max-tokens", type=int, default=JUDGE_MAX_TOKENS)
+    key_source = ap.add_mutually_exclusive_group()
+    key_source.add_argument("--api-key-keychain", default=None, metavar="NAME",
+                            help="Read the model API key from macOS keychain item NAME")
+    key_source.add_argument("--api-key-env", default=None, metavar="NAME",
+                            help="Read the model API key from environment variable NAME")
+    ap.add_argument("--price-in", type=float, default=None,
+                    help="USD per MTok of input, for every model (default: list price)")
+    ap.add_argument("--price-out", type=float, default=None,
+                    help="USD per MTok of output, for every model (default: list price)")
     args = ap.parse_args()
+    llm = build_llm(args)
+    if args.eval_now and args.no_spawn:
+        raise SystemExit("--eval-now sets the spawned server's clock; with --no-spawn, start "
+                         "that server with VELD_EVAL_NOW instead")
 
     sys.stdout.reconfigure(line_buffering=True)
     for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -1065,6 +1421,7 @@ def main():
                       data_by_id[cid]["conversation"]["speaker_b"]) for cid in data_by_id}
     print(f"LoCoMo {dataset_path} sha256 {dataset_sha}: {len(questions)} questions selected "
           f"from {len(wanted)} conversations ({full_questions} non-adversarial in the dataset)")
+    eval_now = resolve_eval_now(args.eval_now, [data_by_id[c] for c in wanted])
 
     out_path = Path(args.output).expanduser() if args.output else default_output(args.dry_run)
     if out_path.exists() and not args.resume:
@@ -1078,18 +1435,25 @@ def main():
         if results["config"]["top_k"] != args.top_k:
             raise SystemExit(f"{out_path} retrieved top-{results['config']['top_k']}; "
                              f"rerun with --top-k {results['config']['top_k']}")
+        stored = stored_llm_identity(results["config"])
+        current = stored_llm_identity(llm_config(llm, False))
+        if stored != current:
+            raise SystemExit(f"{out_path} was judged with {dict(zip(LLM_IDENTITY, stored))}; "
+                             f"this command asks for {dict(zip(LLM_IDENTITY, current))}")
+        if results["config"].get("eval_now") != eval_now:
+            raise SystemExit(f"{out_path} retrieved with --eval-now "
+                             f"{results['config'].get('eval_now')}; this command resolves to "
+                             f"{eval_now}")
         results["config"]["runs"] = max(results["config"]["runs"], args.runs)
         results["dry_run"] = results.get("dry_run", False) and args.dry_run
         print(f"Resuming {out_path}")
     else:
         results = {
             "benchmark": "LoCoMo end-to-end QA accuracy (J)",
-            "comparability_note": COMPARABILITY_NOTE,
+            "comparability_note": comparability_note(llm),
             "dataset": {"url": DATASET_URL, "path": str(dataset_path), "sha256": dataset_sha},
             "config": {
-                "model": MODEL, "reader_effort": READER_EFFORT, "judge_effort": JUDGE_EFFORT,
-                "reader_max_tokens": READER_MAX_TOKENS, "judge_max_tokens": JUDGE_MAX_TOKENS,
-                "fallbacks": f"default ({FALLBACK_BETA})", "top_k": args.top_k,
+                "top_k": args.top_k,
                 "recall_mode": "hybrid (server default)", "runs": args.runs,
                 "categories": {str(k): v for k, v in CATEGORY.items()},
                 "excluded_categories": sorted(EXCLUDED_CATEGORIES),
@@ -1101,8 +1465,12 @@ def main():
             "rows": {},
             "dry_run": args.dry_run,
         }
+    results["config"].update(llm_config(llm, args.price_in is not None
+                                        or args.price_out is not None))
+    results["config"].update(eval_now=eval_now, eval_now_arg=args.eval_now)
     results["config"]["conversations"] = wanted
     results["config"]["limit_questions"] = args.limit_questions
+    client = None if args.dry_run else make_client(llm, llm_api_key(args))
     qids = [q["qid"] for q in questions]
 
     todo = [q for q in questions if results["rows"].get(q["qid"], {}).get("retrieved") is None]
@@ -1119,12 +1487,12 @@ def main():
             print(reader_prompt(row, speakers[row["conversation"]]))
             print(f"----- judge prompt, {row['qid']} (answer placeholder) -----")
             print(judge_prompt(row, "<reader answer>"))
-        results["projection"] = project(rows, speakers, args.runs, full_questions)
+        results["projection"] = project(rows, speakers, args.runs, full_questions, llm)
         save_results(results, out_path)
         print(f"\nDry run written to {out_path}")
         return
 
-    api_phase(args, results, qids, speakers, out_path)
+    api_phase(args, results, qids, speakers, out_path, client, llm)
     results["aggregate"] = aggregate(results, qids, results["config"]["runs"])
     save_results(results, out_path)
     print_summary(results, results["aggregate"])
