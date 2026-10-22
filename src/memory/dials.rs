@@ -218,6 +218,20 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub bm25_read_staleness_ms: Option<u64>,
 
+    /// Live-vector count up to which a Vamana vector search scans every vector exactly instead
+    /// of walking the graph. `None` keeps `vamana::EXACT_SEARCH_MAX_VECTORS` (50 000); `0`
+    /// walks the graph for every search.
+    #[serde(default)]
+    pub vector_exact_search_max: Option<usize>,
+
+    /// Beam width L of a Vamana graph walk. `None` sizes the beam as today: the requested
+    /// count k, plus up to 2k more while vectors are soft-deleted, never below the index's
+    /// search list size (100). Set, a walk keeps `max(k, L)` candidates and soft-deleted
+    /// vectors route it without taking a slot. Only searches above
+    /// `vector_exact_search_max` walk the graph.
+    #[serde(default)]
+    pub vector_search_beam: Option<usize>,
+
     // ---- Recall ranking sliders (None = compile-time constant default) ---------------
     // Overlay the historical `const`s in recall.rs / hybrid_search.rs / constants.rs.
     // Rendered as sliders in the monitor "Dials" tab; see [`RECALL_SLIDER_SPECS`] for
@@ -691,6 +705,8 @@ impl Default for CognitiveDials {
             graph_episode_entities: None,
             confidence_gate_all_paths: None,
             bm25_read_staleness_ms: None,
+            vector_exact_search_max: None,
+            vector_search_beam: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
             rrf_k_inner: None,
@@ -759,6 +775,7 @@ impl CognitiveDials {
         });
         self.graph_episode_entities = self.graph_episode_entities.map(|n| n.clamp(1, 1000));
         self.bm25_read_staleness_ms = self.bm25_read_staleness_ms.map(|ms| ms.min(60_000));
+        self.vector_search_beam = self.vector_search_beam.map(|l| l.clamp(1, 10_000));
         if let Some((b, v, g)) = self.rrf_weights {
             self.rrf_weights = Some((b.clamp(0.0, 1.0), v.clamp(0.0, 1.0), g.clamp(0.0, 1.0)));
         }
@@ -885,7 +902,7 @@ impl CognitiveDials {
     /// WORKING_MEMORY_THRESHOLD}`,
     /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG,
     /// DATE_WINDOW_INDEX_VECTORS,GRAPH_EPISODE_ENTITIES,CONFIDENCE_GATE_ALL_PATHS,
-    /// BM25_READ_STALENESS_MS}`.
+    /// BM25_READ_STALENESS_MS,VECTOR_EXACT_SEARCH_MAX,VECTOR_SEARCH_BEAM}`.
     pub fn from_env() -> Self {
         // An empty value is unset: the recall workflow passes '' for a dispatch input left
         // blank, and reading that as `false` would record an override the run never made.
@@ -961,6 +978,12 @@ impl CognitiveDials {
         }
         if let Some(v) = env_parse::<u64>("VELD_DIALS_BM25_READ_STALENESS_MS") {
             d.bm25_read_staleness_ms = Some(v);
+        }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_VECTOR_EXACT_SEARCH_MAX") {
+            d.vector_exact_search_max = Some(v);
+        }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_VECTOR_SEARCH_BEAM") {
+            d.vector_search_beam = Some(v);
         }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
@@ -1050,6 +1073,8 @@ mod tests {
         assert!(d.graph_episode_entities.is_none());
         assert!(d.confidence_gate_all_paths.is_none());
         assert!(d.bm25_read_staleness_ms.is_none());
+        assert!(d.vector_exact_search_max.is_none());
+        assert!(d.vector_search_beam.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,
             crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS

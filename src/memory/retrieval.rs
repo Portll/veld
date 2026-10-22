@@ -26,7 +26,7 @@ use crate::constants::{
 };
 use crate::embeddings::competitive::CompetitiveEmbedder;
 use crate::embeddings::Embedder;
-use crate::vector_db::vamana::{VamanaConfig, VamanaIndex};
+use crate::vector_db::vamana::{VamanaConfig, VamanaIndex, VamanaSearchParams};
 
 /// Filename for persisted Vamana index (instant startup)
 const VAMANA_INDEX_FILE: &str = "vamana.idx";
@@ -75,6 +75,10 @@ pub struct RetrievalEngine {
     /// Shared consolidation event buffer for introspection
     /// Records edge formation, strengthening, and pruning events
     consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,
+    /// The owning `MemorySystem`'s runtime dials, read once per vector search for the
+    /// `vector_exact_search_max` and `vector_search_beam` overrides. `None` keeps the index's
+    /// own sizing.
+    dials: RwLock<Option<Arc<RwLock<crate::memory::dials::CognitiveDials>>>>,
 }
 
 /// Bidirectional mapping between memory IDs and vector IDs
@@ -288,6 +292,7 @@ impl RetrievalEngine {
             secondary_id_mapping,
             storage_path,
             consolidation_events,
+            dials: RwLock::new(None),
         };
 
         // ATOMIC STARTUP: Rebuild Vamana from RocksDB (single source of truth)
@@ -969,6 +974,27 @@ impl RetrievalEngine {
         Ok(())
     }
 
+    /// Attach the shared runtime dials so their vector-search overrides take effect. Pass the
+    /// same `Arc` the owning `MemorySystem` holds.
+    pub fn attach_dials(&self, dials: Arc<RwLock<crate::memory::dials::CognitiveDials>>) {
+        *self.dials.write() = Some(dials);
+    }
+
+    /// The vector-search overrides the attached dials set now.
+    fn vector_search_params(&self) -> VamanaSearchParams {
+        self.dials
+            .read()
+            .as_ref()
+            .map(|dials| {
+                let dials = dials.read();
+                VamanaSearchParams {
+                    exact_search_max: dials.vector_exact_search_max,
+                    beam_width: dials.vector_search_beam,
+                }
+            })
+            .unwrap_or_default()
+    }
+
     /// Set the consolidation event buffer (for late binding after construction)
     pub fn set_consolidation_events(&mut self, events: Arc<RwLock<ConsolidationEventBuffer>>) {
         self.consolidation_events = Some(events);
@@ -1512,11 +1538,13 @@ impl RetrievalEngine {
             };
 
         // Search vector index - fetch more candidates for chunk deduplication
+        let params = self.vector_search_params();
         let index = self.vector_index.read();
         let results = crate::metrics::timed_vector_search(|| {
-            index.search(
+            index.search_with(
                 &query_embedding,
                 limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
+                params,
             )
         })
         .context("Vector search failed")?;
@@ -1595,11 +1623,13 @@ impl RetrievalEngine {
             };
 
         // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
+        let params = self.vector_search_params();
         let index = sec_index.read();
         let results = crate::metrics::timed_vector_search(|| {
-            index.search(
+            index.search_with(
                 query_embedding_secondary,
                 limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
+                params,
             )
         })
         .context("Secondary vector search failed")?;
@@ -1665,9 +1695,14 @@ impl RetrievalEngine {
         limit: usize,
     ) -> Result<Vec<(MemoryId, f32)>> {
         // LOCK ORDERING: primary vector_index (1) before id_mapping (2)
+        let params = self.vector_search_params();
         let index = self.vector_index.read();
         let results = crate::metrics::timed_vector_search(|| {
-            index.search(projected, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
+            index.search_with(
+                projected,
+                limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
+                params,
+            )
         })
         .context("Aligned vector search failed")?;
 
@@ -1725,9 +1760,14 @@ impl RetrievalEngine {
         exclude_id: Option<&MemoryId>,
     ) -> Result<Vec<(MemoryId, f32)>> {
         // Search vector index - fetch more candidates to account for chunk deduplication
+        let params = self.vector_search_params();
         let index = self.vector_index.read();
         let results = crate::metrics::timed_vector_search(|| {
-            index.search(embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
+            index.search_with(
+                embedding,
+                limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
+                params,
+            )
         })
         .context("Vector search by embedding failed")?;
 
@@ -1810,9 +1850,14 @@ impl RetrievalEngine {
         };
 
         // Search Vamana index with candidate multiplier for filtering headroom
+        let params = self.vector_search_params();
         let index = self.vector_index.read();
         let results = crate::metrics::timed_vector_search(|| {
-            index.search(&query_embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER)
+            index.search_with(
+                &query_embedding,
+                limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER,
+                params,
+            )
         })
         .context("Vector search failed")?;
 

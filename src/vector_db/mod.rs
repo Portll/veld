@@ -48,7 +48,9 @@ pub(crate) mod vamana_store;
 pub use hnsw::{HnswConfig, HnswIndex};
 pub use pq::{CompressedVectorStore, PQConfig, ProductQuantizer};
 pub use spann::{SpannConfig, SpannIndex};
-pub use vamana::{DistanceMetric, VamanaConfig, VamanaIndex, REBUILD_THRESHOLD};
+pub use vamana::{
+    DistanceMetric, VamanaConfig, VamanaIndex, VamanaSearchParams, REBUILD_THRESHOLD,
+};
 pub use vamana_projection::{
     VamanaEmbeddingKind, VamanaProjection, VamanaProjectionBootstrap, VamanaProjectionError,
 };

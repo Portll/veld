@@ -1591,6 +1591,7 @@ impl MemorySystem {
             }
         }
         hybrid_search_engine.attach_dials(cognitive_dials_arc.clone());
+        retriever.attach_dials(cognitive_dials_arc.clone());
         {
             let mut d = cognitive_dials_arc.write();
             Self::apply_rerank_model_dial(&hybrid_search_engine, &mut d);

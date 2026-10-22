@@ -31,11 +31,13 @@ reconsolidation behaves exactly as it did pre-dials.
 | `graph_episode_entities` | `VELD_DIALS_GRAPH_EPISODE_ENTITIES` | `None` (every entity) | How many of the entities recall's graph traversal reaches (Layer 2) have their recent episodes read as candidates. The entities kept are those with the highest decay factor (the nearest to a query entity; an entity reached twice counts at its best), ties broken by salience, then name. Each expanded entity costs an index scan and up to `RECALL_GRAPH_EPISODES_PER_ENTITY` episode reads, so a dense graph can spend most of a recall here. Clamped to 1–1000. |
 | `confidence_gate_all_paths` | `VELD_DIALS_CONFIDENCE_GATE_ALL_PATHS` | `None` (semantic recall only) | Where the calibrated-confidence gate (`0.85 + 0.15 × confidence` once a memory has five feedback observations) and abstention (importance × confidence below the abstention threshold drops a memory with more than two feedback events, unless the graph reached it with activation above 0.3) apply. Unset, only semantic recall applies them. `Some(true)` applies them to spreading-activation recall and filter-only recall too (the gate scales their order, then abstention filters), and abstention to tag, date and advanced-search recall, which order by time or by the store, so the multiplier would move nothing there. |
 | `bm25_read_staleness_ms` | `VELD_DIALS_BM25_READ_STALENESS_MS` | `None` (commit every buffered write) | How long a journaled write may sit buffered in the BM25 index before a recall commits it itself. `None` commits everything buffered before the search, so a memory is keyword-findable on the first recall after its write (a `/api/remember` memory has no embedding until its background embed finishes, so BM25 is then its only route into recall). `Some(ms)` leaves younger writes to the BM25 projection's background committer, which commits within `COMMIT_INTERVAL` (200 ms) of the previous commit; a recall then pays no commit, and can miss the keyword match of a memory written less than that long ago. Clamped to at most 60 000. |
+| `vector_exact_search_max` | `VELD_DIALS_VECTOR_EXACT_SEARCH_MAX` | `None` (50 000) | The live-vector count up to which a Vamana vector search (recall Layer 3, the secondary and aligned legs, interference lookups) scans every vector exactly instead of walking the graph. At 768 dimensions 50 000 vectors is under 40 M multiply-adds a query. `0` walks the graph for every search; a larger value keeps more indexes exact. |
+| `vector_search_beam` | `VELD_DIALS_VECTOR_SEARCH_BEAM` | `None` (k + up to 2k, at least 100) | The beam width L of a Vamana graph walk, used only above `vector_exact_search_max`. `None` sizes the beam from the request: the k asked for, plus up to 2k more while vectors are soft-deleted, never below the index's search list size of 100. Set, a walk keeps `max(k, L)` candidates, and soft-deleted vectors route the walk without taking a slot, so deletions no longer widen it. Clamped to 1–10 000. |
 
 The recall gate records the overrides a run was measured under
 (`retrieval_dials` in `tests/recall/locomo-gate-baseline.json`: `date_window_leg`,
-`date_window_index_vectors`, `relative_priors`, `graph_episode_entities` and
-`confidence_gate_all_paths`) and
+`date_window_index_vectors`, `relative_priors`, `graph_episode_entities`,
+`confidence_gate_all_paths`, `vector_exact_search_max` and `vector_search_beam`) and
 refuses to diff two runs that overrode them differently. `bm25_read_staleness_ms` is not recorded: the gate ingests through
 `MemorySystem::remember`, which commits BM25 as it writes, so nothing is ever
 buffered when it recalls.
@@ -57,6 +59,7 @@ flowchart LR
     KV[(KV store<br/>per-user blob)] -->|deserialize + overlay| INIT
     INIT --> ARC[Arc&lt;RwLock&lt;CognitiveDials&gt;&gt;]
     ARC --> HS[hybrid_search_engine.attach_dials]
+    ARC --> RE[retriever.attach_dials]
     ARC --> MS[MemorySystem]
     PUT[PUT /api/dials] -->|sanitize + stamp updated_at| ARC
     ARC -->|serde_json::to_vec| KV
@@ -68,7 +71,8 @@ flowchart LR
    `COGNITIVE_DIALS_KEY`, deserialize and `sanitized()`-overlay it. A corrupt
    blob is logged and skipped (not fatal).
 3. **Attach** — the `Arc<RwLock<CognitiveDials>>` is handed to the hybrid
-   search engine and stored on `MemorySystem`. The engine's recall path
+   search engine and the retrieval engine (the vector-search dials), and stored
+   on `MemorySystem`. The engine's recall path
    reads through this handle on every call, so a runtime change takes
    effect immediately.
 4. **Persist** — `PUT /api/dials` replaces the in-memory state, calls

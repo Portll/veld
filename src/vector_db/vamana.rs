@@ -119,6 +119,19 @@ pub const MIN_ACCEPTABLE_RECALL: f32 = 0.85;
 /// under 40M multiply-adds a query, a few milliseconds, and it is exact where the graph approximates.
 pub const EXACT_SEARCH_MAX_VECTORS: usize = 50_000;
 
+/// Per-search overrides of an index's own sizing. The default changes nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VamanaSearchParams {
+    /// Live-vector count up to which the search scans every vector instead of walking the
+    /// graph. `None` keeps the index's own threshold ([`EXACT_SEARCH_MAX_VECTORS`] unless
+    /// [`VamanaIndex::set_exact_search_max`] changed it).
+    pub exact_search_max: Option<usize>,
+    /// Beam width L of a graph walk. `None` sizes the beam as k plus up to 2k more while
+    /// vectors are soft-deleted, never below the configured search list size. `Some(l)`
+    /// walks with `max(k, l)`, and soft-deleted vectors route the walk without taking a slot.
+    pub beam_width: Option<usize>,
+}
+
 /// Main Vamana index
 pub struct VamanaIndex {
     pub(crate) config: VamanaConfig,
@@ -466,40 +479,60 @@ impl VamanaIndex {
 
     /// Greedy search for nearest neighbors
     ///
-    /// Optimized to use zero-copy slice access for vector data.
     /// Holds both graph and vector storage locks for the duration of the search
     /// to avoid per-neighbor lock acquisition overhead.
     fn greedy_search(&self, query: &[f32], k: usize, entry: u32) -> Result<Vec<SearchCandidate>> {
-        let graph = self.graph.read();
-        let storage = self.vectors.read(); // Hold lock for entire search (zero-copy access)
+        self.walk_f32(query, k, entry, None)
+    }
 
+    /// [`Self::walk`] with full-precision distances to `query`.
+    fn walk_f32(
+        &self,
+        query: &[f32],
+        k: usize,
+        entry: u32,
+        route_only: Option<&DeletedSet>,
+    ) -> Result<Vec<SearchCandidate>> {
+        let graph = self.graph.read();
+        let storage = self.vectors.read();
+        self.walk(&graph, k, entry, route_only, |id| {
+            // Zero-copy slice access - no allocation per neighbor
+            Ok(self.distance(query, Self::get_slice_from_storage(&storage, id)?))
+        })
+    }
+
+    /// Beam search over `graph` from `entry`, keeping the `k` nearest by `distance`, nearest
+    /// first. Ids in `route_only` are walked through like any other node but never kept.
+    fn walk(
+        &self,
+        graph: &[VamanaNode],
+        k: usize,
+        entry: u32,
+        route_only: Option<&DeletedSet>,
+        distance: impl Fn(u32) -> Result<f32>,
+    ) -> Result<Vec<SearchCandidate>> {
         let search_cap = self.config.search_list_size;
         let mut visited = self.visited.take(graph.len());
         let mut candidates = BinaryHeap::with_capacity(search_cap);
         let mut w = BinaryHeap::with_capacity(search_cap);
+        let kept = |id: u32| route_only.is_none_or(|ids| !ids.contains(id));
 
-        // Start from entry point (zero-copy slice access)
-        let entry_slice = Self::get_slice_from_storage(&storage, entry)?;
-        let entry_dist = self.distance(query, entry_slice);
-
+        let entry_dist = distance(entry)?;
         candidates.push(Reverse(SearchCandidate {
             id: entry,
             distance: entry_dist,
         }));
-
-        w.push(SearchCandidate {
-            id: entry,
-            distance: entry_dist,
-        });
-
+        if kept(entry) {
+            w.push(SearchCandidate {
+                id: entry,
+                distance: entry_dist,
+            });
+        }
         visited.insert(entry);
 
-        // Greedy search
         while let Some(Reverse(current)) = candidates.pop() {
-            // Defensive check: w should never be empty (entry point pushed above)
             if w.peek()
-                .map(|p| current.distance > p.distance)
-                .unwrap_or(false)
+                .is_some_and(|worst: &SearchCandidate| current.distance > worst.distance)
             {
                 break;
             }
@@ -510,44 +543,33 @@ impl VamanaIndex {
                 continue;
             }
 
-            let node = &graph[current.id as usize];
-            for &neighbor_id in &node.neighbors {
+            for &neighbor_id in &graph[current.id as usize].neighbors {
                 if !visited.insert(neighbor_id) {
                     continue;
                 }
+                let dist = distance(neighbor_id)?;
 
-                // Zero-copy slice access - no allocation per neighbor
-                let neighbor_slice = Self::get_slice_from_storage(&storage, neighbor_id)?;
-                let dist = self.distance(query, neighbor_slice);
-
-                // Defensive: check if closer than worst in w, or w not yet full
-                let should_add = w.len() < k || w.peek().map(|p| dist < p.distance).unwrap_or(true);
+                // Closer than the worst kept, or the kept list is not yet full
+                let should_add = w.len() < k || w.peek().is_some_and(|worst| dist < worst.distance);
                 if should_add {
                     candidates.push(Reverse(SearchCandidate {
                         id: neighbor_id,
                         distance: dist,
                     }));
-
-                    w.push(SearchCandidate {
-                        id: neighbor_id,
-                        distance: dist,
-                    });
-
-                    if w.len() > k {
-                        w.pop();
+                    if kept(neighbor_id) {
+                        w.push(SearchCandidate {
+                            id: neighbor_id,
+                            distance: dist,
+                        });
+                        if w.len() > k {
+                            w.pop();
+                        }
                     }
                 }
             }
         }
 
-        // Extract results
-        let mut results = Vec::new();
-        while let Some(candidate) = w.pop() {
-            results.push(candidate);
-        }
-        results.reverse();
-
-        Ok(results)
+        Ok(w.into_sorted_vec())
     }
 
     /// Robust prune (DiskANN's α-RNG rule): keep candidates nearest first, dropping any that a kept
@@ -614,6 +636,16 @@ impl VamanaIndex {
 
     /// Search for k nearest neighbors (excludes soft-deleted vectors)
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
+        self.search_with(query, k, VamanaSearchParams::default())
+    }
+
+    /// [`Self::search`] with per-search overrides of the index's sizing.
+    pub fn search_with(
+        &self,
+        query: &[f32],
+        k: usize,
+        params: VamanaSearchParams,
+    ) -> Result<Vec<(u32, f32)>> {
         let n = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
         if n == 0 || k == 0 {
             return Ok(Vec::new());
@@ -626,9 +658,10 @@ impl VamanaIndex {
                 self.config.dimension
             );
         }
+        let exact_search_max = params.exact_search_max.unwrap_or(self.exact_search_max);
         {
             let deleted = self.deleted_ids.read();
-            if n.saturating_sub(deleted.len()) <= self.exact_search_max {
+            if n.saturating_sub(deleted.len()) <= exact_search_max {
                 return self.exact_search(query, k, n, &deleted);
             }
         }
@@ -642,9 +675,20 @@ impl VamanaIndex {
 
         let entry = *self.medoid.read();
         let deleted = self.deleted_ids.read();
-        let deleted_count = deleted.len();
+
+        if let Some(beam_width) = params.beam_width {
+            // Deleted vectors route the walk without taking a slot, so the beam need not grow
+            // with them to return k live results.
+            let candidates = self.walk_f32(query, k.max(beam_width), entry, Some(&deleted))?;
+            return Ok(candidates
+                .into_iter()
+                .take(k)
+                .map(|c| (c.id, c.distance))
+                .collect());
+        }
 
         // Request extra candidates to account for deleted vectors
+        let deleted_count = deleted.len();
         let search_k = if deleted_count > 0 {
             k + deleted_count.min(k * 2)
         } else {
@@ -1788,6 +1832,53 @@ mod tests {
                     "query {i}, k {k}"
                 );
             }
+        }
+    }
+
+    /// Default parameters are `search`; `exact_search_max` overrides the index threshold either
+    /// way; a set beam returns k live results nearest first with deleted vectors only routing.
+    #[test]
+    fn search_params_override_the_sizing_and_default_changes_nothing() {
+        let vectors = clustered_unit_vectors(1500, 24, 15, 13);
+        let mut index = VamanaIndex::new(graph_config(24)).unwrap();
+        index.build(vectors.clone()).unwrap();
+        for id in (0..1500).step_by(3) {
+            index.mark_deleted(id);
+        }
+        let walk = VamanaSearchParams {
+            exact_search_max: Some(0),
+            ..Default::default()
+        };
+        let routed = VamanaSearchParams {
+            exact_search_max: Some(0),
+            beam_width: Some(16),
+        };
+        let queries: Vec<&Vec<f32>> = vectors.iter().step_by(97).collect();
+        let mut exact = Vec::new();
+        let mut walked = Vec::new();
+        for q in &queries {
+            let default = index.search(q, 10).unwrap();
+            assert_eq!(
+                index
+                    .search_with(q, 10, VamanaSearchParams::default())
+                    .unwrap(),
+                default
+            );
+            exact.push(default);
+            walked.push(index.search_with(q, 10, walk).unwrap());
+            let hits = index.search_with(q, 10, routed).unwrap();
+            assert_eq!(hits.len(), 10);
+            assert!(hits.iter().all(|(id, _)| !index.is_deleted(*id)));
+            assert!(hits.windows(2).all(|w| w[0].1 <= w[1].1));
+        }
+        index.set_exact_search_max(0);
+        let everything = VamanaSearchParams {
+            exact_search_max: Some(usize::MAX),
+            ..Default::default()
+        };
+        for (i, q) in queries.iter().enumerate() {
+            assert_eq!(index.search(q, 10).unwrap(), walked[i]);
+            assert_eq!(index.search_with(q, 10, everything).unwrap(), exact[i]);
         }
     }
 
