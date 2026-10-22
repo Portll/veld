@@ -237,6 +237,98 @@ fn dot_product_scalar_inline(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // =============================================================================
+// INT8 DOT PRODUCT
+// =============================================================================
+
+/// Integer dot product of two int8 vectors, over their common length. Exact on every kernel,
+/// so a walk over int8 codes visits the same nodes on every machine.
+#[inline(always)]
+pub fn dot_i8_inline(a: &[i8], b: &[i8]) -> i32 {
+    let len = a.len().min(b.len());
+    let (a, b) = (&a[..len], &b[..len]);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86_avx2_fma() {
+            // SAFETY: the CPU reports AVX2, the feature the kernel is compiled with, and both
+            // slices have length `len`.
+            return unsafe { dot_i8_avx2(a, b) };
+        }
+        dot_i8_scalar(a, b)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[cfg(target_feature = "neon")]
+        // SAFETY: NEON is enabled for this target and both slices have length `len`.
+        unsafe {
+            dot_i8_neon(a, b)
+        }
+
+        #[cfg(not(target_feature = "neon"))]
+        {
+            dot_i8_scalar(a, b)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        dot_i8_scalar(a, b)
+    }
+}
+
+/// AVX2 int8 dot product: widen 16 bytes to i16, multiply-add pairs into i32 lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
+    let len = a.len();
+    let simd_len = len & !15;
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i < simd_len {
+        let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(a.as_ptr().add(i) as *const __m128i));
+        let vb = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.as_ptr().add(i) as *const __m128i));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va, vb));
+        i += 16;
+    }
+    let lanes = std::mem::transmute::<__m256i, [i32; 8]>(acc);
+    let mut sum: i32 = lanes.iter().sum();
+    for j in simd_len..len {
+        sum += a[j] as i32 * b[j] as i32;
+    }
+    sum
+}
+
+/// NEON int8 dot product: widening multiplies into i16, pairwise-accumulated into i32 lanes.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn dot_i8_neon(a: &[i8], b: &[i8]) -> i32 {
+    let len = a.len();
+    let simd_len = len & !15;
+    let mut acc = vdupq_n_s32(0);
+    let mut i = 0;
+    while i < simd_len {
+        let va = vld1q_s8(a.as_ptr().add(i));
+        let vb = vld1q_s8(b.as_ptr().add(i));
+        acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(va), vget_low_s8(vb)));
+        acc = vpadalq_s16(acc, vmull_high_s8(va, vb));
+        i += 16;
+    }
+    let mut sum = vaddvq_s32(acc);
+    for j in simd_len..len {
+        sum += a[j] as i32 * b[j] as i32;
+    }
+    sum
+}
+
+#[inline(always)]
+fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
+    a.iter().zip(b).map(|(&x, &y)| x as i32 * y as i32).sum()
+}
+
+// =============================================================================
 // EUCLIDEAN DISTANCE
 // =============================================================================
 
@@ -710,6 +802,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_dispatched_int8_kernel_is_exact() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(29);
+        for len in (0..=48).chain([63, 64, 65, 384, 768, 1024]) {
+            let a: Vec<i8> = (0..len).map(|_| rng.gen_range(-127..=127)).collect();
+            let b: Vec<i8> = (0..len).map(|_| rng.gen_range(-127..=127)).collect();
+            assert_eq!(dot_i8_inline(&a, &b), dot_i8_scalar(&a, &b), "len {len}");
+        }
+        let extreme = vec![-127i8; 1024];
+        assert_eq!(dot_i8_inline(&extreme, &extreme), 1024 * 127 * 127);
+        assert_eq!(dot_i8_inline(&extreme, &[127i8; 1024]), -1024 * 127 * 127);
+        assert_eq!(dot_i8_inline(&[3, 4, 5], &[2, 2]), 14, "the common length");
     }
 
     #[test]

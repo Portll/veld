@@ -36,6 +36,20 @@ pub(crate) const MAPPINGS_MARKER_FILE: &str = "mappings.authoritative";
 /// Filename for persisted secondary Vamana index
 const SECONDARY_VAMANA_INDEX_FILE: &str = "secondary_vamana.idx";
 
+/// Whether this process walks its Vamana graphs on int8 codes (`VELD_VECTOR_INT8_TRAVERSAL`),
+/// rescoring each walk's beam in f32. Off unless set to 1/true/on/yes. Read when an index is
+/// created or loaded: the codes are built then.
+fn int8_traversal_enabled() -> bool {
+    std::env::var("VELD_VECTOR_INT8_TRAVERSAL")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Multi-modal retrieval engine with production vector search
 ///
 /// # Lock Ordering (SHO-72)
@@ -249,6 +263,7 @@ impl RetrievalEngine {
             search_list_size: 100, // 2x for better accuracy with 10M vectors
             alpha: 1.2,
             use_mmap: true, // Memory-mapped: OS manages paging, RSS stays low at scale
+            quantized_traversal: int8_traversal_enabled(),
             ..Default::default()
         };
 
@@ -267,6 +282,7 @@ impl RetrievalEngine {
                     search_list_size: 100,
                     alpha: 1.2,
                     use_mmap: true, // mmap by default for secondary to control memory footprint
+                    quantized_traversal: int8_traversal_enabled(),
                     ..Default::default()
                 };
                 let sec_storage = storage_path.join("secondary_vector_index");
@@ -621,6 +637,7 @@ impl RetrievalEngine {
 
                     // If mapping count matches loaded vectors, use the fast path
                     if mapped == loaded_count {
+                        loaded_index.set_quantized_traversal(int8_traversal_enabled());
                         *sec_index.write() = loaded_index;
                         *sec_mapping.write() = rebuilt_map;
                         info!(
@@ -779,6 +796,7 @@ impl RetrievalEngine {
 
         // Persistence stores a construction default; recall searches with the runtime list size.
         loaded_index.config.search_list_size = 100;
+        loaded_index.set_quantized_traversal(int8_traversal_enabled());
         let needs_compaction = loaded_index.needs_compaction();
         {
             let mut index = self.vector_index.write();

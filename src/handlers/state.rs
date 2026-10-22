@@ -2383,6 +2383,7 @@ impl MultiUserMemoryManager {
                     alpha: 1.2,
                     use_mmap: true,
                     distance_metric: crate::vector_db::DistanceMetric::default(),
+                    quantized_traversal: false,
                 },
             };
             vamana_projections.push(crate::vector_db::VamanaProjection::lazy(

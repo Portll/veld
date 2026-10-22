@@ -152,6 +152,7 @@ mod tests {
             alpha: 1.2,
             use_mmap: false,
             distance_metric: DistanceMetric::Cosine,
+            quantized_traversal: false,
         };
         let mut index = VamanaIndex::new(cfg).expect("new index");
         // Three nearly-orthogonal vectors so cosine scores are distinct.
@@ -254,6 +255,7 @@ mod tests {
             alpha: 1.2,
             use_mmap: false,
             distance_metric: DistanceMetric::Cosine,
+            quantized_traversal: false,
         };
         let mut index = VamanaIndex::new(cfg).expect("new index");
         index

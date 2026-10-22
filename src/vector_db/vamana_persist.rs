@@ -515,6 +515,7 @@ impl VamanaIndex {
             dimension,
             use_mmap: false, // A rebuild of a loaded index keeps its vectors on the heap
             distance_metric: header.distance_metric_enum(),
+            quantized_traversal: false, // Callers opt in with set_quantized_traversal
         };
 
         let index = VamanaIndex {

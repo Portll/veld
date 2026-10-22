@@ -956,6 +956,7 @@ mod tests {
             // requires a storage path which makes test cleanup noisy.
             use_mmap: false,
             distance_metric: DistanceMetric::Cosine,
+            quantized_traversal: false,
         }
     }
 
@@ -1370,6 +1371,7 @@ mod tests {
                 alpha: 1.2,
                 use_mmap: false,
                 distance_metric: DistanceMetric::Cosine,
+                quantized_traversal: false,
             };
             let index = Arc::new(RwLock::new(VamanaIndex::new(config).unwrap()));
             let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
