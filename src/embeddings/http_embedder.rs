@@ -551,11 +551,35 @@ impl Embedder for HttpEmbedder {
     }
 
     fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        // A text longer than the window is embedded in pieces, so the batch goes one by one.
-        if texts.iter().any(|t| !self.fits(&self.document_text(t))) {
-            return texts.iter().map(|t| self.encode(t)).collect();
+        // A text longer than the window is embedded in pieces on its own; the rest still go
+        // to the server as one batch.
+        let (fitting, oversized): (Vec<usize>, Vec<usize>) =
+            (0..texts.len()).partition(|&i| self.fits(&self.document_text(texts[i])));
+        if oversized.is_empty() {
+            return self.encode_fitting_batch(texts);
         }
-        // Use batch endpoint if available
+        let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        for &i in &oversized {
+            embeddings[i] = Some(self.encode(texts[i])?);
+        }
+        let batch: Vec<&str> = fitting.iter().map(|&i| texts[i]).collect();
+        for (&i, embedding) in fitting.iter().zip(self.encode_fitting_batch(&batch)?) {
+            embeddings[i] = Some(embedding);
+        }
+        embeddings
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .context("a text in the batch was left without an embedding")
+    }
+}
+
+impl HttpEmbedder {
+    /// `texts`, each within the model's window, in one request; one by one when the server
+    /// refuses the batch or answers it with the wrong count.
+    fn encode_fitting_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         let prefixed: Vec<std::borrow::Cow<'_, str>> =
             texts.iter().map(|t| self.document_text(t)).collect();
         let req = BatchEmbeddingRequest {
@@ -584,6 +608,7 @@ impl Embedder for HttpEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn the_remote_embedder_opt_in_does_not_depend_on_enforce_https() {
@@ -660,6 +685,115 @@ mod tests {
         assert!(!e.fits(&"a ".repeat(3000)), "6000 bytes may be 3000 tokens");
         let unlimited = HttpEmbedder::new(cfg("some-other-model"));
         assert!(unlimited.fits(&"a ".repeat(100_000)));
+    }
+
+    /// A local stand-in for an embedding server: `/tokenize` is missing, as on LM Studio, and
+    /// `/v1/embeddings` answers each input with `[input bytes, 1]`. Returns its URL and every
+    /// `input` it was sent, in order.
+    fn embedding_server() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let seen = inputs.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    loop {
+                        let mut request_line = String::new();
+                        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut length = 0usize;
+                        loop {
+                            let mut header = String::new();
+                            reader.read_line(&mut header).unwrap();
+                            let header = header.trim_end();
+                            if header.is_empty() {
+                                break;
+                            }
+                            if let Some((name, value)) = header.split_once(':') {
+                                if name.eq_ignore_ascii_case("content-length") {
+                                    length = value.trim().parse().unwrap();
+                                }
+                            }
+                        }
+                        let mut body = vec![0u8; length];
+                        reader.read_exact(&mut body).unwrap();
+                        let (status, reply) = if request_line.contains("/v1/embeddings") {
+                            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            let input = request["input"].clone();
+                            let texts: Vec<String> = match &input {
+                                serde_json::Value::Array(items) => items
+                                    .iter()
+                                    .map(|t| t.as_str().unwrap().to_string())
+                                    .collect(),
+                                other => vec![other.as_str().unwrap().to_string()],
+                            };
+                            seen.lock().unwrap().push(input);
+                            let data: Vec<serde_json::Value> = texts
+                                .iter()
+                                .map(|t| serde_json::json!({ "embedding": [t.len() as f32, 1.0] }))
+                                .collect();
+                            ("200 OK", serde_json::json!({ "data": data }).to_string())
+                        } else {
+                            ("404 Not Found", String::new())
+                        };
+                        write!(
+                            writer,
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .unwrap();
+                        writer.flush().unwrap();
+                    }
+                });
+            }
+        });
+        (url, inputs)
+    }
+
+    /// One text past the window is embedded in pieces by itself; the texts that fit still go to
+    /// the server together, in one request, and every embedding lands at its text's position.
+    #[test]
+    fn an_oversized_text_leaves_the_rest_of_the_batch_whole() {
+        let (url, inputs) = embedding_server();
+        let e = HttpEmbedder::new(HttpEmbedderConfig {
+            base_url: url,
+            timeout_ms: 10_000,
+            ..cfg("text-embedding-nomic-embed-text-v1.5")
+        });
+        let long = "word ".repeat(2000);
+        let texts = ["alpha", long.as_str(), "beta gamma"];
+        let embeddings = e.encode_batch(&texts).unwrap();
+
+        assert_eq!(embeddings.len(), 3);
+        assert_eq!(
+            embeddings[0],
+            vec!["search_document: alpha".len() as f32, 1.0]
+        );
+        assert_eq!(
+            embeddings[2],
+            vec!["search_document: beta gamma".len() as f32, 1.0]
+        );
+        let norm = embeddings[1].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "the pieces' mean is unit length");
+
+        let inputs = inputs.lock().unwrap();
+        let batches: Vec<&serde_json::Value> = inputs.iter().filter(|i| i.is_array()).collect();
+        assert_eq!(
+            batches,
+            vec![&serde_json::json!([
+                "search_document: alpha",
+                "search_document: beta gamma"
+            ])]
+        );
+        let pieces = inputs.iter().filter(|i| i.is_string()).count();
+        assert!(pieces >= 2, "the long text went in {pieces} piece(s)");
     }
 
     #[test]
