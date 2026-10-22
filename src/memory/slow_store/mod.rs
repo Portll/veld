@@ -300,6 +300,9 @@ pub struct SlowStore {
     sync_in_flight: AtomicBool,
     /// When the last mirror rebuild finished (successfully or not).
     last_sync: Mutex<Option<std::time::Instant>>,
+    /// The last Voronoi analysis of this store's mirror, see
+    /// [`VoronoiAnalyzer::analyze`](crate::memory::voronoi::VoronoiAnalyzer::analyze).
+    pub(crate) voronoi_cache: crate::memory::voronoi::VoronoiCache,
 }
 
 /// Exclusive right to rebuild a store's graph mirror, from
@@ -459,6 +462,7 @@ impl SlowStore {
             mirror_conn: Mutex::new(None),
             sync_in_flight: AtomicBool::new(false),
             last_sync: Mutex::new(None),
+            voronoi_cache: Default::default(),
         };
         store.create_schema()?;
         store.check_schema_version()?;
@@ -691,6 +695,15 @@ impl SlowStore {
     /// True until the first mirror rebuild starts.
     pub fn never_synced(&self) -> bool {
         self.last_sync.lock().is_none()
+    }
+
+    /// When the graph mirror last changed, `None` before the first rebuild. A
+    /// rebuild stamps this as it starts and again after the new mirror is
+    /// swapped in, and the mirror changes no other way, so a result derived from
+    /// the mirror stays valid while this is unchanged, provided the stamp was
+    /// read before the rows were.
+    pub fn last_sync(&self) -> Option<std::time::Instant> {
+        *self.last_sync.lock()
     }
 
     /// Rebuild the entity/edge mirror from a full graph snapshot, unless a
@@ -1138,6 +1151,90 @@ mod tests {
         assert!(store.get_adjacency_list(0.0).unwrap().is_empty());
         assert!(store.load_all_edge_pairs().unwrap().is_empty());
         assert!(store.get_active_thoughts(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn embedding_sample_ignores_row_order() {
+        let entities: Vec<EntityNode> = (0..40)
+            .map(|i| {
+                let mut entity = test_entity(&format!("e{i}"));
+                entity.name_embedding = Some(vec![i as f32, 1.0, -0.5]);
+                entity
+            })
+            .collect();
+        let reversed: Vec<EntityNode> = entities.iter().rev().cloned().collect();
+        let (tmp_a, tmp_b) = (NamedTempFile::new().unwrap(), NamedTempFile::new().unwrap());
+        let forward = SlowStore::open(tmp_a.path()).unwrap();
+        let backward = SlowStore::open(tmp_b.path()).unwrap();
+        forward.sync_from_graph(&entities, &[]).unwrap();
+        backward.sync_from_graph(&reversed, &[]).unwrap();
+
+        let sample = forward.sample_embeddings(10, 7).unwrap();
+        assert_eq!(sample, backward.sample_embeddings(10, 7).unwrap());
+
+        // The ten lowest keys, in uuid order.
+        let mut keyed: Vec<(u64, String)> = entities
+            .iter()
+            .map(|e| {
+                let uuid = e.uuid.to_string();
+                (embeddings::sample_key(&uuid, 7), uuid)
+            })
+            .collect();
+        keyed.sort();
+        let mut expected: Vec<String> = keyed[..10].iter().map(|(_, u)| u.clone()).collect();
+        expected.sort();
+        let got: Vec<String> = sample.iter().map(|(u, _, _)| u.clone()).collect();
+        assert_eq!(got, expected);
+
+        // At or above the row count, every row comes back.
+        let mut all = forward.load_all_embeddings().unwrap();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(forward.sample_embeddings(40, 7).unwrap(), all);
+        assert_eq!(forward.sample_embeddings(1000, 7).unwrap(), all);
+        assert!(forward.sample_embeddings(0, 7).unwrap().is_empty());
+    }
+
+    #[test]
+    fn voronoi_analysis_is_reused_until_the_mirror_is_rebuilt() {
+        use crate::memory::voronoi::{VoronoiAnalyzer, VoronoiConfig};
+        use std::sync::Arc;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+        let entities: Vec<EntityNode> = (0..6)
+            .map(|i| {
+                let mut entity = test_entity(&format!("e{i}"));
+                let angle = i as f32;
+                entity.name_embedding = Some(vec![angle.cos(), angle.sin(), 0.5]);
+                entity
+            })
+            .collect();
+        let config = VoronoiConfig {
+            k: 3,
+            ..Default::default()
+        };
+
+        // Never synced: nothing says when the rows last changed, so nothing is kept.
+        let unsynced = VoronoiAnalyzer::analyze(&store, &config).unwrap();
+        let again = VoronoiAnalyzer::analyze(&store, &config).unwrap();
+        assert!(!Arc::ptr_eq(&unsynced, &again));
+
+        store.sync_from_graph(&entities, &[]).unwrap();
+        let first = VoronoiAnalyzer::analyze(&store, &config).unwrap();
+        assert_eq!(first.stats.entity_count, 6);
+        let again = VoronoiAnalyzer::analyze(&store, &config).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+
+        let other = VoronoiConfig {
+            k: 2,
+            ..config.clone()
+        };
+        let with_other = VoronoiAnalyzer::analyze(&store, &other).unwrap();
+        assert!(!Arc::ptr_eq(&first, &with_other));
+
+        store.sync_from_graph(&entities[..5], &[]).unwrap();
+        let rebuilt = VoronoiAnalyzer::analyze(&store, &config).unwrap();
+        assert_eq!(rebuilt.stats.entity_count, 5);
     }
 
     #[test]
