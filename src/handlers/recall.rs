@@ -36,6 +36,9 @@ use crate::relevance;
 use crate::user_memory::SharedUserMemory;
 use crate::validation;
 
+/// Tag on every record proactive_context auto-ingests; the anti-echo filter keys on it.
+const AUTO_CAPTURED_TAG: &str = "auto-captured";
+
 /// Append one row to the recall event log without holding up the response. A failed write is
 /// logged; the log's horizon and count are what a reader sees, never a fabricated row.
 fn log_recall_event(
@@ -267,7 +270,8 @@ pub struct ProactiveContextRequest {
     pub context: String,
     #[serde(default = "default_proactive_max_results")]
     pub max_results: usize,
-    /// Minimum semantic similarity threshold (0.0-1.0)
+    /// Minimum score (0.0-1.0) on the response's normalised scale, where the top
+    /// result scores 0.95
     #[serde(default = "default_semantic_threshold")]
     pub semantic_threshold: f32,
     /// Weight for entity matching in relevance scoring
@@ -331,7 +335,7 @@ fn default_proactive_max_results() -> usize {
 }
 
 fn default_semantic_threshold() -> f32 {
-    0.05 // Minimum absolute score for quality gate on composite pipeline scores
+    0.05 // On the normalised scale; the 30%-of-top floor binds below 0.285
 }
 
 fn default_entity_weight() -> f32 {
@@ -1837,10 +1841,16 @@ pub async fn proactive_context(
                     if alpha_count < 10 {
                         return false;
                     }
-                    // Anti-echo: skip memories that are just our own context echoed back
-                    // (auto-ingest stores context, which then gets retrieved for itself)
+                    // Anti-echo: auto-ingest stores the context, which would then be
+                    // retrieved for itself. Only auto-captured records can be such an echo;
+                    // an explicit memory that shares the context's words is a real match.
                     // Uses inline comparison to avoid allocating a HashSet<String> per candidate
-                    if !query_words.is_empty() {
+                    let auto_captured = m
+                        .experience
+                        .tags
+                        .iter()
+                        .any(|tag| tag.eq_ignore_ascii_case(AUTO_CAPTURED_TAG));
+                    if auto_captured && !query_words.is_empty() {
                         let mut mem_word_count = 0usize;
                         let mut overlap = 0usize;
                         for w in content.split_whitespace() {
@@ -1923,20 +1933,22 @@ pub async fn proactive_context(
             // Sort by boosted score (highest first), id as the tie-break so the order is repeatable
             enriched.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
 
-            // Drop results below minimum absolute score — don't pad with irrelevant filler
-            // Also drop results that are < 30% of the top score (too weak relative to best)
+            // Normalise before the threshold: raw pipeline scores are often tiny after
+            // recency decay, and semantic_threshold is documented on the scale the
+            // response reports, where the top result scores 0.95.
             let top_score = enriched.first().map(|(_, s, _)| *s).unwrap_or(0.0);
-            let abs_min = semantic_threshold;
-            let relative_min = top_score * 0.30;
-            let effective_min = abs_min.max(relative_min);
-            enriched.retain(|(_, s, _)| *s >= effective_min);
-
-            // Normalize scores for display: scale relative to top result
             if top_score > 0.0 {
                 for (_, score, _) in enriched.iter_mut() {
                     *score = (*score / top_score) * 0.95;
                 }
             }
+
+            // Drop results below the threshold — don't pad with irrelevant filler — and
+            // results under 30% of the top score (too weak relative to the best).
+            let top_normalized_score = if top_score > 0.0 { 0.95 } else { 0.0 };
+            let relative_min = top_normalized_score * 0.30;
+            let effective_min = semantic_threshold.max(relative_min);
+            enriched.retain(|(_, s, _)| *s >= effective_min);
 
             // Return top results with entity overlap annotation
             let out = enriched
@@ -2136,7 +2148,7 @@ pub async fn proactive_context(
                                 entities: segment.entities,
                                 tags: vec![
                                     "assistant-response".to_string(),
-                                    "auto-captured".to_string(),
+                                    AUTO_CAPTURED_TAG.to_string(),
                                 ],
                                 context: response_repo.clone().map(|slug| {
                                     let mut ctx =
@@ -2234,7 +2246,7 @@ pub async fn proactive_context(
                         content: segment.content,
                         experience_type: segment.experience_type,
                         entities: segment.entities,
-                        tags: vec!["auto-captured".to_string()],
+                        tags: vec![AUTO_CAPTURED_TAG.to_string()],
                         context,
                         ..Default::default()
                     };
