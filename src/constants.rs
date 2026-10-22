@@ -2392,12 +2392,13 @@ pub const SEMANTIC_CLUSTER_THRESHOLD: f32 = 0.75;
 /// - Longer windows would merge unrelated sessions
 pub const TEMPORAL_CLUSTER_WINDOW_SECS: i64 = 1800;
 
-/// Additive RRF boost for memories whose IDs appear in temporal fact matches.
+/// Boost for memories whose IDs appear in temporal fact matches, as a share of the top
+/// fused score.
 ///
 /// Applied in Layer 4.55 when the query has temporal intent and
 /// TemporalFactStore returns facts whose `source_memory_id` matches a
-/// candidate.  0.20 is calibrated to lift temporal-source memories by ~2
-/// RRF positions without overriding strong semantic matches.
+/// candidate. On one RRF leg at k = 20 a 0.20 share lifts a rank-10 memory to between
+/// ranks 3 and 4; a boosted memory from rank 7 or lower stays under an unboosted rank 1.
 pub const TEMPORAL_RECALL_BOOST: f32 = 0.20;
 
 /// Minimum inter-memory gap (seconds) marking a session boundary.

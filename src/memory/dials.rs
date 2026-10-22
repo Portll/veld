@@ -187,7 +187,7 @@ pub struct CognitiveDials {
     /// and `constants::CE_BLEND_*` decide. See `ce_share`.
     #[serde(default)]
     pub ce_blend: Option<f32>,
-    /// Temporal-fact source-memory boost. Default 0.20.
+    /// Temporal-fact source-memory boost, as a share of the top fused score. Default 0.20.
     #[serde(default)]
     pub temporal_recall_boost: Option<f32>,
     /// Cross-encoder share for one query shape; each overrides its `constants::CE_BLEND_*`
@@ -259,7 +259,8 @@ pub struct CognitiveDials {
     /// `bm25_specificity_discount`, `episode_tcm`, `confidence_gate`,
     /// `content_fallback`, `mmr`, `ordinal_cliff`, `arousal`,
     /// `valence_credibility`, `session_continuity`, `hebbian`, `query_coverage`,
-    /// `people_density`, `prf`.
+    /// `people_density`, `prf`, `entity_overlap`, `length_penalty`,
+    /// `temporal_topic_dedup`, `temporal_fact_boost`.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
 }
@@ -984,6 +985,10 @@ mod tests {
             "query_coverage",
             "people_density",
             "prf",
+            "entity_overlap",
+            "length_penalty",
+            "temporal_topic_dedup",
+            "temporal_fact_boost",
         ];
         for id in &all_ids {
             assert!(
