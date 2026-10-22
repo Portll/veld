@@ -2352,7 +2352,8 @@ impl MemorySystem {
                                 self.retriever.get_from_storage(id).ok().map(|m| {
                                     (
                                         id.0.to_string(),
-                                        *similarity,
+                                        // Interference's bars are MiniLM-tuned; read on that scale.
+                                        crate::similarity::scale::to_reference(*similarity),
                                         m.importance(),
                                         m.created_at,
                                         m.experience.content.chars().take(50).collect::<String>(),

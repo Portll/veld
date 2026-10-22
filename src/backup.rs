@@ -155,6 +155,20 @@ pub struct IntentLogBackupSpec {
 }
 
 impl IntentLogBackupSpec {
+    /// Whether the file `file_name` in `source_dir` belongs in the archive:
+    /// any file of the journal (its head or a sealed segment), or a file the
+    /// spec names. A segment's cached backup record never does.
+    pub fn includes(&self, file_name: &str) -> bool {
+        if file_name.ends_with(SEGMENT_RECORD_SUFFIX) {
+            return false;
+        }
+        crate::intent_log::is_log_file(&self.log_filename, file_name)
+            || self
+                .only_files
+                .as_ref()
+                .is_none_or(|only| only.iter().any(|n| n == file_name))
+    }
+
     /// Build a spec from `source_dir` with the conventional log filename
     /// (`intent.log`), copying every plain file in the directory. For
     /// tests and call sites that want full control, construct the struct
@@ -512,11 +526,7 @@ impl VeldBackupEngine {
                 return Err(e);
             }
         };
-        let journal_cut_lsn = files
-            .iter()
-            .find(|f| f.name == spec.log_filename)
-            .and_then(|f| f.lsn_range)
-            .map(|(_, hi)| hi);
+        let journal_cut_lsn = journal_cut_lsn(spec, &files);
 
         Ok(StagedIntentLog {
             staging_dir,
@@ -606,7 +616,70 @@ impl VeldBackupEngine {
     }
 }
 
+/// The highest LSN the captured journal files hold: the backup's
+/// consistency cut. A head just rotated holds no frame, so every file of the
+/// journal counts, not the head alone.
+pub(crate) fn journal_cut_lsn(
+    spec: &IntentLogBackupSpec,
+    files: &[IntentLogFileMeta],
+) -> Option<u64> {
+    files
+        .iter()
+        .filter(|f| crate::intent_log::is_log_file(&spec.log_filename, &f.name))
+        .filter_map(|f| f.lsn_range)
+        .map(|(_, hi)| hi)
+        .max()
+}
+
+/// Suffix of the file beside a sealed segment that caches its backup record
+/// (digest, size, LSN range): the segment never changes, so a backup hashes
+/// and scans it once rather than on every run.
+const SEGMENT_RECORD_SUFFIX: &str = ".backup.json";
+
+fn segment_record_path(segment: &Path) -> PathBuf {
+    let mut os = segment.as_os_str().to_os_string();
+    os.push(SEGMENT_RECORD_SUFFIX);
+    PathBuf::from(os)
+}
+
+/// The backup record of sealed segment `path`, from its cache when the cache
+/// describes a file of the segment's current size; otherwise hashed and
+/// scanned, and cached for the next backup (best effort).
+fn sealed_segment_meta(path: &Path, name: &str) -> Result<IntentLogFileMeta> {
+    let size = fs::metadata(path)?.len();
+    let record = segment_record_path(path);
+    if let Some(cached) = fs::read(&record)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<IntentLogFileMeta>(&bytes).ok())
+        .filter(|meta| meta.name == name && meta.size_bytes == size)
+    {
+        return Ok(cached);
+    }
+    let mut hasher = Sha256::new();
+    let size_bytes = std::io::copy(&mut fs::File::open(path)?, &mut hasher)?;
+    let meta = IntentLogFileMeta {
+        name: name.to_string(),
+        sha256: format!("{:x}", hasher.finalize()),
+        size_bytes,
+        lsn_range: scan_lsn_range(path)
+            .with_context(|| format!("failed to scan LSN range for intent log {path:?}"))?,
+    };
+    match serde_json::to_vec(&meta) {
+        Ok(bytes) => {
+            if let Err(e) = fs::write(&record, bytes) {
+                tracing::debug!(segment = %path.display(), error = %e, "backup record of a sealed segment not cached");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "backup record of a sealed segment not encoded"),
+    }
+    Ok(meta)
+}
+
 /// The intent-log capture both backends' backups share: copy, hash and LSN-scan.
+/// A sealed segment is never written again, so it is hard-linked into the
+/// archive (copied where the filesystem cannot link) and its digest comes
+/// from its cached record: the work a capture does, under the journal lock,
+/// is proportional to the head, not to the whole log.
 pub(crate) fn copy_intent_log_files(
     spec: &IntentLogBackupSpec,
     target_dir: &Path,
@@ -623,6 +696,7 @@ pub(crate) fn copy_intent_log_files(
         .filter_map(|e| e.ok())
         .collect();
     entries.sort_by_key(|e| e.file_name());
+    fs::create_dir_all(target_dir)?;
 
     for entry in entries {
         let path = entry.path();
@@ -630,18 +704,30 @@ pub(crate) fn copy_intent_log_files(
             continue;
         }
         let file_name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(only) = &spec.only_files {
-            if !only.iter().any(|n| n == &file_name) {
-                continue;
-            }
+        if !spec.includes(&file_name) {
+            continue;
         }
         let dst = target_dir.join(&file_name);
+
+        if crate::intent_log::segment_base(&spec.log_filename, &file_name).is_some() {
+            let meta = sealed_segment_meta(&path, &file_name)?;
+            if fs::hard_link(&path, &dst).is_err() {
+                let (sha256, size_bytes) = copy_and_hash(&path, &dst)?;
+                if sha256 != meta.sha256 || size_bytes != meta.size_bytes {
+                    anyhow::bail!(
+                        "sealed intent log segment {path:?} no longer matches its backup record"
+                    );
+                }
+            }
+            metas.push(meta);
+            continue;
+        }
 
         // Stream-copy + hash + size so a huge log doesn't load fully
         // into memory.
         let (sha256, size_bytes) = copy_and_hash(&path, &dst)?;
 
-        // For the main journal file, scan for the LSN range so PITR
+        // For the head of the journal, scan for the LSN range so PITR
         // can decide whether the operator-requested LSN is in range.
         let lsn_range = if file_name == spec.log_filename {
             scan_lsn_range(&dst)
@@ -996,7 +1082,33 @@ impl VeldBackupEngine {
         // the memory store just restored; only those files are replaced.
         match &target.only_files {
             Some(files) => {
-                let pairs: Vec<(PathBuf, PathBuf)> = files
+                // The journal's files as the archive holds them, and the live
+                // segments it does not: those were sealed after the backup and
+                // go aside with the head they belonged to.
+                let archived: std::collections::BTreeSet<String> = metadata
+                    .intent_log_files
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect();
+                let later_segments: Vec<String> = crate::intent_log::sealed_segments(
+                    &target.source_dir.join(&target.log_filename),
+                )?
+                .iter()
+                .filter_map(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .filter(|name| !archived.contains(name))
+                .collect();
+                let names: std::collections::BTreeSet<String> = files
+                    .iter()
+                    .cloned()
+                    .chain(archived.iter().cloned())
+                    .chain(later_segments.iter().cloned())
+                    .chain(
+                        later_segments
+                            .iter()
+                            .map(|name| format!("{name}{SEGMENT_RECORD_SUFFIX}")),
+                    )
+                    .collect();
+                let pairs: Vec<(PathBuf, PathBuf)> = names
                     .iter()
                     .map(|f| (staging.join(f), target.source_dir.join(f)))
                     .collect();
@@ -2396,6 +2508,102 @@ mod tests {
         assert_eq!(lsns, vec![0, 1], "the journal is truncated to max_lsn");
         assert!(!temp_dir.path().join("tenant.restore_tmp").exists());
         assert!(!user_dir.join("intent.log.pre_restore").exists());
+    }
+
+    fn append_synced(log: &mut IntentLog, frames: u64) {
+        for _ in 0..frames {
+            let lsn = log.next_lsn().0;
+            log.append(format!("frame-{lsn}").as_bytes()).unwrap();
+            log.sync().unwrap();
+        }
+    }
+
+    /// A rotated journal is captured whole: its sealed segments hard-linked
+    /// (their record cached for the next backup), the head copied, the cut at
+    /// the last frame. A restore puts back exactly those files; a segment
+    /// sealed after the backup goes aside with the head it followed.
+    #[test]
+    fn a_rotated_journal_round_trips_and_later_segments_leave_on_restore() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let user_dir = temp_dir.path().join("tenant");
+        let db_path = user_dir.join("storage");
+        let user_id = "rotated";
+
+        let db = open_db_with_user_auth(&db_path);
+        let head = user_dir.join("intent.log");
+        let mut log = IntentLog::open(&head).unwrap();
+        log.set_segment_bytes(Some(100));
+        append_synced(&mut log, 12);
+        let sealed_at_backup: Vec<PathBuf> = log.sealed().iter().map(|s| s.path.clone()).collect();
+        assert!(sealed_at_backup.len() >= 2, "{sealed_at_backup:?}");
+        fs::write(user_dir.join("projection_checkpoints.bin"), b"checkpoints").unwrap();
+
+        let spec = IntentLogBackupSpec::per_user(user_dir.clone());
+        let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
+        let metadata = engine
+            .create_comprehensive_backup_with_intent_log(&db, user_id, &[], None, Some(&spec))
+            .unwrap();
+        drop(db);
+
+        assert_eq!(metadata.journal_cut_lsn, Some(11));
+        let archive = backup_root
+            .join(user_id)
+            .join(format!("intent_log_{}", metadata.backup_id));
+        for sealed in &sealed_at_backup {
+            let archived = archive.join(sealed.file_name().unwrap());
+            assert!(archived.exists(), "{archived:?}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    fs::metadata(sealed).unwrap().ino(),
+                    fs::metadata(&archived).unwrap().ino(),
+                    "a sealed segment is hard-linked, not copied"
+                );
+            }
+            assert!(segment_record_path(sealed).exists(), "its record is cached");
+            assert!(
+                !segment_record_path(&archived).exists(),
+                "the cache stays out of the archive"
+            );
+        }
+        assert!(engine.verify_backup(user_id, metadata.backup_id).unwrap());
+
+        append_synced(&mut log, 12);
+        assert!(log.sealed().len() > sealed_at_backup.len());
+        drop(log);
+
+        engine
+            .restore_comprehensive_backup_with_intent_log(
+                user_id,
+                Some(metadata.backup_id),
+                &db_path,
+                &[],
+                Some(&spec),
+                &RestoreOptions::default(),
+            )
+            .unwrap();
+
+        let restored = IntentLog::open(&head).unwrap();
+        let lsns: Vec<u64> = restored.iter().unwrap().map(|r| r.unwrap().lsn.0).collect();
+        assert_eq!(lsns, (0..12).collect::<Vec<_>>());
+        assert_eq!(restored.next_lsn(), Lsn(12));
+        let sealed_now: Vec<PathBuf> = restored.sealed().iter().map(|s| s.path.clone()).collect();
+        assert_eq!(sealed_now, sealed_at_backup);
+        let leftovers: Vec<String> = fs::read_dir(&user_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                n.ends_with(".pre_restore")
+                    || n.ends_with(SEGMENT_RECORD_SUFFIX)
+                        && !sealed_at_backup
+                            .iter()
+                            .any(|s| n.starts_with(&*s.file_name().unwrap().to_string_lossy()))
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
