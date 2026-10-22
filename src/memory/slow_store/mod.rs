@@ -16,31 +16,43 @@
 //!
 //! The `entities`/`edges` mirror shares its file with the intent-log
 //! projection (`memories`), which writes on every remember inside the
-//! tenant's journal mutex. A rebuild therefore never touches the
-//! projection's connection: it runs on its own writer connection, fills
-//! `entities_shadow`/`edges_shadow` in short chunked transactions (so the
-//! SQLite write lock is free between chunks and a projection write waits
-//! milliseconds, well inside `busy_timeout`), then swaps the shadow tables
-//! in with renames in one tiny transaction. Readers see the old mirror until
-//! the swap commits and the new one after, never a half-built one.
+//! tenant's journal mutex. A rebuild runs on its own writer connection, fills
+//! `entities_shadow`/`edges_shadow` in transactions of a fraction of a
+//! millisecond that yield to a waiting projection write (`mirror_tx`), then
+//! swaps the shadow tables in with renames in one tiny transaction. Readers
+//! see the old mirror until the swap commits and the new one after, never a
+//! half-built one.
 //! [`SlowStore::begin_sync`] gates rebuilds: one in flight per store, and
 //! none within the caller's TTL of the last one.
+//!
+//! A rebuild reads the graph through a [`MirrorSource`] a chunk at a time.
+//! Between rebuilds, [`MirrorSyncToken::apply_changes`] applies only the rows
+//! the graph's change log names; the mirror keeps the [`ChangeCursor`] it
+//! reflects. Each directed pair holds its strongest live edge, ties to the
+//! lower uuid, so a rebuild and a run of incremental syncs agree.
 
 mod embeddings;
+mod mirror_delta;
+mod mirror_tx;
 mod projection;
 mod queries;
 mod relational_adapter;
+mod scoped;
 mod storage;
 
+use mirror_delta::next_step;
+pub use mirror_delta::{GraphLookup, MirrorSource};
 pub use projection::SqliteProjection;
 pub use queries::{EntityCluster, RawDiamondGap, RawOpenTriad, RawStarGap};
 pub use relational_adapter::RelationalSlowStoreAdapter;
+pub use scoped::ScopedGraph;
 pub use storage::{StoredGap, StoredMemoryRow, StoredThought};
 
 use super::gap_topology::GapStore;
 
 use crate::graph_memory::{
-    EdgeSource, EdgeTier, EntityNode, LtpStatus, RelationType, RelationshipEdge,
+    ChangeCursor, EdgeSource, EdgeTier, EntityNode, GraphChanges, LtpStatus, RelationType,
+    RelationshipEdge,
 };
 use crate::keystore::SecretCryptor;
 use anyhow::{Context, Result};
@@ -52,14 +64,35 @@ use rusqlite::{
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use uuid::Uuid;
+
+/// How a sync brought the mirror up to the graph.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMode {
+    /// Rebuilt from a full pass over the graph.
+    #[default]
+    Full,
+    /// Only the rows changed since the last sync.
+    Incremental,
+    /// Nothing changed since the last sync.
+    Unchanged,
+    /// Another sync was in flight, or the last rebuild is within the TTL.
+    Skipped,
+}
 
 /// Statistics from a graph → SQLite sync operation
 #[derive(Debug, Default)]
 pub struct SyncStats {
+    pub mode: SyncMode,
     pub entities_upserted: usize,
     pub edges_upserted: usize,
+    pub entities_removed: usize,
+    pub edges_removed: usize,
+    /// Rows a full copy re-read because the graph wrote them during the copy;
+    /// `None` when the change log had dropped some of those writes.
+    pub changed_during_copy: Option<usize>,
     /// Co-retrieval edges between memories, which the entity mirror leaves out.
     pub edges_between_memories: usize,
     /// Other edges left out because an endpoint is not among the synced entities.
@@ -80,10 +113,11 @@ pub const MIRROR_SYNC_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// Floor for the configured mirror TTL.
 pub const MIRROR_SYNC_TTL_MIN: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Rows per mirror-rebuild transaction. Each chunk holds the SQLite write
-/// lock only for its own inserts, so a projection write queued behind it
-/// waits milliseconds rather than the whole rebuild.
-const MIRROR_CHUNK_ROWS: usize = 2048;
+/// Rows per chunk a rebuild takes from in-memory slices.
+const MIRROR_CHUNK_ROWS: usize = 512;
+
+/// Changed rows read from the graph per incremental-sync step.
+const DELTA_CHUNK_ROWS: usize = 128;
 
 /// WAL size SQLite truncates back to after a checkpoint resets the log, so a
 /// rebuild's burst of pages does not leave a permanently huge `-wal` file.
@@ -300,6 +334,10 @@ pub struct SlowStore {
     sync_in_flight: AtomicBool,
     /// When the last mirror rebuild finished (successfully or not).
     last_sync: Mutex<Option<std::time::Instant>>,
+    /// The change-log position the mirror reflects; `None` when unknown.
+    mirror_cursor: Mutex<Option<ChangeCursor>>,
+    /// Projection writes waiting for `conn`; see [`SlowStore::writer`].
+    writers_waiting: AtomicUsize,
 }
 
 /// Exclusive right to rebuild a store's graph mirror, from
@@ -308,21 +346,60 @@ pub struct SlowStore {
 #[must_use = "dropping the token releases the rebuild slot without rebuilding"]
 pub struct MirrorSyncToken<'a> {
     store: &'a SlowStore,
+    /// A rebuild ran under this token; dropping it restarts the TTL clock.
+    rebuilt: bool,
 }
 
 impl MirrorSyncToken<'_> {
     /// Rebuild the mirror from a full snapshot of the graph. The TTL clock
     /// restarts when this returns, whether or not the rebuild succeeded, so a
     /// failing rebuild is not retried back to back.
-    pub fn rebuild(self, entities: &[EntityNode], edges: &[RelationshipEdge]) -> Result<SyncStats> {
-        let result = self.store.rebuild_mirror(entities, edges, &mut || {});
-        *self.store.last_sync.lock() = Some(std::time::Instant::now());
-        result
+    pub fn rebuild(
+        mut self,
+        entities: &[EntityNode],
+        edges: &[RelationshipEdge],
+    ) -> Result<SyncStats> {
+        self.rebuild_from(
+            &mut mirror_delta::SliceSource::new(entities, edges),
+            &mut || {},
+        )
+    }
+
+    /// Rebuild the mirror from `source`, a chunk at a time. The mirror's cursor
+    /// is cleared; set it once the rows changed during the read are applied.
+    /// `between_chunks` runs after each committed chunk.
+    pub fn rebuild_from(
+        &mut self,
+        source: &mut dyn MirrorSource,
+        between_chunks: &mut dyn FnMut(),
+    ) -> Result<SyncStats> {
+        self.rebuilt = true;
+        *self.store.mirror_cursor.lock() = None;
+        self.store.rebuild_mirror_from(source, between_chunks)
+    }
+
+    /// Apply the rows `changes` names, read fresh through `lookup`.
+    pub fn apply_changes(
+        &mut self,
+        changes: &GraphChanges,
+        lookup: &mut dyn GraphLookup,
+        between_chunks: &mut dyn FnMut(),
+    ) -> Result<SyncStats> {
+        self.store
+            .apply_graph_changes(changes, lookup, between_chunks)
+    }
+
+    /// Record the change-log position the mirror now reflects.
+    pub fn set_cursor(&self, cursor: Option<ChangeCursor>) {
+        *self.store.mirror_cursor.lock() = cursor;
     }
 }
 
 impl Drop for MirrorSyncToken<'_> {
     fn drop(&mut self) {
+        if self.rebuilt {
+            *self.store.last_sync.lock() = Some(std::time::Instant::now());
+        }
         self.store.sync_in_flight.store(false, Ordering::Release);
     }
 }
@@ -459,10 +536,21 @@ impl SlowStore {
             mirror_conn: Mutex::new(None),
             sync_in_flight: AtomicBool::new(false),
             last_sync: Mutex::new(None),
+            mirror_cursor: Mutex::new(None),
+            writers_waiting: AtomicUsize::new(0),
         };
         store.create_schema()?;
         store.check_schema_version()?;
         Ok(store)
+    }
+
+    /// The mirror's writer: no automatic checkpoint, which would run inside a
+    /// commit while the write turn is held; the mirror checkpoints between its
+    /// transactions instead.
+    fn open_mirror_writer(path: &Path) -> Result<Connection> {
+        let conn = Self::open_writer(path)?;
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        Ok(conn)
     }
 
     fn open_writer(path: &Path) -> Result<Connection> {
@@ -475,6 +563,19 @@ impl SlowStore {
         .context("Failed to open slow store SQLite database")?;
         configure_writer(&conn)?;
         Ok(conn)
+    }
+
+    /// The projection connection, as every projection write takes it. A
+    /// writer that has to wait says so, and the mirror transaction holding the
+    /// connection commits at its next step and hands it over.
+    pub(crate) fn writer(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        if let Some(conn) = self.conn.try_lock() {
+            return conn;
+        }
+        self.writers_waiting.fetch_add(1, Ordering::AcqRel);
+        let conn = self.conn.lock();
+        self.writers_waiting.fetch_sub(1, Ordering::AcqRel);
+        conn
     }
 
     /// Check out a pooled read-only connection. All read paths use this instead
@@ -685,7 +786,27 @@ impl SlowStore {
         self.sync_in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
-        Some(MirrorSyncToken { store: self })
+        Some(MirrorSyncToken {
+            store: self,
+            rebuilt: false,
+        })
+    }
+
+    /// Claim the sync slot for an incremental sync: no TTL, only one sync in
+    /// flight. `None` while another holds the slot.
+    pub fn begin_incremental(&self) -> Option<MirrorSyncToken<'_>> {
+        self.sync_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(MirrorSyncToken {
+            store: self,
+            rebuilt: false,
+        })
+    }
+
+    /// The change-log position the mirror reflects, when known.
+    pub fn mirror_cursor(&self) -> Option<ChangeCursor> {
+        *self.mirror_cursor.lock()
     }
 
     /// True until the first mirror rebuild starts.
@@ -713,6 +834,7 @@ impl SlowStore {
             None => {
                 tracing::debug!("SlowStore sync skipped: a mirror rebuild is already in flight");
                 Ok(SyncStats {
+                    mode: SyncMode::Skipped,
                     skipped: true,
                     ..SyncStats::default()
                 })
@@ -724,83 +846,81 @@ impl SlowStore {
     /// chunked transactions, swap it in atomically, drop the old tables and
     /// checkpoint the WAL. `between_chunks` runs after each committed chunk,
     /// with no transaction open.
-    fn rebuild_mirror(
+    fn rebuild_mirror_from(
         &self,
-        entities: &[EntityNode],
-        edges: &[RelationshipEdge],
+        source: &mut dyn MirrorSource,
         between_chunks: &mut dyn FnMut(),
     ) -> Result<SyncStats> {
-        let _span = tracing::info_span!(
-            "slow_store.sync",
-            entities = entities.len(),
-            edges = edges.len(),
-        )
-        .entered();
+        let _span = tracing::info_span!("slow_store.sync").entered();
 
         let start = std::time::Instant::now();
         *self.last_sync.lock() = Some(start);
         let mut stats = SyncStats::default();
         let mut guard = self.mirror_conn.lock();
         if guard.is_none() {
-            *guard = Some(Self::open_writer(&self.path)?);
+            *guard = Some(Self::open_mirror_writer(&self.path)?);
         }
         let conn = guard.as_mut().expect("mirror connection opened above");
+        let _paused = self.pause_projection_checkpoints()?;
 
         // Shadow or retired tables left by a rebuild that died part-way are
-        // garbage; their indexes go with them, freeing the index names. The
-        // child table goes first, so neither drop has a referencing table.
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS edges_shadow;
-             DROP TABLE IF EXISTS entities_shadow;
-             DROP TABLE IF EXISTS edges_old;
-             DROP TABLE IF EXISTS entities_old;",
-        )?;
+        // garbage; their indexes go with them, freeing the index names. Child
+        // tables go first, so no drop has a referencing table.
+        for table in [
+            "edges_shadow",
+            "entities_shadow",
+            "edges_old",
+            "entities_old",
+        ] {
+            self.clear_and_drop(conn, table, between_chunks)?;
+        }
         let suffix = if index_exists(conn, EDGE_PAIR_INDEX)? {
             ALT_INDEX_SUFFIX
         } else {
             ""
         };
-        conn.execute_batch(&entities_table_ddl("entities_shadow"))?;
-        conn.execute_batch(&edges_table_ddl("edges_shadow", "entities_shadow"))?;
+        let mut ddl = entities_table_ddl("entities_shadow");
+        ddl.push_str(&edges_table_ddl("edges_shadow", "entities_shadow"));
         for (base, columns, unique) in EDGE_INDEXES {
             let unique = if unique { "UNIQUE " } else { "" };
-            conn.execute_batch(&format!(
+            ddl.push_str(&format!(
                 "CREATE {unique}INDEX {base}{suffix} ON edges_shadow({columns});"
-            ))?;
+            ));
         }
+        let turn = self.conn.lock();
+        conn.execute_batch(&ddl)?;
+        drop(turn);
 
-        for chunk in entities.chunks(MIRROR_CHUNK_ROWS) {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            Self::sync_entities(
-                &tx,
-                "entities_shadow",
-                chunk,
-                &mut stats,
-                self.encryptor.as_ref(),
-                &self.enc,
-            )?;
-            tx.commit()?;
-            between_chunks();
+        let (enc, toggles) = (self.encryptor.as_ref(), &self.enc);
+        let mut synced: HashSet<Uuid> = HashSet::new();
+        while let Some(entities) = source.next_entities()? {
+            let mut rest = entities.as_slice();
+            if rest.is_empty() {
+                continue;
+            }
+            self.budgeted_writes(conn, between_chunks, |tx| {
+                let (step, more) = next_step(&mut rest);
+                Self::sync_entities(tx, "entities_shadow", step, &mut stats, enc, toggles)?;
+                synced.extend(step.iter().map(|e| e.uuid));
+                Ok(more)
+            })?;
         }
-        let synced: HashSet<Uuid> = entities.iter().map(|e| e.uuid).collect();
-        for chunk in edges.chunks(MIRROR_CHUNK_ROWS) {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            Self::sync_edges(
-                &tx,
-                "edges_shadow",
-                chunk,
-                &synced,
-                &mut stats,
-                self.encryptor.as_ref(),
-                &self.enc,
-            )?;
-            tx.commit()?;
-            between_chunks();
+        while let Some(edges) = source.next_relationships()? {
+            let mut rest = edges.as_slice();
+            if rest.is_empty() {
+                continue;
+            }
+            self.budgeted_writes(conn, between_chunks, |tx| {
+                let (step, more) = next_step(&mut rest);
+                Self::sync_edges(tx, "edges_shadow", step, &synced, &mut stats, enc, toggles)?;
+                Ok(more)
+            })?;
         }
 
         // Renames rewrite the foreign keys to follow their parent: edges_old
         // ends up referencing entities_old, the new edges referencing the new
         // entities.
+        let turn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(
             "ALTER TABLE edges RENAME TO edges_old;
@@ -809,7 +929,9 @@ impl SlowStore {
              ALTER TABLE edges_shadow RENAME TO edges;",
         )?;
         tx.commit()?;
-        conn.execute_batch("DROP TABLE edges_old; DROP TABLE entities_old;")?;
+        parking_lot::MutexGuard::unlock_fair(turn);
+        self.clear_and_drop(conn, "edges_old", between_chunks)?;
+        self.clear_and_drop(conn, "entities_old", between_chunks)?;
 
         // The rebuild pushes the whole mirror through the WAL; fold it back
         // into the database without waiting on readers or the projection.
@@ -919,77 +1041,97 @@ impl SlowStore {
         enc: Option<&SecretCryptor>,
         toggles: &SlowStoreEncrypt,
     ) -> Result<()> {
-        // Conflict target is the directed pair, not `uuid`. The slow store is a
-        // connectivity graph (one entry per A->B, per `idx_edge_pair`), but
-        // GraphMemory legitimately holds several edges per pair (one per
-        // relation type). Targeting `uuid` made the 2nd such edge violate the
-        // pair-unique index — an unhandled conflict that aborted the whole sync
-        // transaction. Collapsing on the pair keeps the first uuid/relation_type
-        // and refreshes the mutable strength/tier/activation columns.
-        let mut stmt = tx.prepare_cached(&format!(
-            "INSERT INTO {table} (uuid, from_entity, to_entity, relation_type, strength,
-                                  tier, ltp_status, activation_count, created_at,
-                                  last_activated, context)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(from_entity, to_entity) DO UPDATE SET
-                strength = excluded.strength,
-                tier = excluded.tier,
-                ltp_status = excluded.ltp_status,
-                activation_count = excluded.activation_count,
-                last_activated = excluded.last_activated,
-                context = excluded.context"
-        ))?;
-
+        let mut stmt = tx.prepare_cached(&edge_upsert_sql(table))?;
         for edge in edges {
             if !synced.contains(&edge.from_entity) || !synced.contains(&edge.to_entity) {
-                if edge.relation_type == RelationType::CoRetrieved
-                    || edge.created_by == EdgeSource::Coactivation
-                {
-                    stats.edges_between_memories += 1;
-                } else {
-                    stats.edges_dangling += 1;
-                }
+                count_left_out(edge, stats);
                 continue;
             }
-            let tier_str = match edge.tier {
-                EdgeTier::L1Working => "L1Working",
-                EdgeTier::L2Episodic => "L2Episodic",
-                EdgeTier::L3Semantic => "L3Semantic",
-            };
-            let ltp_str = match edge.ltp_status {
-                LtpStatus::None => "None",
-                LtpStatus::Burst { .. } => "Burst",
-                LtpStatus::Weekly => "Weekly",
-                LtpStatus::Full => "Full",
-            };
-
-            // Edge free-text `context` is encrypted when the graph toggle is on
-            // (no SQL readers). `relation_type` stays PLAINTEXT — the gap queries
-            // read/group on it; from/to/strength are structural.
-            let edge_uuid = edge.uuid.to_string();
-            let context_col =
-                seal_text_value(enc, &edge.context, toggles.graph, edge_uuid.as_bytes())?;
-            stmt.execute(params![
-                edge.uuid.to_string(),
-                edge.from_entity.to_string(),
-                edge.to_entity.to_string(),
-                edge.relation_type.as_str(),
-                edge.strength,
-                tier_str,
-                ltp_str,
-                edge.activation_count,
-                edge.created_at.to_rfc3339(),
-                edge.last_activated.to_rfc3339(),
-                context_col,
-            ])?;
+            Self::insert_edge(&mut stmt, edge, enc, toggles)?;
             stats.edges_upserted += 1;
         }
+        Ok(())
+    }
+
+    /// Write `edge` through an [`edge_upsert_sql`] statement.
+    fn insert_edge(
+        stmt: &mut rusqlite::CachedStatement<'_>,
+        edge: &RelationshipEdge,
+        enc: Option<&SecretCryptor>,
+        toggles: &SlowStoreEncrypt,
+    ) -> Result<()> {
+        let tier_str = match edge.tier {
+            EdgeTier::L1Working => "L1Working",
+            EdgeTier::L2Episodic => "L2Episodic",
+            EdgeTier::L3Semantic => "L3Semantic",
+        };
+        let ltp_str = match edge.ltp_status {
+            LtpStatus::None => "None",
+            LtpStatus::Burst { .. } => "Burst",
+            LtpStatus::Weekly => "Weekly",
+            LtpStatus::Full => "Full",
+        };
+
+        // Edge free-text `context` is encrypted when the graph toggle is on
+        // (no SQL readers). `relation_type` stays PLAINTEXT — the gap queries
+        // read/group on it; from/to/strength are structural.
+        let edge_uuid = edge.uuid.to_string();
+        let context_col = seal_text_value(enc, &edge.context, toggles.graph, edge_uuid.as_bytes())?;
+        stmt.execute(params![
+            edge.uuid.to_string(),
+            edge.from_entity.to_string(),
+            edge.to_entity.to_string(),
+            edge.relation_type.as_str(),
+            edge.strength,
+            tier_str,
+            ltp_str,
+            edge.activation_count,
+            edge.created_at.to_rfc3339(),
+            edge.last_activated.to_rfc3339(),
+            context_col,
+        ])?;
         Ok(())
     }
 
     /// Database file path
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// Insert into an edge mirror table. The conflict target is the directed pair:
+/// GraphMemory holds several edges per pair (one per relation type), and the
+/// mirror keeps the strongest, ties to the lower uuid, whatever order they
+/// arrive in.
+fn edge_upsert_sql(table: &str) -> String {
+    format!(
+        "INSERT INTO {table} (uuid, from_entity, to_entity, relation_type, strength,
+                              tier, ltp_status, activation_count, created_at,
+                              last_activated, context)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(from_entity, to_entity) DO UPDATE SET
+            uuid = excluded.uuid,
+            relation_type = excluded.relation_type,
+            strength = excluded.strength,
+            tier = excluded.tier,
+            ltp_status = excluded.ltp_status,
+            activation_count = excluded.activation_count,
+            created_at = excluded.created_at,
+            last_activated = excluded.last_activated,
+            context = excluded.context
+         WHERE excluded.strength > {table}.strength
+            OR (excluded.strength = {table}.strength AND excluded.uuid < {table}.uuid)"
+    )
+}
+
+/// Count an edge the mirror leaves out because an endpoint is not mirrored.
+fn count_left_out(edge: &RelationshipEdge, stats: &mut SyncStats) {
+    if edge.relation_type == RelationType::CoRetrieved
+        || edge.created_by == EdgeSource::Coactivation
+    {
+        stats.edges_between_memories += 1;
+    } else {
+        stats.edges_dangling += 1;
     }
 }
 
@@ -1854,12 +1996,15 @@ mod tests {
                 let _token = store.begin_sync(std::time::Duration::ZERO).unwrap();
                 let mut first = true;
                 store
-                    .rebuild_mirror(&entities, &[], &mut || {
-                        if std::mem::take(&mut first) {
-                            paused_tx.send(()).unwrap();
-                            resume_rx.recv().unwrap();
-                        }
-                    })
+                    .rebuild_mirror_from(
+                        &mut mirror_delta::SliceSource::new(&entities, &[]),
+                        &mut || {
+                            if std::mem::take(&mut first) {
+                                paused_tx.send(()).unwrap();
+                                resume_rx.recv().unwrap();
+                            }
+                        },
+                    )
                     .unwrap();
             })
         };
@@ -1892,24 +2037,29 @@ mod tests {
         let _token = store.begin_sync(std::time::Duration::ZERO).unwrap();
         let mut writes = 0u64;
         store
-            .rebuild_mirror(&entities, &edges, &mut || {
-                // The swap has not happened: readers still see the old mirror.
-                assert_eq!(store.entity_count().unwrap(), 1);
-                writes += 1;
-                let (done_tx, done_rx) = mpsc::channel();
-                let writer = Arc::clone(&store);
-                let lsn = writes;
-                std::thread::spawn(move || {
-                    let res = writer.upsert_memory("u", &format!("m{lsn}"), lsn, b"payload", 0.5);
-                    let _ = done_tx.send(res.map_err(|e| e.to_string()));
-                });
-                let res = done_rx
-                    .recv_timeout(std::time::Duration::from_secs(4))
-                    .expect("a projection write must not wait on the rebuild");
-                res.expect("projection write succeeds mid-rebuild");
-            })
+            .rebuild_mirror_from(
+                &mut mirror_delta::SliceSource::new(&entities, &edges),
+                &mut || {
+                    // Readers see the old mirror or the new one, never a half-built one.
+                    let seen = store.entity_count().unwrap();
+                    assert!(seen == 1 || seen == entities.len(), "saw {seen} entities");
+                    writes += 1;
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let writer = Arc::clone(&store);
+                    let lsn = writes;
+                    std::thread::spawn(move || {
+                        let res =
+                            writer.upsert_memory("u", &format!("m{lsn}"), lsn, b"payload", 0.5);
+                        let _ = done_tx.send(res.map_err(|e| e.to_string()));
+                    });
+                    let res = done_rx
+                        .recv_timeout(std::time::Duration::from_secs(4))
+                        .expect("a projection write must not wait on the rebuild");
+                    res.expect("projection write succeeds mid-rebuild");
+                },
+            )
             .unwrap();
-        assert_eq!(writes, 3, "two entity chunks and one edge chunk");
+        assert!(writes >= 3, "a write between every chunk: {writes}");
         assert_eq!(store.count_memories("u").unwrap(), writes);
         assert_eq!(store.entity_count().unwrap(), entities.len());
         assert_eq!(store.edge_count().unwrap(), 1);

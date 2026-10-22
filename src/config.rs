@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use tracing::info;
 
+use crate::memory::gap_topology::GapWorkerConfig;
+
 /// Legacy storage directory name used in versions <= 0.1.80.
 const LEGACY_STORAGE_DIR: &str = "veld_data";
 
@@ -392,6 +394,9 @@ fn load_config_path_into_env(path: &std::path::Path) {
         ("mcp", "VELD_MCP_ENABLED"),
         ("auto_compress", "VELD_AUTO_COMPRESS"),
         ("graph_mirror_sync_secs", "VELD_GRAPH_MIRROR_SYNC_SECS"),
+        ("gap_worker_nice", "VELD_GAP_WORKER_NICE"),
+        ("gap_worker_chunk_rows", "VELD_GAP_WORKER_CHUNK_ROWS"),
+        ("gap_worker_cpu_pct", "VELD_GAP_WORKER_CPU_PCT"),
         ("intent_log_segment_mb", "VELD_INTENT_LOG_SEGMENT_MB"),
     ];
 
@@ -762,6 +767,19 @@ pub struct ServerConfig {
     /// Env `VELD_GRAPH_MIRROR_SYNC_SECS`, config.toml key `graph_mirror_sync_secs`.
     pub graph_mirror_sync_secs: u64,
 
+    /// Nice value of the gap analysis worker thread, 0 to 19 (default: 10).
+    /// Env `VELD_GAP_WORKER_NICE`, config.toml key `gap_worker_nice`.
+    pub gap_worker_nice: i32,
+
+    /// Rows of work the gap analysis worker does between pauses, and rows a
+    /// mirror sync reads per hold of the graph lock (default: 4096, minimum: 64).
+    /// Env `VELD_GAP_WORKER_CHUNK_ROWS`, config.toml key `gap_worker_chunk_rows`.
+    pub gap_worker_chunk_rows: usize,
+
+    /// Share of one core the gap analysis worker may take, 1 to 100 (default: 50).
+    /// Env `VELD_GAP_WORKER_CPU_PCT`, config.toml key `gap_worker_cpu_pct`.
+    pub gap_worker_cpu_pct: u8,
+
     /// Size, in MiB, at which a tenant's intent log seals its head file into a
     /// segment and starts a new one (default: 256; 0 never rotates). A log that
     /// has rotated needs a build that reads segments.
@@ -803,6 +821,9 @@ impl Default for ServerConfig {
             log_periodic_scales: vec![7.0, 30.0, 365.0], // Weekly, monthly, yearly resonance
             auto_compress: true,
             graph_mirror_sync_secs: crate::memory::slow_store::MIRROR_SYNC_TTL.as_secs(),
+            gap_worker_nice: GapWorkerConfig::default().nice,
+            gap_worker_chunk_rows: GapWorkerConfig::default().chunk_rows,
+            gap_worker_cpu_pct: GapWorkerConfig::default().cpu_pct,
             intent_log_segment_mb: INTENT_LOG_SEGMENT_MB_DEFAULT,
         }
     }
@@ -811,10 +832,53 @@ impl Default for ServerConfig {
 /// Default [`ServerConfig::intent_log_segment_mb`].
 pub const INTENT_LOG_SEGMENT_MB_DEFAULT: u64 = 256;
 
+/// Smallest [`ServerConfig::gap_worker_chunk_rows`].
+pub const GAP_WORKER_CHUNK_ROWS_MIN: usize = 64;
+
+/// `raw`, the value of `name`, parsed and clamped to `min..=max`; `default`
+/// when unset or not a number.
+fn env_clamped<T>(name: &str, raw: Result<String, env::VarError>, default: T, min: T, max: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + Copy + std::fmt::Display,
+{
+    let Ok(raw) = raw else {
+        return default;
+    };
+    match raw.trim().parse::<T>() {
+        Ok(n) if n < min || n > max => {
+            let clamped = if n < min { min } else { max };
+            tracing::warn!("{name}={n} is outside {min}..={max}, clamped to {clamped}");
+            clamped
+        }
+        Ok(n) => n,
+        Err(_) => {
+            tracing::warn!("{name}={raw} is not a number, using default {default}");
+            default
+        }
+    }
+}
+
 impl ServerConfig {
     /// The graph-mirror TTL as a `Duration`, for `SlowStore::begin_sync`.
     pub fn graph_mirror_sync_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.graph_mirror_sync_secs)
+    }
+
+    /// How the gap analysis worker thread runs.
+    pub fn gap_worker_config(&self) -> GapWorkerConfig {
+        GapWorkerConfig {
+            nice: self.gap_worker_nice,
+            chunk_rows: self.gap_worker_chunk_rows,
+            cpu_pct: self.gap_worker_cpu_pct,
+        }
+    }
+
+    /// How gap paths sync a tenant's graph mirror.
+    pub fn graph_mirror_options(&self) -> crate::memory::graph_mirror::MirrorSyncOptions {
+        crate::memory::graph_mirror::MirrorSyncOptions {
+            ttl: self.graph_mirror_sync_ttl(),
+            chunk_rows: self.gap_worker_chunk_rows,
+        }
     }
 
     /// The intent-log segment size in bytes, for `IntentLog::set_segment_bytes`.
@@ -1034,6 +1098,28 @@ impl ServerConfig {
             }
         }
 
+        config.gap_worker_nice = env_clamped(
+            "VELD_GAP_WORKER_NICE",
+            env::var("VELD_GAP_WORKER_NICE"),
+            config.gap_worker_nice,
+            0,
+            19,
+        );
+        config.gap_worker_chunk_rows = env_clamped(
+            "VELD_GAP_WORKER_CHUNK_ROWS",
+            env::var("VELD_GAP_WORKER_CHUNK_ROWS"),
+            config.gap_worker_chunk_rows,
+            GAP_WORKER_CHUNK_ROWS_MIN,
+            usize::MAX,
+        );
+        config.gap_worker_cpu_pct = env_clamped(
+            "VELD_GAP_WORKER_CPU_PCT",
+            env::var("VELD_GAP_WORKER_CPU_PCT"),
+            config.gap_worker_cpu_pct,
+            1,
+            100,
+        );
+
         if let Ok(val) = env::var("VELD_INTENT_LOG_SEGMENT_MB") {
             match val.trim().parse::<u64>() {
                 Ok(n) => config.intent_log_segment_mb = n,
@@ -1234,6 +1320,9 @@ pub fn print_env_help() {
     println!("  VELD_MAX_USERS        - Max users in memory LRU (default: 1000)");
     println!("  VELD_AUTO_COMPRESS    - Compress old memories during maintenance (default: true)");
     println!("  VELD_GRAPH_MIRROR_SYNC_SECS - Seconds a rebuilt graph mirror is served before the next rebuild (default: 600, min: 30)");
+    println!("  VELD_GAP_WORKER_NICE  - Nice value of the gap analysis worker thread (default: 10, 0-19)");
+    println!("  VELD_GAP_WORKER_CHUNK_ROWS - Rows of gap work between pauses and per graph-lock hold (default: 4096, min: 64)");
+    println!("  VELD_GAP_WORKER_CPU_PCT - Share of one core the gap analysis worker may take (default: 50, 1-100)");
     println!("  VELD_RATE_LIMIT       - Requests per second (default: 0 on localhost/dev, otherwise 4000)");
     println!("  VELD_RATE_BURST       - Burst size (default: 8000)");
     println!("  VELD_MAX_CONCURRENT   - Max concurrent requests (default: 200)");
@@ -1542,6 +1631,38 @@ mod tests {
         env::set_var("VELD_GRAPH_MIRROR_SYNC_SECS", "soon");
         assert_eq!(ServerConfig::from_env().graph_mirror_sync_secs, 600);
         env::remove_var("VELD_GRAPH_MIRROR_SYNC_SECS");
+    }
+
+    #[test]
+    fn gap_worker_knobs_default_parse_and_clamp() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for name in [
+            "VELD_GAP_WORKER_NICE",
+            "VELD_GAP_WORKER_CHUNK_ROWS",
+            "VELD_GAP_WORKER_CPU_PCT",
+        ] {
+            env::remove_var(name);
+        }
+        assert_eq!(
+            ServerConfig::from_env().gap_worker_config(),
+            GapWorkerConfig::default()
+        );
+        env::set_var("VELD_GAP_WORKER_NICE", "40");
+        env::set_var("VELD_GAP_WORKER_CHUNK_ROWS", "8");
+        env::set_var("VELD_GAP_WORKER_CPU_PCT", "25");
+        let config = ServerConfig::from_env();
+        assert_eq!(config.gap_worker_nice, 19);
+        assert_eq!(config.gap_worker_chunk_rows, GAP_WORKER_CHUNK_ROWS_MIN);
+        assert_eq!(config.gap_worker_cpu_pct, 25);
+        env::set_var("VELD_GAP_WORKER_CPU_PCT", "most");
+        assert_eq!(ServerConfig::from_env().gap_worker_cpu_pct, 50);
+        for name in [
+            "VELD_GAP_WORKER_NICE",
+            "VELD_GAP_WORKER_CHUNK_ROWS",
+            "VELD_GAP_WORKER_CPU_PCT",
+        ] {
+            env::remove_var(name);
+        }
     }
 
     #[test]
