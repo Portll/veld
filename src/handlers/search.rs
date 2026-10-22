@@ -88,8 +88,11 @@ pub async fn advanced_search(
 
     let (memories, count) = run_blocking(move || {
         let memory = memory_sys.read();
-        let raw_memories =
-            memory.apply_recall_gates(memory.advanced_search(criteria).map_err(AppError::Internal)?);
+        let raw_memories = memory.apply_recall_gates(
+            memory
+                .advanced_search(criteria)
+                .map_err(AppError::Internal)?,
+        );
         let count = raw_memories.len();
         let memories: Vec<serde_json::Value> = raw_memories
             .into_iter()
