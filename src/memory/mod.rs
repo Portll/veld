@@ -3066,16 +3066,35 @@ impl MemorySystem {
             let secondary_text =
                 crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
             if let Ok(Some(secondary)) = self.embedder.encode_secondary(&secondary_text) {
-                memory.experience.embeddings_secondary = Some(secondary);
-                // Persist so restarts retain the secondary embedding (parity with
-                // the primary, which is persisted above). No-op for the no-secondary
-                // common case since this branch is skipped entirely.
-                match self.long_term_memory.update(&memory) {
-                    Ok(()) => outcome.note_rewritten(memory_id),
+                // Persisted so restarts retain it, as the primary is above and for the same
+                // reason: applied to the record read again under the write gate, because
+                // writing back the copy read before the (slow) embedding call would undo
+                // a write made meanwhile.
+                let _write_guard = self.write_lock.enter()?;
+                let mut fresh = match self.long_term_memory.get(memory_id) {
+                    Ok(fresh) => fresh,
                     Err(e) => {
-                        tracing::warn!("Failed to persist background secondary embedding: {e}")
+                        tracing::debug!(
+                            "memory {} gone before its secondary embedding landed: {e}",
+                            memory_id.0
+                        );
+                        return Ok(outcome);
+                    }
+                };
+                if fresh.experience.content != memory.experience.content {
+                    // Rewritten meanwhile; that write embedded its own content.
+                    return Ok(outcome);
+                }
+                if fresh.experience.embeddings_secondary.is_none() {
+                    fresh.experience.embeddings_secondary = Some(secondary);
+                    match self.long_term_memory.update(&fresh) {
+                        Ok(()) => outcome.note_rewritten(memory_id),
+                        Err(e) => {
+                            tracing::warn!("Failed to persist background secondary embedding: {e}")
+                        }
                     }
                 }
+                memory = fresh;
             }
         }
 
@@ -3137,6 +3156,15 @@ impl MemorySystem {
                                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                             })
                         {
+                            // The survivor and the absorbed memory are read, decided and
+                            // rewritten under the write gate: copies read before it would
+                            // overwrite whatever another writer stored in between.
+                            let absorb_gate =
+                                if *best_sim >= crate::constants::WRITE_GATE_ABSORPTION_THRESHOLD {
+                                    Some(self.write_lock.enter()?)
+                                } else {
+                                    None
+                                };
                             let survivor = (*best_sim
                                 >= crate::constants::WRITE_GATE_ABSORPTION_THRESHOLD)
                                 .then(|| uuid::Uuid::parse_str(best_id).ok())
@@ -3149,16 +3177,19 @@ impl MemorySystem {
                                             &existing.experience.content,
                                         )
                                 });
-                            if let Some(survivor) = survivor {
+                            let absorbed = survivor.as_ref().and_then(|_| {
+                                self.long_term_memory.get(memory_id).ok().filter(|fresh| {
+                                    !fresh.is_forgotten()
+                                        && fresh.experience.content == memory_arc.experience.content
+                                })
+                            });
+                            if let (Some(survivor), Some(absorbed)) = (survivor, absorbed) {
                                 outcome.note_rewritten(memory_id);
                                 outcome.note_rewritten(&survivor.id);
                                 self.absorb_redundant_memory(
-                                    &memory_arc,
-                                    survivor,
-                                    importance,
-                                    *best_sim,
-                                    bm25,
+                                    &absorbed, survivor, importance, *best_sim, bm25,
                                 );
+                                drop(absorb_gate);
                                 let elapsed = start.elapsed();
                                 crate::metrics::EMBED_BACKGROUND_DURATION
                                     .observe(elapsed.as_secs_f64());
@@ -3177,6 +3208,9 @@ impl MemorySystem {
                                 &similar_memories,
                             );
 
+                        // Each decay is applied to the record read under the write gate,
+                        // so it lands on top of any write made since the candidate scan.
+                        let _write_guard = self.write_lock.enter()?;
                         for (old_id, _similarity, decay_amount) in
                             &interference_result.retroactive_targets
                         {
@@ -3199,30 +3233,35 @@ impl MemorySystem {
                             }
                         }
 
-                        if interference_result.proactive_decay > 0.0 {
-                            let before = memory_arc.importance();
-                            memory_arc.decay_importance(interference_result.proactive_decay);
-                            if self.long_term_memory.update(&memory_arc).is_ok() {
-                                outcome.note_rewritten(memory_id);
-                                self.note_importance_change(before, memory_arc.importance());
-                            }
-                        }
-
-                        for event in &interference_result.events {
-                            self.record_consolidation_event(event.clone());
-                        }
-
                         if interference_result.is_duplicate {
                             tracing::info!(
                                 memory_id = %memory_arc.id.0,
                                 "Near-duplicate detected (>=0.95 cosine), suppressing importance"
                             );
-                            let before = memory_arc.importance();
-                            memory_arc.decay_importance(0.99);
-                            if self.long_term_memory.update(&memory_arc).is_ok() {
-                                outcome.note_rewritten(memory_id);
-                                self.note_importance_change(before, memory_arc.importance());
+                        }
+                        if interference_result.proactive_decay > 0.0
+                            || interference_result.is_duplicate
+                        {
+                            let own = self.long_term_memory.get(memory_id).ok().filter(|fresh| {
+                                fresh.experience.content == memory_arc.experience.content
+                            });
+                            if let Some(own) = own {
+                                let before = own.importance();
+                                if interference_result.proactive_decay > 0.0 {
+                                    own.decay_importance(interference_result.proactive_decay);
+                                }
+                                if interference_result.is_duplicate {
+                                    own.decay_importance(0.99);
+                                }
+                                if self.long_term_memory.update(&own).is_ok() {
+                                    outcome.note_rewritten(memory_id);
+                                    self.note_importance_change(before, own.importance());
+                                }
                             }
+                        }
+
+                        for event in &interference_result.events {
+                            self.record_consolidation_event(event.clone());
                         }
 
                         {
