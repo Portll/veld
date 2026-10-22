@@ -239,11 +239,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.14"
 
 # Distributed Tracing (P1.6) - OPTIONAL (heavy, ~200 packages, not needed for edge)
-# NOTE: tracing-opentelemetry 0.28 requires opentelemetry 0.27
-tracing-opentelemetry = { version = "0.28", optional = true }
-opentelemetry = { version = "0.27", features = ["trace"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"], optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"], optional = true }
+# NOTE: tracing-opentelemetry 0.33 requires opentelemetry 0.32. opentelemetry_sdk
+# 0.32.1 is the floor (GHSA-w9wp-h8wv-79jx). The otlp exporter keeps only gRPC
+# (tonic): its 0.32 defaults switched to HTTP with a blocking reqwest client.
+tracing-opentelemetry = { version = "0.33", optional = true }
+opentelemetry = { version = "0.32", features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "internal-logs"], optional = true }
+opentelemetry_sdk = { version = "0.32.1", features = ["trace"], optional = true }
 
 # FFT for spectral analysis of access patterns (learned decay scales)
 rustfft = "6"
