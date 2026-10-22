@@ -264,7 +264,9 @@ impl super::MemorySystem {
             Some(_) => query.effective_competition_mode(),
             None => CompetitionMode::Coexist,
         };
-        let _ = Self::compete_memories(&mut memories, competition_mode);
+        let mut ranked: Vec<Scored> = memories.into_iter().map(Scored::shared).collect();
+        let _ = Self::compete_memories(&mut ranked, competition_mode);
+        let mut memories: Vec<SharedMemory> = ranked.into_iter().map(Scored::into_shared).collect();
 
         memories.truncate(query.max_results);
 
@@ -3023,7 +3025,7 @@ impl super::MemorySystem {
                 score
             };
 
-            let with_unified_score = |mem: &SharedMemory, base: f32| -> SharedMemory {
+            let with_unified_score = |mem: &SharedMemory, base: f32| -> Scored {
                 // Recency decay: exponential decay based on age
                 let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
                 let recency_boost = (-RECENCY_DECAY_RATE * hours_old).exp() * recency_scale;
@@ -3366,7 +3368,7 @@ impl super::MemorySystem {
                 // `final_score` into the feature side-map. This READS the locals
                 // already computed above — it recomputes nothing and writes nothing
                 // back to `mem`, `base`, or `final_score`. The live score path below
-                // (`set_score(final_score)`) is byte-for-byte unchanged.
+                // (the candidate scored `final_score`) is byte-for-byte unchanged.
                 scoring_features.borrow_mut().insert(
                     mem.id.clone(),
                     crate::memory::types::ScoringFeatures {
@@ -3394,9 +3396,7 @@ impl super::MemorySystem {
                     },
                 );
 
-                let mut cloned: Memory = mem.as_ref().clone();
-                cloned.set_score(final_score);
-                Arc::new(cloned)
+                Scored::scored(Arc::clone(mem), final_score)
             };
 
             // The record the fusion layers already read: working, session, or storage.
@@ -3635,9 +3635,7 @@ impl super::MemorySystem {
                                     .cross_encoder_contribution = ce_score;
                                 let base = mem.score.unwrap_or(0.0);
                                 let blended = base * base_w + ce_score * ce_w;
-                                let mut cloned: Memory = mem.as_ref().clone();
-                                cloned.set_score(blended);
-                                *mem = Arc::new(cloned);
+                                mem.set_score(blended);
                             }
                         }
 
@@ -3679,9 +3677,7 @@ impl super::MemorySystem {
                 if demotion < 1.0 {
                     let base = mem.score.unwrap_or(0.0);
                     let demoted_score = base * demotion;
-                    let mut cloned: Memory = mem.as_ref().clone();
-                    cloned.set_score(demoted_score);
-                    *mem = Arc::new(cloned);
+                    mem.set_score(demoted_score);
                     any_demoted = true;
                 }
             }
@@ -3756,9 +3752,7 @@ impl super::MemorySystem {
                 }
                 if (factor - 1.0).abs() > f32::EPSILON {
                     let base = mem.score.unwrap_or(0.0);
-                    let mut cloned: Memory = mem.as_ref().clone();
-                    cloned.set_score(base * factor);
-                    *mem = Arc::new(cloned);
+                    mem.set_score(base * factor);
                 }
             }
             memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
@@ -3904,9 +3898,7 @@ impl super::MemorySystem {
                     if !prefs.contains(&mem.experience.experience_type) {
                         let base = mem.score.unwrap_or(0.0);
                         let penalized = base * 0.85;
-                        let mut cloned: Memory = mem.as_ref().clone();
-                        cloned.set_score(penalized);
-                        *mem = Arc::new(cloned);
+                        mem.set_score(penalized);
                     }
                 }
                 memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
@@ -3996,9 +3988,7 @@ impl super::MemorySystem {
                                 };
                                 if demotion < 1.0 {
                                     let base = mem.score.unwrap_or(0.0);
-                                    let mut cloned: Memory = mem.as_ref().clone();
-                                    cloned.set_score(base * demotion);
-                                    *mem = Arc::new(cloned);
+                                    mem.set_score(base * demotion);
                                     demoted += 1;
                                 }
                             }
@@ -4019,9 +4009,7 @@ impl super::MemorySystem {
                                     let overshoot = age_hours / window_hours;
                                     let demotion = (1.0 / overshoot as f32).clamp(0.3, 0.5);
                                     let base = mem.score.unwrap_or(0.0);
-                                    let mut cloned: Memory = mem.as_ref().clone();
-                                    cloned.set_score(base * demotion);
-                                    *mem = Arc::new(cloned);
+                                    mem.set_score(base * demotion);
                                     demoted += 1;
                                 }
                             }
@@ -4039,9 +4027,7 @@ impl super::MemorySystem {
                             let factor = step_for((now - mem.created_at).num_days().max(0));
                             if factor < 1.0 {
                                 let base = mem.score.unwrap_or(0.0);
-                                let mut cloned: Memory = mem.as_ref().clone();
-                                cloned.set_score(base * factor);
-                                *mem = Arc::new(cloned);
+                                mem.set_score(base * factor);
                                 demoted += 1;
                             }
                         }
@@ -4074,7 +4060,7 @@ impl super::MemorySystem {
         // The memory an ordinal pin put first. Later layers re-sort by score (Layer 5.95 does
         // whenever the query has focal entities), and a pin that only moved a position was
         // undone by them; it is re-asserted once at the end of recall.
-        let mut ordinal_pin: Option<SharedMemory> = None;
+        let mut ordinal_pin: Option<Scored> = None;
         {
             let ql = query_text.to_lowercase();
 
@@ -4166,9 +4152,7 @@ impl super::MemorySystem {
                     for (mid, &boost) in relevant_recent.iter().zip(boosts.iter()) {
                         if let Some(mem) = memories.iter_mut().find(|m| m.id == *mid) {
                             let base = mem.score.unwrap_or(0.0);
-                            let mut cloned: Memory = mem.as_ref().clone();
-                            cloned.set_score(base + boost);
-                            *mem = Arc::new(cloned);
+                            mem.set_score(base + boost);
                         }
                     }
                     memories
@@ -4211,7 +4195,7 @@ impl super::MemorySystem {
                                         {
                                             continue;
                                         }
-                                        memories.push(Arc::new(mem));
+                                        memories.push(Scored::shared(Arc::new(mem)));
                                         injected += 1;
                                     }
                                 }
@@ -4220,10 +4204,7 @@ impl super::MemorySystem {
                             for mem in memories.iter_mut() {
                                 if session_ids.contains(&mem.id) {
                                     let base = mem.score.unwrap_or(0.0);
-                                    let mut cloned: Memory = mem.as_ref().clone();
-                                    cloned
-                                        .set_score(base + crate::constants::ORDINAL_SESSION_BOOST);
-                                    *mem = Arc::new(cloned);
+                                    mem.set_score(base + crate::constants::ORDINAL_SESSION_BOOST);
                                 }
                             }
                             memories.sort_by(|a, b| {
@@ -4260,9 +4241,7 @@ impl super::MemorySystem {
                     );
                     for mem in memories.iter_mut() {
                         let base = mem.score.unwrap_or(0.0);
-                        let mut cloned: Memory = mem.as_ref().clone();
-                        cloned.set_score(base * 0.50);
-                        *mem = Arc::new(cloned);
+                        mem.set_score(base * 0.50);
                     }
                 }
             }
@@ -4470,16 +4449,12 @@ impl super::MemorySystem {
                     // Thin memory: covers less than half the query entities
                     let penalty = 0.90 + 0.10 * coverage_ratio; // 0.90-0.95
                     let base = mem.score.unwrap_or(0.0);
-                    let mut cloned: Memory = mem.as_ref().clone();
-                    cloned.set_score(base * penalty);
-                    *mem = Arc::new(cloned);
+                    mem.set_score(base * penalty);
                 } else if coverage_ratio > 0.8 && entity_count >= 2.0 {
                     // Rich memory: covers most query entities
                     let boost = 1.0 + 0.05 * (coverage_ratio - 0.8); // 1.00-1.01
                     let base = mem.score.unwrap_or(0.0);
-                    let mut cloned: Memory = mem.as_ref().clone();
-                    cloned.set_score(base * boost);
-                    *mem = Arc::new(cloned);
+                    mem.set_score(base * boost);
                 }
             }
 
@@ -4528,13 +4503,14 @@ impl super::MemorySystem {
                                             continue;
                                         }
                                         if view.tier == CandidateTier::LongTerm {
-                                            let mut scored = view.memory.as_ref().clone();
                                             // Score slightly below top result to avoid
                                             // displacing the original match entirely
-                                            scored.set_score(top_score * 0.85 * fact.confidence);
-                                            memories.push(Arc::new(scored));
+                                            memories.push(Scored::scored(
+                                                Arc::clone(&view.memory),
+                                                top_score * 0.85 * fact.confidence,
+                                            ));
                                         } else {
-                                            memories.push(Arc::clone(&view.memory));
+                                            memories.push(Scored::shared(Arc::clone(&view.memory)));
                                         }
                                         injected += 1;
                                     }
@@ -4563,6 +4539,11 @@ impl super::MemorySystem {
                 }
             }
         }
+
+        // The survivors become the result: one copy of each record a layer scored, carrying
+        // its score, and the shared record for one no layer scored.
+        let mut memories: Vec<SharedMemory> =
+            memories.into_iter().map(Scored::into_shared).collect();
 
         // Usage writes from here on (access counts, coactivation, retrieval counter) are
         // skipped under read-only recall — see `recall_readonly()`.
@@ -4967,6 +4948,10 @@ impl super::MemorySystem {
         }
 
         if let Some(pinned) = ordinal_pin {
+            let pinned = match memories.iter().find(|m| m.id == pinned.id) {
+                Some(kept) => Arc::clone(kept),
+                None => pinned.into_shared(),
+            };
             Self::reassert_ordinal_pin(&mut memories, pinned, query.max_results);
         }
 
@@ -5256,7 +5241,7 @@ impl super::MemorySystem {
     }
 
     /// Entity-aware retrieval-time competition for the live recall path.
-    fn compete_memories(memories: &mut Vec<SharedMemory>, mode: CompetitionMode) -> (usize, usize) {
+    fn compete_memories(memories: &mut Vec<Scored>, mode: CompetitionMode) -> (usize, usize) {
         use crate::constants::{COMPETITION_ENTITY_OVERLAP_MIN, COMPETITION_MAX_PAIRS};
 
         if mode == CompetitionMode::Coexist || memories.len() < 2 {
@@ -5358,28 +5343,11 @@ impl super::MemorySystem {
                         };
 
                         let weaker_score = memories[weaker_idx].score.unwrap_or(0.0);
-                        let mut weaker_clone: Memory = memories[weaker_idx].as_ref().clone();
-                        weaker_clone.set_score(weaker_score - penalty);
-                        weaker_clone
-                            .experience
-                            .metadata
-                            .insert("competition_conflict".to_string(), "true".to_string());
-                        weaker_clone.experience.metadata.insert(
-                            "competition_opponent".to_string(),
-                            memories[stronger_idx].id.0.to_string(),
-                        );
-                        memories[weaker_idx] = Arc::new(weaker_clone);
-
-                        let mut stronger_clone: Memory = memories[stronger_idx].as_ref().clone();
-                        stronger_clone
-                            .experience
-                            .metadata
-                            .insert("competition_conflict".to_string(), "true".to_string());
-                        stronger_clone.experience.metadata.insert(
-                            "competition_opponent".to_string(),
-                            memories[weaker_idx].id.0.to_string(),
-                        );
-                        memories[stronger_idx] = Arc::new(stronger_clone);
+                        let stronger_id = memories[stronger_idx].id.clone();
+                        let weaker_id = memories[weaker_idx].id.clone();
+                        memories[weaker_idx].set_score(weaker_score - penalty);
+                        memories[weaker_idx].mark_competing(&stronger_id);
+                        memories[stronger_idx].mark_competing(&weaker_id);
                         continue;
                     }
                     CompetitionMode::Coexist => continue,
@@ -5845,7 +5813,7 @@ impl super::MemorySystem {
     ///
     /// Reference: Berntsen (2021) — functional constraints on involuntary memory
     /// prevent loose associations from dominating retrieval.
-    fn apply_mmr(memories: &[SharedMemory], lambda: f32, k: usize) -> Vec<SharedMemory> {
+    fn apply_mmr(memories: &[Scored], lambda: f32, k: usize) -> Vec<Scored> {
         if memories.len() <= 1 || k == 0 {
             return memories.to_vec();
         }
@@ -6044,7 +6012,7 @@ pub(crate) fn query_token_matches_entity(token: &str, entity: &str) -> bool {
 ///
 /// [`COMPETITION_POOL_HEADROOM`]: crate::constants::COMPETITION_POOL_HEADROOM
 /// [`INTERFERENCE_SIMILARITY_THRESHOLD`]: crate::constants::INTERFERENCE_SIMILARITY_THRESHOLD
-fn competition_similarity_floor(pool: &[SharedMemory]) -> f32 {
+fn competition_similarity_floor<M: std::ops::Deref<Target = Memory>>(pool: &[M]) -> f32 {
     use crate::constants::{COMPETITION_POOL_HEADROOM, INTERFERENCE_SIMILARITY_THRESHOLD};
     let vectors: Vec<&[f32]> = pool
         .iter()
@@ -6065,6 +6033,84 @@ fn competition_similarity_floor(pool: &[SharedMemory]) -> f32 {
     sims.sort_by(|a, b| a.total_cmp(b));
     let median = sims[sims.len() / 2];
     (median + COMPETITION_POOL_HEADROOM * (1.0 - median)).max(INTERFERENCE_SIMILARITY_THRESHOLD)
+}
+
+/// A candidate in the layers after Layer 5: the shared record and the score those layers
+/// adjust. A layer rescoring a candidate writes `score` here; the record (content,
+/// embeddings) is copied once, by [`Scored::into_shared`], and only for a candidate that
+/// survives into the result. Field access reads `score` from here and everything else from
+/// the record.
+#[derive(Clone)]
+struct Scored {
+    memory: SharedMemory,
+    score: Option<f32>,
+    /// Whether a layer has scored this candidate, so that the result carries `score` on its
+    /// own copy of the record. A record that entered with the score it carries and was never
+    /// rescored is returned as the shared record itself.
+    rescored: bool,
+}
+
+impl Scored {
+    /// A candidate a layer has just scored.
+    fn scored(memory: SharedMemory, score: f32) -> Self {
+        Self {
+            memory,
+            score: Some(score),
+            rescored: true,
+        }
+    }
+
+    /// A record entering with the score it already carries.
+    fn shared(memory: SharedMemory) -> Self {
+        let score = memory.score;
+        Self {
+            memory,
+            score,
+            rescored: false,
+        }
+    }
+
+    fn set_score(&mut self, score: f32) {
+        self.score = Some(score);
+        self.rescored = true;
+    }
+
+    /// Flag the candidate as one of a competing pair, naming its opponent, on a copy of the
+    /// record that also carries the candidate's score.
+    fn mark_competing(&mut self, opponent: &MemoryId) {
+        let mut memory = self.memory.as_ref().clone();
+        memory.score = self.score;
+        memory
+            .experience
+            .metadata
+            .insert("competition_conflict".to_string(), "true".to_string());
+        memory
+            .experience
+            .metadata
+            .insert("competition_opponent".to_string(), opponent.0.to_string());
+        self.memory = Arc::new(memory);
+        self.rescored = false;
+    }
+
+    /// The result entry: the shared record when no layer scored the candidate, otherwise
+    /// one copy carrying the score, independent of the record the tiers and the candidate
+    /// projection hold (no copy when nothing else holds it).
+    fn into_shared(self) -> SharedMemory {
+        if !self.rescored {
+            return self.memory;
+        }
+        let mut memory = Arc::try_unwrap(self.memory).unwrap_or_else(|shared| (*shared).clone());
+        memory.score = self.score;
+        Arc::new(memory)
+    }
+}
+
+impl std::ops::Deref for Scored {
+    type Target = Memory;
+
+    fn deref(&self) -> &Memory {
+        &self.memory
+    }
 }
 
 /// Orders each run of exactly equal scores in a score-sorted list by content, then id.
@@ -6921,6 +6967,143 @@ mod ordinal_pin_tests {
         MemorySystem::reassert_ordinal_pin(&mut list, pinned.clone(), 10);
         assert_eq!(list[0].id, pinned.id);
         assert_eq!(list[0].score, Some(0.95));
+    }
+}
+
+#[cfg(test)]
+mod scored_candidate_tests {
+    use super::Scored;
+    use crate::memory::types::{CompetitionMode, Experience, Memory, MemoryId, SharedMemory};
+    use crate::memory::MemorySystem;
+    use std::sync::Arc;
+
+    fn record(content: &str, embedding: Vec<f32>, entities: &[&str]) -> SharedMemory {
+        Arc::new(Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                content: content.to_string(),
+                embeddings: Some(embedding),
+                entities: entities.iter().map(|e| e.to_string()).collect(),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    /// What the layers did before: a deep copy of the record for every score they set.
+    fn copy_with_score(memory: &SharedMemory, score: f32) -> SharedMemory {
+        let mut copy: Memory = memory.as_ref().clone();
+        copy.set_score(score);
+        Arc::new(copy)
+    }
+
+    /// Scoring, rescoring and re-sorting candidates gives the order and scores the copying
+    /// layers gave, and the shared records keep their own score.
+    #[test]
+    fn rescoring_candidates_matches_rescoring_copies() {
+        let records: Vec<SharedMemory> = (0..4)
+            .map(|i| record(&format!("memory {i}"), vec![i as f32, 1.0], &[]))
+            .collect();
+        let base = [0.4_f32, 0.9, 0.6, 0.2];
+        let factor = [1.0_f32, 0.5, 1.2, 3.0];
+
+        let mut copies: Vec<SharedMemory> = records
+            .iter()
+            .zip(base)
+            .map(|(m, b)| copy_with_score(m, b))
+            .collect();
+        for (m, f) in copies.iter_mut().zip(factor) {
+            if f != 1.0 {
+                *m = copy_with_score(m, m.score.unwrap() * f);
+            }
+        }
+        copies.sort_by(|a, b| b.score.unwrap().total_cmp(&a.score.unwrap()));
+
+        let mut candidates: Vec<Scored> = records
+            .iter()
+            .zip(base)
+            .map(|(m, b)| Scored::scored(Arc::clone(m), b))
+            .collect();
+        for (m, f) in candidates.iter_mut().zip(factor) {
+            if f != 1.0 {
+                let rescored = m.score.unwrap() * f;
+                m.set_score(rescored);
+            }
+        }
+        candidates.sort_by(|a, b| b.score.unwrap().total_cmp(&a.score.unwrap()));
+        let result: Vec<SharedMemory> = candidates.into_iter().map(Scored::into_shared).collect();
+
+        assert_eq!(result.len(), copies.len());
+        for (got, want) in result.iter().zip(&copies) {
+            assert_eq!(got.id, want.id);
+            assert_eq!(got.score.map(f32::to_bits), want.score.map(f32::to_bits));
+            assert_eq!(got.experience.content, want.experience.content);
+        }
+        assert!(records.iter().all(|m| m.score.is_none()));
+    }
+
+    /// A scored result is a copy whose usage state is its own, as the copying layers'
+    /// results were; a record no layer scored is returned as the shared record.
+    #[test]
+    fn a_scored_result_is_independent_and_an_unscored_one_is_shared() {
+        let shared = record("held by a tier", vec![1.0, 0.0], &[]);
+        let held = Arc::clone(&shared);
+
+        let result = Scored::scored(Arc::clone(&shared), 0.7).into_shared();
+        assert!(!Arc::ptr_eq(&result, &shared));
+        assert_eq!(result.score, Some(0.7));
+        result.set_activation(0.25);
+        assert_eq!(shared.activation(), 1.0, "the tier's record is untouched");
+
+        let untouched = Scored::shared(Arc::clone(&shared)).into_shared();
+        assert!(Arc::ptr_eq(&untouched, &held));
+    }
+
+    /// Surfaced competitors are flagged with their opponents on copies carrying the
+    /// candidate scores, the weaker one demoted, and the records they came from unchanged.
+    #[test]
+    fn surfaced_competitors_are_flagged_on_copies() {
+        let strong = record(
+            "deploys run on fridays",
+            vec![1.0, 0.0, 0.0],
+            &["deploy", "friday"],
+        );
+        let weak = record(
+            "deploys run on fridays now",
+            vec![1.0, 0.001, 0.0],
+            &["deploy", "friday"],
+        );
+        let mut pool = vec![
+            Scored::scored(Arc::clone(&strong), 0.8),
+            Scored::scored(Arc::clone(&weak), 0.6),
+        ];
+        let (competitions, eliminated) =
+            MemorySystem::compete_memories(&mut pool, CompetitionMode::SurfaceBoth);
+        assert_eq!((competitions, eliminated), (1, 0));
+        let result: Vec<SharedMemory> = pool.into_iter().map(Scored::into_shared).collect();
+
+        assert_eq!(result[0].score, Some(0.8));
+        assert!((result[1].score.unwrap() - 0.59).abs() < 1e-6);
+        assert_eq!(
+            result[0].experience.metadata.get("competition_opponent"),
+            Some(&weak.id.0.to_string())
+        );
+        assert_eq!(
+            result[1].experience.metadata.get("competition_opponent"),
+            Some(&strong.id.0.to_string())
+        );
+        assert!(result.iter().all(|m| m
+            .experience
+            .metadata
+            .get("competition_conflict")
+            .map(String::as_str)
+            == Some("true")));
+        assert!(strong.experience.metadata.is_empty() && weak.experience.metadata.is_empty());
+        assert!(strong.score.is_none() && weak.score.is_none());
     }
 }
 
