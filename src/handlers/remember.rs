@@ -78,32 +78,38 @@ pub(crate) enum SnapshotKind {
     Update,
 }
 
-/// Journal `memory`, as just written to the primary store, through the
-/// tenant's intent log so every projection (SQLite, Vamana, BM25, wiki) sees
-/// the write. The store already holds it durably, so a failure is logged and
-/// the request still succeeds; C2 reconcile on the next open backfills a
-/// frame that never landed. Blocking: run it off the async executor.
+/// Queue the intent-log frame of `memory`, as just written to the primary
+/// store, so every projection (SQLite, Vamana, BM25, wiki) sees the write.
+/// Wait on the result after releasing the gate. The store already holds the
+/// write durably, so a frame that cannot be queued is logged and comes back
+/// empty: the request still succeeds and C2 reconcile on the next open
+/// backfills the frame. Blocking.
 ///
 /// `_gate` is the tenant's write gate, held from the store write through this
-/// append: the frame carries the caller's copy, not a fresh read, so a write to
-/// the same memory landing in between would leave the log behind the store.
-pub(crate) fn journal_memory_snapshot(
+/// call: the frame carries the caller's copy, not a fresh read, and its place
+/// in the log is fixed here, so a write to the same memory landing in between
+/// would leave the log behind the store.
+pub(crate) fn enqueue_snapshot(
     state: &super::state::MultiUserMemoryManager,
     user_id: &str,
     memory: &crate::memory::Memory,
     kind: SnapshotKind,
     _gate: &crate::memory::write_gate::WriteGuard<'_>,
-) {
+) -> super::state::JournalPending {
     let Some(payload) = snapshot_payload(user_id, memory, kind) else {
-        return;
+        return super::state::JournalPending::empty(user_id);
     };
-    if let Err(e) = state.journal_and_apply(user_id, &payload) {
-        tracing::warn!(
-            user_id = %user_id,
-            memory_id = %memory.id.0,
-            error = %e,
-            "intent-log journal_and_apply failed (RocksDB write already durable)",
-        );
+    match state.journal_enqueue(user_id, std::slice::from_ref(&payload)) {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::warn!(
+                user_id = %user_id,
+                memory_id = %memory.id.0,
+                error = %e,
+                "intent-log frame not queued (store write already durable)",
+            );
+            super::state::JournalPending::empty(user_id)
+        }
     }
 }
 
@@ -143,63 +149,42 @@ pub(crate) fn snapshot_payload(
     })
 }
 
-/// Journal many frames for one tenant: one writer-lock acquisition and one
-/// fsync per chunk instead of per frame. Failure handling as
-/// [`journal_memory_snapshot`]: the store already holds the writes, so a
-/// chunk that cannot be journaled is logged and C2 reconcile backfills it on
-/// the next open. Blocking.
-pub(crate) fn journal_batch(
+/// Queue many frames for one tenant, in chunks that each commit whole or not
+/// at all, under the write gate the caller holds (`_gate`), so their LSNs follow
+/// the store writes they record. Wait on the result after releasing the gate;
+/// the chunks join whichever group commit runs then, with the frames other
+/// writers queued meanwhile. Failure handling as [`enqueue_snapshot`]: the
+/// store already holds the writes, so a chunk that cannot be queued is logged
+/// and C2 reconcile backfills it on the next open. Blocking.
+pub(crate) fn enqueue_batch(
     state: &super::state::MultiUserMemoryManager,
     user_id: &str,
     payloads: &[crate::intent_log::IntentPayload],
-) {
+    _gate: &crate::memory::write_gate::WriteGuard<'_>,
+) -> super::state::JournalPending {
+    // Bounds one write's records: a group syncs all of a write at once, and a
+    // multi-thousand-frame write would hold every queued writer behind it.
     const CHUNK: usize = 256;
-    if payloads.is_empty() {
-        return;
-    }
-    let writer = match state.get_user_journaled_writer(user_id) {
-        Ok(writer) => writer,
-        Err(e) => {
-            tracing::warn!(
-                user_id = %user_id,
-                frames = payloads.len(),
-                error = %e,
-                "intent-log journal unavailable; batch not journaled (store writes already durable)",
-            );
-            return;
-        }
-    };
+    let mut pending = super::state::JournalPending::empty(user_id);
     for chunk in payloads.chunks(CHUNK) {
-        let outcomes = writer.lock().record_and_apply_batch(chunk);
-        match outcomes {
-            Ok(outcomes) => {
-                for outcome in &outcomes {
-                    for err in &outcome.apply_errors {
-                        tracing::warn!(
-                            user_id = %user_id,
-                            projection = %err.projection,
-                            lsn = outcome.lsn.0,
-                            error = %err.source,
-                            "projection apply failed during journaled batch (log durable; replay will retry)",
-                        );
-                    }
-                }
-            }
+        match state.journal_enqueue(user_id, chunk) {
+            Ok(queued) => pending.absorb(queued),
             Err(e) => tracing::warn!(
                 user_id = %user_id,
                 frames = chunk.len(),
                 error = %e,
-                "intent-log batch could not be journaled (store writes already durable)",
+                "intent-log batch not queued (store writes already durable)",
             ),
         }
     }
+    pending
 }
 
 /// Journal `Update` (or `Remember`) snapshots of `ids` as the store holds them
-/// now, in one batch. The snapshots are read and appended under the tenant's
-/// write gate, so each frame is the store's state at its place in the log, and
-/// a write that lands after the read journals its own frame after this one.
-/// Blocking.
+/// now. The snapshots are read and queued under the tenant's write gate, so
+/// each frame is the store's state at its place in the log, and a write that
+/// lands after the read journals its own frame after this one; the sync is
+/// waited for after the gate is released. Blocking.
 pub(crate) fn journal_stored(
     state: &super::state::MultiUserMemoryManager,
     memory: &SharedUserMemory,
@@ -207,22 +192,28 @@ pub(crate) fn journal_stored(
     ids: &[crate::memory::MemoryId],
     kind: SnapshotKind,
 ) {
-    let guard = memory.read();
-    let _gate = guard.journal_section();
-    let payloads: Vec<_> = ids
-        .iter()
-        .filter_map(|id| match guard.get_memory(id) {
-            Ok(stored) => snapshot_payload(user_id, &stored, kind),
-            Err(e) => {
-                tracing::warn!(
-                    memory_id = %id.0,
-                    "snapshot not journaled, memory unreadable: {e}"
-                );
-                None
-            }
-        })
-        .collect();
-    journal_batch(state, user_id, &payloads);
+    if ids.is_empty() {
+        return;
+    }
+    let pending = {
+        let guard = memory.read();
+        let gate = guard.journal_section();
+        let payloads: Vec<_> = ids
+            .iter()
+            .filter_map(|id| match guard.get_memory(id) {
+                Ok(stored) => snapshot_payload(user_id, &stored, kind),
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %id.0,
+                        "snapshot not journaled, memory unreadable: {e}"
+                    );
+                    None
+                }
+            })
+            .collect();
+        enqueue_batch(state, user_id, &payloads, &gate)
+    };
+    pending.wait_logged("stored snapshot");
 }
 
 /// Complete a journaled write's deferred embedding and journal a snapshot of
@@ -1346,44 +1337,13 @@ pub async fn remember(
         let memory_for_journal = memory.clone();
         let mid = memory_id.clone();
         let journal_join = tokio::task::spawn_blocking(move || {
-            // Read and appended under the write gate: see `journal_stored`.
-            let guard = memory_for_journal.read();
-            let _gate = guard.journal_section();
-            let bincode = match guard.get_memory(&mid) {
-                Ok(mem) => match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!(
-                            memory_id = %mid.0,
-                            error = %e,
-                            "skipping intent-log journal: failed to bincode memory snapshot",
-                        );
-                        return;
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        memory_id = %mid.0,
-                        error = %e,
-                        "skipping intent-log journal: memory not retrievable from primary store",
-                    );
-                    return;
-                }
-            };
-            let payload = crate::intent_log::IntentPayload::Remember {
-                user_id: user_id.clone(),
-                memory_id: mid.0.to_string(),
-                memory_bincode: bincode,
-                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
-            };
-            if let Err(e) = state.journal_and_apply(&user_id, &payload) {
-                tracing::warn!(
-                    user_id = %user_id,
-                    memory_id = %mid.0,
-                    error = %e,
-                    "intent-log journal_and_apply failed (RocksDB write already durable; SQLite projection will catch up on next replay)",
-                );
-            }
+            journal_stored(
+                &state,
+                &memory_for_journal,
+                &user_id,
+                std::slice::from_ref(&mid),
+                SnapshotKind::Remember,
+            );
         });
         if let Err(e) = journal_join.await {
             tracing::warn!(
@@ -1725,7 +1685,7 @@ fn detect_and_resolve_conflicts(
     for candidate_id in candidate_ids.iter().take(CONFLICT_MAX_CANDIDATES) {
         // The candidate is read, decayed, stored and journaled under the write gate: a
         // write to it in between would be overwritten by this copy, or journaled before it.
-        let (sim, text_sim, old_entities) = {
+        let (sim, text_sim, old_entities, frame) = {
             let gate = memory_guard.journal_section();
             let mut candidate = match memory_guard.get_memory(candidate_id) {
                 Ok(m) => m,
@@ -1767,12 +1727,13 @@ fn detect_and_resolve_conflicts(
             candidate.set_importance(old_importance * CONFLICT_IMPORTANCE_DECAY);
             candidate.set_valid_until(chrono::Utc::now());
             memory_guard.update_memory_journaled(&candidate)?;
-            journal_memory_snapshot(state, user_id, &candidate, SnapshotKind::Update, &gate);
+            let frame = enqueue_snapshot(state, user_id, &candidate, SnapshotKind::Update, &gate);
 
             let old_entities: Vec<uuid::Uuid> =
                 candidate.entity_refs.iter().map(|e| e.entity_id).collect();
-            (sim, text_sim, old_entities)
+            (sim, text_sim, old_entities, frame)
         };
+        frame.wait_logged("conflict resolution");
 
         // Create SupersededBy edge in graph
         let now = chrono::Utc::now();
@@ -2136,24 +2097,13 @@ pub async fn batch_remember(
             .map(crate::memory::MemoryId)
             .collect();
         let journal_join = tokio::task::spawn_blocking(move || {
-            // Read and appended under the write gate: see `journal_stored`.
-            let guard = memory_for_journal.read();
-            let _gate = guard.journal_section();
-            let payloads: Vec<_> = ids
-                .iter()
-                .filter_map(|mid| match guard.get_memory(mid) {
-                    Ok(stored) => snapshot_payload(&user_id, &stored, SnapshotKind::Remember),
-                    Err(e) => {
-                        tracing::warn!(
-                            memory_id = %mid.0,
-                            error = %e,
-                            "skipping intent-log journal (batch): memory not retrievable from primary store",
-                        );
-                        None
-                    }
-                })
-                .collect();
-            journal_batch(&state, &user_id, &payloads);
+            journal_stored(
+                &state,
+                &memory_for_journal,
+                &user_id,
+                &ids,
+                SnapshotKind::Remember,
+            );
         });
         if let Err(e) = journal_join.await {
             tracing::warn!(
@@ -2728,57 +2678,18 @@ pub async fn upsert_memory(
         let mid = memory_id.clone();
         let is_update = was_update;
         let journal_join = tokio::task::spawn_blocking(move || {
-            // Read and appended under the write gate: see `journal_stored`.
-            let guard = memory_system_for_journal.read();
-            let _gate = guard.journal_section();
-            let bincode = match guard.get_memory(&mid) {
-                Ok(mem) => match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!(
-                            memory_id = %mid.0,
-                            error = %e,
-                            "skipping intent-log journal (upsert): bincode encode failed",
-                        );
-                        return;
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        memory_id = %mid.0,
-                        error = %e,
-                        "skipping intent-log journal (upsert): memory not retrievable",
-                    );
-                    return;
-                }
-            };
-            let payload = if is_update {
-                crate::intent_log::IntentPayload::Update {
-                    user_id: user_id.clone(),
-                    memory_id: mid.0.to_string(),
-                    memory_bincode: bincode,
-                    schema_version: Some(
-                        crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION,
-                    ),
-                }
+            let kind = if is_update {
+                SnapshotKind::Update
             } else {
-                crate::intent_log::IntentPayload::Remember {
-                    user_id: user_id.clone(),
-                    memory_id: mid.0.to_string(),
-                    memory_bincode: bincode,
-                    schema_version: Some(
-                        crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION,
-                    ),
-                }
+                SnapshotKind::Remember
             };
-            if let Err(e) = state_clone.journal_and_apply(&user_id, &payload) {
-                tracing::warn!(
-                    user_id = %user_id,
-                    memory_id = %mid.0,
-                    error = %e,
-                    "intent-log journal_and_apply (upsert) failed (RocksDB write already durable)",
-                );
-            }
+            journal_stored(
+                &state_clone,
+                &memory_system_for_journal,
+                &user_id,
+                std::slice::from_ref(&mid),
+                kind,
+            );
         });
         // Awaited before responding — see the matching comment in
         // `remember`: a detached journal task leaves a store-ahead-of-log
@@ -3031,5 +2942,196 @@ mod declared_and_ner_tests {
             "caller tag, NER, a YAKE keyword NER lacked, then cold start on an empty graph"
         );
         assert_eq!(assembled.ner_entities.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod group_commit_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::upsert_journaled;
+    use crate::handlers::test_helpers::TestHarness;
+    use crate::intent_log::IntentPayload;
+    use crate::memory::types::ChangeType;
+    use crate::memory::{Experience, MemoryId};
+    use crate::metrics::INTENT_LOG_SYNC_SHARED_TOTAL;
+
+    fn upsert(
+        harness: &TestHarness,
+        memory: &crate::user_memory::SharedUserMemory,
+        user_id: &str,
+        external_id: &str,
+        content: String,
+    ) -> MemoryId {
+        upsert_journaled(
+            &harness.manager,
+            memory,
+            user_id,
+            external_id.to_string(),
+            Experience {
+                content,
+                ..Default::default()
+            },
+            ChangeType::ContentUpdated,
+            None,
+        )
+        .unwrap()
+        .0
+    }
+
+    /// Every frame in `user_id`'s log, in LSN order.
+    fn frames(harness: &TestHarness, user_id: &str) -> Vec<IntentPayload> {
+        let writer = harness.manager.get_user_journaled_writer(user_id).unwrap();
+        let writer = writer.lock();
+        writer
+            .log()
+            .iter()
+            .unwrap()
+            .map(|record| {
+                crate::intent_log::payload::decode_record(&record.unwrap())
+                    .unwrap()
+                    .1
+            })
+            .collect()
+    }
+
+    /// Two writers to one tenant whose frames are queued while a sync runs
+    /// commit together: the second reaches the journal queue while the first
+    /// waits for the sync, which it could not while the write gate was held
+    /// through the sync.
+    #[test]
+    fn two_writers_on_one_tenant_share_one_sync() {
+        let harness = Arc::new(TestHarness::new());
+        let user_id = "group-commit-user";
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let writer = harness.manager.get_user_journaled_writer(user_id).unwrap();
+        let shared_before = INTENT_LOG_SYNC_SHARED_TOTAL.get();
+
+        // Holding the writer stands in for a sync in progress.
+        let in_sync = writer.lock();
+        let writers: Vec<_> = (0..2)
+            .map(|i| {
+                let harness = Arc::clone(&harness);
+                let memory = memory.clone();
+                std::thread::spawn(move || {
+                    upsert(
+                        &harness,
+                        &memory,
+                        user_id,
+                        &format!("group-{i}"),
+                        format!("writer {i} files the harbour tide table for the ferry desk"),
+                    )
+                })
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while writer.queued_writes() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the two writes never reached the journal queue together"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(in_sync);
+        let ids: Vec<MemoryId> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+
+        assert!(
+            INTENT_LOG_SYNC_SHARED_TOTAL.get() > shared_before,
+            "one writer's sync covered the other's frame"
+        );
+        let logged: Vec<String> = frames(&harness, user_id)
+            .iter()
+            .map(|p| p.memory_id().to_string())
+            .collect();
+        for id in &ids {
+            assert!(logged.contains(&id.0.to_string()), "{} was journaled", id.0);
+        }
+    }
+
+    /// Upserts and forgets racing on the same memories leave, for every memory
+    /// id, a last frame that says what the store holds: a snapshot equal to the
+    /// stored record, or a `Forget` for a record the store no longer has.
+    #[test]
+    fn concurrent_upserts_and_forgets_leave_each_ids_last_frame_matching_the_store() {
+        const KEYS: usize = 3;
+        const ROUNDS: usize = 5;
+        let harness = Arc::new(TestHarness::new());
+        let user_id = "group-commit-race-user";
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+
+        let mut threads = Vec::new();
+        for key in 0..KEYS {
+            let harness = Arc::clone(&harness);
+            let memory = memory.clone();
+            threads.push(std::thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    upsert(
+                        &harness,
+                        &memory,
+                        user_id,
+                        &format!("race-{key}"),
+                        format!("key {key} round {round}: the lighthouse lamp needs a new wick"),
+                    );
+                }
+            }));
+        }
+        {
+            let harness = Arc::clone(&harness);
+            let memory = memory.clone();
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    for key in 0..KEYS {
+                        let found = memory
+                            .read()
+                            .find_by_external_id(&format!("race-{key}"))
+                            .unwrap();
+                        if let Some(stored) = found {
+                            crate::handlers::crud::forget_one_journaled(
+                                &harness.manager,
+                                &memory.read(),
+                                user_id,
+                                stored.id,
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let mut last: HashMap<String, IntentPayload> = HashMap::new();
+        for frame in frames(&harness, user_id) {
+            last.insert(frame.memory_id().to_string(), frame);
+        }
+        assert!(!last.is_empty());
+        let guard = memory.read();
+        for (id, frame) in last {
+            let memory_id = MemoryId(uuid::Uuid::parse_str(&id).unwrap());
+            match frame {
+                IntentPayload::Forget { .. } => assert!(
+                    !matches!(guard.is_stored(&memory_id), Ok(true)),
+                    "{id}: the last frame forgets a memory the store holds"
+                ),
+                IntentPayload::Remember { memory_bincode, .. }
+                | IntentPayload::Update { memory_bincode, .. } => {
+                    let logged =
+                        crate::memory::storage::decode_memory_snapshot(&memory_bincode).unwrap();
+                    let stored = guard
+                        .get_memory(&memory_id)
+                        .unwrap_or_else(|e| panic!("{id}: logged live, missing from store: {e}"));
+                    assert_eq!(
+                        (&logged.experience.content, logged.version),
+                        (&stored.experience.content, stored.version),
+                        "{id}: the last frame is not the stored record"
+                    );
+                }
+                other => panic!("{id}: unexpected frame {other:?}"),
+            }
+        }
     }
 }

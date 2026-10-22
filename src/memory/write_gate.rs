@@ -9,13 +9,16 @@
 //! every queued or later writer away with [`WritesClosed`], which the HTTP layer
 //! answers as a retryable 503.
 //!
-//! The gate also orders the tenant's intent log. A write path appends its frame while
-//! it still holds the gate, from a snapshot it read under the gate, so the log takes
-//! the frames for one memory in the order the store took the writes; replication
-//! followers and projections apply in log order, and a frame appended out of that
-//! order leaves them stale or resurrects a deleted memory. Lock order: the gate, then
-//! the journal writer's mutex, then the graph's lock. Nothing that holds the journal
-//! mutex or a graph guard may enter the gate.
+//! The gate also orders the tenant's intent log. A write path queues its frame
+//! (`MultiUserMemoryManager::journal_enqueue`) while it still holds the gate, from the
+//! snapshot the store took under the gate, so the log takes the frames for one memory
+//! in the order the store took the writes; replication followers and projections apply
+//! in log order, and a frame out of that order leaves them stale or resurrects a
+//! deleted memory. The queue fixes a frame's LSN, so the gate is released before the
+//! sync is waited for: held through the sync, it would keep every other writer to the
+//! tenant out of the queue and no two writes would share a sync. Lock order: the gate,
+//! then the journal's queue and writer mutexes, then the graph's lock. Nothing that
+//! holds the journal mutex or a graph guard may enter the gate.
 //!
 //! The gate is re-entrant on its thread: a path that holds it across a store write and
 //! the append calls the store's own gated methods, which enter it again.

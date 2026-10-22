@@ -519,19 +519,23 @@ pub fn apply_replicated_page(
         }
     }
     let guard = memory_sys.read();
-    // Held from the first store write through the append, so no local write to these
-    // memories lands between a frame's store write and its place in this log.
-    let _gate = guard.journal_section();
+    // Held from the first store write until the page's frames are queued, so no local
+    // write to these memories lands between a frame's store write and its place in
+    // this log. The sync is waited for after the gate is released.
+    let gate = guard.journal_section();
     guard.upsert_memories(&snapshots)?;
     for (_, payload) in &frames {
         apply_non_snapshot(manager, user_id, payload)?;
     }
 
-    // One writer lock, append batch and fsync for the page rather than one per frame.
-    // All or nothing: a page that fails journals no frame, and its retry adds no
-    // duplicates of the frames before the failure.
+    // One write for the page rather than one per frame. All or nothing: a page that
+    // fails journals no frame, and its retry adds no duplicates of the frames before
+    // the failure.
     let payloads: Vec<IntentPayload> = frames.into_iter().map(|(_, payload)| payload).collect();
-    Ok(manager.journal_and_apply_batch(user_id, &payloads)?.len() as u64)
+    let page = manager.journal_enqueue(user_id, &payloads)?;
+    drop(gate);
+    drop(guard);
+    Ok(page.wait()?.len() as u64)
 }
 
 /// The store-side effect of a `Forget`, `Anchor` or `SetAnchored` frame; snapshots are handled in
