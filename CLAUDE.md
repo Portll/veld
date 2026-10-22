@@ -131,7 +131,7 @@ Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `Pri
 - **Background pipeline** ([src/handlers/consolidation.rs](src/handlers/consolidation.rs) `consolidate_memories`): fact extraction → maintenance (replay + tier consolidation + decay) → graph strengthening. Spawned as detached `tokio::task` (survives HTTP timeout). Guarded by per-user `CONSOLIDATION_LOCKS`.
 - **Sleep-phase consolidation**: `/api/consolidation/sleep` — deeper replay pass.
 - **Gap topology** ([src/memory/gap_topology/](src/memory/gap_topology/)): detector, scoring, Voronoi decomposition. Surfaces knowledge gaps in the graph.
-- **Session detection** ([src/memory/wavelet_sessions.rs](src/memory/wavelet_sessions.rs)): gap-based segmentation — a fixed 2h inter-memory gap threshold (`detect_sessions`) plus a partition-theoretic adaptive threshold (`detect_sessions_adaptive`: largest relative jump in the sorted gap distribution, with a Hardy-Ramanujan `(1 − 1/24)` modular correction, clamped to `[300s, 28800s]`). **No wavelet transform despite the module name** — the file name is legacy. Powers ordinal-session resolution in recall ("two sessions ago").
+- **Session detection** ([src/memory/wavelet_sessions.rs](src/memory/wavelet_sessions.rs)): gap-based segmentation — a fixed 2h inter-memory gap threshold (`detect_sessions`) plus an adaptive threshold (`detect_sessions_adaptive`: the largest relative jump between consecutive sorted gaps, searched only inside `[300s, 28800s]`, reported as the geometric mean of the chosen pair; recall does not use it yet). **No wavelet transform despite the module name** — the file name is legacy. Powers ordinal-session resolution in recall ("two sessions ago").
 
 ### Ingest
 
