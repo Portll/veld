@@ -1654,6 +1654,91 @@ mod proactive_integration_tests {
     }
 
     #[tokio::test]
+    async fn proactive_context_surfaces_only_the_requested_memory_types() {
+        let h = Harness::new();
+        let decision_id = store_memory_full(
+            &h,
+            "test-user",
+            "Decision: the release pipeline signs every build artifact with the hardware key",
+            "Decision",
+            &["release", "signing"],
+        )
+        .await;
+        let learning_id = store_memory_full(
+            &h,
+            "test-user",
+            "Learning: the release pipeline fails to sign an artifact when the hardware key sleeps",
+            "Learning",
+            &["release", "signing"],
+        )
+        .await;
+        wait_for_background_work(&h).await;
+
+        let surfaced = |memory_types: Value| {
+            let h = &h;
+            async move {
+                let (status, body) = json_of(
+                    h.app(),
+                    authed_post(
+                        "/api/proactive_context",
+                        json!({
+                            "user_id": "test-user",
+                            "context": "release pipeline artifact signing with the hardware key",
+                            "max_results": 10,
+                            "semantic_threshold": 0.0,
+                            "auto_ingest": false,
+                            "memory_types": memory_types,
+                        }),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                ids_of(body["memories"].as_array().unwrap())
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let unfiltered = surfaced(json!([])).await;
+        assert!(
+            unfiltered.contains(&decision_id) && unfiltered.contains(&learning_id),
+            "with no filter both types surface: {unfiltered:?}"
+        );
+        let learning_only = surfaced(json!(["learning"])).await;
+        assert!(
+            learning_only.contains(&learning_id),
+            "the requested type surfaces: {learning_only:?}"
+        );
+        assert!(
+            !learning_only.contains(&decision_id),
+            "another type does not surface: {learning_only:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_context_refuses_an_unknown_memory_type() {
+        let h = Harness::new();
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/proactive_context",
+                json!({
+                    "user_id": "test-user",
+                    "context": "release pipeline artifact signing with the hardware key",
+                    "memory_types": ["Decision", "Recipe"],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.to_string().contains("memory_types"),
+            "the error names the field: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn proactive_context_respects_max_results() {
         let h = Harness::new();
         for i in 0..5 {

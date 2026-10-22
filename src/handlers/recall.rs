@@ -280,7 +280,8 @@ pub struct ProactiveContextRequest {
     /// Weight for recency boost
     #[serde(default = "default_recency_weight")]
     pub recency_weight: f32,
-    /// Filter to specific memory types
+    /// Surface only memories of these types (e.g. `["Decision", "Learning"]`); empty means
+    /// every type except Intention. An unknown type is refused.
     #[serde(default)]
     pub memory_types: Vec<String>,
     /// Whether to auto-ingest the context as a Conversation memory. Off unless asked: hooks
@@ -1309,6 +1310,18 @@ pub async fn proactive_context(
         .transpose()
         .map_validation_err("repo")?;
     super::remember::validate_emotion(req.emotional_valence, req.emotional_arousal)?;
+    let memory_type_filter = req
+        .memory_types
+        .iter()
+        .map(|t| super::remember::parse_experience_type(Some(t)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| match e {
+            AppError::InvalidInput { reason, .. } => AppError::InvalidInput {
+                field: "memory_types".to_string(),
+                reason,
+            },
+            other => other,
+        })?;
     let evidence_source = state
         .session_store
         .get_or_create_session(&req.user_id)
@@ -1823,6 +1836,7 @@ pub async fn proactive_context(
                 recency_weight: Some(recency_weight),
                 rrf_k: rrf_k_for_context,
                 prospective_signals,
+                experience_types: (!memory_type_filter.is_empty()).then_some(memory_type_filter),
                 competition_mode: req.competition_mode,
                 evidence_source: Some(evidence_source_for_recall),
                 repo: repo_for_query,
