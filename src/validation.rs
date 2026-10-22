@@ -351,6 +351,21 @@ pub fn validate_weight(name: &str, value: f32) -> Result<()> {
     Ok(())
 }
 
+/// Validate an emotional valence (-1.0 to 1.0 inclusive, must be finite)
+pub fn validate_emotional_valence(valence: f32) -> Result<()> {
+    if !valence.is_finite() || !(-1.0..=1.0).contains(&valence) {
+        return Err(anyhow!(
+            "emotional_valence must be between -1.0 and 1.0, got: {valence}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an emotional arousal (0.0 to 1.0 inclusive, must be finite)
+pub fn validate_emotional_arousal(arousal: f32) -> Result<()> {
+    validate_weight("emotional_arousal", arousal)
+}
+
 /// Validate a reminder timestamp is not unreasonably far in the past or future
 pub fn validate_reminder_timestamp(at: &chrono::DateTime<chrono::Utc>) -> Result<()> {
     let now = chrono::Utc::now();
@@ -588,6 +603,22 @@ mod tests {
         assert!(validate_weight("test", 1.1).is_err());
         assert!(validate_weight("test", f32::NAN).is_err());
         assert!(validate_weight("test", f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn test_validate_emotion() {
+        assert!(validate_emotional_valence(-1.0).is_ok());
+        assert!(validate_emotional_valence(0.0).is_ok());
+        assert!(validate_emotional_valence(1.0).is_ok());
+        assert!(validate_emotional_valence(-1.5).is_err());
+        assert!(validate_emotional_valence(1.5).is_err());
+        assert!(validate_emotional_valence(f32::NAN).is_err());
+
+        assert!(validate_emotional_arousal(0.0).is_ok());
+        assert!(validate_emotional_arousal(1.0).is_ok());
+        assert!(validate_emotional_arousal(-0.1).is_err());
+        assert!(validate_emotional_arousal(1.5).is_err());
+        assert!(validate_emotional_arousal(f32::INFINITY).is_err());
     }
 
     #[test]

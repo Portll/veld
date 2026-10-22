@@ -22,7 +22,7 @@ use crate::errors::ValidationErrorExt;
 use crate::handlers::crud::forget_one_journaled;
 use crate::handlers::recall::recall_memory_view;
 use crate::handlers::remember::{
-    build_rich_context, parse_experience_type, remember_journaled, WriteOrigin,
+    build_rich_context, parse_experience_type, remember_journaled, validate_emotion, WriteOrigin,
 };
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::handlers::types::{MemoryEvent, RecallFact, RecallMemory, RecallResponse, RecallTodo};
@@ -323,6 +323,10 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     }
     if let Err(e) = validation::validate_content(&req.content, false).map_validation_err("content")
     {
+        warn!(user_id = %req.user_id, "Validation failed: {}", e);
+        return;
+    }
+    if let Err(e) = validate_emotion(req.emotional_valence, req.emotional_arousal) {
         warn!(user_id = %req.user_id, "Validation failed: {}", e);
         return;
     }

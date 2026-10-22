@@ -789,6 +789,18 @@ pub fn build_rich_context(
     Some(ctx)
 }
 
+/// Refuse an emotional valence outside -1.0 to 1.0 or an arousal outside 0.0 to 1.0,
+/// naming the field, before either reaches [`build_rich_context`].
+pub fn validate_emotion(valence: Option<f32>, arousal: Option<f32>) -> Result<(), AppError> {
+    if let Some(valence) = valence {
+        validation::validate_emotional_valence(valence).map_validation_err("emotional_valence")?;
+    }
+    if let Some(arousal) = arousal {
+        validation::validate_emotional_arousal(arousal).map_validation_err("emotional_arousal")?;
+    }
+    Ok(())
+}
+
 /// Start a write's tag list with the declared entity names, then the caller's tags.
 ///
 /// Declared names lead because they are authored and `entity_cap::cap_by_selectivity` keeps the
@@ -1156,6 +1168,7 @@ pub async fn remember(
         .map(validation::validate_repo)
         .transpose()
         .map_validation_err("repo")?;
+    validate_emotion(req.emotional_valence, req.emotional_arousal)?;
 
     // ── Ingest pipeline: extract clean text from structured formats ──────
     let (processed_content, ingest_tags) = if req.filename.is_some() || {
@@ -1848,6 +1861,13 @@ pub async fn batch_remember(
     let mut seen_content: HashSet<u64> = HashSet::new();
     for (index, mut item) in req.memories.into_iter().enumerate() {
         if let Err(e) = validation::validate_content(&item.content, false) {
+            validation_errors.push(BatchErrorItem {
+                index,
+                error: e.to_string(),
+            });
+            continue;
+        }
+        if let Err(e) = validate_emotion(item.emotional_valence, item.emotional_arousal) {
             validation_errors.push(BatchErrorItem {
                 index,
                 error: e.to_string(),

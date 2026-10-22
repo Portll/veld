@@ -478,7 +478,6 @@ mod remember_tests {
     }
 
     #[tokio::test]
-    #[ignore = "veld bug: /api/remember stores an emotional_valence outside [-1, 1] instead of refusing it"]
     async fn remember_emotional_valence_out_of_range_rejected() {
         let h = Harness::new();
         let status = status_of(
@@ -497,7 +496,6 @@ mod remember_tests {
     }
 
     #[tokio::test]
-    #[ignore = "veld bug: /api/remember stores an emotional_valence outside [-1, 1] instead of refusing it"]
     async fn remember_emotional_valence_negative_limit() {
         let h = Harness::new();
         let status = status_of(
@@ -516,7 +514,6 @@ mod remember_tests {
     }
 
     #[tokio::test]
-    #[ignore = "veld bug: /api/remember stores an emotional_arousal outside [0, 1] instead of refusing it"]
     async fn remember_emotional_arousal_out_of_range_rejected() {
         let h = Harness::new();
         let status = status_of(
@@ -535,7 +532,6 @@ mod remember_tests {
     }
 
     #[tokio::test]
-    #[ignore = "veld bug: /api/remember stores an emotional_arousal outside [0, 1] instead of refusing it"]
     async fn remember_emotional_arousal_negative_rejected() {
         let h = Harness::new();
         let status = status_of(
@@ -675,6 +671,55 @@ mod remember_tests {
         assert_eq!(status, StatusCode::OK);
         let created = body["created"].as_i64().unwrap_or(0);
         assert!(created >= 2, "Expected at least 2 created, got {created}");
+    }
+
+    #[tokio::test]
+    async fn batch_remember_refuses_out_of_range_emotion_per_item() {
+        let h = Harness::new();
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember/batch",
+                json!({
+                    "user_id": "test-user",
+                    "memories": [
+                        {"content": "Docked at the north pier after the storm passed"},
+                        {"content": "Refuelled at the south quay", "emotional_valence": 1.5},
+                        {"content": "Waited out the fog in the harbour", "emotional_arousal": -0.1},
+                    ],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["created"].as_i64(), Some(1), "{body}");
+        let errors = body["errors"].as_array().expect("errors array");
+        let indices: Vec<i64> = errors.iter().filter_map(|e| e["index"].as_i64()).collect();
+        assert_eq!(indices, vec![1, 2], "{body}");
+        assert!(errors[0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("emotional_valence")));
+        assert!(errors[1]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("emotional_arousal")));
+    }
+
+    #[tokio::test]
+    async fn proactive_context_refuses_out_of_range_emotion() {
+        let h = Harness::new();
+        let status = status_of(
+            h.app(),
+            authed_post(
+                "/api/proactive_context",
+                json!({
+                    "user_id": "test-user",
+                    "context": "Docked at the north pier after the storm passed",
+                    "emotional_valence": -1.5,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
