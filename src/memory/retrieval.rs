@@ -40,6 +40,10 @@ const SECONDARY_VAMANA_INDEX_FILE: &str = "secondary_vamana.idx";
 /// the secondary has none in the store, and rebuilding it at open decoded every memory.
 const SECONDARY_ID_MAP_FILE: &str = "secondary_id_map.bin";
 const SECONDARY_ID_MAP_MAGIC: [u8; 4] = *b"VSID";
+/// Vector mappings a rebuild or compaction writes per commit: one commit per memory made a
+/// 100k-memory rebuild on redb run for minutes, and one for the whole index would hold every
+/// encoded mapping at once.
+const MAPPING_WRITE_BATCH: usize = 10_000;
 const SECONDARY_ID_MAP_VERSION: u32 = 1;
 
 /// When [`RetrievalEngine::save_if_due`] writes the index files: a save rewrites every vector
@@ -1121,11 +1125,17 @@ impl RetrievalEngine {
 
         let mut index = self.fresh_index()?;
         index.build(vectors)?;
+        let mappings: Vec<(MemoryId, Vec<u32>)> = members
+            .into_iter()
+            .enumerate()
+            .map(|(vid, memory_id)| (memory_id, vec![vid as u32]))
+            .collect();
+        for batch in mappings.chunks(MAPPING_WRITE_BATCH) {
+            self.storage.update_vector_mappings(batch)?;
+        }
         let mut id_mapping = IdMapping::new();
-        for (vid, memory_id) in members.into_iter().enumerate() {
-            self.storage
-                .update_vector_mapping(&memory_id, vec![vid as u32])?;
-            id_mapping.insert(memory_id, vid as u32);
+        for (memory_id, ids) in mappings {
+            id_mapping.insert_chunks(memory_id, ids);
         }
 
         let built = id_mapping.len();
@@ -1169,8 +1179,13 @@ impl RetrievalEngine {
             remapped.insert_chunks(memory_id, new_ids);
         }
         fresh.build(vectors)?;
-        for (memory_id, ids) in &remapped.memory_to_vectors {
-            self.storage.update_vector_mapping(memory_id, ids.clone())?;
+        let mappings: Vec<(MemoryId, Vec<u32>)> = remapped
+            .memory_to_vectors
+            .iter()
+            .map(|(memory_id, ids)| (memory_id.clone(), ids.clone()))
+            .collect();
+        for batch in mappings.chunks(MAPPING_WRITE_BATCH) {
+            self.storage.update_vector_mappings(batch)?;
         }
 
         *index = fresh;

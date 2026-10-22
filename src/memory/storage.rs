@@ -4698,6 +4698,22 @@ impl MemoryStorage {
         self.update_modality_vectors(memory_id, Modality::Text, vector_ids)
     }
 
+    /// [`Self::update_vector_mapping`] for many memories in one atomic write batch, each
+    /// keeping its other modalities.
+    pub fn update_vector_mappings(&self, mappings: &[(MemoryId, Vec<u32>)]) -> Result<()> {
+        if mappings.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        for (memory_id, vector_ids) in mappings {
+            let mut entry = self.get_vector_mapping(memory_id)?.unwrap_or_default();
+            entry.add_modality(Modality::Text, vector_ids.clone());
+            let value = bincode::serde::encode_to_vec(&entry, bincode::config::standard())?;
+            batch.put(format!("vmapping:{}", memory_id.0).as_bytes(), &value);
+        }
+        self.guarded_batch(&batch, &self.write_options())
+    }
+
     /// Update vector mapping for a specific modality
     ///
     /// MULTIMODALITY READY: Preserves vectors for other modalities while updating one.

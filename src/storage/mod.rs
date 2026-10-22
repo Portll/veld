@@ -516,6 +516,10 @@ pub trait PrimaryMemoryStore: Send + Sync {
     /// Replace the TEXT-modality vectors for one memory, preserving other
     /// modalities — the write half of the retrieval engine's index maintenance.
     fn update_vector_mapping(&self, memory_id: &MemoryId, vector_ids: Vec<u32>) -> Result<()>;
+    /// [`Self::update_vector_mapping`] for many memories as one atomic write: one commit
+    /// for an index rebuild or compaction, which rewrite every memory's mapping and did it
+    /// one commit (on redb, one write transaction) per memory.
+    fn update_vector_mappings(&self, mappings: &[(MemoryId, Vec<u32>)]) -> Result<()>;
     fn put_vector_mapping(&self, id: &MemoryId, mapping: &VectorMappingEntry) -> Result<()>;
     /// Store `memory` and set its TEXT-modality vectors to `vector_ids`, keeping its
     /// other modalities, as ONE atomic write: a crash between two writes would leave

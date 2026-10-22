@@ -2170,6 +2170,18 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         Ok(())
     }
 
+    fn update_vector_mappings(&self, mappings: &[(MemoryId, Vec<u32>)]) -> Result<()> {
+        if mappings.is_empty() {
+            return Ok(());
+        }
+        let txn = begin_write(&self.database, self.durability)?;
+        for (memory_id, vector_ids) in mappings {
+            merge_text_vectors(&txn, memory_id, vector_ids.clone())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
         // The memory whose content is exactly this, confirmed against the record so a
         // digest collision cannot answer for different content.

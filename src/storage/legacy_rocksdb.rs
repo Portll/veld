@@ -526,6 +526,10 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
         self.inner.update_vector_mapping(memory_id, vector_ids)
     }
 
+    fn update_vector_mappings(&self, mappings: &[(MemoryId, Vec<u32>)]) -> Result<()> {
+        self.inner.update_vector_mappings(mappings)
+    }
+
     fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
         self.inner.get_by_content_hash(content)
     }
@@ -1815,6 +1819,45 @@ mod engine_parity_tests {
                 }),
                 near_london,
                 "{engine}: a radius search missed or overshot the circle"
+            );
+        }
+    }
+
+    #[test]
+    fn update_vector_mappings_writes_what_one_update_per_memory_writes_on_both_engines() {
+        for (engine, store, _dir) in engines() {
+            let first = memory("the lock gates open at dawn", 0.5);
+            let second = memory("the dredger works the channel", 0.5);
+            let mut kept = VectorMappingEntry::with_text(vec![1]);
+            kept.add_modality(crate::memory::storage::Modality::Image, vec![9]);
+            store.put_vector_mapping(&first.id, &kept).unwrap();
+            store.update_vector_mappings(&[]).unwrap();
+
+            store
+                .update_vector_mappings(&[
+                    (first.id.clone(), vec![4, 5]),
+                    (second.id.clone(), vec![6]),
+                ])
+                .unwrap();
+
+            let first_now = store.get_vector_mapping(&first.id).unwrap().unwrap();
+            assert_eq!(first_now.text_vectors(), Some(&vec![4, 5]), "{engine}");
+            assert_eq!(
+                first_now
+                    .modalities
+                    .get(&crate::memory::storage::Modality::Image)
+                    .map(|m| m.vector_ids.clone()),
+                Some(vec![9]),
+                "{engine}: another modality was dropped"
+            );
+            assert_eq!(
+                store
+                    .get_vector_mapping(&second.id)
+                    .unwrap()
+                    .unwrap()
+                    .text_vectors(),
+                Some(&vec![6]),
+                "{engine}"
             );
         }
     }
