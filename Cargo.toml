@@ -473,11 +473,13 @@ strip = true  # Reduce binary size
 # into a JoinError instead of the panic ending the server. (The cdylib clobbering that also
 # forbade it, rust-lang/cargo#6313, went with the cdylib to the veld-py crate.)
 
-# The local install loop: `cargo build --profile local --bin veld`. Thin LTO over 16 codegen
-# units instead of release's fat LTO over one; tagged releases keep [profile.release].
+# The local install loop: `cargo build --profile local --bin veld`. No LTO and incremental codegen:
+# a one-file edit builds in 22 s against 137 s with thin LTO, and the LoCoMo gate returned
+# identical quality with latency no worse (A/B, 2026-10-21). Tagged releases keep [profile.release].
 [profile.local]
 inherits = "release"
-lto = "thin"
+lto = false
+incremental = true
 codegen-units = 16
 
 [profile.bench]
