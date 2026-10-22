@@ -23,7 +23,6 @@ pub mod alignment;
 pub mod alignment_affine;
 pub mod alignment_conditioning;
 pub mod alignment_config;
-pub mod alignment_csls;
 pub mod alignment_procrustes;
 pub mod alignment_ridge;
 pub mod arctic;
@@ -86,7 +85,6 @@ pub use alignment_conditioning::Conditioning;
 pub use alignment_config::{
     AlignmentConfig, AlignmentMethod, AlignmentObjective, CapabilityState, EvalMetric, WhitenMode,
 };
-pub use alignment_csls::{csls_adjust, local_means, topk_mean};
 
 /// Load a primary embedder by canonical identifier.
 ///
