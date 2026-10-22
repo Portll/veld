@@ -11,9 +11,9 @@ use std::path::Path;
 
 const BASELINE: &[(&str, usize)] = &[
     ("backup", 39),
-    ("graph_memory", 21),
+    ("graph_memory", 20),
     ("handlers", 24),
-    ("memory", 190),
+    ("memory", 188),
     ("memory/sleep_time", 0),
     ("user_auth", 7),
     ("user_memory", 0),
