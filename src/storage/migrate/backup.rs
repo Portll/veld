@@ -369,10 +369,11 @@ impl RedbBackupEngine {
         }
         let journal = target_user.join(JOURNAL);
         if exists(&journal)? {
-            crate::backup::scan_lsn_range(&journal)
-                .with_context(|| format!("restored journal {}", journal.display()))?;
+            let mut log = crate::intent_log::IntentLog::open(&journal)?;
+            for frame in log.iter()? {
+                frame.with_context(|| format!("restored journal {}", journal.display()))?;
+            }
             if let Some(max_lsn) = options.max_lsn {
-                let mut log = crate::intent_log::IntentLog::open(&journal)?;
                 log.truncate_to_lsn(crate::intent_log::Lsn(max_lsn))
                     .map_err(|e| anyhow!("PITR truncate_to_lsn({max_lsn}) failed: {e}"))?;
                 log.sync().context("syncing the truncated intent log")?;
@@ -417,11 +418,7 @@ impl PendingBackup<'_> {
     /// Call before `export`, under the journal writer, so the stores are a superset of the staged journal.
     pub fn stage_intent_log(&mut self, spec: &IntentLogBackupSpec) -> Result<()> {
         let files = crate::backup::copy_intent_log_files(spec, &self.tmp.join(INTENT_DIR))?;
-        let cut = files
-            .iter()
-            .find(|f| f.name == spec.log_filename)
-            .and_then(|f| f.lsn_range)
-            .map(|(_, hi)| hi);
+        let cut = crate::backup::journal_cut_lsn(spec, &files);
         self.intent = Some((files, cut));
         Ok(())
     }
@@ -636,7 +633,7 @@ fn hash_intent_file(path: &Path, name: &str) -> Result<IntentLogFileMeta> {
         .with_context(|| format!("opening intent log file {}", path.display()))?;
     let mut hasher = Sha256::new();
     let size_bytes = std::io::copy(&mut file, &mut hasher)?;
-    let lsn_range = if name == JOURNAL {
+    let lsn_range = if crate::intent_log::is_log_file(JOURNAL, name) {
         crate::backup::scan_lsn_range(path)?
     } else {
         None
