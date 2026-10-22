@@ -418,6 +418,39 @@ jobs:
           fi
           echo "Kernel class agrees: $REPORTED"
 
+      # Absolute floors, which do not move when the baseline is re-recorded, on the gated run only.
+      # They come from the retired recall-guard workflow, which needed a live server no hosted
+      # runner had and so failed at its reachability check. Its p99 ceiling carries over as it
+      # was (3,000 ms; the gate baseline's p99 is 1,147 ms). Its 0.60 multi_hop recall@10 floor
+      # was measured on bench/recall_latency_guard.py's 20-memory corpus and does not transfer:
+      # the gate baseline scores 0.406. The same derivation, known-good minus 10 points rounded
+      # down, gives 0.30 here; the baseline comparison above already gates a 2% drop.
+      - name: Enforce the absolute floors
+        if: >-
+          always() && steps.run.conclusion == 'success' && env.SUITE == 'locomo-gate' &&
+          env.RECORD != 'true' && hashFiles(format('current-{0}.json', matrix.engine)) != ''
+        env:
+          MULTI_HOP_R10_FLOOR: '0.30'
+          P99_LATENCY_CEILING_MS: '3000'
+        run: |
+          python3 - "current-${{ matrix.engine }}.json" <<'EOF'
+          import json, os, sys
+          report = json.load(open(sys.argv[1]))
+          floor = float(os.environ["MULTI_HOP_R10_FLOOR"])
+          ceiling = float(os.environ["P99_LATENCY_CEILING_MS"])
+          r10 = report["by_category"]["multi_hop"]["recall@10"]
+          p99 = report["layers"]["full"]["latency_p99_ms"]
+          print(f"multi_hop recall@10 {r10:.4f} (floor {floor}), p99 {p99:.0f} ms (ceiling {ceiling:.0f})")
+          failed = False
+          if r10 < floor:
+              print(f"::error::multi_hop recall@10 {r10:.4f} is under the {floor} floor")
+              failed = True
+          if p99 > ceiling:
+              print(f"::error::recall p99 {p99:.0f} ms is over the {ceiling:.0f} ms ceiling")
+              failed = True
+          sys.exit(1 if failed else 0)
+          EOF
+
       # Only when the eval step completed: after a timeout or an earlier failure the job is already
       # red for the right reason, and an empty exit code here would add a misleading second error.
       - name: Enforce the gate
