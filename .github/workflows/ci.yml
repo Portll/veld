@@ -142,6 +142,51 @@ jobs:
           clippy zenoh --features zenoh
           exit $status
 
+  # The optional features no other job builds. Each is checked on its own over every target,
+  # so a feature that only compiles beside another, or a test gated on one, cannot rot unbuilt.
+  # All nine compiled on 2026-10-22. llm-parser gates no code today; it is checked so that the
+  # first code it gates is checked too.
+  feature-check:
+    name: Feature Check
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-check
+      # libssl-dev and pkg-config for tiberius (mssql), whose default TLS is native-tls.
+      - name: Install LLVM and OpenSSL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang libssl-dev pkg-config
+      - name: Check each optional feature
+        run: |
+          {
+            echo "### Feature Check"
+            echo ""
+            echo "| Feature | Result |"
+            echo "|---------|--------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          failed=()
+          for feature in multi-tenant postgres mssql python pdf stress fortress telemetry llm-parser; do
+            echo "::group::cargo check --all-targets --features $feature"
+            if cargo check --all-targets --features "$feature"; then
+              result=passed
+            else
+              result=failed
+              failed+=("$feature")
+            fi
+            echo "::endgroup::"
+            echo "| $feature | $result |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::these features do not compile: ${failed[*]}"
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -345,7 +390,7 @@ jobs:
   summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [version-check, format, clippy, build, test]
+    needs: [version-check, upstream-ledger, format, clippy, feature-check, build, test]
     if: always()
     steps:
       - name: Generate final summary
@@ -356,8 +401,10 @@ jobs:
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
 
           version_icon="${{ needs.version-check.result == 'success' && '✅' || '❌' }}"
+          ledger_icon="${{ needs.upstream-ledger.result == 'success' && '✅' || '❌' }}"
           format_icon="${{ needs.format.result == 'success' && '✅' || '❌' }}"
           clippy_icon="${{ needs.clippy.result == 'success' && '✅' || '❌' }}"
+          features_icon="${{ needs.feature-check.result == 'success' && '✅' || '❌' }}"
           # A skipped build passes only where the policy skips it: a push or PR that is not a release
           # tag. On a tag or a dispatch the build must run, and a skip there is a failure.
           build_expected="${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}"
@@ -370,15 +417,19 @@ jobs:
           if [[ "$test_ok" == "true" ]]; then test_icon="✅"; else test_icon="❌"; fi
 
           echo "| Version | $version_icon ${{ needs.version-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Upstream ledger | $ledger_icon ${{ needs.upstream-ledger.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Format | $format_icon ${{ needs.format.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Clippy | $clippy_icon ${{ needs.clippy.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Features | $features_icon ${{ needs.feature-check.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Build | $build_icon $build_result$([[ "$build_icon" == "⏭" ]] && echo ' (release tags and dispatch only)') |" >> $GITHUB_STEP_SUMMARY
           echo "| Tests | $test_icon $test_result |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [[ "${{ needs.version-check.result }}" == "success" && \
+                "${{ needs.upstream-ledger.result }}" == "success" && \
                 "${{ needs.format.result }}" == "success" && \
                 "${{ needs.clippy.result }}" == "success" && \
+                "${{ needs.feature-check.result }}" == "success" && \
                 "$build_ok" == "true" && \
                 "$test_ok" == "true" ]]; then
             echo "### All critical checks passed" >> $GITHUB_STEP_SUMMARY
