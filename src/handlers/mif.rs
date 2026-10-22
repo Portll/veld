@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use super::state::MultiUserMemoryManager;
 use super::types::RetrieveResponse;
+use super::utils::run_blocking;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::graph_memory;
 use crate::mif::adapters::AdapterRegistry;
@@ -53,14 +54,6 @@ pub async fn export_mif(
         .get_user_memory_async(&user_id)
         .await
         .map_err(AppError::Internal)?;
-    // Every read below feeds the exported document. Swallowing a store-read error here (the old
-    // unwrap_or_default) let an export "succeed" while silently omitting memories, todos,
-    // projects or reminders — the worst shape of loss, because the caller holds a backup with
-    // no sign it is partial. A failed read fails the export (shodh-memory 9233dcd).
-    let memories = {
-        let guard = memory_sys.read();
-        guard.get_all_memories().map_err(AppError::Internal)?
-    };
 
     let graph = if req.include_graph {
         Some(
@@ -72,21 +65,6 @@ pub async fn export_mif(
     } else {
         None
     };
-
-    let todos = state
-        .todo_store
-        .list_todos_for_user(&user_id, None)
-        .map_err(AppError::Internal)?;
-
-    let projects = state
-        .todo_store
-        .list_projects(&user_id)
-        .map_err(AppError::Internal)?;
-
-    let reminders = state
-        .prospective_store
-        .list_for_user(&user_id, None)
-        .map_err(AppError::Internal)?;
 
     let since = req
         .since
@@ -102,46 +80,87 @@ pub async fn export_mif(
         since,
     };
 
-    let graph_ref = graph.as_ref().map(|g| g.read());
-    let graph_guard = graph_ref.as_deref();
+    // The whole store, the user's todos, projects and reminders, and the graph, read and
+    // encoded into one document.
+    let (output, export_id, memory_count, todo_count) = {
+        let state = state.clone();
+        let user_id = user_id.clone();
+        let format = req.format.clone();
+        run_blocking(move || {
+            // Every read below feeds the exported document. Swallowing a store-read error here
+            // (the old unwrap_or_default) let an export "succeed" while silently omitting
+            // memories, todos, projects or reminders — the worst shape of loss, because the
+            // caller holds a backup with no sign it is partial. A failed read fails the export
+            // (shodh-memory 9233dcd).
+            let memories = memory_sys
+                .read()
+                .get_all_memories()
+                .map_err(AppError::Internal)?;
 
-    let doc = export::build_document(
-        &memories,
-        graph_guard,
-        &todos,
-        &projects,
-        &reminders,
-        &options,
-    )
-    .map_err(AppError::Internal)?;
+            let todos = state
+                .todo_store
+                .list_todos_for_user(&user_id, None)
+                .map_err(AppError::Internal)?;
 
-    // Convert to requested output format
-    let output = if req.format == "veld" || req.format == "json" {
-        serde_json::to_value(&doc).map_err(|e| AppError::Internal(e.into()))?
-    } else {
-        let registry = AdapterRegistry::new();
-        let bytes = registry
-            .export_with(&req.format, &doc)
+            let projects = state
+                .todo_store
+                .list_projects(&user_id)
+                .map_err(AppError::Internal)?;
+
+            let reminders = state
+                .prospective_store
+                .list_for_user(&user_id, None)
+                .map_err(AppError::Internal)?;
+
+            let graph_ref = graph.as_ref().map(|g| g.read());
+            let graph_guard = graph_ref.as_deref();
+
+            let doc = export::build_document(
+                &memories,
+                graph_guard,
+                &todos,
+                &projects,
+                &reminders,
+                &options,
+            )
             .map_err(AppError::Internal)?;
-        let output_str = String::from_utf8(bytes).map_err(|e| AppError::Internal(e.into()))?;
-        // For non-JSON formats, wrap in an object
-        serde_json::json!({
-            "format": req.format,
-            "data": output_str,
-            "memory_count": doc.memories.len(),
-            "todo_count": doc.todos.len(),
+            drop(graph_ref);
+
+            // Convert to requested output format
+            let output = if format == "veld" || format == "json" {
+                serde_json::to_value(&doc).map_err(|e| AppError::Internal(e.into()))?
+            } else {
+                let registry = AdapterRegistry::new();
+                let bytes = registry
+                    .export_with(&format, &doc)
+                    .map_err(AppError::Internal)?;
+                let output_str =
+                    String::from_utf8(bytes).map_err(|e| AppError::Internal(e.into()))?;
+                // For non-JSON formats, wrap in an object
+                serde_json::json!({
+                    "format": format,
+                    "data": output_str,
+                    "memory_count": doc.memories.len(),
+                    "todo_count": doc.todos.len(),
+                })
+            };
+            Ok((
+                output,
+                doc.export_meta.id,
+                doc.memories.len(),
+                doc.todos.len(),
+            ))
         })
+        .await?
     };
 
     state.log_event(
         &user_id,
         "MIF_EXPORT",
-        &doc.export_meta.id,
+        &export_id,
         &format!(
             "Exported {} memories, {} todos (format: {})",
-            doc.memories.len(),
-            doc.todos.len(),
-            req.format,
+            memory_count, todo_count, req.format,
         ),
     );
 
@@ -179,74 +198,78 @@ pub async fn import_mif(
 ) -> Result<Json<MifImportResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    // Convert data to bytes for adapter detection
-    let data_bytes = serde_json::to_vec(&req.data).map_err(|e| AppError::Internal(e.into()))?;
+    let format = req.format.clone();
+    let data = req.data;
+    let doc = run_blocking(move || {
+        // Convert data to bytes for adapter detection
+        let data_bytes = serde_json::to_vec(&data).map_err(|e| AppError::Internal(e.into()))?;
 
-    // Parse through adapter registry (auto-detect or explicit format)
-    let registry = AdapterRegistry::new();
-    let doc = if let Some(ref fmt) = req.format {
-        registry
-            .import_with(fmt, &data_bytes)
-            .map_err(AppError::Internal)?
-    } else {
-        registry
-            .auto_import(&data_bytes)
-            .map_err(AppError::Internal)?
-    };
+        // Parse through adapter registry (auto-detect or explicit format)
+        let registry = AdapterRegistry::new();
+        let doc = if let Some(ref fmt) = format {
+            registry
+                .import_with(fmt, &data_bytes)
+                .map_err(AppError::Internal)?
+        } else {
+            registry
+                .auto_import(&data_bytes)
+                .map_err(AppError::Internal)?
+        };
 
-    // Validate version
-    import::validate_version(&doc).map_err(AppError::Internal)?;
+        // Validate version
+        import::validate_version(&doc).map_err(AppError::Internal)?;
+        Ok(doc)
+    })
+    .await?;
 
     let options = import::ImportOptions {
         user_id: req.user_id.clone(),
         skip_duplicates: req.skip_duplicates,
     };
 
-    let mut result = import::ImportResult::default();
+    let memory_sys = state
+        .get_user_memory_async(&req.user_id)
+        .await
+        .map_err(AppError::Internal)?;
 
-    // Build dedup set from existing memories
-    let dedup_set = if req.skip_duplicates {
-        let memory_sys = state
-            .get_user_memory_async(&req.user_id)
-            .await
-            .map_err(AppError::Internal)?;
-        let guard = memory_sys.read();
-        let existing: Vec<String> = guard
-            .get_all_memories()
-            .unwrap_or_default()
-            .iter()
-            .map(|m| m.experience.content.clone())
-            .collect();
-        import::build_dedup_set(&existing)
-    } else {
-        std::collections::HashSet::new()
-    };
-
-    // Import memories
-    let (prepared_memories, skipped) = import::prepare_memories(&doc, &dedup_set, &options);
-    result.duplicates_skipped = skipped;
-
-    {
-        let memory_sys = state
-            .get_user_memory_async(&req.user_id)
-            .await
-            .map_err(AppError::Internal)?;
+    // The dedup scan reads the whole store, each imported memory is embedded as it is stored,
+    // and every todo, project and reminder is a store write.
+    let (mut result, doc) = {
         let state = state.clone();
         let user_id = req.user_id.clone();
-        // remember_with_id writes no BM25 document: these frames are how the imports reach
-        // keyword search, and replicas.
-        let (imported, errors) = tokio::task::spawn_blocking(move || {
+        run_blocking(move || {
+            let mut result = import::ImportResult::default();
+
+            // Build dedup set from existing memories
+            let dedup_set = if options.skip_duplicates {
+                let existing: Vec<String> = memory_sys
+                    .read()
+                    .get_all_memories()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|m| m.experience.content.clone())
+                    .collect();
+                import::build_dedup_set(&existing)
+            } else {
+                std::collections::HashSet::new()
+            };
+
+            // Import memories
+            let (prepared_memories, skipped) = import::prepare_memories(&doc, &dedup_set, &options);
+            result.duplicates_skipped = skipped;
+
             let mut imported = Vec::new();
-            let mut errors = Vec::new();
             {
                 let guard = memory_sys.read();
                 for (memory_id, experience, created_at) in prepared_memories {
                     match guard.remember_with_id(memory_id, experience, created_at) {
                         Ok(id) => imported.push(id),
-                        Err(e) => errors.push(format!("Memory: {e}")),
+                        Err(e) => result.errors.push(format!("Memory: {e}")),
                     }
                 }
             }
+            // remember_with_id writes no BM25 document: these frames are how the imports
+            // reach keyword search, and replicas.
             super::remember::journal_stored(
                 &state,
                 &memory_sys,
@@ -254,59 +277,64 @@ pub async fn import_mif(
                 &imported,
                 super::remember::SnapshotKind::Remember,
             );
-            (imported.len(), errors)
+            result.memories_imported += imported.len();
+
+            // Import projects first (todos may reference them)
+            let prepared_projects = import::prepare_projects(&doc, &user_id);
+            for project in prepared_projects {
+                match state.todo_store.store_project(&project) {
+                    Ok(_) => result.projects_imported += 1,
+                    Err(e) => result
+                        .errors
+                        .push(format!("Project '{}': {e}", project.name)),
+                }
+            }
+
+            // Import todos
+            let prepared_todos = import::prepare_todos(&doc, &user_id);
+            for todo in prepared_todos {
+                match state.todo_store.store_todo(&todo) {
+                    Ok(_) => result.todos_imported += 1,
+                    Err(e) => result.errors.push(format!("Todo: {e}")),
+                }
+            }
+
+            // Import reminders
+            let prepared_reminders = import::prepare_reminders(&doc, &user_id);
+            for reminder in prepared_reminders {
+                match state.prospective_store.store(&reminder) {
+                    Ok(_) => result.reminders_imported += 1,
+                    Err(e) => result.errors.push(format!("Reminder: {e}")),
+                }
+            }
+            Ok((result, doc))
         })
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("MIF import task panicked: {e}")))?;
-        result.memories_imported += imported;
-        result.errors.extend(errors);
-    }
-
-    // Import projects first (todos may reference them)
-    let prepared_projects = import::prepare_projects(&doc, &req.user_id);
-    for project in prepared_projects {
-        match state.todo_store.store_project(&project) {
-            Ok(_) => result.projects_imported += 1,
-            Err(e) => result
-                .errors
-                .push(format!("Project '{}': {e}", project.name)),
-        }
-    }
-
-    // Import todos
-    let prepared_todos = import::prepare_todos(&doc, &req.user_id);
-    for todo in prepared_todos {
-        match state.todo_store.store_todo(&todo) {
-            Ok(_) => result.todos_imported += 1,
-            Err(e) => result.errors.push(format!("Todo: {e}")),
-        }
-    }
-
-    // Import reminders
-    let prepared_reminders = import::prepare_reminders(&doc, &req.user_id);
-    for reminder in prepared_reminders {
-        match state.prospective_store.store(&reminder) {
-            Ok(_) => result.reminders_imported += 1,
-            Err(e) => result.errors.push(format!("Reminder: {e}")),
-        }
-    }
+        .await?
+    };
 
     // Import knowledge graph
-    if let Some(ref kg) = doc.knowledge_graph {
+    if doc.knowledge_graph.is_some() {
         let graph_arc = state
             .get_user_graph_async(&req.user_id)
             .await
             .map_err(AppError::Internal)?;
-        let graph_guard = graph_arc.read();
+        result = run_blocking(move || {
+            if let Some(kg) = &doc.knowledge_graph {
+                let graph_guard = graph_arc.read();
 
-        let (entities_imported, entity_errors) = import::import_graph_entities(kg, &graph_guard);
-        result.entities_imported = entities_imported;
-        result.errors.extend(entity_errors);
+                let (entities_imported, entity_errors) =
+                    import::import_graph_entities(kg, &graph_guard);
+                result.entities_imported = entities_imported;
+                result.errors.extend(entity_errors);
 
-        let (edges_imported, edge_errors) =
-            import::import_graph_relationships(kg, &graph_guard, &doc.vendor_extensions);
-        result.edges_imported = edges_imported;
-        result.errors.extend(edge_errors);
+                let (edges_imported, edge_errors) =
+                    import::import_graph_relationships(kg, &graph_guard, &doc.vendor_extensions);
+                result.edges_imported = edges_imported;
+                result.errors.extend(edge_errors);
+            }
+            Ok(result)
+        })
+        .await?;
     }
 
     state.log_event(
@@ -380,7 +408,6 @@ pub async fn add_entity(
         .get_user_graph_async(&req.user_id)
         .await
         .map_err(AppError::Internal)?;
-    let graph_guard = graph.write();
 
     let entity_label = match req.label.as_str() {
         "Person" => graph_memory::EntityLabel::Person,
@@ -420,7 +447,8 @@ pub async fn add_entity(
         pii_classification: Default::default(),
     };
 
-    graph_guard.add_entity(entity).map_err(AppError::Internal)?;
+    // The write lock waits out every graph reader, consolidation passes included.
+    run_blocking(move || graph.write().add_entity(entity).map_err(AppError::Internal)).await?;
 
     state.log_event(
         &req.user_id,
@@ -457,7 +485,6 @@ pub async fn add_relationship(
         .get_user_graph_async(&req.user_id)
         .await
         .map_err(AppError::Internal)?;
-    let graph_guard = graph.write();
 
     let relation_type = match req.relation_type.as_str() {
         "RelatedTo" => graph_memory::RelationType::RelatedTo,
@@ -484,51 +511,63 @@ pub async fn add_relationship(
 
     let strength = req.strength.unwrap_or(0.5);
 
-    let from_entity = graph_guard
-        .find_entity_by_name(&req.from_entity)
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::InvalidInput {
-            field: "from_entity".to_string(),
-            reason: format!("Entity '{}' not found", req.from_entity),
-        })?;
+    // The write lock waits out every graph reader, consolidation passes included, and the
+    // lookups and the insert are graph store reads and writes.
+    {
+        let from_name = req.from_entity.clone();
+        let to_name = req.to_entity.clone();
+        let relation_type = relation_type.clone();
+        run_blocking(move || {
+            let graph_guard = graph.write();
 
-    let to_entity = graph_guard
-        .find_entity_by_name(&req.to_entity)
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::InvalidInput {
-            field: "to_entity".to_string(),
-            reason: format!("Entity '{}' not found", req.to_entity),
-        })?;
+            let from_entity = graph_guard
+                .find_entity_by_name(&from_name)
+                .map_err(AppError::Internal)?
+                .ok_or_else(|| AppError::InvalidInput {
+                    field: "from_entity".to_string(),
+                    reason: format!("Entity '{}' not found", from_name),
+                })?;
 
-    let entity_confidence = Some((from_entity.salience + to_entity.salience) / 2.0);
+            let to_entity = graph_guard
+                .find_entity_by_name(&to_name)
+                .map_err(AppError::Internal)?
+                .ok_or_else(|| AppError::InvalidInput {
+                    field: "to_entity".to_string(),
+                    reason: format!("Entity '{}' not found", to_name),
+                })?;
 
-    let edge = graph_memory::RelationshipEdge {
-        uuid: uuid::Uuid::new_v4(),
-        from_entity: from_entity.uuid,
-        to_entity: to_entity.uuid,
-        relation_type: relation_type.clone(),
-        strength,
-        created_at: chrono::Utc::now(),
-        valid_at: chrono::Utc::now(),
-        invalidated_at: None,
-        source_episode_id: None,
-        context: String::new(),
-        last_activated: chrono::Utc::now(),
-        activation_count: 1,
-        ltp_status: graph_memory::LtpStatus::None,
-        tier: graph_memory::EdgeTier::L1Working,
-        activation_timestamps: None,
-        entity_confidence,
-        created_by: graph_memory::EdgeSource::Explicit,
-        forward_strength: strength,
-        backward_strength: strength,
-        strengthening_sources: Default::default(),
-        last_corroborated: None,
-    };
+            let entity_confidence = Some((from_entity.salience + to_entity.salience) / 2.0);
 
-    graph_guard
-        .add_relationship(edge)
-        .map_err(AppError::Internal)?;
+            let edge = graph_memory::RelationshipEdge {
+                uuid: uuid::Uuid::new_v4(),
+                from_entity: from_entity.uuid,
+                to_entity: to_entity.uuid,
+                relation_type,
+                strength,
+                created_at: chrono::Utc::now(),
+                valid_at: chrono::Utc::now(),
+                invalidated_at: None,
+                source_episode_id: None,
+                context: String::new(),
+                last_activated: chrono::Utc::now(),
+                activation_count: 1,
+                ltp_status: graph_memory::LtpStatus::None,
+                tier: graph_memory::EdgeTier::L1Working,
+                activation_timestamps: None,
+                entity_confidence,
+                created_by: graph_memory::EdgeSource::Explicit,
+                forward_strength: strength,
+                backward_strength: strength,
+                strengthening_sources: Default::default(),
+                last_corroborated: None,
+            };
+
+            graph_guard
+                .add_relationship(edge)
+                .map_err(AppError::Internal)
+        })
+        .await?;
+    }
 
     state.log_event(
         &req.user_id,
@@ -570,18 +609,21 @@ pub async fn get_uncompressed_old(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-
     let cutoff = chrono::Utc::now() - chrono::Duration::days(req.days_old as i64);
-    let raw_memories = memory_guard
-        .get_uncompressed_older_than(cutoff)
-        .map_err(AppError::Internal)?;
+    let (memories, count) = run_blocking(move || {
+        let raw_memories = memory_sys
+            .read()
+            .get_uncompressed_older_than(cutoff)
+            .map_err(AppError::Internal)?;
 
-    let count = raw_memories.len();
-    let memories: Vec<serde_json::Value> = raw_memories
-        .into_iter()
-        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
-        .collect();
+        let count = raw_memories.len();
+        let memories: Vec<serde_json::Value> = raw_memories
+            .into_iter()
+            .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
+            .collect();
+        Ok((memories, count))
+    })
+    .await?;
 
     Ok(Json(RetrieveResponse { memories, count }))
 }
