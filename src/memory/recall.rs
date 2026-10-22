@@ -82,6 +82,81 @@ impl super::MemorySystem {
         Some(embedding)
     }
 
+    /// Working- and Session-tier memories the vector index does not hold, with the higher of
+    /// their primary and secondary cosine to the query where it exceeds 0.1.
+    fn unindexed_tier_hits(
+        &self,
+        query_embedding: &[f32],
+        query_embedding_secondary: Option<&[f32]>,
+        exclude: &HashSet<MemoryId>,
+    ) -> Vec<(MemoryId, f32)> {
+        let dual_cosine = |mem: &Memory| -> Option<f32> {
+            let primary = mem
+                .experience
+                .embeddings
+                .as_deref()
+                .filter(|emb| !emb.is_empty())
+                .map(|emb| {
+                    crate::memory::hybrid_search::cosine_similarity_pub(query_embedding, emb)
+                });
+            let secondary = query_embedding_secondary
+                .zip(mem.experience.embeddings_secondary.as_deref())
+                .filter(|(_, emb)| !emb.is_empty())
+                .map(|(q, emb)| crate::memory::hybrid_search::cosine_similarity_pub(q, emb));
+            let best = match (primary, secondary) {
+                (Some(p), Some(s)) => Some(p.max(s)),
+                (p, s) => p.or(s),
+            };
+            best.filter(|&s| s > 0.1)
+        };
+
+        let mut tier_memories = self.working_memory.read().all_memories();
+        tier_memories.extend(self.session_memory.read().all_memories());
+        tier_memories
+            .iter()
+            .filter(|mem| !exclude.contains(&mem.id) && !self.retriever.has_mapping(&mem.id))
+            .filter_map(|mem| dual_cosine(mem).map(|sim| (mem.id.clone(), sim)))
+            .collect()
+    }
+
+    /// The `vamana_only` rung's answer: the vector leg in its own order, each memory scored
+    /// by its cosine, after the query's filters. No fusion, boost or rescoring stage runs,
+    /// and nothing is written back: access counts and coactivation feed the stages this
+    /// rung leaves out, so a vector-only recall must not move what the next rung measures.
+    fn vector_rung_results<S: CandidateSource + ?Sized>(
+        &self,
+        vector_results: &[(MemoryId, f32)],
+        filter: &Query,
+        candidates: &RecallCandidates<'_, S>,
+    ) -> (Vec<SharedMemory>, Vec<&'static str>) {
+        candidates.prefetch(vector_results.iter().map(|(id, _)| id));
+        let mut memories = Vec::with_capacity(filter.max_results);
+        let mut sources = Vec::new();
+        for (id, similarity) in vector_results {
+            if memories.len() >= filter.max_results {
+                break;
+            }
+            let Some(view) = candidates.get(id) else {
+                continue;
+            };
+            let valid = match filter.as_of {
+                Some(t) => view.memory.is_valid_at(t),
+                None => !view.memory.is_expired(),
+            };
+            if !valid || !self.retriever.matches_filters(&view.memory, filter) {
+                continue;
+            }
+            let source = view.tier.source_label();
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+            let mut memory = view.memory.as_ref().clone();
+            memory.set_score(*similarity);
+            memories.push(Arc::new(memory));
+        }
+        (memories, sources)
+    }
+
     /// Search and retrieve relevant memories (zero-copy with Arc<Memory>)
     ///
     /// PRODUCTION IMPLEMENTATION:
@@ -674,7 +749,11 @@ impl super::MemorySystem {
         }
 
         let attribute_boost_ids: HashSet<MemoryId> = match &query_type {
-            query_parser::QueryType::Attribute(attr_query) => {
+            query_parser::QueryType::Attribute(attr_query)
+                if query
+                    .layer_mode()
+                    .allows(crate::memory::types::LayerMode::PlusBm25) =>
+            {
                 tracing::debug!(
                     "Layer 0.5: Attribute query detected - entity='{}', attribute='{}', synonyms={:?}",
                     attr_query.entity,
@@ -773,7 +852,12 @@ impl super::MemorySystem {
 
         let temporal_gate = has_any_temporal_intent || has_temporal_keywords;
 
-        let temporal_fact_boost_ids: HashSet<MemoryId> = if temporal_gate {
+        // A PlusFacts stage, like Layer 0.7: below that rung it contributes nothing.
+        let temporal_fact_boost_ids: HashSet<MemoryId> = if temporal_gate
+            && query
+                .layer_mode()
+                .allows(crate::memory::types::LayerMode::PlusFacts)
+        {
             if let Some(user_id) = query
                 .user_id
                 .as_ref()
@@ -1360,7 +1444,16 @@ impl super::MemorySystem {
         // Decompose compound/multi-entity queries into sub-queries for independent
         // vector search. BM25 and graph traversal still use the original query —
         // they handle compound queries better naturally.
-        let sub_queries = query_parser::decompose_query(query_text, &query_analysis);
+        // The vamana_only rung is the vector index's own answer to the query embedding:
+        // sub-query lists would come back RRF-fused, not ranked by cosine.
+        let vector_only = !query
+            .layer_mode()
+            .allows(crate::memory::types::LayerMode::PlusSpreading);
+        let sub_queries = if vector_only {
+            vec![query_text.to_string()]
+        } else {
+            query_parser::decompose_query(query_text, &query_analysis)
+        };
         let decomposed = sub_queries.len() > 1;
         // Detect abstract/thematic decomposition (Rule 4): decomposition fired AND
         // query contains abstract vocabulary. Used to invert RRF weights (sub-queries
@@ -1603,67 +1696,21 @@ impl super::MemorySystem {
         // ===========================================================================
         // LAYER 3.5: WORKING + SESSION TIER BRUTE-FORCE COSINE SCAN
         // ===========================================================================
-        // Vamana indexes only long-term storage. Working-tier and Session-tier
-        // memories (current session, last few hours) are NOT in the vector index.
-        // This is the root cause of temporal MRR 0.767: the most recent memories
-        // are invisible to vector search.
-        //
-        // Fix: brute-force cosine similarity over the small in-memory tiers
-        // (typically <100 memories combined), merge results with Vamana output.
-        // Cost: O(n) where n = working + session count. At <100 memories and
-        // 384-dim vectors, this is <0.1ms — negligible vs Vamana's ~2-5ms.
+        // A Working- or Session-tier memory the vector index does not hold yet (its
+        // embedding is still being written back, or its insert failed) is invisible to
+        // Layer 3, so the in-memory tiers are scanned by brute-force cosine for those.
+        // A memory the index does hold was already ranked there: the ones below its cut
+        // are its rejects, and on the decomposed path they re-entered at the top reciprocal
+        // ranks (LoCoMo conv-26: every turn is tier-resident, vector hit@10 0.72 -> 0.68).
         {
             let mut tier_hits = 0usize;
             let vamana_ids: std::collections::HashSet<MemoryId> =
                 vector_results.iter().map(|(id, _)| id.clone()).collect();
-
-            // Helper: compute max similarity across primary + secondary embeddings
-            let dual_cosine = |mem: &crate::memory::types::Memory| -> Option<f32> {
-                let mut best: Option<f32> = None;
-
-                // Primary embedding (MiniLM 384d)
-                if let Some(ref emb) = mem.experience.embeddings {
-                    if !emb.is_empty() {
-                        let sim = crate::memory::hybrid_search::cosine_similarity_pub(
-                            &query_embedding,
-                            emb,
-                        );
-                        best = Some(sim);
-                    }
-                }
-
-                // Secondary embedding (Nomic 768d) — take max of both
-                if let (Some(ref q_sec), Some(ref m_sec)) = (
-                    &query_embedding_secondary,
-                    &mem.experience.embeddings_secondary,
-                ) {
-                    if !m_sec.is_empty() {
-                        let sim_sec =
-                            crate::memory::hybrid_search::cosine_similarity_pub(q_sec, m_sec);
-                        best = Some(best.map_or(sim_sec, |b| b.max(sim_sec)));
-                    }
-                }
-
-                best.filter(|&s| s > 0.1)
-            };
-
-            let mut tier_candidates: Vec<(MemoryId, f32)> = Vec::new();
-            for mem in self.working_memory.read().all_memories() {
-                if vamana_ids.contains(&mem.id) {
-                    continue;
-                }
-                if let Some(sim) = dual_cosine(&mem) {
-                    tier_candidates.push((mem.id.clone(), sim));
-                }
-            }
-            for mem in self.session_memory.read().all_memories() {
-                if vamana_ids.contains(&mem.id) {
-                    continue;
-                }
-                if let Some(sim) = dual_cosine(&mem) {
-                    tier_candidates.push((mem.id.clone(), sim));
-                }
-            }
+            let mut tier_candidates = self.unindexed_tier_hits(
+                &query_embedding,
+                query_embedding_secondary.as_deref(),
+                &vamana_ids,
+            );
 
             if decomposed {
                 // The decomposed vector list carries reciprocal-rank scores (at most
@@ -1693,6 +1740,16 @@ impl super::MemorySystem {
                     "recall [layer:3.5] Working+Session brute-force cosine scan"
                 );
             }
+        }
+
+        if vector_only {
+            let (memories, sources) =
+                self.vector_rung_results(&vector_results, &vector_query, &candidates);
+            crate::memory::gold_funnel::record("final", memories.iter().map(|m| &m.id));
+            self.logger
+                .read()
+                .log_retrieved(query_text, memories.len(), &sources);
+            return Ok(memories);
         }
 
         // ===========================================================================
@@ -1764,17 +1821,25 @@ impl super::MemorySystem {
             let bm25_query_text = query_parser::expand_abstract_terms_for_bm25(query_text);
             let bm25_query_ref: &str = bm25_query_text.as_deref().unwrap_or(query_text);
 
-            let hybrid_ids = self
-                .hybrid_search
-                .search_with_dynamic_weights(
-                    bm25_query_ref,
-                    vector_results.clone(),
-                    get_content,
-                    term_weights,
-                    phrases,
-                    disc_opt,
-                    query.rerank_count, // FIX-11: per-query rerank count override
-                )
+            let bm25_allowed = query
+                .layer_mode()
+                .allows(crate::memory::types::LayerMode::PlusBm25);
+            let hybrid_search_results = if bm25_allowed {
+                self.hybrid_search
+                    .search_with_dynamic_weights(
+                        bm25_query_ref,
+                        vector_results.clone(),
+                        get_content,
+                        term_weights,
+                        phrases,
+                        disc_opt,
+                        query.rerank_count, // FIX-11: per-query rerank count override
+                    )
+                    .ok()
+            } else {
+                None
+            };
+            let hybrid_ids = hybrid_search_results
                 .map(|r| {
                     r.into_iter()
                         .map(|x| {
@@ -1871,7 +1936,7 @@ impl super::MemorySystem {
                 .use_prf
                 .unwrap_or(crate::constants::PRF_ENABLED_DEFAULT)
                 && early_dials_snapshot.signal_enabled("prf");
-            if prf_wanted && hybrid_ids.len() >= 2 {
+            if bm25_allowed && prf_wanted && hybrid_ids.len() >= 2 {
                 let prf_docs = early_dials_snapshot
                     .prf_docs
                     .unwrap_or(crate::constants::PRF_DOCS);
@@ -6885,6 +6950,153 @@ mod date_window_leg_tests {
         sys.recall(&query).expect("recall");
         let funnel = crate::memory::gold_funnel::take().expect("funnel armed");
         assert_eq!(stage(&funnel, "date_window"), None, "{funnel:?}");
+    }
+}
+
+#[cfg(test)]
+mod vector_rung_tests {
+    use super::*;
+    use crate::memory::{MemoryConfig, MemorySystem};
+    use rand::{Rng, SeedableRng};
+    use tempfile::TempDir;
+
+    fn fresh_system() -> (MemorySystem, TempDir) {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        (sys, tmp)
+    }
+
+    fn normalised(v: Vec<f32>) -> Vec<f32> {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.into_iter().map(|x| x / norm).collect()
+    }
+
+    /// A unit vector whose cosine with the unit vector `axis` is `cos`.
+    fn at_cosine(axis: &[f32], cos: f32, rng: &mut impl Rng) -> Vec<f32> {
+        let r: Vec<f32> = (0..axis.len()).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let along: f32 = r.iter().zip(axis).map(|(a, b)| a * b).sum();
+        let orthogonal = normalised(r.iter().zip(axis).map(|(a, b)| a - along * b).collect());
+        let sin = (1.0 - cos * cos).sqrt();
+        axis.iter()
+            .zip(&orthogonal)
+            .map(|(a, o)| cos * a + sin * o)
+            .collect()
+    }
+
+    fn remember_at(
+        sys: &MemorySystem,
+        content: &str,
+        entities: &[&str],
+        embedding: Vec<f32>,
+        day: u32,
+    ) -> MemoryId {
+        let created_at = chrono::NaiveDate::from_ymd_opt(2023, 5, day)
+            .expect("test date")
+            .and_hms_opt(12, 0, 0)
+            .expect("noon")
+            .and_utc();
+        sys.remember(
+            Experience {
+                experience_type: ExperienceType::Conversation,
+                content: content.to_string(),
+                entities: entities.iter().map(|e| e.to_string()).collect(),
+                embeddings: Some(embedding),
+                ..Default::default()
+            },
+            Some(created_at),
+        )
+        .expect("remember")
+    }
+
+    /// LoCoMo conv-26 shape: the turn the question asks about is the oldest and the longest,
+    /// and the turns nearer in time share the question's words and speaker. Every fusion
+    /// stage after the vector leg (temporal facts, entity overlap, the length penalty,
+    /// temporal topic dedup) prefers those; the vector rung must not run any of them.
+    #[test]
+    fn the_vector_rung_returns_the_stored_vectors_in_cosine_order() {
+        let (sys, _tmp) = fresh_system();
+        let dim = sys.get_embedder().dimension();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(26);
+        let query = normalised((0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect());
+
+        let mut by_cosine: Vec<(MemoryId, f32)> = Vec::new();
+        for i in 0..24u32 {
+            let cos = 0.9 - 0.03 * i as f32;
+            let embedding = at_cosine(&query, cos, &mut rng);
+            let id = if i < 12 {
+                remember_at(
+                    &sys,
+                    &format!(
+                        "Caroline: entry {i}, a long account of the evening at the community \
+                         centre, who spoke, what they said, how it felt, and what came after"
+                    ),
+                    &["Caroline", &format!("centre {i}")],
+                    embedding,
+                    1 + i,
+                )
+            } else {
+                remember_at(
+                    &sys,
+                    &format!("Caroline: support group {i}"),
+                    &["Caroline", "LGBTQ", "support group"],
+                    embedding,
+                    1 + i,
+                )
+            };
+            by_cosine.push((id, cos));
+        }
+
+        let recalled = sys
+            .recall(&Query {
+                user_id: Some("vector-rung-user".to_string()),
+                query_text: Some("When did Caroline go to the LGBTQ support group?".to_string()),
+                query_embedding: Some(query),
+                layers: Some(LayerMode::VamanaOnly),
+                max_results: 10,
+                ..Default::default()
+            })
+            .expect("recall");
+
+        let got: Vec<&MemoryId> = recalled.iter().map(|m| &m.id).collect();
+        let want: Vec<&MemoryId> = by_cosine.iter().take(10).map(|(id, _)| id).collect();
+        assert_eq!(got, want);
+        for (memory, (_, cos)) in recalled.iter().zip(&by_cosine) {
+            let score = memory.score.expect("scored");
+            assert!((score - cos).abs() < 1e-3, "score {score} for cosine {cos}");
+        }
+    }
+
+    #[test]
+    fn the_tier_scan_returns_only_memories_the_vector_index_does_not_hold() {
+        let (sys, _tmp) = fresh_system();
+        let dim = sys.get_embedder().dimension();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(35);
+        let query = normalised((0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect());
+        let indexed = remember_at(
+            &sys,
+            "Melanie: we went camping",
+            &["Melanie"],
+            at_cosine(&query, 0.8, &mut rng),
+            1,
+        );
+        let unindexed = remember_at(
+            &sys,
+            "Melanie: the kids loved the lake",
+            &["Melanie"],
+            at_cosine(&query, 0.7, &mut rng),
+            2,
+        );
+        assert!(sys.retriever.has_mapping(&indexed));
+        assert!(sys.retriever.remove_memory(&unindexed));
+
+        let hits = sys.unindexed_tier_hits(&query, None, &HashSet::new());
+        let ids: Vec<&MemoryId> = hits.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![&unindexed]);
+        assert!((hits[0].1 - 0.7).abs() < 1e-3);
     }
 }
 
