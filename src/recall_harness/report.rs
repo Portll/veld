@@ -307,6 +307,14 @@ pub struct RetrievalDials {
     /// semantic recall only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence_gate_all_paths: Option<bool>,
+    /// The `vector_exact_search_max` dial: `None` is the engine default (exact below 50 000
+    /// live vectors).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_exact_search_max: Option<usize>,
+    /// The `vector_search_beam` dial: `None` is the engine default (k plus up to 2k for
+    /// soft-deleted vectors, at least 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_search_beam: Option<usize>,
 }
 
 impl RetrievalDials {
@@ -318,6 +326,8 @@ impl RetrievalDials {
             relative_priors: dials.relative_priors,
             graph_episode_entities: dials.graph_episode_entities,
             confidence_gate_all_paths: dials.confidence_gate_all_paths,
+            vector_exact_search_max: dials.vector_exact_search_max,
+            vector_search_beam: dials.vector_search_beam,
         }
     }
 
@@ -337,6 +347,12 @@ impl RetrievalDials {
         }
         if let Some(v) = self.confidence_gate_all_paths {
             set.push(format!("confidence_gate_all_paths={v}"));
+        }
+        if let Some(v) = self.vector_exact_search_max {
+            set.push(format!("vector_exact_search_max={v}"));
+        }
+        if let Some(v) = self.vector_search_beam {
+            set.push(format!("vector_search_beam={v}"));
         }
         if set.is_empty() {
             "engine defaults".to_string()
@@ -1921,6 +1937,36 @@ mod tests {
             "{}",
             failures[0].detail
         );
+    }
+
+    /// A vector-search override walks a different candidate pool, refused like the others.
+    #[test]
+    fn a_vector_search_dial_on_one_side_refuses_the_comparison() {
+        for (dials, named) in [
+            (
+                RetrievalDials {
+                    vector_exact_search_max: Some(0),
+                    ..Default::default()
+                },
+                "vector_exact_search_max=0",
+            ),
+            (
+                RetrievalDials {
+                    vector_search_beam: Some(64),
+                    ..Default::default()
+                },
+                "vector_search_beam=64",
+            ),
+        ] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            baseline.retrieval_dials = Some(RetrievalDials::default());
+            current.retrieval_dials = Some(dials);
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(failures[0].detail.contains(named), "{}", failures[0].detail);
+        }
     }
 
     /// The confidence gate on every path changes which memories the non-semantic paths
