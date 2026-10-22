@@ -870,6 +870,30 @@ pub static WRITE_GATE_ABSORBED: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("WRITE_GATE_ABSORBED metric must be valid at compile time")
 });
 
+/// Comparisons against each similarity bar (see `crate::similarity::bars`).
+pub static SIMILARITY_BAR_EVALUATED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_similarity_bar_evaluated_total",
+            "Mapped-cosine comparisons against each similarity bar",
+        ),
+        &["bar"],
+    )
+    .expect("SIMILARITY_BAR_EVALUATED_TOTAL metric must be valid at compile time")
+});
+
+/// Comparisons that crossed each similarity bar.
+pub static SIMILARITY_BAR_FIRED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_similarity_bar_fired_total",
+            "Mapped-cosine comparisons that crossed each similarity bar",
+        ),
+        &["bar"],
+    )
+    .expect("SIMILARITY_BAR_FIRED_TOTAL metric must be valid at compile time")
+});
+
 // ============================================================================
 // Graph Degree Metrics
 // ============================================================================
@@ -1183,6 +1207,12 @@ fn do_register_metrics() -> Result<(), MetricsError> {
 
     // Write gate metrics
     register!(WRITE_GATE_ABSORBED, "WRITE_GATE_ABSORBED");
+    register!(
+        SIMILARITY_BAR_EVALUATED_TOTAL,
+        "SIMILARITY_BAR_EVALUATED_TOTAL"
+    );
+    register!(SIMILARITY_BAR_FIRED_TOTAL, "SIMILARITY_BAR_FIRED_TOTAL");
+    crate::similarity::bars::touch_all();
 
     // Graph degree metrics
     register!(

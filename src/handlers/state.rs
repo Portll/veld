@@ -39,6 +39,7 @@ use crate::graph_memory::{
     EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
     LtpStatus, RelationType, RelationshipEdge,
 };
+use crate::memory::tag_sources::{TagSource, TagSources};
 use crate::memory::{
     query_parser, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats,
     ProspectiveStore, SessionStore, TodoStore,
@@ -1636,6 +1637,16 @@ impl MultiUserMemoryManager {
             .clone()
     }
 
+    /// The lock `get_user_journaled_writer` opens `user_id`'s intent log and replays its
+    /// projections under, for the same use as [`Self::user_memory_init_lock`].
+    #[cfg(test)]
+    pub(crate) fn journaled_writer_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
+        self.journaled_writer_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
     /// Does NOT delete data — used before restore to release file locks.
     /// Evict the tenant and close its memory and graph stores before files are restored under
@@ -2127,6 +2138,9 @@ impl MultiUserMemoryManager {
     ///
     /// SlowStores are cached per-user to avoid reopening SQLite on every request
     /// and to ensure the sync TTL actually works across calls.
+    ///
+    /// A miss opens SQLite and creates its schema on the calling thread. Async code calls
+    /// [`Self::get_user_slow_store_async`] instead.
     pub fn get_user_slow_store(
         &self,
         user_id: &str,
@@ -2145,6 +2159,23 @@ impl MultiUserMemoryManager {
         )?);
         self.slow_stores.insert(user_id.to_string(), store.clone());
         Ok(store)
+    }
+
+    /// [`Self::get_user_slow_store`] for async code, on the [`Self::get_user_graph_async`] model:
+    /// a cached store comes back at once; an open, which waits up to SQLite's busy timeout
+    /// while another connection holds the file, runs on the blocking pool.
+    pub async fn get_user_slow_store_async(
+        self: &Arc<Self>,
+        user_id: &str,
+    ) -> Result<std::sync::Arc<crate::memory::slow_store::SlowStore>> {
+        if let Some(store) = self.slow_stores.get(user_id) {
+            return Ok(store.clone());
+        }
+        let manager = Arc::clone(self);
+        let user_id = user_id.to_string();
+        tokio::task::spawn_blocking(move || manager.get_user_slow_store(&user_id))
+            .await
+            .context("slow store open task did not complete")?
     }
 
     /// Get or create the per-tenant `Arc<BM25Index>`.
@@ -2267,12 +2298,13 @@ impl MultiUserMemoryManager {
         // the frames appended after them; a hint that does not verify
         // against the file is ignored.
         let frame_index_hint = checkpoint_store.lock().frame_index();
-        let log = crate::intent_log::IntentLog::open_with_index(
+        let mut log = crate::intent_log::IntentLog::open_with_index(
             &log_path,
             journal_cryptor,
             frame_index_hint,
         )
         .with_context(|| format!("open intent log for user {user_id}"))?;
+        log.set_segment_bytes(self.server_config.intent_log_segment_bytes());
 
         // SQLite slow store projection — first in the replay pass.
         let slow_store = self.get_user_slow_store(user_id)?;
@@ -4086,14 +4118,26 @@ impl MultiUserMemoryManager {
                 false,
             )?;
             let staged_user = staging.join(live_user.file_name().unwrap_or_default());
+            // The journal's sealed segments as restored, and the live ones the
+            // backup does not hold, which go aside with the head they followed.
+            let segments: std::collections::BTreeSet<String> = [&staged_user, &live_user]
+                .into_iter()
+                .map(|dir| crate::intent_log::sealed_segments(&dir.join("intent.log")))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
             let pairs: Vec<(std::path::PathBuf, std::path::PathBuf)> = [
                 "storage.redb",
                 "graph/graph.redb",
                 "intent.log",
                 "projection_checkpoints.bin",
             ]
-            .iter()
-            .map(|rel| (staged_user.join(rel), live_user.join(rel)))
+            .into_iter()
+            .map(str::to_string)
+            .chain(segments)
+            .map(|rel| (staged_user.join(&rel), live_user.join(&rel)))
             .collect();
 
             let writer = self.journaled_writers.get(user_id).map(|w| w.clone());
@@ -4212,17 +4256,19 @@ impl MultiUserMemoryManager {
         experience: &Experience,
         memory_id: &MemoryId,
     ) -> Result<()> {
-        self.rebuild_experience_graph_declared(user_id, experience, memory_id, &[])
+        self.rebuild_experience_graph_declared(user_id, experience, memory_id, &[], None)
     }
 
     /// [`rebuild_experience_graph`](Self::rebuild_experience_graph) with the writer's declared
-    /// entities, as [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared).
+    /// entities and tag provenance, as
+    /// [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared).
     pub fn rebuild_experience_graph_declared(
         &self,
         user_id: &str,
         experience: &Experience,
         memory_id: &MemoryId,
         declared: &[DeclaredEntity],
+        tag_sources: Option<&TagSources>,
     ) -> Result<()> {
         if let Ok(graph) = self.get_user_graph(user_id) {
             match graph.read().delete_episode(&memory_id.0) {
@@ -4238,7 +4284,13 @@ impl MultiUserMemoryManager {
                 ),
             }
         }
-        self.process_experience_into_graph_declared(user_id, experience, memory_id, declared)
+        self.process_experience_into_graph_declared(
+            user_id,
+            experience,
+            memory_id,
+            declared,
+            tag_sources,
+        )
     }
 
     /// Process an experience and extract entities/relationships into the graph
@@ -4255,7 +4307,7 @@ impl MultiUserMemoryManager {
         experience: &Experience,
         memory_id: &MemoryId,
     ) -> Result<()> {
-        self.process_experience_into_graph_declared(user_id, experience, memory_id, &[])
+        self.process_experience_into_graph_declared(user_id, experience, memory_id, &[], None)
     }
 
     /// [`process_experience_into_graph`](Self::process_experience_into_graph) plus the entities
@@ -4272,12 +4324,19 @@ impl MultiUserMemoryManager {
     /// Derived entities pass a stop list of words measured as hubs on a code-heavy store, and a
     /// derived entity already at `MAX_ENTITY_DEGREE` gets no new edges from this memory: at the
     /// cap, every new edge only bought a prune of an older one.
+    ///
+    /// `tag_sources` is the ledger row for the stored tags (see `crate::memory::tag_sources`).
+    /// With it, a causal edge forms only between names the writer or NER named: a caller tag, a
+    /// declared entity or an NER span. A YAKE or cold-start keyword, an ingest hint, a verb or a
+    /// regex term keeps `RelatedTo`. Without it, as on a path that records no provenance, any
+    /// name may take one.
     pub fn process_experience_into_graph_declared(
         &self,
         user_id: &str,
         experience: &Experience,
         memory_id: &MemoryId,
         declared: &[DeclaredEntity],
+        tag_sources: Option<&TagSources>,
     ) -> Result<()> {
         let graph = self.get_user_graph(user_id)?;
 
@@ -4304,6 +4363,11 @@ impl MultiUserMemoryManager {
         // A name the writer declared is the declared entity, not also a derived one.
         let declared_names: std::collections::HashSet<String> =
             declared.iter().map(|d| d.name.to_lowercase()).collect();
+
+        // The middle branch below reads `experience.entities`, which lists every tag, derived
+        // keywords included, so only the other two branches hold names NER produced.
+        let extracted_by_ner =
+            !experience.ner_entities.is_empty() || experience.entities.is_empty();
 
         // Use pre-extracted NER records for proper entity labels when available
         // This avoids redundant NER inference — the handler already ran NER in Pass 1
@@ -4360,6 +4424,30 @@ impl MultiUserMemoryManager {
                 }
             }
         };
+
+        // A keyword names no participant. In "A set B in motion." the keyword "set" sits between
+        // the two event names, so A -> set -> B would be typed causal in every chain that uses
+        // the phrase, and one entity would join them all.
+        let causal_named: Option<std::collections::HashSet<String>> = tag_sources.map(|sources| {
+            let ner_spans: &[crate::embeddings::ner::NerEntity] = if extracted_by_ner {
+                &extracted_entities
+            } else {
+                &[]
+            };
+            sources
+                .tags
+                .iter()
+                .filter(|t| {
+                    !t.redacted
+                        && matches!(
+                            t.source,
+                            TagSource::Caller | TagSource::Declared | TagSource::Ner
+                        )
+                })
+                .map(|t| t.tag.trim().to_lowercase())
+                .chain(ner_spans.iter().map(|e| e.text.trim().to_lowercase()))
+                .collect()
+        });
 
         // Filter noise entities
         let filtered_entities: Vec<_> = extracted_entities
@@ -4735,6 +4823,17 @@ impl MultiUserMemoryManager {
                 })
             })
             .collect();
+        let causal_candidate: Vec<bool> = entity_uuids
+            .iter()
+            .enumerate()
+            .map(|(k, (name, _))| {
+                !fragment_of_comention[k]
+                    && (declared_weight[k].is_some()
+                        || causal_named
+                            .as_ref()
+                            .is_none_or(|named| named.contains(&name.trim().to_lowercase())))
+            })
+            .collect();
 
         let mut hub_edges_skipped = 0u64;
         for i in 0..entity_uuids.len() {
@@ -4752,17 +4851,15 @@ impl MultiUserMemoryManager {
                     declared_strength.unwrap_or_else(|| EdgeTier::L1Working.initial_weight());
                 let mut from_entity = entity_uuids[i].1;
                 let mut to_entity = entity_uuids[j].1;
-                let cue_hit =
-                    if extract_predicates && !fragment_of_comention[i] && !fragment_of_comention[j]
-                    {
-                        crate::graph_memory::extract_directed_predicate(
-                            &experience.content,
-                            &entity_uuids[i].0,
-                            &entity_uuids[j].0,
-                        )
-                    } else {
-                        None
-                    };
+                let cue_hit = if extract_predicates && causal_candidate[i] && causal_candidate[j] {
+                    crate::graph_memory::extract_directed_predicate(
+                        &experience.content,
+                        &entity_uuids[i].0,
+                        &entity_uuids[j].0,
+                    )
+                } else {
+                    None
+                };
                 let relation_type = match cue_hit {
                     Some((rt, a_is_source)) => {
                         if !a_is_source {
@@ -4865,6 +4962,9 @@ pub const GENERIC_DERIVED_ENTITY_WORDS: &[&str] = &[
 /// a direct name match. Each call clones the index `Arc` out and releases
 /// the writer mutex immediately; the ANN search runs under the index's
 /// own `RwLock`, never under the writer lock.
+///
+/// A writer not yet open is opened here, which replays the tenant's intent
+/// log; the querier calls these on the blocking pool for that reason.
 impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
     fn index(
         &self,
@@ -4900,7 +5000,8 @@ impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
 /// The memory↔entity link lives on the `Memory` itself (its `entity_refs`
 /// set), not in `GraphMemory`, so these primitives read the tenant's
 /// `UserMemory`. Each returns owned ids and releases the `UserMemory` read lock
-/// before returning — the querier never holds it across an `await`.
+/// before returning — the querier never holds it across an `await`. Each also
+/// opens a tenant not yet open, so the querier calls them on the blocking pool.
 ///
 /// `memory_ids_with_entity` / `memory_ids_in_episode` scan the tenant's
 /// live memory set (`get_all_memories`); that is `O(n)` in the corpus.

@@ -2864,17 +2864,20 @@ impl GraphMemory {
             if let Some(ref new_emb) = entity.name_embedding {
                 let cache = self.entity_embedding_cache.read();
                 let mut best_match: Option<(Uuid, f32)> = None;
+                let mut crossed = 0u64;
                 for (uuid, existing_emb) in cache.iter() {
                     // The merge bar was set on MiniLM name embeddings; read on that scale.
                     let sim = crate::similarity::scale::name_to_reference(
                         crate::similarity::cosine_similarity(new_emb, existing_emb),
                     );
-                    if sim >= ENTITY_CONCEPT_MERGE_THRESHOLD
-                        && best_match.is_none_or(|(_, best_sim)| sim > best_sim)
-                    {
+                    let crosses = sim >= ENTITY_CONCEPT_MERGE_THRESHOLD;
+                    crossed += u64::from(crosses);
+                    if crosses && best_match.is_none_or(|(_, best_sim)| sim > best_sim) {
                         best_match = Some((*uuid, sim));
                     }
                 }
+                crate::similarity::bars::SimilarityBar::EntityConceptMerge
+                    .record_many(cache.len() as u64, crossed);
                 if let Some((matched_uuid, sim)) = best_match {
                     tracing::debug!(
                         "Concept merge: '{}' matched existing entity {} (cosine={:.3})",
