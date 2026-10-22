@@ -41,6 +41,10 @@ async fn record_tag_sources(
     let id = memory_id.clone();
     let joined = tokio::task::spawn_blocking(move || {
         let guard = memory.read();
+        // The row is read, merged and written back: two writes to one memory (a duplicate
+        // merging into it) each merging into the row read before the other's put would
+        // lose a label. The write gate serializes them, as it does the record itself.
+        let _gate = guard.journal_section();
         let store = guard.tag_source_store();
         let Some(stored) = stored else {
             return store.delete(&id);
