@@ -42,6 +42,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "storage-redb")]
+use crate::config::RedbFileRole;
 use crate::config::StorageBackend;
 use crate::storage::portable::{self, PortableRecord, PortableWriter};
 
@@ -1579,13 +1581,13 @@ fn apply(
             let (primary, graph): (Vec<_>, Vec<_>) =
                 data.into_iter().partition(|r| r.cf.starts_with("primary/"));
             if !primary.is_empty() {
-                apply_redb(&dir.join("storage.redb"), &primary, |cf| {
+                apply_redb(&dir.join("storage.redb"), RedbFileRole::Memories, &primary, |cf| {
                     split_keyspace(cf, "primary")
                         .filter(|t| ["default", "kv", "memories", "vector_mappings"].contains(t))
                 })?;
             }
             if !graph.is_empty() {
-                apply_redb(&dir.join("graph/graph.redb"), &graph, |cf| {
+                apply_redb(&dir.join("graph/graph.redb"), RedbFileRole::Graph, &graph, |cf| {
                     split_keyspace(cf, "graph")
                 })?;
             }
@@ -1595,12 +1597,12 @@ fn apply(
             let (audit, shared): (Vec<_>, Vec<_>) =
                 data.into_iter().partition(|r| r.cf.starts_with("audit/"));
             if !audit.is_empty() {
-                apply_redb(&base.join("audit.redb"), &audit, |cf| {
+                apply_redb(&base.join("audit.redb"), RedbFileRole::Auxiliary, &audit, |cf| {
                     (cf == "audit/audit").then_some("audit")
                 })?;
             }
             if !shared.is_empty() {
-                apply_redb(&base.join("shared.redb"), &shared, |cf| {
+                apply_redb(&base.join("shared.redb"), RedbFileRole::Shared, &shared, |cf| {
                     split_keyspace(cf, "shared").filter(|t| *t != "audit")
                 })?;
             }
@@ -1614,12 +1616,13 @@ fn apply(
 #[cfg(feature = "storage-redb")]
 fn apply_redb<'a>(
     path: &Path,
+    role: RedbFileRole,
     records: &'a [PortableRecord],
     table_for: impl Fn(&'a str) -> Option<&'a str>,
 ) -> Result<()> {
     use redb::{ReadableTableMetadata, TableHandle};
     let tuning = crate::config::StorageTuning::process();
-    let db = crate::storage::redb::create_redb_database(path, &tuning)
+    let db = crate::storage::redb::create_redb_database(path, &tuning, role)
         .with_context(|| format!("opening {}", path.display()))?;
     let txn = crate::storage::redb::begin_write(&db, tuning.durability)?;
     {

@@ -5838,11 +5838,16 @@ impl MemorySystem {
         // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
         // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
         // them, and a replica applying every snapshot grew 18.7 vectors per memory.
+        // The stored versions are read in one batch, as the page is written in one: a
+        // follower's page was a point read, and on redb a read transaction, per memory.
+        let ids: Vec<MemoryId> = memories.iter().map(|memory| memory.id.clone()).collect();
+        let stored = self.long_term_memory.get_many(&ids);
         let vectors_kept: Vec<bool> = memories
             .iter()
-            .map(|memory| {
+            .zip(stored)
+            .map(|(memory, stored)| {
                 self.retriever.is_indexed(&memory.id)
-                    && self.long_term_memory.get(&memory.id).is_ok_and(|stored| {
+                    && stored.is_ok_and(|stored| {
                         keeps_vectors(&stored, &memory.experience.content)
                             && stored.experience.embeddings == memory.experience.embeddings
                     })

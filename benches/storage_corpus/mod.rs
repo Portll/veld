@@ -393,10 +393,13 @@ pub fn announce_tuning(bench: &str) {
     let block_cache = tuning
         .rocksdb_block_cache_bytes
         .map_or_else(|| "built-in".to_string(), |bytes| bytes.to_string());
+    let redb_cache = tuning
+        .redb_cache_bytes
+        .map_or_else(|| "per-file".to_string(), |bytes| bytes.to_string());
     eprintln!(
-        "{bench}: VELD_STORAGE_DURABILITY={} VELD_REDB_CACHE_BYTES={} \
+        "{bench}: VELD_STORAGE_DURABILITY={} VELD_REDB_CACHE_BYTES={redb_cache} \
          VELD_ROCKSDB_WRITE_BUFFER_BYTES={} VELD_ROCKSDB_BLOCK_CACHE_BYTES={block_cache}",
-        tuning.durability, tuning.redb_cache_bytes, tuning.rocksdb_write_buffer_bytes,
+        tuning.durability, tuning.rocksdb_write_buffer_bytes,
     );
 }
 

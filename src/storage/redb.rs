@@ -25,7 +25,7 @@ use super::{
     WriteBatch as StorageWriteBatch,
 };
 use crate::backup::BackupMetadata;
-use crate::config::{StorageBackend, StorageDurability, StorageTuning};
+use crate::config::{RedbFileRole, StorageBackend, StorageDurability, StorageTuning};
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, RelationshipEdge};
 use crate::memory::storage::{
     haversine_metres, SearchCriteria, VectorMappingEntry, EARTH_RADIUS_METRES,
@@ -108,20 +108,29 @@ impl BatchWriter for RedbBatchWriter {
             }
         }
 
+        // Each table is opened once for the batch, not once per op: opening one walks the
+        // table tree, and a batch of thousands of rows in one family did that per row.
+        // Grouping keeps every table's ops in batch order, which is all that decides the
+        // final state: tables share no keys, and the commit below applies them together.
+        let mut by_table: Vec<(&str, Vec<&BatchOp>)> = Vec::new();
+        for op in batch.ops() {
+            let (BatchOp::Put { cf, .. } | BatchOp::Delete { cf, .. }) = op;
+            let name = cf.as_deref().unwrap_or(DEFAULT_TABLE_NAME);
+            match by_table.iter_mut().find(|(table, _)| *table == name) {
+                Some((_, ops)) => ops.push(op),
+                None => by_table.push((name, vec![op])),
+            }
+        }
         let txn = begin_write(&self.database, self.durability)?;
-        {
-            for op in batch.ops() {
+        for (name, ops) in by_table {
+            let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(name);
+            let mut handle = txn.open_table(def)?;
+            for op in ops {
                 match op {
-                    BatchOp::Put { cf, key, value } => {
-                        let def: redb::TableDefinition<'_, &[u8], &[u8]> =
-                            redb::TableDefinition::new(cf.as_deref().unwrap_or(DEFAULT_TABLE_NAME));
-                        let mut handle = txn.open_table(def)?;
+                    BatchOp::Put { key, value, .. } => {
                         handle.insert(key.as_slice(), value.as_slice())?;
                     }
-                    BatchOp::Delete { cf, key } => {
-                        let def: redb::TableDefinition<'_, &[u8], &[u8]> =
-                            redb::TableDefinition::new(cf.as_deref().unwrap_or(DEFAULT_TABLE_NAME));
-                        let mut handle = txn.open_table(def)?;
+                    BatchOp::Delete { key, .. } => {
                         // Deleting an absent key is not an error: rocksdb's
                         // delete_cf is equally indifferent, and a batch that
                         // failed on a missing row would diverge from it.
@@ -278,7 +287,7 @@ fn not_implemented(operation: &str, path: &Path) -> anyhow::Error {
 /// Test-only constructor so conformance tests can build a bare handle.
 #[cfg(test)]
 pub fn create_redb_database_for_test(path: &Path) -> Result<Arc<redb::Database>> {
-    create_redb_database(path, &StorageTuning::process())
+    create_redb_database(path, &StorageTuning::process(), RedbFileRole::Auxiliary)
 }
 
 /// Open (or create) the SHARED redb database holding the global stores'
@@ -286,26 +295,37 @@ pub fn create_redb_database_for_test(path: &Path) -> Result<Arc<redb::Database>>
 /// opener: every store over it must be built FROM THIS HANDLE (`with_store`
 /// constructors), never by path, or the second opener dies on the store lock.
 pub fn open_shared_database(base_path: &Path) -> Result<Arc<redb::Database>> {
-    create_redb_database(&base_path.join("shared.redb"), &StorageTuning::process())
+    create_redb_database(
+        &base_path.join("shared.redb"),
+        &StorageTuning::process(),
+        RedbFileRole::Shared,
+    )
 }
 
 /// Open (or create) a per-user GRAPH database — the redb counterpart of the
 /// graph's own rocksdb directory. Separate file from the shared stores, matching
 /// the rocksdb layout where the graph is its own database.
 pub fn open_graph_database(graph_path: &Path) -> Result<Arc<redb::Database>> {
-    create_redb_database(&graph_path.join("graph.redb"), &StorageTuning::process())
+    create_redb_database(
+        &graph_path.join("graph.redb"),
+        &StorageTuning::process(),
+        RedbFileRole::Graph,
+    )
 }
 
+/// Open (or create) the redb file at `path`, its page cache sized for `role` unless the
+/// tuning names one size for every file.
 pub(crate) fn create_redb_database(
     path: &Path,
     tuning: &StorageTuning,
+    role: RedbFileRole,
 ) -> Result<Arc<redb::Database>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     let mut builder = redb::Builder::new();
-    builder.set_cache_size(tuning.redb_cache_bytes);
+    builder.set_cache_size(tuning.redb_cache_bytes_for(role));
     super::redb_latch::open(path, &builder)
 }
 
@@ -908,7 +928,7 @@ impl RedbPrimaryMemoryStore {
     /// the process's.
     pub fn open_with_tuning(path: &Path, tuning: StorageTuning) -> Result<Self> {
         let database_path = path.join("storage.redb");
-        let database = create_redb_database(&database_path, &tuning)?;
+        let database = create_redb_database(&database_path, &tuning, RedbFileRole::Memories)?;
         let durability = tuning.durability;
         // `kv` with the rest: RocksDB opens its `kv` family with the database, and a
         // write_batch naming a table that does not exist yet is refused here.
@@ -2348,7 +2368,7 @@ pub struct RedbGraphStore {
 impl RedbGraphStore {
     pub fn open(path: &Path) -> Result<Self> {
         let tuning = StorageTuning::process();
-        let database = create_redb_database(&path.join("graph.redb"), &tuning)?;
+        let database = create_redb_database(&path.join("graph.redb"), &tuning, RedbFileRole::Graph)?;
         init_tables(
             &database,
             tuning.durability,
@@ -2478,7 +2498,7 @@ impl RedbKeyValueStore {
     pub fn open(path: &Path, namespace: &str) -> Result<Self> {
         let tuning = StorageTuning::process();
         let database_path = path.join(format!("{}.redb", namespace));
-        let database = create_redb_database(&database_path, &tuning)?;
+        let database = create_redb_database(&database_path, &tuning, RedbFileRole::Auxiliary)?;
         // Materialize the table up front so reads never hit `TableDoesNotExist`.
         init_table(&database, tuning.durability, KV_TABLE)?;
         Ok(Self {
@@ -2627,7 +2647,8 @@ pub struct RedbAuditStore {
 impl RedbAuditStore {
     pub fn open(path: &Path) -> Result<Self> {
         let tuning = StorageTuning::process();
-        let database = create_redb_database(&path.join("audit.redb"), &tuning)?;
+        let database =
+            create_redb_database(&path.join("audit.redb"), &tuning, RedbFileRole::Auxiliary)?;
         init_table(&database, tuning.durability, AUDIT_TABLE)?;
         Ok(Self {
             database,
@@ -2804,7 +2825,7 @@ mod redb_domain_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let eventual = StorageTuning {
             durability: StorageDurability::Eventual,
-            redb_cache_bytes: 4 * 1024 * 1024,
+            redb_cache_bytes: Some(4 * 1024 * 1024),
             ..StorageTuning::default()
         };
         let unflushed = memory_with("committed, never flushed", &["Kiri"], &["unflushed"]);
@@ -3819,7 +3840,11 @@ impl RedbBackupStore {
     /// tool, or a restore into a fresh target. Fails on the lock otherwise, loudly.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
-        let database = create_redb_database(&path.join("storage.redb"), &StorageTuning::process())?;
+        let database = create_redb_database(
+            &path.join("storage.redb"),
+            &StorageTuning::process(),
+            RedbFileRole::Memories,
+        )?;
         Ok(Self {
             database,
             path: path.to_path_buf(),
@@ -3995,7 +4020,11 @@ impl RedbMigrationStore {
     /// tool, or a fresh import target.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
-        let database = create_redb_database(&path.join("storage.redb"), &StorageTuning::process())?;
+        let database = create_redb_database(
+            &path.join("storage.redb"),
+            &StorageTuning::process(),
+            RedbFileRole::Memories,
+        )?;
         Ok(Self {
             path: path.to_path_buf(),
             database,

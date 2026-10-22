@@ -7109,7 +7109,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let tuned = crate::config::StorageTuning {
             durability: crate::config::StorageDurability::Immediate,
-            redb_cache_bytes: 1024 * 1024,
+            redb_cache_bytes: Some(1024 * 1024),
             rocksdb_write_buffer_bytes: 1024 * 1024,
             rocksdb_block_cache_bytes: Some(1024 * 1024),
         };
