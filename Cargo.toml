@@ -154,7 +154,7 @@ path = "src/bin/recall_eval.rs"
 
 [dependencies]
 # MCP Protocol
-rmcp = { version = "1.8", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "2.1", features = ["server", "macros", "transport-io"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 # Global allocator — replaces Windows default heap (eliminates segment doubling / commit bloat)
 mimalloc = "0.1"
