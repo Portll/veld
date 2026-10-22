@@ -1304,6 +1304,7 @@ pub async fn proactive_context(
         .map(validation::validate_repo)
         .transpose()
         .map_validation_err("repo")?;
+    super::remember::validate_emotion(req.emotional_valence, req.emotional_arousal)?;
     let evidence_source = state
         .session_store
         .get_or_create_session(&req.user_id)
