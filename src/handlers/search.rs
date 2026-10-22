@@ -94,7 +94,7 @@ pub async fn advanced_search(
     let count = raw_memories.len();
     let memories: Vec<serde_json::Value> = raw_memories
         .into_iter()
-        .filter_map(|m| serde_json::to_value(&m).ok())
+        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
         .collect();
 
     Ok(Json(RetrieveResponse { memories, count }))
@@ -179,7 +179,7 @@ pub async fn multimodal_search(
 
     let memories: Vec<serde_json::Value> = raw_memories
         .into_iter()
-        .filter_map(|m| serde_json::to_value(&m).ok())
+        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
         .collect();
 
     state.log_event(
@@ -284,7 +284,7 @@ pub async fn robotics_search(
 
     let memories: Vec<serde_json::Value> = raw_memories
         .into_iter()
-        .filter_map(|m| serde_json::to_value(&m).ok())
+        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
         .collect();
 
     state.log_event(

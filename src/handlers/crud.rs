@@ -47,6 +47,9 @@ pub struct MemoryWithHierarchy {
     /// Why `full_content` is false, when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_note: Option<String>,
+    /// C3.1 (W-006): untrusted content reading like an injection directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub injection_suspected: Option<bool>,
 }
 
 /// `?decompress=1|true` (alias `?full=`) asks GET /api/memory/{id} for the restored content.
@@ -210,6 +213,9 @@ pub struct ListMemoryItem {
     pub tags: Vec<String>,
     pub created_at: String,
     pub tier: String,
+    /// C3.1 (W-006): untrusted content reading like an injection directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub injection_suspected: Option<bool>,
 }
 
 /// One list row from a memory, with the preview cut declared rather than silent.
@@ -230,6 +236,7 @@ fn list_item(m: &crate::memory::Memory) -> ListMemoryItem {
         tags: m.experience.entities.clone(),
         created_at: m.created_at.to_rfc3339(),
         tier: format!("{:?}", m.tier),
+        injection_suspected: crate::memory::injection::injection_suspected(m),
     }
 }
 
@@ -415,6 +422,7 @@ pub async fn get_memory(
     let children_ids: Vec<String> = children.iter().map(|c| c.id.0.to_string()).collect();
     let children_count = children_ids.len();
 
+    let injection_suspected = crate::memory::injection::injection_suspected(&memory_obj);
     Ok(Json(MemoryWithHierarchy {
         memory: memory_obj,
         children_ids,
@@ -422,6 +430,7 @@ pub async fn get_memory(
         full_content,
         lossless,
         content_note,
+        injection_suspected,
     }))
 }
 
