@@ -166,7 +166,7 @@ Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `Pri
 
 ### Alignment (recent work)
 
-Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (beyond the original Procrustes + Ridge fitters), with payload hardening, conditioning, and perf-flag config. Fit/eval bins, retrieval integration. Binaries: `alignment-collect`, `alignment-fit`, `alignment-eval` (see [src/bin/](src/bin/)). Evaluations at [evaluations/alignment/](evaluations/alignment/).
+Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes (beyond the original Procrustes + Ridge fitters), with payload hardening, conditioning, and perf-flag config. CSLS was prototyped and removed unused; its `AlignmentConfig.csls_*` knobs are still read from env but do nothing. Fit/eval bins, retrieval integration. Binaries: `alignment-collect`, `alignment-fit`, `alignment-eval` (see [src/bin/](src/bin/)). Evaluations at [evaluations/alignment/](evaluations/alignment/).
 
 ---
 
