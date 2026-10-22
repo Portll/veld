@@ -132,9 +132,41 @@ impl std::str::FromStr for StorageDurability {
 // Eventual because RocksDB, the default engine (ADR 0007), has never synced a write unless asked.
 pub const DEFAULT_STORAGE_DURABILITY: StorageDurability = StorageDurability::Eventual;
 
-/// redb's own page-cache default, which every redb database opened with before
-/// `VELD_REDB_CACHE_BYTES` existed. It is a ceiling per database file, filled as pages are read.
-pub const DEFAULT_REDB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+/// What a redb database file holds, which sizes its page cache when `VELD_REDB_CACHE_BYTES`
+/// is unset.
+///
+/// The cache is a ceiling per file, filled as pages are read, and nothing shares it: a server
+/// with many tenants open holds two files per tenant. redb's own default of 1 GiB per file put
+/// no practical bound on that, where the RocksDB engine serves every tenant from one 256 MiB
+/// block cache. A page the cache does not hold is read from the operating system's page cache
+/// while the file is warm, so a smaller ceiling costs a read call, not a disk read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedbFileRole {
+    /// A tenant's memories, their index tables and its default keyspace (`storage.redb`).
+    Memories,
+    /// A tenant's knowledge graph (`graph.redb`).
+    Graph,
+    /// The stores every tenant shares (`shared.redb`).
+    Shared,
+    /// A file with one small job: a key-value namespace, the audit log.
+    Auxiliary,
+}
+
+impl RedbFileRole {
+    /// The page cache a file in this role opens with when `VELD_REDB_CACHE_BYTES` is unset.
+    pub const fn default_cache_bytes(self) -> usize {
+        const MIB: usize = 1024 * 1024;
+        match self {
+            // Recall reads candidate records from here at random.
+            Self::Memories => 64 * MIB,
+            // Entity and edge rows are small; traversal touches few pages per query.
+            Self::Graph => 32 * MIB,
+            // Todos, reminders, files and feedback for every tenant at once.
+            Self::Shared => 64 * MIB,
+            Self::Auxiliary => 8 * MIB,
+        }
+    }
+}
 
 /// Block cache a RocksDB memory store opens with when no shared cache is supplied
 /// (standalone and CLI use; the server supplies one shared cache for every store).
@@ -149,8 +181,9 @@ pub const DEFAULT_ROCKSDB_STANDALONE_BLOCK_CACHE_BYTES: usize = 16 * 1024 * 1024
 pub struct StorageTuning {
     /// `VELD_STORAGE_DURABILITY`.
     pub durability: StorageDurability,
-    /// `VELD_REDB_CACHE_BYTES`: page cache per redb database file.
-    pub redb_cache_bytes: usize,
+    /// `VELD_REDB_CACHE_BYTES`: page cache for every redb database file, whatever it holds.
+    /// `None` sizes each file by its [`RedbFileRole`].
+    pub redb_cache_bytes: Option<usize>,
     /// `VELD_ROCKSDB_WRITE_BUFFER_BYTES`: memtable size of each column family of a RocksDB
     /// memory store.
     pub rocksdb_write_buffer_bytes: usize,
@@ -163,7 +196,7 @@ impl Default for StorageTuning {
     fn default() -> Self {
         Self {
             durability: DEFAULT_STORAGE_DURABILITY,
-            redb_cache_bytes: DEFAULT_REDB_CACHE_BYTES,
+            redb_cache_bytes: None,
             rocksdb_write_buffer_bytes: crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES,
             rocksdb_block_cache_bytes: None,
         }
@@ -186,11 +219,9 @@ impl StorageTuning {
         let defaults = Self::default();
         Self {
             durability: durability_from_lookup(&lookup),
-            redb_cache_bytes: byte_count_from_lookup(
-                &lookup,
-                "VELD_REDB_CACHE_BYTES",
-                defaults.redb_cache_bytes,
-            ),
+            redb_cache_bytes: lookup("VELD_REDB_CACHE_BYTES").and_then(|raw| {
+                parse_byte_count("VELD_REDB_CACHE_BYTES", &raw, "the per-file defaults")
+            }),
             rocksdb_write_buffer_bytes: byte_count_from_lookup(
                 &lookup,
                 "VELD_ROCKSDB_WRITE_BUFFER_BYTES",
@@ -199,6 +230,14 @@ impl StorageTuning {
             rocksdb_block_cache_bytes: lookup("VELD_ROCKSDB_BLOCK_CACHE_BYTES").and_then(|raw| {
                 parse_byte_count("VELD_ROCKSDB_BLOCK_CACHE_BYTES", &raw, "the built-in size")
             }),
+        }
+    }
+
+    /// The page cache a redb file in `role` opens with.
+    pub const fn redb_cache_bytes_for(&self, role: RedbFileRole) -> usize {
+        match self.redb_cache_bytes {
+            Some(bytes) => bytes,
+            None => role.default_cache_bytes(),
         }
     }
 
@@ -1159,10 +1198,18 @@ impl ServerConfig {
             );
         }
         let tuning = StorageTuning::process();
+        let redb_cache = match tuning.redb_cache_bytes {
+            Some(bytes) => format!("{}MB per database", bytes / (1024 * 1024)),
+            None => format!(
+                "{}MB per tenant store, {}MB per graph",
+                RedbFileRole::Memories.default_cache_bytes() / (1024 * 1024),
+                RedbFileRole::Graph.default_cache_bytes() / (1024 * 1024)
+            ),
+        };
         info!(
-            "   Storage durability: {} (redb cache {}MB per database, RocksDB write buffer {}MB)",
+            "   Storage durability: {} (redb cache {}, RocksDB write buffer {}MB)",
             tuning.durability,
-            tuning.redb_cache_bytes / (1024 * 1024),
+            redb_cache,
             tuning.rocksdb_write_buffer_bytes / (1024 * 1024)
         );
         info!("   Max users in memory: {}", self.max_users_in_memory);
@@ -1279,7 +1326,13 @@ pub fn print_env_help() {
     println!("                                    immediate = every commit synced to disk (redb Immediate, RocksDB synced WAL);");
     println!("                                    eventual = survives a process crash, a power loss can lose the last commits.");
     println!("                                    Supersedes VELD_WRITE_MODE (sync = immediate, async = eventual).");
-    println!("  VELD_REDB_CACHE_BYTES           - redb page cache per database file, in bytes (default: {DEFAULT_REDB_CACHE_BYTES})");
+    println!(
+        "  VELD_REDB_CACHE_BYTES           - redb page cache per database file, in bytes (default: {} per tenant store, {} per graph, {} shared, {} other)",
+        RedbFileRole::Memories.default_cache_bytes(),
+        RedbFileRole::Graph.default_cache_bytes(),
+        RedbFileRole::Shared.default_cache_bytes(),
+        RedbFileRole::Auxiliary.default_cache_bytes()
+    );
     println!(
         "  VELD_ROCKSDB_WRITE_BUFFER_BYTES - RocksDB memtable size per column family, in bytes (default: {})",
         crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES
@@ -1674,7 +1727,11 @@ mod tests {
         assert_eq!(tuning, StorageTuning::default());
         assert_eq!(tuning.durability, StorageDurability::Eventual);
         assert!(!tuning.rocksdb_sync_writes());
-        assert_eq!(tuning.redb_cache_bytes, DEFAULT_REDB_CACHE_BYTES);
+        assert_eq!(tuning.redb_cache_bytes, None);
+        assert_eq!(
+            tuning.redb_cache_bytes_for(RedbFileRole::Memories),
+            RedbFileRole::Memories.default_cache_bytes()
+        );
         assert_eq!(
             tuning.rocksdb_write_buffer_bytes,
             crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES
@@ -1743,7 +1800,12 @@ mod tests {
             ("VELD_ROCKSDB_WRITE_BUFFER_BYTES", " 4194304 "),
             ("VELD_ROCKSDB_BLOCK_CACHE_BYTES", "33554432"),
         ]);
-        assert_eq!(tuned.redb_cache_bytes, 64 * 1024 * 1024);
+        assert_eq!(tuned.redb_cache_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(
+            tuned.redb_cache_bytes_for(RedbFileRole::Auxiliary),
+            64 * 1024 * 1024,
+            "an explicit size applies to every file"
+        );
         assert_eq!(tuned.rocksdb_write_buffer_bytes, 4 * 1024 * 1024);
         assert_eq!(tuned.rocksdb_block_cache_bytes, Some(32 * 1024 * 1024));
         assert_eq!(
@@ -1782,7 +1844,7 @@ mod tests {
             tuning,
             StorageTuning {
                 durability: StorageDurability::Immediate,
-                redb_cache_bytes: 1024 * 1024,
+                redb_cache_bytes: Some(1024 * 1024),
                 rocksdb_write_buffer_bytes: 2 * 1024 * 1024,
                 rocksdb_block_cache_bytes: None,
             }
