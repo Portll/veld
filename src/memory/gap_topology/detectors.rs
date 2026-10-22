@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
+use crate::memory::pacing;
 use crate::similarity::cosine_similarity;
 
 use super::{
@@ -293,93 +294,92 @@ pub fn detect_orbit_gaps(
         return Ok(Vec::new());
     }
 
-    // Find cluster pairs that share attractors but have no direct cross-links
+    // Cluster pairs that share attractors but have few or no cross-links; the
+    // most confident `max_gaps_per_type` become gaps.
     let links = cluster_links(&adj, &meaningful_clusters);
+    let mut candidates: Vec<(usize, usize, usize, usize, f32)> = Vec::new();
+    for (&(i, j), &(shared_attractors, cross_links)) in &links {
+        pacing::tick(1);
+        if shared_attractors == 0 {
+            continue;
+        }
+        let (size_a, size_b) = (
+            meaningful_clusters[i].1.len(),
+            meaningful_clusters[j].1.len(),
+        );
+        let cross_ratio = cross_links as f32 / (size_a * size_b).max(1) as f32;
+        if cross_ratio < 0.1 {
+            let confidence = (shared_attractors as f32 / 5.0).clamp(0.0, 1.0) * (1.0 - cross_ratio);
+            candidates.push((i, j, shared_attractors, cross_links, confidence));
+        }
+    }
+    candidates.sort_by(|a, b| b.4.total_cmp(&a.4).then((a.0, a.1).cmp(&(b.0, b.1))));
+    candidates.truncate(config.max_gaps_per_type);
+
     let mut gaps = Vec::new();
-    for i in 0..meaningful_clusters.len() {
-        for j in (i + 1)..meaningful_clusters.len() {
-            let (id_a, members_a) = &meaningful_clusters[i];
-            let (id_b, members_b) = &meaningful_clusters[j];
-            let Some(&(shared_attractors, cross_links)) = links.get(&(i, j)) else {
-                continue;
-            };
-            if shared_attractors == 0 {
-                continue;
-            }
+    for (i, j, shared_attractors, cross_links, confidence) in candidates {
+        let (id_a, members_a) = &meaningful_clusters[i];
+        let (id_b, members_b) = &meaningful_clusters[j];
+        let gap_id = format!("orbit:{}:{}", id_a, id_b);
 
-            // If few or no cross-links relative to shared attractors, it's an orbit gap
-            let cross_ratio =
-                cross_links as f32 / (members_a.len() * members_b.len()).max(1) as f32;
-            if cross_ratio < 0.1 {
-                let confidence =
-                    (shared_attractors as f32 / 5.0).clamp(0.0, 1.0) * (1.0 - cross_ratio);
+        // Get names for entities
+        let all_uuids: Vec<&str> = members_a
+            .iter()
+            .chain(members_b.iter())
+            .map(|s| s.as_str())
+            .take(20) // limit for name lookup
+            .collect();
+        let names = store.get_entity_names(&all_uuids).unwrap_or_default();
 
-                let gap_id = format!("orbit:{}:{}", id_a, id_b);
+        let entities: Vec<GapEntity> = members_a
+            .iter()
+            .take(5)
+            .chain(members_b.iter().take(5))
+            .map(|uuid| GapEntity {
+                uuid: uuid.clone(),
+                name: names
+                    .get(uuid.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| uuid[..8.min(uuid.len())].to_string()),
+                role: GapRole::ClusterMember,
+            })
+            .collect();
 
-                // Get names for entities
-                let all_uuids: Vec<&str> = members_a
-                    .iter()
-                    .chain(members_b.iter())
-                    .map(|s| s.as_str())
-                    .take(20) // limit for name lookup
-                    .collect();
-                let names = store.get_entity_names(&all_uuids).unwrap_or_default();
-
-                let entities: Vec<GapEntity> = members_a
-                    .iter()
-                    .take(5)
-                    .chain(members_b.iter().take(5))
-                    .map(|uuid| GapEntity {
-                        uuid: uuid.clone(),
-                        name: names
-                            .get(uuid.as_str())
-                            .cloned()
-                            .unwrap_or_else(|| uuid[..8.min(uuid.len())].to_string()),
-                        role: GapRole::ClusterMember,
-                    })
-                    .collect();
-
-                // Sample missing links
-                let mut missing_links = Vec::new();
-                for a in members_a.iter().take(3) {
-                    for b in members_b.iter().take(3) {
-                        let a_name = names
-                            .get(a.as_str())
-                            .cloned()
-                            .unwrap_or_else(|| a[..8.min(a.len())].to_string());
-                        let b_name = names
-                            .get(b.as_str())
-                            .cloned()
-                            .unwrap_or_else(|| b[..8.min(b.len())].to_string());
-                        missing_links.push(MissingLink {
-                            from_uuid: a.clone(),
-                            from_name: a_name,
-                            to_uuid: b.clone(),
-                            to_name: b_name,
-                            evidence: format!(
-                                "Clusters share {} attractor(s) but have only {} cross-link(s)",
-                                shared_attractors, cross_links
-                            ),
-                        });
-                    }
-                }
-
-                gaps.push(GapTopology {
-                    id: gap_id,
-                    gap_type: GapType::OrbitGap,
-                    shape: ShapeSignature::orbit(
-                        members_a.len(),
-                        members_b.len(),
-                        shared_attractors,
+        // Sample missing links
+        let mut missing_links = Vec::new();
+        for a in members_a.iter().take(3) {
+            for b in members_b.iter().take(3) {
+                let a_name = names
+                    .get(a.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| a[..8.min(a.len())].to_string());
+                let b_name = names
+                    .get(b.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| b[..8.min(b.len())].to_string());
+                missing_links.push(MissingLink {
+                    from_uuid: a.clone(),
+                    from_name: a_name,
+                    to_uuid: b.clone(),
+                    to_name: b_name,
+                    evidence: format!(
+                        "Clusters share {} attractor(s) but have only {} cross-link(s)",
+                        shared_attractors, cross_links
                     ),
-                    entities,
-                    missing_links,
-                    confidence,
-                    embedding_similarity: None,
-                    impact_score: 0.0,
                 });
             }
         }
+
+        gaps.push(GapTopology {
+            id: gap_id,
+            gap_type: GapType::OrbitGap,
+            shape: ShapeSignature::orbit(members_a.len(), members_b.len(), shared_attractors),
+            entities,
+            missing_links,
+            confidence,
+            embedding_similarity: None,
+            impact_score: 0.0,
+        });
     }
 
     Ok(gaps)
@@ -401,6 +401,7 @@ fn cluster_links(
         .collect();
     let mut links: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
     for (entity, neighbors) in adj {
+        pacing::tick(1);
         let own = cluster_of.get(entity.as_str()).copied();
         let mut near: Vec<usize> = neighbors
             .iter()
@@ -442,6 +443,7 @@ pub fn label_propagation(
     for _ in 0..max_iterations {
         let mut changed = false;
         for node in &nodes {
+            pacing::tick(1);
             if let Some(neighbors) = adj.get(node.as_str()) {
                 if neighbors.is_empty() {
                     continue;
