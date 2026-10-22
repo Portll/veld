@@ -14,9 +14,9 @@ use tracing::info;
 use super::state::MultiUserMemoryManager;
 use super::temporal_derivation::derive_answer_for_user_query;
 use super::types::{
-    MemoryEvent, MemoryEventKind, RecallExperience, RecallFact, RecallLineageEdge, RecallMemory,
-    RecallRequest, RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse,
-    TrackedRetrieveRequest, TrackedRetrieveResponse,
+    AuditEventKind, MemoryEvent, MemoryEventKind, RecallExperience, RecallFact, RecallLineageEdge,
+    RecallMemory, RecallRequest, RecallResponse, RecallTodo, ReinforceFeedbackRequest,
+    RetrieveResponse, TrackedRetrieveRequest, TrackedRetrieveResponse,
 };
 use super::utils::{is_bare_question, is_boilerplate_response, run_blocking, strip_system_noise};
 use crate::errors::{AppError, ValidationErrorExt};
@@ -2638,7 +2638,7 @@ pub async fn proactive_context(
     // Audit log for proactive context operations
     state.log_event(
         &req.user_id,
-        "PROACTIVE_CONTEXT",
+        AuditEventKind::ProactiveContext,
         ingested_memory_id.as_deref().unwrap_or("none"),
         &format!(
             "Context='{}' surfaced {} memories, {} reminders, {} todos (auto_ingest={})",

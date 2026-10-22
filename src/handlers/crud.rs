@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tracing::info;
 
 use super::state::MultiUserMemoryManager;
-use super::types::{MemoryEvent, MemoryEventKind};
+use super::types::{AuditEventKind, MemoryEvent, MemoryEventKind};
 use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
@@ -692,7 +692,7 @@ pub async fn update_memory(
 
     state.log_event(
         &req.user_id,
-        "UPDATE",
+        AuditEventKind::Update,
         &resolved_id_str,
         &format!("Updated memory content: {content_preview}"),
     );
@@ -815,7 +815,12 @@ pub async fn delete_memory(
 
     forget_one_journaled_blocking(&state, memory, &user_id, resolved_id).await?;
 
-    state.log_event(&user_id, "DELETE", &resolved_id_str, "Memory deleted");
+    state.log_event(
+        &user_id,
+        AuditEventKind::Delete,
+        &resolved_id_str,
+        "Memory deleted",
+    );
 
     state.emit_event(MemoryEvent {
         event_type: MemoryEventKind::Delete,
@@ -862,7 +867,12 @@ pub async fn forget_by_id(
 
     forget_one_journaled_blocking(&state, memory, &req.user_id, resolved_id).await?;
 
-    state.log_event(&req.user_id, "DELETE", &resolved_id_str, "Memory deleted");
+    state.log_event(
+        &req.user_id,
+        AuditEventKind::Delete,
+        &resolved_id_str,
+        "Memory deleted",
+    );
 
     state.emit_event(MemoryEvent {
         event_type: MemoryEventKind::Delete,
@@ -966,7 +976,7 @@ pub async fn patch_memory(
 
     state.log_event(
         &req.user_id,
-        "PATCH",
+        AuditEventKind::Patch,
         &resolved_id_str,
         &format!("Updated fields: {}", changes.join(", ")),
     );
@@ -1148,7 +1158,7 @@ pub async fn forget_by_age(
 
     state.log_event(
         &req.user_id,
-        "FORGET_BY_AGE",
+        AuditEventKind::ForgetByAge,
         &format!("{} days", req.days_old),
         &format!("Forgot {count} memories"),
     );
@@ -1194,7 +1204,7 @@ pub async fn forget_by_importance(
 
     state.log_event(
         &req.user_id,
-        "FORGET_BY_IMPORTANCE",
+        AuditEventKind::ForgetByImportance,
         &format!("threshold {}", req.threshold),
         &format!("Forgot {count} memories"),
     );
@@ -1247,7 +1257,7 @@ pub async fn forget_by_pattern(
 
     state.log_event(
         &req.user_id,
-        "FORGET_BY_PATTERN",
+        AuditEventKind::ForgetByPattern,
         &req.pattern,
         &format!("Forgot {count} memories"),
     );
@@ -1421,7 +1431,7 @@ pub async fn bulk_delete_memories(
 
     state.log_event(
         &req.user_id,
-        "BULK_DELETE",
+        AuditEventKind::BulkDelete,
         "multiple",
         &format!("Deleted {total_count} memories"),
     );
@@ -1467,7 +1477,7 @@ pub async fn clear_all_memories(
 
     state.log_event(
         &req.user_id,
-        "CLEAR_ALL",
+        AuditEventKind::ClearAll,
         "GDPR",
         &format!("GDPR erasure: deleted {count} memories"),
     );

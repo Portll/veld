@@ -67,6 +67,40 @@ macro_rules! event_kind {
 }
 
 event_kind! {
+    /// What an audit-log entry records. `log_event` stores [`AuditEventKind::as_str`] as the
+    /// entry's `event_type` String, which is persisted and read back, so a string here never
+    /// changes; entries already on disk keep whatever string they were written with.
+    AuditEventKind {
+        BackupCreated => "BACKUP_CREATED",
+        BackupPurge => "BACKUP_PURGE",
+        BackupRestored => "BACKUP_RESTORED",
+        Update => "UPDATE",
+        Patch => "PATCH",
+        Delete => "DELETE",
+        BulkDelete => "BULK_DELETE",
+        ClearAll => "CLEAR_ALL",
+        ForgetByAge => "FORGET_BY_AGE",
+        ForgetByImportance => "FORGET_BY_IMPORTANCE",
+        ForgetByPattern => "FORGET_BY_PATTERN",
+        FactsPurge => "facts.purge",
+        FactsPurgeDryRun => "facts.purge.dryrun",
+        FactsPurgePreview => "facts.purge.preview",
+        ContextBlockDirty => "context_block.dirty",
+        MifExport => "MIF_EXPORT",
+        MifImport => "MIF_IMPORT",
+        AddEntity => "ADD_ENTITY",
+        AddRelationship => "ADD_RELATIONSHIP",
+        ProactiveContext => "PROACTIVE_CONTEXT",
+        MultimodalSearch => "MULTIMODAL_SEARCH",
+        RoboticsSearch => "ROBOTICS_SEARCH",
+        ReminderCreate => "REMINDER_CREATE",
+        TodoCreate => "TODO_CREATE",
+        TodoUpdate => "TODO_UPDATE",
+        TodoComplete => "TODO_COMPLETE",
+    }
+}
+
+event_kind! {
     /// What a [`MemoryEvent`] reports. It is the SSE event name and the `event_type` JSON
     /// string, which the TUI and the monitor match on, so a string here never changes.
     MemoryEventKind {
@@ -1302,6 +1336,24 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.starts_with(r#"{"event_type":"CREATE","#), "{json}");
+    }
+
+    #[test]
+    fn audit_event_kinds_read_as_their_strings() {
+        let mut seen = std::collections::HashSet::new();
+        for kind in AuditEventKind::ALL {
+            assert!(
+                seen.insert(kind.as_str()),
+                "{} is declared twice",
+                kind.as_str()
+            );
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+        assert_eq!(AuditEventKind::Delete.as_str(), "DELETE");
+        assert_eq!(
+            AuditEventKind::FactsPurgeDryRun.as_str(),
+            "facts.purge.dryrun"
+        );
     }
 
     #[test]
