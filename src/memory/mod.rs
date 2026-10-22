@@ -11206,7 +11206,8 @@ mod lifecycle_tests {
                     None,
                 )
                 .unwrap();
-            let writers: Vec<(&str, Box<dyn Fn() -> Result<()> + Sync + '_>)> = vec![
+            type Writer<'a> = Box<dyn Fn() -> Result<()> + Sync + 'a>;
+            let writers: Vec<(&str, Writer<'_>)> = vec![
                 (
                     "set_memory_parent",
                     Box::new(|| system.set_memory_parent(&id, Some(parent.clone()))),
