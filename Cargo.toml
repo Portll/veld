@@ -437,12 +437,28 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Argon2 is the one dependency the tests run hot: the keystore and user-auth tests unseal at
+# production cost (256 MiB, 3 passes) through the real binary and HTTP API, and unoptimised that
+# held four integration binaries at 67-192 s each on CI (2026-10-21). Parameters and code paths
+# are unchanged; only the KDF's own codegen is.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 # Stated, not inherited, so an edit to [profile.dev] does not silently change what tests emit.
 [profile.test]
 debug = "line-tables-only"
 
 [profile.test.package."*"]
 debug = false
+
+[profile.test.package.argon2]
+opt-level = 3
+
+[profile.test.package.blake2]
+opt-level = 3
 
 [profile.dev-debug]
 inherits = "dev"
