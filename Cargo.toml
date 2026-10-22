@@ -243,7 +243,7 @@ prometheus = "0.14"
 tracing-opentelemetry = { version = "0.28", optional = true }
 opentelemetry = { version = "0.27", features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"], optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"], optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio"], optional = true }
 
 # FFT for spectral analysis of access patterns (learned decay scales)
 rustfft = "6"
