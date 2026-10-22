@@ -473,6 +473,10 @@ mod performance {
                    Mumbai Delhi Bangalore Hyderabad Chennai Kolkata Pune \
                    London Tokyo Singapore Dubai Sydney Berlin Paris";
 
+        // The first call in a process builds the extractor's lazy tables, and nextest runs each
+        // test in its own process: time the steady state the budget is about.
+        ner.extract(text).unwrap();
+
         let start = Instant::now();
         let entities = ner.extract(text).unwrap();
         let elapsed = start.elapsed();

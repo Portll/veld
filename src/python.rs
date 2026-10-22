@@ -2310,9 +2310,8 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, Py<P
     })
 }
 
-/// Python module definition
-#[pymodule]
-fn veld(m: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Registers the module contents; the `#[pymodule]` entry point is the `veld-py` cdylib crate.
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Core classes
     m.add_class::<PyMemorySystem>()?;
 
