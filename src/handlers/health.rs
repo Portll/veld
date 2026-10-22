@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use super::state::MultiUserMemoryManager;
 use super::types::{ContextStatus, MemoryEvent};
-use super::utils::resolve_request_user_id;
+use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
 use crate::errors::AppError;
 use crate::metrics;
@@ -352,11 +352,16 @@ pub async fn health_index_user(
         .get_user_memory_async(&user_id)
         .await
         .map_err(AppError::Internal)?;
-    let guard = memory.read();
-    let health = guard.index_health();
     // Populations, not error counts: a memory stored and never indexed is
-    // unretrievable and raises nothing for a counter to see.
-    let coverage = guard.index_coverage().map_err(AppError::Internal)?;
+    // unretrievable and raises nothing for a counter to see. `stored` is a scan of
+    // every key in the store.
+    let (health, coverage) = run_blocking(move || {
+        let guard = memory.read();
+        let health = guard.index_health();
+        let coverage = guard.index_coverage().map_err(AppError::Internal)?;
+        Ok((health, coverage))
+    })
+    .await?;
     let (stored, vector_indexed, lexically_indexed) = coverage;
     Ok((
         StatusCode::OK,

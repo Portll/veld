@@ -18,7 +18,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::state::MultiUserMemoryManager;
-use super::utils::resolve_request_user_id;
+use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::CognitiveDials;
@@ -72,9 +72,13 @@ pub async fn set_dials(
         .get_user_memory_async(&req.user_id)
         .await
         .map_err(AppError::Internal)?;
-    let guard = memory.read();
-    guard.set_cognitive_dials(req.dials);
-    let result = guard.cognitive_dials();
+    // Setting the dials writes them to the store, and a rerank model not used before is built.
+    let result = run_blocking(move || {
+        let guard = memory.read();
+        guard.set_cognitive_dials(req.dials);
+        Ok(guard.cognitive_dials())
+    })
+    .await?;
     tracing::info!(
         user_id = %req.user_id,
         reconsolidation_enabled = result.reconsolidation_enabled,
