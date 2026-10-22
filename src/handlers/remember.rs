@@ -71,11 +71,18 @@ async fn record_tag_sources(
     }
 }
 
-/// Which intent-log variant a stored memory snapshot is journaled as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SnapshotKind {
-    Remember,
-    Update,
+pub(crate) use crate::memory::SnapshotKind;
+
+/// A [`crate::memory::JournalSink`] that queues the frame of each record it is
+/// handed into `frames`, under the write gate the write path holds. Wait on
+/// `frames` once the write call has returned and released the gate.
+pub(crate) fn queue_frames<'a>(
+    state: &'a super::state::MultiUserMemoryManager,
+    user_id: &'a str,
+    frames: &'a mut super::state::JournalPending,
+) -> impl FnMut(&crate::memory::Memory, SnapshotKind, &crate::memory::write_gate::WriteGuard<'_>) + 'a
+{
+    move |stored, kind, gate| frames.absorb(enqueue_snapshot(state, user_id, stored, kind, gate))
 }
 
 /// Queue the intent-log frame of `memory`, as just written to the primary
@@ -267,8 +274,10 @@ pub(crate) fn remember_journaled(
         run_id,
         external_id,
     } = origin;
+    let mut frames = super::state::JournalPending::empty(user_id);
     let outcome = {
         let guard = memory.read();
+        let mut journal = queue_frames(state, user_id, &mut frames);
         if agent_id.is_some() || run_id.is_some() {
             guard.remember_with_agent_deferred_detailed_journaled(
                 experience,
@@ -276,18 +285,18 @@ pub(crate) fn remember_journaled(
                 agent_id,
                 run_id,
                 external_id,
+                &mut journal,
             )?
         } else {
-            guard.remember_deferred_detailed_journaled(experience, created_at, external_id)?
+            guard.remember_deferred_detailed_journaled(
+                experience,
+                created_at,
+                external_id,
+                &mut journal,
+            )?
         }
     };
-    journal_stored(
-        state,
-        memory,
-        user_id,
-        std::slice::from_ref(&outcome.id),
-        SnapshotKind::Remember,
-    );
+    frames.wait_logged("remember");
     embed_journaled(state, memory, user_id, &outcome.id);
     Ok(outcome)
 }
@@ -304,6 +313,7 @@ pub(crate) fn upsert_journaled(
     change_type: crate::memory::types::ChangeType,
     changed_by: Option<String>,
 ) -> anyhow::Result<(crate::memory::MemoryId, bool)> {
+    let mut frames = super::state::JournalPending::empty(user_id);
     let (id, was_update) = memory.read().upsert_with_provenance_journaled(
         external_id,
         experience,
@@ -311,13 +321,9 @@ pub(crate) fn upsert_journaled(
         changed_by,
         None,
         crate::memory::UpsertProvenance::default(),
+        &mut queue_frames(state, user_id, &mut frames),
     )?;
-    let kind = if was_update {
-        SnapshotKind::Update
-    } else {
-        SnapshotKind::Remember
-    };
-    journal_stored(state, memory, user_id, std::slice::from_ref(&id), kind);
+    frames.wait_logged("upsert");
     Ok((id, was_update))
 }
 
@@ -1269,30 +1275,52 @@ pub async fn remember(
         let agent_id = req.agent_id.clone();
         let run_id = req.run_id.clone();
         let external_id = req.external_id.clone();
+        let state = state.clone();
+        let user_id = req.user_id.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            // Fast path: persist only (~10ms), embedding deferred to background.
-            // BM25 indexing comes from the Remember journaled below.
-            if agent_id.is_some() || run_id.is_some() {
-                memory_guard.remember_with_agent_deferred_detailed_journaled(
-                    exp_clone,
-                    created_at,
-                    agent_id,
-                    run_id,
-                    external_id,
-                )
-            } else {
-                memory_guard.remember_deferred_detailed_journaled(
-                    exp_clone,
-                    created_at,
-                    external_id,
-                )
-            }
+        // W5: the store write queues its intent-log frame under the write gate,
+        // from the record exactly as stored, so the frame's LSN follows the
+        // store's order for this memory; the sync is waited for after the gate
+        // is released, so concurrent writers to the tenant share it. Awaited
+        // before responding: a detached journal left a crash window as wide as
+        // the task queue (memory durable in the store, no frame until C2
+        // reconcile on the next open). A frame that cannot be made durable is
+        // logged and does not fail the request: the store holds the canonical
+        // write and C2 reconcile backfills the frame.
+        let (outcome, journal_wait) = tokio::task::spawn_blocking(move || {
+            let mut frames = super::state::JournalPending::empty(&user_id);
+            let outcome = {
+                let memory_guard = memory.read();
+                let mut journal = queue_frames(&state, &user_id, &mut frames);
+                // Fast path: persist only (~10ms), embedding deferred to background.
+                // BM25 indexing comes from the frame queued here.
+                if agent_id.is_some() || run_id.is_some() {
+                    memory_guard.remember_with_agent_deferred_detailed_journaled(
+                        exp_clone,
+                        created_at,
+                        agent_id,
+                        run_id,
+                        external_id,
+                        &mut journal,
+                    )
+                } else {
+                    memory_guard.remember_deferred_detailed_journaled(
+                        exp_clone,
+                        created_at,
+                        external_id,
+                        &mut journal,
+                    )
+                }
+            };
+            let journal_start = std::time::Instant::now();
+            frames.wait_logged("remember");
+            outcome.map(|outcome| (outcome, journal_start.elapsed()))
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
-        .map_err(AppError::Internal)?
+        .map_err(AppError::Internal)?;
+        stage_timer.record_elapsed("journal", journal_wait);
+        outcome
     };
     stage_timer.record("store", store_start);
     let memory_id = outcome.id.clone();
@@ -1310,49 +1338,6 @@ pub async fn remember(
     )
     .await;
     stage_timer.record("tag_sources", tag_sources_start);
-
-    // W5: journal the write to the intent log + SQLite projection.
-    //
-    // RocksDB is the source of truth and has already been written above.
-    // The journal is a *derived* record so the SQLite slow store (and
-    // future projections — Vamana, BM25, Postgres) can stay in sync via
-    // replay. The spawn_blocking is AWAITED before responding — a
-    // detached task left a crash window as wide as the task queue (memory
-    // durable in RocksDB, no journal frame until C2 reconcile on next
-    // open) and made LSN order nondeterministic with respect to request
-    // completion. The journal-then-apply primitive is fast (~ one fsync +
-    // projection applies; embeddings are not present yet, so the vector
-    // applies are no-ops at this point).
-    //
-    // Per-projection apply errors are swallowed inside `journal_and_apply`
-    // — the intent log frame is durable regardless, so a future restart's
-    // replay will retry. A failure to journal at all (log I/O error,
-    // payload encode error) is logged at warn level and does NOT fail
-    // the request: RocksDB already holds the canonical write and the
-    // operator can replay manually once the underlying issue is fixed.
-    {
-        let journal_start = std::time::Instant::now();
-        let state = state.clone();
-        let user_id = req.user_id.clone();
-        let memory_for_journal = memory.clone();
-        let mid = memory_id.clone();
-        let journal_join = tokio::task::spawn_blocking(move || {
-            journal_stored(
-                &state,
-                &memory_for_journal,
-                &user_id,
-                std::slice::from_ref(&mid),
-                SnapshotKind::Remember,
-            );
-        });
-        if let Err(e) = journal_join.await {
-            tracing::warn!(
-                error = %e,
-                "intent-log journal task panicked (RocksDB write already durable; C2 reconcile will backfill)",
-            );
-        }
-        stage_timer.record("journal", journal_start);
-    }
 
     // Background: complete embedding + vector indexing; vector search follows
     // in ~150ms. Spawned after the journal so a write-gate Forget follows the
@@ -2049,16 +2034,30 @@ pub async fn batch_remember(
     let (memory_results, storage_errors) = {
         let memory = memory.clone();
         let experiences = experiences_with_index;
-        tokio::task::spawn_blocking(move || {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        // W5: each memory's frame is queued under the write gate of its own store
+        // write, from the record as stored, as the single remember handler does;
+        // the projections (BM25 included: nothing here indexes it) see the batch
+        // through them. The sync is awaited once, after the last store write
+        // released the gate, so the batch's frames commit together, and before
+        // responding, so no store-ahead-of-log window outlives the response.
+        let (results, errors, journal_wait) = tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
             // The experience carried on is the merged one when a duplicate enriched a stored
             // memory, with whether its graph episode has to be rebuilt.
             let mut results: Vec<(usize, String, Experience, bool)> =
                 Vec::with_capacity(experiences.len());
             let mut errors: Vec<BatchErrorItem> = Vec::new();
+            let mut frames = super::state::JournalPending::empty(&user_id);
 
             for (index, experience, created_at) in experiences {
-                match memory_guard.remember_detailed_journaled(experience.clone(), created_at) {
+                let stored = memory_guard.remember_detailed_journaled(
+                    experience.clone(),
+                    created_at,
+                    &mut queue_frames(&state, &user_id, &mut frames),
+                );
+                match stored {
                     Ok(outcome) => {
                         let rebuild = outcome.needs_graph_rebuild();
                         let effective = outcome.merged_experience.unwrap_or(experience);
@@ -2072,47 +2071,18 @@ pub async fn batch_remember(
                     }
                 }
             }
-            (results, errors)
+            drop(memory_guard);
+            let journal_start = std::time::Instant::now();
+            frames.wait_logged("batch remember");
+            (results, errors, journal_start.elapsed())
         })
         .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?;
+        stage_timer.record_elapsed("journal", journal_wait);
+        (results, errors)
     };
 
     stage_timer.record("store", store_start);
-
-    // W5: journal every stored memory, as the single remember handler does,
-    // so the projections (BM25 included: nothing above indexed it) see the
-    // batch. Awaited for the same reason as there: LSN order follows request
-    // completion and no store-ahead-of-log window outlives the response.
-    {
-        let journal_start = std::time::Instant::now();
-        let state = state.clone();
-        let user_id = req.user_id.clone();
-        let memory_for_journal = memory.clone();
-        let mut seen = HashSet::new();
-        let ids: Vec<crate::memory::MemoryId> = memory_results
-            .iter()
-            .filter_map(|(_, id, _, _)| uuid::Uuid::parse_str(id).ok())
-            .filter(|uuid| seen.insert(*uuid))
-            .map(crate::memory::MemoryId)
-            .collect();
-        let journal_join = tokio::task::spawn_blocking(move || {
-            journal_stored(
-                &state,
-                &memory_for_journal,
-                &user_id,
-                &ids,
-                SnapshotKind::Remember,
-            );
-        });
-        if let Err(e) = journal_join.await {
-            tracing::warn!(
-                error = %e,
-                "intent-log journal task (batch) panicked (RocksDB writes already durable; C2 reconcile will backfill)",
-            );
-        }
-        stage_timer.record("journal", journal_start);
-    }
 
     let tag_sources_start = std::time::Instant::now();
     for (index, id, effective, _) in &memory_results {
@@ -2618,37 +2588,48 @@ pub async fn upsert_memory(
     };
 
     let store_start = std::time::Instant::now();
-    let (memory_id, was_update) = {
+    // W5: the upsert queues its `Remember` (create) or `Update` frame under the
+    // write gate, from the record exactly as stored, and reads the version and
+    // tags this handler reports off the same record; the sync is waited for after
+    // the gate is released, and before responding (see `remember`).
+    let (memory_id, was_update, version, stored_tags) = {
         let memory = memory_system.clone();
         let exp = experience.clone();
-        tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            memory_guard.upsert_with_provenance_journaled(
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        let (stored, journal_wait) = tokio::task::spawn_blocking(move || {
+            let mut frames = super::state::JournalPending::empty(&user_id);
+            let mut stored_view = None;
+            let stored = memory.read().upsert_with_provenance_journaled(
                 external_id,
                 exp,
                 change_type,
                 changed_by,
                 change_reason,
                 provenance,
-            )
+                &mut |record: &crate::memory::Memory,
+                      kind,
+                      gate: &crate::memory::write_gate::WriteGuard<'_>| {
+                    stored_view = Some((record.version, record.experience.tags.clone()));
+                    frames.absorb(enqueue_snapshot(&state, &user_id, record, kind, gate));
+                },
+            );
+            let journal_start = std::time::Instant::now();
+            frames.wait_logged("upsert");
+            let journal_wait = journal_start.elapsed();
+            stored.map(|(id, was_update)| {
+                let (version, tags) = match stored_view {
+                    Some((version, tags)) => (version, Some(tags)),
+                    None => (1, None),
+                };
+                ((id, was_update, version, tags), journal_wait)
+            })
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
-        .map_err(AppError::Internal)?
-    };
-
-    let (version, stored_tags) = {
-        let memory = memory_system.clone();
-        let mid = memory_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            match memory_guard.get_memory(&mid) {
-                Ok(m) => (m.version, Some(m.experience.tags.clone())),
-                Err(_) => (1, None),
-            }
-        })
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?;
+        stage_timer.record_elapsed("journal", journal_wait);
+        stored
     };
     stage_timer.record("store", store_start);
     // The stored list, not the request's: an upsert's tags are the record's new tags, and the
@@ -2663,45 +2644,6 @@ pub async fn upsert_memory(
     )
     .await;
     stage_timer.record("tag_sources", tag_sources_start);
-
-    // W5: journal the upsert as a `Remember` (create) or `Update`
-    // (existing) payload. The opaque memory bincode bytes are the same
-    // shape in both cases — the variant is just a hint to projections
-    // that want to distinguish first-write from edit (the SQLite
-    // projection treats them identically — both UPSERT keyed by
-    // `(user_id, memory_id)`).
-    {
-        let journal_start = std::time::Instant::now();
-        let state_clone = state.clone();
-        let user_id = req.user_id.clone();
-        let memory_system_for_journal = memory_system.clone();
-        let mid = memory_id.clone();
-        let is_update = was_update;
-        let journal_join = tokio::task::spawn_blocking(move || {
-            let kind = if is_update {
-                SnapshotKind::Update
-            } else {
-                SnapshotKind::Remember
-            };
-            journal_stored(
-                &state_clone,
-                &memory_system_for_journal,
-                &user_id,
-                std::slice::from_ref(&mid),
-                kind,
-            );
-        });
-        // Awaited before responding — see the matching comment in
-        // `remember`: a detached journal task leaves a store-ahead-of-log
-        // crash window and nondeterministic LSN order.
-        if let Err(e) = journal_join.await {
-            tracing::warn!(
-                error = %e,
-                "intent-log journal task (upsert) panicked (RocksDB write already durable; C2 reconcile will backfill)",
-            );
-        }
-        stage_timer.record("journal", journal_start);
-    }
 
     // Build episodic graph for multi-hop retrieval. An update rebuilds the episode, so the
     // graph does not keep the old entity set.

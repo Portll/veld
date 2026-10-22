@@ -736,6 +736,80 @@ fn keeps_vectors(stored: &Memory, content: &str) -> bool {
     stored.experience.content == content && stored.experience.embeddings.is_some()
 }
 
+/// Apply an upsert's update to the stored record: the content (pushing the old one to
+/// history), the provenance it declares, its declared context, and its entities and tags
+/// when it carries any. One function for the draft the chunk vectors are computed from
+/// before the write gate and for the write under it, so both index the same text.
+fn apply_upsert_update(
+    existing: &mut Memory,
+    mut experience: Experience,
+    change_type: ChangeType,
+    changed_by: Option<String>,
+    change_reason: Option<String>,
+    provenance: UpsertProvenance,
+) {
+    existing.update_content(experience.content, change_type, changed_by, change_reason);
+
+    // Provenance: a provided field overwrites, an omitted one keeps the stored value.
+    if let Some(agent_id) = provenance.agent_id {
+        existing.agent_id = Some(agent_id);
+    }
+    if let Some(created_at) = provenance.created_at {
+        existing.created_at = created_at;
+        existing.when.encoded_at = Some(created_at);
+    }
+    overlay_declared_context(
+        &mut existing.experience.context,
+        experience.context.take(),
+        provenance.episode_id,
+        provenance.writer,
+        provenance.repo,
+    );
+    if !experience.entities.is_empty() {
+        existing.experience.entities = experience.entities;
+    }
+    if !experience.tags.is_empty() {
+        existing.experience.tags = experience.tags;
+    }
+}
+
+/// The record an upsert creates from `experience`, which carries its embedding if it has
+/// one: dates extracted, flat robotics fields moved to facets, the declared context laid
+/// over. Shared by the pre-gate draft and the write, as [`apply_upsert_update`] is.
+fn upsert_new_record(
+    memory_id: MemoryId,
+    mut experience: Experience,
+    importance: f32,
+    external_id: String,
+    provenance: UpsertProvenance,
+) -> Memory {
+    if experience.temporal_refs.is_empty() {
+        let temporal = crate::memory::query_parser::extract_temporal_refs(&experience.content);
+        for temp_ref in temporal.refs {
+            experience.temporal_refs.push(temp_ref.date.to_string());
+        }
+    }
+    // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
+    experience.migrate_robotics_to_facets();
+    overlay_declared_context(
+        &mut experience.context,
+        None,
+        provenance.episode_id,
+        provenance.writer,
+        provenance.repo,
+    );
+    Memory::new_with_external_id(
+        memory_id,
+        experience,
+        importance,
+        external_id,
+        provenance.agent_id,
+        None, // run_id
+        None, // actor_id
+        provenance.created_at,
+    )
+}
+
 /// Whether two versions of a memory index differently in BM25, which reads
 /// content, tags and entities and nothing else.
 fn bm25_text_differs(before: &Memory, after: &Memory) -> bool {
@@ -921,6 +995,20 @@ impl RememberOutcome {
     }
 }
 
+/// Which intent-log variant a stored memory snapshot is journaled as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotKind {
+    Remember,
+    Update,
+}
+
+/// Where a journaled write path hands each record it wrote, as the store now holds it,
+/// while it still holds the tenant's write gate (the guard is the proof). The caller
+/// queues the record's intent-log frame there: the frame takes its place in the log in
+/// the order the store took the write, and carries the record without a read back. The
+/// caller waits for the sync once the write call has returned and the gate is released.
+pub type JournalSink<'a> = dyn FnMut(&Memory, SnapshotKind, &write_gate::WriteGuard<'_>) + 'a;
+
 /// Who keeps the BM25 index in step with a write.
 ///
 /// In server mode the index is shared with the intent log's
@@ -989,12 +1077,18 @@ impl MemorySystem {
     ///
     /// Only for an id with no stored vectors: undoing a failed write removes every
     /// vector the id has, which for an existing memory would include its own.
-    fn store_new_memory(&self, memory: &Memory, defer_embedding: bool) -> Result<VectorIndexing> {
+    /// `chunks` holds chunk vectors the caller computed before taking the write gate.
+    fn store_new_memory(
+        &self,
+        memory: &Memory,
+        defer_embedding: bool,
+        chunks: Option<&retrieval::PreparedChunks>,
+    ) -> Result<VectorIndexing> {
         if defer_embedding {
             self.long_term_memory.store(memory)?;
             return Ok(VectorIndexing::Deferred);
         }
-        match self.retriever.index_vectors(memory) {
+        match self.retriever.index_vectors_prepared(memory, chunks) {
             Ok(vector_ids) => {
                 if let Err(e) = self.long_term_memory.store_with_vectors(memory, vector_ids) {
                     self.retriever.remove_memory(&memory.id);
@@ -2110,18 +2204,27 @@ impl MemorySystem {
         experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RememberOutcome> {
-        self.remember_impl(experience, created_at, None, false, Bm25Sync::Direct)
+        self.remember_impl(experience, created_at, None, false, Bm25Sync::Direct, None)
     }
 
-    /// [`Self::remember_detailed`] for a caller that journals the write: the
-    /// caller MUST journal an `IntentPayload::Remember` for the returned id,
-    /// whose BM25 projection indexes it. Nothing is written to BM25 here.
+    /// [`Self::remember_detailed`] for a caller that journals the write: `journal`
+    /// receives every record the call wrote, the remembered (or merged) memory last,
+    /// and the caller MUST queue its frame there; the BM25 projection indexes it from
+    /// that frame. Nothing is written to BM25 here.
     pub fn remember_detailed_journaled(
         &self,
         experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
+        journal: &mut JournalSink<'_>,
     ) -> Result<RememberOutcome> {
-        self.remember_impl(experience, created_at, None, false, Bm25Sync::Journaled)
+        self.remember_impl(
+            experience,
+            created_at,
+            None,
+            false,
+            Bm25Sync::Journaled,
+            Some(journal),
+        )
     }
 
     /// Store a new memory WITHOUT embedding generation or vector indexing (fast path).
@@ -2147,17 +2250,24 @@ impl MemorySystem {
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         external_id: Option<String>,
     ) -> Result<RememberOutcome> {
-        self.remember_impl(experience, created_at, external_id, true, Bm25Sync::Direct)
+        self.remember_impl(
+            experience,
+            created_at,
+            external_id,
+            true,
+            Bm25Sync::Direct,
+            None,
+        )
     }
 
     /// [`Self::remember_deferred_detailed`] for a caller that journals the
-    /// write: the caller MUST journal an `IntentPayload::Remember` for the
-    /// returned id, whose BM25 projection indexes it.
+    /// write, through `journal` as [`Self::remember_detailed_journaled`].
     pub fn remember_deferred_detailed_journaled(
         &self,
         experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         external_id: Option<String>,
+        journal: &mut JournalSink<'_>,
     ) -> Result<RememberOutcome> {
         self.remember_impl(
             experience,
@@ -2165,6 +2275,7 @@ impl MemorySystem {
             external_id,
             true,
             Bm25Sync::Journaled,
+            Some(journal),
         )
     }
 
@@ -2181,13 +2292,14 @@ impl MemorySystem {
         external_id: Option<String>,
         defer_embedding: bool,
         bm25: Bm25Sync,
+        mut journal: Option<&mut JournalSink<'_>>,
     ) -> Result<RememberOutcome> {
         // C1: serialize the per-user write path. Every writer (HTTP ingest,
         // WebSocket streaming, hooks) funnels through remember_impl, so holding
         // this lock for the create critical section (store + working_memory +
         // index + BM25) prevents interleaved partial writes / concurrent loss.
         // Released before the deferred embed_and_index background task runs.
-        let _write_guard = self.write_lock.enter()?;
+        let write_guard = self.write_lock.enter()?;
 
         // W3.2d: migrate any flat robotics/decision fields into the W3 facets
         // so new memories carry both representations through the transition.
@@ -2201,7 +2313,7 @@ impl MemorySystem {
             .long_term_memory
             .get_by_content_hash(&experience.content)
         {
-            return self.merge_into_existing(existing_id, &experience, bm25);
+            return self.merge_into_existing(existing_id, &experience, bm25, journal, &write_guard);
         }
 
         let memory_id = MemoryId(Uuid::new_v4());
@@ -2293,7 +2405,7 @@ impl MemorySystem {
         // When defer_embedding=true, vector indexing is skipped — embed_and_index()
         // handles it later; BM25 keyword search (below) provides immediate
         // searchability regardless.
-        let vector_indexing = self.store_new_memory(&memory, defer_embedding)?;
+        let vector_indexing = self.store_new_memory(&memory, defer_embedding, None)?;
 
         // Log creation
         self.logger.write().log_created(&memory, "working");
@@ -2429,12 +2541,21 @@ impl MemorySystem {
                                         let before = old_memory.importance();
                                         old_memory.decay_importance(*decay_amount);
                                         match self.long_term_memory.update(&old_memory) {
-                                            Ok(()) if !old_memory.is_forgotten() => self
-                                                .note_importance_change(
-                                                    before,
-                                                    old_memory.importance(),
-                                                ),
-                                            Ok(()) => {}
+                                            Ok(()) => {
+                                                if !old_memory.is_forgotten() {
+                                                    self.note_importance_change(
+                                                        before,
+                                                        old_memory.importance(),
+                                                    );
+                                                }
+                                                if let Some(sink) = journal.as_deref_mut() {
+                                                    sink(
+                                                        &old_memory,
+                                                        SnapshotKind::Update,
+                                                        &write_guard,
+                                                    );
+                                                }
+                                            }
                                             Err(e) => tracing::debug!(
                                                 "Failed to persist retroactive decay: {e}"
                                             ),
@@ -2534,7 +2655,7 @@ impl MemorySystem {
         self.note_stored(memory.importance());
 
         // Tier promotion only: compression reads the store and runs from maintenance.
-        self.consolidate_if_needed()?;
+        let promoted = self.consolidate_if_needed()?;
 
         self.bm25_commit_direct(bm25);
 
@@ -2542,7 +2663,30 @@ impl MemorySystem {
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
+        if let Some(sink) = journal {
+            Self::journal_created(sink, &memory, &promoted, &write_guard);
+        }
         Ok(RememberOutcome::created(memory_id))
+    }
+
+    /// Hand a create's records to its journal: the records tier promotion rewrote, then
+    /// the new memory as the store holds it last, which is the promoted copy when the
+    /// promotion took it too.
+    fn journal_created(
+        sink: &mut JournalSink<'_>,
+        memory: &Memory,
+        promoted: &[Memory],
+        gate: &write_gate::WriteGuard<'_>,
+    ) {
+        let mut own = None;
+        for stored in promoted {
+            if stored.id == memory.id {
+                own = Some(stored);
+            } else {
+                sink(stored, SnapshotKind::Update, gate);
+            }
+        }
+        sink(own.unwrap_or(memory), SnapshotKind::Remember, gate);
     }
 
     /// Index `memory` in BM25 unless the write is journaled, in which case the
@@ -2601,6 +2745,8 @@ impl MemorySystem {
         existing_id: MemoryId,
         incoming: &Experience,
         bm25: Bm25Sync,
+        journal: Option<&mut JournalSink<'_>>,
+        gate: &write_gate::WriteGuard<'_>,
     ) -> Result<RememberOutcome> {
         let mut existing = match self.long_term_memory.get(&existing_id) {
             Ok(memory) => memory,
@@ -2623,6 +2769,11 @@ impl MemorySystem {
                 existing_id = %existing_id.0,
                 "Content dedup: identical duplicate, nothing to merge"
             );
+            // The stored record, read under the gate: journaled as a remember of new
+            // content would be, so the log covers it even if it predates the journal.
+            if let Some(sink) = journal {
+                sink(&existing, SnapshotKind::Remember, gate);
+            }
             return Ok(RememberOutcome::deduped(existing_id, delta, None));
         }
 
@@ -2634,6 +2785,9 @@ impl MemorySystem {
         self.long_term_memory.update(&existing)?;
         if !existing.is_forgotten() {
             self.note_importance_change(before, existing.importance());
+        }
+        if let Some(sink) = journal {
+            sink(&existing, SnapshotKind::Remember, gate);
         }
 
         if !delta.entities_added.is_empty() || !delta.tags_added.is_empty() {
@@ -3197,6 +3351,7 @@ impl MemorySystem {
             None,
             false,
             Bm25Sync::Direct,
+            None,
         )
     }
 
@@ -3237,13 +3392,13 @@ impl MemorySystem {
             external_id,
             true,
             Bm25Sync::Direct,
+            None,
         )
     }
 
     /// [`Self::remember_with_agent_deferred_detailed`] for a caller that
-    /// journals the write: the caller MUST journal an
-    /// `IntentPayload::Remember` for the returned id, whose BM25 projection
-    /// indexes it.
+    /// journals the write, through `journal` as
+    /// [`Self::remember_detailed_journaled`].
     pub fn remember_with_agent_deferred_detailed_journaled(
         &self,
         experience: Experience,
@@ -3251,6 +3406,7 @@ impl MemorySystem {
         agent_id: Option<String>,
         run_id: Option<String>,
         external_id: Option<String>,
+        journal: &mut JournalSink<'_>,
     ) -> Result<RememberOutcome> {
         self.remember_with_agent_impl(
             experience,
@@ -3260,6 +3416,7 @@ impl MemorySystem {
             external_id,
             true,
             Bm25Sync::Journaled,
+            Some(journal),
         )
     }
 
@@ -3273,11 +3430,12 @@ impl MemorySystem {
         external_id: Option<String>,
         defer_embedding: bool,
         bm25: Bm25Sync,
+        journal: Option<&mut JournalSink<'_>>,
     ) -> Result<RememberOutcome> {
         // C1: the per-user write gate, as in remember_impl. The content-hash check below
         // and the store write have to be one step, or two identical remembers both create,
         // and a shutdown has to be able to turn this create away like any other.
-        let _write_guard = self.write_lock.enter()?;
+        let write_guard = self.write_lock.enter()?;
 
         // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
         experience.migrate_robotics_to_facets();
@@ -3288,7 +3446,7 @@ impl MemorySystem {
             .long_term_memory
             .get_by_content_hash(&experience.content)
         {
-            return self.merge_into_existing(existing_id, &experience, bm25);
+            return self.merge_into_existing(existing_id, &experience, bm25, journal, &write_guard);
         }
 
         let memory_id = MemoryId(Uuid::new_v4());
@@ -3349,7 +3507,7 @@ impl MemorySystem {
 
         // Persist with its vector mapping (indexing skipped when deferred —
         // embed_and_index handles it)
-        let vector_indexing = self.store_new_memory(&memory, defer_embedding)?;
+        let vector_indexing = self.store_new_memory(&memory, defer_embedding, None)?;
         self.logger.write().log_created(&memory, "working");
 
         // Add to working memory
@@ -3382,7 +3540,7 @@ impl MemorySystem {
         }
         self.note_stored(memory.importance());
 
-        self.consolidate_if_needed()?;
+        let promoted = self.consolidate_if_needed()?;
 
         self.bm25_commit_direct(bm25);
 
@@ -3390,6 +3548,9 @@ impl MemorySystem {
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
+        if let Some(sink) = journal {
+            Self::journal_created(sink, &memory, &promoted, &write_guard);
+        }
         Ok(RememberOutcome::created(memory_id))
     }
 
@@ -4628,24 +4789,39 @@ impl MemorySystem {
     /// - Working → Session: importance >= 0.4 AND age >= 5 minutes
     /// - Session → LongTerm: importance >= 0.6 AND age >= 1 hour
     ///
-    /// Touches only the in-memory tiers, so it is cheap enough for every remember.
-    /// Compression of old long-term records runs from heavy maintenance instead.
-    fn consolidate_if_needed(&self) -> Result<()> {
+    /// Persists each promotion's new tier and returns the records it wrote, as written,
+    /// for a journaled caller to journal. Compression of old long-term records runs from
+    /// heavy maintenance instead.
+    fn consolidate_if_needed(&self) -> Result<Vec<Memory>> {
         // Promote eligible memories from working to session (importance + time based)
-        self.promote_working_to_session()?;
+        let mut written = self.promote_working_to_session()?;
 
         // Promote eligible memories from session to long-term (importance + time based)
-        self.promote_session_to_longterm()?;
+        written.extend(self.promote_session_to_longterm()?);
 
-        Ok(())
+        Ok(written)
+    }
+
+    /// The stored record of a tier-cache entry chosen for promotion, read under the write
+    /// gate the caller holds. The cache keeps the copy taken when the memory entered it,
+    /// which later writes to the store (the deferred embedding, a merge, a decay) never
+    /// reach; promoting that copy wrote it back over them. `Ok(None)`: the store no
+    /// longer holds a live record, so there is nothing to promote and the entry goes.
+    fn stored_for_promotion(&self, id: &MemoryId) -> Result<Option<Memory>> {
+        Ok(self
+            .long_term_memory
+            .get_memory(id)?
+            .filter(|stored| !stored.is_forgotten()))
     }
 
     /// Move memories from working to session memory (Cowan's model)
     ///
     /// Promotion criteria: importance >= TIER_PROMOTION_WORKING_IMPORTANCE
     /// AND age >= TIER_PROMOTION_WORKING_AGE_SECS
-    fn promote_working_to_session(&self) -> Result<()> {
-        let now = chrono::Utc::now();
+    ///
+    /// Returns the records written to the store, as written.
+    fn promote_working_to_session(&self) -> Result<Vec<Memory>> {
+        let now = scoring_now();
         let min_age = chrono::Duration::seconds(TIER_PROMOTION_WORKING_AGE_SECS);
 
         // Find eligible memories (importance + time threshold, with graph-adjusted threshold)
@@ -4666,31 +4842,56 @@ impl MemorySystem {
         order_for_promotion(&mut to_promote);
 
         if to_promote.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
-
-        let count = to_promote.len();
 
         // Recall's tier trust reads the tier from storage, so the promotion is persisted, and
         // persisted before the tier maps are locked. If the map move then fails, storage
-        // already says Session and the next cycle re-promotes.
-        let mut promoted: Vec<Memory> = Vec::with_capacity(count);
+        // already says Session and the next cycle re-promotes. Each record is read and
+        // written under the write gate, taken before any tier map (the order the write
+        // paths take them in); a closed gate ends the pass.
+        let mut written = Vec::new();
+        let mut moves: Vec<(MemoryId, Option<Memory>)> = Vec::with_capacity(to_promote.len());
         for memory in &to_promote {
-            let mut promoted_memory = (**memory).clone();
-            promoted_memory.promote(); // Working -> Session
-            self.long_term_memory.store(&promoted_memory)?;
-            promoted.push(promoted_memory);
+            let Ok(_gate) = self.write_lock.enter() else {
+                break;
+            };
+            let stored = match self.stored_for_promotion(&memory.id) {
+                Ok(stored) => stored,
+                Err(e) => {
+                    tracing::warn!(memory_id = %memory.id.0, "promotion skipped, record unreadable: {e}");
+                    continue;
+                }
+            };
+            let promoted = match stored {
+                Some(mut stored) => {
+                    if stored.tier == MemoryTier::Working {
+                        stored.promote(); // Working -> Session
+                        self.long_term_memory.store(&stored)?;
+                        written.push(stored.clone());
+                    }
+                    Some(stored)
+                }
+                None => None,
+            };
+            moves.push((memory.id.clone(), promoted));
         }
 
+        let count = moves
+            .iter()
+            .filter(|(_, promoted)| promoted.is_some())
+            .count();
         let mut working = self.working_memory.write();
         let mut session = self.session_memory.write();
 
-        for (memory, promoted_memory) in to_promote.iter().zip(promoted) {
-            self.logger
-                .write()
-                .log_promoted(&memory.id, "working", "session", count);
-            session.add(promoted_memory)?;
-            working.remove(&memory.id)?;
+        for (id, promoted) in moves {
+            if let Some(promoted) = promoted {
+                self.logger
+                    .write()
+                    .log_promoted(&id, "working", "session", count);
+                session.add(promoted)?;
+            }
+            working.remove(&id)?;
         }
 
         if count > 0 {
@@ -4705,15 +4906,17 @@ impl MemorySystem {
                 TIER_PROMOTION_WORKING_AGE_SECS
             );
         }
-        Ok(())
+        Ok(written)
     }
 
     /// Move memories from session to long-term storage (Cowan's model)
     ///
     /// Promotion criteria: importance >= TIER_PROMOTION_SESSION_IMPORTANCE
     /// AND age >= TIER_PROMOTION_SESSION_AGE_SECS
-    fn promote_session_to_longterm(&self) -> Result<()> {
-        let now = chrono::Utc::now();
+    ///
+    /// Returns the records written to the store, as written.
+    fn promote_session_to_longterm(&self) -> Result<Vec<Memory>> {
+        let now = scoring_now();
         let min_age = chrono::Duration::seconds(TIER_PROMOTION_SESSION_AGE_SECS);
 
         // Find eligible memories (importance + time threshold, with graph-adjusted threshold)
@@ -4734,59 +4937,90 @@ impl MemorySystem {
         order_for_promotion(&mut to_promote);
 
         if to_promote.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let count = to_promote.len();
-        let mut session = self.session_memory.write();
+        let mut written = Vec::new();
+        let mut leaving = Vec::with_capacity(count);
 
         for memory in &to_promote {
+            // Read, promoted and stored under the write gate, as in
+            // `promote_working_to_session`; indexed after it is released.
+            let stored = {
+                let Ok(_gate) = self.write_lock.enter() else {
+                    break;
+                };
+                let stored = match self.stored_for_promotion(&memory.id) {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        tracing::warn!(memory_id = %memory.id.0, "promotion skipped, record unreadable: {e}");
+                        continue;
+                    }
+                };
+                match stored {
+                    // A memory important enough at creation enters the session map
+                    // still Working-tier; one step up is what promotion gives it.
+                    Some(mut owned_memory)
+                        if matches!(
+                            owned_memory.tier,
+                            MemoryTier::Working | MemoryTier::Session
+                        ) =>
+                    {
+                        owned_memory.promote(); // Session -> LongTerm
+
+                        // Compress if old enough
+                        let compressed_memory = if self.should_compress(&owned_memory) {
+                            self.compressor.compress(&owned_memory)?
+                        } else {
+                            owned_memory
+                        };
+
+                        // Store in long-term
+                        self.long_term_memory.store(&compressed_memory)?;
+                        written.push(compressed_memory.clone());
+                        Some(compressed_memory)
+                    }
+                    _ => None,
+                }
+            };
+
             // Log promotion
             self.logger
                 .write()
                 .log_promoted(&memory.id, "session", "longterm", count);
 
-            // Clone out of Arc and update tier before long-term storage
-            let mut owned_memory = (**memory).clone();
-            owned_memory.promote(); // Session -> LongTerm
-
-            // Compress if old enough
-            let compressed_memory = if self.should_compress(&owned_memory) {
-                self.compressor.compress(&owned_memory)?
-            } else {
-                owned_memory
-            };
-
-            // Store in long-term
-            self.long_term_memory.store(&compressed_memory)?;
-
             // PRODUCTION: Index memory in Vamana vector DB for semantic search
-            if let Err(e) = self.retriever.index_memory(&compressed_memory) {
-                tracing::warn!(
-                    "Failed to index memory {} in vector DB: {}",
-                    compressed_memory.id.0,
-                    e
-                );
-                // Don't fail promotion if indexing fails - memory is still stored
+            if let Some(stored) = &stored {
+                if let Err(e) = self.retriever.index_memory(stored) {
+                    tracing::warn!("Failed to index memory {} in vector DB: {}", stored.id.0, e);
+                    // Don't fail promotion if indexing fails - memory is still stored
+                }
             }
-
-            // Remove from session
-            session.remove(&memory.id)?;
+            leaving.push(memory.id.clone());
         }
 
-        if count > 0 {
+        let moved = leaving.len();
+        {
+            let mut session = self.session_memory.write();
+            for id in &leaving {
+                session.remove(id)?;
+            }
+        }
+
+        if moved > 0 {
             let mut stats = self.stats.write();
-            stats.promotions_to_longterm += count;
-            stats.session_memory_count = stats.session_memory_count.saturating_sub(count);
-            stats.long_term_memory_count += count;
+            stats.promotions_to_longterm += moved;
+            stats.session_memory_count = stats.session_memory_count.saturating_sub(moved);
+            stats.long_term_memory_count += moved;
             tracing::debug!(
                 "Promoted {} memories from session to long-term (importance >= {}, age >= {}s)",
-                count,
+                moved,
                 TIER_PROMOTION_SESSION_IMPORTANCE,
                 TIER_PROMOTION_SESSION_AGE_SECS
             );
         }
-        Ok(())
+        Ok(written)
     }
 
     // =========================================================================
@@ -6975,13 +7209,15 @@ impl MemorySystem {
             change_reason,
             provenance,
             Bm25Sync::Direct,
+            None,
         )
     }
 
     /// [`Self::upsert_with_provenance`] for a caller that journals the write:
-    /// the caller MUST journal an `IntentPayload::Update` (update) or
-    /// `Remember` (create) for the returned id, whose BM25 projection indexes
-    /// it. Nothing is written to BM25 here.
+    /// `journal` receives the stored record, as an `Update` (update) or a
+    /// `Remember` (create), and the caller MUST queue its frame there; the BM25
+    /// projection indexes it from that frame. Nothing is written to BM25 here.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_with_provenance_journaled(
         &self,
         external_id: String,
@@ -6990,6 +7226,7 @@ impl MemorySystem {
         changed_by: Option<String>,
         change_reason: Option<String>,
         provenance: UpsertProvenance,
+        journal: &mut JournalSink<'_>,
     ) -> Result<(MemoryId, bool)> {
         self.upsert_impl(
             external_id,
@@ -6999,6 +7236,7 @@ impl MemorySystem {
             change_reason,
             provenance,
             Bm25Sync::Journaled,
+            Some(journal),
         )
     }
 
@@ -7012,22 +7250,49 @@ impl MemorySystem {
         change_reason: Option<String>,
         provenance: UpsertProvenance,
         bm25: Bm25Sync,
+        journal: Option<&mut JournalSink<'_>>,
     ) -> Result<(MemoryId, bool)> {
-        // The embedding is the slow part (ONNX or an HTTP embedder), so it is computed
-        // before the per-user lock. Both paths embed the incoming content, except a create
-        // that already carries a vector and an update whose content is what is stored,
-        // which keeps its vectors (re-checked under the lock).
-        let precomputed = if experience.embeddings.is_some() {
-            None
-        } else {
-            let content_is_stored = self
-                .long_term_memory
-                .find_by_external_id(&external_id)
-                .ok()
-                .flatten()
-                .is_some_and(|stored| keeps_vectors(&stored, &experience.content));
-            (!content_is_stored).then(|| self.embed_content(&experience.content))
-        };
+        // The embeddings are the slow part (ONNX or an HTTP embedder), so they are computed
+        // before the per-user lock: the content vector, and for content long enough to
+        // chunk, the chunk vectors of the record this upsert is expected to store, drafted
+        // from the record read here. Both paths embed, except a create that already
+        // carries a vector and an update whose content is what is stored, which keeps its
+        // vectors. Under the lock each vector is used only for the text it was computed
+        // from; anything else is encoded there.
+        let stored_before = self
+            .long_term_memory
+            .find_by_external_id(&external_id)
+            .ok()
+            .flatten();
+        let content_is_stored = experience.embeddings.is_none()
+            && stored_before
+                .as_ref()
+                .is_some_and(|stored| keeps_vectors(stored, &experience.content));
+        let precomputed = (experience.embeddings.is_none() && !content_is_stored)
+            .then(|| self.embed_content(&experience.content));
+        let chunks = (!content_is_stored).then(|| {
+            let draft = match stored_before {
+                Some(mut stored) => {
+                    apply_upsert_update(
+                        &mut stored,
+                        experience.clone(),
+                        change_type.clone(),
+                        changed_by.clone(),
+                        change_reason.clone(),
+                        provenance.clone(),
+                    );
+                    stored
+                }
+                None => upsert_new_record(
+                    MemoryId(Uuid::nil()),
+                    experience.clone(),
+                    0.0,
+                    external_id.clone(),
+                    provenance.clone(),
+                ),
+            };
+            self.retriever.prepare_chunks(&draft)
+        });
 
         // C1: the find-then-create below must be atomic, or two concurrent upserts of one
         // external_id both miss the lookup and both create. Same per-user lock as remember_impl.
@@ -7041,39 +7306,14 @@ impl MemorySystem {
                 && experience.embeddings.is_none()
                 && self.retriever.is_indexed(&memory_id);
 
-            // Push old content to history and update
-            existing.update_content(
-                experience.content.clone(),
+            apply_upsert_update(
+                &mut existing,
+                experience,
                 change_type,
                 changed_by,
                 change_reason,
+                provenance,
             );
-
-            // Provenance: a provided field overwrites, an omitted one keeps the stored value.
-            if let Some(agent_id) = provenance.agent_id {
-                existing.agent_id = Some(agent_id);
-            }
-            if let Some(created_at) = provenance.created_at {
-                existing.created_at = created_at;
-                existing.when.encoded_at = Some(created_at);
-            }
-            overlay_declared_context(
-                &mut existing.experience.context,
-                experience.context.take(),
-                provenance.episode_id,
-                provenance.writer,
-                provenance.repo,
-            );
-
-            // Update entities if provided
-            if !experience.entities.is_empty() {
-                existing.experience.entities = experience.entities;
-            }
-
-            // Update tags if provided
-            if !experience.tags.is_empty() {
-                existing.experience.tags = experience.tags;
-            }
 
             // Regenerate embeddings for new content: the vector computed before the lock
             // when it was computed from this content, otherwise encoded here. Unchanged
@@ -7107,11 +7347,17 @@ impl MemorySystem {
 
             // Persist updated memory
             self.long_term_memory.update(&existing)?;
+            if let Some(sink) = journal {
+                sink(&existing, SnapshotKind::Update, &write_guard);
+            }
 
             // Re-index in vector DB with new embeddings. A reindex soft-deletes the old
             // vectors and adds new ones, so an unchanged memory would only grow ghosts.
             if !vectors_kept {
-                if let Err(e) = self.retriever.reindex_memory(&existing) {
+                if let Err(e) = self
+                    .retriever
+                    .reindex_memory_prepared(&existing, chunks.as_ref())
+                {
                     tracing::warn!(
                         "Failed to reindex memory {} in vector DB: {}",
                         memory_id.0,
@@ -7183,40 +7429,19 @@ impl MemorySystem {
                 }
             }
 
-            // TEMPORAL EXTRACTION: Extract dates from content for temporal filtering
-            if experience.temporal_refs.is_empty() {
-                let temporal =
-                    crate::memory::query_parser::extract_temporal_refs(&experience.content);
-                for temp_ref in temporal.refs {
-                    experience.temporal_refs.push(temp_ref.date.to_string());
-                }
-            }
-
-            // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
-            experience.migrate_robotics_to_facets();
-
-            overlay_declared_context(
-                &mut experience.context,
-                None,
-                provenance.episode_id,
-                provenance.writer,
-                provenance.repo,
-            );
-
-            // Create memory with external_id
-            let memory = Arc::new(Memory::new_with_external_id(
+            let memory = Arc::new(upsert_new_record(
                 memory_id.clone(),
                 experience,
                 importance,
                 external_id.clone(),
-                provenance.agent_id,
-                None, // run_id
-                None, // actor_id
-                provenance.created_at,
+                provenance,
             ));
 
             // Persist to storage, with the vector mapping in the same commit
-            let vector_indexing = self.store_new_memory(&memory, false)?;
+            let vector_indexing = self.store_new_memory(&memory, false, chunks.as_ref())?;
+            if let Some(sink) = journal {
+                sink(&memory, SnapshotKind::Remember, &write_guard);
+            }
 
             // Log creation
             self.logger.write().log_created(&memory, "working");
@@ -10627,6 +10852,222 @@ mod lifecycle_tests {
         }
         assert!(!out.is_empty(), "no storage engine in this build");
         out
+    }
+
+    /// What a journaled write hands its sink, compared with the stored record on the
+    /// fields a stale or partial snapshot would get wrong.
+    fn same_record(handed: &Memory, stored: &Memory) -> bool {
+        handed.experience.content == stored.experience.content
+            && handed.experience.tags == stored.experience.tags
+            && handed.experience.entities == stored.experience.entities
+            && handed.version == stored.version
+            && handed.tier == stored.tier
+            && handed.importance() == stored.importance()
+            && handed.experience.embeddings.is_some() == stored.experience.embeddings.is_some()
+    }
+
+    /// A journaled remember hands its sink the record as the store holds it, under the
+    /// gate, so the handler journals it without reading it back; a duplicate that merges
+    /// new tags hands over the merged record.
+    #[test]
+    fn a_journaled_remember_hands_its_sink_the_record_as_stored() {
+        for (backend, system, _tmp) in systems() {
+            let mut handed: Vec<(Memory, SnapshotKind)> = Vec::new();
+            let mut sink = |m: &Memory, kind: SnapshotKind, _: &write_gate::WriteGuard<'_>| {
+                handed.push((m.clone(), kind))
+            };
+            let first = system
+                .remember_detailed_journaled(
+                    Experience {
+                        content: "The tram depot opens its north gate at dawn".to_string(),
+                        tags: vec!["depot".to_string()],
+                        ..Default::default()
+                    },
+                    None,
+                    &mut sink,
+                )
+                .unwrap();
+            let again = system
+                .remember_detailed_journaled(
+                    Experience {
+                        content: "The tram depot opens its north gate at dawn".to_string(),
+                        tags: vec!["gates".to_string()],
+                        ..Default::default()
+                    },
+                    None,
+                    &mut sink,
+                )
+                .unwrap();
+            assert_eq!(first.id, again.id, "{backend:?}: identical content dedups");
+            let stored = system.long_term_memory.get(&first.id).unwrap();
+            let (last, kind) = handed
+                .iter()
+                .rev()
+                .find(|(m, _)| m.id == first.id)
+                .expect("the memory was handed to the sink");
+            assert_eq!(*kind, SnapshotKind::Remember);
+            assert!(
+                last.experience.tags.contains(&"gates".to_string()),
+                "{backend:?}: the merged tags reached the sink"
+            );
+            assert!(
+                same_record(last, &stored),
+                "{backend:?}: sink copy is the stored record"
+            );
+        }
+    }
+
+    /// Tier promotion promotes the stored record, not the copy the tier map took when
+    /// the memory entered it: the deferred embedding lands in the store only, and
+    /// writing the cached copy back used to drop it.
+    #[test]
+    fn tier_promotion_keeps_what_the_store_gained_after_the_memory_was_cached() {
+        for (backend, system, _tmp) in systems() {
+            let id = system
+                .remember_deferred(
+                    Experience {
+                        content: "Ferry timetable for the winter crossing to the outer isle"
+                            .to_string(),
+                        ..Default::default()
+                    },
+                    Some(chrono::Utc::now() - chrono::Duration::days(1)),
+                    None,
+                )
+                .unwrap();
+            system.embed_and_index(&id).unwrap();
+            assert!(
+                system
+                    .long_term_memory
+                    .get(&id)
+                    .unwrap()
+                    .experience
+                    .embeddings
+                    .is_some(),
+                "{backend:?}: the embedding landed in the store"
+            );
+            let cached: Vec<SharedMemory> = system
+                .working_memory
+                .read()
+                .all_memories()
+                .into_iter()
+                .chain(system.session_memory.read().all_memories())
+                .filter(|m| m.id == id)
+                .collect();
+            assert!(
+                !cached.is_empty(),
+                "{backend:?}: the memory is in a tier map"
+            );
+            assert!(
+                cached.iter().all(|m| m.experience.embeddings.is_none()),
+                "{backend:?}: the cached copy predates the embedding"
+            );
+            for m in &cached {
+                m.set_importance(0.95);
+            }
+
+            let written = system.consolidate_if_needed().unwrap();
+            let promoted = written
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{backend:?}: the memory was promoted"));
+            let stored = system.long_term_memory.get(&id).unwrap();
+            assert!(
+                stored.experience.embeddings.is_some(),
+                "{backend:?}: promotion kept the stored embedding"
+            );
+            assert!(
+                same_record(promoted, &stored),
+                "{backend:?}: reported as written"
+            );
+        }
+    }
+
+    /// The draft an upsert embeds chunks from before taking the write gate splits into
+    /// the chunks of the record it then stores, on create and on update, so the gate
+    /// is held for no chunk embedding.
+    #[test]
+    fn an_upserts_pre_gate_draft_predicts_the_chunks_it_stores() {
+        let long = |topic: &str| {
+            (0..120)
+                .map(|i| {
+                    format!("Line {i} of the {topic} log notes the berth, the crane and the tide.")
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for (backend, system, _tmp) in systems() {
+            let provenance = UpsertProvenance {
+                episode_id: Some("ep-harbour".to_string()),
+                ..Default::default()
+            };
+            let created = Experience {
+                content: long("harbour"),
+                entities: vec!["harbour".to_string()],
+                ..Default::default()
+            };
+            let draft = upsert_new_record(
+                MemoryId(Uuid::nil()),
+                created.clone(),
+                0.0,
+                "doc-harbour".to_string(),
+                provenance.clone(),
+            );
+            let (id, was_update) = system
+                .upsert_with_provenance(
+                    "doc-harbour".to_string(),
+                    created,
+                    ChangeType::Created,
+                    None,
+                    None,
+                    provenance.clone(),
+                )
+                .unwrap();
+            assert!(!was_update);
+            let stored = system.long_term_memory.get(&id).unwrap();
+            let predicted = system.retriever.prepare_chunks(&draft);
+            assert!(
+                predicted.texts().len() > 1,
+                "{backend:?}: the content chunks"
+            );
+            assert_eq!(
+                predicted.texts(),
+                system.retriever.prepare_chunks(&stored).texts(),
+                "{backend:?}: create draft"
+            );
+
+            let update = Experience {
+                content: long("quay"),
+                tags: vec!["quay".to_string()],
+                ..Default::default()
+            };
+            let mut draft = stored.clone();
+            apply_upsert_update(
+                &mut draft,
+                update.clone(),
+                ChangeType::ContentUpdated,
+                None,
+                None,
+                provenance.clone(),
+            );
+            let (updated_id, was_update) = system
+                .upsert_with_provenance(
+                    "doc-harbour".to_string(),
+                    update,
+                    ChangeType::ContentUpdated,
+                    None,
+                    None,
+                    provenance,
+                )
+                .unwrap();
+            assert!(was_update);
+            assert_eq!(updated_id, id);
+            let stored = system.long_term_memory.get(&id).unwrap();
+            assert_eq!(
+                system.retriever.prepare_chunks(&draft).texts(),
+                system.retriever.prepare_chunks(&stored).texts(),
+                "{backend:?}: update draft"
+            );
+        }
     }
 
     fn memory(exp_type: ExperienceType, content: &str) -> Memory {
