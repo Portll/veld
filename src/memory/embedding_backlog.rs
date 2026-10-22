@@ -102,6 +102,10 @@ pub struct DrainReport {
 
 pub struct EmbeddingBacklogStore {
     kv: Arc<dyn KeyValueStore>,
+    /// Serializes every row write. `record` reads a row and writes it back; unserialized,
+    /// two failures of one memory both counted from the same attempt, and a `delete`
+    /// landing between the read and the write was undone by the write.
+    rows: parking_lot::Mutex<()>,
 }
 
 fn key(id: &MemoryId) -> Vec<u8> {
@@ -110,7 +114,10 @@ fn key(id: &MemoryId) -> Vec<u8> {
 
 impl EmbeddingBacklogStore {
     pub fn with_kv(kv: Arc<dyn KeyValueStore>) -> Self {
-        Self { kv }
+        Self {
+            kv,
+            rows: parking_lot::Mutex::new(()),
+        }
     }
 
     pub fn get(&self, id: &MemoryId) -> Result<Option<BacklogEntry>> {
@@ -129,6 +136,11 @@ impl EmbeddingBacklogStore {
     }
 
     pub fn put(&self, id: &MemoryId, entry: &BacklogEntry) -> Result<()> {
+        let _rows = self.rows.lock();
+        self.put_row(id, entry)
+    }
+
+    fn put_row(&self, id: &MemoryId, entry: &BacklogEntry) -> Result<()> {
         let bytes = serde_json::to_vec(entry).context("encode embedding backlog row")?;
         self.kv
             .put_bytes(&key(id), &bytes)
@@ -136,6 +148,7 @@ impl EmbeddingBacklogStore {
     }
 
     pub fn delete(&self, id: &MemoryId) -> Result<()> {
+        let _rows = self.rows.lock();
         self.kv
             .delete_bytes(&key(id))
             .context("delete embedding backlog row")
@@ -167,6 +180,7 @@ impl EmbeddingBacklogStore {
     /// Record that a memory needs a vector. An existing row keeps its enqueue time and reason;
     /// the attempt count and last error move.
     pub fn record(&self, id: &MemoryId, reason: EnqueueReason, error: Option<&str>) -> Result<()> {
+        let _rows = self.rows.lock();
         let now = Utc::now();
         let entry = match self.get(id)? {
             Some(mut existing) => {
@@ -185,7 +199,7 @@ impl EmbeddingBacklogStore {
                 index_only: false,
             },
         };
-        self.put(id, &entry)
+        self.put_row(id, &entry)
     }
 
     /// Queue `ids`, live memories a tenant's open found missing from its vector index, as
@@ -448,6 +462,31 @@ mod tests {
         );
         assert_eq!(second.enqueued_at, first.enqueued_at);
         assert_eq!(second.last_error.as_deref(), Some("timeout"));
+    }
+
+    /// Failures of one memory recorded from many threads at once each count: the row's
+    /// read and write-back are one step, so no two count from the same attempt.
+    #[test]
+    fn concurrent_records_count_every_attempt() {
+        const THREADS: u32 = 8;
+        const EACH: u32 = 25;
+        let (_, s) = store();
+        let s = Arc::new(s);
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || {
+                    for _ in 0..EACH {
+                        s.record(&id(9), EnqueueReason::EmbedFailed, Some("timeout"))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(s.get(&id(9)).unwrap().unwrap().attempts, THREADS * EACH);
     }
 
     #[test]
