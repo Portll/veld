@@ -54,6 +54,7 @@ pub mod temporal_facts;
 pub mod todo_formatter;
 pub mod todos;
 pub mod types;
+mod usage_writes;
 pub mod visualization;
 pub mod voronoi;
 pub mod wavelet_sessions;
@@ -402,9 +403,17 @@ pub struct MemorySystem {
     /// of the corpus is still under the age gate.
     fact_extraction_needed: std::sync::atomic::AtomicBool,
 
-    /// Cached wavelet-detected session map.
-    /// Invalidated when fact_extraction_needed is set (any new remember call).
-    session_map_cache: parking_lot::Mutex<Option<wavelet_sessions::SessionMap>>,
+    /// Advanced after every write that adds, removes or forgets a memory: the set of
+    /// `(id, created_at)` pairs the session map is computed from changes only then.
+    memory_set_generation: std::sync::atomic::AtomicU64,
+
+    /// Cached wavelet-detected session map, with the `memory_set_generation` it was computed
+    /// at.
+    session_map_cache: parking_lot::Mutex<Option<(u64, wavelet_sessions::SessionMap)>>,
+
+    /// Recall usage writes (retrieval counter, co-retrieval reinforcement, competition
+    /// interference), applied in order by a background worker instead of inside recall.
+    usage_writes: usage_writes::UsageWriter,
 
     /// Active reconsolidation shadows (FIX-R1): memories currently in the labile window.
     /// Key: MemoryId, Value: ReconsolidationShadow
@@ -1646,6 +1655,16 @@ impl MemorySystem {
             Arc::new(RwLock::new(detector))
         };
 
+        let stats = Arc::new(RwLock::new(initial_stats));
+        let usage_writes = usage_writes::UsageSinks {
+            store: primary_store.clone(),
+            stats: Arc::clone(&stats),
+            graph: None,
+            interference: Arc::clone(&interference_detector),
+            events: Arc::clone(&consolidation_events),
+        }
+        .into_writer(usage_writes::USAGE_WRITE_QUEUE_CAPACITY);
+
         Ok(Self {
             config: config.clone(),
             working_memory: Arc::new(RwLock::new(WorkingMemory::new(config.working_memory_size))),
@@ -1662,7 +1681,7 @@ impl MemorySystem {
             // LRU embedding caches: max 2,000 entries each (~3MB for 384-dim embeddings)
             query_cache: moka::sync::Cache::builder().max_capacity(2_000).build(),
             content_cache: moka::sync::Cache::builder().max_capacity(2_000).build(),
-            stats: Arc::new(RwLock::new(initial_stats)),
+            stats,
             stored_totals: parking_lot::Mutex::new(initial_totals),
             logger,
             consolidation_events, // Use the shared buffer created earlier
@@ -1691,7 +1710,9 @@ impl MemorySystem {
             // Dirty flag for fact extraction: run on the first cycle, then when there is work
             fact_extraction_needed: std::sync::atomic::AtomicBool::new(true),
             // Wavelet session detection cache — recomputed when new memories arrive
+            memory_set_generation: std::sync::atomic::AtomicU64::new(0),
             session_map_cache: parking_lot::Mutex::new(None),
+            usage_writes,
             // FIX-R1: Reconsolidation shadow map — tracks labile memories
             reconsolidation_shadows: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
@@ -1757,6 +1778,31 @@ impl MemorySystem {
         graph: Arc<parking_lot::RwLock<crate::graph_memory::GraphMemory>>,
     ) {
         self.graph_memory = Some(graph);
+        // The usage writer reinforces edges in the graph it was built with.
+        self.usage_writes.shutdown();
+        self.usage_writes = self
+            .usage_sinks()
+            .into_writer(usage_writes::USAGE_WRITE_QUEUE_CAPACITY);
+    }
+
+    fn usage_sinks(&self) -> usage_writes::UsageSinks {
+        usage_writes::UsageSinks {
+            store: Arc::clone(&self.long_term_memory),
+            stats: Arc::clone(&self.stats),
+            graph: self.graph_memory.clone(),
+            interference: Arc::clone(&self.interference_detector),
+            events: Arc::clone(&self.consolidation_events),
+        }
+    }
+
+    /// Wait until every recall usage write queued so far has applied.
+    pub fn flush_usage_writes(&self) {
+        self.usage_writes.flush();
+    }
+
+    /// Queue one recall usage write for the background worker.
+    fn submit_usage_write(&self, write: usage_writes::UsageWrite) {
+        self.usage_writes.submit(write);
     }
 
     /// Get reference to the optional graph memory
@@ -3773,6 +3819,12 @@ impl MemorySystem {
     }
 
     fn forget_with(&self, criteria: ForgetCriteria, bm25: Bm25Sync) -> Result<usize> {
+        let outcome = self.forget_matching(criteria, bm25);
+        self.note_memory_set_changed();
+        outcome
+    }
+
+    fn forget_matching(&self, criteria: ForgetCriteria, bm25: Bm25Sync) -> Result<usize> {
         let forgotten_count = match criteria {
             ForgetCriteria::ById(memory_id) => {
                 // Delete a single memory by ID from all tiers, tracking which tiers had it
@@ -3996,10 +4048,25 @@ impl MemorySystem {
 
     fn note_stored(&self, importance: f32) {
         self.stored_totals.lock().apply(1, f64::from(importance));
+        self.note_memory_set_changed();
     }
 
     fn note_removed(&self, importance: f32) {
         self.stored_totals.lock().apply(-1, -f64::from(importance));
+        self.note_memory_set_changed();
+    }
+
+    /// Advance the generation the session map is cached against. Called after the write
+    /// is visible, so a map computed before the bump is never stamped with it.
+    fn note_memory_set_changed(&self) {
+        self.memory_set_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The current memory-set generation: equal readings bracket no add, remove or forget.
+    pub(crate) fn memory_set_generation(&self) -> u64 {
+        self.memory_set_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn note_importance_change(&self, before: f32, after: f32) {
@@ -5611,6 +5678,9 @@ impl MemorySystem {
 
     /// Flush long-term storage to ensure data persistence (critical for graceful shutdown)
     pub fn flush_storage(&self) -> Result<()> {
+        // Queued recall usage writes land before the flush that makes them durable.
+        self.usage_writes.flush();
+
         // Flush RocksDB storage
         self.long_term_memory.flush()?;
 
@@ -5776,6 +5846,7 @@ impl MemorySystem {
                 }
             }
         }
+        self.note_memory_set_changed();
         Ok(memories.len())
     }
 
@@ -7830,6 +7901,7 @@ impl MemorySystem {
             if let Err(e) = self.long_term_memory.gc_merge_tombstones(user_id) {
                 tracing::warn!(user_id, error = %e, "S-R6: tombstone GC failed");
             }
+            self.note_memory_set_changed();
         }
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -8910,6 +8982,9 @@ impl Drop for MemorySystem {
     fn drop(&mut self) {
         // Vector index saved via explicit shutdown (save_all_vector_indices)
         // Do NOT save here - Drop fires for temporary instances, overwriting valid saves
+
+        // Queued recall usage writes apply before the flush below.
+        self.usage_writes.shutdown();
 
         // Flush RocksDB WAL to ensure all writes are durable
         if let Err(e) = self.long_term_memory.flush() {

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::constants::{HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING};
 use crate::embeddings::Embedder;
 use crate::memory::graph_retrieval::calculate_density_weights;
-use crate::memory::introspection::{self, StrengtheningReason};
+use crate::memory::introspection::StrengtheningReason;
 use crate::memory::learning_history;
 use crate::memory::query_parser;
 use crate::memory::retrieval::{ReinforcementStats, RetrievalOutcome, TrackedRetrieval};
@@ -334,9 +334,7 @@ impl super::MemorySystem {
 
         // Increment and persist retrieval counter
         if !readonly {
-            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-                self.stats.write().total_retrievals = count;
-            }
+            self.submit_usage_write(super::usage_writes::UsageWrite::RetrievalCounted);
         }
 
         Ok((memories, RecallReadout::default()))
@@ -416,9 +414,7 @@ impl super::MemorySystem {
         });
         memories.truncate(limit);
         if !super::recall_readonly() {
-            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-                self.stats.write().total_retrievals = count;
-            }
+            self.submit_usage_write(super::usage_writes::UsageWrite::RetrievalCounted);
         }
         Ok(memories)
     }
@@ -456,9 +452,7 @@ impl super::MemorySystem {
         let mut memories = self.advanced_search(criteria)?;
         memories.truncate(limit);
         if !super::recall_readonly() {
-            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-                self.stats.write().total_retrievals = count;
-            }
+            self.submit_usage_write(super::usage_writes::UsageWrite::RetrievalCounted);
         }
         Ok(memories)
     }
@@ -4279,13 +4273,12 @@ impl super::MemorySystem {
                 })
                 .collect();
 
-            // Suppression COMPUTES in every mode (per-query ranking); interference
-            // ACCUMULATION is a usage write, so read-only recall must not teach the detector.
+            // Suppression COMPUTES in every mode (per-query ranking), without the detector;
+            // interference ACCUMULATION is a usage write, so read-only recall must not teach
+            // the detector.
             let record_state = !super::recall_readonly();
-            let competition_result = self
-                .interference_detector
-                .write()
-                .apply_retrieval_competition(&candidates, query_text, record_state);
+            let competition_result =
+                super::replay::InterferenceDetector::compete_for_retrieval(&candidates, query_text);
 
             // Record competition event if any memories were suppressed
             if let Some(ref event) = competition_result.event {
@@ -4320,31 +4313,18 @@ impl super::MemorySystem {
                 }
             }
 
-            // Persist interference records from retrieval competition
-            {
-                let detector = self.interference_detector.read();
-                let affected_ids = detector.get_affected_ids_from_competition(&competition_result);
-                if !affected_ids.is_empty() {
-                    for (id, records) in detector.get_records_for_ids(&affected_ids) {
-                        if let Err(e) = self.long_term_memory.save_interference_records(id, records)
-                        {
-                            tracing::debug!("Failed to persist competition interference: {e}");
-                        }
-                    }
-                    let (total_events, _) = detector.stats();
-                    if let Err(e) = self
-                        .long_term_memory
-                        .save_interference_event_count(total_events)
-                    {
-                        tracing::debug!("Failed to persist interference event count: {e}");
-                    }
-                }
-            }
-
             if !competition_result.suppressed.is_empty() {
                 crate::metrics::SUPPRESSOR_DETECTIONS_TOTAL
                     .inc_by(competition_result.suppressed.len() as u64);
             }
+
+            // The interference this competition leaves, and its persistence, are recorded
+            // by the usage-write worker.
+            self.submit_usage_write(super::usage_writes::UsageWrite::Competition {
+                candidates,
+                record_state,
+                result: competition_result,
+            });
         }
 
         // Abstention: filter out memories below confidence threshold
@@ -4642,50 +4622,21 @@ impl super::MemorySystem {
         // participate in coactivation (biological: "neurons that fire together
         // wire together" but suppressed neurons don't fire).
         // S-R4: routed through apply_reinforcement so duplicate retrieval_ids are no-ops.
-        if !readonly && memories.len() >= 2 {
-            if let Some(graph) = &self.graph_memory {
-                let retrieval_id = uuid::Uuid::new_v4();
-                let source = query
-                    .evidence_source
-                    .as_deref()
-                    .unwrap_or(crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE);
-                let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                match graph.read().apply_reinforcement(
-                    retrieval_id,
-                    source,
-                    &memory_uuids[0],
-                    &memory_uuids[1..],
-                ) {
-                    Ok(ref result) if result.edges_updated > 0 => {
-                        // Record consolidation events for coactivation visibility
-                        for i in 0..memories.len().min(5) {
-                            for j in (i + 1)..memories.len().min(5) {
-                                self.record_consolidation_event(
-                                    introspection::ConsolidationEvent::EdgeStrengthened {
-                                        from_memory_id: memories[i].id.0.to_string(),
-                                        to_memory_id: memories[j].id.0.to_string(),
-                                        strength_before: 0.0,
-                                        strength_after: 0.025,
-                                        co_activations: 1,
-                                        timestamp: chrono::Utc::now(),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::trace!("Coactivation recording failed (non-critical): {e}");
-                    }
-                    _ => {}
-                }
-            }
+        if !readonly && memories.len() >= 2 && self.graph_memory.is_some() {
+            let source = query
+                .evidence_source
+                .as_deref()
+                .unwrap_or(crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE);
+            self.submit_usage_write(super::usage_writes::UsageWrite::Coactivation {
+                retrieval_id: uuid::Uuid::new_v4(),
+                source: source.to_string(),
+                memories: memories.iter().map(|m| m.id.0).collect(),
+            });
         }
 
         // Increment and persist retrieval counter
         if !readonly {
-            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-                self.stats.write().total_retrievals = count;
-            }
+            self.submit_usage_write(super::usage_writes::UsageWrite::RetrievalCounted);
         }
 
         self.logger
@@ -5210,33 +5161,29 @@ impl super::MemorySystem {
 
     /// Retrieve or recompute the wavelet-detected session map.
     ///
-    /// The session map is cached and only recomputed when new memories have been
-    /// stored (indicated by `fact_extraction_needed`). This keeps repeated
-    /// ordinal-resolution lookups within a single retrieval pipeline free of
-    /// redundant full-store scans.
-    fn get_or_compute_session_map(&self) -> anyhow::Result<wavelet_sessions::SessionMap> {
-        // Check cache
-        {
-            let cache = self.session_map_cache.lock();
-            if let Some(ref map) = *cache {
-                if !self
-                    .fact_extraction_needed
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    return Ok(map.clone());
-                }
+    /// The map depends only on which memories exist and when each was created, so it is
+    /// cached against the memory-set generation, which every add, remove and forget
+    /// advances. A store whose memories have not changed since the last ordinal query
+    /// reuses the map instead of reading every record again. The generation is read before
+    /// the records, so a write racing the read leaves the map stamped as older than it is
+    /// and the next query recomputes it.
+    pub(crate) fn get_or_compute_session_map(
+        &self,
+    ) -> anyhow::Result<wavelet_sessions::SessionMap> {
+        let generation = self.memory_set_generation();
+        if let Some((cached_at, map)) = self.session_map_cache.lock().as_ref() {
+            if *cached_at == generation {
+                return Ok(map.clone());
             }
         }
 
-        // Recompute from all memories
         let all = self.get_all_memories()?;
         let timestamps: Vec<(MemoryId, chrono::DateTime<chrono::Utc>)> =
             all.iter().map(|m| (m.id.clone(), m.created_at)).collect();
 
         let map = wavelet_sessions::detect_sessions(&timestamps);
 
-        // Cache
-        *self.session_map_cache.lock() = Some(map.clone());
+        *self.session_map_cache.lock() = Some((generation, map.clone()));
         Ok(map)
     }
 
@@ -5484,9 +5431,7 @@ impl super::MemorySystem {
     pub fn recall_tracked(&self, query: &Query) -> Result<TrackedRetrieval> {
         let result = self.retriever.search_tracked(query, query.max_results)?;
         if !super::recall_readonly() {
-            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-                self.stats.write().total_retrievals = count;
-            }
+            self.submit_usage_write(super::usage_writes::UsageWrite::RetrievalCounted);
         }
         Ok(result)
     }
@@ -7881,5 +7826,107 @@ mod prior_fusion_tests {
     #[test]
     fn an_empty_or_zero_base_set_scores_zero_relevance() {
         assert_eq!(fuse_base_with_priors(0.0, 0.0, 0.3, true), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod session_map_cache_tests {
+    use crate::memory::types::{Experience, ForgetCriteria, MemoryId};
+    use crate::memory::{MemoryConfig, MemorySystem};
+
+    fn remember_at(sys: &MemorySystem, content: &str, at: &str) -> MemoryId {
+        let created_at = chrono::DateTime::parse_from_rfc3339(at)
+            .expect("test timestamp")
+            .with_timezone(&chrono::Utc);
+        sys.remember(
+            Experience {
+                content: content.to_string(),
+                ..Default::default()
+            },
+            Some(created_at),
+        )
+        .expect("remember")
+    }
+
+    /// Ordinal queries between writes reuse one session map; a new memory or a forgotten
+    /// one changes the memory set, and the next map reflects it.
+    #[test]
+    fn the_session_map_is_reused_until_the_memory_set_changes() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let sys = MemorySystem::new(
+            MemoryConfig {
+                storage_path: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("memory system");
+        remember_at(&sys, "standup notes on the parser", "2026-03-02T09:00:00Z");
+        remember_at(&sys, "follow-up on the parser fix", "2026-03-02T09:30:00Z");
+        remember_at(&sys, "sprint review of the release", "2026-03-05T15:00:00Z");
+
+        let generation = sys.memory_set_generation();
+        let map = sys.get_or_compute_session_map().expect("session map");
+        assert_eq!(map.sessions.len(), 2);
+        let reused = sys.get_or_compute_session_map().expect("session map");
+        assert_eq!(
+            reused.computed_at, map.computed_at,
+            "no write, no recompute"
+        );
+        assert_eq!(sys.memory_set_generation(), generation);
+
+        let later = remember_at(&sys, "retro after the release", "2026-03-09T10:00:00Z");
+        assert!(sys.memory_set_generation() > generation);
+        assert_eq!(sys.get_or_compute_session_map().unwrap().sessions.len(), 3);
+
+        sys.forget(ForgetCriteria::ById(later)).expect("forget");
+        assert_eq!(sys.get_or_compute_session_map().unwrap().sessions.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod usage_write_tests {
+    use crate::memory::types::{Experience, Query};
+    use crate::memory::{MemoryConfig, MemorySystem};
+
+    /// A recall's retrieval count is written by the background worker: present once the
+    /// queue is flushed, one per recall, and persisted where the inline write put it.
+    #[test]
+    fn each_recall_counts_once_the_usage_writes_land() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let sys = MemorySystem::new(
+            MemoryConfig {
+                storage_path: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("memory system");
+        for content in [
+            "The release train leaves every second Tuesday",
+            "Release notes are drafted the Monday before the train",
+        ] {
+            sys.remember(
+                Experience {
+                    content: content.to_string(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("remember");
+        }
+        sys.flush_usage_writes();
+        let before = sys.stats().total_retrievals;
+        let query = Query {
+            query_text: Some("when does the release train leave".to_string()),
+            max_results: 5,
+            ..Default::default()
+        };
+        crate::memory::with_recall_writes(|| {
+            sys.recall(&query).expect("recall");
+            sys.recall(&query).expect("recall");
+        });
+        sys.flush_usage_writes();
+        assert_eq!(sys.stats().total_retrievals, before + 2);
     }
 }

@@ -253,6 +253,81 @@ pub struct InterferenceCheckResult {
     pub events: Vec<ConsolidationEvent>,
 }
 
+/// What one retrieval competition decides, before it is reported or recorded.
+struct RetrievalCompetitionOutcome {
+    winners: Vec<(String, f32)>,
+    suppressed: Vec<String>,
+    /// `(affected, winner, score_ratio, strength_change)` per interference record, in the
+    /// order the candidates were ranked.
+    interference: Vec<(String, String, f32, f32)>,
+}
+
+impl RetrievalCompetitionOutcome {
+    /// Stronger memories suppress weaker ones: a competitor within 10% of the winner loses
+    /// score in proportion to how close it came, and is suppressed when that leaves it at
+    /// 0.1 or below. Close survivors and suppressed memories both leave an interference
+    /// record (RIF feedback for Layer 4.6, PIPE-3), the survivors a milder one.
+    fn of(candidates: &[(String, f32, f32)]) -> Self {
+        let mut outcome = Self {
+            winners: Vec::new(),
+            suppressed: Vec::new(),
+            interference: Vec::new(),
+        };
+        if candidates.len() <= 1 {
+            outcome.winners = candidates
+                .iter()
+                .map(|(id, score, _)| (id.clone(), *score))
+                .collect();
+            return outcome;
+        }
+
+        let mut scores: Vec<(String, f32)> = candidates
+            .iter()
+            .map(|(id, score, _)| (id.clone(), *score))
+            .collect();
+        scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let Some((winner_id, winner_score)) = scores.first().cloned() else {
+            return outcome;
+        };
+        outcome.winners.push((winner_id.clone(), winner_score));
+
+        // A zero-scoring winner means every remaining score is zero too: no competition.
+        if winner_score <= 0.0 {
+            outcome.winners.extend(scores.into_iter().skip(1));
+            return outcome;
+        }
+
+        for (id, score) in scores.into_iter().skip(1) {
+            let score_ratio = score / winner_score;
+            if score_ratio > 0.9 {
+                let suppression = INTERFERENCE_COMPETITION_FACTOR * (1.0 - score_ratio) * 10.0;
+                let new_score = (score - suppression).max(0.0);
+                if new_score > 0.1 {
+                    outcome.interference.push((
+                        id.clone(),
+                        winner_id.clone(),
+                        score_ratio,
+                        suppression * 0.3,
+                    ));
+                    outcome.winners.push((id, new_score));
+                } else {
+                    outcome.interference.push((
+                        id.clone(),
+                        winner_id.clone(),
+                        score_ratio,
+                        suppression,
+                    ));
+                    outcome.suppressed.push(id);
+                }
+            } else {
+                outcome.winners.push((id, score));
+            }
+        }
+        outcome
+    }
+}
+
 /// Result of retrieval competition
 #[derive(Debug, Clone)]
 pub struct CompetitionResult {
@@ -415,93 +490,33 @@ impl InterferenceDetector {
         query_preview: &str,
         record_state: bool,
     ) -> CompetitionResult {
-        if candidates.len() <= 1 {
-            return CompetitionResult {
-                winners: candidates
-                    .iter()
-                    .map(|(id, score, _)| (id.clone(), *score))
-                    .collect(),
-                suppressed: Vec::new(),
-                competition_factor: 0.0,
-                event: None,
-            };
-        }
+        let result = Self::compete_for_retrieval(candidates, query_preview);
+        self.record_retrieval_competition(candidates, record_state);
+        result
+    }
 
-        // Find groups of competing memories (high similarity to each other)
-        let mut scores: Vec<(String, f32)> = candidates
-            .iter()
-            .map(|(id, score, _)| (id.clone(), *score))
-            .collect();
-
-        // Sort by score descending
-        scores.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-        let mut winners: Vec<(String, f32)> = Vec::new();
-        let mut suppressed: Vec<String> = Vec::new();
-
-        if let Some((winner_id, winner_score)) = scores.first() {
-            winners.push((winner_id.clone(), *winner_score));
-
-            // Guard: skip competition if winner has zero score (all remaining are also zero)
-            if *winner_score <= 0.0 {
-                for (id, score) in scores.iter().skip(1) {
-                    winners.push((id.clone(), *score));
-                }
-            } else {
-                // Apply competition suppression to lower-ranked memories
-                // RIF feedback: record interference for suppressed and close-survivor memories
-                // so Layer 4.6 (PIPE-3) can boost survivors and suppress chronic losers
-                for (id, score) in scores.iter().skip(1) {
-                    let score_ratio = score / winner_score;
-
-                    // Strong suppression for very close competitors
-                    if score_ratio > 0.9 {
-                        let suppression =
-                            INTERFERENCE_COMPETITION_FACTOR * (1.0 - score_ratio) * 10.0;
-                        let new_score = (score - suppression).max(0.0);
-
-                        if new_score > 0.1 {
-                            winners.push((id.clone(), new_score));
-                            // Mild interference record for close survivors ("battle-tested")
-                            if record_state {
-                                self.record_interference(
-                                    id,
-                                    winner_id,
-                                    score_ratio,
-                                    InterferenceType::RetrievalCompetition,
-                                    suppression * 0.3,
-                                );
-                            }
-                        } else {
-                            suppressed.push(id.clone());
-                            // Strong interference record for fully suppressed memories
-                            if record_state {
-                                self.record_interference(
-                                    id,
-                                    winner_id,
-                                    score_ratio,
-                                    InterferenceType::RetrievalCompetition,
-                                    suppression,
-                                );
-                            }
-                        }
-                    } else {
-                        winners.push((id.clone(), *score));
-                    }
-                }
-
-                self.total_interference_events += suppressed.len();
-            }
-        }
-
-        let event = if !suppressed.is_empty() {
+    /// The ranking half of [`Self::apply_retrieval_competition`]: winners, suppressed and
+    /// the event, from the candidates alone. Reads no detector state, so a recall can rank
+    /// without the detector's write lock.
+    pub fn compete_for_retrieval(
+        candidates: &[(String, f32, f32)],
+        query_preview: &str,
+    ) -> CompetitionResult {
+        let outcome = RetrievalCompetitionOutcome::of(candidates);
+        let competition_factor = if candidates.len() <= 1 {
+            0.0
+        } else {
+            INTERFERENCE_COMPETITION_FACTOR
+        };
+        let event = if !outcome.suppressed.is_empty() {
             Some(ConsolidationEvent::RetrievalCompetition {
                 query_preview: query_preview.to_string(),
-                winner_memory_id: winners
+                winner_memory_id: outcome
+                    .winners
                     .first()
                     .map(|(id, _)| id.clone())
                     .unwrap_or_default(),
-                suppressed_memory_ids: suppressed.clone(),
+                suppressed_memory_ids: outcome.suppressed.clone(),
                 competition_factor: INTERFERENCE_COMPETITION_FACTOR,
                 timestamp: Utc::now(),
             })
@@ -510,11 +525,34 @@ impl InterferenceDetector {
         };
 
         CompetitionResult {
-            winners,
-            suppressed,
-            competition_factor: INTERFERENCE_COMPETITION_FACTOR,
+            winners: outcome.winners,
+            suppressed: outcome.suppressed,
+            competition_factor,
             event,
         }
+    }
+
+    /// The state half of [`Self::apply_retrieval_competition`]: the interference the same
+    /// competition leaves, recorded in its order when `record_state`, and the suppressed
+    /// count added to the event total either way, as the combined call always did.
+    pub fn record_retrieval_competition(
+        &mut self,
+        candidates: &[(String, f32, f32)],
+        record_state: bool,
+    ) {
+        let outcome = RetrievalCompetitionOutcome::of(candidates);
+        if record_state {
+            for (id, winner_id, score_ratio, strength) in &outcome.interference {
+                self.record_interference(
+                    id,
+                    winner_id,
+                    *score_ratio,
+                    InterferenceType::RetrievalCompetition,
+                    *strength,
+                );
+            }
+        }
+        self.total_interference_events += outcome.suppressed.len();
     }
 
     /// Record an interference event
@@ -927,6 +965,56 @@ mod tests {
             0,
             "read-only recall taught the detector"
         );
+    }
+
+    /// Ranking without the detector and recording afterwards (a background writer's split)
+    /// gives the combined call's result and leaves the same history and event total.
+    #[test]
+    fn competing_then_recording_matches_the_combined_call() {
+        let candidates = vec![
+            ("mem-1".to_string(), 0.9, 0.85),
+            ("mem-2".to_string(), 0.895, 0.82),
+            ("mem-3".to_string(), 0.86, 0.80),
+            ("mem-4".to_string(), 0.5, 0.70),
+        ];
+
+        let mut combined = InterferenceDetector::new();
+        let together = combined.apply_retrieval_competition(&candidates, "q", true);
+
+        let mut split = InterferenceDetector::new();
+        let ranked = InterferenceDetector::compete_for_retrieval(&candidates, "q");
+        split.record_retrieval_competition(&candidates, true);
+
+        assert_eq!(together.winners, ranked.winners);
+        assert_eq!(together.suppressed, ranked.suppressed);
+        assert_eq!(together.competition_factor, ranked.competition_factor);
+        assert_eq!(together.event.is_some(), ranked.event.is_some());
+        assert_eq!(
+            combined.interference_history_len(),
+            split.interference_history_len()
+        );
+        assert!(split.interference_history_len() > 0);
+        assert_eq!(combined.stats().0, split.stats().0);
+        for id in ["mem-2", "mem-3"] {
+            let a: Vec<f32> = combined
+                .get_history(id)
+                .unwrap()
+                .iter()
+                .map(|r| r.strength_change)
+                .collect();
+            let b: Vec<f32> = split
+                .get_history(id)
+                .unwrap()
+                .iter()
+                .map(|r| r.strength_change)
+                .collect();
+            assert_eq!(a, b);
+        }
+
+        let single = vec![("only".to_string(), 0.7, 0.6)];
+        let alone = InterferenceDetector::compete_for_retrieval(&single, "q");
+        assert_eq!(alone.winners, vec![("only".to_string(), 0.7)]);
+        assert_eq!(alone.competition_factor, 0.0);
     }
 
     // =========================================================================
