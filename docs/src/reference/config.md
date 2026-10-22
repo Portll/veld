@@ -6,7 +6,7 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **119** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **120** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
@@ -108,6 +108,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_SUPABASE_PROJECT_REF` | — | `src/config.rs` |
 | `VELD_TLS_ACK` | — | `src/server.rs` |
 | `VELD_USE_QUANTIZED_MODEL` | — | `src/embeddings/minilm.rs` |
+| `VELD_VECTOR_INT8_TRAVERSAL` | — | `src/memory/retrieval.rs` |
 | `VELD_WIKI_DIR` | — | `src/wiki/mod.rs` |
 | `VELD_WIKI_RENDER` | — | `src/wiki/mod.rs` |
 | `VELD_WIKI_WATCH` | — | `src/wiki/watcher.rs` |

@@ -21,9 +21,9 @@
 //! ```
 
 use super::distance_inline::{
-    cosine_similarity_inline, euclidean_squared_inline, normalized_distance_inline,
+    cosine_similarity_inline, dot_i8_inline, euclidean_squared_inline, normalized_distance_inline,
 };
-use super::vamana_store::{DeletedSet, VectorStore, VisitedPool};
+use super::vamana_store::{quantize_query, DeletedSet, VectorStore, VisitedPool};
 use anyhow::{anyhow, Result};
 use memmap2::MmapMut;
 use parking_lot::RwLock;
@@ -75,6 +75,13 @@ pub struct VamanaConfig {
     /// Distance metric for similarity calculation
     /// Default: NormalizedDotProduct (assumes L2-normalized vectors)
     pub distance_metric: DistanceMetric,
+
+    /// Walk the graph at search time on int8 codes of the vectors, `round(127·x)`, then rescore
+    /// the walk's beam in f32. Applies to `NormalizedDotProduct` only, whose unit vectors keep
+    /// every component in range. Costs one byte per dimension per vector on the heap; a walk
+    /// then reads the f32 rows of the beam alone. Builds, inserts and exact scans stay f32, and
+    /// the codes are rebuilt from the vectors on load, never saved. Default off.
+    pub quantized_traversal: bool,
 }
 
 impl Default for VamanaConfig {
@@ -86,6 +93,7 @@ impl Default for VamanaConfig {
             dimension: 384,                             // MiniLM dimension
             use_mmap: true,                             // Disk-based for large datasets
             distance_metric: DistanceMetric::default(), // NormalizedDotProduct for MiniLM
+            quantized_traversal: false,
         }
     }
 }
@@ -178,7 +186,8 @@ impl VamanaIndex {
 
     /// Create new Vamana index with explicit storage path for mmap
     pub fn with_storage_path(config: VamanaConfig, storage_path: Option<PathBuf>) -> Result<Self> {
-        let vectors = VectorStore::new(config.dimension);
+        let mut vectors = VectorStore::new(config.dimension);
+        vectors.set_codes(Self::walks_on_codes(&config));
         Ok(Self {
             config,
             graph: Arc::new(RwLock::new(Vec::new())),
@@ -197,6 +206,18 @@ impl VamanaIndex {
     /// Search exhaustively up to `n` live vectors; 0 makes every search walk the graph.
     pub fn set_exact_search_max(&mut self, n: usize) {
         self.exact_search_max = n;
+    }
+
+    /// Turn int8 graph walks on or off (see [`VamanaConfig::quantized_traversal`]); turning
+    /// them on codes every stored vector.
+    pub fn set_quantized_traversal(&mut self, on: bool) {
+        self.config.quantized_traversal = on;
+        let walks_on_codes = Self::walks_on_codes(&self.config);
+        self.vectors.write().set_codes(walks_on_codes);
+    }
+
+    fn walks_on_codes(config: &VamanaConfig) -> bool {
+        config.quantized_traversal && config.distance_metric == DistanceMetric::NormalizedDotProduct
     }
 
     /// Get number of vectors in the index
@@ -415,6 +436,7 @@ impl VamanaIndex {
         } else {
             *storage = VectorStore::from_rows(self.config.dimension, vectors)?;
         }
+        storage.set_codes(Self::walks_on_codes(&self.config));
 
         Ok(())
     }
@@ -499,6 +521,37 @@ impl VamanaIndex {
             // Zero-copy slice access - no allocation per neighbor
             Ok(self.distance(query, Self::get_slice_from_storage(&storage, id)?))
         })
+    }
+
+    /// [`Self::walk`] on int8 codes, the beam then rescored against `query` in f32 and
+    /// re-sorted, so the distances returned are exact.
+    fn walk_quantized(
+        &self,
+        query: &[f32],
+        k: usize,
+        entry: u32,
+        route_only: Option<&DeletedSet>,
+    ) -> Result<Vec<SearchCandidate>> {
+        let graph = self.graph.read();
+        let storage = self.vectors.read();
+        let codes = quantize_query(query);
+        let walked = self.walk(&graph, k, entry, route_only, |id| {
+            let row = storage
+                .code_row(id)
+                .ok_or_else(|| anyhow!("Vector {id} has no int8 code"))?;
+            Ok(-(dot_i8_inline(&codes, row) as f32))
+        })?;
+        let mut rescored = walked
+            .into_iter()
+            .map(|c| {
+                Ok(SearchCandidate {
+                    id: c.id,
+                    distance: self.distance(query, Self::get_slice_from_storage(&storage, c.id)?),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        rescored.sort();
+        Ok(rescored)
     }
 
     /// Beam search over `graph` from `entry`, keeping the `k` nearest by `distance`, nearest
@@ -675,11 +728,19 @@ impl VamanaIndex {
 
         let entry = *self.medoid.read();
         let deleted = self.deleted_ids.read();
+        let on_codes = self.vectors.read().has_codes();
+        let walk = |beam: usize, route_only: Option<&DeletedSet>| {
+            if on_codes {
+                self.walk_quantized(query, beam, entry, route_only)
+            } else {
+                self.walk_f32(query, beam, entry, route_only)
+            }
+        };
 
         if let Some(beam_width) = params.beam_width {
             // Deleted vectors route the walk without taking a slot, so the beam need not grow
             // with them to return k live results.
-            let candidates = self.walk_f32(query, k.max(beam_width), entry, Some(&deleted))?;
+            let candidates = walk(k.max(beam_width), Some(&deleted))?;
             return Ok(candidates
                 .into_iter()
                 .take(k)
@@ -696,7 +757,7 @@ impl VamanaIndex {
         };
 
         let beam = search_k.max(self.config.search_list_size);
-        let candidates = self.greedy_search(query, beam, entry)?;
+        let candidates = walk(beam, None)?;
 
         // Filter out deleted vectors and take k results
         let results: Vec<(u32, f32)> = candidates
@@ -1363,7 +1424,8 @@ impl VamanaIndex {
         let data: VamanaData =
             bincode::serde::decode_from_std_read(&mut reader, bincode::config::standard())?;
 
-        let vectors = VectorStore::from_rows(self.config.dimension, data.vectors)?;
+        let mut vectors = VectorStore::from_rows(self.config.dimension, data.vectors)?;
+        vectors.set_codes(Self::walks_on_codes(&self.config));
 
         // Update internal state
         *self.graph.write() = data.graph;
@@ -1503,6 +1565,75 @@ mod tests {
         assert!(
             mean >= 0.75 && recalls.iter().all(|r| *r >= 0.70),
             "recall@{k} fell: mean {mean} over {recalls:?}"
+        );
+    }
+
+    /// Walking on int8 codes and rescoring the beam in f32 keeps recall@10 against brute force
+    /// at or above 0.70 and within 0.05 of the f32 walk, on the corpora the f32 floor above
+    /// uses; the distances returned are the exact f32 ones, and turning the codes off restores
+    /// the f32 results.
+    #[test]
+    fn int8_walks_keep_recall_against_the_f32_walk() {
+        use rand::SeedableRng;
+        let (n, dim, k) = (2000, 32, 10);
+        let (mut f32_hits, mut int8_hits, mut total) = (0usize, 0usize, 0usize);
+        for seed in 1..=3u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let vectors = unit_vectors(&mut rng, n, dim);
+            let queries = unit_vectors(&mut rng, 100, dim);
+            let mut index = VamanaIndex::new(VamanaConfig {
+                dimension: dim,
+                use_mmap: false,
+                ..Default::default()
+            })
+            .unwrap();
+            index.set_exact_search_max(0);
+            index.build(vectors.clone()).unwrap();
+            let f32_results: Vec<Vec<(u32, f32)>> = queries
+                .iter()
+                .map(|q| index.search(q, k).unwrap())
+                .collect();
+
+            index.set_quantized_traversal(true);
+            assert!(index.vectors.read().has_codes());
+            for (q, f32_result) in queries.iter().zip(&f32_results) {
+                let mut exact: Vec<(u32, f32)> = vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i as u32, normalized_distance_inline(q, v)))
+                    .collect();
+                exact.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                let truth: HashSet<u32> = exact[..k].iter().map(|(id, _)| *id).collect();
+                let quantized = index.search(q, k).unwrap();
+                assert_eq!(quantized.len(), k);
+                for (id, distance) in &quantized {
+                    assert_eq!(
+                        *distance,
+                        normalized_distance_inline(q, &vectors[*id as usize])
+                    );
+                }
+                f32_hits += f32_result
+                    .iter()
+                    .filter(|(id, _)| truth.contains(id))
+                    .count();
+                int8_hits += quantized
+                    .iter()
+                    .filter(|(id, _)| truth.contains(id))
+                    .count();
+                total += k;
+            }
+
+            index.set_quantized_traversal(false);
+            for (q, f32_result) in queries.iter().zip(&f32_results) {
+                assert_eq!(&index.search(q, k).unwrap(), f32_result);
+            }
+        }
+        let f32_recall = f32_hits as f64 / total as f64;
+        let int8_recall = int8_hits as f64 / total as f64;
+        eprintln!("recall@{k}: f32 walk {f32_recall:.4}, int8 walk {int8_recall:.4}");
+        assert!(
+            int8_recall >= 0.70 && int8_recall >= f32_recall - 0.05,
+            "int8 recall@{k} {int8_recall} against f32 {f32_recall}"
         );
     }
 

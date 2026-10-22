@@ -20,6 +20,8 @@ pub(crate) struct VectorStore {
     mapped: Option<MappedRows>,
     tail: Vec<f32>,
     tail_rows: usize,
+    /// int8 code of every row, row-major, for graph walks; `None` unless enabled.
+    codes: Option<Vec<i8>>,
 }
 
 impl VectorStore {
@@ -29,6 +31,7 @@ impl VectorStore {
             mapped: None,
             tail: Vec::new(),
             tail_rows: 0,
+            codes: None,
         }
     }
 
@@ -75,6 +78,7 @@ impl VectorStore {
             mapped: Some(MappedRows { map, offset, rows }),
             tail: Vec::new(),
             tail_rows: 0,
+            codes: None,
         })
     }
 
@@ -152,6 +156,38 @@ impl VectorStore {
         debug_assert_eq!(row.len(), self.dimension);
         self.tail.extend_from_slice(row);
         self.tail_rows += 1;
+        if let Some(codes) = self.codes.as_mut() {
+            codes.extend(row.iter().map(|&x| quantize_component(x)));
+        }
+    }
+
+    /// Keep, or drop, an int8 code of every row for graph walks. Kept codes follow every push.
+    pub(crate) fn set_codes(&mut self, on: bool) {
+        if !on {
+            self.codes = None;
+            return;
+        }
+        if self.codes.is_some() {
+            return;
+        }
+        let mut codes = Vec::with_capacity(self.len() * self.dimension);
+        for id in 0..self.len() as u32 {
+            if let Some(row) = self.row(id) {
+                codes.extend(row.iter().map(|&x| quantize_component(x)));
+            }
+        }
+        self.codes = Some(codes);
+    }
+
+    pub(crate) fn has_codes(&self) -> bool {
+        self.codes.is_some()
+    }
+
+    /// The int8 code of row `id`, when codes are kept.
+    #[inline]
+    pub(crate) fn code_row(&self, id: u32) -> Option<&[i8]> {
+        let start = id as usize * self.dimension;
+        self.codes.as_ref()?.get(start..start + self.dimension)
     }
 
     /// The first `n` rows as contiguous runs, each with the id of its first row: the mapped
@@ -182,6 +218,27 @@ impl VectorStore {
         flat.extend_from_slice(&self.tail[..self.tail_rows * self.dimension]);
         flat
     }
+}
+
+/// The int8 code of a unit vector's component: times 127, rounded, so [-1, 1] maps onto
+/// [-127, 127] and anything outside saturates.
+#[inline]
+pub(crate) fn quantize_component(x: f32) -> i8 {
+    (x * 127.0).round().clamp(-127.0, 127.0) as i8
+}
+
+/// A query's int8 code, scaled so its largest component maps to ±127. Ranking rows by dot
+/// product does not depend on the query's scale, so the whole int8 range goes to resolution.
+pub(crate) fn quantize_query(query: &[f32]) -> Vec<i8> {
+    let largest = query.iter().fold(0f32, |m, x| m.max(x.abs()));
+    if largest == 0.0 || !largest.is_finite() {
+        return vec![0; query.len()];
+    }
+    let scale = 127.0 / largest;
+    query
+        .iter()
+        .map(|&x| (x * scale).round().clamp(-127.0, 127.0) as i8)
+        .collect()
 }
 
 /// Soft-deleted vector ids, one bit per id below the highest marked.
@@ -395,6 +452,23 @@ mod tests {
         let runs: Vec<(u32, usize)> = store.runs(5).map(|(id, r)| (id, r.len())).collect();
         assert_eq!(runs, vec![(0, 8), (4, 2)]);
         assert_eq!(store.to_flat().len(), 10);
+    }
+
+    #[test]
+    fn codes_follow_rows_and_pushes() {
+        let mut store =
+            VectorStore::from_rows(3, vec![vec![1.0, -1.0, 0.0], vec![0.5, -0.25, 2.0]]).unwrap();
+        assert!(store.code_row(0).is_none());
+        store.set_codes(true);
+        assert_eq!(store.code_row(0).unwrap(), &[127, -127, 0]);
+        assert_eq!(store.code_row(1).unwrap(), &[64, -32, 127], "2.0 saturates");
+        store.push(&[0.0, 0.1, -0.1]);
+        assert_eq!(store.code_row(2).unwrap(), &[0, 13, -13]);
+        assert!(store.code_row(3).is_none());
+        store.set_codes(false);
+        assert!(!store.has_codes());
+        assert_eq!(quantize_query(&[0.2, -0.05, 0.0]), vec![127, -32, 0]);
+        assert_eq!(quantize_query(&[0.0, 0.0]), vec![0, 0]);
     }
 
     #[test]
