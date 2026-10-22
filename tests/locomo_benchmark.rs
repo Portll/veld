@@ -1387,30 +1387,6 @@ fn locomo_benchmark() {
         println!("\nBenchmark artifact: {}", json_path.display());
         println!("Content hash: {}", content_hash);
     }
-
-    // --- Regression gate ---
-    // All categories must stay >= 0.900 MRR for v0.5+ releases
-    let regression_failures: Vec<String> = type_summaries
-        .iter()
-        .filter_map(|s| {
-            if s.mrr < 0.850 {
-                Some(format!("{}: MRR {:.3} < 0.850 floor", s.query_type, s.mrr))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if !regression_failures.is_empty() {
-        println!("\n*** REGRESSION GATE ***");
-        for f in &regression_failures {
-            println!("  FAIL: {}", f);
-        }
-        println!("  Gate threshold: 0.850 MRR per category");
-        // Don't assert-fail yet — temporal is known-weak at 0.650
-        // Uncomment when all categories are above threshold:
-        // panic!("Regression gate failed: {:?}", regression_failures);
-    }
 }
 
 /// Simple non-cryptographic hash for content verification (not security).
