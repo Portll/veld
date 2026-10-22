@@ -555,13 +555,16 @@ telemetry = [
 # Without it, glibc/CRT malloc fragments heavily and never returns memory to the OS.
 # Confirmed fix by rust-rocksdb maintainer (zaidoon1) in facebook/rocksdb#12364.
 # PRs #989 (ran-openai) and #1026 (timothyg-stripe) fixed jemalloc linking in v0.24.0.
+#
+# zstd compresses the bottommost level (see `crate::storage::rocksdb_set_compression`); every
+# level above it stays LZ4.
 [target.'cfg(not(windows))'.dependencies]
-rocksdb = { version = "0.24", default-features = false, features = ["lz4", "jemalloc"], optional = true }
+rocksdb = { version = "0.24", default-features = false, features = ["lz4", "zstd", "jemalloc"], optional = true }
 
 # jemalloc doesn't compile with MSVC — Windows uses default CRT allocator.
 # Fundamental fix requires facebook/rocksdb#14403 (custom allocator C API for mimalloc).
 [target.'cfg(windows)'.dependencies]
-rocksdb = { version = "0.24", default-features = false, features = ["lz4"], optional = true }
+rocksdb = { version = "0.24", default-features = false, features = ["lz4", "zstd"], optional = true }
 
 [workspace]
 # Standalone workspace - not part of parent kalki-v2

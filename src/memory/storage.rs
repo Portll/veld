@@ -5,8 +5,8 @@ use bincode;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "rocksdb")]
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBCompressionType,
-    IteratorMode, Options, ReadOptions, WriteBatch, WriteBufferManager, WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options,
+    ReadOptions, WriteBatch, WriteBufferManager, WriteOptions, DB,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "rocksdb")]
@@ -1414,12 +1414,13 @@ pub fn block_based_options(cache: &Cache) -> BlockBasedOptions {
 }
 
 #[cfg(feature = "rocksdb")]
-/// Options for a secondary column family (index, KV): Lz4, two memtables of
-/// `write_buffer_bytes`, and [`block_based_options`] over `cache`.
+/// Options for a secondary column family (index, KV): LZ4 with ZSTD on the bottommost level
+/// (`crate::storage::rocksdb_set_compression`), two memtables of `write_buffer_bytes`, and
+/// [`block_based_options`] over `cache`.
 pub fn column_family_options(cache: &Cache, write_buffer_bytes: usize) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.create_if_missing(true);
-    cf_opts.set_compression_type(DBCompressionType::Lz4);
+    crate::storage::rocksdb_set_compression(&mut cf_opts);
     cf_opts.set_max_write_buffer_number(2);
     cf_opts.set_write_buffer_size(write_buffer_bytes);
     cf_opts.set_block_based_table_factory(&block_based_options(cache));
@@ -1507,7 +1508,7 @@ impl MemoryStorage {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        opts.set_compression_type(DBCompressionType::Lz4);
+        crate::storage::rocksdb_set_compression(&mut opts);
 
         // ========================================================================
         // DURABILITY SETTINGS - Critical for data persistence across restarts
@@ -2551,7 +2552,9 @@ impl MemoryStorage {
     /// [`Self::get`], answering an absent record with `None` instead of an error, so a
     /// caller can tell a missing memory from one that will not decode.
     fn get_if_present(&self, id: &MemoryId) -> Result<Option<Memory>> {
-        let value = self.db.get(id.0.as_bytes())?;
+        // Pinned: the record is decoded straight out of the block it was read into, where an
+        // owned read would first copy it, embedding and all, into a buffer of its own.
+        let value = self.db.get_pinned(id.0.as_bytes())?;
         self.open_stored(id, value.as_deref())
     }
 
@@ -3509,13 +3512,22 @@ impl MemoryStorage {
         let mut ids = Vec::new();
         let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
-        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
-        for (key, _) in iter.flatten() {
-            if key.len() == 16 {
-                let uuid_bytes: [u8; 16] = key[..16].try_into().unwrap();
-                ids.push(MemoryId(uuid::Uuid::from_bytes(uuid_bytes)));
+        // The raw iterator hands out borrowed keys and leaves values unread by Rust: the
+        // owning iterator copied every value, embeddings included, into a fresh allocation
+        // only for the key to be kept.
+        let mut iter = self.db.raw_iterator_opt(read_opts);
+        iter.seek_to_first();
+        while iter.valid() {
+            if let Some(key) = iter.key() {
+                if let Ok(uuid_bytes) = <[u8; 16]>::try_from(key) {
+                    ids.push(MemoryId(uuid::Uuid::from_bytes(uuid_bytes)));
+                }
             }
+            iter.next();
         }
+        // An enumeration that stopped on a read error is reported, never returned as if it
+        // were the whole store.
+        iter.status().context("enumerating memory ids")?;
         Ok(ids)
     }
 
@@ -4599,7 +4611,7 @@ impl MemoryStorage {
     /// Get vector mapping for a memory
     pub fn get_vector_mapping(&self, memory_id: &MemoryId) -> Result<Option<VectorMappingEntry>> {
         let mapping_key = format!("vmapping:{}", memory_id.0);
-        match self.db.get(mapping_key.as_bytes())? {
+        match self.db.get_pinned(mapping_key.as_bytes())? {
             Some(data) => {
                 let (entry, _): (VectorMappingEntry, _) = bincode::serde::decode_from_slice(
                     &data,

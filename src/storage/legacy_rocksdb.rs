@@ -4,7 +4,10 @@
 //! direct RocksDB types.
 
 use anyhow::{anyhow, Context, Result};
-use rocksdb::{ColumnFamily, Direction, IteratorMode, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    ColumnFamily, DBCompressionType, Direction, IteratorMode, Options, ReadOptions, WriteBatch,
+    WriteOptions, DB,
+};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,6 +28,35 @@ pub fn write_options(sync: bool) -> WriteOptions {
     let mut options = WriteOptions::default();
     options.set_sync(sync);
     options
+}
+
+/// LZ4 on every level but the bottommost, which is ZSTD.
+///
+/// With dynamic level sizing the bottommost level holds most of a store's bytes, and its files
+/// are rewritten only when a compaction reaches them, so the slower, tighter codec is paid
+/// there once per rewrite while the levels that churn keep LZ4's speed. Each block records
+/// the codec it was written with, so files already on disk stay readable as they are and
+/// change codec only when a compaction rewrites them into the bottommost level.
+pub fn set_compression(options: &mut Options) {
+    options.set_compression_type(DBCompressionType::Lz4);
+    options.set_bottommost_compression_type(DBCompressionType::Zstd);
+    // `enabled` makes RocksDB use the bottommost options rather than the per-level ones;
+    // zero training bytes means no dictionary, and the level stays zstd's default.
+    options.set_bottommost_zstd_max_train_bytes(0, true);
+}
+
+/// The least key above every key that starts with `prefix`: the prefix with its last byte
+/// below 0xFF incremented and everything after that byte dropped. `None` when there is no
+/// such key, for an empty prefix or one made only of 0xFF bytes.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    while let Some(last) = bound.pop() {
+        if last < u8::MAX {
+            bound.push(last + 1);
+            return Some(bound);
+        }
+    }
+    None
 }
 
 /// The process's choice, for adapters built over a handle that carries none.
@@ -204,11 +236,17 @@ impl ColumnStore for RocksDbColumnStore {
             Some(p) => IteratorMode::From(p, Direction::Forward),
             None => IteratorMode::Start,
         };
+        // An upper bound lets RocksDB stop at the end of the prefix instead of stepping on
+        // to the next live key, which can mean reading through the tombstones of deleted
+        // rows just past it and opening files that hold no key in range.
+        let mut read_options = ReadOptions::default();
+        if let Some(bound) = prefix.and_then(prefix_upper_bound) {
+            read_options.set_iterate_upper_bound(bound);
+        }
         let mut rows = Vec::new();
-        for item in self.db.iterator_cf(handle, mode) {
+        for item in self.db.iterator_cf_opt(handle, read_options, mode) {
             let (key, value) = item?;
-            // The bound is enforced HERE. rocksdb's iterator continues past the
-            // prefix, so every caller was carrying this break by hand.
+            // Still checked: a prefix of only 0xFF bytes has no upper bound.
             if let Some(p) = prefix {
                 if !key.starts_with(p) {
                     break;
@@ -2208,5 +2246,74 @@ mod engine_parity_tests {
                 "{engine}: the entity index still names an episode that dropped it"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_bound_tests {
+    use super::*;
+
+    #[test]
+    fn the_upper_bound_is_the_least_key_past_the_prefix() {
+        assert_eq!(prefix_upper_bound(b"tag:"), Some(b"tag;".to_vec()));
+        assert_eq!(prefix_upper_bound(&[0x01, 0xFF]), Some(vec![0x02]));
+        assert_eq!(prefix_upper_bound(&[0xFF, 0xFF]), None);
+        assert_eq!(prefix_upper_bound(b""), None);
+    }
+
+    fn store_with_rows(dir: &Path, rows: &[&[u8]]) -> RocksDbColumnStore {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+        set_compression(&mut options);
+        let db = DB::open_cf(&options, dir, ["rows"]).expect("open");
+        let store = RocksDbColumnStore::with_sync_writes(Arc::new(db), false);
+        for key in rows {
+            store.put_cf("rows", key, b"v").expect("put");
+        }
+        store
+    }
+
+    /// The bound stops the scan; it must not change what the scan returns, including next to
+    /// a deleted row just past the prefix and for a prefix that has no bound at all.
+    #[test]
+    fn a_bounded_prefix_scan_returns_exactly_the_prefixed_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with_rows(
+            dir.path(),
+            &[
+                b"a",
+                b"tag:",
+                b"tag:x",
+                b"tag:\xff",
+                b"tag;",
+                b"tah",
+                &[0xFF],
+                &[0xFF, 0xFF],
+                &[0xFF, 0xFF, 0x00],
+            ],
+        );
+        store.delete_cf("rows", b"tag;").expect("delete");
+        fn keys(store: &RocksDbColumnStore, prefix: &[u8]) -> Vec<Vec<u8>> {
+            store
+                .scan_cf("rows", Some(prefix), None)
+                .expect("scan")
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect()
+        }
+        assert_eq!(
+            keys(&store, b"tag:"),
+            vec![b"tag:".to_vec(), b"tag:x".to_vec(), b"tag:\xff".to_vec()]
+        );
+        assert_eq!(
+            keys(&store, &[0xFF, 0xFF]),
+            vec![vec![0xFF, 0xFF], vec![0xFF, 0xFF, 0x00]]
+        );
+        assert_eq!(store.scan_cf("rows", None, None).expect("scan").len(), 8);
+        assert_eq!(
+            store.scan_cf("rows", Some(b"tag:"), Some(2)).expect("scan").len(),
+            2
+        );
     }
 }

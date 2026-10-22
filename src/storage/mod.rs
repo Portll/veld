@@ -94,6 +94,10 @@ pub type SharedBlockCache = std::convert::Infallible;
 #[cfg(feature = "rocksdb")]
 pub use self::legacy_rocksdb::write_options as rocksdb_write_options;
 
+/// The codecs every RocksDB store veld tunes compresses with: LZ4, ZSTD on the bottommost level.
+#[cfg(feature = "rocksdb")]
+pub use self::legacy_rocksdb::set_compression as rocksdb_set_compression;
+
 /// The one shared engine database behind the global stores, carried by ENGINE
 /// rather than erased. The consumers that remain engine-typed — user-auth, the
 /// GDPR purge's raw column scans, the comprehensive backup — must
