@@ -29,6 +29,7 @@ use veld::embeddings::{load_primary_embedder, Embedder};
 use veld::memory::hybrid_search::{HybridSearchConfig, HybridSearchEngine, RefinerMode};
 use veld::memory::llm_refiner::LlmRefiner;
 use veld::memory::types::MemoryId;
+use veld::similarity::cosine_similarity_sequential_checked;
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 enum Variant {
@@ -356,7 +357,10 @@ fn run_variant(
         let q_vec = &query_embeddings[qi];
         let mut vec_scores: Vec<(MemoryId, f32)> = mem_embeddings
             .iter()
-            .map(|(mid, mv)| (mid.clone(), cosine(q_vec, mv)))
+            .map(|(mid, mv)| {
+                let score = cosine_similarity_sequential_checked(q_vec, mv, 0.0).unwrap_or(0.0);
+                (mid.clone(), score)
+            })
             .collect();
         vec_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
         vec_scores.truncate(candidate_count);
@@ -434,25 +438,6 @@ fn run_variant(
     let _ = std::fs::remove_dir_all(&bm25_dir);
 
     Ok(result)
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0_f32;
-    let mut na = 0.0_f32;
-    let mut nb = 0.0_f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na.sqrt() * nb.sqrt())
-    }
 }
 
 fn recall_at(ranked: &[usize], expected: &HashSet<usize>, k: usize) -> f64 {

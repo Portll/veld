@@ -801,21 +801,9 @@ pub fn calculate_entity_overlap(
     intersection / memory_entities.len() as f32
 }
 
-/// Calculate cosine similarity between two embedding vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
+/// The sequential cosine clamped to [-1, 1], which rounding can overshoot.
+fn clamped_cosine(a: &[f32], b: &[f32]) -> f32 {
+    crate::similarity::cosine_similarity_sequential(a, b).clamp(-1.0, 1.0)
 }
 
 /// Compute information-theoretic attribution using vector projection.
@@ -863,8 +851,8 @@ fn compute_information_attribution(
         .map(|(r, q)| r - resp_proj_scale * q)
         .collect();
 
-    let attribution = cosine_similarity(&mem_residual, &resp_residual).max(0.0);
-    let raw_similarity = cosine_similarity(memory_emb, response_emb);
+    let attribution = clamped_cosine(&mem_residual, &resp_residual).max(0.0);
+    let raw_similarity = clamped_cosine(memory_emb, response_emb);
 
     Some((attribution, raw_similarity))
 }
@@ -1010,7 +998,7 @@ pub fn process_implicit_feedback_with_semantics(
         let (semantic_value, semantic_conf, has_semantic) =
             if let Some(resp_emb) = response_embedding {
                 if !memory.embedding.is_empty() {
-                    let similarity = cosine_similarity(&memory.embedding, resp_emb);
+                    let similarity = clamped_cosine(&memory.embedding, resp_emb);
                     let (val, conf) = signal_from_semantic_similarity(similarity);
                     (val, conf, true)
                 } else {
@@ -1061,7 +1049,7 @@ pub fn process_implicit_feedback_with_semantics(
                 let value = (ENTITY_WEIGHT * entity_value) + (SEMANTIC_WEIGHT * semantic_value);
                 let confidence = (ENTITY_WEIGHT * entity_conf) + (SEMANTIC_WEIGHT * semantic_conf);
                 let similarity = response_embedding
-                    .map(|resp_emb| cosine_similarity(&memory.embedding, resp_emb))
+                    .map(|resp_emb| clamped_cosine(&memory.embedding, resp_emb))
                     .unwrap_or(0.0);
                 (
                     value,
@@ -1796,7 +1784,7 @@ impl FeedbackStore {
             return None;
         }
 
-        let similarity = crate::similarity::scale::to_reference(cosine_similarity(
+        let similarity = crate::similarity::scale::to_reference(clamped_cosine(
             &prev.embedding,
             current_embedding,
         ));
@@ -2707,18 +2695,18 @@ mod tests {
         // Identical vectors = 1.0
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
+        assert!((clamped_cosine(&a, &b) - 1.0).abs() < 0.001);
 
         // Orthogonal vectors = 0.0
         let c = vec![0.0, 1.0, 0.0];
-        assert!((cosine_similarity(&a, &c) - 0.0).abs() < 0.001);
+        assert!((clamped_cosine(&a, &c) - 0.0).abs() < 0.001);
 
         // Opposite vectors = -1.0
         let d = vec![-1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &d) - (-1.0)).abs() < 0.001);
+        assert!((clamped_cosine(&a, &d) - (-1.0)).abs() < 0.001);
 
         // Empty vectors = 0.0
-        assert!((cosine_similarity(&[], &[]) - 0.0).abs() < 0.001);
+        assert!((clamped_cosine(&[], &[]) - 0.0).abs() < 0.001);
     }
 
     #[test]
