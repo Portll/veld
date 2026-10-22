@@ -22,6 +22,18 @@ use super::types::MemoryStats;
 /// Writes held for the worker before a recall's write is dropped instead of queued.
 pub(super) const USAGE_WRITE_QUEUE_CAPACITY: usize = 1024;
 
+/// Where a recall's usage writes apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageWriteMode {
+    /// On the recall's own thread before it returns, so the next recall sees them and two
+    /// runs over the same data rank alike. The recall harness and tests rely on this.
+    #[default]
+    Inline,
+    /// On the bounded background queue, off the read path. The next recall may run before
+    /// they apply.
+    Background,
+}
+
 /// Pairs among the leading memories of a reinforced recall that are reported as
 /// strengthened edges, as the inline path reported them.
 const COACTIVATION_EVENT_SPAN: usize = 5;
@@ -71,8 +83,8 @@ pub(super) struct UsageSinks {
 
 impl UsageSinks {
     /// A writer applying to these sinks.
-    pub(super) fn into_writer(self, capacity: usize) -> UsageWriter {
-        UsageWriter::new(Arc::new(move |write| self.apply(write)), capacity)
+    pub(super) fn into_writer(self, capacity: usize, mode: UsageWriteMode) -> UsageWriter {
+        UsageWriter::new(Arc::new(move |write| self.apply(write)), capacity, mode)
     }
 
     fn apply(&self, write: UsageWrite) {
@@ -182,11 +194,15 @@ pub(super) struct UsageWriter {
 }
 
 impl UsageWriter {
-    pub(super) fn new(apply: ApplyUsageWrite, capacity: usize) -> Self {
+    pub(super) fn new(apply: ApplyUsageWrite, capacity: usize, mode: UsageWriteMode) -> Self {
+        let lane = match mode {
+            UsageWriteMode::Inline => LaneState::Inline,
+            UsageWriteMode::Background => LaneState::NotStarted,
+        };
         Self {
             apply,
             capacity: capacity.max(1),
-            lane: Mutex::new(LaneState::NotStarted),
+            lane: Mutex::new(lane),
             dropped: AtomicU64::new(0),
         }
     }
@@ -313,8 +329,28 @@ mod tests {
                 }
             }),
             capacity,
+            UsageWriteMode::Background,
         );
         (writer, applied, gate)
+    }
+
+    /// Inline mode applies each write before `submit` returns and starts no worker.
+    #[test]
+    fn inline_mode_applies_before_submit_returns() {
+        let applied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&applied);
+        let writer = UsageWriter::new(
+            Arc::new(move |write| {
+                if let UsageWrite::Coactivation { source, .. } = write {
+                    log.lock().push(source);
+                }
+            }),
+            4,
+            UsageWriteMode::Inline,
+        );
+        writer.submit(reinforcement("first"));
+        assert_eq!(*applied.lock(), vec!["first".to_string()]);
+        assert!(matches!(*writer.lane.lock(), LaneState::Inline));
     }
 
     fn reinforcement(source: &str) -> UsageWrite {

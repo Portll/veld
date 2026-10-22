@@ -1562,6 +1562,7 @@ impl MultiUserMemoryManager {
         // Wire up GraphMemory for Layer 2 (spreading activation) and Layer 5 (Hebbian learning)
         let graph = self.get_user_graph(user_id)?;
         user_mem.set_graph_memory(graph);
+        user_mem.set_usage_write_mode(crate::memory::UsageWriteMode::Background);
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
         user_mem.set_feedback_store(self.feedback_store.clone());
 
