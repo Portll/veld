@@ -193,11 +193,10 @@ const REFUSAL_PHRASES: &[&str] = &[
 ];
 
 /// Counted exactly, like `tests/rocksdb_ratchet.rs`: a module that removes a
-/// `#[cfg(feature = "rocksdb")]`-only item must lower its number, or the slack
-/// would readmit growth unnoticed.
+/// rocksdb-only item must lower its number, or the slack would readmit growth unnoticed.
+/// An item is rocksdb-only when its `cfg` holds only in a build with the rocksdb
+/// feature (`cfg_requires_rocksdb`), however the predicate is written.
 const ROCKSDB_ONLY_ITEMS: &[(&str, usize)] = &[("backup.rs", 20), ("handlers", 16)];
-
-const ROCKSDB_ONLY_ATTRIBUTE: &str = "#[cfg(feature = \"rocksdb\")]";
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Found {
@@ -417,28 +416,165 @@ fn every_engine_refusal_is_named_and_none_has_gone_stale() {
 }
 
 /// Runtime items only: a rocksdb-only test module is not an engine divergence, so test
-/// modules are skipped as the refusal scan skips them.
+/// modules are skipped as the refusal scan skips them, and so is an item gated on `test`.
 fn count_rocksdb_only_items(root: &Path, entry: &str) -> usize {
     rust_files(root, entry)
         .iter()
-        .map(|(_, path)| {
-            let source = read(path);
-            let lines: Vec<&str> = source.lines().collect();
-            let mut count = 0;
-            let mut index = 0;
-            while index < lines.len() {
-                if let Some(after_module) = end_of_test_module(&lines, index) {
-                    index = after_module;
+        .map(|(_, path)| count_rocksdb_only_attributes(&read(path)))
+        .sum()
+}
+
+fn count_rocksdb_only_attributes(source: &str) -> usize {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut count = 0;
+    let mut index = 0;
+    while index < lines.len() {
+        if let Some(after_module) = end_of_test_module(&lines, index) {
+            index = after_module;
+            continue;
+        }
+        let trimmed = lines[index].trim_start();
+        let opens_cfg = ["#[cfg(", "#![cfg("]
+            .iter()
+            .find_map(|opening| trimmed.strip_prefix(opening));
+        if let Some(rest) = opens_cfg {
+            // rustfmt wraps a long attribute over several lines; read up to its `]`.
+            let mut attribute = rest.to_string();
+            while !attribute.contains(']') && index + 1 < lines.len() {
+                index += 1;
+                attribute.push(' ');
+                attribute.push_str(lines[index].trim());
+            }
+            let predicate = attribute.split(']').next().unwrap_or_default();
+            let predicate = predicate.trim_end().strip_suffix(')').unwrap_or(predicate);
+            if cfg_requires(predicate, &Atom::Rocksdb) && !cfg_requires(predicate, &Atom::Test) {
+                count += 1;
+            }
+        }
+        index += 1;
+    }
+    count
+}
+
+enum Atom {
+    Rocksdb,
+    Test,
+}
+
+/// Whether `predicate` (the inside of `cfg(..)`) holds only where `atom` does: the atom
+/// itself, an `all(..)` with such a member, or an `any(..)` whose every member is one. A
+/// `not(..)` never requires it.
+fn cfg_requires(predicate: &str, atom: &Atom) -> bool {
+    let tokens = cfg_tokens(predicate);
+    let mut position = 0;
+    requires_at(&tokens, &mut position, atom)
+}
+
+fn cfg_tokens(predicate: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = predicate.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c == '"' {
+            let mut literal = String::from('"');
+            for next in chars.by_ref() {
+                literal.push(next);
+                if next == '"' {
+                    break;
+                }
+            }
+            tokens.push(literal);
+        } else if c.is_alphanumeric() || c == '_' {
+            let mut ident = c.to_string();
+            while let Some(&next) = chars.peek() {
+                if !(next.is_alphanumeric() || next == '_') {
+                    break;
+                }
+                ident.push(next);
+                chars.next();
+            }
+            tokens.push(ident);
+        } else {
+            tokens.push(c.to_string());
+        }
+    }
+    tokens
+}
+
+fn requires_at(tokens: &[String], position: &mut usize, atom: &Atom) -> bool {
+    let Some(head) = tokens.get(*position).cloned() else {
+        return false;
+    };
+    *position += 1;
+    match tokens.get(*position).map(String::as_str) {
+        Some("=") => {
+            let value = tokens.get(*position + 1).cloned().unwrap_or_default();
+            *position += 2;
+            matches!(atom, Atom::Rocksdb) && head == "feature" && value == "\"rocksdb\""
+        }
+        Some("(") => {
+            *position += 1;
+            let mut members = Vec::new();
+            while let Some(token) = tokens.get(*position) {
+                if token == ")" {
+                    *position += 1;
+                    break;
+                }
+                if token == "," {
+                    *position += 1;
                     continue;
                 }
-                if lines[index].trim() == ROCKSDB_ONLY_ATTRIBUTE {
-                    count += 1;
-                }
-                index += 1;
+                members.push(requires_at(tokens, position, atom));
             }
-            count
-        })
-        .sum()
+            match head.as_str() {
+                "all" => members.iter().any(|&m| m),
+                "any" => !members.is_empty() && members.iter().all(|&m| m),
+                _ => false,
+            }
+        }
+        _ => matches!(atom, Atom::Test) && head == "test",
+    }
+}
+
+#[test]
+fn a_rocksdb_only_item_is_seen_however_its_cfg_is_written() {
+    let planted = r#"
+#[cfg(feature = "rocksdb")]
+fn plain() {}
+
+#[cfg(all(feature="rocksdb", unix))]
+fn compound() {}
+
+#[cfg(all(
+    feature = "storage-redb",
+    feature = "rocksdb",
+))]
+fn wrapped() {}
+
+#[cfg(any(feature = "rocksdb", all(feature = "rocksdb", windows)))]
+fn every_branch() {}
+
+#[cfg(any(feature = "rocksdb", feature = "storage-redb"))]
+fn either_engine() {}
+
+#[cfg(not(feature = "rocksdb"))]
+fn the_counterpart() {}
+
+#[cfg(all(test, feature = "rocksdb"))]
+mod helpers;
+
+#[cfg_attr(feature = "rocksdb", allow(dead_code))]
+fn only_an_attribute() {}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "rocksdb")]
+    fn in_a_test() {}
+}
+"#;
+    assert_eq!(count_rocksdb_only_attributes(planted), 4);
 }
 
 #[test]
@@ -449,7 +585,7 @@ fn rocksdb_only_items_in_backup_and_handlers_only_fall() {
         let now = count_rocksdb_only_items(&root, entry);
         if now > *baseline {
             problems.push(format!(
-                "{entry}: {now} `{ROCKSDB_ONLY_ATTRIBUTE}` items, baseline {baseline} — a rocksdb-only branch needs a redb counterpart or a named refusal in KNOWN_REFUSALS"
+                "{entry}: {now} rocksdb-only items, baseline {baseline} — a rocksdb-only branch needs a redb counterpart or a named refusal in KNOWN_REFUSALS"
             ));
         } else if now < *baseline {
             problems.push(format!(
