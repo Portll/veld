@@ -76,10 +76,19 @@
 //! the next group. A write another thread committed finds its outcome waiting
 //! when it gets the mutex and returns without a sync of its own.
 //!
+//! Queueing and waiting are separate steps ([`SharedJournal::enqueue`], then
+//! [`QueuedWrite::wait`]) because a write's LSN is its place in the queue: a
+//! caller that must order its frame against other writers (the memory write
+//! gate) queues it while it holds that order, lets go, and only then waits for
+//! the sync. Holding the outer lock through the sync instead would keep every
+//! other writer to the tenant out of the queue, and no group would form.
+//!
 //! Append, sync, rotation and dispatch all still run under the writer's
 //! mutex, so whoever holds it sees a log whose frames are all synced and
 //! applied, projections still apply in LSN order, and no checkpoint can name
-//! an LSN the log has not made durable.
+//! an LSN the log has not made durable. [`SharedJournal::lock`] commits the
+//! queued writes before it returns, so a record appended through the guard
+//! cannot take an LSN ahead of a write queued earlier.
 
 use std::collections::{HashSet, VecDeque};
 use std::error::Error;
@@ -1073,10 +1082,41 @@ impl SharedJournal {
     }
 
     /// Lock the writer: to read the log or a projection, or to keep writes
-    /// out while the log is copied or swapped. Every write committed before
-    /// the lock was granted is synced and applied.
+    /// out while the log is copied or swapped. Every write queued before the
+    /// lock was granted is committed first, so the log is synced and applied
+    /// up to it, and a record appended through the guard follows them.
     pub fn lock(&self) -> MutexGuard<'_, JournaledWriter> {
-        self.writer.lock()
+        let mut writer = self.writer.lock();
+        let group = std::mem::take(&mut *self.queued.lock());
+        if !group.is_empty() {
+            writer.commit_group(&group);
+        }
+        writer
+    }
+
+    /// Writes queued and not yet taken by a group commit.
+    #[cfg(test)]
+    pub(crate) fn queued_writes(&self) -> usize {
+        self.queued.lock().len()
+    }
+
+    /// Queue `payloads` as one write for the next group commit and return
+    /// without waiting for it. The write's records take their LSNs in queue
+    /// order, after every write queued before this call returned and before
+    /// every write queued after it; [`QueuedWrite::wait`] reports them once
+    /// they are durable. The records stay contiguous and the write is durable
+    /// whole or not at all, as with [`Self::record_and_apply_batch`].
+    pub fn enqueue(
+        self: &Arc<Self>,
+        payloads: &[IntentPayload],
+    ) -> Result<QueuedWrite, JournalError> {
+        let ticket = Arc::new(Ticket::encode(payloads)?);
+        self.queued.lock().push(Arc::clone(&ticket));
+        Ok(QueuedWrite {
+            journal: Arc::clone(self),
+            ticket,
+            waited: false,
+        })
     }
 
     /// [`JournaledWriter::record_and_apply`], committed in one group with
@@ -1120,6 +1160,12 @@ impl SharedJournal {
     fn commit(&self, ticket: Ticket) -> TicketOutcome {
         let ticket = Arc::new(ticket);
         self.queued.lock().push(Arc::clone(&ticket));
+        self.finish(&ticket)
+    }
+
+    /// Wait for `ticket`, already queued, to be committed: by the thread that
+    /// holds the writer's mutex when it is granted here, or by this one.
+    fn finish(&self, ticket: &Arc<Ticket>) -> TicketOutcome {
         let mut writer = self.writer.lock();
         // A group commits under the writer's mutex and records every outcome
         // before releasing it, so once the mutex is ours this write is either
@@ -1137,6 +1183,42 @@ impl SharedJournal {
         ticket
             .take_outcome()
             .unwrap_or(Err(JournalError::Unresolved))
+    }
+}
+
+/// A write [`SharedJournal::enqueue`] queued: its LSN order is fixed, its
+/// durability is not yet known. Dropped without [`Self::wait`], it is committed
+/// on the spot, so a frame queued for a store write the caller already made is
+/// never left in the queue for a later writer, or a shutdown, to find.
+#[must_use = "a queued write is durable only once wait() returns Ok"]
+pub struct QueuedWrite {
+    journal: Arc<SharedJournal>,
+    ticket: Arc<Ticket>,
+    waited: bool,
+}
+
+impl QueuedWrite {
+    /// Block until the group commit that covers this write has synced and
+    /// dispatched it: one outcome per queued payload, in order. A failed
+    /// append or sync is returned here and none of the write's records are in
+    /// the log.
+    pub fn wait(mut self) -> Result<Vec<WriteOutcome>, JournalError> {
+        self.waited = true;
+        self.journal.finish(&self.ticket)
+    }
+}
+
+impl Drop for QueuedWrite {
+    fn drop(&mut self) {
+        if self.waited {
+            return;
+        }
+        if let Err(error) = self.journal.finish(&self.ticket) {
+            tracing::error!(
+                error = %error,
+                "journal write dropped before its wait could not be committed",
+            );
+        }
     }
 }
 
@@ -1802,6 +1884,62 @@ mod tests {
         assert!(INTENT_LOG_SYNC_SHARED_TOTAL.get() >= shared_before + 2);
         drop(seen);
         drop(shared);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn writes_queued_before_any_wait_take_queue_order_and_one_sync() {
+        let path = tmp_path("group_enqueue_order");
+        let (shared, seen, _gate) = shared_journal(&path, None);
+        let shared_before = INTENT_LOG_SYNC_SHARED_TOTAL.get();
+
+        let first = shared.enqueue(&[forget(1)]).unwrap();
+        let second = shared.enqueue(&[forget(2), forget(3)]).unwrap();
+        assert_eq!(shared.queued.lock().len(), 2, "nothing commits on enqueue");
+        assert!(seen.lock().unwrap().is_empty());
+
+        // The second write's wait commits both: the first finds its outcome
+        // waiting and syncs nothing of its own.
+        let second_lsns: Vec<Lsn> = second.wait().unwrap().iter().map(|o| o.lsn).collect();
+        let first_lsns: Vec<Lsn> = first.wait().unwrap().iter().map(|o| o.lsn).collect();
+        assert_eq!(first_lsns, vec![Lsn(0)]);
+        assert_eq!(second_lsns, vec![Lsn(1), Lsn(2)]);
+        assert!(INTENT_LOG_SYNC_SHARED_TOTAL.get() > shared_before);
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .map(|(l, _)| l.0)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        drop(shared);
+        assert_eq!(logged_lsns(&path), vec![0, 1, 2]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_queued_write_dropped_without_a_wait_is_still_committed() {
+        let path = tmp_path("group_dropped_unwaited");
+        let (shared, seen, _gate) = shared_journal(&path, None);
+        drop(shared.enqueue(&[forget(7)]).unwrap());
+        assert!(shared.queued.lock().is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        drop(shared);
+        assert_eq!(logged_lsns(&path), vec![0]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_append_through_the_lock_follows_every_write_queued_before_it() {
+        let path = tmp_path("group_lock_drains_queue");
+        let (shared, _seen, _gate) = shared_journal(&path, None);
+        let queued = shared.enqueue(&[forget(1)]).unwrap();
+        let direct = shared.lock().record_and_apply(&forget(2)).unwrap();
+        assert_eq!(direct.lsn, Lsn(1), "the queued write took LSN 0 first");
+        assert_eq!(queued.wait().unwrap()[0].lsn, Lsn(0));
+        drop(shared);
+        assert_eq!(logged_lsns(&path), vec![0, 1]);
         let _ = std::fs::remove_file(&path);
     }
 

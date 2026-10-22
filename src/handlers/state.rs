@@ -2586,33 +2586,29 @@ impl MultiUserMemoryManager {
         Ok(writer)
     }
 
-    /// Convenience: journal a typed payload through the user's
-    /// `JournaledWriter` and return the assigned LSN. Concurrent calls for
-    /// one user share a sync (see [`crate::intent_log::SharedJournal`]).
-    /// Per-projection apply errors are *not* propagated as failures — they
-    /// are logged at warn level (the log frame is durable, replay will retry
-    /// on restart). The SQLite projection is deferred: the returned LSN is
-    /// durable and applied to the inline projections, but may not be in
-    /// SQLite yet.
+    /// Journal a typed payload through the user's `JournaledWriter` and
+    /// return the assigned LSN: [`Self::journal_enqueue`], then the wait.
+    /// Concurrent calls for one user share a sync (see
+    /// [`crate::intent_log::SharedJournal`]). Per-projection apply errors are
+    /// *not* failures; they are logged (the frame is durable and replay retries
+    /// it on restart). The SQLite projection is deferred: the returned LSN is
+    /// durable and applied to the inline projections, but may not be in SQLite
+    /// yet.
+    ///
+    /// Not for a write that orders its frame with the tenant's write gate:
+    /// waiting here under the gate keeps every other writer out of the group.
+    /// Queue under the gate with [`Self::journal_enqueue`] and wait after it.
     pub fn journal_and_apply(
         &self,
         user_id: &str,
         payload: &crate::intent_log::IntentPayload,
     ) -> Result<crate::intent_log::Lsn> {
-        let writer = self.get_user_journaled_writer(user_id)?;
-        let outcome = writer
-            .record_and_apply(payload)
-            .map_err(|e| anyhow::anyhow!("journal record_and_apply: {e}"))?;
-        for err in &outcome.apply_errors {
-            tracing::warn!(
-                user_id = %user_id,
-                projection = %err.projection,
-                lsn = outcome.lsn.0,
-                error = %err.source,
-                "projection apply failed during journaled write (log durable; replay will retry)",
-            );
-        }
-        Ok(outcome.lsn)
+        let lsns = self
+            .journal_enqueue(user_id, std::slice::from_ref(payload))?
+            .wait()?;
+        lsns.into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("journal record_and_apply: no outcome for the frame"))
     }
 
     /// [`Self::journal_and_apply`] for many records: one append batch and one
@@ -2623,22 +2619,32 @@ impl MultiUserMemoryManager {
         user_id: &str,
         payloads: &[crate::intent_log::IntentPayload],
     ) -> Result<Vec<crate::intent_log::Lsn>> {
-        let writer = self.get_user_journaled_writer(user_id)?;
-        let outcomes = writer
-            .record_and_apply_batch(payloads)
-            .map_err(|e| anyhow::anyhow!("journal record_and_apply_batch: {e}"))?;
-        for outcome in &outcomes {
-            for err in &outcome.apply_errors {
-                tracing::warn!(
-                    user_id = %user_id,
-                    projection = %err.projection,
-                    lsn = outcome.lsn.0,
-                    error = %err.source,
-                    "projection apply failed during journaled write (log durable; replay will retry)",
-                );
-            }
+        self.journal_enqueue(user_id, payloads)?.wait()
+    }
+
+    /// Queue `payloads` as one write for `user_id`'s next group commit and
+    /// return without waiting for the sync. The frames take their LSNs in the
+    /// order writes are queued, so a write path queues them while it still
+    /// holds the tenant's write gate (the order its store write took), releases
+    /// the gate, and then calls [`JournalPending::wait`]: concurrent writers to
+    /// the tenant reach the queue while one of them syncs, and share the next
+    /// sync. The batch is durable whole or not at all; an empty batch queues
+    /// nothing.
+    pub fn journal_enqueue(
+        &self,
+        user_id: &str,
+        payloads: &[crate::intent_log::IntentPayload],
+    ) -> Result<JournalPending> {
+        let mut pending = JournalPending::empty(user_id);
+        if payloads.is_empty() {
+            return Ok(pending);
         }
-        Ok(outcomes.into_iter().map(|outcome| outcome.lsn).collect())
+        let writer = self.get_user_journaled_writer(user_id)?;
+        let queued = writer
+            .enqueue(payloads)
+            .map_err(|e| anyhow::anyhow!("journal record_and_apply_batch: {e}"))?;
+        pending.queued.push(queued);
+        Ok(pending)
     }
 
     /// W-018 support: ensure the wiki projection is materialised for
@@ -2784,9 +2790,9 @@ impl MultiUserMemoryManager {
         let user_mem = self.get_user_memory(user_id)?;
         let new_content = new_body.trim_end().to_string();
         let guard = user_mem.read();
-        // Held from the read through the journal append: a write to this memory in
+        // Held from the read through queueing the frame: a write to this memory in
         // between would be overwritten by this copy, or journaled ahead of it.
-        let _gate = guard.journal_section();
+        let gate = guard.journal_section();
         let mut mem = match guard.get_memory(&mid) {
             Ok(m) => m,
             Err(_) => return Ok(false), // unknown memory — ignore
@@ -2805,7 +2811,10 @@ impl MultiUserMemoryManager {
             memory_bincode: updated_bincode,
             schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
         };
-        self.journal_and_apply(user_id, &payload)?;
+        let frame = self.journal_enqueue(user_id, std::slice::from_ref(&payload))?;
+        drop(gate);
+        drop(guard);
+        frame.wait()?;
         Ok(true)
     }
 
@@ -2864,7 +2873,7 @@ impl MultiUserMemoryManager {
 
         // store-ahead-of-log: snapshot each uncovered memory and backfill a
         // `Remember` frame so the log is a complete record of the store. Each batch
-        // is read and appended under the write gate: the tenant is already serving,
+        // is read and queued under the write gate: the tenant is already serving,
         // and a snapshot read before a live write but appended after its frame would
         // leave the log behind the store.
         let uncovered: Vec<&crate::memory::MemoryId> = store_ids
@@ -2874,7 +2883,7 @@ impl MultiUserMemoryManager {
         let mut backfilled = 0usize;
         for batch in uncovered.chunks(RECONCILE_BACKFILL_BATCH) {
             let guard = user_mem.read();
-            let _gate = guard.journal_section();
+            let gate = guard.journal_section();
             let mut remember_frames = Vec::with_capacity(batch.len());
             for id in batch {
                 let id_str = id.0.to_string();
@@ -2913,8 +2922,11 @@ impl MultiUserMemoryManager {
                     ),
                 });
             }
-            backfilled +=
-                self.journal_reconcile_backfill(user_id, &writer, remember_frames, "Remember");
+            let queued =
+                Self::enqueue_reconcile_backfill(user_id, &writer, remember_frames, "Remember");
+            drop(gate);
+            drop(guard);
+            backfilled += Self::wait_reconcile_backfill(user_id, queued, "Remember");
         }
 
         // log-ahead-of-store: the log says live, the store has no such memory. Restore it
@@ -2953,7 +2965,7 @@ impl MultiUserMemoryManager {
                 }),
             }
         }
-        let forget_backfilled = {
+        let forget_queued = {
             // Under the write gate, and only for ids the store still lacks there: see
             // `crud::journal_bulk_forget`.
             let guard = user_mem.read();
@@ -2969,8 +2981,9 @@ impl MultiUserMemoryManager {
                 }
                 _ => true,
             });
-            self.journal_reconcile_backfill(user_id, &writer, forget_frames, "Forget")
+            Self::enqueue_reconcile_backfill(user_id, &writer, forget_frames, "Forget")
         };
+        let forget_backfilled = Self::wait_reconcile_backfill(user_id, forget_queued, "Forget");
         if !restore.is_empty() {
             for memory in &restore {
                 tracing::warn!(
@@ -3094,21 +3107,43 @@ impl MultiUserMemoryManager {
             .collect())
     }
 
-    /// Journal reconcile backfill frames in batches, one sync per batch and
-    /// the writer lock held for one batch at a time. A failed batch is logged
-    /// and skipped (the next reconcile finds the same gap). Returns the
-    /// number of frames journaled.
-    fn journal_reconcile_backfill(
-        &self,
+    /// Queue reconcile backfill frames in batches, each committed whole or not
+    /// at all. Called under the write gate, so the frames take their place in
+    /// the log in the order the store reads that built them; a batch that cannot
+    /// be queued is logged and skipped (the next reconcile finds the same gap).
+    fn enqueue_reconcile_backfill(
         user_id: &str,
-        writer: &crate::intent_log::SharedJournal,
+        writer: &std::sync::Arc<crate::intent_log::SharedJournal>,
         frames: Vec<crate::intent_log::IntentPayload>,
+        kind: &str,
+    ) -> Vec<(usize, crate::intent_log::QueuedWrite)> {
+        let mut queued = Vec::new();
+        for batch in frames.chunks(RECONCILE_BACKFILL_BATCH) {
+            match writer.enqueue(batch) {
+                Ok(write) => queued.push((batch.len(), write)),
+                Err(e) => tracing::warn!(
+                    user_id = %user_id,
+                    frames = batch.len(),
+                    kind,
+                    error = %e,
+                    "C2 reconcile: backfill batch could not be journaled",
+                ),
+            }
+        }
+        queued
+    }
+
+    /// Wait for the batches [`Self::enqueue_reconcile_backfill`] queued, after
+    /// the gate is released. A failed batch is logged and skipped. Returns the
+    /// number of frames journaled.
+    fn wait_reconcile_backfill(
+        user_id: &str,
+        queued: Vec<(usize, crate::intent_log::QueuedWrite)>,
         kind: &str,
     ) -> usize {
         let mut journaled = 0usize;
-        for batch in frames.chunks(RECONCILE_BACKFILL_BATCH) {
-            let outcomes = writer.record_and_apply_batch(batch);
-            match outcomes {
+        for (frames, write) in queued {
+            match write.wait() {
                 Ok(outcomes) => {
                     for outcome in &outcomes {
                         for err in &outcome.apply_errors {
@@ -3125,7 +3160,7 @@ impl MultiUserMemoryManager {
                 }
                 Err(e) => tracing::warn!(
                     user_id = %user_id,
-                    frames = batch.len(),
+                    frames,
                     kind,
                     error = %e,
                     "C2 reconcile: backfill batch could not be journaled",
@@ -5137,6 +5172,93 @@ impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
             })
             .map(|m| m.id.0.to_string())
             .collect()
+    }
+}
+
+/// Intent-log frames queued for a tenant's next group commit by
+/// [`MultiUserMemoryManager::journal_enqueue`]: their place in the log is
+/// fixed, their durability is not yet known. Wait on it after releasing the
+/// tenant's write gate. Dropped without a wait, each queued write is committed
+/// on the spot (see [`crate::intent_log::QueuedWrite`]).
+#[must_use = "queued frames are durable only once wait() returns Ok"]
+pub struct JournalPending {
+    user_id: String,
+    queued: Vec<crate::intent_log::QueuedWrite>,
+}
+
+impl JournalPending {
+    /// Nothing queued: the result of a step that had no frame to write.
+    pub fn empty(user_id: &str) -> Self {
+        Self {
+            user_id: user_id.to_string(),
+            queued: Vec::new(),
+        }
+    }
+
+    /// Fold `other`'s queued writes in after this one's, keeping their order.
+    pub fn absorb(&mut self, other: JournalPending) {
+        self.queued.extend(other.queued);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queued.is_empty()
+    }
+
+    /// Wait until every queued frame is durable and applied, and return their
+    /// LSNs in order. Projection apply failures are logged, not returned: the
+    /// frame is durable and replay retries the apply. The first write that
+    /// could not be made durable is returned as the error; the writes after it
+    /// are still waited for, and each failure is logged.
+    pub fn wait(self) -> Result<Vec<crate::intent_log::Lsn>> {
+        let mut lsns = Vec::new();
+        let mut first_error = None;
+        for queued in self.queued {
+            match queued.wait() {
+                Ok(outcomes) => {
+                    for outcome in outcomes {
+                        for err in &outcome.apply_errors {
+                            tracing::warn!(
+                                user_id = %self.user_id,
+                                projection = %err.projection,
+                                lsn = outcome.lsn.0,
+                                error = %err.source,
+                                "projection apply failed during journaled write (log durable; replay will retry)",
+                            );
+                        }
+                        lsns.push(outcome.lsn);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %self.user_id,
+                        error = %e,
+                        "intent-log write could not be made durable",
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!("journal record_and_apply: {e}"));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(lsns),
+        }
+    }
+
+    /// [`Self::wait`] for a write whose store change already stands: a frame
+    /// that cannot be made durable is logged and the request still succeeds,
+    /// because C2 reconcile backfills it from the store on the next open.
+    pub fn wait_logged(self, what: &str) {
+        let user_id = self.user_id.clone();
+        if let Err(e) = self.wait() {
+            tracing::warn!(
+                user_id = %user_id,
+                write = what,
+                error = %e,
+                "intent-log frame not journaled (store write already durable; C2 reconcile backfills it)",
+            );
+        }
     }
 }
 

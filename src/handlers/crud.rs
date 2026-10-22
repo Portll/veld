@@ -656,7 +656,7 @@ pub async fn update_memory(
     // worker waiting on it would stall every request scheduled there.
     let resolved_id_str = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
-        // Held from the read through the journal append: a write to this memory in
+        // Held from the read until the frame is queued: a write to this memory in
         // between would be overwritten by this copy, or journaled ahead of it.
         let gate = memory_guard.journal_section();
 
@@ -675,13 +675,16 @@ pub async fn update_memory(
         memory_guard
             .update_memory_journaled(&current_memory)
             .map_err(AppError::Internal)?;
-        super::remember::journal_memory_snapshot(
+        let frame = super::remember::enqueue_snapshot(
             &journal_state,
             &user_id,
             &current_memory,
             super::remember::SnapshotKind::Update,
             &gate,
         );
+        drop(gate);
+        drop(memory_guard);
+        frame.wait_logged("update");
         Ok::<_, AppError>(current_memory.id.0.to_string())
     })
     .await
@@ -904,7 +907,7 @@ pub async fn patch_memory(
     // On the blocking pool, as `update_memory`.
     let (resolved_id_str, changes) = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
-        // Held from the read through the journal append: see `update_memory`.
+        // Held from the read until the frame is queued: see `update_memory`.
         let gate = memory_guard.journal_section();
 
         let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
@@ -946,13 +949,16 @@ pub async fn patch_memory(
         memory_guard
             .update_memory_journaled(&current_memory)
             .map_err(AppError::Internal)?;
-        super::remember::journal_memory_snapshot(
+        let frame = super::remember::enqueue_snapshot(
             &journal_state,
             &user_id,
             &current_memory,
             super::remember::SnapshotKind::Update,
             &gate,
         );
+        drop(gate);
+        drop(memory_guard);
+        frame.wait_logged("patch");
         Ok((current_memory.id.0.to_string(), changes))
     })
     .await
@@ -984,55 +990,56 @@ pub async fn patch_memory(
 /// Journaled in chunks, one writer lock and one fsync each, so a large forget
 /// does not pay an fsync per id.
 ///
-/// The frames are appended under the tenant's write gate, and only for ids the
+/// The frames are queued under the tenant's write gate, and only for ids the
 /// store still lacks there: a write that re-created one after the forget journals
 /// its own frame, and a `Forget` behind that would leave replay without a memory
-/// the store holds.
+/// the store holds. The sync is waited for after the gate is released.
 pub(crate) fn journal_bulk_forget(
     state: &super::state::MultiUserMemoryManager,
     system: &memory::MemorySystem,
     user_id: &str,
     removed: impl IntoIterator<Item = memory::MemoryId>,
 ) {
-    let _gate = system.journal_section();
-    let payloads: Vec<_> = removed
-        .into_iter()
-        .filter(|id| !matches!(system.is_stored(id), Ok(true)))
-        .map(|id| crate::intent_log::IntentPayload::Forget {
-            user_id: user_id.to_string(),
-            memory_id: id.0.to_string(),
-            schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
-        })
-        .collect();
-    super::remember::journal_batch(state, user_id, &payloads);
+    let frames = {
+        let gate = system.journal_section();
+        let payloads: Vec<_> = removed
+            .into_iter()
+            .filter(|id| !matches!(system.is_stored(id), Ok(true)))
+            .map(|id| crate::intent_log::IntentPayload::Forget {
+                user_id: user_id.to_string(),
+                memory_id: id.0.to_string(),
+                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+            })
+            .collect();
+        super::remember::enqueue_batch(state, user_id, &payloads, &gate)
+    };
+    frames.wait_logged("bulk forget");
 }
 
-/// Hard-delete `id` and journal its `Forget` frame as one step under the tenant's
-/// write gate, so no write to the memory lands between the delete and the frame.
-/// A journal failure is logged and the delete stands: the store already holds it.
+/// Hard-delete `id` and queue its `Forget` frame as one step under the tenant's
+/// write gate, so no write to the memory lands between the delete and the frame's
+/// place in the log; the sync is waited for after the gate is released. A journal
+/// failure is logged and the delete stands: the store already holds it.
 pub(crate) fn forget_one_journaled(
     state: &super::state::MultiUserMemoryManager,
     system: &memory::MemorySystem,
     user_id: &str,
     id: memory::MemoryId,
 ) -> anyhow::Result<usize> {
-    let _gate = system.journal_section();
-    let count = system.forget_journaled(memory::ForgetCriteria::ById(id.clone()))?;
-    // W5: RocksDB already holds the canonical removal; the journal frame is what
-    // lets the projections converge via replay.
-    let payload = crate::intent_log::IntentPayload::Forget {
-        user_id: user_id.to_string(),
-        memory_id: id.0.to_string(),
-        schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+    let (count, frame) = {
+        let gate = system.journal_section();
+        let count = system.forget_journaled(memory::ForgetCriteria::ById(id.clone()))?;
+        // W5: RocksDB already holds the canonical removal; the journal frame is what
+        // lets the projections converge via replay.
+        let payload = crate::intent_log::IntentPayload::Forget {
+            user_id: user_id.to_string(),
+            memory_id: id.0.to_string(),
+            schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+        };
+        let frame = super::remember::enqueue_batch(state, user_id, &[payload], &gate);
+        (count, frame)
     };
-    if let Err(e) = state.journal_and_apply(user_id, &payload) {
-        tracing::warn!(
-            user_id = %user_id,
-            memory_id = %id.0,
-            error = %e,
-            "intent-log journal_and_apply (Forget) failed (RocksDB delete already durable)",
-        );
-    }
+    frame.wait_logged("forget");
     Ok(count)
 }
 
@@ -1647,9 +1654,9 @@ pub async fn anchor_memory(
     let journal_memory_id = req.memory_id.clone();
     tokio::task::spawn_blocking(move || {
         let guard = memory_sys_for_anchor.read();
-        // Held from the read through the journal append: a write to this memory in
+        // Held from the read through queueing the frame: a write to this memory in
         // between would be overwritten by this copy, or journaled ahead of it.
-        let _gate = guard.journal_section();
+        let gate = guard.journal_section();
         let mem = guard.get_memory(&mid)?;
         mem.set_anchored(anchor_value);
         guard.update_memory(&mem)?;
@@ -1666,14 +1673,15 @@ pub async fn anchor_memory(
             importance: mem.importance(),
             schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
         };
-        if let Err(e) = journal_state.journal_and_apply(&journal_user_id, &journal_payload) {
-            tracing::warn!(
-                user_id = %journal_user_id,
-                memory_id = %journal_memory_id,
-                error = %e,
-                "intent-log journal_and_apply (Anchor) failed (RocksDB anchor already durable)",
-            );
-        }
+        let frame = super::remember::enqueue_batch(
+            &journal_state,
+            &journal_user_id,
+            &[journal_payload],
+            &gate,
+        );
+        drop(gate);
+        drop(guard);
+        frame.wait_logged("anchor");
         Ok::<(), anyhow::Error>(())
     })
     .await
@@ -2397,14 +2405,12 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            let guard = memory.read();
-            let stored = guard.get_memory(&outcome.id).unwrap();
-            crate::handlers::remember::journal_memory_snapshot(
+            crate::handlers::remember::journal_stored(
                 &harness.manager,
+                &memory,
                 user_id,
-                &stored,
+                std::slice::from_ref(&outcome.id),
                 crate::handlers::remember::SnapshotKind::Remember,
-                &guard.journal_section(),
             );
             ids.push(outcome.id.0.to_string());
         }
