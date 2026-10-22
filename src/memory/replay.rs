@@ -22,6 +22,7 @@ use crate::constants::{
     REPLAY_EDGE_BOOST, REPLAY_IMPORTANCE_THRESHOLD, REPLAY_MAX_AGE_DAYS, REPLAY_STRENGTH_BOOST,
 };
 use crate::memory::introspection::{ConsolidationEvent, InterferenceType};
+use crate::similarity::bars::WritePath;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -298,6 +299,7 @@ impl InterferenceDetector {
         new_memory_importance: f32,
         _new_memory_created: DateTime<Utc>,
         similar_memories: &[(String, f32, f32, DateTime<Utc>, String)], // (id, similarity, importance, created_at, content_preview)
+        path: WritePath,
     ) -> InterferenceCheckResult {
         let mut result = InterferenceCheckResult::default();
         let now = Utc::now();
@@ -309,12 +311,17 @@ impl InterferenceDetector {
             }
 
             // Check if similarity exceeds threshold
-            if *similarity < INTERFERENCE_SIMILARITY_THRESHOLD {
+            let below_bar = *similarity < INTERFERENCE_SIMILARITY_THRESHOLD;
+            path.interference_bar().record(!below_bar);
+            if below_bar {
                 continue;
             }
 
             // Check for duplicates (very high similarity)
-            if *similarity >= INTERFERENCE_SEVERE_THRESHOLD {
+            if path
+                .severe_bar()
+                .record(*similarity >= INTERFERENCE_SEVERE_THRESHOLD)
+            {
                 result.is_duplicate = true;
                 // Return early - should merge, not interfere
                 return result;
@@ -849,6 +856,7 @@ mod tests {
             0.7, // Higher importance than old
             now,
             &similar_memories,
+            WritePath::Synchronous,
         );
 
         // Should detect retroactive interference
@@ -870,7 +878,13 @@ mod tests {
             "Existing content".to_string(),
         )];
 
-        let result = detector.check_interference("new-mem", 0.6, now, &similar_memories);
+        let result = detector.check_interference(
+            "new-mem",
+            0.6,
+            now,
+            &similar_memories,
+            WritePath::Synchronous,
+        );
 
         // Should detect as duplicate
         assert!(result.is_duplicate);

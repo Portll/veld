@@ -78,6 +78,7 @@ fn persist_detected_gaps(
     }
 }
 use crate::metrics;
+use crate::similarity::bars::SimilarityBar;
 use crate::validation;
 
 /// Application state type alias
@@ -331,6 +332,8 @@ pub async fn consolidate_memories(
                     let sim =
                         crate::similarity::scale::to_reference(cosine_similarity(emb_a, emb_b));
                     metrics::DREAM_REPLAY_PAIRS_EVALUATED.inc();
+                    SimilarityBar::DreamBandFloor.record(sim >= DREAM_REPLAY_SIMILARITY_THRESHOLD);
+                    SimilarityBar::DreamBandCeiling.record(sim > DREAM_REPLAY_SIMILARITY_CEILING);
 
                     // Discovery band: interesting but not already-connected similarity
                     if !(DREAM_REPLAY_SIMILARITY_THRESHOLD..=DREAM_REPLAY_SIMILARITY_CEILING)
@@ -731,6 +734,8 @@ pub async fn sleep_phase_consolidation(
                     let (Some(emb_a), Some(emb_b)) = (&mem_a.experience.embeddings, &mem_b.experience.embeddings) else { continue };
 
                     let sim = crate::similarity::scale::to_reference(cosine_similarity(emb_a, emb_b));
+                    SimilarityBar::DreamBandFloor.record(sim >= DREAM_REPLAY_SIMILARITY_THRESHOLD);
+                    SimilarityBar::DreamBandCeiling.record(sim > DREAM_REPLAY_SIMILARITY_CEILING);
                     if !(DREAM_REPLAY_SIMILARITY_THRESHOLD..=DREAM_REPLAY_SIMILARITY_CEILING).contains(&sim) { continue; }
 
                     let entities_a: Vec<uuid::Uuid> = mem_a.entity_refs.iter().map(|e| e.entity_id).collect();
