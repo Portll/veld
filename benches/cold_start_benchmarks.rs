@@ -159,6 +159,9 @@ impl BootFixture {
 
         let started = Instant::now();
         let system = boot_memory_system(OpenStore::open(engine, dir)?, dir)?;
+        // A server open leaves what its index lacks to the backlog drainer's tick; the
+        // fixture drains it here, so every timed boot starts from a fully indexed tenant.
+        system.drain_embedding_backlog_journaled(usize::MAX)?;
         let first_boot = started.elapsed();
         ensure_fully_indexed(&system, corpus_size, "first boot")?;
         system.flush_storage()?;

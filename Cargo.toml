@@ -396,6 +396,10 @@ harness = false
 name = "cold_start_benchmarks"
 harness = false
 
+[[bench]]
+name = "storage_path_benchmarks"
+harness = false
+
 # =============================================================================
 # GATED TEST TARGETS
 # =============================================================================
