@@ -46,7 +46,7 @@ in	1e158e53	224	2026-04-10	robotics-geo	W12	pending
 in	a4a896c4	226	2026-04-10	embeddings-vectors	W8	pending		veld's repair_vector_index and rebuild_index (src/memory/mod.rs) still return without retriever.save()
 in	f7bd0b4c	227	2026-04-10	lineage	W4	pending		
 in	762d413e	228	2026-04-10	graph	W3	pending		veld's decay.rs still carries hybrid_decay_factor_custom and retention_curve_debug, called only from decay.rs's own test; decay.rs serves graph_memory.rs
-in	7abb20b1	229	2026-04-11	http-api	W10	partial	7146a217	tests/handler_pipeline_tests.rs: 78 of #229's 93 tests ported, 4 more ignored as a veld bug (/api/remember stores emotional_valence and emotional_arousal out of range; the check is #240, row 7b882ace). Not carried: the robotics fields, reward and heading range checks and strict mode (#224, row 1e158e53, W12a) and the minimum content length (#198, row a27c06a8)
+in	7abb20b1	229	2026-04-11	http-api	W10	partial	7146a217	tests/handler_pipeline_tests.rs: 82 of #229's 93 tests ported; 4 of them were ignored as a veld bug (/api/remember stored emotional_valence and emotional_arousal out of range) until ac45719f ported the check from #240, row 7b882ace. Not carried: the robotics fields, reward and heading range checks and strict mode (#224, row 1e158e53, W12a) and the minimum content length (#198, row a27c06a8)
 in	5359c7e7	230	2026-04-12	http-api	W10	partial	a8753570	tests/pipeline_integration_tests.rs: 53 of #230's 54 tests ported; importance_override_is_respected is not, because /api/remember takes no importance (#176, row 9f51da05)
 in	49cc4a82	233	2026-04-15	embeddings-vectors	W8	pending		
 in	ef0de730	232	2026-04-15	http-api	W10	pending		
@@ -56,7 +56,7 @@ in	0738ba85	236	2026-04-17	facts-todos	W5	partial	3a2741dc	the session-start bri
 in	a3f87a1e	237	2026-04-19	facts-todos	W5	ported	2b92620c	
 in	b08fa351	239	2026-04-19	robotics-geo	W12	pending		
 in	00695870	241	2026-04-19	http-api	W10	pending		
-in	7b882ace	240	2026-04-19	http-api	W10	pending		
+in	7b882ace	240	2026-04-19	http-api	W10	partial	ac45719f	the emotional_valence (-1.0 to 1.0) and emotional_arousal (0.0 to 1.0) range checks only, on /api/remember and also on veld's batch items, proactive_context's auto-ingest fields and the zenoh remember; the four tests #229 ported for them (7146a217) run. Not carried: the other validators (importance, credibility, tags, limits, query text, local_position, short strings), their wiring into recall, search, facts and todos, and the ab_testing bounds fix
 in	82cf1c90	242	2026-04-19	facts-todos	W5	adapted	7dfa0892	the spatial/mission and session_id pre-flight in /api/recall does not apply (veld's recall has neither); veld's backup already refuses without its graph; a batch reports an unknown type per item instead of failing the batch
 in	674abc7c	243	2026-04-19	storage-integrity	W1	adapted	aef47086	only the iterator-error propagation in the legacy-DB migrations applies, now in veld at all three sites (the two in memory/storage.rs and import_separate_db_into_cf); the lint fixes are to upstream's own code
 in	38b818dd	244	2026-04-19	robotics-geo	W12	pending		
@@ -105,7 +105,7 @@ in	1419a630	297	2026-05-29	retrieval	W2	pending
 in	d8f6f89f	298	2026-05-29	lineage	W4	pending		
 in	5d65752e	299	2026-05-29	retrieval	W2	pending		
 in	46124e27	300	2026-05-29	ner-entities	W6	pending		
-in	d2431028	301	2026-05-29	lineage	W4	partial	422babed	tests/lineage_branch_tests.rs: the no-pivot test passes; the pivot test is ignored as a veld bug (infer_lineage_for_memory only ensures main). The branch-anchoring fix is not ported
+in	d2431028	301	2026-05-29	lineage	W4	adapted	5c853b3b	a pivot opens a branch off main and a branch-tagged BranchedFrom edge anchors it to the most recent earlier candidate, at the inference config's BranchedFrom confidence (0.9, upstream's constant). veld infers only candidate-to-new edges, so there are no pivot-originated edges to tag; re-inferring a pivot reuses its branch; a branch store failure is returned, not logged. tests/lineage_branch_tests.rs (test port 422babed) runs both tests and adds a re-inference test
 in	3d37bf88	302	2026-05-29	retrieval	W2	pending		
 in	92872f42	303	2026-05-29	ner-entities	W6	pending		
 in	c4937162	304	2026-05-29	retrieval	W2	pending		
@@ -146,7 +146,7 @@ in	d054e4a1	353	2026-07-02	anomaly	W12	pending
 in	bd478863	354	2026-07-02	anomaly	W12	pending		
 in	ec740532	356	2026-07-02	anomaly	W12	pending		
 in	4dc8bdd5	351	2026-07-02	graph	W3	pending		re-waved from W0 in triage: the counter sits in graph_memory's typed-pair collapse, graph code that veld has not ported; recall-eval prints DIRECTED_REVERSE_COLLAPSE=n/a until then (feb4a42a), and the LongMemEval-S gate workflow goes with #326
-in	530ad9c5	358	2026-07-03	retrieval	W2	partial	a8753570	its two proactive_context tests are ported and ignored as a veld bug: the anti-echo filter drops any memory sharing 70% of the context's words, and semantic_threshold is applied to raw scores. The src/handlers/recall.rs fix is not ported
+in	530ad9c5	358	2026-07-03	retrieval	W2	adapted	617390af	the anti-echo filter keys on the auto-captured tag only (veld's assistant responses carry it alongside assistant-response) and semantic_threshold applies to normalised scores. The two proactive_context tests (test port a8753570) run, and a test pins that an auto-captured echo is still dropped
 in	c8d32418	359	2026-07-03	retrieval	W2	pending		
 in	284bfd93	361	2026-07-03	infra	-	veld-layer	fce5e337	veld's docs site covers systemd: docs/src/guides/deploying.md points at packaging/linux/veld.service (fce5e337)
 in	06e120ed	357	2026-07-03	anomaly	W12	pending		
@@ -202,7 +202,7 @@ in	ebaa10be	433	2026-08-07	mcp-hooks	W9	pending
 in	956fc9ea	431	2026-08-07	robotics-geo	W12	pending		
 in	2762d395	430	2026-08-07	web-ui	W11	pending		
 in	b43a5c98	435	2026-08-07	ner-entities	W6	pending		
-in	5f7c993c	434	2026-08-08	retrieval	W2	partial	ffac685f	tests/momentum_reinforcement_tests.rs: 3 tests pass, 4 are ignored as a veld bug (reinforce_recall_from never writes momentum, though docs/src/architecture/retrieval.md says /api/reinforce drives it), and the ExplicitOutcome and MomentumPolicy::Apply tests are not carried. The write-through fix is not ported
+in	5f7c993c	434	2026-08-08	retrieval	W2	adapted	7337bbf4	MomentumPolicy is an argument of veld's reinforce_recall_from (Apply from POST /api/reinforce and reinforce_recall, Skip from proactive_context) instead of a separate reinforce_recall_with_momentum; persist_momentum writes through KeyValueStore::put_many, so both engines persist; a memory not found gets no momentum entry. tests/momentum_reinforcement_tests.rs (test port ffac685f) runs all nine of upstream's tests, the ExplicitOutcome provenance test and the Apply control included
 in	68ab0051	437	2026-08-08	web-ui	W11	pending		
 in	cf398448	441	2026-08-08	graph	W3	pending		
 in	6e5eabb4	443	2026-08-08	robotics-geo	W12	pending		
