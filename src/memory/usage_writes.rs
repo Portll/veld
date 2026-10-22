@@ -265,7 +265,7 @@ impl UsageWriter {
             .with_label_values(&[kind])
             .inc();
         let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-        if dropped == 1 || dropped % 1000 == 0 {
+        if dropped == 1 || dropped.is_multiple_of(1000) {
             tracing::warn!(
                 kind,
                 dropped,
@@ -297,8 +297,11 @@ impl Drop for UsageWriter {
 mod tests {
     use super::*;
 
-    /// A writer whose worker records what it applies and can be held mid-write.
-    fn recording_writer(capacity: usize) -> (UsageWriter, Arc<Mutex<Vec<String>>>, Arc<Mutex<()>>) {
+    /// The writer, the sources of the reinforcements it applied in order, and a gate that
+    /// holds its worker mid-write while locked.
+    type RecordingWriter = (UsageWriter, Arc<Mutex<Vec<String>>>, Arc<Mutex<()>>);
+
+    fn recording_writer(capacity: usize) -> RecordingWriter {
         let applied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let gate: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let (log, hold) = (Arc::clone(&applied), Arc::clone(&gate));

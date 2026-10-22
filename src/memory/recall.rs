@@ -3494,7 +3494,7 @@ impl super::MemorySystem {
                     },
                 );
 
-                Scored::scored(Arc::clone(mem), final_score)
+                Scored::with_score(Arc::clone(mem), final_score)
             };
 
             // The record the fusion layers already read: working, session, or storage.
@@ -4554,7 +4554,7 @@ impl super::MemorySystem {
                                         if view.tier == CandidateTier::LongTerm {
                                             // Score slightly below top result to avoid
                                             // displacing the original match entirely
-                                            memories.push(Scored::scored(
+                                            memories.push(Scored::with_score(
                                                 Arc::clone(&view.memory),
                                                 top_score * 0.85 * fact.confidence,
                                             ));
@@ -6120,7 +6120,7 @@ struct Scored {
 
 impl Scored {
     /// A candidate a layer has just scored.
-    fn scored(memory: SharedMemory, score: f32) -> Self {
+    fn with_score(memory: SharedMemory, score: f32) -> Self {
         Self {
             memory,
             score: Some(score),
@@ -7094,7 +7094,7 @@ mod scored_candidate_tests {
         let mut candidates: Vec<Scored> = records
             .iter()
             .zip(base)
-            .map(|(m, b)| Scored::scored(Arc::clone(m), b))
+            .map(|(m, b)| Scored::with_score(Arc::clone(m), b))
             .collect();
         for (m, f) in candidates.iter_mut().zip(factor) {
             if f != 1.0 {
@@ -7121,7 +7121,7 @@ mod scored_candidate_tests {
         let shared = record("held by a tier", vec![1.0, 0.0], &[]);
         let held = Arc::clone(&shared);
 
-        let result = Scored::scored(Arc::clone(&shared), 0.7).into_shared();
+        let result = Scored::with_score(Arc::clone(&shared), 0.7).into_shared();
         assert!(!Arc::ptr_eq(&result, &shared));
         assert_eq!(result.score, Some(0.7));
         result.set_activation(0.25);
@@ -7146,8 +7146,8 @@ mod scored_candidate_tests {
             &["deploy", "friday"],
         );
         let mut pool = vec![
-            Scored::scored(Arc::clone(&strong), 0.8),
-            Scored::scored(Arc::clone(&weak), 0.6),
+            Scored::with_score(Arc::clone(&strong), 0.8),
+            Scored::with_score(Arc::clone(&weak), 0.6),
         ];
         let (competitions, eliminated) =
             MemorySystem::compete_memories(&mut pool, CompetitionMode::SurfaceBoth);
