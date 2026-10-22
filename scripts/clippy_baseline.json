@@ -1,8 +1,8 @@
 {
   "toolchain": "1.99.0",
   "counts": {
-    "default": 345,
-    "redb-only": 336,
-    "zenoh": 345
+    "default": 344,
+    "redb-only": 335,
+    "zenoh": 344
   }
 }
