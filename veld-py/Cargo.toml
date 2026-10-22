@@ -1,0 +1,18 @@
+[package]
+name = "veld-py"
+version = "0.8.4"
+edition = "2021"
+publish = false
+description = "Python extension module for Veld (built by maturin from the root pyproject.toml)"
+
+# The cdylib lives here, not on the main crate: a cdylib on `veld` was linked on every
+# `cargo build` beside the binaries, for an artifact only maturin consumes.
+[lib]
+name = "veld"
+crate-type = ["cdylib"]
+
+# Renamed: this crate's lib is also called `veld` (the module name maturin needs), and a path
+# `veld::` inside it would resolve to itself.
+[dependencies]
+veld-core = { package = "veld", path = "..", features = ["python"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py38"] }

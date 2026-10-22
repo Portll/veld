@@ -215,6 +215,7 @@ Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (be
 - **Don't** run `cargo build`, `trunk serve`, `cargo run`, or any binary-producing command. The user runs these.
 - **You may** run `cargo check`, `cargo check --all-features`, `cargo clippy`, `cargo clippy --all-features`, and `cargo test --no-run` (compile-only test build).
 - **On macOS**, prefix Cargo calls with `./scripts/cargo-dev.sh` so libclang/RocksDB build path picks up the env shim.
+- **Local install builds** use `cargo build --profile local --bin veld` in a private `CARGO_TARGET_DIR` (no LTO, incremental codegen); `--release` (fat LTO, one unit) is for tagged releases. The Python cdylib is the `veld-py` crate, built only by maturin; `build.rs` reruns only when git HEAD moves, so a no-change rebuild is a no-op.
 - **Per-user locking**: any new write handler that mutates shared per-user state should follow the `CONSOLIDATION_LOCKS` pattern in [src/handlers/consolidation.rs](src/handlers/consolidation.rs):
 
   ```rust

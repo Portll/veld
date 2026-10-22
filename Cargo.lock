@@ -6656,6 +6656,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "veld-py"
+version = "0.8.4"
+dependencies = [
+ "pyo3",
+ "veld",
+]
+
+[[package]]
 name = "veld-status-core"
 version = "0.1.0"
 dependencies = [
