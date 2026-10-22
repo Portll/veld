@@ -5890,6 +5890,16 @@ impl IndexingProgress {
     }
 }
 
+/// Which passes a maintenance cycle runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceDepth {
+    /// The in-memory passes only, such as tier promotion and activation decay.
+    Light,
+    /// The light passes plus those that scan the whole store, such as fact decay and
+    /// extraction, replay, auto-repair, compression and the semantic merge pass.
+    Heavy,
+}
+
 /// Result of maintenance cycle including edge boosts for Hebbian learning
 #[derive(Debug, Clone, Default)]
 pub struct MaintenanceResult {

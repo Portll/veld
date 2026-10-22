@@ -283,7 +283,11 @@ pub async fn consolidate_memories(
             let uid = user_id.clone();
             let journal_state = state_clone.clone();
             match tokio::task::spawn_blocking(move || {
-                let result = memory.read().run_maintenance(decay_factor, &uid, true);
+                let result = memory.read().run_maintenance(
+                    decay_factor,
+                    &uid,
+                    crate::memory::MaintenanceDepth::Heavy,
+                );
                 if let Ok(result) = &result {
                     super::remember::journal_maintenance(
                         &journal_state,
@@ -686,7 +690,11 @@ pub async fn sleep_phase_consolidation(
             let uid = user_id.clone();
             let journal_state = state_clone.clone();
             match tokio::task::spawn_blocking(move || {
-                let result = memory.read().run_maintenance(decay_factor, &uid, true);
+                let result = memory.read().run_maintenance(
+                    decay_factor,
+                    &uid,
+                    crate::memory::MaintenanceDepth::Heavy,
+                );
                 if let Ok(result) = &result {
                     super::remember::journal_maintenance(
                         &journal_state,

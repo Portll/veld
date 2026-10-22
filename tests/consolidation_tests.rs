@@ -13,7 +13,8 @@ use tempfile::TempDir;
 use veld::embeddings::ner::{NerConfig, NeuralNer};
 use veld::graph_memory::GraphMemory;
 use veld::memory::{
-    Experience, ExperienceType, Memory, MemoryConfig, MemoryId, MemorySystem, MemoryTier,
+    Experience, ExperienceType, MaintenanceDepth, Memory, MemoryConfig, MemoryId, MemorySystem,
+    MemoryTier,
 };
 use veld::uuid::Uuid;
 
@@ -958,7 +959,9 @@ fn test_consolidation_report_after_maintenance() {
     }
 
     // Run maintenance to potentially trigger decay events (0.95 = standard decay factor)
-    system.run_maintenance(0.95, "test-user", false).unwrap();
+    system
+        .run_maintenance(0.95, "test-user", MaintenanceDepth::Light)
+        .unwrap();
 
     // Get report
     let report = system.get_consolidation_report(epoch(), None);
@@ -1118,7 +1121,9 @@ fn test_consolidation_report_stats_consistency() {
     }
 
     // Run maintenance with standard decay factor
-    system.run_maintenance(0.95, "test-user", false).unwrap();
+    system
+        .run_maintenance(0.95, "test-user", MaintenanceDepth::Light)
+        .unwrap();
 
     // Get report
     let report = system.get_consolidation_report(epoch(), None);
@@ -1383,7 +1388,7 @@ fn a_corrected_report_supersedes_the_initial_claim_end_to_end() {
             .expect("remember claim");
     }
     system
-        .run_maintenance(1.0, user, true)
+        .run_maintenance(1.0, user, MaintenanceDepth::Heavy)
         .expect("heavy maintenance");
 
     let after_claim = system.get_facts(user, 100).expect("facts");
@@ -1401,7 +1406,7 @@ fn a_corrected_report_supersedes_the_initial_claim_end_to_end() {
             .expect("remember correction");
     }
     system
-        .run_maintenance(1.0, user, true)
+        .run_maintenance(1.0, user, MaintenanceDepth::Heavy)
         .expect("heavy maintenance");
 
     let after_correction = system.get_facts(user, 100).expect("facts");

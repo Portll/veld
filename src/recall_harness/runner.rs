@@ -1556,7 +1556,11 @@ pub fn ingest_corpus(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        match user_mem.read().run_maintenance(1.0, EVAL_USER, true) {
+        match user_mem.read().run_maintenance(
+            1.0,
+            EVAL_USER,
+            crate::memory::MaintenanceDepth::Heavy,
+        ) {
             Ok(r) => tracing::info!(
                 "eval consolidation cycle: facts_extracted~maintenance ran ({:?})",
                 r

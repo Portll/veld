@@ -3227,7 +3227,12 @@ impl MultiUserMemoryManager {
         // Heavy cycle every 6th iteration (6 hours at 3600s intervals).
         // Heavy cycles run replay, entity-entity strengthening, fact extraction (full memory scan),
         // and flush databases (triggers compaction). Light cycles only touch in-memory data.
-        let is_heavy = cycle.is_multiple_of(6);
+        let depth = if cycle.is_multiple_of(6) {
+            crate::memory::MaintenanceDepth::Heavy
+        } else {
+            crate::memory::MaintenanceDepth::Light
+        };
+        let is_heavy = depth == crate::memory::MaintenanceDepth::Heavy;
 
         if is_heavy {
             tracing::info!(
@@ -3283,7 +3288,7 @@ impl MultiUserMemoryManager {
                         total_feedback_events += learned.update_count;
                     }
                 }
-                match memory.run_maintenance(decay_factor, &user_id, is_heavy) {
+                match memory.run_maintenance(decay_factor, &user_id, depth) {
                     Ok(result) => {
                         total_processed += result.decayed_count;
                         total_facts_extracted += result.facts_extracted;
