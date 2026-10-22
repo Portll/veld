@@ -95,6 +95,25 @@ on:
         default: 'minilm-l6-v2'
         type: choice
         options: ['minilm-l6-v2', 'arctic-embed-xs', 'nomic-embed-text-v1.5']
+      ingest:
+        description: >-
+          Write path the harness ingests through: sync stores with MemorySystem::remember (the
+          baseline's path); deferred takes the remember handler's journaled path, so the write
+          gate, deferred interference and the journaled BM25 projection run. recall-eval refuses
+          to gate across paths, so dispatch deferred with record=true.
+        required: false
+        default: 'sync'
+        type: choice
+        options: ['sync', 'deferred']
+      similarity_scale:
+        description: >-
+          on maps every similarity bar's cosine onto MiniLM's scale (the shipped behaviour);
+          off reads raw cosines (VELD_SIMILARITY_SCALE=off). Only changes an arm whose embedder
+          is not MiniLM.
+        required: false
+        default: 'on'
+        type: choice
+        options: ['on', 'off']
 
 permissions:
   contents: read
@@ -253,6 +272,8 @@ jobs:
           VELD_DIALS_RERANK_COUNT: ${{ github.event.inputs.rerank_count || '' }}
           VELD_DIALS_RERANK_POOL: ${{ github.event.inputs.rerank_pool || '' }}
           VELD_TUNE_CE_BLEND: ${{ github.event.inputs.ce_blend || '' }}
+          SHODH_EVAL_INGEST: ${{ github.event.inputs.ingest || 'sync' }}
+          VELD_SIMILARITY_SCALE: ${{ github.event.inputs.similarity_scale || 'on' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
           # minilm-l6-v2 is VELD_EMBEDDER=minilm, nomic-embed-text-v1.5 is VELD_EMBEDDER=nomic;
