@@ -40,6 +40,10 @@ pub struct CompressedMemory {
     pub strategy: String,
 }
 
+/// Metadata a restore from a `compressed_data` blob removes from what it returns.
+const BLOB_RESTORE_REMOVES: [&str; 3] =
+    ["compressed_data", "compression_ratio", "compression_strategy"];
+
 /// Compression pipeline for optimizing memory storage
 pub struct CompressionPipeline {
     keyword_extractor: KeywordExtractor,
@@ -293,6 +297,54 @@ impl CompressionPipeline {
         let Some(compressed_b64) = memory.experience.metadata.get("compressed_data") else {
             return Ok(Self::restore_in_place(memory));
         };
+        let experience = Self::decode_blob(compressed_b64)?;
+
+        // Restore the memory
+        let mut restored = memory.clone();
+        restored.experience = experience;
+        restored.compressed = false;
+        for key in BLOB_RESTORE_REMOVES {
+            restored.experience.metadata.remove(key);
+        }
+
+        Ok(restored)
+    }
+
+    /// `memory` without its `compressed_data` blob and the `compression_ratio` describing
+    /// it, when the blob decodes to the experience the record already holds. Then
+    /// [`Self::decompress`] restores the same memory from either copy, and the blob is only a
+    /// second copy of the whole experience, embeddings included, written before
+    /// compress_lz4 stopped writing one.
+    ///
+    /// `None` when there is no blob, it will not decode, or it holds anything else: an edit
+    /// made after compression, which a restore from the blob would undo, so removing the
+    /// blob would change what a restore returns.
+    pub fn without_redundant_blob(memory: &Memory) -> Option<Memory> {
+        let blob = memory.experience.metadata.get("compressed_data")?;
+        let from_blob = Self::decode_blob(blob).ok()?;
+        // Compared as JSON values: metadata is a HashMap, whose encoding order differs from
+        // one map to another holding the same pairs. The keys a restore drops are left out of
+        // both sides, since neither copy's restore keeps them.
+        let comparable = |experience: &Experience| {
+            let mut experience = experience.clone();
+            for key in BLOB_RESTORE_REMOVES {
+                experience.metadata.remove(key);
+            }
+            serde_json::to_value(&experience).ok()
+        };
+        let blob_view = comparable(&from_blob)?;
+        if Some(blob_view) != comparable(&memory.experience) {
+            return None;
+        }
+        let mut stripped = memory.clone();
+        stripped.experience.metadata.remove("compressed_data");
+        stripped.experience.metadata.remove("compression_ratio");
+        Some(stripped)
+    }
+
+    /// The experience a `compressed_data` blob holds, decoded under the size and ratio
+    /// bounds that keep a hostile blob from expanding without limit.
+    fn decode_blob(compressed_b64: &str) -> Result<Experience> {
         let compressed = general_purpose::STANDARD.decode(compressed_b64)?;
 
         // Zip bomb protection: Check compression ratio before decompressing
@@ -333,16 +385,7 @@ impl CompressionPipeline {
 
         let (experience, _): (Experience, _) =
             bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
-
-        // Restore the memory
-        let mut restored = memory.clone();
-        restored.experience = experience;
-        restored.compressed = false;
-        restored.experience.metadata.remove("compressed_data");
-        restored.experience.metadata.remove("compression_ratio");
-        restored.experience.metadata.remove("compression_strategy");
-
-        Ok(restored)
+        Ok(experience)
     }
 
     /// Create a summary of content (extractive - takes first N words)
@@ -2065,6 +2108,94 @@ mod tests {
             .experience
             .metadata
             .contains_key("compression_ratio"));
+    }
+
+    /// A record as compress_lz4 wrote it before 0e79f6c3: the experience, plus its blob.
+    fn legacy_lz4_record(original: &Memory) -> Memory {
+        let mut stored = original.clone();
+        stored.compressed = true;
+        let blob = legacy_compressed_data(original);
+        let meta = &mut stored.experience.metadata;
+        meta.insert("compressed_data".to_string(), blob);
+        meta.insert("compression_ratio".to_string(), "0.41".to_string());
+        meta.insert("compression_strategy".to_string(), "lz4".to_string());
+        stored
+    }
+
+    fn json(memory: &Memory) -> serde_json::Value {
+        serde_json::to_value(memory).unwrap()
+    }
+
+    /// A blob that copies the record's experience goes, and the record restores to exactly
+    /// what it restored to from the blob.
+    #[test]
+    fn a_blob_that_copies_the_record_is_stripped_and_the_restore_is_unchanged() {
+        let pipeline = CompressionPipeline::new();
+        let mut original = create_test_memory(&make_body(120), 0.9);
+        original.experience.embeddings = Some(vec![0.125; 384]);
+        let stored = legacy_lz4_record(&original);
+
+        let stripped = CompressionPipeline::without_redundant_blob(&stored).expect("redundant");
+        let meta = &stripped.experience.metadata;
+        assert!(!meta.contains_key("compressed_data"));
+        assert!(!meta.contains_key("compression_ratio"));
+        assert_eq!(meta.get("compression_strategy").map(String::as_str), Some("lz4"));
+        assert!(stripped.compressed);
+        assert_eq!(
+            json(&pipeline.decompress(&stripped).unwrap()),
+            json(&pipeline.decompress(&stored).unwrap())
+        );
+        assert!(
+            CompressionPipeline::without_redundant_blob(&stripped).is_none(),
+            "nothing left to strip"
+        );
+    }
+
+    /// The semantic step ran before the blob was taken, so a hybrid blob carries the summary,
+    /// the keywords and a `semantic` label the record later relabelled.
+    #[test]
+    fn a_hybrid_blob_that_copies_the_record_is_stripped() {
+        let pipeline = CompressionPipeline::new();
+        let original = create_test_memory(&make_body(80), 0.2);
+        let mut semantic = original.clone();
+        let meta = &mut semantic.experience.metadata;
+        meta.insert("summary".to_string(), "a summary...".to_string());
+        meta.insert("keywords".to_string(), "alpha,beta".to_string());
+        meta.insert("compression_strategy".to_string(), "semantic".to_string());
+        let mut stored = legacy_lz4_record(&semantic);
+        stored
+            .experience
+            .metadata
+            .insert("compression_strategy".to_string(), "hybrid".to_string());
+
+        let stripped = CompressionPipeline::without_redundant_blob(&stored).expect("redundant");
+        assert_eq!(
+            json(&pipeline.decompress(&stripped).unwrap()),
+            json(&pipeline.decompress(&stored).unwrap())
+        );
+    }
+
+    /// A record edited after compression restores from its blob to the version before the
+    /// edit; stripping would change that, so the blob stays.
+    #[test]
+    fn a_blob_that_differs_from_the_record_is_kept() {
+        let original = create_test_memory("the body when it was compressed", 0.9);
+        let mut stored = legacy_lz4_record(&original);
+        stored.experience.content = "the body as edited afterwards".to_string();
+        assert!(CompressionPipeline::without_redundant_blob(&stored).is_none());
+
+        let mut tagged = legacy_lz4_record(&original);
+        tagged.experience.tags.push("added-later".to_string());
+        assert!(CompressionPipeline::without_redundant_blob(&tagged).is_none());
+
+        let mut corrupt = legacy_lz4_record(&original);
+        corrupt
+            .experience
+            .metadata
+            .insert("compressed_data".to_string(), "not base64 at all!".to_string());
+        assert!(CompressionPipeline::without_redundant_blob(&corrupt).is_none());
+
+        assert!(CompressionPipeline::without_redundant_blob(&original).is_none());
     }
 
     #[test]
