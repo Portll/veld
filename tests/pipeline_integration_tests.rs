@@ -1518,7 +1518,6 @@ mod proactive_integration_tests {
     }
 
     #[tokio::test]
-    #[ignore = "veld bug: proactive_context's anti-echo filter drops any memory sharing 70% of the context's words, not only auto-ingested echoes (upstream #358 unported)"]
     async fn proactive_context_keeps_explicit_memory_that_overlaps_context() {
         let h = Harness::new();
         let content = "Workflow preference: when running automated validation, use the existing local runner path and avoid duplicate remote automation runs. Do not create temporary branches or extra remote jobs unless explicitly requested.";
@@ -1563,7 +1562,49 @@ mod proactive_integration_tests {
     }
 
     #[tokio::test]
-    #[ignore = "veld bug: proactive_context drops a memory echoing the context's words and applies semantic_threshold to raw, not normalized, scores (upstream #358 unported)"]
+    async fn proactive_context_drops_an_auto_captured_echo_of_the_context() {
+        let h = Harness::new();
+        let query =
+            "run automated validation using the local runner without duplicate remote automation";
+        let echo_id =
+            store_memory_full(&h, "test-user", query, "Conversation", &["auto-captured"]).await;
+        let explicit_id = store_memory_full(
+            &h,
+            "test-user",
+            &format!("Decision: {query}, agreed with the release team"),
+            "Decision",
+            &["workflow"],
+        )
+        .await;
+        wait_for_background_work(&h).await;
+
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/proactive_context",
+                json!({
+                    "user_id": "test-user",
+                    "context": query,
+                    "max_results": 10,
+                    "semantic_threshold": 0.0,
+                    "auto_ingest": false,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let surfaced = ids_of(body["memories"].as_array().unwrap());
+        assert!(
+            surfaced.contains(&explicit_id.as_str()),
+            "the explicit memory surfaces: {body}"
+        );
+        assert!(
+            !surfaced.contains(&echo_id.as_str()),
+            "the auto-captured echo of the context is dropped: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn proactive_context_threshold_uses_normalized_score_scale() {
         let h = Harness::new();
         let content = "Workflow preference: proactive context threshold calibration should surface durable old validation memories when recall ranks them as the best candidate.";
