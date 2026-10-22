@@ -49,7 +49,7 @@ Context is surfaced before a tool runs and returned to the model as `additionalC
 
 ## MCP / Memory Tools
 
-The TypeScript MCP server ([mcp-server/index.ts](mcp-server/index.ts), published as `@veld/memory-mcp`) exposes **46 tools** over the HTTP API. The Rust binary `veld serve` ([src/cli.rs](src/cli.rs), using `rmcp` from [src/mcp/mod.rs](src/mcp/mod.rs)) also serves an MCP stdio transport.
+The TypeScript MCP server ([mcp-server/index.ts](mcp-server/index.ts), published as `@veld/memory-mcp`) exposes **60 tools** over the HTTP API. The Rust binary `veld serve` ([src/cli.rs](src/cli.rs), using `rmcp` from [src/mcp/mod.rs](src/mcp/mod.rs)) serves the same 60 tools over an MCP stdio transport; `tests/mcp_tool_parity.rs` and `mcp-server/tests/tool-parity.test.ts` fail when the two sets drift.
 
 **CLI subcommands** (from [src/cli.rs](src/cli.rs)):
 
@@ -248,7 +248,7 @@ When writing new storage code: target the trait surface (`PrimaryMemoryStore`, `
 Veld hooks are configured for three clients:
 
 ### VS Code Copilot Agent
-- `.vscode/mcp.json` — registers Veld MCP server (46 tools).
+- `.vscode/mcp.json` — registers Veld MCP server (60 tools).
 - `.github/copilot-instructions.md` — workspace instructions with tool/skill switches.
 - User ID: `vscode-copilot`.
 

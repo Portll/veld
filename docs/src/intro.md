@@ -26,7 +26,7 @@ Veld exposes an HTTP API and two MCP transports:
 | Client | Integration point |
 |---|---|
 | Claude Code | `.claude/settings.json` + automatic memory hooks |
-| VS Code Copilot | `.vscode/mcp.json` — registers 46 MCP tools |
+| VS Code Copilot | `.vscode/mcp.json` — registers 60 MCP tools |
 | Cursor | MCP stdio server (`veld serve --mcp`) |
 | Any HTTP client | REST API at `http://127.0.0.1:3030/api/` |
 | Python | `pip install veld` (PyO3 bindings) |

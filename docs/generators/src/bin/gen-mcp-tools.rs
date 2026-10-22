@@ -33,7 +33,22 @@ struct McpTool {
     description: String,
 }
 
+/// The `ListToolsRequestSchema` handler alone. The prompt list and the server name use the
+/// same `name:` / `description:` shape, so matching the whole file counted them as tools.
+fn tool_listing(source: &str) -> &str {
+    let Some(start) = source.find("setRequestHandler(ListToolsRequestSchema") else {
+        return source;
+    };
+    let region = &source[start..];
+    let end = region[1..]
+        .find("setRequestHandler(")
+        .map(|i| i + 1)
+        .unwrap_or(region.len());
+    &region[..end]
+}
+
 fn extract_tools(source: &str) -> Vec<McpTool> {
+    let source = tool_listing(source);
     // Match either:
     //   name: "tool_name", ... description: "..."
     // or:
