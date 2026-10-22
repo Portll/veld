@@ -22,6 +22,7 @@ use std::sync::Arc;
 use veld::embeddings::{
     save_alignment, Alignment, AlignmentPairId, Embedder, ProcrustesAlignment, RidgeAlignment,
 };
+use veld::similarity::cosine_similarity_floored;
 
 /// Magic for the encoded-vector cache file (`pairs.<pair>.<side>.vec`).
 const PAIRS_VEC_MAGIC: &[u8; 8] = b"VELDPV1\0";
@@ -307,10 +308,7 @@ fn mean_paired_cosine<A: Alignment>(
     let mut sum = 0.0_f32;
     for (p, s) in primary.iter().zip(secondary.iter()) {
         let projected = a.project(s)?;
-        let dot: f32 = projected.iter().zip(p.iter()).map(|(x, y)| x * y).sum();
-        let np: f32 = projected.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let pp: f32 = p.iter().map(|x| x * x).sum::<f32>().sqrt();
-        sum += dot / (np * pp).max(1e-12);
+        sum += cosine_similarity_floored(&projected, p);
     }
     Ok(sum / primary.len() as f32)
 }

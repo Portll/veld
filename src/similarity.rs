@@ -1,6 +1,10 @@
 //! Vector similarity search for semantic retrieval
 //!
-//! Uses SIMD-optimized operations from distance_inline for single comparisons.
+//! [`cosine_similarity`] runs on the SIMD kernels in distance_inline. The
+//! `*_sequential` and `*_floored` cosines sum left to right instead: each keeps the
+//! exact results of the code it replaced, which rankings and reports were built on.
+//! The vector indexes use `distance_inline::cosine_similarity_inline`, which divides
+//! by `sqrt(|a|² |b|²)` and is a different function again.
 
 use crate::vector_db::distance_inline::dot_product_inline;
 use ordered_float::OrderedFloat;
@@ -31,6 +35,51 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Cosine similarity with every sum taken left to right in f32, as `Iterator::sum` takes it.
+/// Mismatched lengths, an empty vector or a zero vector give 0.0. It differs from
+/// [`cosine_similarity`] in the last bits, because that kernel sums in SIMD lanes with fused
+/// multiply-adds, and in returning NaN for a NaN or infinite component where that function
+/// returns 0.0, so a score already ranked with this function must keep using it.
+pub fn cosine_similarity_sequential(a: &[f32], b: &[f32]) -> f32 {
+    sequential_cosine(a, b, -0.0, 0.0).unwrap_or(0.0)
+}
+
+/// The sequential cosine as an `Option`: None for mismatched lengths, an empty vector, or a
+/// squared norm at or below `min_norm_sq`. Its sums start from +0.0, so a dot product that is
+/// exactly zero comes out +0.0 where [`cosine_similarity_sequential`] gives -0.0; callers that
+/// order scores with `total_cmp` see the difference.
+pub fn cosine_similarity_sequential_checked(a: &[f32], b: &[f32], min_norm_sq: f32) -> Option<f32> {
+    sequential_cosine(a, b, 0.0, min_norm_sq)
+}
+
+/// Cosine of `a` and `b` summed left to right from `seed`, the dot product over the full
+/// (equal) length. The seed decides only the sign of a sum that is exactly zero.
+fn sequential_cosine(a: &[f32], b: &[f32], seed: f32, min_norm_sq: f32) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let (mut dot, mut norm_a, mut norm_b) = (seed, seed, seed);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    if norm_a <= min_norm_sq || norm_b <= min_norm_sq {
+        return None;
+    }
+    Some(dot / (norm_a.sqrt() * norm_b.sqrt()))
+}
+
+/// Cosine for the alignment fit and eval reports: the dot product over the common prefix of `a`
+/// and `b`, divided by the product of their full norms floored at 1e-12, with no length or zero
+/// check. Sums run left to right as in [`cosine_similarity_sequential`].
+pub fn cosine_similarity_floored(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    dot / (norm_a * norm_b).max(1e-12)
 }
 
 /// Cosine similarity for vectors the caller already knows are L2-normalised: the
@@ -86,6 +135,55 @@ mod tests {
         assert!((dot_normalized(&a, &a) - 1.0).abs() < 1e-6);
         assert_eq!(dot_normalized(&a, &[1.0]), 0.0);
         assert_eq!(dot_normalized(&[f32::NAN, 0.0], &[1.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn sequential_cosine_values_and_guards() {
+        let a = [1.0_f32, 0.0, 0.0];
+        assert!((cosine_similarity_sequential(&a, &a) - 1.0).abs() < 0.001);
+        assert!(cosine_similarity_sequential(&a, &[0.0, 1.0, 0.0]).abs() < 0.001);
+        assert!((cosine_similarity_sequential(&a, &[-1.0, 0.0, 0.0]) + 1.0).abs() < 0.001);
+        assert_eq!(cosine_similarity_sequential(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity_sequential(&a, &[1.0]), 0.0);
+        assert_eq!(cosine_similarity_sequential(&a, &[0.0; 3]), 0.0);
+        assert!(cosine_similarity_sequential(&[f32::NAN, 1.0], &[1.0, 0.0]).is_nan());
+
+        assert_eq!(cosine_similarity_sequential_checked(&a, &[1.0], 0.0), None);
+        assert_eq!(
+            cosine_similarity_sequential_checked(&a, &[0.0; 3], 0.0),
+            None
+        );
+        assert_eq!(
+            cosine_similarity_sequential_checked(&a, &[1e-4, 0.0, 0.0], f32::EPSILON),
+            None
+        );
+        assert_eq!(
+            cosine_similarity_sequential_checked(&a, &[2.0, 0.0, 0.0], f32::EPSILON),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn sequential_cosine_seeds_differ_only_in_the_sign_of_zero() {
+        let a = [1.0_f32, 0.0];
+        let b = [-0.0_f32, -1.0];
+        assert_eq!(
+            cosine_similarity_sequential(&a, &b).to_bits(),
+            (-0.0_f32).to_bits()
+        );
+        assert_eq!(
+            cosine_similarity_sequential_checked(&a, &b, 0.0).map(f32::to_bits),
+            Some(0.0_f32.to_bits())
+        );
+    }
+
+    #[test]
+    fn floored_cosine_has_no_length_or_zero_guard() {
+        assert!((cosine_similarity_floored(&[3.0, 4.0], &[3.0, 4.0]) - 1.0).abs() < 1e-6);
+        assert_eq!(cosine_similarity_floored(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+        // The dot product stops at the shorter vector; the norms do not.
+        let partial = cosine_similarity_floored(&[1.0, 1.0], &[1.0]);
+        assert!((partial - 1.0 / 2.0_f32.sqrt()).abs() < 1e-6);
     }
 
     #[test]

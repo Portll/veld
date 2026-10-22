@@ -139,19 +139,7 @@ impl TodoStore {
 
     /// Cosine similarity, or None on a dimension mismatch or a zero vector.
     fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
-        if a.len() != b.len() || a.is_empty() {
-            return None;
-        }
-        let (mut dot, mut norm_a, mut norm_b) = (0.0f32, 0.0f32, 0.0f32);
-        for (x, y) in a.iter().zip(b) {
-            dot += x * y;
-            norm_a += x * x;
-            norm_b += y * y;
-        }
-        if norm_a <= f32::EPSILON || norm_b <= f32::EPSILON {
-            return None;
-        }
-        Some(dot / (norm_a.sqrt() * norm_b.sqrt()))
+        crate::similarity::cosine_similarity_sequential_checked(a, b, f32::EPSILON)
     }
 
     /// Todos similar to an embedding: an exact cosine scan over the embedding stored on each

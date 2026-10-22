@@ -34,6 +34,7 @@ use rust_stemmers::{Algorithm, Stemmer};
 use super::types::MemoryId;
 use crate::embeddings::Embedder;
 use crate::memory::llm_refiner::Refiner;
+use crate::similarity::cosine_similarity_sequential;
 
 /// Stem text using the English Porter stemmer for BM25 matching.
 /// Enables "choose" to match "chose", "decided" to match "decision", etc.
@@ -1282,10 +1283,12 @@ impl CrossEncoderReranker {
         let mut bi_scores: Vec<f32> = Vec::with_capacity(candidates.len());
         for (_, content, _, stored) in &candidates {
             let bi = match stored {
-                Some(emb) if emb.len() == query_dim => cosine_similarity(query_embedding, emb),
+                Some(emb) if emb.len() == query_dim => {
+                    cosine_similarity_sequential(query_embedding, emb)
+                }
                 _ => {
                     let doc_embedding = self.embedder.encode(content)?;
-                    cosine_similarity(query_embedding, &doc_embedding)
+                    cosine_similarity_sequential(query_embedding, &doc_embedding)
                 }
             };
             bi_scores.push(bi);
@@ -1334,27 +1337,8 @@ impl CrossEncoderReranker {
     }
 }
 
-/// Public alias for cross-encoder reranking in recall pipeline (Plan 001 §2.1)
-pub fn cosine_similarity_pub(a: &[f32], b: &[f32]) -> f32 {
-    cosine_similarity(a, b)
-}
-
-/// Compute cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot / (norm_a * norm_b)
-}
+/// The bi-encoder cosine the recall pipeline shares with the reranker (Plan 001 §2.1).
+pub use crate::similarity::cosine_similarity_sequential as cosine_similarity_pub;
 
 /// BM25 hits for one query, with the dials snapshot they were searched under, so fusing them
 /// reads the same snapshot.
@@ -2384,19 +2368,6 @@ mod tests {
             contents,
             ["lantern marker00", "lantern marker01", "lantern marker02"]
         );
-    }
-
-    #[test]
-    fn test_cosine_similarity() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
-
-        let c = vec![0.0, 1.0, 0.0];
-        assert!((cosine_similarity(&a, &c) - 0.0).abs() < 0.001);
-
-        let d = vec![-1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &d) - (-1.0)).abs() < 0.001);
     }
 
     #[test]

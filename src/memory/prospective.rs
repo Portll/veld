@@ -23,23 +23,6 @@ const CF_PROSPECTIVE: &str = "prospective";
 /// Column family for secondary indices (due dates, status, keyword lookups)
 const CF_PROSPECTIVE_INDEX: &str = "prospective_index";
 
-/// Compute cosine similarity between two embedding vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot / (norm_a * norm_b)
-}
-
 /// Migrate unpadded `due:{ts}:{id}` keys to zero-padded `due:{:020}:{id}` format.
 ///
 /// Prior versions wrote bare timestamps (e.g. `due:1739404800:uuid`), which break
@@ -614,7 +597,10 @@ impl ProspectiveStore {
                     .or_else(|| embed_fn(&task.content).map(std::borrow::Cow::Owned));
 
                 if let Some(task_embedding) = task_emb {
-                    let similarity = cosine_similarity(context_embedding, &task_embedding);
+                    let similarity = crate::similarity::cosine_similarity_sequential(
+                        context_embedding,
+                        &task_embedding,
+                    );
                     if similarity >= threshold {
                         seen_ids.insert(task.id.0);
                         matches.push((task, similarity));

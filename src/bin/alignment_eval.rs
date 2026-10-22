@@ -18,6 +18,7 @@ use std::sync::Arc;
 use veld::embeddings::{
     read_alignment_file, Alignment, AlignmentPairId, Embedder, ProcrustesAlignment, RidgeAlignment,
 };
+use veld::similarity::cosine_similarity_floored;
 
 const PAIRS_VEC_MAGIC: &[u8; 8] = b"VELDPV1\0";
 
@@ -125,10 +126,7 @@ fn main() -> Result<()> {
 
     for (i, row) in rows.iter().enumerate() {
         let projected = alignment.project(&sv[i])?;
-        let dot: f32 = projected.iter().zip(pv[i].iter()).map(|(x, y)| x * y).sum();
-        let np: f32 = projected.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let pp: f32 = pv[i].iter().map(|x| x * x).sum::<f32>().sqrt();
-        let cos = dot / (np * pp).max(1e-12);
+        let cos = cosine_similarity_floored(&projected, &pv[i]);
         let e = by_domain.entry(row.domain.clone()).or_insert((0.0, 0));
         e.0 += cos;
         e.1 += 1;
