@@ -53,19 +53,12 @@ VELD_URL=http://127.0.0.1:3030 VELD_API_KEY=dev-key-local python bench/recall_la
 
 ### CI integration
 
-See `.github/workflows/recall-guard.yml`.  The job is `workflow_dispatch`
-(opt-in) because it requires a live veld server with the embedding model
-loaded — GitHub hosted runners cannot provide that.  Run it locally or on a
-self-hosted runner before merging recall-path changes.
-
-To run on a self-hosted runner:
-
-1. Ensure the runner has `ORT_DYLIB_PATH` and `VELD_MODEL_PATH` set (see
-   project CLAUDE.md).
-2. Add the `self-hosted` label to the job's `runs-on` field in
-   `.github/workflows/recall-guard.yml`.
-3. The veld server must be started as a pre-step (or run as a systemd service
-   on the runner).
+None. The `recall-guard` workflow that ran this script needed a live veld server, which a
+hosted runner does not have, so it failed at its reachability check on every run; it was
+retired on 2026-10-22. Its two floors moved to the recall gate (`.github/workflows/recall.yml`,
+step "Enforce the absolute floors"), which measures the 100-case LoCoMo gate on every pull
+request that touches the recall path: the p99 ceiling as it was, and the multi_hop floor
+re-derived for that corpus. Run this script by hand against a local server.
 
 ## run_eval.sh
 
