@@ -40,9 +40,16 @@ instead. This is that record. Nothing in the tree implements it yet.
    leaks enough of its text to be reconstructed in part, so a plaintext side row would undo
    encryption-v2 for every sealed record. "Raw little-endian `f32`" holds only for plaintext
    tenants.
-2. **Record.** `Experience` keeps its fields, so the bincode layout pinned by
+2. **Record.** `Experience` keeps its fields and gains none, so the bincode layout pinned by
    `tests/persisted_layout.rs` does not move. A migrated record stores them as `None`; the side
-   row holds the values. The side envelope gets its own pinned layout entry in that test.
+   row holds the values. Nothing marks a record as migrated inside the record: records are
+   positional bincode, so a new field on `Memory` or `Experience` is not made safe by
+   `serde(default)` and every record written before it would stop decoding. Whether a record's
+   vectors live beside it is read from the side table itself (a row present), and any state the
+   move needs beyond that lives in the side table or in a store-level stamp, never in the record.
+   Were a record field ever unavoidable, it would need a legacy decode arm for the old shape,
+   as `tests/persisted_layout.rs` describes. The side envelope gets its own pinned layout entry
+   in that test.
 3. **Reads.** `get`, `get_many`, the scans and `search` hydrate from the side row in the same
    read (one more key in RocksDB's batched multi-get; the same read transaction on redb). A record
    that still carries inline vectors wins over any side row, which is what makes the move lazy.
