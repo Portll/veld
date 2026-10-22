@@ -537,6 +537,60 @@ pub static EMBEDDING_BACKLOG_PENDING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("EMBEDDING_BACKLOG_PENDING metric must be valid at compile time")
 });
 
+/// Buckets for work that runs from milliseconds on a small store to minutes on a large one:
+/// opening a tenant, saving a vector index file.
+fn store_scale_histogram_opts(name: &str, help: &str) -> HistogramOpts {
+    HistogramOpts::new(name, help).buckets(vec![
+        0.005, 0.025, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 180.0, 600.0,
+    ])
+}
+
+/// Time a tenant's open spends in each stage. `stage`: `primary_store`, `vector_index`,
+/// `stored_totals`, `unindexed_scan`, `compressed_blob_strip`, `memory_system` (the whole
+/// memory-system open, the stages before it included), `graph`, `log_reconcile`, `total`.
+pub static TENANT_OPEN_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        store_scale_histogram_opts(
+            "veld_tenant_open_duration_seconds",
+            "Time a tenant open spends in each stage",
+        ),
+        &["stage"],
+    )
+    .expect("TENANT_OPEN_DURATION metric must be valid at compile time")
+});
+
+/// Record that a tenant-open `stage` began at `started` and has just ended.
+pub fn observe_tenant_open_stage(stage: &str, started: std::time::Instant) {
+    TENANT_OPEN_DURATION
+        .with_label_values(&[stage])
+        .observe(started.elapsed().as_secs_f64());
+}
+
+/// One BM25 (tantivy) commit, whichever path ran it: the projection's background committer,
+/// an inline commit, or a search that committed pending writes first.
+pub static BM25_COMMIT_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(HistogramOpts::new(
+        "veld_bm25_commit_duration_seconds",
+        "BM25 index commit duration",
+    )
+    .buckets(vec![
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ]))
+    .expect("BM25_COMMIT_DURATION metric must be valid at compile time")
+});
+
+/// One vector index file written to disk. `index`: `primary`, `secondary`.
+pub static VECTOR_INDEX_SAVE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        store_scale_histogram_opts(
+            "veld_vector_index_save_duration_seconds",
+            "Vector index file save duration",
+        ),
+        &["index"],
+    )
+    .expect("VECTOR_INDEX_SAVE_DURATION metric must be valid at compile time")
+});
+
 /// Memories the backlog drainer embedded and indexed
 pub static EMBEDDING_BACKLOG_DRAINED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
@@ -1221,6 +1275,9 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(VECTOR_SEARCH_DURATION, "VECTOR_SEARCH_DURATION");
 
     // Storage metrics
+    register!(TENANT_OPEN_DURATION, "TENANT_OPEN_DURATION");
+    register!(BM25_COMMIT_DURATION, "BM25_COMMIT_DURATION");
+    register!(VECTOR_INDEX_SAVE_DURATION, "VECTOR_INDEX_SAVE_DURATION");
     register!(ROCKSDB_OPS_TOTAL, "ROCKSDB_OPS_TOTAL");
     register!(ROCKSDB_OPS_DURATION, "ROCKSDB_OPS_DURATION");
     register!(LEGACY_FALLBACK_BRANCH_TOTAL, "LEGACY_FALLBACK_BRANCH_TOTAL");

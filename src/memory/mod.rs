@@ -246,6 +246,15 @@ pub use crate::memory::visualization::{GraphStats, MemoryLogger};
 /// truth, so the old directory can be deleted by operators at any time.
 pub const BM25_INDEX_DIR: &str = "bm25_projection_index";
 
+/// Content longer than this is not indexed from a memory's stored vectors by the backlog
+/// drain. Such content is chunked and every chunk re-embedded, and something this large is
+/// usually binary data or a log dump that an embedder can stall on; MiniLM reads only the
+/// first ~512 tokens of each chunk anyway.
+const MAX_REPAIR_CONTENT_LEN: usize = 1_000_000;
+
+/// Memories read per batch when an open decodes the ones its vector index lacks.
+const OPEN_READ_BATCH: usize = 256;
+
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
@@ -1028,6 +1037,7 @@ impl MemorySystem {
             Self::with_primary_store_and_bm25_index(config, Arc::new(primary), None, bm25_index)?;
         system.attach_redb_backup_db(database);
         system.backfill_in_memory_bm25()?;
+        system.index_queued_at_open()?;
         Ok(system)
     }
 
@@ -1040,7 +1050,38 @@ impl MemorySystem {
         )?);
         let system = Self::with_storage_and_bm25_index(config, storage, bm25_index)?;
         system.backfill_in_memory_bm25()?;
+        system.index_queued_at_open()?;
         Ok(system)
+    }
+
+    /// Standalone mode runs no backlog drainer, so the memories the open queued for want of
+    /// a vector are indexed before it returns, as the startup repair did: on the server the
+    /// drainer's tick does it after the tenant is already serving.
+    fn index_queued_at_open(&self) -> Result<()> {
+        use embedding_backlog::EmbedOutcome;
+        let report = self.embedding_backlog.drain_where(
+            usize::MAX,
+            |entry| entry.index_only,
+            |memory_id, _| match self.long_term_memory.get(memory_id) {
+                Ok(memory) if memory.is_forgotten() => EmbedOutcome::MemoryGone,
+                Ok(memory) => self.repair_index_entry(&memory),
+                Err(e) if e.to_string().contains("Memory not found") => EmbedOutcome::MemoryGone,
+                Err(e) => EmbedOutcome::Failed(e.to_string()),
+            },
+        )?;
+        if report.attempted == 0 {
+            return Ok(());
+        }
+        tracing::info!(
+            indexed = report.drained,
+            failed = report.failed,
+            stopped = report.stopped.as_deref().unwrap_or(""),
+            "indexed the memories this open found missing from the vector index"
+        );
+        if report.drained > 0 {
+            self.retriever.save()?;
+        }
+        Ok(())
     }
 
     /// Standalone mode has no journal to replay, so an in-memory index (a sealed
@@ -1407,6 +1448,7 @@ impl MemorySystem {
 
         // Pass shared embedder and event buffer to retrieval engine (no duplicate model load)
         // Event buffer allows retriever to record Hebbian edge events for introspection
+        let stage = std::time::Instant::now();
         let retriever = RetrievalEngine::with_event_buffer(
             primary_store.clone(),
             &config.storage_path,
@@ -1414,98 +1456,51 @@ impl MemorySystem {
             Some(consolidation_events.clone()),
         )
         .context("Failed to initialize retrieval engine")?;
+        crate::metrics::observe_tenant_open_stage("vector_index", stage);
 
-        // STARTUP RECOVERY: Check for orphaned memories and auto-repair
-        // This fixes memories that were stored but not indexed (crash, embedding failure, etc.)
-        let storage_count = primary_store
-            .get_stats()
-            .map(|s| s.total_count)
-            .unwrap_or(0);
+        // The one full read of the store an open makes: it seeds the stored totals behind
+        // stats() and sizes the check for memories the vector index lacks. It was made twice.
+        let stage = std::time::Instant::now();
+        let storage_stats = primary_store.get_stats().unwrap_or_else(|e| {
+            tracing::warn!("stored totals not read at open, starting from zero: {e}");
+            Default::default()
+        });
+        crate::metrics::observe_tenant_open_stage("stored_totals", stage);
+
+        // STARTUP RECOVERY: memories stored but not indexed (a crash before the index was
+        // saved, an embedding failure) are queued for the embedding backlog, whose drain
+        // indexes them on its tick. Repairing them here held the open, and every request
+        // waiting on it, for as long as the re-embedding took.
+        let backlog =
+            embedding_backlog::EmbeddingBacklogStore::with_kv(primary_store.key_value_store());
         let indexed_count = retriever.len();
-        let orphaned_count = storage_count.saturating_sub(indexed_count);
-
-        if orphaned_count > 0 {
-            tracing::warn!(
-                storage_count = storage_count,
-                indexed_count = indexed_count,
-                orphaned_count = orphaned_count,
-                "Detected orphaned memories at startup - initiating auto-repair"
-            );
-
-            // Get all memories from storage
-            if let Ok(all_memories) = primary_store.get_all() {
-                let indexed_ids = retriever.get_indexed_memory_ids();
-                let mut repaired = 0;
-                let mut failed = 0;
-
-                for memory in all_memories {
-                    if indexed_ids.contains(&memory.id) {
-                        continue; // Already indexed
-                    }
-
-                    // Skip absurdly large memories (>1MB) - likely binary data or log dumps
-                    // MiniLM only uses first ~512 tokens anyway, so this protects ONNX from hanging
-                    const MAX_REPAIR_CONTENT_LEN: usize = 1_000_000;
-                    if memory.experience.content.len() > MAX_REPAIR_CONTENT_LEN {
-                        tracing::warn!(
-                            memory_id = %memory.id.0,
-                            content_len = memory.experience.content.len(),
-                            "Skipping oversized memory during auto-repair (>1MB)"
-                        );
-                        failed += 1;
-                        continue;
-                    }
-
-                    // Orphaned memory - try to index it
-                    tracing::info!(memory_id = %memory.id.0, content_len = memory.experience.content.len(), "Attempting to repair orphaned memory...");
-                    match retriever.index_memory(&memory) {
-                        Ok(_) => {
-                            repaired += 1;
-                            // A repair killed before its final save would start over on the
-                            // next boot, so progress is persisted as it goes.
-                            const REPAIR_SAVE_EVERY: usize = 500;
-                            if repaired % REPAIR_SAVE_EVERY == 0 {
-                                if let Err(e) = retriever.save() {
-                                    tracing::error!("Failed to persist repair progress: {}", e);
-                                }
-                            }
-                            if repaired <= 10 || repaired % 100 == 0 {
-                                tracing::info!(
-                                    memory_id = %memory.id.0,
-                                    progress = format!("{}/{}", repaired, orphaned_count),
-                                    "Repaired orphaned memory"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            tracing::error!(
-                                memory_id = %memory.id.0,
-                                error = %e,
-                                "Failed to repair orphaned memory"
-                            );
-                        }
-                    }
-                }
-
-                // Persist the repaired index
-                if repaired > 0 {
-                    if let Err(e) = retriever.save() {
-                        tracing::error!("Failed to persist repaired index: {}", e);
-                    } else {
-                        tracing::info!(
-                            repaired = repaired,
-                            failed = failed,
-                            final_indexed = retriever.len(),
-                            "Startup repair complete - index persisted"
-                        );
-                    }
-                }
+        if storage_stats.total_count > indexed_count {
+            let stage = std::time::Instant::now();
+            match Self::unindexed_live_ids(primary_store.as_ref(), &retriever) {
+                Ok(unindexed) => match backlog.enqueue_unindexed(&unindexed) {
+                    Ok(queued) => tracing::warn!(
+                        storage_count = storage_stats.total_count,
+                        indexed_count,
+                        unindexed = unindexed.len(),
+                        queued,
+                        "memories missing from the vector index queued for the embedding backlog"
+                    ),
+                    Err(e) => tracing::error!(
+                        unindexed = unindexed.len(),
+                        "could not queue unindexed memories; the backlog's reconcile finds \
+                         them: {e:#}"
+                    ),
+                },
+                Err(e) => tracing::error!(
+                    "could not enumerate unindexed memories; the backlog's reconcile finds \
+                     them: {e:#}"
+                ),
             }
-        } else if storage_count > 0 {
+            crate::metrics::observe_tenant_open_stage("unindexed_scan", stage);
+        } else if storage_stats.total_count > 0 {
             tracing::info!(
-                storage_count = storage_count,
-                indexed_count = indexed_count,
+                storage_count = storage_stats.total_count,
+                indexed_count,
                 "All memories indexed - no repair needed"
             );
         }
@@ -1513,8 +1508,6 @@ impl MemorySystem {
         // Disable visualization logging for production performance
         let logger = Arc::new(RwLock::new(MemoryLogger::new(false)));
 
-        // Load stats from storage to recover state after restart
-        let storage_stats = primary_store.get_stats().unwrap_or_default();
         let initial_totals = StoredTotals {
             count: storage_stats.total_count,
             importance_sum: f64::from(storage_stats.importance_sum),
@@ -1744,9 +1737,7 @@ impl MemorySystem {
             recall_event_store: recall_events::RecallEventStore::with_kv(
                 primary_store.key_value_store(),
             ),
-            embedding_backlog: embedding_backlog::EmbeddingBacklogStore::with_kv(
-                primary_store.key_value_store(),
-            ),
+            embedding_backlog: backlog,
             // R3a (F3): per-user persistent learned-weight store over this user's
             // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
             // weights are loaded on init (below) but NOT injected into scoring.
@@ -5700,6 +5691,34 @@ impl MemorySystem {
         self.write_lock.hold()
     }
 
+    /// Live memories in `store` that `retriever`'s index does not hold. Ids are enumerated
+    /// from keys alone and only the ones the index lacks are decoded, to leave out forgotten
+    /// records, which the index never holds.
+    fn unindexed_live_ids(
+        store: &dyn crate::storage::PrimaryMemoryStore,
+        retriever: &RetrievalEngine,
+    ) -> Result<Vec<MemoryId>> {
+        let candidates: Vec<MemoryId> = store
+            .get_all_ids()?
+            .into_iter()
+            .filter(|id| !retriever.is_indexed(id))
+            .collect();
+        let mut live = Vec::new();
+        for batch in candidates.chunks(OPEN_READ_BATCH) {
+            for (id, read) in batch.iter().zip(store.get_many(batch)) {
+                match read {
+                    Ok(memory) if memory.is_forgotten() => {}
+                    Ok(_) => live.push(id.clone()),
+                    Err(e) => tracing::warn!(
+                        memory_id = %id.0,
+                        "unindexed memory not readable at open; not queued: {e:#}"
+                    ),
+                }
+            }
+        }
+        Ok(live)
+    }
+
     /// Whether the long-term store holds a record under `id`, forgotten or not.
     pub fn is_stored(&self, id: &MemoryId) -> Result<bool> {
         Ok(self.long_term_memory.get_memory(id)?.is_some())
@@ -6341,19 +6360,26 @@ impl MemorySystem {
     fn embed_backlog_outcome(
         &self,
         memory_id: &MemoryId,
+        entry: &embedding_backlog::BacklogEntry,
         rewritten: &mut Vec<MemoryId>,
     ) -> embedding_backlog::EmbedOutcome {
         use embedding_backlog::EmbedOutcome;
         if self.writes_closed() {
             return EmbedOutcome::WritesClosed;
         }
-        match self.long_term_memory.get(memory_id) {
+        let memory = match self.long_term_memory.get(memory_id) {
             Ok(memory) if memory.is_forgotten() => return EmbedOutcome::MemoryGone,
-            Ok(_) => {}
+            Ok(memory) => memory,
             Err(e) if e.to_string().contains("Memory not found") => {
                 return EmbedOutcome::MemoryGone
             }
             Err(e) => return EmbedOutcome::Failed(e.to_string()),
+        };
+        // A memory without its own vector was never embedded, so it never reached the
+        // passes that follow embedding either: it takes the full path below whatever the
+        // row says.
+        if entry.index_only && memory.experience.embeddings.is_some() {
+            return self.repair_index_entry(&memory);
         }
         match self.embed_and_index_journaled(memory_id) {
             Ok(outcome) => {
@@ -6376,11 +6402,43 @@ impl MemorySystem {
             .flatten()
             .and_then(|row| row.last_error)
             .unwrap_or_else(|| "not indexed after embed_and_index".to_string());
+        self.failure_or_embedder_down(last_error)
+    }
+
+    /// A failed attempt as the drain should take it: the embedder answering a probe makes
+    /// it this memory's failure, and silence makes it the host's, which stops the drain.
+    fn failure_or_embedder_down(&self, error: String) -> embedding_backlog::EmbedOutcome {
+        use embedding_backlog::EmbedOutcome;
         match self.embedder.encode("veld embedder probe") {
-            Ok(_) => EmbedOutcome::Failed(last_error),
-            Err(probe) => {
-                EmbedOutcome::EmbedderUnavailable(format!("{last_error}; probe: {probe}"))
+            Ok(_) => EmbedOutcome::Failed(error),
+            Err(probe) => EmbedOutcome::EmbedderUnavailable(format!("{error}; probe: {probe}")),
+        }
+    }
+
+    /// Index `memory` as the startup repair did in place before an open handed these to the
+    /// backlog: from the vectors it carries (chunked content is re-embedded chunk by chunk),
+    /// without the absorption and interference passes it went through when it was written.
+    /// Content past [`MAX_REPAIR_CONTENT_LEN`] is refused and its row kept, as the repair
+    /// skipped it: an embedder handed a log dump of that size could stall the drain.
+    fn repair_index_entry(&self, memory: &Memory) -> embedding_backlog::EmbedOutcome {
+        use embedding_backlog::EmbedOutcome;
+        if self.retriever.is_indexed(&memory.id) {
+            return EmbedOutcome::Indexed;
+        }
+        if memory.experience.content.len() > MAX_REPAIR_CONTENT_LEN {
+            return EmbedOutcome::Failed(format!(
+                "content of {} bytes is over the {MAX_REPAIR_CONTENT_LEN}-byte limit for \
+                 indexing from stored vectors",
+                memory.experience.content.len()
+            ));
+        }
+        match self.retriever.index_memory(memory) {
+            Ok(()) => {
+                self.stats.write().vector_index_count += 1;
+                EmbedOutcome::Indexed
             }
+            // Chunked content is re-embedded chunk by chunk, so this can be the host.
+            Err(e) => self.failure_or_embedder_down(format!("{e:#}")),
         }
     }
 
@@ -6392,13 +6450,17 @@ impl MemorySystem {
         limit: usize,
     ) -> Result<(embedding_backlog::DrainReport, Vec<MemoryId>)> {
         let mut rewritten = Vec::new();
-        let report = self
-            .embedding_backlog
-            .drain_with(limit, |id| self.embed_backlog_outcome(id, &mut rewritten))?;
-        if report.drained > 0 {
-            if let Err(e) = self.retriever.save() {
-                tracing::warn!("embedding backlog: index save after drain failed: {e}");
-            }
+        let report = self.embedding_backlog.drain_with(limit, |id, entry| {
+            self.embed_backlog_outcome(id, entry, &mut rewritten)
+        })?;
+        // Every drained row changed the index, as every write since the last save may have;
+        // the files are rewritten when enough has changed or a change has waited long
+        // enough, not after each drain that indexed anything.
+        if let Err(e) = self
+            .retriever
+            .save_if_due(&retrieval::IndexSavePolicy::process())
+        {
+            tracing::warn!("vector index save after the backlog drain failed: {e}");
         }
         Ok((report, rewritten))
     }
@@ -10214,6 +10276,123 @@ mod vector_index_reopen_tests {
                 "reopened after the rebuild: {needle}"
             );
         }
+    }
+
+    /// The server's construction: the tenant's store and its BM25 handle supplied, no
+    /// standalone backfill, and the backlog drained by the server's tick.
+    fn open_tenant(path: &std::path::Path, backend: crate::config::StorageBackend) -> MemorySystem {
+        let primary: Arc<dyn crate::storage::PrimaryMemoryStore> = match backend {
+            #[cfg(feature = "rocksdb")]
+            crate::config::StorageBackend::RocksDb => Arc::new(
+                crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::open(path, None)
+                    .expect("rocksdb store"),
+            ),
+            #[cfg(feature = "storage-redb")]
+            crate::config::StorageBackend::Redb => Arc::new(
+                crate::storage::redb::RedbPrimaryMemoryStore::open(path).expect("redb store"),
+            ),
+            #[allow(unreachable_patterns)]
+            other => panic!("{other:?} is not in this build"),
+        };
+        let bm25 = Arc::new(
+            hybrid_search::BM25Index::new(&path.join(BM25_INDEX_DIR)).expect("bm25 index"),
+        );
+        MemorySystem::with_primary_store_and_bm25_index(
+            MemoryConfig {
+                storage_path: path.to_path_buf(),
+                ..Default::default()
+            },
+            primary,
+            None,
+            bm25,
+        )
+        .expect("memory system")
+    }
+
+    fn engines() -> Vec<crate::config::StorageBackend> {
+        let mut engines = Vec::new();
+        #[cfg(feature = "rocksdb")]
+        engines.push(crate::config::StorageBackend::RocksDb);
+        #[cfg(feature = "storage-redb")]
+        engines.push(crate::config::StorageBackend::Redb);
+        engines
+    }
+
+    /// A memory the saved index lost waits for the drain instead of holding the open, and
+    /// the drain indexes it from the vector it carries, rewriting nothing.
+    #[test]
+    fn a_tenant_open_queues_what_the_saved_index_lacks_for_the_drain() {
+        for backend in engines() {
+            let tmp = TempDir::new().expect("temp dir");
+            let remember = |sys: &MemorySystem, content: &str| {
+                sys.remember(
+                    Experience {
+                        content: content.to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .expect("remember")
+            };
+            let (kept, lost) = {
+                let sys = open_tenant(tmp.path(), backend);
+                let kept = remember(&sys, "The harbour crane was serviced on Tuesday.");
+                let lost = remember(&sys, "The quarry road reopened after the landslide.");
+                assert!(sys.retriever.remove_memory(&lost), "{backend:?}");
+                sys.flush_storage().expect("flush");
+                (kept, lost)
+            };
+
+            let sys = open_tenant(tmp.path(), backend);
+            assert!(sys.retriever.is_indexed(&kept), "{backend:?}");
+            assert!(!sys.retriever.is_indexed(&lost), "{backend:?}: not repaired in place");
+            let row = sys
+                .embedding_backlog
+                .get(&lost)
+                .expect("backlog read")
+                .unwrap_or_else(|| panic!("{backend:?}: the lost memory is queued"));
+            assert!(row.index_only, "{backend:?}");
+            assert!(sys.embedding_backlog.get(&kept).expect("read").is_none());
+
+            let (report, rewritten) = sys.drain_embedding_backlog_journaled(10).expect("drain");
+            assert_eq!(report.drained, 1, "{backend:?}");
+            assert!(rewritten.is_empty(), "{backend:?}: nothing to journal");
+            assert!(sys.retriever.is_indexed(&lost), "{backend:?}");
+            assert!(sys.embedding_backlog.get(&lost).expect("read").is_none());
+        }
+    }
+
+    /// Standalone mode has no drainer, so its open indexes what it queued before returning.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn a_standalone_open_indexes_what_it_queued_before_returning() {
+        let tmp = TempDir::new().expect("temp dir");
+        let lost = {
+            let sys = open(tmp.path());
+            sys.remember(
+                Experience {
+                    content: "The ferry timetable changed for winter.".to_string(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("remember");
+            let lost = sys
+                .remember(
+                    Experience {
+                        content: "The lighthouse lens was replaced in March.".to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .expect("remember");
+            assert!(sys.retriever.remove_memory(&lost));
+            sys.flush_storage().expect("flush");
+            lost
+        };
+        let sys = open(tmp.path());
+        assert!(sys.retriever.is_indexed(&lost));
+        assert_eq!(sys.embedding_backlog_report().expect("report").pending, 0);
     }
 }
 

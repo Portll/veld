@@ -1359,6 +1359,7 @@ impl MultiUserMemoryManager {
         match self.server_config.effective_storage_backend {
             #[cfg(feature = "rocksdb")]
             StorageBackend::RocksDb => {
+                let stage = std::time::Instant::now();
                 let primary_store = RocksDbPrimaryMemoryStore::open(
                     &config.storage_path,
                     self.shared_rocksdb_cache.as_ref(),
@@ -1369,6 +1370,7 @@ impl MultiUserMemoryManager {
                         config.storage_path
                     )
                 })?;
+                crate::metrics::observe_tenant_open_stage("primary_store", stage);
 
                 // Share the tenant's `Arc<BM25Index>` with the
                 // retrieval engine so reads see exactly the same tantivy
@@ -1389,6 +1391,7 @@ impl MultiUserMemoryManager {
             StorageBackend::RocksDb => Err(no_rocksdb("opening a user memory store")),
             #[cfg(feature = "storage-redb")]
             StorageBackend::Redb => {
+                let stage = std::time::Instant::now();
                 let primary =
                     crate::storage::redb::RedbPrimaryMemoryStore::open(&config.storage_path)
                         .with_context(|| {
@@ -1397,6 +1400,7 @@ impl MultiUserMemoryManager {
                                 config.storage_path
                             )
                         })?;
+                crate::metrics::observe_tenant_open_stage("primary_store", stage);
                 let database = primary.database();
                 let primary_store: Arc<dyn crate::storage::PrimaryMemoryStore> = Arc::new(primary);
 
@@ -1495,6 +1499,7 @@ impl MultiUserMemoryManager {
             return Ok(memory);
         }
 
+        let open_began = std::time::Instant::now();
         let user_path = self.user_dir(user_id)?;
         let config = MemoryConfig {
             storage_path: user_path,
@@ -1559,8 +1564,11 @@ impl MultiUserMemoryManager {
                 }
             }
         };
+        crate::metrics::observe_tenant_open_stage("memory_system", open_began);
         // Wire up GraphMemory for Layer 2 (spreading activation) and Layer 5 (Hebbian learning)
+        let stage = std::time::Instant::now();
         let graph = self.get_user_graph(user_id)?;
+        crate::metrics::observe_tenant_open_stage("graph", stage);
         user_mem.set_graph_memory(graph);
         user_mem.set_usage_write_mode(crate::memory::UsageWriteMode::Background);
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
@@ -1587,6 +1595,7 @@ impl MultiUserMemoryManager {
             .insert(user_id.to_string(), ())
             .is_none()
         {
+            let stage = std::time::Instant::now();
             if let Err(e) = self.reconcile_store_with_intent_log(user_id, &memory_arc) {
                 tracing::warn!(
                     user_id = %user_id,
@@ -1594,7 +1603,9 @@ impl MultiUserMemoryManager {
                     "C2 store↔log reconcile failed (non-fatal)",
                 );
             }
+            crate::metrics::observe_tenant_open_stage("log_reconcile", stage);
         }
+        crate::metrics::observe_tenant_open_stage("total", open_began);
 
         Ok(memory_arc)
     }
