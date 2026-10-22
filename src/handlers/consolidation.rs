@@ -5,19 +5,20 @@
 
 use axum::{
     extract::{Extension, State},
+    http::StatusCode,
     response::Json,
 };
 
 use super::state::MultiUserMemoryManager;
 use super::types::{
     BackupResponse, CleanupCorruptedRequest, CleanupCorruptedResponse, ConsolidateRequest,
-    ConsolidateResponse, CreateBackupRequest, ListBackupsRequest, ListBackupsResponse, MemoryEvent,
-    MigrateLegacyRequest, MigrateLegacyResponse, PurgeBackupsRequest, PurgeBackupsResponse,
-    RebuildIndexRequest, RebuildIndexResponse, RepairIndexRequest, RepairIndexResponse,
-    RestoreBackupRequest, RestoreBackupResponse, VerifyBackupRequest, VerifyBackupResponse,
-    VerifyIndexRequest,
+    ConsolidateResponse, CreateBackupRequest, IndexJobResponse, ListBackupsRequest,
+    ListBackupsResponse, MemoryEvent, MigrateLegacyRequest, MigrateLegacyResponse,
+    PurgeBackupsRequest, PurgeBackupsResponse, RebuildIndexRequest, RepairIndexRequest,
+    RepairIndexResponse, RestoreBackupRequest, RestoreBackupResponse, VerifyBackupRequest,
+    VerifyBackupResponse, VerifyIndexRequest,
 };
-use super::utils::resolve_request_user_id;
+use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory;
@@ -77,6 +78,64 @@ fn persist_detected_gaps(
         }
     }
 }
+
+/// Applies a maintenance pass's replay to the graph, on the calling thread: Hebbian boosts on
+/// the replayed memories' edges, with edge-tier promotions fed back to the memories'
+/// importance, then entity-entity reinforcement per replayed memory, then the opportunistic
+/// pruning flush, which runs with or without a replay. Each step takes its own graph read, so
+/// a writer queued behind one step gets in before the next. Returns the edges and the
+/// entity-entity edges strengthened.
+fn strengthen_from_replay(
+    graph: &parking_lot::RwLock<crate::graph_memory::GraphMemory>,
+    memory: &crate::user_memory::SharedUserMemory,
+    replay: Option<&memory::types::MaintenanceResult>,
+    source: &str,
+    user_id: &str,
+) -> (usize, usize) {
+    let mut edges_strengthened = 0;
+    let mut entity_edges_strengthened = 0;
+    if let Some(replay) = replay {
+        if !replay.edge_boosts.is_empty() {
+            let graph_guard = graph.read();
+            match graph_guard.strengthen_memory_edges(&replay.edge_boosts, source) {
+                Ok((count, promotion_boosts)) => {
+                    edges_strengthened += count;
+                    if !promotion_boosts.is_empty() {
+                        if let Err(e) = memory.read().apply_edge_promotion_boosts(&promotion_boosts)
+                        {
+                            tracing::warn!(
+                                user_id = %user_id,
+                                source,
+                                "Failed to apply edge promotion boosts: {e}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!(user_id = %user_id, source, "Edge boost failed: {e}"),
+            }
+        }
+        if !replay.replay_memory_ids.is_empty() {
+            let graph_guard = graph.read();
+            for mem_id_str in &replay.replay_memory_ids {
+                if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
+                    match graph_guard.strengthen_episode_entity_edges(&uuid, source) {
+                        Ok(count) => entity_edges_strengthened += count,
+                        Err(e) => tracing::debug!(
+                            user_id = %user_id,
+                            source,
+                            "Entity edge strengthening failed for {mem_id_str}: {e}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    if let Err(e) = graph.read().flush_pending_maintenance() {
+        tracing::warn!(user_id = %user_id, source, "Failed to flush pending maintenance: {e}");
+    }
+    (edges_strengthened, entity_edges_strengthened)
+}
+
 use crate::metrics;
 use crate::validation;
 
@@ -203,66 +262,33 @@ pub async fn consolidate_memories(
         };
 
         // Step 3: Apply graph strengthening from replay results
-        let mut edges_strengthened: usize = 0;
-        let mut entity_edges_strengthened: usize = 0;
-
-        // Direction 1: Edge strengthening + promotion boost propagation
-        if !maintenance_result.edge_boosts.is_empty() {
-            if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
-                let graph_guard = graph.read();
-                match graph_guard.strengthen_memory_edges(
-                    &maintenance_result.edge_boosts,
-                    "consolidation:replay",
-                ) {
-                    Ok((count, promotion_boosts)) => {
-                        edges_strengthened += count;
-                        if !promotion_boosts.is_empty() {
-                            let memory_guard = memory.read();
-                            if let Err(e) =
-                                memory_guard.apply_edge_promotion_boosts(&promotion_boosts)
-                            {
-                                tracing::warn!(
-                                    user_id = %user_id,
-                                    "Failed to apply edge promotion boosts: {e}"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("On-demand edge boost failed: {e}");
-                    }
+        let memories_replayed = maintenance_result.replay_memory_ids.len();
+        let memories_decayed = maintenance_result.decayed_count;
+        let (edges_strengthened, entity_edges_strengthened) =
+            match state_clone.get_user_graph_async(&user_id).await {
+                Ok(graph) => {
+                    let memory = memory.clone();
+                    let uid = user_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        strengthen_from_replay(
+                            &graph,
+                            &memory,
+                            Some(&maintenance_result),
+                            "consolidation:replay",
+                            &uid,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            "Consolidation graph strengthening task failed: {e}"
+                        );
+                        (0, 0)
+                    })
                 }
-            }
-        }
-
-        // Direction 3: Entity-entity Hebbian reinforcement for replayed memories
-        if !maintenance_result.replay_memory_ids.is_empty() {
-            if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
-                let graph_guard = graph.read();
-                for mem_id_str in &maintenance_result.replay_memory_ids {
-                    if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
-                        match graph_guard
-                            .strengthen_episode_entity_edges(&uuid, "consolidation:replay")
-                        {
-                            Ok(count) => entity_edges_strengthened += count,
-                            Err(e) => {
-                                tracing::debug!(
-                                    "Entity edge strengthening failed for {mem_id_str}: {e}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Direction 2: Lazy decay — flush opportunistic pruning queue
-        if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
-            let graph_guard = graph.read();
-            if let Err(e) = graph_guard.flush_pending_maintenance() {
-                tracing::warn!(user_id = %user_id, "Failed to flush pending maintenance: {e}");
-            }
-        }
+                Err(_) => (0, 0),
+            };
 
         // Step 3.5: Dream replay — random memory pair comparison discovers
         // latent cross-topic connections (Wilson & McNaughton 1994).
@@ -483,11 +509,11 @@ pub async fn consolidate_memories(
             memories_processed = result.memories_processed,
             facts_extracted = result.facts_extracted,
             facts_reinforced = result.facts_reinforced,
-            memories_replayed = maintenance_result.replay_memory_ids.len(),
+            memories_replayed,
             edges_strengthened,
             entity_edges_strengthened,
             dream_edges_created,
-            memories_decayed = maintenance_result.decayed_count,
+            memories_decayed,
             duration_secs = format!("{:.1}", duration),
             "Consolidation complete (background)"
         );
@@ -626,60 +652,25 @@ pub async fn sleep_phase_consolidation(
             }
         };
 
-        // Phase 3: Edge strengthening from replay
-        if let Some(ref maint) = maintenance_result {
-            if !maint.edge_boosts.is_empty() {
-                if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
-                    let graph_guard = graph.read();
-                    match graph_guard
-                        .strengthen_memory_edges(&maint.edge_boosts, "consolidation:sleep")
-                    {
-                        Ok((count, promotion_boosts)) => {
-                            tracing::debug!(user_id = %user_id, count, "Sleep-phase: edges strengthened");
-                            if !promotion_boosts.is_empty() {
-                                let memory_guard = memory.read();
-                                if let Err(e) =
-                                    memory_guard.apply_edge_promotion_boosts(&promotion_boosts)
-                                {
-                                    tracing::warn!(
-                                        user_id = %user_id,
-                                        "Sleep-phase: failed to apply edge promotion boosts: {e}"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => tracing::debug!("Sleep-phase edge boost failed: {e}"),
-                    }
-                }
-            }
-
-            // Phase 4: Entity-entity Hebbian reinforcement
-            if !maint.replay_memory_ids.is_empty() {
-                if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
-                    let graph_guard = graph.read();
-                    for mem_id_str in &maint.replay_memory_ids {
-                        if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
-                            if let Err(e) = graph_guard
-                                .strengthen_episode_entity_edges(&uuid, "consolidation:sleep")
-                            {
-                                tracing::warn!(
-                                    user_id = %user_id,
-                                    "Sleep-phase: entity edge strengthening failed for {uuid}: {e}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 5: Flush pending maintenance (opportunistic edge pruning)
+        // Phases 3-5: edge strengthening and entity-entity reinforcement from replay, then
+        // the opportunistic edge pruning flush.
         if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
-            let graph_guard = graph.read();
-            if let Err(e) = graph_guard.flush_pending_maintenance() {
+            let memory = memory.clone();
+            let uid = user_id.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                strengthen_from_replay(
+                    &graph,
+                    &memory,
+                    maintenance_result.as_ref(),
+                    "consolidation:sleep",
+                    &uid,
+                )
+            })
+            .await
+            {
                 tracing::warn!(
                     user_id = %user_id,
-                    "Sleep-phase: failed to flush pending maintenance: {e}"
+                    "Sleep-phase graph strengthening task failed: {e}"
                 );
             }
         }
@@ -861,10 +852,13 @@ pub async fn verify_index_integrity(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let report = memory_guard
-        .verify_index_integrity()
-        .map_err(AppError::Internal)?;
+    let report = run_blocking(move || {
+        memory_sys
+            .read()
+            .verify_index_integrity()
+            .map_err(AppError::Internal)
+    })
+    .await?;
 
     Ok(Json(report))
 }
@@ -881,10 +875,13 @@ pub async fn repair_vector_index(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let (total_storage, total_indexed, repaired, failed) = memory_guard
-        .repair_vector_index()
-        .map_err(AppError::Internal)?;
+    let (total_storage, total_indexed, repaired, failed) = run_blocking(move || {
+        memory_sys
+            .read()
+            .repair_vector_index()
+            .map_err(AppError::Internal)
+    })
+    .await?;
 
     Ok(Json(RepairIndexResponse {
         success: failed == 0,
@@ -908,10 +905,13 @@ pub async fn cleanup_corrupted(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let deleted_count = memory_guard
-        .cleanup_corrupted()
-        .map_err(AppError::Internal)?;
+    let deleted_count = run_blocking(move || {
+        memory_sys
+            .read()
+            .cleanup_corrupted()
+            .map_err(AppError::Internal)
+    })
+    .await?;
 
     // Broadcast DELETE event for real-time dashboard so TUI updates its count
     if deleted_count > 0 {
@@ -948,9 +948,13 @@ pub async fn migrate_legacy(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let (migrated, already_current, failed) =
-        memory_guard.migrate_legacy().map_err(AppError::Internal)?;
+    let (migrated, already_current, failed) = run_blocking(move || {
+        memory_sys
+            .read()
+            .migrate_legacy()
+            .map_err(AppError::Internal)
+    })
+    .await?;
 
     // Broadcast event for real-time dashboard
     if migrated > 0 {
@@ -979,11 +983,89 @@ pub async fn migrate_legacy(
     }))
 }
 
-/// Rebuild vector index from storage (removes orphaned index entries)
+/// Per-user index job locks. A rebuild and a re-embed each walk every memory of the tenant
+/// and rewrite its vectors; two at once reindex the same memories over each other.
+static INDEX_JOB_LOCKS: std::sync::LazyLock<
+    dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+#[derive(Clone, Copy)]
+enum IndexJob {
+    Rebuild,
+    Reembed,
+}
+
+/// Starts `job` on the manager's tracker and answers 202 Accepted, or 409 Conflict while a
+/// rebuild or re-embed for the user is still running. The job embeds every memory it
+/// indexes, which on a large tenant outlasts the HTTP timeout; the shutdown drain waits for
+/// it. Its counts are logged when it ends, and `POST /api/index/verify` reports the index it
+/// leaves.
+fn start_index_job(
+    state: &AppState,
+    user_id: &str,
+    memory: crate::user_memory::SharedUserMemory,
+    job: IndexJob,
+) -> (StatusCode, Json<IndexJobResponse>) {
+    let lock = INDEX_JOB_LOCKS
+        .entry(user_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let Ok(running) = lock.try_lock_owned() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(IndexJobResponse {
+                accepted: false,
+                message: "An index rebuild or re-embed is already running for this user."
+                    .to_string(),
+            }),
+        );
+    };
+    let uid = user_id.to_string();
+    state.task_tracker.spawn_blocking(move || {
+        let _running = running;
+        let started = std::time::Instant::now();
+        match job {
+            IndexJob::Rebuild => match memory.read().rebuild_index() {
+                Ok((storage_count, indexed_count)) => tracing::info!(
+                    user_id = %uid,
+                    storage_count,
+                    indexed_count,
+                    is_healthy = storage_count == indexed_count,
+                    duration_secs = format!("{:.1}", started.elapsed().as_secs_f64()),
+                    "Index rebuild complete (background)"
+                ),
+                Err(e) => tracing::error!(user_id = %uid, "Index rebuild failed: {e:#}"),
+            },
+            IndexJob::Reembed => match memory.read().reembed_all() {
+                Ok((reembedded, failed)) => tracing::info!(
+                    user_id = %uid,
+                    reembedded,
+                    failed,
+                    duration_secs = format!("{:.1}", started.elapsed().as_secs_f64()),
+                    "Re-embed complete (background)"
+                ),
+                Err(e) => tracing::error!(user_id = %uid, "Re-embed failed: {e:#}"),
+            },
+        }
+    });
+    let message = match job {
+        IndexJob::Rebuild => "Index rebuild started in background.",
+        IndexJob::Reembed => "Re-embed started in background.",
+    };
+    (
+        StatusCode::ACCEPTED,
+        Json(IndexJobResponse {
+            accepted: true,
+            message: format!("{message} POST /api/index/verify reports the index it leaves."),
+        }),
+    )
+}
+
+/// Index every stored memory missing from the vector index, in the background (202).
 pub async fn rebuild_index(
     State(state): State<AppState>,
     Json(req): Json<RebuildIndexRequest>,
-) -> Result<Json<RebuildIndexResponse>, AppError> {
+) -> Result<(StatusCode, Json<IndexJobResponse>), AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
@@ -991,26 +1073,23 @@ pub async fn rebuild_index(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let (storage_count, indexed_count) =
-        memory_guard.rebuild_index().map_err(AppError::Internal)?;
-
-    Ok(Json(RebuildIndexResponse {
-        success: true,
-        storage_count,
-        indexed_count,
-        is_healthy: storage_count == indexed_count,
-    }))
+    Ok(start_index_job(
+        &state,
+        &req.user_id,
+        memory_sys,
+        IndexJob::Rebuild,
+    ))
 }
 
-/// Re-embed all memories with context-prefixed embeddings (v0.7.2 migration)
+/// Re-embed all memories with context-prefixed embeddings (v0.7.2 migration), in the
+/// background (202).
 ///
 /// Clears pre-computed embeddings and re-indexes every memory through the new
 /// `extract_searchable_text()` path which prepends [project | topic | type].
 pub async fn reembed_all(
     State(state): State<AppState>,
     Json(req): Json<RebuildIndexRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<(StatusCode, Json<IndexJobResponse>), AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
@@ -1018,14 +1097,12 @@ pub async fn reembed_all(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let (reembedded, failed) = memory_guard.reembed_all().map_err(AppError::Internal)?;
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "reembedded": reembedded,
-        "failed": failed,
-    })))
+    Ok(start_index_job(
+        &state,
+        &req.user_id,
+        memory_sys,
+        IndexJob::Reembed,
+    ))
 }
 
 // =============================================================================
@@ -1083,7 +1160,12 @@ pub async fn list_backups(
 ) -> Result<Json<ListBackupsResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    match state.list_backups_for_user(&req.user_id) {
+    let listed = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        run_blocking(move || Ok(state.list_backups_for_user(&user_id))).await?
+    };
+    match listed {
         Ok(backups) => {
             let count = backups.len();
             Ok(Json(ListBackupsResponse {
@@ -1103,7 +1185,14 @@ pub async fn verify_backup(
 ) -> Result<Json<VerifyBackupResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    match state.verify_backup_for_user(&req.user_id, req.backup_id) {
+    // Verification reads the whole backup to check its checksums.
+    let verified = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        let backup_id = req.backup_id;
+        run_blocking(move || Ok(state.verify_backup_for_user(&user_id, backup_id))).await?
+    };
+    match verified {
         Ok(is_valid) => Ok(Json(VerifyBackupResponse {
             success: true,
             is_valid,
@@ -1128,7 +1217,13 @@ pub async fn purge_backups(
 ) -> Result<Json<PurgeBackupsResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    match state.purge_backups_for_user(&req.user_id, req.keep_count) {
+    let purged = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
+        let keep_count = req.keep_count;
+        run_blocking(move || Ok(state.purge_backups_for_user(&user_id, keep_count))).await?
+    };
+    match purged {
         Ok(purged_count) => {
             if purged_count > 0 {
                 state.log_event(
