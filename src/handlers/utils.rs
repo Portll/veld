@@ -338,6 +338,20 @@ pub fn resolve_request_user_id(
         })
 }
 
+/// Runs a handler's store, graph, index or embedding work on the blocking pool. That work
+/// parks the thread it runs on, and the `parking_lot` guards around it wait the same way; on
+/// a runtime worker that is a worker every other request and the probes go without until it
+/// is done. A request dropped mid-task leaves the task to finish.
+pub(crate) async fn run_blocking<T, F>(work: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("blocking task did not complete: {e}")))?
+}
+
 #[cfg(test)]
 mod resolve_request_user_id_tests {
     use super::resolve_request_user_id;

@@ -8,8 +8,9 @@ use serde::Deserialize;
 
 use super::state::MultiUserMemoryManager;
 use super::types::RetrieveResponse;
+use super::utils::run_blocking;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::{self, Memory, Query as MemoryQuery};
+use crate::memory::{self, Query as MemoryQuery};
 use crate::validation;
 use std::sync::Arc;
 
@@ -37,8 +38,6 @@ pub async fn advanced_search(
         .get_user_memory_async(&req.user_id)
         .await
         .map_err(AppError::Internal)?;
-
-    let memory_guard = memory_sys.read();
 
     // Build search criteria
     let mut criterias = Vec::new();
@@ -87,17 +86,18 @@ pub async fn advanced_search(
         memory::storage::SearchCriteria::Combined(criterias)
     };
 
-    let raw_memories = memory_guard.apply_recall_gates(
-        memory_guard
-            .advanced_search(criteria)
-            .map_err(AppError::Internal)?,
-    );
-
-    let count = raw_memories.len();
-    let memories: Vec<serde_json::Value> = raw_memories
-        .into_iter()
-        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
-        .collect();
+    let (memories, count) = run_blocking(move || {
+        let memory = memory_sys.read();
+        let raw_memories =
+            memory.apply_recall_gates(memory.advanced_search(criteria).map_err(AppError::Internal)?);
+        let count = raw_memories.len();
+        let memories: Vec<serde_json::Value> = raw_memories
+            .into_iter()
+            .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
+            .collect();
+        Ok((memories, count))
+    })
+    .await?;
 
     Ok(Json(RetrieveResponse { memories, count }))
 }
@@ -124,8 +124,6 @@ pub async fn multimodal_search(
         .get_user_memory_async(&req.user_id)
         .await
         .map_err(AppError::Internal)?;
-
-    let memory_guard = memory_sys.read();
 
     let retrieval_mode = match req.mode.as_str() {
         "similarity" => memory::RetrievalMode::Similarity,
@@ -175,14 +173,7 @@ pub async fn multimodal_search(
         ..Default::default()
     };
 
-    let shared_memories = memory_guard.recall(&query).map_err(AppError::Internal)?;
-    let raw_memories: Vec<Memory> = shared_memories.iter().map(|m| (**m).clone()).collect();
-    let count = raw_memories.len();
-
-    let memories: Vec<serde_json::Value> = raw_memories
-        .into_iter()
-        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
-        .collect();
+    let (memories, count) = recall_to_json(memory_sys, query).await?;
 
     state.log_event(
         &req.user_id,
@@ -224,8 +215,6 @@ pub async fn robotics_search(
         .get_user_memory_async(&req.user_id)
         .await
         .map_err(AppError::Internal)?;
-
-    let memory_guard = memory_sys.read();
 
     let retrieval_mode = match req.mode.as_str() {
         "spatial" => memory::RetrievalMode::Spatial,
@@ -280,14 +269,7 @@ pub async fn robotics_search(
         ..Default::default()
     };
 
-    let shared_memories = memory_guard.recall(&query).map_err(AppError::Internal)?;
-    let raw_memories: Vec<Memory> = shared_memories.iter().map(|m| (**m).clone()).collect();
-    let count = raw_memories.len();
-
-    let memories: Vec<serde_json::Value> = raw_memories
-        .into_iter()
-        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
-        .collect();
+    let (memories, count) = recall_to_json(memory_sys, query).await?;
 
     state.log_event(
         &req.user_id,
@@ -300,4 +282,24 @@ pub async fn robotics_search(
     );
 
     Ok(Json(RetrieveResponse { memories, count }))
+}
+
+/// The full recall pipeline (embedding, vector, BM25, graph and rerank), with its results
+/// serialized for the response, on the blocking pool.
+async fn recall_to_json(
+    memory_sys: crate::user_memory::SharedUserMemory,
+    query: MemoryQuery,
+) -> Result<(Vec<serde_json::Value>, usize), AppError> {
+    run_blocking(move || {
+        let shared_memories = memory_sys
+            .read()
+            .recall(&query)
+            .map_err(AppError::Internal)?;
+        let memories: Vec<serde_json::Value> = shared_memories
+            .iter()
+            .filter_map(|m| crate::memory::injection::serialize_flagged(m))
+            .collect();
+        Ok((memories, shared_memories.len()))
+    })
+    .await
 }
