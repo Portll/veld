@@ -1086,7 +1086,6 @@ impl RRFusion {
     /// Returns fused (MemoryId, rrf_score) sorted by rrf_score descending.
     pub fn fuse(&self, ranked_lists: Vec<Vec<(MemoryId, f32)>>) -> Vec<(MemoryId, f32)> {
         let mut scores: HashMap<MemoryId, f32> = HashMap::new();
-        let mut original_scores: HashMap<MemoryId, Vec<Option<f32>>> = HashMap::new();
         // First-appearance order across the input lists: equal fused scores keep it, so the
         // output does not depend on the map's per-instance hash order.
         let mut first_seen: Vec<MemoryId> = Vec::new();
@@ -1094,7 +1093,7 @@ impl RRFusion {
         for (list_idx, ranked_list) in ranked_lists.iter().enumerate() {
             let weight = self.weights.get(list_idx).copied().unwrap_or(1.0);
 
-            for (rank, (memory_id, score)) in ranked_list.iter().enumerate() {
+            for (rank, (memory_id, _)) in ranked_list.iter().enumerate() {
                 // RRF formula: weight * 1/(k + rank)
                 // rank is 0-indexed, so rank+1 for 1-indexed
                 let rrf_contribution = weight / (self.k + (rank + 1) as f32);
@@ -1104,14 +1103,6 @@ impl RRFusion {
                     0.0
                 });
                 *fused += rrf_contribution;
-
-                // Track original scores for debugging
-                let orig = original_scores
-                    .entry(memory_id.clone())
-                    .or_insert_with(|| vec![None; ranked_lists.len()]);
-                if list_idx < orig.len() {
-                    orig[list_idx] = Some(*score);
-                }
             }
         }
 
