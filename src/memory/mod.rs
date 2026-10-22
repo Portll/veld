@@ -1580,7 +1580,11 @@ impl MemorySystem {
             .get_bytes(dials::COGNITIVE_DIALS_KEY)
         {
             match serde_json::from_slice::<dials::CognitiveDials>(&bytes) {
-                Ok(persisted) => *cognitive_dials_arc.write() = persisted.sanitized(),
+                Ok(persisted) => {
+                    *cognitive_dials_arc.write() = persisted
+                        .without_unknown_signals("persisted dials")
+                        .sanitized()
+                }
                 Err(e) => tracing::warn!("ignoring corrupt persisted cognitive dials: {e}"),
             }
         }
@@ -1901,7 +1905,9 @@ impl MemorySystem {
     /// by automated tuners. Persistence is best-effort: a KV failure is logged, not
     /// fatal (the in-memory dials still update).
     pub fn set_cognitive_dials(&self, new_dials: dials::CognitiveDials) {
-        let mut d = new_dials.sanitized();
+        let mut d = new_dials
+            .without_unknown_signals("set_cognitive_dials")
+            .sanitized();
         d.updated_at = Some(chrono::Utc::now());
         Self::apply_rerank_model_dial(&self.hybrid_search, &mut d);
         match serde_json::to_vec(&d) {

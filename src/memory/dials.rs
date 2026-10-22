@@ -49,6 +49,30 @@ fn default_working_memory_threshold() -> u32 {
     crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD
 }
 
+/// Every id a `disabled_signals` entry can name: the signals recall gates through
+/// [`CognitiveDials::signal_enabled`]. An entry outside this set switches nothing off.
+pub const SIGNAL_IDS: &[&str] = &[
+    "seq_proximity",
+    "context_richness",
+    "temporal_fact_density",
+    "entity_confidence",
+    "access_burstiness",
+    "valence",
+    "bm25_specificity_discount",
+    "episode_tcm",
+    "confidence_gate",
+    "content_fallback",
+    "mmr",
+    "ordinal_cliff",
+    "arousal",
+    "valence_credibility",
+    "session_continuity",
+    "hebbian",
+    "query_coverage",
+    "people_density",
+    "prf",
+];
+
 /// KV key under which a user's `CognitiveDials` are persisted. The store is per-user
 /// (each `MemorySystem` opens that user's own database), so a bare key is sufficient.
 pub const COGNITIVE_DIALS_KEY: &[u8] = b"cognitive_dials";
@@ -275,13 +299,8 @@ pub struct CognitiveDials {
     /// change**.  Populated from `VELD_DIALS_DISABLE_SIGNALS` (comma-separated
     /// IDs) at startup, or via the `PUT /api/dials` HTTP endpoint at runtime.
     ///
-    /// Stable signal IDs:
-    /// `seq_proximity`, `context_richness`, `temporal_fact_density`,
-    /// `entity_confidence`, `access_burstiness`, `valence`,
-    /// `bm25_specificity_discount`, `episode_tcm`, `confidence_gate`,
-    /// `content_fallback`, `mmr`, `ordinal_cliff`, `arousal`,
-    /// `valence_credibility`, `session_continuity`, `hebbian`, `query_coverage`,
-    /// `people_density`, `prf`.
+    /// The ids are [`SIGNAL_IDS`]. `PUT /api/dials` refuses a set naming any other id;
+    /// the env var and persisted dials drop one with a warning.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
 }
@@ -774,7 +793,39 @@ impl CognitiveDials {
     /// they add zero overhead when no signals are disabled.
     #[inline]
     pub fn signal_enabled(&self, id: &str) -> bool {
+        debug_assert!(
+            SIGNAL_IDS.contains(&id),
+            "signal id {id:?} is not in SIGNAL_IDS"
+        );
         !self.disabled_signals.contains(id)
+    }
+
+    /// The `disabled_signals` entries that name no signal in [`SIGNAL_IDS`], sorted.
+    pub fn unknown_signals(&self) -> Vec<String> {
+        let mut unknown: Vec<String> = self
+            .disabled_signals
+            .iter()
+            .filter(|id| !SIGNAL_IDS.contains(&id.as_str()))
+            .cloned()
+            .collect();
+        unknown.sort();
+        unknown
+    }
+
+    /// These dials without the `disabled_signals` entries that name no signal, each one
+    /// logged as a warning naming `origin` (where the set came from). Such an entry
+    /// disables nothing, so a typo would otherwise read as a signal switched off.
+    pub fn without_unknown_signals(mut self, origin: &str) -> Self {
+        for id in self.unknown_signals() {
+            tracing::warn!(
+                signal = %id,
+                origin,
+                known = %SIGNAL_IDS.join(","),
+                "unknown signal id in disabled_signals ignored"
+            );
+            self.disabled_signals.remove(&id);
+        }
+        self
     }
 
     /// Cross-encoder share of the Layer 5.3 blend for a query shape: `ce_blend` when set,
@@ -941,13 +992,17 @@ impl CognitiveDials {
                 .map(String::from)
                 .collect();
         }
-        d.sanitized()
+        d.without_unknown_signals("VELD_DIALS_DISABLE_SIGNALS")
+            .sanitized()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VELD_DIALS_DISABLE_SIGNALS` is process-wide; tests that set it run one at a time.
+    static DISABLE_SIGNALS_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn default_is_inert() {
@@ -1005,28 +1060,7 @@ mod tests {
     #[test]
     fn signal_enabled_all_on_by_default() {
         let d = CognitiveDials::default();
-        let all_ids = [
-            "seq_proximity",
-            "context_richness",
-            "temporal_fact_density",
-            "entity_confidence",
-            "access_burstiness",
-            "valence",
-            "bm25_specificity_discount",
-            "episode_tcm",
-            "confidence_gate",
-            "content_fallback",
-            "mmr",
-            "ordinal_cliff",
-            "arousal",
-            "valence_credibility",
-            "session_continuity",
-            "hebbian",
-            "query_coverage",
-            "people_density",
-            "prf",
-        ];
-        for id in &all_ids {
+        for id in SIGNAL_IDS {
             assert!(
                 d.signal_enabled(id),
                 "signal '{}' must be enabled by default (empty disabled_signals)",
@@ -1088,6 +1122,9 @@ mod tests {
         // cargo test runs each #[test] in the same process, but serial tests
         // that set+unset the same var are racey only when run in parallel;
         // here we use a unique-enough var name and restore it after the call.
+        let _env = DISABLE_SIGNALS_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::set_var("VELD_DIALS_DISABLE_SIGNALS", "seq_proximity,valence");
         let d = CognitiveDials::from_env();
         std::env::remove_var("VELD_DIALS_DISABLE_SIGNALS");
@@ -1104,6 +1141,50 @@ mod tests {
         assert!(d.signal_enabled("hebbian"), "hebbian must remain enabled");
         // Default reconsolidation state must be preserved.
         assert!(!d.reconsolidation_enabled);
+    }
+
+    /// Known ids pass; an unknown one is reported, then dropped with a warning, so the set
+    /// the dials carry is the set that switches something off.
+    #[test]
+    fn unknown_signal_ids_are_reported_and_dropped() {
+        let d = CognitiveDials {
+            disabled_signals: ["valence", "valance", "prf", "hebian"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            d.unknown_signals(),
+            vec!["hebian".to_string(), "valance".to_string()]
+        );
+        let cleaned = d.without_unknown_signals("test");
+        assert!(cleaned.unknown_signals().is_empty());
+        let mut kept: Vec<&str> = cleaned
+            .disabled_signals
+            .iter()
+            .map(String::as_str)
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec!["prf", "valence"]);
+        assert!(!cleaned.signal_enabled("valence"));
+    }
+
+    /// An unknown id in `VELD_DIALS_DISABLE_SIGNALS` is ignored at load, the known ones kept.
+    #[test]
+    fn from_env_drops_unknown_signal_ids() {
+        let _env = DISABLE_SIGNALS_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("VELD_DIALS_DISABLE_SIGNALS", "seq_proximty,arousal");
+        let d = CognitiveDials::from_env();
+        std::env::remove_var("VELD_DIALS_DISABLE_SIGNALS");
+        assert!(d.unknown_signals().is_empty());
+        assert!(!d.signal_enabled("arousal"));
+        assert!(
+            d.signal_enabled("seq_proximity"),
+            "the misspelling disabled nothing"
+        );
     }
 
     /// The two recall-cost dials read their env vars and clamp: at least one entity is

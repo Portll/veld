@@ -61,11 +61,13 @@ pub async fn get_dials(
 
 /// `PUT /api/dials` — replace the user's cognitive dials (sanitized + `updated_at`
 /// stamped). Returns the resulting, sanitized dials so the caller sees clamped values.
+/// A `disabled_signals` entry that names no signal is refused with a 400 naming it.
 pub async fn set_dials(
     State(state): State<AppState>,
     Json(req): Json<SetDialsRequest>,
 ) -> Result<Json<CognitiveDials>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validate_disabled_signals(&req.dials)?;
     let memory = state
         .get_user_memory_async(&req.user_id)
         .await
@@ -79,6 +81,22 @@ pub async fn set_dials(
         "Cognitive dials updated"
     );
     Ok(Json(result))
+}
+
+/// Refuse a dial set whose `disabled_signals` names an id recall does not gate.
+fn validate_disabled_signals(dials: &CognitiveDials) -> Result<(), AppError> {
+    let unknown = dials.unknown_signals();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::InvalidInput {
+        field: "dials.disabled_signals".to_string(),
+        reason: format!(
+            "unknown signal id(s): {}; known ids: {}",
+            unknown.join(", "),
+            crate::memory::dials::SIGNAL_IDS.join(", ")
+        ),
+    })
 }
 
 /// `GET /api/dials/schema` — default / recommended / absolute ranges for the recall
@@ -100,4 +118,43 @@ pub async fn get_dials_schema() -> Json<serde_json::Value> {
         })
         .collect();
     Json(serde_json::json!({ "sliders": sliders }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_disabled_signals;
+    use crate::errors::AppError;
+    use crate::memory::CognitiveDials;
+
+    fn dials_disabling(ids: &[&str]) -> CognitiveDials {
+        CognitiveDials {
+            disabled_signals: ids.iter().map(|id| id.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A PUT naming only known signals passes; one naming an unknown id is a 400 that names
+    /// it (and not the known ids it also carried as unknown).
+    #[test]
+    fn put_refuses_an_unknown_signal_by_name() {
+        assert!(validate_disabled_signals(&dials_disabling(&["valence", "prf"])).is_ok());
+        assert!(validate_disabled_signals(&CognitiveDials::default()).is_ok());
+
+        let err = validate_disabled_signals(&dials_disabling(&["valence", "valance"]))
+            .expect_err("an unknown id must be refused");
+        match &err {
+            AppError::InvalidInput { field, reason } => {
+                assert_eq!(field, "dials.disabled_signals");
+                assert!(
+                    reason.starts_with("unknown signal id(s): valance;"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
 }
