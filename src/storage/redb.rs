@@ -1996,6 +1996,17 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         })
     }
 
+    fn ids_in_date_range(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<MemoryId>> {
+        let txn = self.database.begin_read()?;
+        Ok(self
+            .index_candidates(&txn, &SearchCriteria::ByDate { start, end })?
+            .unwrap_or_default())
+    }
+
     fn search(&self, criteria: SearchCriteria) -> Result<Vec<Memory>> {
         let txn = self.database.begin_read()?;
         let Some(candidates) = self.index_candidates(&txn, &criteria)? else {

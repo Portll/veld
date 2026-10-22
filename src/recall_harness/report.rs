@@ -292,6 +292,10 @@ pub struct RetrievalDials {
     /// The `date_window_leg` dial: `None` is the engine default (on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_window_leg: Option<bool>,
+    /// The `date_window_index_vectors` dial: `None` is the engine default (the leg reads
+    /// each window memory's record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_window_index_vectors: Option<bool>,
     /// The `relative_priors` dial: `None` is the engine default (priors added to the base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_priors: Option<bool>,
@@ -310,6 +314,7 @@ impl RetrievalDials {
     pub fn of(dials: &crate::memory::dials::CognitiveDials) -> Self {
         Self {
             date_window_leg: dials.date_window_leg,
+            date_window_index_vectors: dials.date_window_index_vectors,
             relative_priors: dials.relative_priors,
             graph_episode_entities: dials.graph_episode_entities,
             confidence_gate_all_paths: dials.confidence_gate_all_paths,
@@ -320,6 +325,9 @@ impl RetrievalDials {
         let mut set: Vec<String> = Vec::new();
         if let Some(v) = self.date_window_leg {
             set.push(format!("date_window_leg={v}"));
+        }
+        if let Some(v) = self.date_window_index_vectors {
+            set.push(format!("date_window_index_vectors={v}"));
         }
         if let Some(v) = self.relative_priors {
             set.push(format!("relative_priors={v}"));
@@ -1938,12 +1946,15 @@ mod tests {
         );
         let dials = crate::memory::dials::CognitiveDials {
             confidence_gate_all_paths: Some(true),
+            date_window_index_vectors: Some(true),
             ..Default::default()
         };
-        assert_eq!(
-            RetrievalDials::of(&dials).confidence_gate_all_paths,
-            Some(true)
-        );
+        let recorded = RetrievalDials::of(&dials);
+        assert_eq!(recorded.confidence_gate_all_paths, Some(true));
+        assert_eq!(recorded.date_window_index_vectors, Some(true));
+        assert!(recorded
+            .describe()
+            .contains("date_window_index_vectors=true"));
     }
 
     /// A baseline written before the field existed ran under engine defaults, so a current

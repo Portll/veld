@@ -178,6 +178,15 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub date_window_leg: Option<bool>,
 
+    /// Whether the date window leg scores a long-term memory from the vector index rather
+    /// than its record: ids come from the date index, a memory indexed as one vector is
+    /// scored from it, and only the rest (chunked, unindexed, soft-forgotten) are read.
+    /// RocksDB's date index is per UTC day, and a memory scored from the index ties on
+    /// its id rather than its creation time, so the pool can differ from the record path.
+    /// `None` and `Some(false)` read every memory in the window.
+    #[serde(default)]
+    pub date_window_index_vectors: Option<bool>,
+
     /// Whether Layer 5 puts relevance first: the fused base divided by the candidate set's
     /// best base, scaled by `1 + Σ priors`, instead of the priors added to the base. Added,
     /// priors up to ~0.5 sit on an RRF base near 0.03, so they order the list more than
@@ -677,6 +686,7 @@ impl Default for CognitiveDials {
             rerank_model: None,
             rrf_weights: None,
             date_window_leg: None,
+            date_window_index_vectors: None,
             relative_priors: None,
             graph_episode_entities: None,
             confidence_gate_all_paths: None,
@@ -874,7 +884,8 @@ impl CognitiveDials {
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
     /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG,
-    /// GRAPH_EPISODE_ENTITIES,CONFIDENCE_GATE_ALL_PATHS,BM25_READ_STALENESS_MS}`.
+    /// DATE_WINDOW_INDEX_VECTORS,GRAPH_EPISODE_ENTITIES,CONFIDENCE_GATE_ALL_PATHS,
+    /// BM25_READ_STALENESS_MS}`.
     pub fn from_env() -> Self {
         // An empty value is unset: the recall workflow passes '' for a dispatch input left
         // blank, and reading that as `false` would record an override the run never made.
@@ -935,6 +946,9 @@ impl CognitiveDials {
         }
         if let Some(v) = env_bool("VELD_DIALS_DATE_WINDOW_LEG") {
             d.date_window_leg = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_DATE_WINDOW_INDEX_VECTORS") {
+            d.date_window_index_vectors = Some(v);
         }
         if let Some(v) = env_bool("VELD_DIALS_RELATIVE_PRIORS") {
             d.relative_priors = Some(v);
@@ -1031,6 +1045,7 @@ mod tests {
         assert!(d.rerank_model.is_none());
         assert!(d.rrf_weights.is_none());
         assert!(d.date_window_leg.is_none());
+        assert!(d.date_window_index_vectors.is_none());
         assert!(d.relative_priors.is_none());
         assert!(d.graph_episode_entities.is_none());
         assert!(d.confidence_gate_all_paths.is_none());

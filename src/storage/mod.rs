@@ -492,6 +492,19 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn update_memory(&self, memory: &Memory) -> Result<()>;
     fn delete_memory(&self, id: &MemoryId) -> Result<()>;
     fn search(&self, criteria: SearchCriteria) -> Result<Vec<Memory>>;
+    /// The ids the date index files under `[start, end]`, without reading a record. A
+    /// row is not proof of a live memory: forgotten memories keep theirs, and RocksDB's
+    /// index is per UTC day, so it can name a memory created later on `end`'s day. A
+    /// caller that needs only live memories in the exact span checks the record. The
+    /// default answers through `search`, which reads every record; engines with a date
+    /// index override it.
+    fn ids_in_date_range(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<MemoryId>> {
+        Ok(self
+            .search(SearchCriteria::ByDate { start, end })?
+            .into_iter()
+            .map(|memory| memory.id)
+            .collect())
+    }
     fn get_vector_mapping(&self, id: &MemoryId) -> Result<Option<VectorMappingEntry>>;
     /// Every mapping at once — the retrieval engine's index rebuild reads the
     /// whole set, and this was its last reason to hold the concrete store.
