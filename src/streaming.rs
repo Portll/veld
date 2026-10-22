@@ -209,10 +209,10 @@ fn default_trigger_events() -> Vec<String> {
     ]
 }
 fn default_injection_min_relevance() -> f32 {
-    0.70 // Same default as InjectionConfig
+    0.70
 }
 fn default_injection_max_memories() -> usize {
-    3 // Same default as InjectionConfig
+    3
 }
 fn default_injection_cooldown() -> u64 {
     180 // 3 minutes
@@ -473,6 +473,10 @@ pub struct SurfacedStreamMemory {
 
     /// Tags/entities from the memory
     pub tags: Vec<String>,
+
+    /// C3.1 (W-006): untrusted content reading like an injection directive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injection_suspected: Option<bool>,
 }
 
 /// Breakdown of composite relevance score components
@@ -1345,8 +1349,6 @@ impl StreamingMemoryExtractor {
         .await
         .ok()?;
 
-        // Create injection config from extraction config
-        // Streaming injection config (simple values, no InjectionConfig struct needed)
         let min_relevance = config.injection_min_relevance;
         let max_per_message = config.injection_max_memories;
         let cooldown_seconds = config.injection_cooldown_secs;
@@ -1451,6 +1453,7 @@ impl StreamingMemoryExtractor {
                             },
                             created_at: m.created_at,
                             tags: m.experience.entities.clone(),
+                            injection_suspected: crate::memory::injection::injection_suspected(&m),
                         },
                     )
                     .collect()

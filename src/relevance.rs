@@ -256,6 +256,10 @@ pub struct SurfacedMemory {
 
     /// Tags associated with the memory
     pub tags: Vec<String>,
+
+    /// C3.1 (W-006): untrusted content reading like an injection directive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injection_suspected: Option<bool>,
 }
 
 /// Reason why a memory was surfaced
@@ -957,6 +961,7 @@ impl RelevanceEngine {
                         },
                         created_at: memory.created_at,
                         tags: memory.experience.tags.clone(),
+                        injection_suspected: crate::memory::injection::injection_suspected(&memory),
                     })
                 },
             )
@@ -1167,6 +1172,7 @@ impl RelevanceEngine {
                         },
                         created_at: memory.created_at,
                         tags: memory.experience.tags.clone(),
+                        injection_suspected: crate::memory::injection::injection_suspected(&memory),
                     })
                 },
             )

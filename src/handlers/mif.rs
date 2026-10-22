@@ -580,7 +580,7 @@ pub async fn get_uncompressed_old(
     let count = raw_memories.len();
     let memories: Vec<serde_json::Value> = raw_memories
         .into_iter()
-        .filter_map(|m| serde_json::to_value(&m).ok())
+        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
         .collect();
 
     Ok(Json(RetrieveResponse { memories, count }))
