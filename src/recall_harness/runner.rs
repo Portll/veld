@@ -22,6 +22,7 @@ use crate::memory::retrieval::RetrievalOutcome;
 use crate::memory::types::MemoryId;
 use crate::memory::types::{ExperienceType, LayerMode, NerEntityRecord};
 use crate::memory::{Experience, Query};
+use crate::similarity::bars::SimilarityBar;
 
 use super::fixtures::{
     self, CorpusItem, SmokeCase, SmokeCategory, SMOKE_CASES_PATH, SMOKE_CORPUS_PATH,
@@ -29,10 +30,10 @@ use super::fixtures::{
 use super::metrics::{paired_bootstrap_ci, Metrics};
 use super::report::{
     aggregate_category, aggregate_layer, median, AblationCaseRow, AblationReport, AblationRow,
-    CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure, LayerReport,
-    LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord, RankedResult,
-    ReachabilityCategory, ReachabilityReport, Report, RerankSetting, RetrievalDials, StageTrace,
-    SMOKE_K,
+    BarCount, CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure,
+    IngestPath, LayerReport, LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow,
+    PerCaseRecord, RankedResult, ReachabilityCategory, ReachabilityReport, Report, RerankSetting,
+    RetrievalDials, StageTrace, SMOKE_K,
 };
 
 /// Embedder identifier emitted in the report. Matches the model wired into
@@ -294,6 +295,10 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
     //
     // RH-8: within each pass, ingest happens once and the case loop runs
     // once per `LayerMode`. Determinism check is per-mode.
+    let ingest = IngestPath::from_env()?;
+    // The counters are process-wide and recall-eval runs one suite per process, so the
+    // difference across the passes is this run's.
+    let bars_before = SimilarityBar::ALL.map(SimilarityBar::totals);
     let mut passes: Vec<OnePassResult> = Vec::with_capacity(repeats);
     // Model tape coverage: inputs the models were first asked for in each repeat.
     let mut tape_growth: Vec<(usize, usize)> = Vec::new();
@@ -312,6 +317,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
             &cases,
             &layer_modes,
             inputs.age_days,
+            ingest,
         )
         .with_context(|| format!("repeat {i} of {repeats}"))?;
         passes.push(pass);
@@ -452,6 +458,21 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         rerank: Some(passes[0].rerank.clone()),
         retrieval_dials: Some(passes[0].retrieval_dials.clone()),
         model_tape: crate::embeddings::model_tape::replay_digest(),
+        ingest,
+        similarity_bars: SimilarityBar::ALL
+            .iter()
+            .zip(bars_before)
+            .map(|(bar, (evaluated_before, fired_before))| {
+                let (evaluated, fired) = bar.totals();
+                (
+                    bar.label().to_string(),
+                    BarCount {
+                        evaluated: evaluated - evaluated_before,
+                        fired: fired - fired_before,
+                    },
+                )
+            })
+            .collect(),
         git_sha: inputs.git_sha.clone(),
         timestamp: chrono::Utc::now(),
         layers,
@@ -679,6 +700,7 @@ fn run_one_pass(
     cases: &[SmokeCase],
     layer_modes: &[LayerMode],
     age_days: f64,
+    ingest: IngestPath,
 ) -> Result<OnePassResult> {
     // Ingest through the production manager so the graph/lineage/ontology layer
     // is actually built, then query the per-user `MemorySystem` (which now has a
@@ -688,7 +710,7 @@ fn run_one_pass(
 
     // The NER-backend gate now lives in `ingest_corpus`, so every measurement
     // path is covered rather than only the two that remembered to ask.
-    let id_map = ingest_corpus(&manager, corpus)?;
+    let id_map = ingest_corpus_with(&manager, corpus, ingest)?;
     let system = manager.get_user_memory(EVAL_USER)?;
 
     // Typed-fraction scoreboard: the substrate's creation metric, printed once
@@ -1329,9 +1351,20 @@ pub(crate) fn guard_ner_backend(manager: &MultiUserMemoryManager) -> Result<()> 
     Ok(())
 }
 
+/// [`ingest_corpus_with`] on the path `SHODH_EVAL_INGEST` names.
 pub fn ingest_corpus(
     manager: &MultiUserMemoryManager,
     corpus: &[CorpusItem],
+) -> Result<HashMap<String, Uuid>> {
+    ingest_corpus_with(manager, corpus, IngestPath::from_env()?)
+}
+
+/// Ingest `corpus` for [`EVAL_USER`] through `path`, then build each memory's graph with the
+/// tag provenance remember records.
+pub fn ingest_corpus_with(
+    manager: &MultiUserMemoryManager,
+    corpus: &[CorpusItem],
+    path: IngestPath,
 ) -> Result<HashMap<String, Uuid>> {
     guard_ner_backend(manager)?;
     let mut map: HashMap<String, Uuid> = HashMap::with_capacity(corpus.len());
@@ -1418,10 +1451,21 @@ pub fn ingest_corpus(
             ..Default::default()
         };
 
-        let memory_id = user_mem
-            .read()
-            .remember(experience.clone(), Some(item.created_at))
-            .with_context(|| format!("remembering corpus item {}", item.id))?;
+        let memory_id = match path {
+            IngestPath::Synchronous => user_mem
+                .read()
+                .remember(experience.clone(), Some(item.created_at)),
+            IngestPath::Deferred => crate::handlers::remember::remember_journaled(
+                manager,
+                &user_mem,
+                EVAL_USER,
+                experience.clone(),
+                Some(item.created_at),
+                crate::handlers::remember::WriteOrigin::default(),
+            )
+            .map(|outcome| outcome.id),
+        }
+        .with_context(|| format!("remembering corpus item {}", item.id))?;
 
         // Pass 2: build the entity graph from this memory (the step the bare
         // MemorySystem path skipped entirely), with the tag provenance remember
@@ -1453,6 +1497,27 @@ pub fn ingest_corpus(
             .with_context(|| format!("storing temporal facts for corpus item {}", item.id))?;
 
         map.insert(item.id.clone(), memory_id.0);
+    }
+
+    if path == IngestPath::Deferred {
+        // A write whose inline embed failed waits in the backlog, which the server's drain
+        // finishes before anyone reads; querying first would measure a store it never serves.
+        let (drain, rewritten) = user_mem
+            .read()
+            .drain_embedding_backlog_journaled(corpus.len().max(1))?;
+        crate::handlers::remember::journal_stored(
+            manager,
+            &user_mem,
+            EVAL_USER,
+            &rewritten,
+            crate::handlers::remember::SnapshotKind::Update,
+        );
+        anyhow::ensure!(
+            drain.remaining == 0,
+            "deferred ingest left {} memories unembedded ({:?})",
+            drain.remaining,
+            drain.stopped
+        );
     }
 
     // Consolidation fidelity (SHODH_EVAL_CONSOLIDATE): production runs a periodic
@@ -4225,6 +4290,64 @@ mod tests {
         assert_eq!(
             root_top1, n,
             "a chain's true root is no longer the strongest-scored origin"
+        );
+    }
+
+    /// Only the deferred path runs the write gate. A copy that differs from an earlier memory
+    /// only in whitespace has different bytes, so both paths store it as its own record; the
+    /// handler's path then absorbs it into the earlier one and the synchronous path keeps it.
+    #[test]
+    fn a_planted_exact_copy_is_absorbed_only_on_the_deferred_path() {
+        let base = chrono::Utc::now() - chrono::Duration::days(1);
+        let corpus: Vec<CorpusItem> = [
+            ("filler", "Station 4 logged 12 litres of rain on Tuesday."),
+            (
+                "original",
+                "Caroline adopted a grey cat named Pepper from the Boston shelter last spring.",
+            ),
+            (
+                "copy",
+                "Caroline adopted a grey cat named  Pepper\nfrom the Boston shelter last spring.",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(k, (id, content))| CorpusItem {
+            id: id.into(),
+            content: content.into(),
+            memory_type: "fact".into(),
+            tags: Vec::new(),
+            created_at: base + chrono::Duration::minutes(k as i64),
+            episode: None,
+        })
+        .collect();
+
+        let absorbed_on = |path: IngestPath| {
+            let dir = unique_storage_dir("write-gate-path");
+            let manager = build_manager(&dir).expect("manager");
+            let id_map = ingest_corpus_with(&manager, &corpus, path).expect("ingest");
+            assert_ne!(
+                id_map["copy"], id_map["original"],
+                "{path:?}: the bytes differ, so remember keeps both"
+            );
+            let system = manager.get_user_memory(EVAL_USER).expect("system");
+            let copy = system
+                .read()
+                .get_memory(&MemoryId(id_map["copy"]))
+                .expect("copy stored");
+            let absorbed_by = copy.experience.metadata.get("absorbed_by").cloned();
+            let original = id_map["original"].to_string();
+            let _ = std::fs::remove_dir_all(&dir);
+            absorbed_by == Some(original)
+        };
+
+        assert!(
+            absorbed_on(IngestPath::Deferred),
+            "the deferred path must absorb the copy into the original"
+        );
+        assert!(
+            !absorbed_on(IngestPath::Synchronous),
+            "the synchronous path has no write gate"
         );
     }
 
