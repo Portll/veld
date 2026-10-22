@@ -7,6 +7,10 @@
 //! vector, written at every point that gives up, and reconciled against the index so a path that
 //! never recorded its failure is caught too. The drain embeds oldest first and stops at the first
 //! "embedder unavailable" rather than hammering a host that is down.
+//!
+//! A tenant's open queues here too, rather than repairing in place, every live memory the
+//! loaded vector index lacks: the open serves at once and the drain indexes them on its tick.
+//! Those rows are [`BacklogEntry::index_only`] when the memory already carries its vectors.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -42,6 +46,12 @@ pub struct BacklogEntry {
     pub last_attempt_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Queued at open for a memory whose vector the saved index lost after the memory was
+    /// embedded and processed: the drain indexes it from the vectors it carries, without the
+    /// absorption and interference passes it already went through. Absent from rows that are
+    /// not, so those serialize as before and an older build reads every row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub index_only: bool,
 }
 
 /// What one attempt to embed and index a memory came to.
@@ -172,9 +182,44 @@ impl EmbeddingBacklogStore {
                 attempts: u32::from(error.is_some()),
                 last_attempt_at: error.map(|_| now),
                 last_error: error.map(str::to_string),
+                index_only: false,
             },
         };
         self.put(id, &entry)
+    }
+
+    /// Queue `ids`, live memories a tenant's open found missing from its vector index, as
+    /// [`BacklogEntry::index_only`] rows, in one atomic write. An id that already has a row
+    /// keeps it: whatever queued it first knows more about what it needs. Returns how many
+    /// rows were added.
+    pub fn enqueue_unindexed(&self, ids: &[MemoryId]) -> Result<usize> {
+        let existing = self.all()?;
+        let now = Utc::now();
+        let pairs = ids
+            .iter()
+            .filter(|id| !existing.contains_key(*id))
+            .map(|id| {
+                let entry = BacklogEntry {
+                    v: SCHEMA,
+                    reason: EnqueueReason::Reconciled,
+                    enqueued_at: now,
+                    attempts: 0,
+                    last_attempt_at: None,
+                    last_error: None,
+                    index_only: true,
+                };
+                Ok((
+                    key(id),
+                    serde_json::to_vec(&entry).context("encode embedding backlog row")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !pairs.is_empty() {
+            self.kv
+                .put_many(&pairs)
+                .context("write embedding backlog rows")?;
+        }
+        Ok(pairs.len())
     }
 
     pub fn report(&self) -> Result<BacklogReport> {
@@ -248,24 +293,37 @@ impl EmbeddingBacklogStore {
         Ok(report)
     }
 
-    /// Embed oldest first, at most `limit`, through `embed_one`. Stops at the first
-    /// `EmbedderUnavailable` so a down host is asked once per drain, not once per row.
+    /// Embed oldest first, at most `limit`, through `embed_one`, which is given each row with
+    /// its id. Stops at the first `EmbedderUnavailable` so a down host is asked once per
+    /// drain, not once per row.
     pub fn drain_with(
         &self,
         limit: usize,
-        mut embed_one: impl FnMut(&MemoryId) -> EmbedOutcome,
+        embed_one: impl FnMut(&MemoryId, &BacklogEntry) -> EmbedOutcome,
+    ) -> Result<DrainReport> {
+        self.drain_where(limit, |_| true, embed_one)
+    }
+
+    /// [`Self::drain_with`] over the rows `select` accepts; the others are left as they are
+    /// and still counted in `remaining`.
+    pub fn drain_where(
+        &self,
+        limit: usize,
+        select: impl Fn(&BacklogEntry) -> bool,
+        mut embed_one: impl FnMut(&MemoryId, &BacklogEntry) -> EmbedOutcome,
     ) -> Result<DrainReport> {
         let rows = self.all()?;
-        let mut ordered: Vec<(&MemoryId, &BacklogEntry)> = rows.iter().collect();
+        let mut ordered: Vec<(&MemoryId, &BacklogEntry)> =
+            rows.iter().filter(|(_, entry)| select(entry)).collect();
         ordered.sort_by(|a, b| {
             a.1.enqueued_at
                 .cmp(&b.1.enqueued_at)
                 .then_with(|| a.0.cmp(b.0))
         });
         let mut report = DrainReport::default();
-        for (id, _) in ordered.into_iter().take(limit) {
+        for (id, entry) in ordered.into_iter().take(limit) {
             report.attempted += 1;
-            match embed_one(id) {
+            match embed_one(id, entry) {
                 EmbedOutcome::Indexed => {
                     self.delete(id)?;
                     report.drained += 1;
@@ -429,7 +487,7 @@ mod tests {
         }
         let mut calls = Vec::new();
         let r = s
-            .drain_with(10, |m| {
+            .drain_with(10, |m, _| {
                 calls.push(m.clone());
                 if *m == id(2) {
                     EmbedOutcome::EmbedderUnavailable("connection refused".into())
@@ -455,7 +513,7 @@ mod tests {
         s.record(&id(1), EnqueueReason::EmbedFailed, None).unwrap();
         s.record(&id(2), EnqueueReason::EmbedFailed, None).unwrap();
         let r = s
-            .drain_with(10, |m| {
+            .drain_with(10, |m, _| {
                 if *m == id(1) {
                     EmbedOutcome::MemoryGone
                 } else {
@@ -483,7 +541,7 @@ mod tests {
 
         let mut calls = 0;
         let r = s
-            .drain_with(10, |_| {
+            .drain_with(10, |_, _| {
                 calls += 1;
                 EmbedOutcome::WritesClosed
             })
@@ -501,7 +559,7 @@ mod tests {
         for n in 1..=5u128 {
             s.record(&id(n), EnqueueReason::Reconciled, None).unwrap();
         }
-        let r = s.drain_with(2, |_| EmbedOutcome::Indexed).unwrap();
+        let r = s.drain_with(2, |_, _| EmbedOutcome::Indexed).unwrap();
         assert_eq!((r.attempted, r.drained, r.remaining), (2, 2, 3));
     }
 
@@ -527,6 +585,83 @@ mod tests {
         *kv.poison.lock().unwrap() = true;
         assert!(s.all().is_err());
         assert!(s.report().is_err());
-        assert!(s.drain_with(1, |_| EmbedOutcome::Indexed).is_err());
+        assert!(s.drain_with(1, |_, _| EmbedOutcome::Indexed).is_err());
+    }
+
+    #[test]
+    fn rows_queued_at_open_are_index_only_and_leave_existing_rows_alone() {
+        let (_, s) = store();
+        s.record(&id(1), EnqueueReason::EmbedFailed, Some("refused"))
+            .unwrap();
+        let before = s.get(&id(1)).unwrap().unwrap();
+
+        assert_eq!(s.enqueue_unindexed(&[id(1), id(2), id(3)]).unwrap(), 2);
+        assert_eq!(s.enqueue_unindexed(&[id(2)]).unwrap(), 0, "already queued");
+
+        assert_eq!(s.get(&id(1)).unwrap().unwrap(), before);
+        let queued = s.get(&id(2)).unwrap().unwrap();
+        assert!(queued.index_only);
+        assert_eq!(queued.reason, EnqueueReason::Reconciled);
+        assert_eq!(queued.attempts, 0);
+
+        let mut seen = Vec::new();
+        s.drain_with(10, |m, entry| {
+            seen.push((m.clone(), entry.index_only));
+            EmbedOutcome::Indexed
+        })
+        .unwrap();
+        assert_eq!(seen, vec![(id(1), false), (id(2), true), (id(3), true)]);
+    }
+
+    #[test]
+    fn a_selective_drain_leaves_the_other_rows_queued() {
+        let (_, s) = store();
+        s.record(&id(1), EnqueueReason::EmbedFailed, Some("refused"))
+            .unwrap();
+        s.enqueue_unindexed(&[id(2)]).unwrap();
+        let mut seen = Vec::new();
+        let r = s
+            .drain_where(
+                10,
+                |entry| entry.index_only,
+                |m, _| {
+                    seen.push(m.clone());
+                    EmbedOutcome::Indexed
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, vec![id(2)]);
+        assert_eq!((r.attempted, r.drained, r.remaining), (1, 1, 1));
+        assert!(s.get(&id(1)).unwrap().is_some());
+    }
+
+    /// The flag is left out of rows that do not carry it, so a row reads the same to a build
+    /// that predates it; one that does carry it is still a row such a build can read.
+    #[test]
+    fn rows_without_the_flag_serialize_as_before() {
+        let (kv, s) = store();
+        s.record(&id(1), EnqueueReason::EmbedFailed, None).unwrap();
+        s.enqueue_unindexed(&[id(2)]).unwrap();
+        let raw = |n: u128| {
+            let bytes = kv.get_bytes(&key(&id(n))).unwrap().unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        assert!(raw(1).get("index_only").is_none());
+        assert_eq!(raw(2)["index_only"], serde_json::Value::Bool(true));
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct RowBeforeTheFlag {
+            v: u32,
+            reason: EnqueueReason,
+            enqueued_at: DateTime<Utc>,
+            attempts: u32,
+            #[serde(default)]
+            last_attempt_at: Option<DateTime<Utc>>,
+            #[serde(default)]
+            last_error: Option<String>,
+        }
+        let bytes = kv.get_bytes(&key(&id(2))).unwrap().unwrap();
+        assert!(serde_json::from_slice::<RowBeforeTheFlag>(&bytes).is_ok());
     }
 }

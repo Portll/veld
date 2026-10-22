@@ -186,6 +186,28 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Replace the file at `path` with `bytes` as an index save does: written to a sibling temp
+/// file that is synced, renamed over `path`, and the directory synced, so a crash leaves the
+/// old file or the new one and never a part of either.
+pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp_path = saving_path(path);
+    let written = (|| -> Result<()> {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })()
+    .and_then(|()| {
+        std::fs::rename(&tmp_path, path)?;
+        sync_parent_dir(path)
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    written
+}
+
 /// Align offset to boundary
 fn align_to(offset: usize, alignment: usize) -> usize {
     (offset + alignment - 1) & !(alignment - 1)
@@ -559,6 +581,16 @@ impl VamanaIndex {
             }
         }
         false
+    }
+
+    /// The content checksum in the header of the index file at `path`, read without mapping
+    /// or verifying the rest. It identifies one saved file: a file that differs from it in
+    /// any byte after the header carries another, so a file written beside an index can
+    /// name the index it belongs to.
+    pub fn saved_checksum(path: &Path) -> Result<u64> {
+        let mut header = [0u8; HEADER_SIZE];
+        File::open(path)?.read_exact(&mut header)?;
+        Ok(VamanaHeader::from_bytes(&header)?.checksum)
     }
 
     /// Verify index file integrity without fully loading

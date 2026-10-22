@@ -779,7 +779,12 @@ impl BM25Index {
     }
 
     fn commit_locked(&self, writer: &mut IndexWriter) -> Result<()> {
-        if let Err(e) = writer.commit() {
+        // Every commit funnels through here, so the histogram covers the background
+        // committer, inline commits and searches that commit pending writes first.
+        let started = Instant::now();
+        let committed = writer.commit();
+        crate::metrics::BM25_COMMIT_DURATION.observe(started.elapsed().as_secs_f64());
+        if let Err(e) = committed {
             // What the writer holds after a failed commit is not known, so no fingerprint
             // may vouch for it.
             self.indexed_text.lock().clear();

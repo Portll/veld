@@ -35,6 +35,76 @@ const VAMANA_INDEX_FILE: &str = "vamana.idx";
 pub(crate) const MAPPINGS_MARKER_FILE: &str = "mappings.authoritative";
 /// Filename for persisted secondary Vamana index
 const SECONDARY_VAMANA_INDEX_FILE: &str = "secondary_vamana.idx";
+/// The secondary index's memory ↔ vector id map, written beside the index file by the same
+/// save and naming that file by its checksum. The primary's map is the stored vector mappings;
+/// the secondary has none in the store, and rebuilding it at open decoded every memory.
+const SECONDARY_ID_MAP_FILE: &str = "secondary_id_map.bin";
+const SECONDARY_ID_MAP_MAGIC: [u8; 4] = *b"VSID";
+const SECONDARY_ID_MAP_VERSION: u32 = 1;
+
+/// When [`RetrievalEngine::save_if_due`] writes the index files: a save rewrites every vector
+/// (413 MB for the largest live tenant), so it waits for enough changes to be worth one, or
+/// for changes to have gone unsaved long enough. Shutdown and eviction save unconditionally.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndexSavePolicy {
+    /// Changes that make a save due, at least: `VELD_VECTOR_INDEX_SAVE_CHANGES`.
+    pub min_changes: u64,
+    /// The share of the index's vectors that makes a save due when that is more, so a large
+    /// index is not rewritten for a change count that is small beside it.
+    pub changes_per_vector: f64,
+    /// How long a change may go unsaved: `VELD_VECTOR_INDEX_SAVE_INTERVAL_SECS`.
+    pub max_unsaved_age: std::time::Duration,
+}
+
+impl Default for IndexSavePolicy {
+    fn default() -> Self {
+        Self {
+            min_changes: 1_000,
+            changes_per_vector: 0.05,
+            max_unsaved_age: std::time::Duration::from_secs(15 * 60),
+        }
+    }
+}
+
+impl IndexSavePolicy {
+    /// The policy this process saves with: the environment, read once.
+    pub fn process() -> Self {
+        static POLICY: std::sync::OnceLock<IndexSavePolicy> = std::sync::OnceLock::new();
+        *POLICY.get_or_init(|| Self::from_lookup(|name| std::env::var(name).ok()))
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let defaults = Self::default();
+        let positive = |name: &str| {
+            lookup(name).and_then(|raw| match raw.trim().parse::<u64>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    warn!("{name}='{raw}' ignored: not a positive whole number");
+                    None
+                }
+            })
+        };
+        Self {
+            min_changes: positive("VELD_VECTOR_INDEX_SAVE_CHANGES").unwrap_or(defaults.min_changes),
+            changes_per_vector: defaults.changes_per_vector,
+            max_unsaved_age: positive("VELD_VECTOR_INDEX_SAVE_INTERVAL_SECS")
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(defaults.max_unsaved_age),
+        }
+    }
+
+    /// Whether `unsaved` changes, the oldest `unsaved_for` old, over an index of `vectors`
+    /// vectors call for a save now.
+    pub fn is_due(&self, unsaved: u64, unsaved_for: std::time::Duration, vectors: usize) -> bool {
+        if unsaved == 0 {
+            return false;
+        }
+        let threshold = self
+            .min_changes
+            .max((vectors as f64 * self.changes_per_vector) as u64);
+        unsaved >= threshold || unsaved_for >= self.max_unsaved_age
+    }
+}
 
 /// Whether this process walks its Vamana graphs on int8 codes (`VELD_VECTOR_INT8_TRAVERSAL`),
 /// rescoring each walk's beam in f32. Off unless set to 1/true/on/yes. Read when an index is
@@ -93,6 +163,18 @@ pub struct RetrievalEngine {
     /// `vector_exact_search_max` and `vector_search_beam` overrides. `None` keeps the index's
     /// own sizing.
     dials: RwLock<Option<Arc<RwLock<crate::memory::dials::CognitiveDials>>>>,
+    /// Index changes since the files were last saved; see [`Self::save_if_due`].
+    unsaved_changes: std::sync::atomic::AtomicU64,
+    /// The index was rebuilt or compacted since the files were saved, so they describe
+    /// none of it however few changes were counted.
+    rewritten_since_save: std::sync::atomic::AtomicBool,
+    /// When the oldest unsaved change was made; `None` while everything is saved. Not a
+    /// lock in the order above: held only to read or swap the instant.
+    unsaved_since: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Held for a whole [`Self::save`], before any lock in the order above. Saves come from
+    /// the drainer's tick, eviction and shutdown, and two at once would write the same
+    /// temporary files.
+    save_lock: parking_lot::Mutex<()>,
 }
 
 /// Bidirectional mapping between memory IDs and vector IDs
@@ -177,6 +259,127 @@ impl IdMapping {
     /// Check if a memory ID has any vector mappings (for deletion verification)
     fn contains(&self, memory_id: &MemoryId) -> bool {
         self.memory_to_vectors.contains_key(memory_id)
+    }
+}
+
+/// Write the secondary index's id map beside the index file at `index_path`, naming that file
+/// by the checksum its save recorded and by its vector count.
+///
+/// Layout, little-endian: magic `VSID`, version u32, index checksum u64, index vector count
+/// u64, entry count u64, then per entry the 16-byte memory id, a u32 vector count and the
+/// vector ids as u32.
+fn write_secondary_id_map(
+    index_path: &Path,
+    index_vectors: usize,
+    entries: &[(MemoryId, Vec<u32>)],
+) -> Result<()> {
+    let checksum = VamanaIndex::saved_checksum(index_path)
+        .context("reading the checksum of the secondary index just saved")?;
+    let vector_ids: usize = entries.iter().map(|(_, ids)| ids.len()).sum();
+    let mut bytes = Vec::with_capacity(32 + entries.len() * 20 + vector_ids * 4);
+    bytes.extend_from_slice(&SECONDARY_ID_MAP_MAGIC);
+    bytes.extend_from_slice(&SECONDARY_ID_MAP_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&checksum.to_le_bytes());
+    bytes.extend_from_slice(&(index_vectors as u64).to_le_bytes());
+    bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (memory_id, ids) in entries {
+        bytes.extend_from_slice(memory_id.0.as_bytes());
+        bytes.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in ids {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+    crate::vector_db::vamana_persist::write_file_atomically(
+        &index_path.with_file_name(SECONDARY_ID_MAP_FILE),
+        &bytes,
+    )
+}
+
+/// The id map saved with the secondary index file at `index_path`, checked against `index`,
+/// which was loaded from that file. `None` when there is no map, or it was written by
+/// another save: then nothing ties its ids to these vectors. Entries for vectors the index
+/// does not hold or has deleted are dropped, and vectors no entry names are marked deleted,
+/// as the primary load retires unreferenced vectors.
+fn read_secondary_id_map(index_path: &Path, index: &VamanaIndex) -> Result<Option<IdMapping>> {
+    let map_path = index_path.with_file_name(SECONDARY_ID_MAP_FILE);
+    let bytes = match fs::read(&map_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", map_path.display())),
+    };
+    let mut cursor = SliceReader::new(&bytes);
+    if cursor.take(4)? != SECONDARY_ID_MAP_MAGIC {
+        anyhow::bail!("{} is not a secondary id map", map_path.display());
+    }
+    let version = cursor.u32()?;
+    if version != SECONDARY_ID_MAP_VERSION {
+        anyhow::bail!("secondary id map version {version} is not one this build reads");
+    }
+    let checksum = cursor.u64()?;
+    let index_vectors = cursor.u64()?;
+    if checksum != VamanaIndex::saved_checksum(index_path)? || index_vectors != index.len() as u64
+    {
+        return Ok(None);
+    }
+    let entries = cursor.u64()?;
+    let vectors = index.len();
+    let mut map = IdMapping::new();
+    let mut referenced = HashSet::new();
+    for _ in 0..entries {
+        let memory_id = MemoryId(uuid::Uuid::from_bytes(cursor.take(16)?.try_into()?));
+        let count = cursor.u32()? as usize;
+        let mut ids = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            let id = cursor.u32()?;
+            if (id as usize) < vectors && !index.is_deleted(id) {
+                ids.push(id);
+            }
+        }
+        if !ids.is_empty() {
+            referenced.extend(ids.iter().copied());
+            map.insert_chunks(memory_id, ids);
+        }
+    }
+    if !cursor.is_empty() {
+        anyhow::bail!("{} has bytes past its last entry", map_path.display());
+    }
+    for id in 0..vectors as u32 {
+        if !referenced.contains(&id) && !index.is_deleted(id) {
+            index.mark_deleted(id);
+        }
+    }
+    Ok(Some(map))
+}
+
+/// Little-endian reads over a byte slice that fail, rather than panic, past its end.
+struct SliceReader<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> SliceReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { rest: bytes }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.rest.len() < n {
+            anyhow::bail!("truncated: wanted {n} bytes, {} left", self.rest.len());
+        }
+        let (head, tail) = self.rest.split_at(n);
+        self.rest = tail;
+        Ok(head)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rest.is_empty()
     }
 }
 
@@ -309,6 +512,10 @@ impl RetrievalEngine {
             storage_path,
             consolidation_events,
             dials: RwLock::new(None),
+            unsaved_changes: std::sync::atomic::AtomicU64::new(0),
+            rewritten_since_save: std::sync::atomic::AtomicBool::new(false),
+            unsaved_since: parking_lot::Mutex::new(None),
+            save_lock: parking_lot::Mutex::new(()),
         };
 
         // ATOMIC STARTUP: Rebuild Vamana from RocksDB (single source of truth)
@@ -611,48 +818,28 @@ impl RetrievalEngine {
                     loaded_index.config.search_list_size = 100;
                     let loaded_count = loaded_index.len();
 
-                    // Rebuild secondary IdMapping from RocksDB memories
-                    // (secondary has no separate RocksDB mapping store)
-                    let all_ids = self.storage.get_all_ids()?;
-                    let mut rebuilt_map = IdMapping::new();
-                    let mut mapped = 0usize;
-
-                    for memory_id in &all_ids {
-                        if let Ok(memory) = self.storage.get(memory_id) {
-                            if memory.is_forgotten() {
-                                continue;
-                            }
-                            if memory.experience.embeddings_secondary.is_some() {
-                                // Assign sequential vector IDs matching the order they were
-                                // inserted during the save that produced this file.
-                                // This works because VamanaIndex assigns IDs sequentially
-                                // and we iterate in the same order (get_all_ids is stable).
-                                if mapped < loaded_count {
-                                    rebuilt_map.insert(memory_id.clone(), mapped as u32);
-                                    mapped += 1;
-                                }
-                            }
+                    // The map saved with this file. Deriving it from the store instead
+                    // decoded every memory, and paired ids by store order, which is not the
+                    // order vectors were inserted in once any were added after a rebuild.
+                    match read_secondary_id_map(&sec_vamana_path, &loaded_index) {
+                        Ok(Some(map)) => {
+                            let memories = map.len();
+                            loaded_index.set_quantized_traversal(int8_traversal_enabled());
+                            *sec_index.write() = loaded_index;
+                            *sec_mapping.write() = map;
+                            info!(
+                                "Secondary Vamana loaded from file: {} vectors, {} memories in {:.2}ms",
+                                loaded_count,
+                                memories,
+                                start_time.elapsed().as_secs_f64() * 1000.0
+                            );
+                            return Ok(());
                         }
+                        Ok(None) => warn!(
+                            "Secondary Vamana file has no id map saved with it, rebuilding"
+                        ),
+                        Err(e) => warn!("Secondary Vamana id map unreadable ({e:#}), rebuilding"),
                     }
-
-                    // If mapping count matches loaded vectors, use the fast path
-                    if mapped == loaded_count {
-                        loaded_index.set_quantized_traversal(int8_traversal_enabled());
-                        *sec_index.write() = loaded_index;
-                        *sec_mapping.write() = rebuilt_map;
-                        info!(
-                            "Secondary Vamana loaded from file: {} vectors in {:.2}ms",
-                            loaded_count,
-                            start_time.elapsed().as_secs_f64() * 1000.0
-                        );
-                        return Ok(());
-                    }
-
-                    // Mismatch — fall through to full rebuild
-                    warn!(
-                        "Secondary Vamana file has {} vectors but found {} mappable memories, rebuilding",
-                        loaded_count, mapped
-                    );
                 }
                 Err(e) => {
                     warn!("Failed to load secondary Vamana file: {}, rebuilding", e);
@@ -701,6 +888,9 @@ impl RetrievalEngine {
             }
         }
 
+        drop(sec_map);
+        drop(sec_idx);
+        self.mark_rewritten();
         info!(
             "Rebuilt secondary Vamana from RocksDB: {} indexed, {} failed in {:.2}s",
             indexed,
@@ -753,7 +943,8 @@ impl RetrievalEngine {
         let live = |vid: u32| (vid as usize) < loaded_count && !deleted.contains(vid);
 
         // A mapping whose ids are missing or deleted in this file was written after the last save;
-        // its memory goes back to the startup repair, which re-indexes and re-records it.
+        // its memory is queued at open for the embedding backlog, whose drain re-indexes and
+        // re-records it.
         let mut usable: Vec<(MemoryId, Vec<u32>)> = Vec::new();
         let mut stale: Vec<MemoryId> = Vec::new();
         for (memory_id, entry) in self.storage.get_all_vector_mappings()? {
@@ -858,6 +1049,7 @@ impl RetrievalEngine {
 
     /// The saved index stops being authoritative the moment stored mappings start to change.
     fn invalidate_saved_index(&self) {
+        self.mark_rewritten();
         let marker = self
             .storage_path
             .join("vector_index")
@@ -881,7 +1073,8 @@ impl RetrievalEngine {
 
     /// Build the primary index from storage. A memory that embeds as one vector, its own, is built
     /// in with Vamana's batch construction and its mapping rewritten; a chunked memory, or one with
-    /// no own vector, loses its mapping and is left to the startup repair, which re-chunks it.
+    /// no own vector, loses its mapping and is queued at open for the embedding backlog, whose
+    /// drain re-chunks it.
     fn rebuild_primary_index(&self) -> Result<()> {
         use crate::embeddings::chunking::{chunk_text, ChunkConfig};
 
@@ -1027,10 +1220,21 @@ impl RetrievalEngine {
     /// On next startup, if .vamana exists and is valid, we load it directly.
     /// Otherwise, we fall back to rebuilding from RocksDB.
     pub fn save(&self) -> Result<()> {
+        let _saving = self.save_lock.lock();
         let index_path = self.storage_path.join("vector_index");
         fs::create_dir_all(&index_path)?;
 
         let vamana_path = index_path.join(VAMANA_INDEX_FILE);
+        // Changes counted before the save began are in what it writes; any counted while it
+        // runs may not be, so only these are cleared when it succeeds.
+        let pending = self
+            .unsaved_changes
+            .load(std::sync::atomic::Ordering::Acquire);
+        let rewritten = self
+            .rewritten_since_save
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        let save_began = std::time::Instant::now();
+        let mut saved_all = true;
 
         // LOCK ORDERING: Always acquire vector_index (1) before id_mapping (2). The mapping
         // is only counted: holding it through the save would stall every insert.
@@ -1038,8 +1242,12 @@ impl RetrievalEngine {
         let vector_count = self.id_mapping.read().len();
         if vector_count > 0 {
             // save_to_file replaces the file atomically: on a crash the old one survives.
+            let started = std::time::Instant::now();
             match vector_index.save_to_file(&vamana_path) {
                 Ok(()) => {
+                    crate::metrics::VECTOR_INDEX_SAVE_DURATION
+                        .with_label_values(&["primary"])
+                        .observe(started.elapsed().as_secs_f64());
                     if let Err(e) = fs::write(index_path.join(MAPPINGS_MARKER_FILE), b"") {
                         warn!("Failed to write the vector mappings marker: {}", e);
                     }
@@ -1050,6 +1258,7 @@ impl RetrievalEngine {
                     );
                 }
                 Err(e) => {
+                    saved_all = false;
                     warn!(
                         "Failed to save Vamana index (will rebuild on restart): {}",
                         e
@@ -1063,25 +1272,121 @@ impl RetrievalEngine {
         drop(vector_index);
 
         // Save secondary Vamana index if present
-        // LOCK ORDERING: secondary_vector_index (3)
-        if let Some(ref sec_index) = self.secondary_vector_index {
+        // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
+        if let (Some(ref sec_index), Some(ref sec_mapping)) =
+            (&self.secondary_vector_index, &self.secondary_id_mapping)
+        {
             let sec_path = self.storage_path.join("secondary_vector_index");
             fs::create_dir_all(&sec_path)?;
             let sec_vamana_path = sec_path.join(SECONDARY_VAMANA_INDEX_FILE);
 
             let sec_idx = sec_index.read();
             if !sec_idx.is_empty() {
+                // Read under the index lock, which holds inserts off for the save: a vector
+                // is added before its mapping, so every entry read here names a vector this
+                // snapshot contains.
+                let entries: Vec<(MemoryId, Vec<u32>)> = sec_mapping
+                    .read()
+                    .memory_to_vectors
+                    .iter()
+                    .map(|(memory_id, vector_ids)| (memory_id.clone(), vector_ids.clone()))
+                    .collect();
+                let started = std::time::Instant::now();
                 match sec_idx.save_to_file(&sec_vamana_path) {
-                    Ok(()) => info!("Saved secondary Vamana index: {} vectors", sec_idx.len()),
-                    Err(e) => warn!(
-                        "Failed to save secondary Vamana (will rebuild on restart): {}",
-                        e
-                    ),
+                    Ok(()) => {
+                        crate::metrics::VECTOR_INDEX_SAVE_DURATION
+                            .with_label_values(&["secondary"])
+                            .observe(started.elapsed().as_secs_f64());
+                        match write_secondary_id_map(&sec_vamana_path, sec_idx.len(), &entries) {
+                            Ok(()) => info!(
+                                "Saved secondary Vamana index: {} vectors, {} memories",
+                                sec_idx.len(),
+                                entries.len()
+                            ),
+                            Err(e) => {
+                                saved_all = false;
+                                warn!(
+                                    "Saved the secondary Vamana index but not its id map; the next \
+                                     open rebuilds it: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        saved_all = false;
+                        warn!(
+                            "Failed to save secondary Vamana (will rebuild on restart): {}",
+                            e
+                        );
+                    }
                 }
             }
         }
 
+        if saved_all {
+            let left = match self.unsaved_changes.fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| Some(count.saturating_sub(pending)),
+            ) {
+                Ok(before) | Err(before) => before.saturating_sub(pending),
+            };
+            let mut since = self.unsaved_since.lock();
+            *since = (left > 0 || self.rewritten_since_save.load(std::sync::atomic::Ordering::Acquire))
+                .then_some(save_began);
+        } else if rewritten {
+            self.rewritten_since_save
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         Ok(())
+    }
+
+    /// Record that an index was rebuilt in memory, so the saved files describe none of it and
+    /// the next [`Self::save_if_due`] saves whatever was counted.
+    fn mark_rewritten(&self) {
+        self.rewritten_since_save
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.note_unsaved(0);
+    }
+
+    /// Count `changes` index changes toward the next save, starting the unsaved clock if
+    /// everything was saved.
+    fn note_unsaved(&self, changes: u64) {
+        self.unsaved_changes
+            .fetch_add(changes, std::sync::atomic::Ordering::AcqRel);
+        self.unsaved_since
+            .lock()
+            .get_or_insert_with(std::time::Instant::now);
+    }
+
+    /// Save the index files when `policy` says enough has changed since the last save, or
+    /// changes have waited long enough; returns whether it saved. The backlog drainer calls
+    /// this on its tick, which makes the tick the timer.
+    pub fn save_if_due(&self, policy: &IndexSavePolicy) -> Result<bool> {
+        let unsaved_for = match *self.unsaved_since.lock() {
+            Some(since) => since.elapsed(),
+            None => return Ok(false),
+        };
+        let unsaved = self
+            .unsaved_changes
+            .load(std::sync::atomic::Ordering::Acquire);
+        let rewritten = self
+            .rewritten_since_save
+            .load(std::sync::atomic::Ordering::Acquire);
+        let vectors = self.vector_index.read().len();
+        if !rewritten && !policy.is_due(unsaved, unsaved_for, vectors) {
+            return Ok(false);
+        }
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Index changes not yet in the saved files.
+    pub fn unsaved_changes(&self) -> u64 {
+        self.unsaved_changes
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Get number of vectors in the index
@@ -1156,7 +1461,7 @@ impl RetrievalEngine {
     /// to ensure ALL content is searchable, not just the first 256 tokens.
     /// Vector index inserts lost since process start. Non-zero means memories
     /// are stored and semantically unreachable — the orphan condition the
-    /// startup recovery repairs, counted while it is accumulating rather than
+    /// open-time scan queues for the backlog, counted while it is accumulating rather than
     /// only after a restart notices.
     pub fn vector_index_failure_count(&self) -> u64 {
         self.vector_index_failures
@@ -1263,12 +1568,32 @@ impl RetrievalEngine {
             (&self.secondary_vector_index, &self.secondary_id_mapping)
         {
             if let Some(ref sec_emb) = memory.experience.embeddings_secondary {
+                // A memory the secondary already holds keeps one vector there. The saved
+                // secondary can hold a memory the saved primary lost (the two files are
+                // written one after the other), and the repair that re-indexes the primary
+                // comes through here.
+                let previous: Vec<u32> = sec_mapping
+                    .read()
+                    .memory_to_vectors
+                    .get(&memory.id)
+                    .cloned()
+                    .unwrap_or_default();
                 // LOCK ORDERING: secondary_vector_index (3) before secondary_id_mapping (4)
-                match sec_index.write().add_vector(sec_emb.clone()) {
+                let added = {
+                    let mut sec_idx = sec_index.write();
+                    for &vid in &previous {
+                        sec_idx.mark_deleted(vid);
+                    }
+                    sec_idx.add_vector(sec_emb.clone())
+                };
+                match added {
                     Ok(sec_vector_id) => {
                         sec_mapping.write().insert(memory.id.clone(), sec_vector_id);
                     }
                     Err(e) => {
+                        if !previous.is_empty() {
+                            sec_mapping.write().remove_all(&memory.id);
+                        }
                         // Secondary failure is non-fatal — primary is authoritative
                         warn!("Failed to index secondary for {}: {}", memory.id.0, e);
                     }
@@ -1276,6 +1601,7 @@ impl RetrievalEngine {
             }
         }
 
+        self.note_unsaved(1);
         Ok(vector_ids)
     }
 
@@ -1392,6 +1718,8 @@ impl RetrievalEngine {
 
             // NOTE: Memory graph edges are managed in GraphMemory at the API layer
             // GraphMemory handles cleanup via its own mechanisms
+
+            self.note_unsaved(1);
 
             // ATOMIC: Remove vector mapping from RocksDB
             if let Err(e) = self.storage.delete_vector_mapping(memory_id) {
@@ -3416,5 +3744,128 @@ mod corpus_action_tests {
             corpus_action(None, None, 384, "minilm"),
             CorpusAction::MigrateChangedLength
         );
+    }
+}
+
+#[cfg(test)]
+mod persisted_secondary_map_tests {
+    use super::*;
+
+    fn saved_index(dir: &Path, vectors: usize) -> (PathBuf, VamanaIndex) {
+        saved_index_scaled(dir, vectors, 1.0)
+    }
+
+    fn saved_index_scaled(dir: &Path, vectors: usize, scale: f32) -> (PathBuf, VamanaIndex) {
+        let config = VamanaConfig {
+            dimension: 4,
+            use_mmap: false,
+            ..Default::default()
+        };
+        let mut index = VamanaIndex::new(config).unwrap();
+        let basis: Vec<Vec<f32>> = (0..vectors)
+            .map(|i| {
+                let mut v = vec![0.1; 4];
+                v[i % 4] = scale * (1.0 + i as f32);
+                v
+            })
+            .collect();
+        index.build(basis).unwrap();
+        let path = dir.join(SECONDARY_VAMANA_INDEX_FILE);
+        index.save_to_file(&path).unwrap();
+        (path, index)
+    }
+
+    fn id(n: u128) -> MemoryId {
+        MemoryId(uuid::Uuid::from_u128(n))
+    }
+
+    /// The map comes back as saved, minus entries for vectors the file deleted, and a vector
+    /// no entry names is retired rather than left to answer searches for nobody.
+    #[test]
+    fn a_map_saved_with_its_index_reads_back_against_that_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, index) = saved_index(dir.path(), 5);
+        index.mark_deleted(3);
+        index.save_to_file(&path).unwrap();
+        let entries = vec![(id(1), vec![0]), (id(2), vec![4, 1]), (id(3), vec![3])];
+        write_secondary_id_map(&path, index.len(), &entries).unwrap();
+
+        let loaded = VamanaIndex::load_from_file(&path).unwrap();
+        let map = read_secondary_id_map(&path, &loaded).unwrap().expect("map");
+        assert_eq!(map.memory_to_vectors.get(&id(1)), Some(&vec![0]));
+        assert_eq!(map.memory_to_vectors.get(&id(2)), Some(&vec![4, 1]));
+        assert!(!map.contains(&id(3)), "its only vector was deleted");
+        assert_eq!(map.get_memory_id(4), Some(&id(2)));
+        assert!(loaded.is_deleted(2), "vector 2 belongs to no memory");
+        assert!(!loaded.is_deleted(0));
+    }
+
+    /// A map is only trusted beside the file it was written with: a later save of the index
+    /// that did not rewrite the map leaves a map whose ids may name other vectors.
+    #[test]
+    fn a_map_from_another_save_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, index) = saved_index(dir.path(), 4);
+        write_secondary_id_map(&path, index.len(), &[(id(1), vec![0])]).unwrap();
+
+        // The same vector count, so only the checksum tells the two files apart.
+        let (_, rebuilt) = saved_index_scaled(dir.path(), 4, 2.0);
+        let loaded = VamanaIndex::load_from_file(&path).unwrap();
+        assert_eq!(loaded.len(), index.len());
+        assert_eq!(rebuilt.len(), index.len());
+        assert!(read_secondary_id_map(&path, &loaded).unwrap().is_none());
+
+        std::fs::remove_file(path.with_file_name(SECONDARY_ID_MAP_FILE)).unwrap();
+        assert!(read_secondary_id_map(&path, &loaded).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_truncated_map_is_an_error_not_a_partial_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, index) = saved_index(dir.path(), 4);
+        write_secondary_id_map(&path, index.len(), &[(id(1), vec![0]), (id(2), vec![1])]).unwrap();
+        let map_path = path.with_file_name(SECONDARY_ID_MAP_FILE);
+        let bytes = std::fs::read(&map_path).unwrap();
+        std::fs::write(&map_path, &bytes[..bytes.len() - 2]).unwrap();
+        let loaded = VamanaIndex::load_from_file(&path).unwrap();
+        assert!(read_secondary_id_map(&path, &loaded).is_err());
+    }
+
+    #[test]
+    fn a_save_falls_due_on_changes_scaled_to_the_index_or_on_age() {
+        let policy = IndexSavePolicy::default();
+        let fresh = std::time::Duration::from_secs(1);
+        assert!(!policy.is_due(0, std::time::Duration::from_secs(86_400), 10));
+        assert!(!policy.is_due(999, fresh, 10));
+        assert!(policy.is_due(1_000, fresh, 10));
+        assert!(
+            !policy.is_due(4_999, fresh, 100_000),
+            "5% of a 100k-vector index is 5000 changes"
+        );
+        assert!(policy.is_due(5_000, fresh, 100_000));
+        assert!(policy.is_due(1, policy.max_unsaved_age, 100_000));
+    }
+
+    #[test]
+    fn the_save_policy_reads_positive_whole_numbers_from_the_environment() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let tuned = IndexSavePolicy::from_lookup(vars(&[
+            ("VELD_VECTOR_INDEX_SAVE_CHANGES", "250"),
+            ("VELD_VECTOR_INDEX_SAVE_INTERVAL_SECS", "60"),
+        ]));
+        assert_eq!(tuned.min_changes, 250);
+        assert_eq!(tuned.max_unsaved_age, std::time::Duration::from_secs(60));
+        let ignored = IndexSavePolicy::from_lookup(vars(&[
+            ("VELD_VECTOR_INDEX_SAVE_CHANGES", "0"),
+            ("VELD_VECTOR_INDEX_SAVE_INTERVAL_SECS", "soon"),
+        ]));
+        assert_eq!(ignored, IndexSavePolicy::default());
     }
 }
