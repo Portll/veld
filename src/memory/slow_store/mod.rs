@@ -2113,3 +2113,6 @@ mod tests {
         assert!(!store.never_synced());
     }
 }
+
+#[cfg(test)]
+mod rebuild_before;
