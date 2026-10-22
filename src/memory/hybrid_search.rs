@@ -2139,6 +2139,8 @@ mod tests {
         reopened
             .finish_rebuild()
             .expect("finishing twice is not an error");
+        // Tantivy allows one IndexWriter per directory; the next open needs this one gone.
+        drop(reopened);
 
         let again = BM25Index::new(&path).expect("reopen with a current schema");
         assert!(
