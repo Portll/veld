@@ -775,16 +775,10 @@ fn run_one_pass(
             // SHODH_QUERY_NER A/B lever: neural-NER graph seeding (no-op when unset).
             manager.annotate_query_ner(&mut query);
 
-            // Pure function of fixtures + ingest (hoisted above recall so the
-            // feature exporter can arm with this query's gold ids).
+            // Pure function of fixtures + ingest.
             let relevance = build_relevance_map(case, &id_map);
             if feature_export.is_some() && matches!(*mode, LayerMode::Full) {
-                crate::memory::fusion_features::begin(
-                    relevance
-                        .keys()
-                        .map(|u| crate::memory::types::MemoryId(*u))
-                        .collect(),
-                );
+                crate::memory::fusion_features::begin();
             }
 
             let started = Instant::now();
@@ -823,8 +817,8 @@ fn run_one_pass(
                 retrieved: retrieved_corpus_ids,
             });
 
-            // Drain the per-query fusion features (None unless armed above AND
-            // the FLAT fusion path ran) and pair them with the case outcome.
+            // Drain the per-query fusion features and pair them with the case
+            // outcome. None unless a recall stage recorded them, and none does.
             if let Some(features) = crate::memory::fusion_features::take() {
                 let gold_final_rank = retrieved_uuids
                     .iter()

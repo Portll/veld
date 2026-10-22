@@ -9,20 +9,16 @@
 //! label "which leg should have been trusted" for this query).
 //!
 //! Same thread-local pattern as [`super::gold_funnel`]: the recall harness arms
-//! it per query with the gold ids, the FLAT fusion path populates it (a no-op
-//! when unarmed — production pays nothing), the harness drains it and writes
-//! JSONL for the offline fit.
+//! it per query and drains it into JSONL for the offline fit. No recall stage
+//! records features into it, so [`take`] returns None and the export stays empty.
 
-use super::types::MemoryId;
 use std::cell::RefCell;
-use std::collections::HashSet;
 
 thread_local! {
     static STATE: RefCell<Option<ExportState>> = const { RefCell::new(None) };
 }
 
 struct ExportState {
-    gold: HashSet<MemoryId>,
     features: Option<FusionFeatures>,
 }
 
@@ -73,13 +69,10 @@ pub struct FusionFeatures {
     pub candidates: Vec<CandidateRow>,
 }
 
-/// Arm the exporter for the next recall with this query's gold ids.
-pub fn begin(gold: HashSet<MemoryId>) {
+/// Arm the exporter for the next recall.
+pub fn begin() {
     STATE.with(|c| {
-        *c.borrow_mut() = Some(ExportState {
-            gold,
-            features: None,
-        });
+        *c.borrow_mut() = Some(ExportState { features: None });
     });
 }
 
@@ -87,22 +80,4 @@ pub fn begin(gold: HashSet<MemoryId>) {
 /// path that populates them did not run).
 pub fn take() -> Option<FusionFeatures> {
     STATE.with(|c| c.borrow_mut().take().and_then(|s| s.features))
-}
-
-/// True when armed — lets the fusion skip the (sort-heavy) feature computation.
-pub fn is_armed() -> bool {
-    STATE.with(|c| c.borrow().is_some())
-}
-
-/// Run `f` with the armed gold set to produce the features, and store them.
-/// No-op when unarmed.
-pub fn record_with(f: impl FnOnce(&HashSet<MemoryId>) -> FusionFeatures) {
-    STATE.with(|c| {
-        let mut borrow = c.borrow_mut();
-        let Some(state) = borrow.as_mut() else {
-            return;
-        };
-        let features = f(&state.gold);
-        state.features = Some(features);
-    });
 }
