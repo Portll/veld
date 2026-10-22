@@ -44,6 +44,152 @@ const EPISODE_RECENCY_INDEX_MARKER: &[u8] = b"~episode_recency_index_v1";
 /// a miss in the index proves nothing and readers fall back to scanning.
 const EDGE_INDEX_MARKER: &[u8] = b"~edge_index_v1";
 
+/// Row in `edge_index` holding the counters as they stood when the graph was last closed
+/// with nothing writing; see [`CounterSnapshot`]. `~` keeps it out of the `t:` and `e:` scans.
+const COUNTER_SNAPSHOT_KEY: &[u8] = b"~graph_counters_v1";
+
+/// The counters an open would otherwise count: relationship rows (`mem_edge:` lookup rows
+/// included, as the census counts them), episode rows, and the activation total.
+///
+/// Written only while the graph is held exclusively, and removed by the first write after
+/// it ([`SnapshotRetiringStore`]), so a row that is present describes the store exactly: a
+/// crash after any write leaves no row and the next open counts. Fixed little-endian bytes,
+/// not bincode, so no persisted serde layout is involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CounterSnapshot {
+    relationship_rows: u64,
+    episode_rows: u64,
+    total_activations: u64,
+}
+
+impl CounterSnapshot {
+    const VERSION: u8 = 1;
+    const LEN: usize = 25;
+
+    fn encode(&self) -> [u8; Self::LEN] {
+        let mut bytes = [0u8; Self::LEN];
+        bytes[0] = Self::VERSION;
+        bytes[1..9].copy_from_slice(&self.relationship_rows.to_le_bytes());
+        bytes[9..17].copy_from_slice(&self.episode_rows.to_le_bytes());
+        bytes[17..25].copy_from_slice(&self.total_activations.to_le_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::LEN || bytes[0] != Self::VERSION {
+            return None;
+        }
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
+        Some(Self {
+            relationship_rows: word(1),
+            episode_rows: word(9),
+            total_activations: word(17),
+        })
+    }
+}
+
+/// The graph's store, made to remove the counter snapshot before anything else changes.
+///
+/// The first write after a snapshot carries the row's removal in its own batch, so no
+/// later write can commit while the row still claims the old counts. Writes that arrive
+/// while that first one is in flight wait for it; once the row is gone every write passes
+/// straight through, at the cost of one atomic load.
+struct SnapshotRetiringStore {
+    inner: Arc<dyn crate::storage::ColumnStore>,
+    /// The snapshot row may be in the store.
+    snapshot_present: std::sync::atomic::AtomicBool,
+    /// Held by the write that removes the row, and by any write that found it present.
+    retiring: parking_lot::Mutex<()>,
+}
+
+impl SnapshotRetiringStore {
+    fn new(inner: Arc<dyn crate::storage::ColumnStore>, snapshot_present: bool) -> Self {
+        Self {
+            inner,
+            snapshot_present: std::sync::atomic::AtomicBool::new(snapshot_present),
+            retiring: parking_lot::Mutex::new(()),
+        }
+    }
+
+    /// Write `batch`, removing the snapshot row with it when the row may be present.
+    fn write_retiring(&self, batch: &crate::storage::WriteBatch) -> Result<()> {
+        if !self.snapshot_present.load(Ordering::Acquire) {
+            return self.inner.write_batch(batch);
+        }
+        let _retiring = self.retiring.lock();
+        if !self.snapshot_present.load(Ordering::Acquire) {
+            return self.inner.write_batch(batch);
+        }
+        let mut with_removal = batch.clone();
+        with_removal.delete_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY);
+        self.inner.write_batch(&with_removal)?;
+        self.snapshot_present.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Store `snapshot`. The caller holds the graph exclusively, so no write runs between
+    /// its counters being read and the row landing.
+    fn put_snapshot(&self, snapshot: &CounterSnapshot) -> Result<()> {
+        self.inner
+            .put_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY, &snapshot.encode())?;
+        self.snapshot_present.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl crate::storage::ColumnStore for SnapshotRetiringStore {
+    fn backend(&self) -> crate::config::StorageBackend {
+        self.inner.backend()
+    }
+
+    fn get_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.get_cf(cf, key)
+    }
+
+    fn multi_get_cf(&self, cf: &str, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        self.inner.multi_get_cf(cf, keys)
+    }
+
+    fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        if !self.snapshot_present.load(Ordering::Acquire) {
+            return self.inner.put_cf(cf, key, value);
+        }
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.put_cf(cf, key, value);
+        self.write_retiring(&batch)
+    }
+
+    fn delete_cf(&self, cf: &str, key: &[u8]) -> Result<()> {
+        if !self.snapshot_present.load(Ordering::Acquire) {
+            return self.inner.delete_cf(cf, key);
+        }
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.delete_cf(cf, key);
+        self.write_retiring(&batch)
+    }
+
+    fn scan_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_cf(cf, prefix, limit)
+    }
+
+    fn flush_cf(&self, cf: &str) -> Result<()> {
+        self.inner.flush_cf(cf)
+    }
+
+    fn ensure_cf(&self, cf: &str) -> Result<()> {
+        self.inner.ensure_cf(cf)
+    }
+
+    fn write_batch(&self, batch: &crate::storage::WriteBatch) -> Result<()> {
+        self.write_retiring(batch)
+    }
+}
+
 /// Maximum number of retrieval IDs held in the idempotency guard (S-R4).
 /// Oldest entries are evicted FIFO once this cap is reached.
 const SEEN_RETRIEVALS_CAPACITY: usize = 1024;
@@ -2137,6 +2283,9 @@ pub struct GraphMemory {
     /// Every read/write/scan/batch goes through this.
     store: Arc<dyn crate::storage::ColumnStore>,
 
+    /// The same store as `store`, typed, for writing the counter snapshot.
+    counter_store: Arc<SnapshotRetiringStore>,
+
     /// Present ONLY when rocksdb-backed: the backup/checkpoint accessor hands
     /// the engine DB to the rocksdb BackupEngine. A store built over another
     /// backend has no engine DB to hold.
@@ -2404,12 +2553,28 @@ impl GraphMemory {
 
         Self::ensure_episode_recency_index(store.as_ref())?;
 
-        // Counted once at open, then kept by the write paths, so get_stats() is O(1).
-        let RelationshipCensus {
-            rows: relationship_count,
-            total_activations,
-        } = Self::relationship_census_and_edge_index(store.as_ref())?;
-        let episode_count = Self::count_cf_entries(store.as_ref(), CF_EPISODES);
+        // Kept by the write paths after open, so get_stats() is O(1). A graph last closed with
+        // nothing writing left them in a snapshot row; otherwise they are counted, which
+        // decodes every relationship.
+        let (relationship_count, total_activations, episode_count, snapshot_present) =
+            match Self::usable_counter_snapshot(store.as_ref())? {
+                Some(snapshot) => (
+                    snapshot.relationship_rows as usize,
+                    snapshot.total_activations,
+                    snapshot.episode_rows as usize,
+                    true,
+                ),
+                None => {
+                    let RelationshipCensus {
+                        rows,
+                        total_activations,
+                    } = Self::relationship_census_and_edge_index(store.as_ref())?;
+                    let episodes = Self::count_cf_entries(store.as_ref(), CF_EPISODES);
+                    (rows, total_activations, episodes, false)
+                }
+            };
+        let counter_store = Arc::new(SnapshotRetiringStore::new(store, snapshot_present));
+        let store: Arc<dyn crate::storage::ColumnStore> = counter_store.clone();
 
         // Load entity embedding cache for concept merging
         // Only entities with pre-computed name_embeddings are cached
@@ -2419,6 +2584,7 @@ impl GraphMemory {
 
         let graph = Self {
             store,
+            counter_store,
             db,
             #[cfg(feature = "storage-redb")]
             redb_db: None,
@@ -2709,6 +2875,39 @@ impl GraphMemory {
         Ok(())
     }
 
+    /// The counter snapshot, when the store holds one this open can trust: readable, and
+    /// written beside a complete edge index (the census that a missing index needs also
+    /// backfills it). A row that is present and unusable is removed here, so no later open
+    /// trusts a row that described the store before this open's census.
+    fn usable_counter_snapshot(
+        store: &dyn crate::storage::ColumnStore,
+    ) -> Result<Option<CounterSnapshot>> {
+        let Some(bytes) = store.get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY)? else {
+            return Ok(None);
+        };
+        let edge_index_complete = store.get_cf(CF_EDGE_INDEX, EDGE_INDEX_MARKER)?.is_some();
+        match CounterSnapshot::decode(&bytes) {
+            Some(snapshot) if edge_index_complete => Ok(Some(snapshot)),
+            _ => {
+                store.delete_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Write the counters to the store, so the next open of the graph as it stands now reads
+    /// them instead of counting. `&mut self` is the guarantee the snapshot needs: no write
+    /// runs between the counters being read and the row landing, and the first write after
+    /// it removes the row (see [`SnapshotRetiringStore`]). Called when the graph is closed:
+    /// at shutdown and when its cache entry is evicted.
+    pub fn persist_counters(&mut self) -> Result<()> {
+        self.counter_store.put_snapshot(&CounterSnapshot {
+            relationship_rows: self.relationship_count.load(Ordering::Acquire) as u64,
+            episode_rows: self.episode_count.load(Ordering::Acquire) as u64,
+            total_activations: self.total_activations.load(Ordering::Acquire),
+        })
+    }
+
     /// Count entries in a column family (one-time startup cost)
     fn count_cf_entries(store: &dyn crate::storage::ColumnStore, cf: &str) -> usize {
         let mut count = 0usize;
@@ -2830,10 +3029,20 @@ impl GraphMemory {
         store: &dyn crate::storage::ColumnStore,
         name_index: &HashMap<String, Uuid>,
     ) -> Vec<(Uuid, Vec<f32>)> {
+        /// Entities read per batch: one batched read (one read transaction on redb) in place
+        /// of a point read per entity.
+        const READ_BATCH: usize = 256;
         let mut cache = Vec::with_capacity(ENTITY_EMBEDDING_CACHE_MAX.min(name_index.len()));
-        for uuid in name_index.values() {
-            let key = uuid.as_bytes();
-            if let Ok(Some(value)) = store.get_cf(CF_ENTITIES, key) {
+        let uuids: Vec<Uuid> = name_index.values().copied().collect();
+        'batches: for batch in uuids.chunks(READ_BATCH) {
+            let keys: Vec<&[u8]> = batch.iter().map(|uuid| uuid.as_bytes().as_slice()).collect();
+            let Ok(values) = store.multi_get_cf(CF_ENTITIES, &keys) else {
+                continue;
+            };
+            for (uuid, value) in batch.iter().zip(values) {
+                let Some(value) = value else {
+                    continue;
+                };
                 if let Ok((entity, _)) = bincode::serde::decode_from_slice::<EntityNode, _>(
                     &value,
                     bincode::config::standard(),
@@ -2841,7 +3050,7 @@ impl GraphMemory {
                     if let Some(emb) = entity.name_embedding {
                         cache.push((*uuid, emb));
                         if cache.len() >= ENTITY_EMBEDDING_CACHE_MAX {
-                            break;
+                            break 'batches;
                         }
                     }
                 }
@@ -6806,9 +7015,18 @@ impl GraphMemory {
         let mut to_prune: Vec<Uuid> = Vec::new();
         let mut orphan_candidates: HashSet<Uuid> = HashSet::new();
         let mut total_edges = 0usize;
+        // The pass reads every row of the family anyway, so it counts them as the open's
+        // census does and re-bases the counters on that count below.
+        let rows_before = self.relationship_count.load(Ordering::Acquire);
+        let activations_before = self.total_activations.load(Ordering::Acquire);
+        let mut census = RelationshipCensus::default();
         for first in 0..=u8::MAX {
-            for (_, value) in self.store.scan_cf(CF_RELATIONSHIPS, Some(&[first]), None)? {
+            for (key, value) in self.store.scan_cf(CF_RELATIONSHIPS, Some(&[first]), None)? {
+                census.rows += 1;
                 if let Ok(edge) = RelationshipEdge::decode(&value) {
+                    if key.len() == 16 {
+                        census.total_activations += edge.activation_count as u64;
+                    }
                     chunk.push(edge);
                 }
             }
@@ -6828,6 +7046,7 @@ impl GraphMemory {
             }
             chunk.clear();
         }
+        self.rebase_relationship_counters(&census, rows_before, activations_before);
 
         if to_prune.is_empty() {
             return Ok(crate::memory::types::GraphDecayResult::default());
@@ -6868,6 +7087,37 @@ impl GraphMemory {
             orphaned_entity_ids,
             orphaned_memory_ids: Vec::new(), // Populated by memory layer via entity→memory lookup
         })
+    }
+
+    /// Re-base the relationship counters on `census`, a count made by a pass over the family
+    /// that began when they read `rows_before` and `activations_before`. What writes moved
+    /// them by during the pass is carried over. A row written or removed during the pass in
+    /// a part it had not reached yet is counted by both until the next pass, as the memory
+    /// store's totals are; between passes the write paths keep the counters, which since
+    /// they are persisted across restarts (see [`Self::persist_counters`]) means this pass,
+    /// not the next open, is what bounds how far they drift from the stored rows.
+    fn rebase_relationship_counters(
+        &self,
+        census: &RelationshipCensus,
+        rows_before: usize,
+        activations_before: u64,
+    ) {
+        let _ = self.relationship_count.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                let moved = current as i64 - rows_before as i64;
+                Some((census.rows as i64 + moved).max(0) as usize)
+            },
+        );
+        let _ = self.total_activations.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                let moved = i128::from(current) - i128::from(activations_before);
+                Some((i128::from(census.total_activations) + moved).max(0) as u64)
+            },
+        );
     }
 
     /// Flush pending maintenance from opportunistic pruning queues.
@@ -12316,6 +12566,135 @@ mod edge_index_tests {
         graph.flush_pending_maintenance().unwrap();
         assert!(graph.get_relationship(&ids[0]).unwrap().is_some());
         assert!(graph.get_relationship(&ids[1]).unwrap().is_none());
+    }
+
+    fn counts(graph: &GraphMemory) -> (usize, usize, u64) {
+        (
+            graph.relationship_count.load(Ordering::Relaxed),
+            graph.episode_count.load(Ordering::Relaxed),
+            graph.total_activations.load(Ordering::Relaxed),
+        )
+    }
+
+    /// A graph closed with its counters saved opens on them: a row written behind the
+    /// graph's back after the save is not counted, which shows no census ran.
+    #[test]
+    fn an_open_after_a_saved_close_reads_the_counters_instead_of_counting() {
+        let stores = crate::storage::test_support::column_stores(GRAPH_CF_NAMES);
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (backend, store, _tmp) in stores {
+            let saved = {
+                let mut graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
+                let [a, b, c] = ["Aspen", "Birch", "Cedar"]
+                    .map(|name| graph.add_entity(named_entity(name)).unwrap());
+                graph.add_episode(episode_over(Uuid::new_v4(), vec![a, b])).unwrap();
+                graph
+                    .add_relationships(vec![
+                        typed_edge(a, b, RelationType::RelatedTo, 0.5),
+                        typed_edge(b, c, RelationType::CoOccurs, 0.5),
+                    ])
+                    .unwrap();
+                graph.persist_counters().unwrap();
+                counts(&graph)
+            };
+            store
+                .put_cf(CF_RELATIONSHIPS, b"written behind the graph", b"x")
+                .unwrap();
+
+            let graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
+            assert_eq!(counts(&graph), saved, "{backend:?}");
+        }
+    }
+
+    /// The first write after a save removes the row with it, so a graph that wrote and then
+    /// stopped without saving again is counted at its next open.
+    #[test]
+    fn the_first_write_after_a_save_removes_the_saved_counters() {
+        let stores = crate::storage::test_support::column_stores(GRAPH_CF_NAMES);
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (backend, store, _tmp) in stores {
+            let (a, b) = {
+                let mut graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
+                let a = graph.add_entity(named_entity("Hazel")).unwrap();
+                let b = graph.add_entity(named_entity("Holly")).unwrap();
+                graph.persist_counters().unwrap();
+                (a, b)
+            };
+            let after_write = {
+                let graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
+                assert!(
+                    store.get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY).unwrap().is_some(),
+                    "{backend:?}: an open leaves the row until something writes"
+                );
+                graph
+                    .add_relationship(typed_edge(a, b, RelationType::RelatedTo, 0.5))
+                    .unwrap();
+                assert!(
+                    store.get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY).unwrap().is_none(),
+                    "{backend:?}: the write took the row with it"
+                );
+                counts(&graph)
+            };
+            store
+                .put_cf(CF_RELATIONSHIPS, b"written behind the graph", b"x")
+                .unwrap();
+            let graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
+            assert_eq!(
+                counts(&graph).0,
+                after_write.0 + 1,
+                "{backend:?}: counted, the stray row included"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_counter_row_is_removed_and_the_graph_counted() {
+        let stores = crate::storage::test_support::column_stores(GRAPH_CF_NAMES);
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (backend, store, _tmp) in stores {
+            {
+                let graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
+                let a = graph.add_entity(named_entity("Rowan")).unwrap();
+                let b = graph.add_entity(named_entity("Spruce")).unwrap();
+                graph
+                    .add_relationship(typed_edge(a, b, RelationType::RelatedTo, 0.5))
+                    .unwrap();
+            }
+            store
+                .put_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY, &[9, 9, 9])
+                .unwrap();
+            let graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
+            assert!(
+                store.get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY).unwrap().is_none(),
+                "{backend:?}"
+            );
+            assert!(counts(&graph).0 >= 1, "{backend:?}");
+        }
+    }
+
+    /// The full decay pass reads every row, so it re-bases the counters on what is stored
+    /// rather than leaving a drift to be carried across restarts by the snapshot.
+    #[test]
+    fn the_full_decay_pass_rebases_the_relationship_counters() {
+        let stores = crate::storage::test_support::column_stores(GRAPH_CF_NAMES);
+        crate::storage::test_support::assert_both_backends(&stores);
+        for (backend, store, _tmp) in stores {
+            let graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
+            let a = graph.add_entity(named_entity("Linden")).unwrap();
+            let b = graph.add_entity(named_entity("Poplar")).unwrap();
+            let id = graph
+                .add_relationship(typed_edge(a, b, RelationType::RelatedTo, 0.9))
+                .unwrap();
+            let stored_rows = store.scan_cf(CF_RELATIONSHIPS, None, None).unwrap().len();
+            graph.relationship_count.store(1_000, Ordering::Relaxed);
+            graph.total_activations.store(1_000, Ordering::Relaxed);
+
+            graph.apply_decay().unwrap();
+
+            let activations = graph.get_relationship(&id).unwrap().unwrap().activation_count;
+            assert_eq!(counts(&graph).0, stored_rows, "{backend:?}");
+            assert_eq!(counts(&graph).2, u64::from(activations), "{backend:?}");
+        }
     }
 }
 
