@@ -30,44 +30,51 @@ use crate::validation;
 /// the stored record could not be read back, so the row is removed. Failure to write is
 /// logged, not raised: the memory is stored, and a missing row reads as undetermined, which is
 /// true. A failure to READ the existing row removes the row rather than guessing.
+///
+/// Returns the row written, which the graph build reads to tell the writer's names from derived
+/// ones, or `None` when no row describes the stored record.
 async fn record_tag_sources(
     memory: &SharedUserMemory,
     memory_id: &crate::memory::MemoryId,
     incoming: TagSources,
     stored: Option<Vec<String>>,
     merge_existing: bool,
-) {
+) -> Option<TagSources> {
     let memory = memory.clone();
     let id = memory_id.clone();
     let joined = tokio::task::spawn_blocking(move || {
         let guard = memory.read();
         let store = guard.tag_source_store();
         let Some(stored) = stored else {
-            return store.delete(&id);
+            return store.delete(&id).map(|()| None);
         };
         let existing = if merge_existing {
             match store.get(&id) {
                 Ok(existing) => existing,
                 Err(e) => {
                     tracing::warn!(memory_id = %id.0, error = %e, "tag sources: existing row unreadable; removing");
-                    return store.delete(&id);
+                    return store.delete(&id).map(|()| None);
                 }
             }
         } else {
             None
         };
         match TagSources::reconcile(incoming, existing, &stored) {
-            Some(row) => store.put(&id, &row),
-            None => store.delete(&id),
+            Some(row) => store.put(&id, &row).map(|()| Some(row)),
+            None => store.delete(&id).map(|()| None),
         }
     })
     .await;
     match joined {
-        Ok(Ok(())) => {}
+        Ok(Ok(row)) => row,
         Ok(Err(e)) => {
-            tracing::warn!(memory_id = %memory_id.0, error = %e, "tag sources: write failed")
+            tracing::warn!(memory_id = %memory_id.0, error = %e, "tag sources: write failed");
+            None
         }
-        Err(e) => tracing::warn!(memory_id = %memory_id.0, error = %e, "tag sources: task failed"),
+        Err(e) => {
+            tracing::warn!(memory_id = %memory_id.0, error = %e, "tag sources: task failed");
+            None
+        }
     }
 }
 
@@ -1324,7 +1331,7 @@ pub async fn remember(
     let rebuild_graph = outcome.needs_graph_rebuild();
     let experience = outcome.merged_experience.unwrap_or(experience);
     let tag_sources_start = std::time::Instant::now();
-    record_tag_sources(
+    let stored_tag_sources = record_tag_sources(
         &memory,
         &memory_id,
         labelled_tags,
@@ -1483,6 +1490,7 @@ pub async fn remember(
                             &experience,
                             &mid,
                             &declared,
+                            stored_tag_sources.as_ref(),
                         )
                     } else {
                         state.process_experience_into_graph_declared(
@@ -1490,6 +1498,7 @@ pub async fn remember(
                             &experience,
                             &mid,
                             &declared,
+                            stored_tag_sources.as_ref(),
                         )
                     }
                 })
@@ -2177,20 +2186,25 @@ pub async fn batch_remember(
     }
 
     let tag_sources_start = std::time::Instant::now();
+    let mut stored_tag_sources_by_index: std::collections::HashMap<usize, TagSources> =
+        std::collections::HashMap::new();
     for (index, id, effective, _) in &memory_results {
         let (Some(labelled), Ok(uuid)) =
             (labelled_by_index.remove(index), uuid::Uuid::parse_str(id))
         else {
             continue;
         };
-        record_tag_sources(
+        if let Some(row) = record_tag_sources(
             &memory,
             &crate::memory::MemoryId(uuid),
             labelled,
             Some(effective.tags.clone()),
             true,
         )
-        .await;
+        .await
+        {
+            stored_tag_sources_by_index.insert(*index, row);
+        }
     }
     stage_timer.record("tag_sources", tag_sources_start);
 
@@ -2228,13 +2242,25 @@ pub async fn batch_remember(
                     let mid = memory_id.clone();
                     let rebuild = *rebuild;
                     let declared = declared_by_index.remove(index).unwrap_or_default();
+                    let tag_sources = stored_tag_sources_by_index.remove(index);
                     let graph_start = std::time::Instant::now();
                     let graph_result = tokio::task::spawn_blocking(move || {
                         if rebuild {
-                            state.rebuild_experience_graph_declared(&uid, &exp, &mid, &declared)
+                            state.rebuild_experience_graph_declared(
+                                &uid,
+                                &exp,
+                                &mid,
+                                &declared,
+                                tag_sources.as_ref(),
+                            )
                         } else {
-                            state
-                                .process_experience_into_graph_declared(&uid, &exp, &mid, &declared)
+                            state.process_experience_into_graph_declared(
+                                &uid,
+                                &exp,
+                                &mid,
+                                &declared,
+                                tag_sources.as_ref(),
+                            )
                         }
                     })
                     .await
@@ -2717,7 +2743,7 @@ pub async fn upsert_memory(
     // The stored list, not the request's: an upsert's tags are the record's new tags, and the
     // ledger has to describe the record.
     let tag_sources_start = std::time::Instant::now();
-    record_tag_sources(
+    let stored_tag_sources = record_tag_sources(
         &memory_system,
         &memory_id,
         labelled_tags,
@@ -2817,9 +2843,21 @@ pub async fn upsert_memory(
         let mid = memory_id.clone();
         tokio::task::spawn_blocking(move || {
             if was_update {
-                state.rebuild_experience_graph_declared(&user_id, &experience, &mid, &declared)
+                state.rebuild_experience_graph_declared(
+                    &user_id,
+                    &experience,
+                    &mid,
+                    &declared,
+                    stored_tag_sources.as_ref(),
+                )
             } else {
-                state.process_experience_into_graph_declared(&user_id, &experience, &mid, &declared)
+                state.process_experience_into_graph_declared(
+                    &user_id,
+                    &experience,
+                    &mid,
+                    &declared,
+                    stored_tag_sources.as_ref(),
+                )
             }
         })
         .await
