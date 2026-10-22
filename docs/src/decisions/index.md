@@ -25,3 +25,4 @@ pointing back at it with `supersedes:` in the frontmatter and add
 | [0006](0006-backend-parity-and-on-demand-migration.md) | Backend parity and on-demand migration | proposed | 2026-09-11 |
 | [0007](0007-rocksdb-default-engine.md) | RocksDB is the default engine and the port target | accepted | 2026-10-03 |
 | [0008](0008-local-ipc-transport.md) | Whether veld takes upstream's authenticated local IPC transport | proposed | 2026-10-04 |
+| [0009](0009-embeddings-out-of-the-record.md) | Embeddings out of the memory record, into a vector table of their own | proposed | 2026-10-22 |
