@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use veld::embeddings::ner::{NerConfig, NeuralNer};
 use veld::graph_memory::GraphMemory;
 use veld::memory::{
-    Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalOutcome,
+    Experience, ExperienceType, MemoryConfig, MemorySystem, MomentumPolicy, Query, RetrievalOutcome,
 };
 
 /// Create fallback NER instance for testing
@@ -826,6 +826,7 @@ fn test_hebbian_edge_strength_persists() {
                     &ids,
                     RetrievalOutcome::Helpful,
                     &format!("session-{session}"),
+                    MomentumPolicy::Apply,
                 )
                 .unwrap();
         }
@@ -875,6 +876,7 @@ fn test_hebbian_edge_strength_persists() {
                 &[id1.clone(), id2.clone()],
                 RetrievalOutcome::Helpful,
                 "session-0",
+                MomentumPolicy::Apply,
             )
             .unwrap();
         let repeated = edge();
@@ -959,6 +961,7 @@ fn test_ltp_persists_across_restart() {
                     &ids,
                     RetrievalOutcome::Helpful,
                     &format!("session-{session}"),
+                    MomentumPolicy::Apply,
                 )
                 .unwrap();
         }

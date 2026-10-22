@@ -1534,12 +1534,15 @@ pub async fn proactive_context(
                 // write gate of each write and waited for once both passes are done.
                 let mut frames = super::state::JournalPending::empty(&journal_user);
 
-                // Reinforce helpful memories (importance boost)
+                // MomentumPolicy::Skip on both calls: Phase 3 already charged each of these
+                // memories its graded signal, and these buckets classify that same evidence.
+                // What this stage still owes is importance, coactivation and edge updates.
                 if !helpful_ids.is_empty() {
                     if let Err(e) = memory_guard.reinforce_recall_from_journaled(
                         &helpful_ids,
                         crate::memory::RetrievalOutcome::Helpful,
                         &evidence_source_for_feedback,
+                        crate::memory::MomentumPolicy::Skip,
                         &mut super::remember::queue_frames(
                             &journal_state,
                             &journal_user,
@@ -1556,6 +1559,7 @@ pub async fn proactive_context(
                         &misleading_ids,
                         crate::memory::RetrievalOutcome::Misleading,
                         &evidence_source_for_feedback,
+                        crate::memory::MomentumPolicy::Skip,
                         &mut super::remember::queue_frames(
                             &journal_state,
                             &journal_user,
@@ -2928,6 +2932,7 @@ pub async fn reinforce_feedback(
                 &memory_ids,
                 outcome,
                 &evidence_source,
+                crate::memory::MomentumPolicy::Apply,
                 &mut super::remember::queue_frames(&journal_state, &user_id, &mut frames),
             );
             frames.wait_logged("reinforce");

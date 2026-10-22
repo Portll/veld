@@ -3,17 +3,12 @@
 //! The momentum EMA is retrieval signal 11. It is reached two ways:
 //!
 //! 1. Explicitly, by a caller asserting an outcome through `POST /api/reinforce`, which runs
-//!    `MemorySystem::reinforce_recall_from`. veld's documentation says the EMA is taken over
-//!    those signals (docs/src/architecture/retrieval.md, docs/src/glossary.md), but
-//!    `reinforce_recall_from` moves importance and graph edges only and never writes
-//!    momentum. The tests for that path are ported and ignored as a veld bug.
+//!    `MemorySystem::reinforce_recall_from` with `MomentumPolicy::Apply`, as
+//!    `reinforce_recall` does.
 //! 2. Implicitly, by `proactive_context`, which applies its own graded signal per memory and
-//!    then hands the memories it classified to `reinforce_recall_from`. That second stage
-//!    must not land a second signal for the same observation, which veld holds today.
-//!
-//! Not ported: upstream's `SignalTrigger::ExplicitOutcome` provenance test and its
-//! `MomentumPolicy::Apply` control. Both name API that arrives with the #434 fix (an explicit
-//! trigger variant and a momentum policy argument), which veld does not have.
+//!    then hands the memories it classified to `reinforce_recall_from` with
+//!    `MomentumPolicy::Skip`. That second stage must not land a second signal for the same
+//!    observation.
 
 use std::sync::Arc;
 
@@ -22,8 +17,8 @@ use tempfile::TempDir;
 
 use veld::memory::{
     types::{Experience, ExperienceType},
-    FeedbackStore, MemoryConfig, MemoryId, MemorySystem, RetrievalOutcome, SignalRecord,
-    SignalTrigger,
+    FeedbackStore, MemoryConfig, MemoryId, MemorySystem, MomentumPolicy, RetrievalOutcome,
+    SignalRecord, SignalTrigger,
 };
 
 fn config(path: &std::path::Path) -> MemoryConfig {
@@ -63,10 +58,7 @@ fn graded_implicit_signal() -> SignalRecord {
     SignalRecord::from_entity_overlap(0.8)
 }
 
-const EXPLICIT_MOMENTUM_BUG: &str = "veld bug: POST /api/reinforce (reinforce_recall_from) never writes the feedback momentum its docs say it drives";
-
 #[test]
-#[ignore = "veld bug: POST /api/reinforce (reinforce_recall_from) never writes the feedback momentum its docs say it drives"]
 fn explicit_helpful_reinforcement_moves_momentum_positive() {
     let (system, store, _tmp) = system_with_feedback();
     let id = remember(&system, "Vamana graph traversal uses beam search");
@@ -79,10 +71,7 @@ fn explicit_helpful_reinforcement_moves_momentum_positive() {
         .reinforce_recall(std::slice::from_ref(&id), RetrievalOutcome::Helpful)
         .expect("reinforce");
 
-    let momentum = store
-        .read()
-        .get_momentum(&id)
-        .unwrap_or_else(|| panic!("{EXPLICIT_MOMENTUM_BUG}"));
+    let momentum = store.read().get_momentum(&id).expect("momentum");
     assert!(
         momentum.ema > 0.0,
         "helpful reinforcement moves momentum positive, got {}",
@@ -92,7 +81,6 @@ fn explicit_helpful_reinforcement_moves_momentum_positive() {
 }
 
 #[test]
-#[ignore = "veld bug: POST /api/reinforce (reinforce_recall_from) never writes the feedback momentum its docs say it drives"]
 fn explicit_misleading_reinforcement_moves_momentum_negative() {
     let (system, store, _tmp) = system_with_feedback();
     let id = remember(&system, "Vamana alpha is applied during construction");
@@ -101,10 +89,7 @@ fn explicit_misleading_reinforcement_moves_momentum_negative() {
         .reinforce_recall(std::slice::from_ref(&id), RetrievalOutcome::Misleading)
         .expect("reinforce");
 
-    let momentum = store
-        .read()
-        .get_momentum(&id)
-        .unwrap_or_else(|| panic!("{EXPLICIT_MOMENTUM_BUG}"));
+    let momentum = store.read().get_momentum(&id).expect("momentum");
     assert!(
         momentum.ema < 0.0,
         "misleading reinforcement moves momentum negative, got {}",
@@ -131,7 +116,24 @@ fn explicit_neutral_reinforcement_writes_no_momentum() {
 }
 
 #[test]
-#[ignore = "veld bug: POST /api/reinforce (reinforce_recall_from) never writes the feedback momentum its docs say it drives"]
+fn explicit_reinforcement_records_the_explicit_outcome_trigger() {
+    // The trigger says which path wrote a signal: every other variant records an inference
+    // the system drew, this one an outcome a caller asserted.
+    let (system, store, _tmp) = system_with_feedback();
+    let id = remember(&system, "Explicit outcome trigger provenance");
+
+    system
+        .reinforce_recall(std::slice::from_ref(&id), RetrievalOutcome::Helpful)
+        .expect("reinforce");
+
+    let momentum = store.read().get_momentum(&id).expect("momentum");
+    match momentum.recent_signals.back().map(|s| &s.trigger) {
+        Some(SignalTrigger::ExplicitOutcome { outcome }) => assert_eq!(outcome, "helpful"),
+        other => panic!("expected an ExplicitOutcome trigger, got {other:?}"),
+    }
+}
+
+#[test]
 fn repeated_explicit_reinforcement_accumulates_momentum() {
     // The EMA is inertia-damped: repeated use builds momentum without saturating on the
     // first signal.
@@ -143,11 +145,7 @@ fn repeated_explicit_reinforcement_accumulates_momentum() {
         system
             .reinforce_recall(std::slice::from_ref(&id), RetrievalOutcome::Helpful)
             .expect("reinforce");
-        let ema = store
-            .read()
-            .get_momentum(&id)
-            .unwrap_or_else(|| panic!("{EXPLICIT_MOMENTUM_BUG}"))
-            .ema;
+        let ema = store.read().get_momentum(&id).expect("momentum").ema;
         assert!(
             ema > previous,
             "round {round}: EMA must increase, {previous} -> {ema}"
@@ -176,6 +174,7 @@ fn implicit_path_applies_exactly_one_momentum_signal() {
             std::slice::from_ref(&id),
             RetrievalOutcome::Helpful,
             "session-implicit",
+            MomentumPolicy::Skip,
         )
         .expect("reinforce");
 
@@ -198,10 +197,39 @@ fn implicit_path_applies_exactly_one_momentum_signal() {
 }
 
 #[test]
+fn apply_policy_would_double_count_the_implicit_path() {
+    // The control for the test above: Apply after the graded signal is the second charge for
+    // one observation that Skip exists to prevent.
+    let (system, store, _tmp) = system_with_feedback();
+    let id = remember(&system, "Would be double counted");
+
+    {
+        let mut guard = store.write();
+        let momentum = guard.get_or_create_momentum(id.clone(), ExperienceType::Context);
+        momentum.update(graded_implicit_signal());
+    }
+
+    system
+        .reinforce_recall_from(
+            std::slice::from_ref(&id),
+            RetrievalOutcome::Helpful,
+            "session-implicit",
+            MomentumPolicy::Apply,
+        )
+        .expect("reinforce");
+
+    let momentum = store.read().get_momentum(&id).expect("momentum");
+    assert_eq!(
+        momentum.signal_count, 2,
+        "Apply after a graded signal records a second signal"
+    );
+}
+
+#[test]
 fn the_implicit_reinforcement_stage_still_boosts_importance() {
     // The reinforcement stage owes the implicit path its importance boost, coactivation and
     // entity-edge updates even though momentum was written before it.
-    let (system, _store, _tmp) = system_with_feedback();
+    let (system, store, _tmp) = system_with_feedback();
     let id = remember(&system, "Importance still moves on the implicit path");
     let before = system.get_memory(&id).expect("stored memory").importance();
 
@@ -210,6 +238,7 @@ fn the_implicit_reinforcement_stage_still_boosts_importance() {
             std::slice::from_ref(&id),
             RetrievalOutcome::Helpful,
             "session-implicit",
+            MomentumPolicy::Skip,
         )
         .expect("reinforce");
 
@@ -219,12 +248,15 @@ fn the_implicit_reinforcement_stage_still_boosts_importance() {
         after > before,
         "the boost is persisted: importance {before} -> {after}"
     );
+    assert!(
+        store.read().get_momentum(&id).is_none(),
+        "Skip creates no momentum entry"
+    );
 }
 
 // FeedbackStore::with_persistence opens a standalone RocksDB store.
 #[cfg(feature = "rocksdb")]
 #[test]
-#[ignore = "veld bug: POST /api/reinforce (reinforce_recall_from) never writes the feedback momentum its docs say it drives"]
 fn explicit_reinforcement_momentum_survives_restart() {
     // A deployment driven only through POST /api/reinforce never reaches the flush that
     // proactive_context performs, so the momentum must be written through at reinforcement.
@@ -246,9 +278,7 @@ fn explicit_reinforcement_momentum_survives_restart() {
     };
 
     let reopened = FeedbackStore::with_persistence(store_dir.path()).expect("reopen store");
-    let momentum = reopened
-        .get_momentum(&id)
-        .unwrap_or_else(|| panic!("{EXPLICIT_MOMENTUM_BUG}"));
+    let momentum = reopened.get_momentum(&id).expect("momentum");
     assert!(
         momentum.ema > 0.0,
         "restored momentum retains the helpful signal, got {}",

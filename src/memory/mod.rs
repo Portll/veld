@@ -181,8 +181,9 @@ pub use crate::memory::feedback::{
     apply_context_pattern_signals, calculate_entity_flow, calculate_entity_overlap,
     detect_negative_keywords, extract_entities_simple, process_implicit_feedback,
     process_implicit_feedback_with_semantics, signal_from_entity_flow, ContextFingerprint,
-    FeedbackMomentum, FeedbackStore, FeedbackStoreStats, PendingFeedback, PreviousContext,
-    RetrievalTrace, RetrievalTraceStore, SignalRecord, SignalTrigger, SurfacedMemoryInfo, Trend,
+    FeedbackMomentum, FeedbackStore, FeedbackStoreStats, MomentumPolicy, PendingFeedback,
+    PreviousContext, RetrievalTrace, RetrievalTraceStore, SignalRecord, SignalTrigger,
+    SurfacedMemoryInfo, Trend,
 };
 pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult};
 pub use crate::memory::graph_retrieval::{

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::constants::{HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING};
 use crate::embeddings::Embedder;
+use crate::memory::feedback::{MomentumPolicy, SignalRecord, SignalTrigger};
 use crate::memory::graph_retrieval::calculate_density_weights;
 use crate::memory::introspection::StrengtheningReason;
 use crate::memory::learning_history;
@@ -5566,6 +5567,13 @@ impl super::MemorySystem {
     /// persistent storage to ensure importance changes are visible immediately
     /// through cached references (via Arc interior mutability) AND survive restarts.
     ///
+    /// The outcome is also charged to each memory's feedback-momentum EMA
+    /// ([`MomentumPolicy::Apply`]): a caller of this method asserts the outcome directly.
+    ///
+    /// [`reinforce_recall_tracked`](Self::reinforce_recall_tracked) does not route through
+    /// here: it delegates to `Retriever::reinforce_tracked`, which applies neither the
+    /// momentum write nor the graph updates below.
+    ///
     /// # Arguments
     /// * `memory_ids` - IDs of memories that were used in the task
     /// * `outcome` - Whether the memories were helpful, misleading, or neutral
@@ -5581,18 +5589,22 @@ impl super::MemorySystem {
             memory_ids,
             outcome,
             crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE,
+            MomentumPolicy::Apply,
         )
     }
 
     /// `reinforce_recall` with the evidence source named: the session or tool whose
-    /// feedback this is. One source counts once per edge it strengthens.
+    /// feedback this is. One source counts once per edge it strengthens. `momentum_policy`
+    /// says whether the outcome is charged to the feedback-momentum EMA; see
+    /// [`MomentumPolicy`].
     pub fn reinforce_recall_from(
         &self,
         memory_ids: &[MemoryId],
         outcome: RetrievalOutcome,
         source: &str,
+        momentum_policy: MomentumPolicy,
     ) -> Result<ReinforcementStats> {
-        self.reinforce_recall_with(memory_ids, outcome, source, None)
+        self.reinforce_recall_with(memory_ids, outcome, source, momentum_policy, None)
     }
 
     /// [`Self::reinforce_recall_from`] for a caller that journals: `journal` receives
@@ -5602,9 +5614,10 @@ impl super::MemorySystem {
         memory_ids: &[MemoryId],
         outcome: RetrievalOutcome,
         source: &str,
+        momentum_policy: MomentumPolicy,
         journal: &mut super::JournalSink<'_>,
     ) -> Result<ReinforcementStats> {
-        self.reinforce_recall_with(memory_ids, outcome, source, Some(journal))
+        self.reinforce_recall_with(memory_ids, outcome, source, momentum_policy, Some(journal))
     }
 
     fn reinforce_recall_with(
@@ -5612,6 +5625,7 @@ impl super::MemorySystem {
         memory_ids: &[MemoryId],
         outcome: RetrievalOutcome,
         source: &str,
+        momentum_policy: MomentumPolicy,
         mut journal: Option<&mut super::JournalSink<'_>>,
     ) -> Result<ReinforcementStats> {
         if memory_ids.is_empty() {
@@ -5707,12 +5721,15 @@ impl super::MemorySystem {
         // embedding that landed later), and a read outside the gate let a concurrent write
         // to the memory be overwritten.
         let mut persist_failures: Vec<(MemoryId, String)> = Vec::new();
+        let mut found: Vec<(MemoryId, ExperienceType)> = Vec::with_capacity(memory_ids.len());
 
         for id in memory_ids {
             let promoted = promotion_boosts.remove(id).unwrap_or_default();
+            let mut experience_type = None;
             let applied = self.mutate_record(
                 id,
                 |memory| {
+                    experience_type = Some(memory.experience.experience_type.clone());
                     memory.record_access();
                     for boost in &promoted {
                         memory.boost_importance(*boost);
@@ -5733,13 +5750,18 @@ impl super::MemorySystem {
                 journal.as_deref_mut(),
             );
             match applied {
-                Ok(_) => match &outcome {
-                    RetrievalOutcome::Helpful => stats.importance_boosts += 1,
-                    RetrievalOutcome::Misleading => stats.importance_decays += 1,
-                    RetrievalOutcome::Neutral
-                    | RetrievalOutcome::Abstained
-                    | RetrievalOutcome::Ignored => {}
-                },
+                Ok(_) => {
+                    if let Some(experience_type) = experience_type {
+                        found.push((id.clone(), experience_type));
+                    }
+                    match &outcome {
+                        RetrievalOutcome::Helpful => stats.importance_boosts += 1,
+                        RetrievalOutcome::Misleading => stats.importance_decays += 1,
+                        RetrievalOutcome::Neutral
+                        | RetrievalOutcome::Abstained
+                        | RetrievalOutcome::Ignored => {}
+                    }
+                }
                 Err(e) if !matches!(self.long_term_memory.get_memory(id), Ok(Some(_))) => {
                     tracing::debug!(
                         memory_id = %id.0,
@@ -5765,6 +5787,10 @@ impl super::MemorySystem {
                 failure_count = persist_failures.len(),
                 "Hebbian reinforcement had persistence failures - learning feedback partially lost"
             );
+        }
+
+        if momentum_policy == MomentumPolicy::Apply {
+            self.charge_explicit_momentum(&found, outcome);
         }
 
         // R2 (LTR) JOIN HOOK: a feedback label has arrived for these memories.
@@ -5841,6 +5867,43 @@ impl super::MemorySystem {
         }
 
         Ok(stats)
+    }
+
+    /// Charge an asserted outcome to each memory's feedback-momentum EMA (retrieval signal
+    /// 11) and write it through. Only helpful and misleading carry evidence of usefulness;
+    /// the other outcomes record an access and write no signal.
+    fn charge_explicit_momentum(
+        &self,
+        memories: &[(MemoryId, ExperienceType)],
+        outcome: RetrievalOutcome,
+    ) {
+        let Some(feedback_store) = &self.feedback_store else {
+            return;
+        };
+        let (value, label) = match outcome {
+            RetrievalOutcome::Helpful => (1.0, "helpful"),
+            RetrievalOutcome::Misleading => (-1.0, "misleading"),
+            RetrievalOutcome::Neutral | RetrievalOutcome::Abstained | RetrievalOutcome::Ignored => {
+                return
+            }
+        };
+        if memories.is_empty() {
+            return;
+        }
+        let ids: Vec<MemoryId> = memories.iter().map(|(id, _)| id.clone()).collect();
+        let mut store = feedback_store.write();
+        for (id, experience_type) in memories {
+            store
+                .get_or_create_momentum(id.clone(), experience_type.clone())
+                .update(SignalRecord::new(
+                    value,
+                    1.0,
+                    SignalTrigger::ExplicitOutcome {
+                        outcome: label.to_string(),
+                    },
+                ));
+        }
+        store.persist_momentum(&ids);
     }
 
     /// Reinforce using a tracked recall (convenience wrapper)

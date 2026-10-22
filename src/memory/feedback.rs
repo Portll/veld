@@ -205,6 +205,31 @@ pub enum SignalTrigger {
         /// Raw cosine similarity before projection (for comparison/diagnostics)
         raw_similarity: f32,
     },
+
+    /// An outcome a caller asserted through `POST /api/reinforce`, not one inferred from
+    /// the conversation. Every other variant records an inference; this one names the
+    /// explicit reinforcement path as the writer, so a momentum history says which path
+    /// produced each signal.
+    ExplicitOutcome {
+        /// `"helpful"` or `"misleading"`; a neutral outcome writes no signal.
+        outcome: String,
+    },
+}
+
+/// Whether a reinforcement call writes the outcome into the feedback-momentum EMA.
+///
+/// Only the caller knows whether momentum was already charged for these memories, and
+/// getting it wrong is silent, so the policy is an argument rather than inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MomentumPolicy {
+    /// Write the outcome: the caller asserted it directly (`POST /api/reinforce`, the
+    /// harnesses) and nothing else has charged momentum for it.
+    Apply,
+    /// Leave momentum alone: `proactive_context` has already applied its own graded,
+    /// confidence-weighted signal and only classified the same evidence into buckets.
+    /// A second, blunt ±1.0 charge would swamp the graded value and inflate
+    /// `signal_count`, and with it the inertia that resists later correction.
+    Skip,
 }
 
 /// A tool or actuator action performed between feedback cycles.
@@ -1636,6 +1661,50 @@ impl FeedbackStore {
     /// Mark a memory as dirty (needs persistence)
     pub fn mark_dirty(&mut self, memory_id: &MemoryId) {
         self.dirty.insert(memory_id.clone());
+    }
+
+    /// Write these memories' momentum through to the store now, in one atomic batch.
+    ///
+    /// [`mark_dirty`](Self::mark_dirty) only queues, and [`flush`](Self::flush) is driven
+    /// from `proactive_context`, which a deployment using only `POST /api/reinforce` never
+    /// reaches. No engine flush is forced: `flush` waits on one, which would stall the
+    /// harnesses' per-query reinforcement loops. Entries that fail to write stay dirty, so
+    /// a later `flush` retries them.
+    pub fn persist_momentum(&mut self, memory_ids: &[MemoryId]) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let mut pairs = Vec::with_capacity(memory_ids.len());
+        let mut written = Vec::with_capacity(memory_ids.len());
+        for memory_id in memory_ids {
+            let Some(momentum) = self.momentum.get(memory_id) else {
+                continue;
+            };
+            match serde_json::to_vec(momentum) {
+                Ok(value) => {
+                    pairs.push((format!("momentum:{}", memory_id.0).into_bytes(), value));
+                    written.push(memory_id.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(memory_id = %memory_id.0, error = %e, "Failed to encode momentum; left for the next flush");
+                    self.dirty.insert(memory_id.clone());
+                }
+            }
+        }
+        if pairs.is_empty() {
+            return;
+        }
+        match store.put_many(&pairs) {
+            Ok(()) => {
+                for memory_id in &written {
+                    self.dirty.remove(memory_id);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(count = pairs.len(), error = %e, "Failed to persist momentum; left for the next flush");
+                self.dirty.extend(written);
+            }
+        }
     }
 
     /// Set pending feedback for a user (also persists to disk)
