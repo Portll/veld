@@ -99,8 +99,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, unlike the other jobs: each Rust release adds lints, and the warning ratchet
+      # below compares counts measured on this toolchain (scripts/clippy_baseline.json). A bump
+      # here re-measures that baseline in the same change.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install LLVM
@@ -109,24 +113,34 @@ jobs:
           sudo apt-get install -y llvm-dev libclang-dev clang
       - name: Run Clippy
         run: |
-          set -o pipefail
           # clippy::all stays at -W while its style and complexity lints are cleared. The correctness
           # group is denied: -W clippy::all would downgrade those deny-by-default lints, which flag
           # code that is almost certainly wrong, such as an assert that can never fail. The -D comes
           # after the -W so it wins for that group.
-          cargo clippy --all-targets -- -W clippy::all -D clippy::correctness 2>&1 | tee clippy-output.txt
-          cargo clippy --all-targets --no-default-features --features storage-redb -- -W clippy::all -D clippy::correctness 2>&1 | tee -a clippy-output.txt
-          # The Zenoh transport is compiled only under its feature, which no other job enables. It
-          # stopped compiling unnoticed (twelve errors, found 2026-10-21) while the handlers it
-          # mirrors moved on; this keeps it type-checked against them. Check only, no test run.
-          cargo clippy --all-targets --features zenoh -- -W clippy::all -D clippy::correctness 2>&1 | tee -a clippy-output.txt
-          WARNINGS=$(grep -c "warning:" clippy-output.txt || true)
-          echo "### Clippy Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Warnings | $WARNINGS |" >> $GITHUB_STEP_SUMMARY
-          echo "| Status | Passed |" >> $GITHUB_STEP_SUMMARY
+          #
+          # The warnings never fail the build on their own, so each feature set's count is held to
+          # scripts/clippy_baseline.json and may only fall.
+          #
+          # The zenoh set: the Zenoh transport is compiled only under its feature, which no other
+          # job enables. It stopped compiling unnoticed (twelve errors, found 2026-10-21) while the
+          # handlers it mirrors moved on; this keeps it type-checked against them. Check only.
+          {
+            echo "### Clippy Results"
+            echo ""
+            echo "| Feature set | Warnings | Baseline | Errors | Status |"
+            echo "|-------------|----------|----------|--------|--------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          clippy() {
+            local set=$1
+            shift
+            cargo clippy --all-targets "$@" --message-format=json -- -W clippy::all -D clippy::correctness > "clippy-$set.json" || status=1
+            python3 scripts/clippy_ratchet.py "$set" "clippy-$set.json" || status=1
+          }
+          clippy default
+          clippy redb-only --no-default-features --features storage-redb
+          clippy zenoh --features zenoh
+          exit $status
 
   build:
     name: Build (${{ matrix.os }})
