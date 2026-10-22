@@ -482,13 +482,15 @@ pub trait KeyValueStore: Send + Sync {
 /// declared here so the field can become `Arc<dyn PrimaryMemoryStore>` — the
 /// boundary the storage abstraction was designed for and stalled at.
 ///
-/// **`get` is NOT expressible in terms of `get_memory`, and that is why both are
-/// here.** `RocksDbPrimaryMemoryStore::get_memory` classifies not-found by
-/// `err.to_string().contains("Memory not found")`, so routing `get` through it
-/// would send every genuine failure through a string match and return `Ok(None)`
-/// for any error whose message someone later rewords — a decode failure, a
-/// corrupt value or a permission error rendered as "this memory does not exist".
-/// `get` therefore delegates straight to the backend and keeps its own error.
+/// `get`, `store`, `update` and `delete` are the MemoryStorage names for
+/// `get_memory`, `put_memory`, `update_memory` and `delete_memory`, and their
+/// defaults call those. An engine overrides `get` when its `get_memory` is not a
+/// real lookup: `RocksDbPrimaryMemoryStore::get_memory` classifies not-found by
+/// `err.to_string().contains("Memory not found")`, so a `get` routed through it
+/// would turn every genuine failure whose message someone later rewords — a decode
+/// failure, a corrupt value, a permission error — into "this memory does not
+/// exist". That adapter's `get` delegates straight to the backend and keeps its
+/// own error.
 pub trait PrimaryMemoryStore: Send + Sync {
     fn backend(&self) -> StorageBackend;
     fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>>;
@@ -532,7 +534,10 @@ pub trait PrimaryMemoryStore: Send + Sync {
     // ── What MemorySystem calls, by frequency. Signatures are MemoryStorage's
     //    exactly: an alias that "tidies" one of these changes behaviour at a call
     //    site that will not look any different.
-    fn get(&self, id: &MemoryId) -> Result<Memory>;
+    fn get(&self, id: &MemoryId) -> Result<Memory> {
+        self.get_memory(id)?
+            .ok_or_else(|| anyhow::anyhow!("Memory not found: {}", id.0))
+    }
     /// [`Self::get`] for every id in `ids`, results in the same order, each exactly what
     /// `get` returns for that id: the same record, forgotten ones included, and the same
     /// not-found error. Engines override it to read the batch in one pass; this default
@@ -540,12 +545,18 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn get_many(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
         ids.iter().map(|id| self.get(id)).collect()
     }
-    fn store(&self, memory: &Memory) -> Result<()>;
-    fn update(&self, memory: &Memory) -> Result<()>;
+    fn store(&self, memory: &Memory) -> Result<()> {
+        self.put_memory(memory)
+    }
+    fn update(&self, memory: &Memory) -> Result<()> {
+        self.update_memory(memory)
+    }
     /// [`Self::update`] for many memories as one atomic write: every record and its
     /// index rows commit together, or none does. One commit, one sync.
     fn update_many(&self, memories: &[Memory]) -> Result<()>;
-    fn delete(&self, id: &MemoryId) -> Result<()>;
+    fn delete(&self, id: &MemoryId) -> Result<()> {
+        self.delete_memory(id)
+    }
     /// Every LIVE memory: forgotten (soft-deleted, `Memory::is_forgotten`) records are
     /// left out on every engine. Its callers index, list, repair and merge what recall
     /// can reach, and a forgotten record handed to them comes back into the vector and

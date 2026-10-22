@@ -1604,16 +1604,10 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
     // Production runs this store whenever VELD_STORAGE_BACKEND=redb (config::effective_
     // storage_backend_for_current_build); RocksDB stays the default under ADR 0007.
     //
-    // These four are the same operations this trait carries under other names. On
-    // redb `get_memory` is a plain table lookup returning Option, so composing `get`
-    // from it is exact — unlike the rocksdb adapter, where `get_memory` recovers
-    // not-found by matching an error STRING and composing the other way round would
-    // launder real failures into `Ok(None)`. Same two names, opposite safe direction,
-    // per backend.
-    fn get(&self, id: &MemoryId) -> Result<Memory> {
-        self.get_memory(id)?
-            .ok_or_else(|| anyhow!("Memory not found: {}", id.0))
-    }
+    // `get`, `store`, `update` and `delete` are the trait defaults over `get_memory`,
+    // `put_memory`, `update_memory` and `delete_memory`. `get_memory` here is a plain
+    // table lookup returning Option, so the default `get` composed from it is exact.
+
     /// One read transaction for the whole batch. A transaction or table that will not open
     /// is answered id by id through `get`, so each id still carries the error `get` gives.
     fn get_many(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
@@ -1635,12 +1629,6 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
             })
             .collect()
     }
-    fn store(&self, memory: &Memory) -> Result<()> {
-        self.put_memory(memory)
-    }
-    fn update(&self, memory: &Memory) -> Result<()> {
-        self.update_memory(memory)
-    }
     fn update_many(&self, memories: &[Memory]) -> Result<()> {
         if memories.is_empty() {
             return Ok(());
@@ -1655,9 +1643,6 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
             }
             Ok(())
         })
-    }
-    fn delete(&self, id: &MemoryId) -> Result<()> {
-        self.delete_memory(id)
     }
     fn get_all(&self) -> Result<Vec<Memory>> {
         Ok(self

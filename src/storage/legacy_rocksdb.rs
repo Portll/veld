@@ -354,27 +354,20 @@ impl RocksDbPrimaryMemoryStore {
 }
 
 impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
-    // ── The 21 methods MemorySystem calls, delegated verbatim. Pure forwarding on
+    // ── The methods MemorySystem calls, delegated verbatim. Pure forwarding on
     //    purpose: this adapter's whole job is to preserve current runtime behaviour
     //    while call sites move off the concrete type, so anything cleverer here
     //    would change behaviour in the commit whose point is that nothing changes.
+    //    `store`, `update` and `delete` are the trait defaults over `put_memory`,
+    //    `update_memory` and `delete_memory`, which forward to the same calls.
     fn get(&self, id: &MemoryId) -> Result<Memory> {
         self.inner.get(id)
     }
     fn get_many(&self, ids: &[MemoryId]) -> Vec<Result<Memory>> {
         self.inner.get_many(ids)
     }
-    fn store(&self, memory: &Memory) -> Result<()> {
-        self.inner.store(memory)
-    }
-    fn update(&self, memory: &Memory) -> Result<()> {
-        self.inner.update(memory)
-    }
     fn update_many(&self, memories: &[Memory]) -> Result<()> {
         self.inner.store_many(memories)
-    }
-    fn delete(&self, id: &MemoryId) -> Result<()> {
-        self.inner.delete(id)
     }
     fn get_all(&self) -> Result<Vec<Memory>> {
         self.inner.get_all()
