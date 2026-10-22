@@ -13,7 +13,9 @@
 use tempfile::TempDir;
 
 use veld::memory::compression::is_active;
-use veld::memory::{Experience, ExperienceType, MemoryConfig, MemorySystem, SemanticFact};
+use veld::memory::{
+    Experience, ExperienceType, MaintenanceDepth, MemoryConfig, MemorySystem, SemanticFact,
+};
 
 static ENV_INIT: std::sync::Once = std::sync::Once::new();
 
@@ -99,7 +101,7 @@ fn maintenance_extracts_memories_that_arrive_behind_a_prior_cycle() {
         )
         .expect("remember young");
     system
-        .run_maintenance(1.0, user, true)
+        .run_maintenance(1.0, user, MaintenanceDepth::Heavy)
         .expect("heavy maintenance on a young store");
     assert!(system.get_facts(user, 10).expect("facts").is_empty());
 
@@ -112,7 +114,7 @@ fn maintenance_extracts_memories_that_arrive_behind_a_prior_cycle() {
             .expect("remember backfill");
     }
     system
-        .run_maintenance(1.0, user, true)
+        .run_maintenance(1.0, user, MaintenanceDepth::Heavy)
         .expect("heavy maintenance after backfill");
 
     let facts = system.get_facts(user, 10).expect("facts");
@@ -239,7 +241,7 @@ fn repeated_distillation_is_idempotent() {
     for _ in 0..3 {
         system.distill_facts(user, 2, 7).expect("re-distill");
         system
-            .run_maintenance(1.0, user, true)
+            .run_maintenance(1.0, user, MaintenanceDepth::Heavy)
             .expect("heavy maintenance");
     }
     let rescanned = all_facts(&system, user);

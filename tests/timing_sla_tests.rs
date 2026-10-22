@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use veld::embeddings::ner::{NerConfig, NeuralNer};
 use veld::memory::types::{Experience, ExperienceType, GeoFilter, Query};
-use veld::memory::{MemoryConfig, MemorySystem};
+use veld::memory::{MaintenanceDepth, MemoryConfig, MemorySystem};
 
 // ============================================================================
 // SLA THRESHOLDS (in milliseconds)
@@ -620,7 +620,7 @@ fn test_sla_maintenance_latency() {
     // Measure maintenance operation
     let start = Instant::now();
     let processed = system
-        .run_maintenance(0.95, "test-user", false)
+        .run_maintenance(0.95, "test-user", MaintenanceDepth::Light)
         .expect("Maintenance failed");
     let duration = start.elapsed().as_millis();
 

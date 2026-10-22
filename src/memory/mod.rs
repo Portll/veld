@@ -7889,8 +7889,9 @@ impl MemorySystem {
     /// 2. Decay activation levels on all memories
     /// 3. Run graph maintenance (prune weak edges)
     ///
-    /// `is_heavy`: when true, runs expensive operations (fact extraction, auto-repair)
-    /// that require full RocksDB scans. Light cycles only touch in-memory data.
+    /// `depth`: [`MaintenanceDepth::Heavy`] also runs the expensive operations (fact
+    /// extraction, auto-repair) that scan the whole store. Light cycles only touch
+    /// in-memory data.
     ///
     /// Returns the number of memories processed for activation decay.
     /// Also records consolidation events for introspection.
@@ -7898,8 +7899,9 @@ impl MemorySystem {
         &self,
         decay_factor: f32,
         user_id: &str,
-        is_heavy: bool,
+        depth: MaintenanceDepth,
     ) -> Result<MaintenanceResult> {
+        let is_heavy = depth == MaintenanceDepth::Heavy;
         let start_time = std::time::Instant::now();
         // The scoring clock, so a pinned harness clock (VELD_EVAL_NOW) promotes, decays and
         // closes windows the same on every pass, as it already ages graph edges.
@@ -11176,7 +11178,7 @@ mod lifecycle_tests {
                 cached.set_importance(0.95);
             }
             let result = system
-                .run_maintenance(1.0, "maintenance-user", false)
+                .run_maintenance(1.0, "maintenance-user", MaintenanceDepth::Light)
                 .unwrap();
             assert!(
                 result.rewritten.contains(&id),
@@ -11478,7 +11480,9 @@ mod lifecycle_tests {
                 )
                 .unwrap();
             assert!(flag(&system), "{backend}");
-            system.run_maintenance(1.0, "flag-user", true).unwrap();
+            system
+                .run_maintenance(1.0, "flag-user", MaintenanceDepth::Heavy)
+                .unwrap();
             assert!(
                 flag(&system),
                 "{backend}: a young corpus is unfinished work for a later cycle"
@@ -11500,7 +11504,9 @@ mod lifecycle_tests {
                     Some(chrono::Utc::now() - chrono::Duration::days(10)),
                 )
                 .unwrap();
-            system.run_maintenance(1.0, "flag-user", true).unwrap();
+            system
+                .run_maintenance(1.0, "flag-user", MaintenanceDepth::Heavy)
+                .unwrap();
             assert!(!flag(&system), "{backend}: nothing is left to extract");
         }
     }
@@ -11820,13 +11826,17 @@ mod lifecycle_tests {
                 "{backend}: remember leaves compression to maintenance"
             );
 
-            system.run_maintenance(1.0, "compress-user", false).unwrap();
+            system
+                .run_maintenance(1.0, "compress-user", MaintenanceDepth::Light)
+                .unwrap();
             assert!(
                 !system.long_term_memory.get(&old.id).unwrap().compressed,
                 "{backend}: a light cycle does not compress"
             );
 
-            system.run_maintenance(1.0, "compress-user", true).unwrap();
+            system
+                .run_maintenance(1.0, "compress-user", MaintenanceDepth::Heavy)
+                .unwrap();
             assert!(
                 system.long_term_memory.get(&old.id).unwrap().compressed,
                 "{backend}: the heavy cycle compresses an aged record"
