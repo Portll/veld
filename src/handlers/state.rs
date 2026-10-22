@@ -581,17 +581,39 @@ impl MultiUserMemoryManager {
         let graph_memories = moka::sync::Cache::builder()
             .max_capacity(server_config.max_users_in_memory as u64)
             .time_to_idle(std::time::Duration::from_secs(3600))
-            .eviction_listener(move |key: Arc<String>, _value, cause| {
-                let cause_label = if cause == moka::notification::RemovalCause::Expired {
-                    "idle-timeout"
-                } else {
-                    "LRU"
-                };
-                info!(
-                    "Evicted graph for user '{}' from memory cache ({})",
-                    key, cause_label
-                );
-            })
+            .eviction_listener(
+                move |key: Arc<String>, value: Arc<parking_lot::RwLock<GraphMemory>>, cause| {
+                    let cause_label = if cause == moka::notification::RemovalCause::Expired {
+                        "idle-timeout"
+                    } else {
+                        "LRU"
+                    };
+                    info!(
+                        "Evicted graph for user '{}' from memory cache ({})",
+                        key, cause_label
+                    );
+                    if matches!(
+                        cause,
+                        moka::notification::RemovalCause::Size
+                            | moka::notification::RemovalCause::Expired
+                    ) {
+                        // Off the listener, which runs inside the cache. try_write, never a
+                        // wait: a graph still in use (a user memory may hold it) keeps its
+                        // counts and the next open counts instead; a wait would hold the
+                        // store open against that open.
+                        std::thread::spawn(move || {
+                            if let Some(mut graph) = value.try_write() {
+                                if let Err(e) = graph.persist_counters() {
+                                    tracing::warn!(
+                                        user_id = %key,
+                                        "graph counters not saved at eviction: {e:#}"
+                                    );
+                                }
+                            }
+                        });
+                    }
+                },
+            )
             .build();
 
         // Single shared LRU block cache for ALL RocksDB instances (per-user memory DBs,
@@ -1887,6 +1909,22 @@ impl MultiUserMemoryManager {
             "All databases flushed: shared (5 stores), {} user memories",
             flushed
         );
+
+        // With writes closed, each graph's counters are saved so its next open reads them
+        // instead of decoding every relationship. A graph busy past the wait is counted then.
+        for (user_id, graph) in self.graph_memories.iter() {
+            match graph.try_write_for(std::time::Duration::from_secs(2)) {
+                Some(mut graph) => {
+                    if let Err(e) = graph.persist_counters() {
+                        tracing::warn!(user_id = %user_id, "graph counters not saved: {e:#}");
+                    }
+                }
+                None => tracing::warn!(
+                    user_id = %user_id,
+                    "graph busy at shutdown; its next open counts its relationships"
+                ),
+            }
+        }
 
         Ok(())
     }
