@@ -13,7 +13,7 @@ use tracing::info;
 
 use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
-use super::utils::resolve_request_user_id;
+use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{self, ExperienceType, Memory};
@@ -376,62 +376,70 @@ pub async fn get_memory(
         .get_user_memory_async(&user_id)
         .await
         .map_err(AppError::Internal)?;
-    let memory_guard = memory.read();
+    let decompress = wants_full_content(&params);
 
-    let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
-    let memory_obj = (*shared_memory).clone();
-    let resolved_id = shared_memory.id.clone();
+    let found = run_blocking(move || {
+        let memory_guard = memory.read();
 
-    // The response says what its content IS. A compressed record is returned as stored unless
-    // the caller asks for the restored body; a legacy lossy record is never passed off as full.
-    let lossless = memory_guard.memory_is_lossless(&memory_obj);
-    let (memory_obj, full_content, content_note) = if !memory_obj.compressed {
-        (memory_obj, true, None)
-    } else if !lossless {
-        (
-            memory_obj,
-            false,
-            Some(
-                "written by the pre-fix lossy compressor: the body was replaced by a summary at \
-                 storage time and cannot be restored"
-                    .to_string(),
-            ),
-        )
-    } else if wants_full_content(&params) {
-        match memory_guard.decompress_memory(&memory_obj) {
-            Ok(restored) => (restored, true, None),
-            Err(e) => (
+        let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
+        let memory_obj = (*shared_memory).clone();
+        let resolved_id = shared_memory.id.clone();
+
+        // The response says what its content IS. A compressed record is returned as stored
+        // unless the caller asks for the restored body; a legacy lossy record is never passed
+        // off as full.
+        let lossless = memory_guard.memory_is_lossless(&memory_obj);
+        let (memory_obj, full_content, content_note) = if !memory_obj.compressed {
+            (memory_obj, true, None)
+        } else if !lossless {
+            (
                 memory_obj,
                 false,
-                Some(format!("decompression failed: {e}")),
-            ),
-        }
-    } else {
-        (
-            memory_obj,
-            false,
-            Some("compressed; pass ?decompress=1 for the restored content".to_string()),
-        )
-    };
+                Some(
+                    "written by the pre-fix lossy compressor: the body was replaced by a summary \
+                     at storage time and cannot be restored"
+                        .to_string(),
+                ),
+            )
+        } else if decompress {
+            match memory_guard.decompress_memory(&memory_obj) {
+                Ok(restored) => (restored, true, None),
+                Err(e) => (
+                    memory_obj,
+                    false,
+                    Some(format!("decompression failed: {e}")),
+                ),
+            }
+        } else {
+            (
+                memory_obj,
+                false,
+                Some("compressed; pass ?decompress=1 for the restored content".to_string()),
+            )
+        };
 
-    // Fetch children for hierarchy context
-    let children = memory_guard
-        .get_memory_children(&resolved_id)
-        .unwrap_or_default();
+        // Fetch children for hierarchy context
+        let children = memory_guard
+            .get_memory_children(&resolved_id)
+            .unwrap_or_default();
 
-    let children_ids: Vec<String> = children.iter().map(|c| c.id.0.to_string()).collect();
-    let children_count = children_ids.len();
+        let children_ids: Vec<String> = children.iter().map(|c| c.id.0.to_string()).collect();
+        let children_count = children_ids.len();
 
-    let injection_suspected = crate::memory::injection::injection_suspected(&memory_obj);
-    Ok(Json(MemoryWithHierarchy {
-        memory: memory_obj,
-        children_ids,
-        children_count,
-        full_content,
-        lossless,
-        content_note,
-        injection_suspected,
-    }))
+        let injection_suspected = crate::memory::injection::injection_suspected(&memory_obj);
+        Ok(MemoryWithHierarchy {
+            memory: memory_obj,
+            children_ids,
+            children_count,
+            full_content,
+            lossless,
+            content_note,
+            injection_suspected,
+        })
+    })
+    .await?;
+
+    Ok(Json(found))
 }
 
 // =============================================================================
@@ -1045,6 +1053,46 @@ async fn forget_one_journaled_blocking(
         .map_err(AppError::Internal)
 }
 
+/// Forgets by each criterion in turn and journals a `Forget` frame for every memory removed,
+/// on the blocking pool: each criterion is a full-store scan and delete, and the journal waits
+/// on the tenant's write gate. Returns how many were forgotten. A criterion that fails still
+/// has the earlier ones' removals journaled, as they are already gone from the store.
+async fn forget_bulk_journaled_blocking(
+    state: &AppState,
+    memory: crate::user_memory::SharedUserMemory,
+    user_id: &str,
+    criteria: Vec<memory::ForgetCriteria>,
+) -> Result<usize, AppError> {
+    let state = state.clone();
+    let user_id = user_id.to_string();
+    run_blocking(move || {
+        let memory_guard = memory.read();
+        let mut total_count = 0;
+        let mut removed = Vec::new();
+        let mut failure = None;
+        for c in criteria {
+            match memory_guard.forget_collecting_removed(c) {
+                Ok((count, ids)) => {
+                    total_count += count;
+                    removed.extend(ids);
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        if !removed.is_empty() {
+            journal_bulk_forget(&state, &memory_guard, &user_id, removed);
+        }
+        match failure {
+            Some(e) => Err(AppError::Internal(e)),
+            None => Ok(total_count),
+        }
+    })
+    .await
+}
+
 /// POST /api/forget/age - Forget memories older than N days
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn forget_by_age(
@@ -1058,12 +1106,13 @@ pub async fn forget_by_age(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let (count, removed) = memory_guard
-        .forget_collecting_removed(memory::ForgetCriteria::OlderThan(req.days_old))
-        .map_err(AppError::Internal)?;
-    journal_bulk_forget(&state, &memory_guard, &req.user_id, removed);
-    drop(memory_guard);
+    let count = forget_bulk_journaled_blocking(
+        &state,
+        memory_sys,
+        &req.user_id,
+        vec![memory::ForgetCriteria::OlderThan(req.days_old)],
+    )
+    .await?;
 
     state.log_event(
         &req.user_id,
@@ -1103,12 +1152,13 @@ pub async fn forget_by_importance(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let (count, removed) = memory_guard
-        .forget_collecting_removed(memory::ForgetCriteria::LowImportance(req.threshold))
-        .map_err(AppError::Internal)?;
-    journal_bulk_forget(&state, &memory_guard, &req.user_id, removed);
-    drop(memory_guard);
+    let count = forget_bulk_journaled_blocking(
+        &state,
+        memory_sys,
+        &req.user_id,
+        vec![memory::ForgetCriteria::LowImportance(req.threshold)],
+    )
+    .await?;
 
     state.log_event(
         &req.user_id,
@@ -1155,12 +1205,13 @@ pub async fn forget_by_pattern(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let (count, removed) = memory_guard
-        .forget_collecting_removed(memory::ForgetCriteria::Pattern(req.pattern.clone()))
-        .map_err(AppError::Internal)?;
-    journal_bulk_forget(&state, &memory_guard, &req.user_id, removed);
-    drop(memory_guard);
+    let count = forget_bulk_journaled_blocking(
+        &state,
+        memory_sys,
+        &req.user_id,
+        vec![memory::ForgetCriteria::Pattern(req.pattern.clone())],
+    )
+    .await?;
 
     state.log_event(
         &req.user_id,
@@ -1200,13 +1251,13 @@ pub async fn forget_by_tags(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-
-    let (deleted_count, removed) = memory_guard
-        .forget_collecting_removed(memory::ForgetCriteria::ByTags(req.tags.clone()))
-        .map_err(AppError::Internal)?;
-    journal_bulk_forget(&state, &memory_guard, &req.user_id, removed);
-    drop(memory_guard);
+    let deleted_count = forget_bulk_journaled_blocking(
+        &state,
+        memory_sys,
+        &req.user_id,
+        vec![memory::ForgetCriteria::ByTags(req.tags.clone())],
+    )
+    .await?;
 
     info!(
         "🏷️ Forget by tags: user={}, tags={:?}, deleted={}",
@@ -1257,16 +1308,16 @@ pub async fn forget_by_date(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-
-    let (deleted_count, removed) = memory_guard
-        .forget_collecting_removed(memory::ForgetCriteria::ByDateRange {
+    let deleted_count = forget_bulk_journaled_blocking(
+        &state,
+        memory_sys,
+        &req.user_id,
+        vec![memory::ForgetCriteria::ByDateRange {
             start: req.start,
             end: req.end,
-        })
-        .map_err(AppError::Internal)?;
-    journal_bulk_forget(&state, &memory_guard, &req.user_id, removed);
-    drop(memory_guard);
+        }],
+    )
+    .await?;
 
     info!(
         "📅 Forget by date: user={}, start={}, end={}, deleted={}",
@@ -1333,29 +1384,8 @@ pub async fn bulk_delete_memories(
         criteria.push(memory::ForgetCriteria::ByDateRange { start, end });
     }
 
-    let memory_guard = memory_sys.read();
-    let mut total_count = 0;
-    let mut removed = Vec::new();
-    // Each pass's removals are journaled even when a later pass fails: they
-    // are already gone from the store.
-    let mut failure = None;
-    for c in criteria {
-        match memory_guard.forget_collecting_removed(c) {
-            Ok((count, ids)) => {
-                total_count += count;
-                removed.extend(ids);
-            }
-            Err(e) => {
-                failure = Some(e);
-                break;
-            }
-        }
-    }
-    journal_bulk_forget(&state, &memory_guard, &req.user_id, removed);
-    drop(memory_guard);
-    if let Some(e) = failure {
-        return Err(AppError::Internal(e));
-    }
+    let total_count =
+        forget_bulk_journaled_blocking(&state, memory_sys, &req.user_id, criteria).await?;
 
     state.log_event(
         &req.user_id,
@@ -1395,12 +1425,13 @@ pub async fn clear_all_memories(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let (count, removed) = memory_guard
-        .forget_collecting_removed(memory::ForgetCriteria::All)
-        .map_err(AppError::Internal)?;
-    journal_bulk_forget(&state, &memory_guard, &req.user_id, removed);
-    drop(memory_guard);
+    let count = forget_bulk_journaled_blocking(
+        &state,
+        memory_sys,
+        &req.user_id,
+        vec![memory::ForgetCriteria::All],
+    )
+    .await?;
 
     state.log_event(
         &req.user_id,
@@ -1504,8 +1535,8 @@ pub async fn get_memory_health(
         .map_err(AppError::Internal)?;
 
     let mem = {
-        let guard = memory.read();
-        resolve_memory(&guard, &memory_id_str)?
+        let memory_id_str = memory_id_str.clone();
+        run_blocking(move || resolve_memory(&memory.read(), &memory_id_str)).await?
     };
 
     let importance = mem.importance();
@@ -1701,13 +1732,16 @@ pub async fn wiki_render(
         ));
     }
 
-    // (b) Start the live edit-back watcher for this user (no-op unless
-    // VELD_WIKI_WATCH is on). The Arc is the shared AppState the watcher
-    // thread calls back into.
-    state.ensure_wiki_watcher(state.clone(), &user_id);
-
-    let (target_dir, pages, edits_applied) =
-        state.render_wiki(&user_id).map_err(AppError::Internal)?;
+    // Rendering opens the tenant's intent log, folds in the edits on disk and walks the
+    // rendered pages.
+    let (target_dir, pages, edits_applied) = run_blocking(move || {
+        // (b) Start the live edit-back watcher for this user (no-op unless
+        // VELD_WIKI_WATCH is on). The Arc is the shared AppState the watcher
+        // thread calls back into.
+        state.ensure_wiki_watcher(state.clone(), &user_id);
+        state.render_wiki(&user_id).map_err(AppError::Internal)
+    })
+    .await?;
 
     Ok(Json(serde_json::json!({
         "success": true,
