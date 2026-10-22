@@ -6859,16 +6859,28 @@ impl MemorySystem {
             .take(limit)
             .map(|(_, id)| (id, EmbedPurpose::Write))
             .collect();
+        // A row the batch clears is one this drain drained: it counts in the report, and it
+        // takes its place in `limit`.
+        let mut cleared = 0usize;
         if !ids.is_empty() {
-            for (_, outcome) in self.embed_and_index_batch(&ids, Bm25Sync::Journaled) {
+            for (id, outcome) in self.embed_and_index_batch(&ids, Bm25Sync::Journaled) {
                 if let Ok(outcome) = outcome {
                     note(outcome.rewritten, &mut rewritten);
                 }
+                if self.retriever.is_indexed(&id)
+                    && self.embedding_backlog.get(&id).ok().flatten().is_none()
+                {
+                    cleared += 1;
+                }
             }
         }
-        let report = self
+        let mut report = self
             .embedding_backlog
-            .drain_with(limit, |key| self.embed_backlog_outcome(key, &mut rewritten))?;
+            .drain_with(limit.saturating_sub(cleared), |key| {
+                self.embed_backlog_outcome(key, &mut rewritten)
+            })?;
+        report.attempted += cleared;
+        report.drained += cleared;
         if let Err(e) = self.refresh_space_registry() {
             tracing::warn!("space registry: could not write: {e}");
         }
