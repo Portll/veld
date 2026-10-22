@@ -1497,3 +1497,171 @@ mod probes_while_a_tenant_opens {
         assert!(std::sync::Arc::ptr_eq(&opened, &cached));
     }
 }
+
+#[cfg(test)]
+mod probes_while_handlers_work {
+    //! Handlers that scan, embed into or rewrite a tenant's store did that work on the tokio
+    //! worker serving the request, and every request scheduled there, the probes included,
+    //! waited for it. The runtime below has one worker; one such handler is enough to stall it.
+    use super::*;
+    use crate::handlers::test_helpers::{get, get_unauthenticated, post_json, send, TestHarness};
+    use crate::user_memory::SharedUserMemory;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    /// Holds the tenant's memory exclusively on another thread until the returned sender
+    /// fires or 10 s pass. Work on the tenant waits the hold out, as it would wait out work
+    /// that took that long.
+    fn hold_tenant(memory: SharedUserMemory) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = memory.write();
+            held_tx.send(()).expect("test waits for the hold");
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        held_rx.recv().expect("tenant held");
+        (release_tx, holder)
+    }
+
+    /// Sends `request` from a spawned task, which needs a free worker as a real connection's
+    /// does, and waits on this thread, which is not a worker.
+    fn answer(
+        app: &axum::Router,
+        request: Request<Body>,
+    ) -> Option<(StatusCode, serde_json::Value)> {
+        let (tx, rx) = mpsc::channel();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(send(app, request).await);
+        });
+        rx.recv_timeout(Duration::from_secs(5)).ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn probes_answer_while_handlers_wait_on_tenant_work() {
+        const TENANT: &str = "tenant-at-work";
+        let _quiet = crate::storage::write_latch::test_serial::quiet().await;
+        let harness = TestHarness::new();
+        let app = harness.router();
+        let memory = harness.manager.get_user_memory(TENANT).expect("open");
+        let (release, holder) = hold_tenant(Arc::clone(&memory));
+        let holders = Arc::strong_count(&memory);
+
+        let user = serde_json::json!({ "user_id": TENANT });
+        let requests = vec![
+            post_json(
+                "/api/search/advanced",
+                &serde_json::json!({"user_id": TENANT, "min_importance": 0.0, "max_importance": 1.0}),
+            ),
+            post_json(
+                "/api/search/multimodal",
+                &serde_json::json!({"user_id": TENANT, "query_text": "tenant work", "mode": "similarity"}),
+            ),
+            post_json(
+                "/api/recall/tags",
+                &serde_json::json!({"user_id": TENANT, "tags": ["tenant-work"]}),
+            ),
+            post_json(
+                "/api/recall/date",
+                &serde_json::json!({"user_id": TENANT, "start": "2020-01-01T00:00:00Z", "end": "2030-01-01T00:00:00Z"}),
+            ),
+            post_json(
+                "/api/forget/tags",
+                &serde_json::json!({"user_id": TENANT, "tags": ["tenant-work"]}),
+            ),
+            post_json(
+                "/api/memories/bulk",
+                &serde_json::json!({"user_id": TENANT, "tags": ["tenant-work"]}),
+            ),
+            post_json("/api/index/verify", &user),
+            post_json("/api/index/repair", &user),
+            post_json(
+                "/api/storage/uncompressed",
+                &serde_json::json!({"user_id": TENANT, "days_old": 30}),
+            ),
+            post_json("/api/export/mif", &user),
+            get(&format!("/api/storage/stats?user_id={TENANT}")),
+            get(&format!("/api/health/index?user_id={TENANT}")),
+            get(&format!("/api/brain/{TENANT}")),
+        ];
+        let sent = requests.len();
+        let handlers: Vec<_> = requests
+            .into_iter()
+            .map(|request| tokio::spawn(send(app.clone(), request)))
+            .collect();
+
+        // A handler holds the tenant from its lookup until its work is done, so every one of
+        // them holding it means each has reached the work the hold stands in for.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&memory) < holders + sent && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reached = Arc::strong_count(&memory) - holders;
+        let health = answer(&app, get_unauthenticated("/health"));
+        let still_waiting = handlers.iter().filter(|h| !h.is_finished()).count();
+
+        release.send(()).expect("holder waits for release");
+        holder.join().expect("holder thread");
+        for handler in handlers {
+            let (status, body) = handler.await.expect("request task");
+            assert!(status.is_success(), "{status}: {body}");
+        }
+
+        assert!(
+            reached >= sent,
+            "only {reached} of {sent} handlers reached the tenant's work: one held the only worker"
+        );
+        let (status, _) =
+            health.expect("/health did not answer while handlers waited on the tenant's work");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            still_waiting, sent,
+            "a handler answered before the tenant's work could run"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn an_index_job_answers_at_once_and_refuses_a_second_while_it_runs() {
+        // Its own tenant: index jobs are serialized per user id across the process.
+        const TENANT: &str = "tenant-index-job";
+        let harness = TestHarness::new();
+        let app = harness.router();
+        let memory = harness.manager.get_user_memory(TENANT).expect("open");
+        let (release, holder) = hold_tenant(memory);
+        let user = serde_json::json!({ "user_id": TENANT });
+
+        let rebuild = answer(&app, post_json("/api/index/rebuild", &user));
+        let overlapping = answer(&app, post_json("/api/index/reembed", &user));
+
+        release.send(()).expect("holder waits for release");
+        holder.join().expect("holder thread");
+        assert!(
+            harness
+                .manager
+                .drain_background_tasks(Duration::from_secs(10))
+                .await,
+            "the rebuild did not finish once the tenant was let go"
+        );
+        let after = answer(&app, post_json("/api/index/reembed", &user));
+        assert!(
+            harness
+                .manager
+                .drain_background_tasks(Duration::from_secs(10))
+                .await,
+            "the re-embed did not finish"
+        );
+
+        let (status, body) =
+            rebuild.expect("the rebuild did not answer while its work waited on the tenant");
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["accepted"], true, "{body}");
+        let (status, body) = overlapping.expect("the second job did not answer");
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["accepted"], false, "{body}");
+        let (status, body) = after.expect("a job after the first ended did not answer");
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    }
+}
