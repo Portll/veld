@@ -174,9 +174,16 @@ pub async fn follow(State(state): State<AppState>, headers: HeaderMap, body: Byt
             );
         }
     }
-    match replication::follow(&state.base_path, &source, &req.admin_key, Some(&api_key)) {
-        Ok(status) => respond(StatusCode::OK, json!({"following": status})),
-        Err(e) => failed(e),
+    // Reads the cursor saved for the source from disk.
+    let base = state.base_path.clone();
+    let followed = tokio::task::spawn_blocking(move || {
+        replication::follow(&base, &source, &req.admin_key, Some(&api_key))
+    })
+    .await;
+    match followed {
+        Ok(Ok(status)) => respond(StatusCode::OK, json!({"following": status})),
+        Ok(Err(e)) => failed(e),
+        Err(e) => failed(anyhow::anyhow!("follow task: {e}")),
     }
 }
 
