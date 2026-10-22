@@ -42,7 +42,8 @@ use uuid::Uuid;
 
 use crate::embeddings::{NerEntity, NeuralNer};
 use crate::graph_memory::GraphMemory;
-use crate::handlers::remember::{embed_journaled, journal_stored, SnapshotKind};
+use crate::handlers::remember::{embed_journaled, queue_frames};
+use crate::handlers::state::JournalPending;
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::memory::{Experience, ExperienceType, MemoryId, Query as MemoryQuery};
 use crate::similarity::cosine_similarity;
@@ -1022,6 +1023,7 @@ impl StreamingMemoryExtractor {
         let manager_for_batch = Arc::clone(&manager);
         let user_id_for_batch = user_id.clone();
         let outcome = tokio::task::spawn_blocking(move || {
+            let mut frames = JournalPending::empty(&user_id_for_batch);
             let outcome = Self::process_batch(
                 &ner,
                 &memory_for_batch,
@@ -1029,14 +1031,9 @@ impl StreamingMemoryExtractor {
                 mode,
                 &config,
                 &user_metadata,
+                &mut queue_frames(&manager_for_batch, &user_id_for_batch, &mut frames),
             );
-            journal_stored(
-                &manager_for_batch,
-                &memory_for_batch,
-                &user_id_for_batch,
-                &outcome.memory_ids,
-                SnapshotKind::Remember,
-            );
+            frames.wait_logged("stream batch");
             outcome
         })
         .await;
@@ -1093,6 +1090,8 @@ impl StreamingMemoryExtractor {
     /// the deferred, journaled write path: the caller journals a `Remember` frame for
     /// each of [`BatchOutcome::memory_ids`], whose BM25 projection indexes it.
     /// Blocking: call from `spawn_blocking`.
+    /// `journal` receives each stored record under the write gate, for its frame to
+    /// be queued there; the caller waits for the frames once this returns.
     fn process_batch(
         ner: &NeuralNer,
         memory_system: &SharedUserMemory,
@@ -1100,6 +1099,7 @@ impl StreamingMemoryExtractor {
         mode: StreamMode,
         config: &ExtractionConfig,
         user_metadata: &HashMap<String, serde_json::Value>,
+        journal: &mut crate::memory::JournalSink<'_>,
     ) -> BatchOutcome {
         let mut dedupe_skipped = 0;
         let kept: Vec<BufferedMessage> = messages
@@ -1177,6 +1177,7 @@ impl StreamingMemoryExtractor {
                 experience,
                 Some(msg.timestamp),
                 None,
+                journal,
             ) {
                 Ok(stored) => {
                     outcome.memory_ids.push(stored.id.clone());
@@ -1735,6 +1736,7 @@ mod tests {
             StreamMode::Conversation,
             &ExtractionConfig::default(),
             &HashMap::new(),
+            &mut |_, _, _| {},
         );
 
         assert_eq!(outcome.memory_ids.len(), 5);

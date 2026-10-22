@@ -2353,6 +2353,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                &mut |_, _, _| {},
             )
             .unwrap();
         assert!(
@@ -2394,6 +2395,7 @@ mod tests {
             ("sweepterm beta record", "sweep-me"),
             ("sweepterm gamma record", "keep-me"),
         ] {
+            let mut frames = crate::handlers::state::JournalPending::empty(user_id);
             let outcome = memory
                 .read()
                 .remember_detailed_journaled(
@@ -2403,15 +2405,14 @@ mod tests {
                         ..Default::default()
                     },
                     None,
+                    &mut crate::handlers::remember::queue_frames(
+                        &harness.manager,
+                        user_id,
+                        &mut frames,
+                    ),
                 )
                 .unwrap();
-            crate::handlers::remember::journal_stored(
-                &harness.manager,
-                &memory,
-                user_id,
-                std::slice::from_ref(&outcome.id),
-                crate::handlers::remember::SnapshotKind::Remember,
-            );
+            frames.wait().unwrap();
             ids.push(outcome.id.0.to_string());
         }
         let mut before = keyword_hits(&engine, "sweepterm");
@@ -2513,6 +2514,7 @@ mod tests {
         let harness = TestHarness::new();
         let user_id = "journal-backlog-user";
         let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let mut frames = crate::handlers::state::JournalPending::empty(user_id);
         let outcome = memory
             .read()
             .remember_deferred_detailed_journaled(
@@ -2522,15 +2524,14 @@ mod tests {
                 },
                 None,
                 None,
+                &mut crate::handlers::remember::queue_frames(
+                    &harness.manager,
+                    user_id,
+                    &mut frames,
+                ),
             )
             .unwrap();
-        crate::handlers::remember::journal_stored(
-            &harness.manager,
-            &memory,
-            user_id,
-            std::slice::from_ref(&outcome.id),
-            crate::handlers::remember::SnapshotKind::Remember,
-        );
+        frames.wait().unwrap();
 
         let (status, body) = test_helpers::send(
             harness.router(),

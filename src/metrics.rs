@@ -167,7 +167,11 @@ impl WriteStageTimer {
 
     /// Record a stage that began at `since`. Repeated stages accumulate.
     pub fn record(&mut self, stage: &'static str, since: std::time::Instant) {
-        let elapsed = since.elapsed();
+        self.record_elapsed(stage, since.elapsed());
+    }
+
+    /// Record a stage measured elsewhere, such as inside a blocking task.
+    pub fn record_elapsed(&mut self, stage: &'static str, elapsed: std::time::Duration) {
         observe_write_stage(self.endpoint, stage, elapsed);
         match self.stages.iter_mut().find(|(name, _)| *name == stage) {
             Some((_, total)) => *total += elapsed,

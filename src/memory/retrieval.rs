@@ -124,6 +124,25 @@ fn int8_traversal_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Chunk vectors computed before a write lock is taken, keyed by chunk text, for
+/// [`RetrievalEngine::index_vectors_prepared`] and [`RetrievalEngine::reindex_memory_prepared`].
+/// Keyed by text rather than position so a record that changed between the draft and the
+/// write still reuses every chunk whose text it kept.
+#[derive(Debug, Default)]
+pub struct PreparedChunks {
+    by_text: HashMap<String, Vec<f32>>,
+}
+
+impl PreparedChunks {
+    /// The chunk texts held, sorted.
+    #[cfg(test)]
+    pub(crate) fn texts(&self) -> Vec<&str> {
+        let mut texts: Vec<&str> = self.by_text.keys().map(String::as_str).collect();
+        texts.sort_unstable();
+        texts
+    }
+}
+
 /// Multi-modal retrieval engine with production vector search
 ///
 /// # Lock Ordering (SHO-72)
@@ -1488,8 +1507,17 @@ impl RetrievalEngine {
     }
 
     pub fn index_memory(&self, memory: &Memory) -> Result<()> {
+        self.index_memory_prepared(memory, None)
+    }
+
+    /// [`Self::index_memory`], taking chunk vectors from `chunks` where its texts match.
+    fn index_memory_prepared(
+        &self,
+        memory: &Memory,
+        chunks: Option<&PreparedChunks>,
+    ) -> Result<()> {
         self.counting_index_failures(|| {
-            let vector_ids = self.insert_vectors(memory)?;
+            let vector_ids = self.insert_vectors(memory, chunks)?;
             // ATOMIC: Store vector mapping in RocksDB
             // This ensures the mapping survives restarts and can't become orphaned
             self.storage
@@ -1502,7 +1530,42 @@ impl RetrievalEngine {
     /// ids, for a caller that writes them in the same storage transaction as the
     /// memory itself (`PrimaryMemoryStore::store_with_vectors`).
     pub fn index_vectors(&self, memory: &Memory) -> Result<Vec<u32>> {
-        self.counting_index_failures(|| self.insert_vectors(memory))
+        self.index_vectors_prepared(memory, None)
+    }
+
+    /// [`Self::index_vectors`], taking chunk vectors from `chunks` where its texts match.
+    pub fn index_vectors_prepared(
+        &self,
+        memory: &Memory,
+        chunks: Option<&PreparedChunks>,
+    ) -> Result<Vec<u32>> {
+        self.counting_index_failures(|| self.insert_vectors(memory, chunks))
+    }
+
+    /// Embed the chunks `memory`'s searchable text splits into, for a caller that indexes
+    /// it later under a lock and wants the slow part done before taking it. Empty when
+    /// the text fits one chunk: the whole-document embedding covers that case. A chunk
+    /// that fails to embed here is left out and encoded again at indexing, where the
+    /// failure fails the index as it always has.
+    pub fn prepare_chunks(&self, memory: &Memory) -> PreparedChunks {
+        use crate::embeddings::chunking::{chunk_text, ChunkConfig};
+
+        let chunk_result = chunk_text(
+            &Self::extract_searchable_text(memory),
+            &ChunkConfig::default(),
+        );
+        let mut by_text = HashMap::new();
+        if chunk_result.was_chunked {
+            for chunk in chunk_result.chunks {
+                if by_text.contains_key(&chunk) {
+                    continue;
+                }
+                if let Ok(embedding) = self.embedder.encode(&chunk) {
+                    by_text.insert(chunk, embedding);
+                }
+            }
+        }
+        PreparedChunks { by_text }
     }
 
     /// Counted at the boundary, not at the seven call sites.
@@ -1516,8 +1579,9 @@ impl RetrievalEngine {
     }
 
     /// Embed `memory` into the in-memory primary and secondary indexes and return its
-    /// primary vector ids; nothing is persisted.
-    fn insert_vectors(&self, memory: &Memory) -> Result<Vec<u32>> {
+    /// primary vector ids; nothing is persisted. A chunk whose text `chunks` holds takes
+    /// that vector instead of an embedder call.
+    fn insert_vectors(&self, memory: &Memory, chunks: Option<&PreparedChunks>) -> Result<Vec<u32>> {
         use crate::embeddings::chunking::{chunk_text, ChunkConfig};
 
         let text = Self::extract_searchable_text(memory);
@@ -1530,10 +1594,12 @@ impl RetrievalEngine {
             let embeddings: Vec<Vec<f32>> = chunk_result
                 .chunks
                 .iter()
-                .map(|chunk| {
-                    self.embedder
+                .map(|chunk| match chunks.and_then(|p| p.by_text.get(chunk)) {
+                    Some(prepared) => Ok(prepared.clone()),
+                    None => self
+                        .embedder
                         .encode(chunk)
-                        .context("Failed to generate chunk embedding")
+                        .context("Failed to generate chunk embedding"),
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -1631,6 +1697,15 @@ impl RetrievalEngine {
     ///
     /// Strategy: Remove old vector and add new one (Vamana doesn't support update-in-place)
     pub fn reindex_memory(&self, memory: &Memory) -> Result<()> {
+        self.reindex_memory_prepared(memory, None)
+    }
+
+    /// [`Self::reindex_memory`], taking chunk vectors from `chunks` where its texts match.
+    pub fn reindex_memory_prepared(
+        &self,
+        memory: &Memory,
+        chunks: Option<&PreparedChunks>,
+    ) -> Result<()> {
         // Check if memory is already indexed (may have multiple vectors from chunking)
         let existing_vector_ids = {
             let mapping = self.id_mapping.read();
@@ -1688,7 +1763,7 @@ impl RetrievalEngine {
 
         // Add with new embedding (may create multiple chunks)
         // index_memory() also handles secondary indexing
-        self.index_memory(memory)
+        self.index_memory_prepared(memory, chunks)
     }
 
     /// Remove a memory from the vector index
