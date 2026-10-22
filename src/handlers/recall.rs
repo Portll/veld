@@ -1118,6 +1118,13 @@ pub async fn recall(
     // M3: assemble the query-level feeling-of-knowing readout. Advisory and
     // terminal — it never feeds back into scoring or adaptive weight learning.
     let meta_opt = memory.read().last_query_metacognition();
+    // Outside the closure below, so a slow store not yet open is opened on the blocking pool.
+    let gap_store = match &meta_opt {
+        Some(meta) if !meta.focal_entities.is_empty() => {
+            state.get_user_slow_store_async(&req.user_id).await.ok()
+        }
+        _ => None,
+    };
     let metacognition = meta_opt.map(|mut meta| {
         let top = recall_memories
             .first()
@@ -1137,7 +1144,7 @@ pub async fn recall(
         meta.answerability = if top > 0.0 { top / (top + 1.0) } else { 0.0 };
         // M5 link: does the query sit in a known unresolved knowledge gap?
         if !meta.focal_entities.is_empty() {
-            if let Ok(store) = state.get_user_slow_store(&req.user_id) {
+            if let Some(store) = &gap_store {
                 if let Ok(hits) =
                     store.gaps_touching_entities(&req.user_id, &meta.focal_entities, 1)
                 {

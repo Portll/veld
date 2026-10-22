@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::memory::types::{ExperienceType, MemoryId};
+use crate::similarity::bars::SimilarityBar;
 
 // =============================================================================
 // CONSTANTS
@@ -1733,8 +1734,8 @@ impl FeedbackStore {
         ));
 
         // ACT-R inspired thresholds
-        let is_repetition = similarity > 0.8; // High similarity = re-asking
-        let is_topic_change = similarity < 0.3; // Low similarity = moved on
+        let is_repetition = SimilarityBar::QueryRepetition.record(similarity > 0.8); // High similarity = re-asking
+        let is_topic_change = SimilarityBar::QueryTopicChange.record(similarity < 0.3); // Low similarity = moved on
 
         Some((is_repetition, is_topic_change, similarity))
     }

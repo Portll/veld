@@ -54,6 +54,7 @@ use crate::constants::{
     SEMANTIC_MERGE_SIMILARITY_THRESHOLD,
 };
 use crate::memory::types::{EntityRef, MemoryId};
+use crate::similarity::bars::SimilarityBar;
 use crate::similarity::cosine_similarity;
 use crate::storage::{KeyValueStore, PrimaryMemoryStore};
 
@@ -158,6 +159,7 @@ pub fn find_merge_candidates(
         .collect();
 
     let mut candidates: Vec<MergeCandidate> = Vec::new();
+    let (mut compared, mut crossed) = (0u64, 0u64);
     for (i, a) in with_emb.iter().enumerate() {
         let emb_a = a.experience.embeddings.as_deref().unwrap_or_default();
         for b in &with_emb[i + 1..] {
@@ -166,7 +168,9 @@ pub fn find_merge_candidates(
                 continue;
             }
             let sim = crate::similarity::scale::to_reference(cosine_similarity(emb_a, emb_b));
+            compared += 1;
             if sim >= SEMANTIC_MERGE_SIMILARITY_THRESHOLD {
+                crossed += 1;
                 let score_a = a.access_count() as f64 + a.importance() as f64;
                 let score_b = b.access_count() as f64 + b.importance() as f64;
                 let (loser, winner) = if score_a <= score_b {
@@ -182,6 +186,7 @@ pub fn find_merge_candidates(
             }
         }
     }
+    SimilarityBar::SemanticMerge.record_many(compared, crossed);
 
     candidates.sort_by(|a, b| {
         b.similarity
