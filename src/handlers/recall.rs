@@ -18,7 +18,7 @@ use super::types::{
     RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse, TrackedRetrieveRequest,
     TrackedRetrieveResponse,
 };
-use super::utils::{is_bare_question, is_boilerplate_response, strip_system_noise};
+use super::utils::{is_bare_question, is_boilerplate_response, run_blocking, strip_system_noise};
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::feedback;
 // Note: compute_relevance removed - using unified 5-layer pipeline scoring instead
@@ -585,8 +585,10 @@ pub async fn recall(
     // the computed query embedding between prospective semantic matching and recall.
     // This fixes C5 (keyword-only → semantic) and sets up prospective_signals for boosting.
     let prospective_for_recall = state.prospective_store.clone();
+    let todo_store_for_recall = state.todo_store.clone();
     let memory_for_recall = memory.clone();
     let user_id_for_recall = req.user_id.clone();
+    let todo_user_id = req.user_id.clone();
     let query_for_recall = req.query.clone();
     let tags_for_recall = req.tags.clone();
 
@@ -595,7 +597,7 @@ pub async fn recall(
         .get_or_create_session(&req.user_id)
         .to_string();
 
-    let (memories, recall_readout, triggered_reminders, _prospective_signals, query_embedding_opt) =
+    let (memories, recall_readout, triggered_reminders, _prospective_signals, todos) =
         tokio::task::spawn_blocking(move || {
 
             let memory_guard = memory_for_recall.read();
@@ -691,13 +693,49 @@ pub async fn recall(
             // an unreadable store or a decode error all presented as a confident
             // negative answer. Propagate; an error is the honest response.
             let (memories, readout) = memory_guard.recall_with_readout(&query)?;
+            drop(memory_guard);
+
+            // Search todos semantically using the embedding already computed for recall
+            let todos: Vec<RecallTodo> = match query_embedding_opt {
+                Some(emb) => todo_store_for_recall
+                    .search_similar(&todo_user_id, &emb, 5)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(t, _)| {
+                        matches!(
+                            t.status,
+                            TodoStatus::Todo | TodoStatus::InProgress | TodoStatus::Blocked
+                        )
+                    })
+                    .map(|(t, score)| {
+                        let project_name = t.project_id.as_ref().and_then(|pid| {
+                            todo_store_for_recall
+                                .get_project(&todo_user_id, pid)
+                                .ok()
+                                .flatten()
+                                .map(|p| p.name)
+                        });
+                        RecallTodo {
+                            id: t.id.0.to_string(),
+                            short_id: t.short_id(),
+                            content: t.content.clone(),
+                            status: format!("{:?}", t.status).to_lowercase(),
+                            priority: t.priority.indicator().to_string(),
+                            project: project_name,
+                            due_date: t.due_date.map(|d| d.format("%Y-%m-%d").to_string()),
+                            score,
+                        }
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
 
             Ok::<_, anyhow::Error>((
                 memories,
                 readout,
                 reminders,
                 prospective_signals,
-                query_embedding_opt,
+                todos,
             ))
         })
         .await
@@ -721,45 +759,6 @@ pub async fn recall(
         .map(|(rank, m)| recall_memory_view(m, rank, total))
         .collect();
 
-    // Search todos semantically using the embedding already computed for recall
-    let todos: Vec<RecallTodo> = {
-        if let Some(emb) = query_embedding_opt {
-            state
-                .todo_store
-                .search_similar(&req.user_id, &emb, 5)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|(t, _)| {
-                    matches!(
-                        t.status,
-                        TodoStatus::Todo | TodoStatus::InProgress | TodoStatus::Blocked
-                    )
-                })
-                .map(|(t, score)| {
-                    let project_name = t.project_id.as_ref().and_then(|pid| {
-                        state
-                            .todo_store
-                            .get_project(&req.user_id, pid)
-                            .ok()
-                            .flatten()
-                            .map(|p| p.name)
-                    });
-                    RecallTodo {
-                        id: t.id.0.to_string(),
-                        short_id: t.short_id(),
-                        content: t.content.clone(),
-                        status: format!("{:?}", t.status).to_lowercase(),
-                        priority: t.priority.indicator().to_string(),
-                        project: project_name,
-                        due_date: t.due_date.map(|d| d.format("%Y-%m-%d").to_string()),
-                        score,
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
-    };
     let todo_count = if todos.is_empty() {
         None
     } else {
@@ -1061,10 +1060,26 @@ pub async fn recall(
     // M3: assemble the query-level feeling-of-knowing readout. Advisory and
     // terminal — it never feeds back into scoring or adaptive weight learning.
     let meta_opt = recall_readout.metacognition;
-    // Outside the closure below, so a slow store not yet open is opened on the blocking pool.
-    let gap_store = match &meta_opt {
+    // Outside the closure below, so the slow store's open and its gap read run on the blocking
+    // pool: the read is a SQLite query for up to 500 gaps, each one's entity list parsed.
+    let known_gap = match &meta_opt {
         Some(meta) if !meta.focal_entities.is_empty() => {
-            state.get_user_slow_store_async(&req.user_id).await.ok()
+            match state.get_user_slow_store_async(&req.user_id).await {
+                Ok(store) => {
+                    let user_id = req.user_id.clone();
+                    let focal_entities = meta.focal_entities.clone();
+                    tokio::task::spawn_blocking(move || {
+                        store
+                            .gaps_touching_entities(&user_id, &focal_entities, 1)
+                            .ok()
+                            .map(|hits| !hits.is_empty())
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                }
+                Err(_) => None,
+            }
         }
         _ => None,
     };
@@ -1087,12 +1102,8 @@ pub async fn recall(
         meta.answerability = if top > 0.0 { top / (top + 1.0) } else { 0.0 };
         // M5 link: does the query sit in a known unresolved knowledge gap?
         if !meta.focal_entities.is_empty() {
-            if let Some(store) = &gap_store {
-                if let Ok(hits) =
-                    store.gaps_touching_entities(&req.user_id, &meta.focal_entities, 1)
-                {
-                    meta.in_known_gap = !hits.is_empty();
-                }
+            if let Some(in_known_gap) = known_gap {
+                meta.in_known_gap = in_known_gap;
             }
             meta.signal_strength = format!("{}+gap", meta.signal_strength);
         }
@@ -2927,29 +2938,38 @@ pub async fn recall_by_tags(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
     let limit = req.limit.unwrap_or(50);
+    let tags = req.tags.clone();
+    let include_derived = req.include_derived;
+    let include_embeddings = req.include_embeddings;
 
-    let raw_memories = if req.include_derived {
-        memory_guard.recall_by_tags(&req.tags, limit)
-    } else {
-        memory_guard.recall_by_authored_tags(&req.tags, limit)
-    }
-    .map_err(AppError::Internal)?;
-    let count = raw_memories.len();
-
-    // Serialize memories to JSON for response
-    let memories: Vec<serde_json::Value> = raw_memories
-        .into_iter()
-        .map(|mut m| {
-            if !req.include_embeddings {
-                m.experience.embeddings = None;
-                m.experience.embeddings_secondary = None;
+    let (memories, count) = run_blocking(move || {
+        let raw_memories = {
+            let memory_guard = memory_sys.read();
+            if include_derived {
+                memory_guard.recall_by_tags(&tags, limit)
+            } else {
+                memory_guard.recall_by_authored_tags(&tags, limit)
             }
-            m
-        })
-        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
-        .collect();
+        }
+        .map_err(AppError::Internal)?;
+        let count = raw_memories.len();
+
+        // Serialize memories to JSON for response
+        let memories: Vec<serde_json::Value> = raw_memories
+            .into_iter()
+            .map(|mut m| {
+                if !include_embeddings {
+                    m.experience.embeddings = None;
+                    m.experience.embeddings_secondary = None;
+                }
+                m
+            })
+            .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
+            .collect();
+        Ok((memories, count))
+    })
+    .await?;
 
     info!(
         "📋 Recall by tags: user={}, tags={:?}, found={}",
@@ -3003,20 +3023,25 @@ pub async fn recall_by_date(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
     let limit = req.limit.unwrap_or(50);
+    let (start, end) = (req.start, req.end);
 
-    // Use recall_by_date which increments the retrieval counter
-    let raw_memories = memory_guard
-        .recall_by_date(req.start, req.end, limit)
-        .map_err(AppError::Internal)?;
-    let count = raw_memories.len();
+    let (memories, count) = run_blocking(move || {
+        // Use recall_by_date which increments the retrieval counter
+        let raw_memories = memory_sys
+            .read()
+            .recall_by_date(start, end, limit)
+            .map_err(AppError::Internal)?;
+        let count = raw_memories.len();
 
-    // Serialize memories to JSON for response
-    let memories: Vec<serde_json::Value> = raw_memories
-        .into_iter()
-        .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
-        .collect();
+        // Serialize memories to JSON for response
+        let memories: Vec<serde_json::Value> = raw_memories
+            .into_iter()
+            .filter_map(|m| crate::memory::injection::serialize_flagged(&m))
+            .collect();
+        Ok((memories, count))
+    })
+    .await?;
 
     info!(
         "📅 Recall by date: user={}, start={}, end={}, found={}",
