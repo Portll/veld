@@ -291,9 +291,19 @@ pub struct CognitiveDials {
     /// `bm25_specificity_discount`, `episode_tcm`, `confidence_gate`,
     /// `content_fallback`, `mmr`, `ordinal_cliff`, `arousal`,
     /// `valence_credibility`, `session_continuity`, `hebbian`, `query_coverage`,
-    /// `people_density`, `prf`.
+    /// `people_density`, `prf`, `turn_context`, `neighbour_expansion`.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
+
+    /// Set of opt-in signal IDs switched on: ranking changes that did not earn a default
+    /// but stay measurable on one build. Empty (the default) runs none of them. Populated
+    /// from `VELD_DIALS_ENABLE_SIGNALS` (comma-separated IDs) or `PUT /api/dials`.
+    ///
+    /// Opt-in signal IDs (measured on locomo-holdout, 2026-10-21, see
+    /// `docs/src/architecture/dials.md`): `entity_overlap_relative`,
+    /// `topic_dedup_topical`, `competition_demote`, `rerank_context`.
+    #[serde(default)]
+    pub enabled_signals: HashSet<String>,
 }
 
 /// UI/range metadata for a recall slider (consumed by `GET /api/dials/schema`).
@@ -695,6 +705,7 @@ impl Default for CognitiveDials {
             density_linguistic_w: None,
             updated_at: None,
             disabled_signals: HashSet::new(),
+            enabled_signals: HashSet::new(),
         }
     }
 }
@@ -789,6 +800,12 @@ impl CognitiveDials {
     #[inline]
     pub fn signal_enabled(&self, id: &str) -> bool {
         !self.disabled_signals.contains(id)
+    }
+
+    /// Returns `true` when the named opt-in signal is switched on (in `enabled_signals`).
+    #[inline]
+    pub fn signal_opted_in(&self, id: &str) -> bool {
+        self.enabled_signals.contains(id)
     }
 
     /// Whether linked memories are contextualised at ingest (`turn_context`;
@@ -998,6 +1015,14 @@ impl CognitiveDials {
                 .map(String::from)
                 .collect();
         }
+        if let Ok(raw) = std::env::var("VELD_DIALS_ENABLE_SIGNALS") {
+            d.enabled_signals = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+        }
         d.sanitized()
     }
 }
@@ -1091,10 +1116,6 @@ mod tests {
             "query_coverage",
             "people_density",
             "prf",
-            "entity_overlap_relative",
-            "topic_dedup_topical",
-            "competition_demote",
-            "rerank_context",
             "turn_context",
             "neighbour_expansion",
         ];
@@ -1150,6 +1171,26 @@ mod tests {
                 id
             );
         }
+    }
+
+    /// Opt-in signals stay off unless `enabled_signals` names them.
+    #[test]
+    fn opt_in_signals_are_off_by_default() {
+        let d = CognitiveDials::default();
+        for id in [
+            "entity_overlap_relative",
+            "topic_dedup_topical",
+            "competition_demote",
+            "rerank_context",
+        ] {
+            assert!(!d.signal_opted_in(id), "{id}");
+        }
+        let d = CognitiveDials {
+            enabled_signals: HashSet::from(["rerank_context".to_string()]),
+            ..Default::default()
+        };
+        assert!(d.signal_opted_in("rerank_context"));
+        assert!(!d.signal_opted_in("competition_demote"));
     }
 
     /// SD-3: VELD_DIALS_DISABLE_SIGNALS env var is parsed and produces the correct

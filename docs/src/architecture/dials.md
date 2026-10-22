@@ -72,6 +72,24 @@ The recall gate records the overrides a run was measured under
 (`retrieval_dials` in `tests/recall/locomo-gate-baseline.json`) and refuses to
 diff two runs that overrode them differently.
 
+### Signal switches
+
+`disabled_signals` (`VELD_DIALS_DISABLE_SIGNALS=id,id`) switches named recall
+signals off; every signal runs by default. `turn_context` and
+`neighbour_expansion` honour it too, so one build runs an arm with them off.
+
+`enabled_signals` (`VELD_DIALS_ENABLE_SIGNALS=id,id`) switches on opt-in
+signals: ranking changes kept measurable on one build that did not earn a
+default. Each was measured on `locomo-holdout` (1,166 cases) on 2026-10-21 at
+pool 100 / count 50 / blend 0.4, by switching it off from the set of all four:
+
+| Opt-in signal | What it changes | Off from the full set |
+|---|---|---|
+| `rerank_context` | The cross-encoder reads a linked memory with its date and the memory it follows. | recall@10 −0.030 [−0.042, −0.018], MRR −0.019: it pays, but every reranked passage of a linked memory gets longer, so it waits for the rerank-depth decision and a paired latency measurement. |
+| `entity_overlap_relative` | Layer 4.525 weighs a matched query word by its rarity in the candidate pool and scales the score instead of adding a flat 0.10. | recall@100 +0.031 [+0.017, +0.046], multi_hop recall@10 +0.032: it hurts. |
+| `topic_dedup_topical` | Layer 4.54 ignores entities that a quarter of the candidates carry and demotes a memory once. | 0 cases moved. |
+| `competition_demote` | A competition's loser is kept, ×0.85, instead of deleted. | 1 case moved. |
+
 ## Lifecycle
 
 ```mermaid

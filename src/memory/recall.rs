@@ -168,7 +168,7 @@ impl super::MemorySystem {
         let demote = self
             .cognitive_dials
             .read()
-            .signal_enabled("competition_demote");
+            .signal_opted_in("competition_demote");
         let _ = Self::compete_memories(&mut memories, competition_mode, demote);
 
         memories.truncate(query.max_results);
@@ -2107,14 +2107,16 @@ impl super::MemorySystem {
             // "risks"->"risk", "testing"->"test". Stop word filtering prevents
             // false positives from "the" matching inside "prometheus" etc.
             //
-            // A matched word is weighted by its rarity in the candidate pool and the boost
-            // scales the fused score (x1.00-1.40). A flat +0.10 per word against fused scores
+            // With the `entity_overlap_relative` opt-in, a matched word is weighted by its
+            // rarity in the candidate pool and the boost scales the fused score (x1.00-1.40). A flat +0.10 per word against fused scores
             // of 0.01-0.05 ranked by match count before meaning, and a word most candidates
             // carry (a speaker, a project, a repo) moved them all alike. A structured
             // identifier ("serve.mjs" against a declared `repo:admin/serve.mjs`) keeps its
             // flat +0.10: it matches at a name boundary or not at all.
-            // [signal: entity_overlap_relative] Gated by disabled_signals dial; default = on.
-            // Off restores the flat per-match boost.
+            // [signal: entity_overlap_relative] Opt-in via enabled_signals; default = off.
+            // Measured 2026-10-21 on locomo-holdout at depth: switching it off from the full
+            // set gained recall@100 +0.031 [+0.017, +0.046] and multi_hop recall@10 +0.032,
+            // so the flat per-match boost stays the default.
             {
                 use rust_stemmers::{Algorithm, Stemmer};
                 let stemmer = Stemmer::create(Algorithm::English);
@@ -2138,7 +2140,7 @@ impl super::MemorySystem {
                     .collect();
 
                 if !query_stems.is_empty() {
-                    let relative = early_dials_snapshot.signal_enabled("entity_overlap_relative");
+                    let relative = early_dials_snapshot.signal_opted_in("entity_overlap_relative");
                     let per_match = if decomposed { 0.04 } else { 0.10 };
                     let cap = if decomposed { 0.16 } else { 0.40 };
                     struct Overlap<'q> {
@@ -2391,13 +2393,14 @@ impl super::MemorySystem {
             // Only the top TEMPORAL_DEDUP_MAX_CANDIDATES by fused score are compared: the pass
             // is all-pairs over the fused set, which runs to hundreds of candidates.
             if has_any_temporal_intent || has_temporal_keywords {
-                // [signal: topic_dedup_topical] Gated by disabled_signals dial; default = on.
-                // Off restores the pairwise, compounding demotion over every shared entity.
+                // [signal: topic_dedup_topical] Opt-in via enabled_signals; default = off.
+                // Neutral on locomo-holdout (2026-10-21: 0 cases moved), so the pairwise
+                // demotion over every shared entity stays the default.
                 let demoted = temporal_topic_dedup(
                     &mut fused,
                     &candidates,
                     crate::constants::TEMPORAL_DEDUP_MAX_CANDIDATES,
-                    early_dials_snapshot.signal_enabled("topic_dedup_topical"),
+                    early_dials_snapshot.signal_opted_in("topic_dedup_topical"),
                 );
                 if demoted > 0 {
                     tracing::debug!(
@@ -3446,8 +3449,12 @@ impl super::MemorySystem {
                 d.use_reranking,
                 d.rerank_count,
                 d.ce_share(rerank_shape),
-                // [signal: rerank_context] Gated by disabled_signals dial; default = on.
-                d.turn_context_enabled() && d.signal_enabled("rerank_context"),
+                // [signal: rerank_context] Opt-in via enabled_signals; default = off.
+                // Measured 2026-10-21 on locomo-holdout at pool 100 / count 50 / blend 0.4:
+                // switching it off from the full set cost recall@10 -0.030 [-0.042, -0.018]
+                // and MRR -0.019. It lengthens every reranked passage of a linked memory, so
+                // it waits for the rerank-depth decision and a paired latency measurement.
+                d.turn_context_enabled() && d.signal_opted_in("rerank_context"),
             )
         };
         if ce_w < crate::constants::CE_BLEND_SKIP_BELOW {
@@ -3488,8 +3495,8 @@ impl super::MemorySystem {
                 // carries as an entity, that entity is put in front of the text the
                 // cross-encoder reads. Nothing changes for a query with no identifier in it.
                 //
-                // A linked memory is read with its context (index_text): its date and the
-                // memory it follows. A reply that names nothing is otherwise judged on its own
+                // With the `rerank_context` opt-in, a linked memory is read with its context
+                // (index_text): its date and the memory it follows. A reply that names nothing is otherwise judged on its own
                 // words, which is how anaphoric gold reached the pool and still lost the
                 // blend.
                 let query_identifiers: Vec<String> = query_text
@@ -4192,12 +4199,13 @@ impl super::MemorySystem {
         // (Linguistic boost moved to Layer 5.85, before ordinal resolution)
 
         let competition_mode = query.effective_competition_mode();
-        // [signal: competition_demote] Gated by disabled_signals dial; default = on.
-        // Off restores deleting each competition's loser from the results.
+        // [signal: competition_demote] Opt-in via enabled_signals; default = off.
+        // Neutral on locomo-holdout (2026-10-21: 1 case moved), so deleting each
+        // competition's loser stays the default.
         let demote = self
             .cognitive_dials
             .read()
-            .signal_enabled("competition_demote");
+            .signal_opted_in("competition_demote");
         let (competitions_detected, memories_eliminated) =
             Self::compete_memories(&mut memories, competition_mode, demote);
         if competitions_detected > 0 {
@@ -6269,7 +6277,8 @@ impl<'s, S: CandidateSource + ?Sized> RecallCandidates<'s, S> {
 /// Layer 4.54: with recency intent, the older of two same-topic candidates is demoted
 /// (x0.85), so the newer statement of a topic leads.
 ///
-/// `topical` (the default) reads topic from the entities that tell candidates apart: an
+/// `topical` (the `topic_dedup_topical` opt-in) reads topic from the entities that tell
+/// candidates apart: an
 /// entity carried by more than a quarter of the compared candidates (a speaker, a
 /// conversation, a project or repo tag) names the setting, not the topic, and is left out
 /// of the overlap. A memory is demoted once however many newer same-topic memories it

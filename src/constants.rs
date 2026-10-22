@@ -2367,8 +2367,9 @@ pub const COMPETITION_MAX_PAIRS: usize = 20;
 /// Minimum shared-entity overlap required before two memories can compete.
 pub const COMPETITION_ENTITY_OVERLAP_MIN: usize = 1;
 
-/// Score multiplier for the loser of a retrieval-time competition. The loser stays in the
-/// results below its winner rather than leaving them: one shared entity (a speaker, a
+/// Score multiplier for the loser of a retrieval-time competition under the
+/// `competition_demote` opt-in. The loser stays in the results below its winner rather
+/// than leaving them: one shared entity (a speaker, a
 /// project) and a high pool-relative cosine also pair two memories that are both answers,
 /// and deleting one cost recall that ranking order alone would have kept.
 pub const COMPETITION_LOSER_DEMOTION: f32 = 0.85;
