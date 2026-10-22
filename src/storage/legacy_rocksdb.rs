@@ -2355,7 +2355,10 @@ mod scan_bound_tests {
         );
         assert_eq!(store.scan_cf("rows", None, None).expect("scan").len(), 8);
         assert_eq!(
-            store.scan_cf("rows", Some(b"tag:"), Some(2)).expect("scan").len(),
+            store
+                .scan_cf("rows", Some(b"tag:"), Some(2))
+                .expect("scan")
+                .len(),
             2
         );
     }

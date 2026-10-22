@@ -1485,7 +1485,9 @@ impl MemorySystem {
                 crate::metrics::observe_tenant_open_stage("compressed_blob_strip", stage);
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!("compressed_data blobs not stripped; the next open retries: {e:#}"),
+            Err(e) => {
+                tracing::warn!("compressed_data blobs not stripped; the next open retries: {e:#}")
+            }
         }
 
         // The one full read of the store an open makes: it seeds the stored totals behind
@@ -10466,10 +10468,16 @@ mod vector_index_reopen_tests {
             {
                 let sys = open_tenant(tmp.path(), backend);
                 assert!(!has_blob(&sys, &redundant.id), "{backend:?}");
-                assert!(has_blob(&sys, &edited.id), "{backend:?}: its blob is not a copy");
+                assert!(
+                    has_blob(&sys, &edited.id),
+                    "{backend:?}: its blob is not a copy"
+                );
                 let stripped = sys.long_term_memory.get(&redundant.id).expect("stored");
                 assert_eq!(stripped.experience.content, redundant.experience.content);
-                assert_eq!(stripped.experience.embeddings, redundant.experience.embeddings);
+                assert_eq!(
+                    stripped.experience.embeddings,
+                    redundant.experience.embeddings
+                );
                 assert!(sys
                     .long_term_memory
                     .default_key_value_store()
@@ -10483,17 +10491,21 @@ mod vector_index_reopen_tests {
                 .store(&late)
                 .expect("store");
             let sys = open_tenant(tmp.path(), backend);
-            assert!(has_blob(&sys, &late.id), "{backend:?}: the marker ends the pass");
+            assert!(
+                has_blob(&sys, &late.id),
+                "{backend:?}: the marker ends the pass"
+            );
         }
     }
 
     fn engines() -> Vec<crate::config::StorageBackend> {
-        let mut engines = Vec::new();
-        #[cfg(feature = "rocksdb")]
-        engines.push(crate::config::StorageBackend::RocksDb);
-        #[cfg(feature = "storage-redb")]
-        engines.push(crate::config::StorageBackend::Redb);
-        engines
+        [
+            #[cfg(feature = "rocksdb")]
+            crate::config::StorageBackend::RocksDb,
+            #[cfg(feature = "storage-redb")]
+            crate::config::StorageBackend::Redb,
+        ]
+        .to_vec()
     }
 
     /// A memory the saved index lost waits for the drain instead of holding the open, and
@@ -10523,7 +10535,10 @@ mod vector_index_reopen_tests {
 
             let sys = open_tenant(tmp.path(), backend);
             assert!(sys.retriever.is_indexed(&kept), "{backend:?}");
-            assert!(!sys.retriever.is_indexed(&lost), "{backend:?}: not repaired in place");
+            assert!(
+                !sys.retriever.is_indexed(&lost),
+                "{backend:?}: not repaired in place"
+            );
             let row = sys
                 .embedding_backlog
                 .get(&lost)

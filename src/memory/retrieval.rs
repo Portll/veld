@@ -321,8 +321,7 @@ fn read_secondary_id_map(index_path: &Path, index: &VamanaIndex) -> Result<Optio
     }
     let checksum = cursor.u64()?;
     let index_vectors = cursor.u64()?;
-    if checksum != VamanaIndex::saved_checksum(index_path)? || index_vectors != index.len() as u64
-    {
+    if checksum != VamanaIndex::saved_checksum(index_path)? || index_vectors != index.len() as u64 {
         return Ok(None);
     }
     let entries = cursor.u64()?;
@@ -839,9 +838,9 @@ impl RetrievalEngine {
                             );
                             return Ok(());
                         }
-                        Ok(None) => warn!(
-                            "Secondary Vamana file has no id map saved with it, rebuilding"
-                        ),
+                        Ok(None) => {
+                            warn!("Secondary Vamana file has no id map saved with it, rebuilding")
+                        }
                         Err(e) => warn!("Secondary Vamana id map unreadable ({e:#}), rebuilding"),
                     }
                 }
@@ -1340,6 +1339,9 @@ impl RetrievalEngine {
         }
 
         if saved_all {
+            // Under the clock's lock: a change counted after the subtraction below starts the
+            // clock again once this releases it, and one counted before is in `left`.
+            let mut since = self.unsaved_since.lock();
             let left = match self.unsaved_changes.fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
@@ -1347,9 +1349,11 @@ impl RetrievalEngine {
             ) {
                 Ok(before) | Err(before) => before.saturating_sub(pending),
             };
-            let mut since = self.unsaved_since.lock();
-            *since = (left > 0 || self.rewritten_since_save.load(std::sync::atomic::Ordering::Acquire))
-                .then_some(save_began);
+            *since = (left > 0
+                || self
+                    .rewritten_since_save
+                    .load(std::sync::atomic::Ordering::Acquire))
+            .then_some(save_began);
         } else if rewritten {
             self.rewritten_since_save
                 .store(true, std::sync::atomic::Ordering::Release);
