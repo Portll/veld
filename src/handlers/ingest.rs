@@ -8,7 +8,7 @@ use axum::{extract::State, response::Json};
 
 use super::health::AppState;
 use super::remember::parse_experience_type;
-use super::types::MemoryEvent;
+use super::types::{MemoryEvent, MemoryEventKind};
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::ingest;
 use crate::memory::{types::NerEntityRecord, Experience, SessionEvent};
@@ -296,7 +296,7 @@ pub async fn ingest(
     );
 
     state.emit_event(MemoryEvent {
-        event_type: "CREATE".to_string(),
+        event_type: MemoryEventKind::Create,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(memory_id.0.to_string()),

@@ -14,9 +14,9 @@ use tracing::info;
 use super::state::MultiUserMemoryManager;
 use super::temporal_derivation::derive_answer_for_user_query;
 use super::types::{
-    MemoryEvent, RecallExperience, RecallFact, RecallLineageEdge, RecallMemory, RecallRequest,
-    RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse, TrackedRetrieveRequest,
-    TrackedRetrieveResponse,
+    MemoryEvent, MemoryEventKind, RecallExperience, RecallFact, RecallLineageEdge, RecallMemory,
+    RecallRequest, RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse,
+    TrackedRetrieveRequest, TrackedRetrieveResponse,
 };
 use super::utils::{is_bare_question, is_boilerplate_response, run_blocking, strip_system_noise};
 use crate::errors::{AppError, ValidationErrorExt};
@@ -969,7 +969,7 @@ pub async fn recall(
         })).collect::<Vec<_>>(),
     });
     state.emit_event(MemoryEvent {
-        event_type: "RETRIEVE".to_string(),
+        event_type: MemoryEventKind::Retrieve,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: None,
@@ -1619,7 +1619,7 @@ pub async fn proactive_context(
             // Emit SSE event for feedback processing
             if let Some(ref feedback) = result {
                 state.emit_event(MemoryEvent {
-                    event_type: "FEEDBACK_PROCESSED".to_string(),
+                    event_type: MemoryEventKind::FeedbackProcessed,
                     timestamp: chrono::Utc::now(),
                     user_id: req.user_id.clone(),
                     memory_id: None,
@@ -2623,7 +2623,7 @@ pub async fn proactive_context(
         })).collect::<Vec<_>>(),
     });
     state.emit_event(MemoryEvent {
-        event_type: "PROACTIVE_CONTEXT".to_string(),
+        event_type: MemoryEventKind::ProactiveContext,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: ingested_memory_id.clone(),
@@ -2757,7 +2757,7 @@ pub async fn surface_relevant(
 
     // Broadcast RETRIEVE event for real-time dashboard
     state.emit_event(MemoryEvent {
-        event_type: "RETRIEVE".to_string(),
+        event_type: MemoryEventKind::Retrieve,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: None,
@@ -3053,7 +3053,7 @@ pub async fn recall_by_tags(
 
     // Broadcast RETRIEVE event for real-time dashboard
     state.emit_event(MemoryEvent {
-        event_type: "RETRIEVE".to_string(),
+        event_type: MemoryEventKind::Retrieve,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: None,
@@ -3125,7 +3125,7 @@ pub async fn recall_by_date(
 
     // Broadcast RETRIEVE event for real-time dashboard
     state.emit_event(MemoryEvent {
-        event_type: "RETRIEVE".to_string(),
+        event_type: MemoryEventKind::Retrieve,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: None,

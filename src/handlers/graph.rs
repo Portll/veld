@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use super::state::MultiUserMemoryManager;
-use super::types::MemoryEvent;
+use super::types::{MemoryEvent, MemoryEventKind};
 use super::utils::resolve_request_user_id;
 use crate::auth::AuthenticatedUser;
 use crate::entity_frequency::{frequency, Bucket, Frequency, Window};
@@ -418,7 +418,7 @@ pub async fn delete_entity(
 
     if deleted {
         state.emit_event(MemoryEvent {
-            event_type: "ENTITY_DELETE".to_string(),
+            event_type: MemoryEventKind::EntityDelete,
             timestamp: chrono::Utc::now(),
             user_id: user_id.clone(),
             memory_id: Some(uuid.to_string()),
@@ -466,7 +466,7 @@ pub async fn clear_user_graph(
     );
 
     state.emit_event(MemoryEvent {
-        event_type: "GRAPH_CLEAR".to_string(),
+        event_type: MemoryEventKind::GraphClear,
         timestamp: chrono::Utc::now(),
         user_id: user_id.clone(),
         memory_id: Some(format!("{}/{}/{}", entities, relationships, episodes)),
@@ -556,7 +556,7 @@ pub async fn rebuild_user_graph(
     );
 
     state.emit_event(MemoryEvent {
-        event_type: "GRAPH_REBUILD".to_string(),
+        event_type: MemoryEventKind::GraphRebuild,
         timestamp: chrono::Utc::now(),
         user_id: user_id.clone(),
         memory_id: None,
@@ -608,7 +608,7 @@ pub async fn invalidate_relationship(
     blocking(move || graph.write().invalidate_relationship(&rel_uuid)).await?;
 
     state.emit_event(MemoryEvent {
-        event_type: "EDGE_INVALIDATE".to_string(),
+        event_type: MemoryEventKind::EdgeInvalidate,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(req.relationship_uuid.clone()),

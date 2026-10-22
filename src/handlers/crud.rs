@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tracing::info;
 
 use super::state::MultiUserMemoryManager;
-use super::types::MemoryEvent;
+use super::types::{MemoryEvent, MemoryEventKind};
 use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
@@ -818,7 +818,7 @@ pub async fn delete_memory(
     state.log_event(&user_id, "DELETE", &resolved_id_str, "Memory deleted");
 
     state.emit_event(MemoryEvent {
-        event_type: "DELETE".to_string(),
+        event_type: MemoryEventKind::Delete,
         timestamp: chrono::Utc::now(),
         user_id: user_id.to_string(),
         memory_id: Some(resolved_id_str.clone()),
@@ -865,7 +865,7 @@ pub async fn forget_by_id(
     state.log_event(&req.user_id, "DELETE", &resolved_id_str, "Memory deleted");
 
     state.emit_event(MemoryEvent {
-        event_type: "DELETE".to_string(),
+        event_type: MemoryEventKind::Delete,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(resolved_id_str.clone()),
@@ -1297,7 +1297,7 @@ pub async fn forget_by_tags(
     );
 
     state.emit_event(MemoryEvent {
-        event_type: "DELETE".to_string(),
+        event_type: MemoryEventKind::Delete,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: None,
@@ -1357,7 +1357,7 @@ pub async fn forget_by_date(
     );
 
     state.emit_event(MemoryEvent {
-        event_type: "DELETE".to_string(),
+        event_type: MemoryEventKind::Delete,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: None,
@@ -1715,9 +1715,9 @@ pub async fn anchor_memory(
 
     state.emit_event(MemoryEvent {
         event_type: if req.anchor {
-            "ANCHOR".to_string()
+            MemoryEventKind::Anchor
         } else {
-            "UNANCHOR".to_string()
+            MemoryEventKind::Unanchor
         },
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
@@ -1872,7 +1872,7 @@ pub async fn move_memory_tier(
     .map_err(AppError::Internal)?;
 
     state.emit_event(MemoryEvent {
-        event_type: "TIER_MOVE".to_string(),
+        event_type: MemoryEventKind::TierMove,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(req.memory_id.clone()),

@@ -11,7 +11,7 @@ use tracing::info;
 
 use super::state::MultiUserMemoryManager;
 use super::todos::TodoQuery;
-use super::types::MemoryEvent;
+use super::types::{MemoryEvent, MemoryEventKind};
 use super::utils::resolve_request_user_id;
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
@@ -348,7 +348,7 @@ pub async fn index_project_codebase(
     );
 
     state.emit_event(MemoryEvent {
-        event_type: "CODEBASE_INDEXED".to_string(),
+        event_type: MemoryEventKind::CodebaseIndexed,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(project.id.0.to_string()),

@@ -52,7 +52,7 @@ use crate::storage::legacy_rocksdb::{
 use crate::storage::{AuditLogEntry, AuditStore, StorageCapabilities};
 use crate::streaming;
 
-use super::types::{AuditEvent, ContextStatus, MemoryEvent};
+use super::types::{AuditEvent, ContextStatus, MemoryEvent, MemoryEventKind};
 
 /// Type alias for context sessions map
 pub type ContextSessions = DashMap<String, ContextStatus>;
@@ -3820,7 +3820,7 @@ impl MultiUserMemoryManager {
             }
 
             self.emit_event(MemoryEvent {
-                event_type: "REMINDER_DUE".to_string(),
+                event_type: MemoryEventKind::ReminderDue,
                 timestamp: chrono::Utc::now(),
                 user_id: user_id.clone(),
                 memory_id: Some(task.id.0.to_string()),

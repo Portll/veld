@@ -14,7 +14,7 @@ use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
-use super::types::MemoryEvent;
+use super::types::{MemoryEvent, MemoryEventKind};
 use super::utils::resolve_request_user_id;
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
@@ -1367,7 +1367,7 @@ pub async fn create_todo(
     let formatted = todo_formatter::format_todo_created(&todo, project_name.as_deref());
 
     state.emit_event(MemoryEvent {
-        event_type: "TODO_CREATE".to_string(),
+        event_type: MemoryEventKind::TodoCreate,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(todo.id.0.to_string()),
@@ -1954,7 +1954,7 @@ async fn update_todo_core(
     let formatted = todo_formatter::format_todo_updated(&todo, project_name.as_deref());
 
     state.emit_event(MemoryEvent {
-        event_type: "TODO_UPDATE".to_string(),
+        event_type: MemoryEventKind::TodoUpdate,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(todo.id.0.to_string()),
@@ -2124,7 +2124,7 @@ async fn complete_todo_core(
             }
 
             state.emit_event(MemoryEvent {
-                event_type: "TODO_COMPLETE".to_string(),
+                event_type: MemoryEventKind::TodoComplete,
                 timestamp: chrono::Utc::now(),
                 user_id: req.user_id.clone(),
                 memory_id: Some(completed.id.0.to_string()),
@@ -2236,7 +2236,7 @@ async fn delete_todo_core(
 
     if success {
         state.emit_event(MemoryEvent {
-            event_type: "TODO_DELETE".to_string(),
+            event_type: MemoryEventKind::TodoDelete,
             timestamp: chrono::Utc::now(),
             user_id: query.user_id.clone(),
             memory_id: Some(todo.id.0.to_string()),
@@ -2313,7 +2313,7 @@ async fn reorder_todo_core(
             let formatted = format!("Moved {} {}", updated.short_id(), req.direction);
 
             state.emit_event(MemoryEvent {
-                event_type: "TODO_REORDER".to_string(),
+                event_type: MemoryEventKind::TodoReorder,
                 timestamp: chrono::Utc::now(),
                 user_id: req.user_id.clone(),
                 memory_id: Some(updated.id.0.to_string()),
@@ -2725,7 +2725,7 @@ pub async fn add_todo_comment(
     let formatted = todo_formatter::format_comment_added(&todo.short_id(), &comment);
 
     state.emit_event(MemoryEvent {
-        event_type: "TODO_COMMENT_ADD".to_string(),
+        event_type: MemoryEventKind::TodoCommentAdd,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(comment.id.0.to_string()),
@@ -2895,7 +2895,7 @@ pub async fn delete_todo_comment(
 
     if success {
         state.emit_event(MemoryEvent {
-            event_type: "TODO_COMMENT_DELETE".to_string(),
+            event_type: MemoryEventKind::TodoCommentDelete,
             timestamp: chrono::Utc::now(),
             user_id: user_id.clone(),
             memory_id: Some(comment_id.to_string()),
@@ -2981,7 +2981,7 @@ pub async fn create_project(
     let formatted = todo_formatter::format_project_created(&project);
 
     state.emit_event(MemoryEvent {
-        event_type: "PROJECT_CREATE".to_string(),
+        event_type: MemoryEventKind::ProjectCreate,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(project.id.0.to_string()),
@@ -3128,7 +3128,7 @@ pub async fn update_project(
     let formatted = todo_formatter::format_project_updated(&updated);
 
     state.emit_event(MemoryEvent {
-        event_type: "PROJECT_UPDATE".to_string(),
+        event_type: MemoryEventKind::ProjectUpdate,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(updated.id.0.to_string()),
@@ -3212,7 +3212,7 @@ pub async fn delete_project(
     let formatted = todo_formatter::format_project_deleted(&project, todos_count);
 
     state.emit_event(MemoryEvent {
-        event_type: "PROJECT_DELETE".to_string(),
+        event_type: MemoryEventKind::ProjectDelete,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(project.id.0.to_string()),

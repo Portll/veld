@@ -8,7 +8,7 @@ use axum::{extract::State, response::Json};
 
 use super::health::AppState;
 use super::state::MultiUserMemoryManager;
-use super::types::MemoryEvent;
+use super::types::{MemoryEvent, MemoryEventKind};
 use crate::declared_entities::{DeclaredEntity, DeclaredEntityInput};
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::tag_sources::{TagSource, TagSources};
@@ -1420,7 +1420,7 @@ pub async fn remember(
     );
 
     state.emit_event(MemoryEvent {
-        event_type: "CREATE".to_string(),
+        event_type: MemoryEventKind::Create,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(memory_id.0.to_string()),
@@ -2746,9 +2746,9 @@ pub async fn upsert_memory(
     // Broadcast event
     state.emit_event(MemoryEvent {
         event_type: if was_update {
-            "UPDATE".to_string()
+            MemoryEventKind::Update
         } else {
-            "CREATE".to_string()
+            MemoryEventKind::Create
         },
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),

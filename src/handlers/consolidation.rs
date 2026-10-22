@@ -13,7 +13,7 @@ use super::state::MultiUserMemoryManager;
 use super::types::{
     BackupResponse, CleanupCorruptedRequest, CleanupCorruptedResponse, ConsolidateRequest,
     ConsolidateResponse, CreateBackupRequest, IndexJobResponse, ListBackupsRequest,
-    ListBackupsResponse, MemoryEvent, MigrateLegacyRequest, MigrateLegacyResponse,
+    ListBackupsResponse, MemoryEvent, MemoryEventKind, MigrateLegacyRequest, MigrateLegacyResponse,
     PurgeBackupsRequest, PurgeBackupsResponse, RebuildIndexRequest, RepairIndexRequest,
     RepairIndexResponse, RestoreBackupRequest, RestoreBackupResponse, VerifyBackupRequest,
     VerifyBackupResponse, VerifyIndexRequest,
@@ -986,7 +986,7 @@ pub async fn cleanup_corrupted(
     // Broadcast DELETE event for real-time dashboard so TUI updates its count
     if deleted_count > 0 {
         state.emit_event(MemoryEvent {
-            event_type: "DELETE".to_string(),
+            event_type: MemoryEventKind::Delete,
             timestamp: chrono::Utc::now(),
             user_id: req.user_id.clone(),
             memory_id: None,
@@ -1029,7 +1029,7 @@ pub async fn migrate_legacy(
     // Broadcast event for real-time dashboard
     if migrated > 0 {
         state.emit_event(MemoryEvent {
-            event_type: "MIGRATE".to_string(),
+            event_type: MemoryEventKind::Migrate,
             timestamp: chrono::Utc::now(),
             user_id: req.user_id.clone(),
             memory_id: None,

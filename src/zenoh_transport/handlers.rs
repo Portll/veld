@@ -25,7 +25,9 @@ use crate::handlers::remember::{
     build_rich_context, parse_experience_type, remember_journaled, validate_emotion, WriteOrigin,
 };
 use crate::handlers::state::MultiUserMemoryManager;
-use crate::handlers::types::{MemoryEvent, RecallFact, RecallMemory, RecallResponse, RecallTodo};
+use crate::handlers::types::{
+    MemoryEvent, MemoryEventKind, RecallFact, RecallMemory, RecallResponse, RecallTodo,
+};
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
 use crate::memory::types::{GeoFilter, MemoryId};
 use crate::memory::{Experience, Query as MemoryQuery, RetrievalMode, SessionEvent, TodoStatus};
@@ -603,7 +605,7 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
 
     // Broadcast event (for SSE/WebSocket dashboards)
     manager.emit_event(MemoryEvent {
-        event_type: "CREATE".to_string(),
+        event_type: MemoryEventKind::Create,
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: Some(memory_id.0.to_string()),
@@ -1288,7 +1290,7 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
 
     // Broadcast mission event for SSE/WebSocket dashboards
     manager.emit_event(MemoryEvent {
-        event_type: "MISSION_START".to_string(),
+        event_type: MemoryEventKind::MissionStart,
         timestamp: chrono::Utc::now(),
         user_id: user_id.clone(),
         memory_id: Some(req.mission_id.clone()),
@@ -1397,7 +1399,7 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
     .await;
 
     manager.emit_event(MemoryEvent {
-        event_type: "MISSION_END".to_string(),
+        event_type: MemoryEventKind::MissionEnd,
         timestamp: chrono::Utc::now(),
         user_id: user_id.clone(),
         memory_id: Some(req.mission_id.clone()),

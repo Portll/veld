@@ -34,7 +34,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
-use super::types::MemoryEvent;
+use super::types::{MemoryEvent, MemoryEventKind};
 use super::utils::resolve_request_user_id;
 use crate::auth::AuthenticatedUser;
 use crate::datasets::link::{LinkKind, RowPk};
@@ -251,7 +251,7 @@ pub async fn create_dataset(
         .await
         .map_err(map_dataset_error)?;
     state.emit_event(dataset_event(
-        "DATASET_CREATED",
+        MemoryEventKind::DatasetCreated,
         &user_id,
         &dref.name,
         format!("created dataset '{}'", dref.name),
@@ -338,7 +338,7 @@ pub async fn drop_dataset(
     let dref = locate_dataset(&store, &user_id, &name).await?;
     store.drop_dataset(&dref).await.map_err(map_dataset_error)?;
     state.emit_event(dataset_event(
-        "DATASET_DROPPED",
+        MemoryEventKind::DatasetDropped,
         &user_id,
         &name,
         format!("dropped dataset '{name}'"),
@@ -368,7 +368,7 @@ pub async fn insert_rows(
         .await
         .map_err(map_dataset_error)?;
     state.emit_event(dataset_event(
-        "DATASET_ROWS_INSERTED",
+        MemoryEventKind::DatasetRowsInserted,
         &user_id,
         &name,
         format!("inserted {inserted} row(s) into '{name}'"),
@@ -503,7 +503,7 @@ pub async fn link_row(
             .map_err(map_dataset_error)?,
     }
     state.emit_event(dataset_event(
-        "DATASET_ROW_LINKED",
+        MemoryEventKind::DatasetRowLinked,
         &user_id,
         &name,
         format!("linked a row in '{name}' to {}", req.target_id),
@@ -540,14 +540,14 @@ fn json_to_param(value: &serde_json::Value) -> Result<Param<'_>, String> {
 /// the `DATASET_*` `event_type`. The dataset name is carried in `entities`
 /// as `dataset:<name>` and the human-readable change in `content_preview`.
 fn dataset_event(
-    event_type: &str,
+    event_type: MemoryEventKind,
     user_id: &str,
     dataset: &str,
     preview: String,
     count: Option<usize>,
 ) -> MemoryEvent {
     MemoryEvent {
-        event_type: event_type.to_string(),
+        event_type,
         timestamp: chrono::Utc::now(),
         user_id: user_id.to_string(),
         memory_id: None,
