@@ -1116,7 +1116,11 @@ fn apply_primary(store: &dyn PrimaryMemoryStore, action: &PrimaryAction) -> Outc
             Err(_) => Outcome::Refused,
         },
         PrimaryAction::RunMergePass(limit) => counted(store.run_merge_pass(MERGE_USER, *limit)),
-        PrimaryAction::GcMergeTombstones => counted(store.gc_merge_tombstones(MERGE_USER)),
+        PrimaryAction::GcMergeTombstones => counted(
+            store
+                .gc_merge_tombstones(MERGE_USER)
+                .map(|reclaimed| reclaimed.len()),
+        ),
     }
 }
 

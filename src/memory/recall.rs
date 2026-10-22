@@ -5592,6 +5592,28 @@ impl super::MemorySystem {
         outcome: RetrievalOutcome,
         source: &str,
     ) -> Result<ReinforcementStats> {
+        self.reinforce_recall_with(memory_ids, outcome, source, None)
+    }
+
+    /// [`Self::reinforce_recall_from`] for a caller that journals: `journal` receives
+    /// every memory record the reinforcement rewrote, as stored.
+    pub fn reinforce_recall_from_journaled(
+        &self,
+        memory_ids: &[MemoryId],
+        outcome: RetrievalOutcome,
+        source: &str,
+        journal: &mut super::JournalSink<'_>,
+    ) -> Result<ReinforcementStats> {
+        self.reinforce_recall_with(memory_ids, outcome, source, Some(journal))
+    }
+
+    fn reinforce_recall_with(
+        &self,
+        memory_ids: &[MemoryId],
+        outcome: RetrievalOutcome,
+        source: &str,
+        mut journal: Option<&mut super::JournalSink<'_>>,
+    ) -> Result<ReinforcementStats> {
         if memory_ids.is_empty() {
             return Ok(ReinforcementStats::default());
         }
@@ -5601,6 +5623,11 @@ impl super::MemorySystem {
             outcome,
             ..Default::default()
         };
+        // Importance boosts from promoted edges, applied with the outcome's below: the
+        // graph guard is held here, and the store write takes the write gate, which comes
+        // before the graph in lock order.
+        let mut promotion_boosts: std::collections::HashMap<MemoryId, Vec<f32>> =
+            std::collections::HashMap::new();
 
         // Hebbian coactivation: strengthen associations between co-retrieved memories
         // Uses GraphMemory if available, otherwise counts pair associations directly.
@@ -5627,16 +5654,10 @@ impl super::MemorySystem {
                                 };
                                 for mid in memory_ids {
                                     if mid.0 == promo.from_entity || mid.0 == promo.to_entity {
-                                        // Apply boost through all tiers
-                                        if let Some(mem) = self.working_memory.read().get(mid) {
-                                            mem.boost_importance(boost);
-                                        } else if let Some(mem) =
-                                            self.session_memory.read().get(mid)
-                                        {
-                                            mem.boost_importance(boost);
-                                        } else if let Ok(mem) = self.long_term_memory.get(mid) {
-                                            mem.boost_importance(boost);
-                                        }
+                                        promotion_boosts
+                                            .entry(mid.clone())
+                                            .or_default()
+                                            .push(boost);
                                     }
                                 }
                             }
@@ -5680,96 +5701,59 @@ impl super::MemorySystem {
             }
         }
 
-        // CACHE COHERENT IMPORTANCE UPDATES:
-        // 1. First try to find memory in caches (working, session)
-        // 2. If found in cache, modify through the cached Arc (interior mutability)
-        //    This updates ALL holders of this Arc reference
-        // 3. Then persist to storage for durability
-        // 4. If not in cache, get from storage, modify, and persist
+        // Importance updates: each record is read, changed and written under the write
+        // gate (`mutate_record`), and the cached tier copies are replaced with it. Writing
+        // the cached copy back instead stored whatever that copy lacked (a deferred
+        // embedding that landed later), and a read outside the gate let a concurrent write
+        // to the memory be overwritten.
         let mut persist_failures: Vec<(MemoryId, String)> = Vec::new();
 
         for id in memory_ids {
-            // Try working memory cache first
-            let cached_memory = {
-                let working = self.working_memory.read();
-                working.get(id)
-            };
-
-            // Try session memory cache if not in working
-            let cached_memory = cached_memory.or_else(|| {
-                let session = self.session_memory.read();
-                session.get(id)
-            });
-
-            if let Some(memory) = cached_memory {
-                // CACHE HIT: Modify through cached Arc (updates all references)
-                memory.record_access();
-                match &outcome {
-                    RetrievalOutcome::Helpful => {
-                        memory.boost_importance(HEBBIAN_BOOST_HELPFUL);
-                        stats.importance_boosts += 1;
+            let promoted = promotion_boosts.remove(id).unwrap_or_default();
+            let applied = self.mutate_record(
+                id,
+                |memory| {
+                    memory.record_access();
+                    for boost in &promoted {
+                        memory.boost_importance(*boost);
                     }
-                    RetrievalOutcome::Misleading => {
-                        memory.decay_importance(HEBBIAN_DECAY_MISLEADING);
-                        stats.importance_decays += 1;
+                    match &outcome {
+                        RetrievalOutcome::Helpful => memory.boost_importance(HEBBIAN_BOOST_HELPFUL),
+                        RetrievalOutcome::Misleading => {
+                            memory.decay_importance(HEBBIAN_DECAY_MISLEADING)
+                        }
+                        // I8: Abstained/Ignored are shadow-neutral for live reinforcement
+                        // (access-only); they carry their negative label to the trace store.
+                        RetrievalOutcome::Neutral
+                        | RetrievalOutcome::Abstained
+                        | RetrievalOutcome::Ignored => {}
                     }
-                    // I8: Abstained/Ignored are shadow-neutral for live reinforcement
-                    // (access-only); they carry their negative label to the trace store.
+                    true
+                },
+                journal.as_deref_mut(),
+            );
+            match applied {
+                Ok(_) => match &outcome {
+                    RetrievalOutcome::Helpful => stats.importance_boosts += 1,
+                    RetrievalOutcome::Misleading => stats.importance_decays += 1,
                     RetrievalOutcome::Neutral
                     | RetrievalOutcome::Abstained
-                    | RetrievalOutcome::Ignored => {
-                        // Just access recorded
-                    }
+                    | RetrievalOutcome::Ignored => {}
+                },
+                Err(e) if !matches!(self.long_term_memory.get_memory(id), Ok(Some(_))) => {
+                    tracing::debug!(
+                        memory_id = %id.0,
+                        error = %e,
+                        "Memory not found during reinforcement - may have been deleted"
+                    );
                 }
-                // PERSIST: Write updated memory to durable storage
-                // Track failures instead of silently ignoring
-                if let Err(e) = self.long_term_memory.update(&memory) {
+                Err(e) => {
                     persist_failures.push((id.clone(), e.to_string()));
                     tracing::warn!(
                         memory_id = %id.0,
                         error = %e,
                         "Failed to persist reinforcement update - Hebbian feedback may be lost on restart"
                     );
-                }
-            } else {
-                // CACHE MISS: Get from storage, modify, and persist
-                match self.long_term_memory.get(id) {
-                    Ok(memory) => {
-                        memory.record_access();
-                        match &outcome {
-                            RetrievalOutcome::Helpful => {
-                                memory.boost_importance(HEBBIAN_BOOST_HELPFUL);
-                                stats.importance_boosts += 1;
-                            }
-                            RetrievalOutcome::Misleading => {
-                                memory.decay_importance(HEBBIAN_DECAY_MISLEADING);
-                                stats.importance_decays += 1;
-                            }
-                            // I8: shadow-neutral live behaviour; negative label captured
-                            // to the trace store, not to importance/confidence.
-                            RetrievalOutcome::Neutral
-                            | RetrievalOutcome::Abstained
-                            | RetrievalOutcome::Ignored => {
-                                // Just access recorded
-                            }
-                        }
-                        // PERSIST: Write to durable storage
-                        if let Err(e) = self.long_term_memory.update(&memory) {
-                            persist_failures.push((id.clone(), e.to_string()));
-                            tracing::warn!(
-                                memory_id = %id.0,
-                                error = %e,
-                                "Failed to persist reinforcement update - Hebbian feedback may be lost on restart"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            memory_id = %id.0,
-                            error = %e,
-                            "Memory not found during reinforcement - may have been deleted"
-                        );
-                    }
                 }
             }
         }

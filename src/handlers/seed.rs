@@ -464,10 +464,14 @@ pub async fn seed_project(
         {
             let seed_tags = vec!["_seed".to_string()];
             let guard = memory.read();
-            let forgotten = guard.forget_collecting_removed(ForgetCriteria::ByTags(seed_tags));
+            let forgotten = super::crud::forget_bulk_journaled(
+                &state,
+                &guard,
+                &user_id,
+                [ForgetCriteria::ByTags(seed_tags)],
+            );
             match forgotten {
-                Ok((count, removed)) => {
-                    super::crud::journal_bulk_forget(&state, &guard, &user_id, removed);
+                Ok(count) => {
                     if count > 0 {
                         tracing::info!("Cleaned {} old seed memories for re-seeding", count);
                     }

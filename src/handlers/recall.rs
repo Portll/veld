@@ -1011,42 +1011,58 @@ pub async fn recall(
     // Based on Nader et al. (2000): retrieval reopens the consolidation window.
     if count > 0 {
         let memory_for_recon = memory.clone();
+        let recon_state = state.clone();
+        let recon_user = req.user_id.clone();
         let recon_ids: Vec<(String, f32)> = recall_memories
             .iter()
             .take(crate::constants::RECONSOLIDATION_MAX_PER_RECALL)
             .map(|m| (m.id.clone(), m.score))
             .collect();
-        tokio::task::spawn(async move {
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                let guard = memory_for_recon.read();
-                for (id_str, relevance_score) in &recon_ids {
-                    let Ok(uuid) = uuid::Uuid::parse_str(id_str) else {
-                        continue;
-                    };
-                    let mid = crate::memory::MemoryId(uuid);
-                    let Ok(mem) = guard.get_memory(&mid) else {
-                        continue;
-                    };
-                    // Cooldown: skip if accessed recently
-                    let secs_since = (chrono::Utc::now() - mem.last_accessed()).num_seconds();
-                    if secs_since < crate::constants::RECONSOLIDATION_COOLDOWN_SECS {
-                        continue;
-                    }
-                    let boost = crate::constants::RECONSOLIDATION_BOOST * relevance_score;
-                    mem.boost_importance(boost);
-                    if let Err(e) = guard.update_memory(&mem) {
+        // On the task tracker, so a shutdown waits for it instead of closing the store
+        // under it.
+        state.task_tracker.spawn_blocking(move || {
+            let mut frames = super::state::JournalPending::empty(&recon_user);
+            let guard = memory_for_recon.read();
+            for (id_str, relevance_score) in &recon_ids {
+                let Ok(uuid) = uuid::Uuid::parse_str(id_str) else {
+                    continue;
+                };
+                let mid = crate::memory::MemoryId(uuid);
+                let boost = crate::constants::RECONSOLIDATION_BOOST * relevance_score;
+                // Read, boosted and written under the write gate, with its `Update` frame
+                // queued there: boosting a copy read before the gate and writing it back
+                // overwrote any write to the memory made in between, and left the log
+                // without the boost.
+                let boosted = guard.mutate_record(
+                    &mid,
+                    |mem| {
+                        // Cooldown: skip if accessed recently
+                        let secs_since = (chrono::Utc::now() - mem.last_accessed()).num_seconds();
+                        if secs_since < crate::constants::RECONSOLIDATION_COOLDOWN_SECS {
+                            return false;
+                        }
+                        mem.boost_importance(boost);
+                        true
+                    },
+                    Some(&mut super::remember::queue_frames(
+                        &recon_state,
+                        &recon_user,
+                        &mut frames,
+                    )),
+                );
+                match boosted {
+                    Ok(true) => metrics::RECONSOLIDATION_TOTAL.inc(),
+                    Ok(false) => {}
+                    Err(e) => {
                         tracing::debug!(
                             "Reconsolidation importance boost failed for {}: {e}",
-                            mem.id.0
-                        );
+                            mid.0
+                        )
                     }
-                    metrics::RECONSOLIDATION_TOTAL.inc();
                 }
-            })
-            .await
-            {
-                tracing::debug!("Reconsolidation task failed: {e}");
             }
+            drop(guard);
+            frames.wait_logged("recall reconsolidation");
         });
     }
 
@@ -1505,15 +1521,25 @@ pub async fn proactive_context(
             let graph_for_reinforce = graph_memory.clone();
             let helpful_ids_for_graph = helpful_ids.clone();
             let evidence_source_for_feedback = evidence_source.clone();
+            let journal_state = state.clone();
+            let journal_user = req.user_id.clone();
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_sys_for_reinforce.read();
+                // The records the reinforcement rewrites are journaled, queued under the
+                // write gate of each write and waited for once both passes are done.
+                let mut frames = super::state::JournalPending::empty(&journal_user);
 
                 // Reinforce helpful memories (importance boost)
                 if !helpful_ids.is_empty() {
-                    if let Err(e) = memory_guard.reinforce_recall_from(
+                    if let Err(e) = memory_guard.reinforce_recall_from_journaled(
                         &helpful_ids,
                         crate::memory::RetrievalOutcome::Helpful,
                         &evidence_source_for_feedback,
+                        &mut super::remember::queue_frames(
+                            &journal_state,
+                            &journal_user,
+                            &mut frames,
+                        ),
                     ) {
                         tracing::warn!("Failed to reinforce helpful memories: {}", e);
                     }
@@ -1521,14 +1547,20 @@ pub async fn proactive_context(
 
                 // Weaken misleading memories (importance decay)
                 if !misleading_ids.is_empty() {
-                    if let Err(e) = memory_guard.reinforce_recall_from(
+                    if let Err(e) = memory_guard.reinforce_recall_from_journaled(
                         &misleading_ids,
                         crate::memory::RetrievalOutcome::Misleading,
                         &evidence_source_for_feedback,
+                        &mut super::remember::queue_frames(
+                            &journal_state,
+                            &journal_user,
+                            &mut frames,
+                        ),
                     ) {
                         tracing::warn!("Failed to weaken misleading memories: {}", e);
                     }
                 }
+                frames.wait_logged("feedback reinforcement");
 
                 // Strengthen graph edges for helpful memories (Hebbian: "what fires together, wires together")
                 // When feedback confirms a memory was useful, strengthen its episode's entity edges
@@ -2873,9 +2905,20 @@ pub async fn reinforce_feedback(
         .to_string();
     let stats = {
         let memory = memory.clone();
+        let journal_state = state.clone();
+        let user_id = req.user_id.clone();
+        // Each record the reinforcement rewrites has its `Update` frame queued under the
+        // write gate of that write; the sync is waited for before responding.
         tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            memory_guard.reinforce_recall_from(&memory_ids, outcome, &evidence_source)
+            let mut frames = super::state::JournalPending::empty(&user_id);
+            let stats = memory.read().reinforce_recall_from_journaled(
+                &memory_ids,
+                outcome,
+                &evidence_source,
+                &mut super::remember::queue_frames(&journal_state, &user_id, &mut frames),
+            );
+            frames.wait_logged("reinforce");
+            stats
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?

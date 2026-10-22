@@ -86,6 +86,7 @@ fn persist_detected_gaps(
 /// a writer queued behind one step gets in before the next. Returns the edges and the
 /// entity-entity edges strengthened.
 fn strengthen_from_replay(
+    state: &MultiUserMemoryManager,
     graph: &parking_lot::RwLock<crate::graph_memory::GraphMemory>,
     memory: &crate::user_memory::SharedUserMemory,
     replay: Option<&memory::types::MaintenanceResult>,
@@ -96,19 +97,22 @@ fn strengthen_from_replay(
     let mut entity_edges_strengthened = 0;
     if let Some(replay) = replay {
         if !replay.edge_boosts.is_empty() {
-            let graph_guard = graph.read();
-            match graph_guard.strengthen_memory_edges(&replay.edge_boosts, source) {
+            // The graph guard is released before the boosts are applied: they take the write
+            // gate, which comes before the graph in lock order.
+            let strengthened = graph
+                .read()
+                .strengthen_memory_edges(&replay.edge_boosts, source);
+            match strengthened {
                 Ok((count, promotion_boosts)) => {
                     edges_strengthened += count;
                     if !promotion_boosts.is_empty() {
-                        if let Err(e) = memory.read().apply_edge_promotion_boosts(&promotion_boosts)
-                        {
-                            tracing::warn!(
-                                user_id = %user_id,
-                                source,
-                                "Failed to apply edge promotion boosts: {e}"
-                            );
-                        }
+                        apply_promotion_boosts_journaled(
+                            state,
+                            memory,
+                            user_id,
+                            &promotion_boosts,
+                            source,
+                        );
                     }
                 }
                 Err(e) => tracing::debug!(user_id = %user_id, source, "Edge boost failed: {e}"),
@@ -166,6 +170,30 @@ pub(crate) fn consolidation_lock(user_id: &str) -> std::sync::Arc<tokio::sync::M
 pub(crate) fn prune_consolidation_locks() {
     CONSOLIDATION_LOCKS
         .retain(|_, lock| std::sync::Arc::strong_count(lock) > 1 || lock.try_lock().is_err());
+}
+
+/// Apply edge-promotion importance boosts and journal the records they rewrote, so replay
+/// and replicas see the boosts. Runs on the blocking pool; the boosts take the write gate.
+fn apply_promotion_boosts_journaled(
+    state: &MultiUserMemoryManager,
+    memory: &crate::user_memory::SharedUserMemory,
+    user_id: &str,
+    boosts: &[crate::memory::types::EdgePromotionBoost],
+    source: &str,
+) {
+    let applied = memory.read().apply_edge_promotion_boosts(boosts);
+    match applied {
+        Ok((_, rewritten)) => super::remember::journal_stored(
+            state,
+            memory,
+            user_id,
+            &rewritten,
+            super::remember::SnapshotKind::Update,
+        ),
+        Err(e) => {
+            tracing::warn!(user_id = %user_id, source, "Failed to apply edge promotion boosts: {e}")
+        }
+    }
 }
 
 // =============================================================================
@@ -253,9 +281,19 @@ pub async fn consolidate_memories(
         let maintenance_result = {
             let memory = memory.clone();
             let uid = user_id.clone();
+            let journal_state = state_clone.clone();
             match tokio::task::spawn_blocking(move || {
-                let memory_guard = memory.read();
-                memory_guard.run_maintenance(decay_factor, &uid, true)
+                let result = memory.read().run_maintenance(decay_factor, &uid, true);
+                if let Ok(result) = &result {
+                    super::remember::journal_maintenance(
+                        &journal_state,
+                        &memory,
+                        &uid,
+                        &result.rewritten,
+                        &result.removed,
+                    );
+                }
+                result
             })
             .await
             {
@@ -279,8 +317,10 @@ pub async fn consolidate_memories(
                 Ok(graph) => {
                     let memory = memory.clone();
                     let uid = user_id.clone();
+                    let state = state_clone.clone();
                     tokio::task::spawn_blocking(move || {
                         strengthen_from_replay(
+                            &state,
                             &graph,
                             &memory,
                             Some(&maintenance_result),
@@ -644,9 +684,19 @@ pub async fn sleep_phase_consolidation(
         let maintenance_result = {
             let memory = memory.clone();
             let uid = user_id.clone();
+            let journal_state = state_clone.clone();
             match tokio::task::spawn_blocking(move || {
-                let memory_guard = memory.read();
-                memory_guard.run_maintenance(decay_factor, &uid, true)
+                let result = memory.read().run_maintenance(decay_factor, &uid, true);
+                if let Ok(result) = &result {
+                    super::remember::journal_maintenance(
+                        &journal_state,
+                        &memory,
+                        &uid,
+                        &result.rewritten,
+                        &result.removed,
+                    );
+                }
+                result
             })
             .await
             {
@@ -667,8 +717,10 @@ pub async fn sleep_phase_consolidation(
         if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
             let memory = memory.clone();
             let uid = user_id.clone();
+            let state = state_clone.clone();
             if let Err(e) = tokio::task::spawn_blocking(move || {
                 strengthen_from_replay(
+                    &state,
                     &graph,
                     &memory,
                     maintenance_result.as_ref(),

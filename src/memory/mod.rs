@@ -2157,6 +2157,9 @@ impl MemorySystem {
             created_at,
         ));
 
+        // The embeddings above are computed outside the write gate; the replaced-record
+        // check and the store write are one step under it.
+        let _write_guard = self.write_lock.enter()?;
         // An import may re-supply an id already stored; that replaces a record, it does not
         // add one.
         let replaced = self
@@ -4071,6 +4074,8 @@ impl MemorySystem {
     }
 
     fn forget_with(&self, criteria: ForgetCriteria, bm25: Bm25Sync) -> Result<usize> {
+        // Re-entrant, for callers that hold it from a read or until they queue the frames.
+        let _gate = self.write_lock.hold();
         let outcome = self.forget_matching(criteria, bm25);
         self.note_memory_set_changed();
         outcome
@@ -5115,11 +5120,16 @@ impl MemorySystem {
     /// When an edge promotes from L1→L2 or L2→L3, the memories involved get
     /// a small importance boost, reflecting that they participate in a consolidating
     /// relationship. Uses interior mutability — `set_importance` works through Arc.
+    ///
+    /// Returns how many boosts applied and the ids whose stored record was rewritten,
+    /// which a journaled caller owes an `Update` snapshot each. Takes the write gate,
+    /// so the caller must not hold a graph guard (lock order: gate, then graph).
     pub fn apply_edge_promotion_boosts(
         &self,
         boosts: &[crate::memory::types::EdgePromotionBoost],
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<MemoryId>)> {
         let mut applied = 0;
+        let mut rewritten = Vec::new();
 
         for boost in boosts {
             let memory_id = match uuid::Uuid::parse_str(&boost.memory_id) {
@@ -5147,7 +5157,12 @@ impl MemorySystem {
                     timestamp: chrono::Utc::now(),
                 });
                 applied += 1;
-            } else if let Ok(memory) = self.long_term_memory.get(&memory_id) {
+            } else if let (_gate, Ok(memory)) = (
+                // Read and stored under the write gate, taken before the read, so the boost
+                // lands on the stored record and not on a copy another writer replaced.
+                self.write_lock.hold(),
+                self.long_term_memory.get(&memory_id),
+            ) {
                 let before = memory.importance();
                 let new_importance = (before + boost.boost as f32).min(1.0);
                 memory.set_importance(new_importance);
@@ -5162,6 +5177,7 @@ impl MemorySystem {
                 if !memory.is_forgotten() {
                     self.note_importance_change(before, memory.importance());
                 }
+                rewritten.push(memory.id.clone());
                 self.record_consolidation_event(ConsolidationEvent::EdgePromotionBoostApplied {
                     memory_id: boost.memory_id.clone(),
                     entity_name: boost.entity_name.clone(),
@@ -5182,7 +5198,7 @@ impl MemorySystem {
             );
         }
 
-        Ok(applied)
+        Ok((applied, rewritten))
     }
 
     /// Apply compensatory boost to memories that lost all graph edges (Direction 2).
@@ -5246,14 +5262,14 @@ impl MemorySystem {
     /// Each record is re-read and rewritten under the per-user write lock, so a writer
     /// that changed it after the candidate scan is not overwritten with the stale copy;
     /// the lock is released between records so remembers interleave with a long pass.
-    /// Returns the number of records compressed.
-    fn compress_old_memories(&self) -> Result<usize> {
+    /// Returns the ids of the records compressed.
+    fn compress_old_memories(&self) -> Result<Vec<MemoryId>> {
         let cutoff =
-            chrono::Utc::now() - chrono::Duration::days(self.config.compression_age_days as i64);
+            scoring_now() - chrono::Duration::days(self.config.compression_age_days as i64);
 
         let candidates = self.long_term_memory.get_uncompressed_older_than(cutoff)?;
 
-        let mut compressed_count = 0;
+        let mut compressed_ids = Vec::new();
         for candidate in candidates {
             let Ok(_write_guard) = self.write_lock.enter() else {
                 break;
@@ -5268,15 +5284,15 @@ impl MemorySystem {
             self.long_term_memory.update(&compressed)?;
             self.note_importance_change(memory.importance(), compressed.importance());
             self.stats.write().compressed_count += 1;
-            compressed_count += 1;
+            compressed_ids.push(compressed.id.clone());
         }
 
-        Ok(compressed_count)
+        Ok(compressed_ids)
     }
 
     /// Check if a memory should be compressed
     fn should_compress(&self, memory: &Memory) -> bool {
-        let age = chrono::Utc::now() - memory.created_at;
+        let age = scoring_now() - memory.created_at;
         age.num_days() > self.config.compression_age_days as i64 && !memory.compressed
     }
 
@@ -6168,6 +6184,9 @@ impl MemorySystem {
     }
 
     fn update_memory_with(&self, memory: &Memory, bm25: Bm25Sync) -> Result<()> {
+        // Re-entrant: the callers that read the record first hold it already, from the
+        // read; this covers the store write and the index updates for any that do not.
+        let _gate = self.write_lock.hold();
         let memory_id = memory.id.clone();
 
         let reindex_bm25 = bm25 == Bm25Sync::Direct
@@ -6219,6 +6238,7 @@ impl MemorySystem {
     /// The records are written in one atomic store write (one commit and sync for a
     /// follower's page, not one per memory), so `memories` should name each id once.
     pub fn upsert_memories(&self, memories: &[Memory]) -> Result<usize> {
+        let _gate = self.write_lock.hold();
         // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
         // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
         // them, and a replica applying every snapshot grew 18.7 vectors per memory.
@@ -6279,53 +6299,64 @@ impl MemorySystem {
         memory_id: &MemoryId,
         parent_id: Option<MemoryId>,
     ) -> Result<()> {
-        // Update the persistent copy in long-term storage
-        let mut memory = self.long_term_memory.get(memory_id)?;
-        memory.set_parent(parent_id.clone());
-        self.long_term_memory.update(&memory)?;
-
-        // Also update the in-memory tier copy (working or session) so reads
-        // reflect the parent_id immediately without waiting for tier promotion
-        let updated = Arc::new(memory);
-        {
-            let mut wm = self.working_memory.write();
-            if wm.contains(memory_id) {
-                let _ = wm.remove(memory_id);
-                let _ = wm.add_shared(Arc::clone(&updated));
-            }
-        }
-        {
-            let mut sm = self.session_memory.write();
-            if sm.contains(memory_id) {
-                let _ = sm.remove(memory_id);
-                let _ = sm.add_shared(Arc::clone(&updated));
-            }
-        }
-
-        Ok(())
+        self.mutate_record(
+            memory_id,
+            |memory| {
+                memory.set_parent(parent_id);
+                true
+            },
+            None,
+        )
+        .map(|_| ())
     }
 
     /// Records on a memory that `todo_id` cites it: the memory half of the todo-memory link.
     pub fn link_related_todo(&self, memory_id: &MemoryId, todo_id: TodoId) -> Result<()> {
-        self.mutate_related_todos(memory_id, move |memory| memory.add_related_todo(todo_id))
+        self.mutate_record(
+            memory_id,
+            move |memory| {
+                memory.add_related_todo(todo_id);
+                true
+            },
+            None,
+        )
+        .map(|_| ())
     }
 
     /// Drops `todo_id` from a memory's back-links, when the todo stops citing it or is deleted.
     pub fn unlink_related_todo(&self, memory_id: &MemoryId, todo_id: &TodoId) -> Result<()> {
-        self.mutate_related_todos(memory_id, |memory| memory.remove_related_todo(todo_id))
+        self.mutate_record(
+            memory_id,
+            |memory| {
+                memory.remove_related_todo(todo_id);
+                true
+            },
+            None,
+        )
+        .map(|_| ())
     }
 
-    /// Applies a back-link edit to storage and the cached tier copies. Not a full memory
-    /// update: only `related_todo_ids` changes, which neither the vector nor the BM25 index
-    /// reads, as in [`Self::set_memory_parent`].
-    fn mutate_related_todos(
+    /// Apply `edit` to the stored record and the cached tier copies, for a change neither
+    /// the vector nor the BM25 index reads (a parent, todo back-links, importance, the
+    /// anchor flag), so nothing is re-indexed. The record is read, edited and written
+    /// under the write gate, so the edit lands on what the store holds rather than on a
+    /// copy another writer has since replaced. `edit` returns whether it changed anything;
+    /// nothing is written when it did not. `journal` receives the record as stored.
+    pub fn mutate_record(
         &self,
         memory_id: &MemoryId,
-        edit: impl FnOnce(&mut Memory),
-    ) -> Result<()> {
+        edit: impl FnOnce(&mut Memory) -> bool,
+        journal: Option<&mut JournalSink<'_>>,
+    ) -> Result<bool> {
+        let gate = self.write_lock.hold();
         let mut memory = self.long_term_memory.get(memory_id)?;
-        edit(&mut memory);
+        if !edit(&mut memory) {
+            return Ok(false);
+        }
         self.long_term_memory.update(&memory)?;
+        if let Some(sink) = journal {
+            sink(&memory, SnapshotKind::Update, &gate);
+        }
 
         let updated = Arc::new(memory);
         {
@@ -6342,7 +6373,7 @@ impl MemorySystem {
                 let _ = sm.add_shared(Arc::clone(&updated));
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Agent-initiated tier move. Updates the persistent record's `tier`
@@ -6364,6 +6395,28 @@ impl MemorySystem {
         memory_id: &MemoryId,
         target_tier: MemoryTier,
     ) -> Result<MemoryTier> {
+        self.move_to_tier_with(memory_id, target_tier, None)
+    }
+
+    /// [`Self::move_to_tier`] for a caller that journals the move: `journal` receives
+    /// the moved record as stored, and nothing when the memory was already there.
+    pub fn move_to_tier_journaled(
+        &self,
+        memory_id: &MemoryId,
+        target_tier: MemoryTier,
+        journal: &mut JournalSink<'_>,
+    ) -> Result<MemoryTier> {
+        self.move_to_tier_with(memory_id, target_tier, Some(journal))
+    }
+
+    fn move_to_tier_with(
+        &self,
+        memory_id: &MemoryId,
+        target_tier: MemoryTier,
+        journal: Option<&mut JournalSink<'_>>,
+    ) -> Result<MemoryTier> {
+        // Read and written under the write gate: see `mutate_record`.
+        let gate = self.write_lock.hold();
         let mut memory = self.long_term_memory.get(memory_id)?;
         let previous_tier = memory.tier;
 
@@ -6373,6 +6426,9 @@ impl MemorySystem {
 
         memory.tier = target_tier;
         self.long_term_memory.update(&memory)?;
+        if let Some(sink) = journal {
+            sink(&memory, SnapshotKind::Update, &gate);
+        }
 
         let shared = Arc::new(memory);
 
@@ -6415,10 +6471,15 @@ impl MemorySystem {
     /// resist automatic decay below `ANCHOR_IMPORTANCE_FLOOR` and are skipped
     /// during compression — used by agents to pin critical facts.
     pub fn set_memory_anchor(&self, memory_id: &MemoryId, anchored: bool) -> Result<()> {
-        let memory = self.long_term_memory.get(memory_id)?;
-        memory.set_anchored(anchored);
-        self.update_memory(&memory)?;
-        Ok(())
+        self.mutate_record(
+            memory_id,
+            |memory| {
+                memory.set_anchored(anchored);
+                true
+            },
+            None,
+        )
+        .map(|_| ())
     }
 
     /// Construct a transient handle to the ACL store backed by the same
@@ -7548,6 +7609,15 @@ impl MemorySystem {
         self.long_term_memory.find_by_external_id(external_id)
     }
 
+    /// [`Self::reconsolidation_expiry`] for a test that needs only the stats.
+    #[cfg(test)]
+    pub(crate) fn run_reconsolidation_expiry(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> dials::ReconsolidationStats {
+        self.reconsolidation_expiry(now, &mut Vec::new())
+    }
+
     /// Close expired reconsolidation labile windows (FIX-R1) and apply the enabled
     /// re-encode layers. Runs inside `run_maintenance` (off the recall hot path). `now`
     /// is injected so the expiry pass is unit-testable without a clock abstraction.
@@ -7562,9 +7632,12 @@ impl MemorySystem {
     /// Concurrency: the shadow write-guard is released before the per-memory apply loop,
     /// so no tier lock is held across application (matches the shadow-creation path in
     /// `recall`, which also takes `reconsolidation_shadows.write()`).
-    pub(crate) fn run_reconsolidation_expiry(
+    ///
+    /// Adds to `rewritten` every memory whose stored record it rewrote.
+    fn reconsolidation_expiry(
         &self,
         now: chrono::DateTime<chrono::Utc>,
+        rewritten: &mut Vec<MemoryId>,
     ) -> dials::ReconsolidationStats {
         let mut stats = dials::ReconsolidationStats::default();
         let d = self.cognitive_dials.read().clone();
@@ -7627,7 +7700,7 @@ impl MemorySystem {
             // Layers 2 & 3: enrich entity_refs / nudge embedding from the accumulated
             // context, then persist (one clone + one re-index for both layers).
             if d.re_encode_entity_enrich || d.re_encode_embedding_nudge {
-                let (enriched, nudged) = self.reconsolidate_memory(&mem, shadow, &d);
+                let (enriched, nudged) = self.reconsolidate_memory(&mem, shadow, &d, rewritten);
                 stats.entities_enriched += enriched;
                 stats.embeddings_nudged += nudged;
             }
@@ -7710,70 +7783,90 @@ impl MemorySystem {
         }
     }
 
-    /// Layers 2 & 3 re-encode: clone the memory once, optionally (a) merge new
-    /// retrieval-context entities into `entity_refs` and (b) nudge its embedding toward
-    /// the retrieval-context embedding, then persist via `update_memory` (single
-    /// re-index). Returns `(entities_enriched, embeddings_nudged)`. No-op (no clone, no
+    /// Layers 2 & 3 re-encode: optionally (a) merge new retrieval-context entities into
+    /// `entity_refs` and (b) nudge the embedding toward the retrieval-context embedding,
+    /// then persist via `update_memory` (single re-index). Returns `(entities_enriched,
+    /// embeddings_nudged)` and adds the id to `rewritten` when it wrote. No-op (no
     /// persist) when neither layer is dialed on or no mutation actually occurs.
+    ///
+    /// The entity lookups and the context embedding depend only on the shadow, so they
+    /// run first, outside the write gate; the mutation is applied to the record read
+    /// under the gate. `mem` is the tier map's copy, taken when the memory entered it,
+    /// and persisting an edit of it wrote back whatever the store gained since.
     fn reconsolidate_memory(
         &self,
         mem: &SharedMemory,
         shadow: &types::ReconsolidationShadow,
         dials: &dials::CognitiveDials,
+        rewritten: &mut Vec<MemoryId>,
     ) -> (usize, usize) {
         if !dials.re_encode_entity_enrich && !dials.re_encode_embedding_nudge {
             return (0, 0);
         }
-        let mut m = (**mem).clone();
+
+        // Layer 2 input: the known entities the retrieval context names.
+        let context_entities: Vec<(uuid::Uuid, String)> = match &self.graph_memory {
+            Some(graph) if dials.re_encode_entity_enrich => {
+                let g = graph.read();
+                extract_entities_simple(&shadow.retrieval_context)
+                    .into_iter()
+                    .filter_map(|kw| g.find_entity_by_name(&kw).ok().flatten())
+                    .map(|node| (node.uuid, node.name.clone()))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        // Layer 3 input: the retrieval-context embedding.
+        let context_embedding = if dials.re_encode_embedding_nudge {
+            self.compute_embedding(&shadow.retrieval_context).ok()
+        } else {
+            None
+        };
+        if context_entities.is_empty() && context_embedding.is_none() {
+            return (0, 0);
+        }
+
+        let Ok(_gate) = self.write_lock.enter() else {
+            return (0, 0);
+        };
+        let Ok(mut m) = self.long_term_memory.get(&mem.id) else {
+            return (0, 0);
+        };
         let mut entities_enriched = 0usize;
         let mut embeddings_nudged = 0usize;
         let mut dirty = false;
 
         // Layer 2: merge genuinely-new context entities into entity_refs.
-        if dials.re_encode_entity_enrich {
-            if let Some(graph) = &self.graph_memory {
-                let g = graph.read();
-                let before = m.entity_refs.len();
-                for kw in extract_entities_simple(&shadow.retrieval_context) {
-                    if let Ok(Some(node)) = g.find_entity_by_name(&kw) {
-                        m.add_entity_ref(
-                            node.uuid,
-                            node.name.clone(),
-                            "reconsolidated".to_string(),
-                        );
-                    }
-                }
-                let added = m.entity_refs.len() - before;
-                if added > 0 {
-                    entities_enriched = added;
-                    dirty = true;
-                }
+        if !context_entities.is_empty() {
+            let before = m.entity_refs.len();
+            for (uuid, name) in context_entities {
+                m.add_entity_ref(uuid, name, "reconsolidated".to_string());
+            }
+            let added = m.entity_refs.len() - before;
+            if added > 0 {
+                entities_enriched = added;
+                dirty = true;
             }
         }
 
         // Layer 3: blend the embedding toward the retrieval-context embedding (L2-norm).
-        if dials.re_encode_embedding_nudge {
-            if let Some(mem_emb) = m.experience.embeddings.clone() {
-                if !mem_emb.is_empty() {
-                    if let Ok(ctx_emb) = self.compute_embedding(&shadow.retrieval_context) {
-                        if ctx_emb.len() == mem_emb.len() {
-                            let blend = dials.embedding_blend;
-                            let mut blended: Vec<f32> = mem_emb
-                                .iter()
-                                .zip(ctx_emb.iter())
-                                .map(|(a, b)| (1.0 - blend) * a + blend * b)
-                                .collect();
-                            let norm = blended.iter().map(|x| x * x).sum::<f32>().sqrt();
-                            if norm > f32::EPSILON {
-                                for x in blended.iter_mut() {
-                                    *x /= norm;
-                                }
-                                m.experience.embeddings = Some(blended);
-                                embeddings_nudged = 1;
-                                dirty = true;
-                            }
-                        }
+        if let (Some(ctx_emb), Some(mem_emb)) = (context_embedding, m.experience.embeddings.clone())
+        {
+            if !mem_emb.is_empty() && ctx_emb.len() == mem_emb.len() {
+                let blend = dials.embedding_blend;
+                let mut blended: Vec<f32> = mem_emb
+                    .iter()
+                    .zip(ctx_emb.iter())
+                    .map(|(a, b)| (1.0 - blend) * a + blend * b)
+                    .collect();
+                let norm = blended.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > f32::EPSILON {
+                    for x in blended.iter_mut() {
+                        *x /= norm;
                     }
+                    m.experience.embeddings = Some(blended);
+                    embeddings_nudged = 1;
+                    dirty = true;
                 }
             }
         }
@@ -7783,6 +7876,7 @@ impl MemorySystem {
                 tracing::debug!("reconsolidation memory update failed: {e}");
                 return (0, 0);
             }
+            rewritten.push(m.id.clone());
         }
         (entities_enriched, embeddings_nudged)
     }
@@ -7806,10 +7900,14 @@ impl MemorySystem {
         is_heavy: bool,
     ) -> Result<MaintenanceResult> {
         let start_time = std::time::Instant::now();
-        let now = chrono::Utc::now();
+        // The scoring clock, so a pinned harness clock (VELD_EVAL_NOW) promotes, decays and
+        // closes windows the same on every pass, as it already ages graph edges.
+        let now = scoring_now();
+        let mut rewritten: Vec<MemoryId> = Vec::new();
+        let mut removed: Vec<MemoryId> = Vec::new();
 
         // 1. Consolidation: promote memories between tiers
-        self.consolidate_if_needed()?;
+        rewritten.extend(self.consolidate_if_needed()?.into_iter().map(|m| m.id));
 
         // 2. Decay activation on all in-memory memories (working + session)
         let mut decayed_count = 0;
@@ -7877,7 +7975,7 @@ impl MemorySystem {
         // 2.45 FIX-R1: close expired reconsolidation labile windows + re-encode.
         // Runs after decay (so the resting activation it sets is final) and before
         // potentiation. No-op unless `reconsolidation_enabled` is dialed on.
-        let _recon_stats = self.run_reconsolidation_expiry(now);
+        let _recon_stats = self.reconsolidation_expiry(now, &mut rewritten);
 
         // 2.5 Potentiation: boost ALL memories based on access count (Hebbian LTP)
         // This implements "neurons that fire together wire together" - memories
@@ -8271,17 +8369,26 @@ impl MemorySystem {
                     replay_result.replay_memory_ids =
                         candidates.iter().map(|c| c.memory_id.clone()).collect();
 
-                    // Apply memory boosts
+                    // Apply memory boosts, each read and stored under the write gate so it
+                    // lands on the stored record; a closed gate ends them.
                     for (mem_id_str, boost) in &memory_boosts {
                         if let Ok(mem_id) = uuid::Uuid::parse_str(mem_id_str) {
+                            let Ok(_gate) = self.write_lock.enter() else {
+                                break;
+                            };
                             if let Ok(memory) = self.long_term_memory.get(&MemoryId(mem_id)) {
                                 let before = memory.importance();
                                 memory.boost_importance(*boost);
                                 match self.long_term_memory.update(&memory) {
-                                    Ok(()) if !memory.is_forgotten() => {
-                                        self.note_importance_change(before, memory.importance())
+                                    Ok(()) => {
+                                        if !memory.is_forgotten() {
+                                            self.note_importance_change(
+                                                before,
+                                                memory.importance(),
+                                            );
+                                        }
+                                        rewritten.push(memory.id.clone());
                                     }
-                                    Ok(()) => {}
                                     Err(e) => {
                                         tracing::debug!("Failed to persist replay boost: {e}")
                                     }
@@ -8335,8 +8442,16 @@ impl MemorySystem {
         // 5.2. Compression of aged long-term records (heavy only, when auto_compress).
         if is_heavy && self.config.auto_compress {
             match self.compress_old_memories() {
-                Ok(0) => {}
-                Ok(n) => tracing::debug!(user_id, compressed = n, "Compressed aged memories"),
+                Ok(compressed) => {
+                    if !compressed.is_empty() {
+                        tracing::debug!(
+                            user_id,
+                            compressed = compressed.len(),
+                            "Compressed aged memories"
+                        );
+                    }
+                    rewritten.extend(compressed);
+                }
                 Err(e) => tracing::warn!(user_id, error = %e, "Compression pass failed"),
             }
         }
@@ -8350,8 +8465,13 @@ impl MemorySystem {
             if let Err(e) = self.long_term_memory.run_merge_pass(user_id, 32) {
                 tracing::warn!(user_id, error = %e, "S-R6: merge pass failed");
             }
-            if let Err(e) = self.long_term_memory.gc_merge_tombstones(user_id) {
-                tracing::warn!(user_id, error = %e, "S-R6: tombstone GC failed");
+            // Under the write gate: the reclaim deletes memories, and the caller queues
+            // their `Forget` frames from what this reports.
+            if let Ok(_gate) = self.write_lock.enter() {
+                match self.long_term_memory.gc_merge_tombstones(user_id) {
+                    Ok(reclaimed) => removed.extend(reclaimed),
+                    Err(e) => tracing::warn!(user_id, error = %e, "S-R6: tombstone GC failed"),
+                }
             }
             self.note_memory_set_changed();
         }
@@ -8376,6 +8496,8 @@ impl MemorySystem {
             duration_ms
         );
 
+        let mut seen = std::collections::HashSet::new();
+        rewritten.retain(|id| seen.insert(id.clone()) && !removed.contains(id));
         Ok(MaintenanceResult {
             decayed_count,
             edge_boosts: replay_result.edge_boosts,
@@ -8384,6 +8506,8 @@ impl MemorySystem {
             total_priority_score: replay_result.total_priority_score,
             facts_extracted: facts_extracted_count,
             facts_reinforced: facts_reinforced_count,
+            rewritten,
+            removed,
         })
     }
 
@@ -9340,7 +9464,8 @@ impl MemorySystem {
         };
         const DELETE_CONFIDENCE: f32 = 0.1;
 
-        let now = chrono::Utc::now();
+        // The scoring clock, as `run_maintenance` uses, so a pinned clock decays alike.
+        let now = scoring_now();
         let mut total_decayed = 0;
         let mut total_deleted = 0;
 
@@ -11018,6 +11143,108 @@ mod lifecycle_tests {
                 same_record(promoted, &stored),
                 "{backend:?}: reported as written"
             );
+        }
+    }
+
+    /// A maintenance pass reports the records it rewrote, here a tier promotion, so a
+    /// journaled caller can give each an `Update` frame.
+    #[test]
+    fn maintenance_reports_the_records_it_promoted() {
+        for (backend, system, _tmp) in systems() {
+            let id = system
+                .remember_deferred(
+                    Experience {
+                        content: "Night shift handover notes for the signal box".to_string(),
+                        ..Default::default()
+                    },
+                    Some(chrono::Utc::now() - chrono::Duration::days(1)),
+                    None,
+                )
+                .unwrap();
+            for cached in system
+                .working_memory
+                .read()
+                .all_memories()
+                .into_iter()
+                .chain(system.session_memory.read().all_memories())
+                .filter(|m| m.id == id)
+            {
+                cached.set_importance(0.95);
+            }
+            let result = system
+                .run_maintenance(1.0, "maintenance-user", false)
+                .unwrap();
+            assert!(
+                result.rewritten.contains(&id),
+                "{backend:?}: the promoted record is reported: {:?}",
+                result.rewritten
+            );
+            assert!(result.removed.is_empty(), "{backend:?}");
+        }
+    }
+
+    /// The record-level writers that used to read and write outside the write gate now
+    /// wait for it, so none of them can land between another writer's read and write.
+    #[test]
+    fn record_writers_wait_for_the_write_gate() {
+        for (backend, system, _tmp) in systems() {
+            let id = system
+                .remember(
+                    Experience {
+                        content: "The ferry ramp is greased every Tuesday".to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let parent = system
+                .remember(
+                    Experience {
+                        content: "Harbour maintenance schedule".to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let writers: Vec<(&str, Box<dyn Fn() -> Result<()> + Sync + '_>)> = vec![
+                (
+                    "set_memory_parent",
+                    Box::new(|| system.set_memory_parent(&id, Some(parent.clone()))),
+                ),
+                (
+                    "move_to_tier",
+                    Box::new(|| system.move_to_tier(&id, MemoryTier::Archive).map(|_| ())),
+                ),
+                (
+                    "update_memory",
+                    Box::new(|| {
+                        let stored = system.long_term_memory.get(&id)?;
+                        system.update_memory(&stored)
+                    }),
+                ),
+                (
+                    "set_memory_anchor",
+                    Box::new(|| system.set_memory_anchor(&id, true)),
+                ),
+            ];
+            for (name, write) in &writers {
+                let gate = system.journal_section();
+                std::thread::scope(|scope| {
+                    let (done_tx, done_rx) = std::sync::mpsc::channel();
+                    scope.spawn(move || {
+                        write().unwrap();
+                        done_tx.send(()).unwrap();
+                    });
+                    assert!(
+                        done_rx
+                            .recv_timeout(std::time::Duration::from_millis(100))
+                            .is_err(),
+                        "{backend:?}: {name} wrote while another thread held the gate"
+                    );
+                    drop(gate);
+                    done_rx.recv().unwrap();
+                });
+            }
         }
     }
 

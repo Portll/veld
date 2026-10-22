@@ -1016,6 +1016,52 @@ pub(crate) fn journal_bulk_forget(
     frames.wait_logged("bulk forget");
 }
 
+/// Run bulk forgets and queue a `Forget` frame for every store key they removed,
+/// all under one hold of the tenant's write gate, so no write to a removed memory lands
+/// between its delete and its frame's place in the log; the sync is waited for after
+/// the gate is released. A pass that fails stops the rest, and the removals made before
+/// it are still journaled: they are already gone from the store. Returns the count the
+/// passes reported.
+pub(crate) fn forget_bulk_journaled(
+    state: &super::state::MultiUserMemoryManager,
+    system: &memory::MemorySystem,
+    user_id: &str,
+    criteria: impl IntoIterator<Item = memory::ForgetCriteria>,
+) -> anyhow::Result<usize> {
+    let mut count = 0;
+    let mut failure = None;
+    let frames = {
+        let gate = system.journal_section();
+        let mut removed = Vec::new();
+        for criterion in criteria {
+            match system.forget_collecting_removed(criterion) {
+                Ok((n, ids)) => {
+                    count += n;
+                    removed.extend(ids);
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        let payloads: Vec<_> = removed
+            .into_iter()
+            .map(|id| crate::intent_log::IntentPayload::Forget {
+                user_id: user_id.to_string(),
+                memory_id: id.0.to_string(),
+                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+            })
+            .collect();
+        super::remember::enqueue_batch(state, user_id, &payloads, &gate)
+    };
+    frames.wait_logged("bulk forget");
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(count),
+    }
+}
+
 /// Hard-delete `id` and queue its `Forget` frame as one step under the tenant's
 /// write gate, so no write to the memory lands between the delete and the frame's
 /// place in the log; the sync is waited for after the gate is released. A journal
@@ -1073,29 +1119,8 @@ async fn forget_bulk_journaled_blocking(
     let state = state.clone();
     let user_id = user_id.to_string();
     run_blocking(move || {
-        let memory_guard = memory.read();
-        let mut total_count = 0;
-        let mut removed = Vec::new();
-        let mut failure = None;
-        for c in criteria {
-            match memory_guard.forget_collecting_removed(c) {
-                Ok((count, ids)) => {
-                    total_count += count;
-                    removed.extend(ids);
-                }
-                Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
-            }
-        }
-        if !removed.is_empty() {
-            journal_bulk_forget(&state, &memory_guard, &user_id, removed);
-        }
-        match failure {
-            Some(e) => Err(AppError::Internal(e)),
-            None => Ok(total_count),
-        }
+        forget_bulk_journaled(&state, &memory.read(), &user_id, criteria)
+            .map_err(AppError::Internal)
     })
     .await
 }
@@ -1828,9 +1853,19 @@ pub async fn move_memory_tier(
         .map_err(AppError::Internal)?;
 
     let mid = memory_id.clone();
+    let journal_state = state.clone();
+    let user_id = req.user_id.clone();
+    // The moved record's `Update` frame is queued under the write gate the move holds,
+    // so replay and replicas carry the tier; the sync is waited for after the gate.
     let previous_tier = tokio::task::spawn_blocking(move || {
-        let guard = memory_sys.read();
-        guard.move_to_tier(&mid, target_tier)
+        let mut frames = super::state::JournalPending::empty(&user_id);
+        let moved = memory_sys.read().move_to_tier_journaled(
+            &mid,
+            target_tier,
+            &mut super::remember::queue_frames(&journal_state, &user_id, &mut frames),
+        );
+        frames.wait_logged("tier move");
+        moved
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
