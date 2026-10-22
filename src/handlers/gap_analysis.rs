@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use super::state::MultiUserMemoryManager;
-use super::types::MemoryEvent;
+use super::types::{MemoryEvent, MemoryEventKind};
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::gap_topology::{GapDetectionConfig, GapDetectionResult, GapDetector};
 use crate::memory::mapper::{compute_mapper, MapperConfig, MapperFilter};
@@ -383,7 +383,7 @@ pub async fn analyze_gaps(
 
         let result = GapDetector::detect(store.as_ref(), &config)?;
         job_state.emit_event(MemoryEvent {
-            event_type: "gap_analysis_complete".to_string(),
+            event_type: MemoryEventKind::GapAnalysisComplete,
             timestamp: chrono::Utc::now(),
             user_id: user_id.clone(),
             memory_id: None,

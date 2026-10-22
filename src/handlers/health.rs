@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 use super::state::MultiUserMemoryManager;
-use super::types::{ContextStatus, MemoryEvent};
+use super::types::{ContextStatus, MemoryEvent, MemoryEventKind};
 use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
 use crate::errors::AppError;
@@ -519,7 +519,7 @@ pub async fn update_context_status(
     state.broadcast_context(status);
 
     state.emit_event(MemoryEvent {
-        event_type: "CONTEXT_UPDATE".to_string(),
+        event_type: MemoryEventKind::ContextUpdate,
         timestamp: chrono::Utc::now(),
         user_id: "system".to_string(),
         memory_id: Some(req.session_id),

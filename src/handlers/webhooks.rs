@@ -100,7 +100,9 @@ pub async fn memory_events_sse(
                         return None;
                     }
                     let json = serde_json::to_string(&event).ok()?;
-                    Some(Ok(Event::default().event(&event.event_type).data(json)))
+                    Some(Ok(Event::default()
+                        .event(event.event_type.as_str())
+                        .data(json)))
                 }
                 Err(_) => None,
             }

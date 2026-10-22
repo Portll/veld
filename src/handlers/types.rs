@@ -31,10 +31,86 @@ pub struct AuditEvent {
     pub details: String,
 }
 
+/// Declares an event-kind enum whose `as_str`, `Display` and serialized form are the given
+/// strings, so a kind reads on the wire exactly as the string literal it replaced.
+macro_rules! event_kind {
+    ($(#[$doc:meta])* $name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            /// Every kind, in declaration order.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text),+
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+    };
+}
+
+event_kind! {
+    /// What a [`MemoryEvent`] reports. It is the SSE event name and the `event_type` JSON
+    /// string, which the TUI and the monitor match on, so a string here never changes.
+    MemoryEventKind {
+        Create => "CREATE",
+        Update => "UPDATE",
+        Delete => "DELETE",
+        Retrieve => "RETRIEVE",
+        Migrate => "MIGRATE",
+        Anchor => "ANCHOR",
+        Unanchor => "UNANCHOR",
+        TierMove => "TIER_MOVE",
+        ProactiveContext => "PROACTIVE_CONTEXT",
+        FeedbackProcessed => "FEEDBACK_PROCESSED",
+        ContextUpdate => "CONTEXT_UPDATE",
+        CodebaseIndexed => "CODEBASE_INDEXED",
+        EntityDelete => "ENTITY_DELETE",
+        GraphClear => "GRAPH_CLEAR",
+        GraphRebuild => "GRAPH_REBUILD",
+        EdgeInvalidate => "EDGE_INVALIDATE",
+        GapAnalysisComplete => "gap_analysis_complete",
+        ReminderDue => "REMINDER_DUE",
+        TodoCreate => "TODO_CREATE",
+        TodoUpdate => "TODO_UPDATE",
+        TodoComplete => "TODO_COMPLETE",
+        TodoDelete => "TODO_DELETE",
+        TodoReorder => "TODO_REORDER",
+        TodoCommentAdd => "TODO_COMMENT_ADD",
+        TodoCommentDelete => "TODO_COMMENT_DELETE",
+        ProjectCreate => "PROJECT_CREATE",
+        ProjectUpdate => "PROJECT_UPDATE",
+        ProjectDelete => "PROJECT_DELETE",
+        DatasetCreated => "DATASET_CREATED",
+        DatasetDropped => "DATASET_DROPPED",
+        DatasetRowsInserted => "DATASET_ROWS_INSERTED",
+        DatasetRowLinked => "DATASET_ROW_LINKED",
+        MissionStart => "MISSION_START",
+        MissionEnd => "MISSION_END",
+    }
+}
+
 /// SSE Memory Event - lightweight event for real-time streaming
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryEvent {
-    pub event_type: String,
+    pub event_type: MemoryEventKind,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub user_id: String,
     pub memory_id: Option<String>,
@@ -1213,7 +1289,7 @@ mod tests {
     #[test]
     fn test_memory_event_serialize() {
         let event = MemoryEvent {
-            event_type: "created".to_string(),
+            event_type: MemoryEventKind::Create,
             timestamp: chrono::Utc::now(),
             user_id: "user-123".to_string(),
             memory_id: Some("mem-123".to_string()),
@@ -1225,7 +1301,29 @@ mod tests {
             results: None,
         };
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("created"));
+        assert!(json.starts_with(r#"{"event_type":"CREATE","#), "{json}");
+    }
+
+    #[test]
+    fn memory_event_kinds_read_as_their_strings() {
+        let mut seen = std::collections::HashSet::new();
+        for kind in MemoryEventKind::ALL {
+            assert!(
+                seen.insert(kind.as_str()),
+                "{} is declared twice",
+                kind.as_str()
+            );
+            assert_eq!(kind.to_string(), kind.as_str());
+            assert_eq!(
+                serde_json::to_string(kind).unwrap(),
+                format!("\"{}\"", kind.as_str())
+            );
+        }
+        assert_eq!(MemoryEventKind::Delete.as_str(), "DELETE");
+        assert_eq!(
+            MemoryEventKind::GapAnalysisComplete.as_str(),
+            "gap_analysis_complete"
+        );
     }
 
     #[test]
