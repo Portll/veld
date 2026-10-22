@@ -39,6 +39,24 @@ pub enum AlignedSide {
     Query,
 }
 
+/// Run `primary` on this thread and `secondary` on a scoped one, inside the caller's tracing
+/// span. The primary is usually a local model and the secondary an HTTP server, so neither
+/// need wait for the other. A panic on the secondary's thread is resumed here.
+fn beside_primary<P, S>(primary: impl FnOnce() -> P, secondary: impl FnOnce() -> S + Send) -> (P, S)
+where
+    S: Send,
+{
+    let span = tracing::Span::current();
+    std::thread::scope(|scope| {
+        let secondary = scope.spawn(move || span.in_scope(secondary));
+        let primary = primary();
+        let secondary = secondary
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (primary, secondary)
+    })
+}
+
 /// Dual-model competitive embedder.
 ///
 /// Wraps a primary embedder (always available, backward-compatible) and an optional
@@ -112,17 +130,19 @@ impl CompetitiveEmbedder {
     /// secondary result is returned as `None` (graceful degradation — the primary
     /// embedding is still valid).
     pub fn encode_dual(&self, text: &str) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
-        let primary_emb = self.primary.encode(text)?;
+        let Some(secondary) = &self.secondary else {
+            return Ok((self.primary.encode(text)?, None));
+        };
+        let (primary_emb, secondary_emb) =
+            beside_primary(|| self.primary.encode(text), || secondary.encode(text));
+        let primary_emb = primary_emb?;
 
-        let secondary_emb = match &self.secondary {
-            Some(embedder) => match embedder.encode(text) {
-                Ok(emb) => Some(emb),
-                Err(e) => {
-                    tracing::warn!("Secondary embedder failed (graceful degradation): {}", e);
-                    None
-                }
-            },
-            None => None,
+        let secondary_emb = match secondary_emb {
+            Ok(emb) => Some(emb),
+            Err(e) => {
+                tracing::warn!("Secondary embedder failed (graceful degradation): {}", e);
+                None
+            }
         };
 
         Ok((primary_emb, secondary_emb))
@@ -133,20 +153,24 @@ impl CompetitiveEmbedder {
     /// Returns parallel vectors: `(primary_embeddings, Option<secondary_embeddings>)`.
     /// If the secondary model fails mid-batch, the entire secondary result is `None`.
     pub fn encode_dual_batch(&self, texts: &[&str]) -> Result<DualEmbeddingBatch> {
-        let primary_batch = self.primary.encode_batch(texts)?;
+        let Some(secondary) = &self.secondary else {
+            return Ok((self.primary.encode_batch(texts)?, None));
+        };
+        let (primary_batch, secondary_batch) = beside_primary(
+            || self.primary.encode_batch(texts),
+            || secondary.encode_batch(texts),
+        );
+        let primary_batch = primary_batch?;
 
-        let secondary_batch = match &self.secondary {
-            Some(embedder) => match embedder.encode_batch(texts) {
-                Ok(batch) => Some(batch),
-                Err(e) => {
-                    tracing::warn!(
-                        "Secondary embedder batch failed (graceful degradation): {}",
-                        e
-                    );
-                    None
-                }
-            },
-            None => None,
+        let secondary_batch = match secondary_batch {
+            Ok(batch) => Some(batch),
+            Err(e) => {
+                tracing::warn!(
+                    "Secondary embedder batch failed (graceful degradation): {}",
+                    e
+                );
+                None
+            }
         };
 
         Ok((primary_batch, secondary_batch))
@@ -387,6 +411,83 @@ mod tests {
         fn dimension(&self) -> usize {
             768
         }
+    }
+
+    /// Returns only once the other half of its pair has started too, so a pair run one after
+    /// the other fails instead of passing slowly.
+    struct RendezvousEmbedder {
+        arrived: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+        dim: usize,
+    }
+
+    impl RendezvousEmbedder {
+        fn pair(
+            primary_dim: usize,
+            secondary_dim: usize,
+        ) -> (Arc<dyn Embedder>, Arc<dyn Embedder>) {
+            let arrived = Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
+            (
+                Arc::new(Self {
+                    arrived: arrived.clone(),
+                    dim: primary_dim,
+                }),
+                Arc::new(Self {
+                    arrived,
+                    dim: secondary_dim,
+                }),
+            )
+        }
+    }
+
+    impl Embedder for RendezvousEmbedder {
+        fn id(&self) -> &str {
+            "stub-rendezvous"
+        }
+        fn encode(&self, _text: &str) -> Result<Vec<f32>> {
+            let (count, both) = &*self.arrived;
+            let mut arrived = count.lock().unwrap();
+            *arrived += 1;
+            both.notify_all();
+            let (arrived, waited) = both
+                .wait_timeout_while(arrived, std::time::Duration::from_secs(10), |n| *n < 2)
+                .unwrap();
+            if waited.timed_out() && *arrived < 2 {
+                anyhow::bail!("the other embedder never started alongside");
+            }
+            Ok(vec![0.5; self.dim])
+        }
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+    }
+
+    #[test]
+    fn encode_dual_runs_both_models_at_once() {
+        let (primary, secondary) = RendezvousEmbedder::pair(4, 6);
+        let embedder = CompetitiveEmbedder::new(primary, Some(secondary));
+        let (p, s) = embedder.encode_dual("text").unwrap();
+        assert_eq!(p.len(), 4);
+        assert_eq!(s.map(|s| s.len()), Some(6));
+    }
+
+    #[test]
+    fn encode_dual_batch_runs_both_models_at_once() {
+        let (primary, secondary) = RendezvousEmbedder::pair(4, 6);
+        let embedder = CompetitiveEmbedder::new(primary, Some(secondary));
+        let (p, s) = embedder.encode_dual_batch(&["one"]).unwrap();
+        assert_eq!(p, vec![vec![0.5; 4]]);
+        assert_eq!(s, Some(vec![vec![0.5; 6]]));
+    }
+
+    #[test]
+    fn a_failing_secondary_leaves_the_primary_embedding() {
+        let embedder = CompetitiveEmbedder::new(
+            Arc::new(StubEmbedder::new(8)),
+            Some(Arc::new(FailingEmbedder)),
+        );
+        let (p, s) = embedder.encode_dual("text").unwrap();
+        assert_eq!(p.len(), 8);
+        assert!(s.is_none());
     }
 
     #[test]

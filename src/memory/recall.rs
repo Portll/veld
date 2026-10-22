@@ -1224,16 +1224,37 @@ impl super::MemorySystem {
 
         // PERFORMANCE: Use pre-computed embedding if caller provided one,
         // otherwise fall back to SHA256-keyed cache (80ms → <1μs for repeated queries)
-        let query_embedding =
+        let primary_embedding = || -> Result<Vec<f32>> {
             if let Some(pre) = query.query_embedding.as_ref().filter(|e| !e.is_empty()) {
                 EMBEDDING_CACHE_QUERY
                     .with_label_values(&["precomputed"])
                     .inc();
                 tracing::debug!("Query embedding PRECOMPUTED by caller — skipping encode");
-                pre.clone()
+                Ok(pre.clone())
             } else {
-                self.recall_query_embedding(query_text)?
+                self.recall_query_embedding(query_text)
+            }
+        };
+
+        // Secondary query embedding for dual-index competition (Nomic 768d), computed on a
+        // scoped thread beside the primary: one is usually a local model and the other an HTTP
+        // server, so neither need wait for the other.
+        let (query_embedding, query_embedding_secondary): (Result<Vec<f32>>, Option<Vec<f32>>) =
+            if self.embedder.has_secondary() {
+                let span = tracing::Span::current();
+                std::thread::scope(|scope| {
+                    let secondary = scope
+                        .spawn(|| span.in_scope(|| self.secondary_query_embedding(query_text)));
+                    let primary = primary_embedding();
+                    let secondary = secondary
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (primary, secondary)
+                })
+            } else {
+                (primary_embedding(), None)
             };
+        let query_embedding = query_embedding?;
         // The query-side embedding of `query_text` itself, which Layer 5.3's bi-encoder pass
         // scores against even after Layer 3.1 replaces `query_embedding` with a sub-query
         // average. A caller-supplied embedding is not taken to be it.
@@ -1243,13 +1264,6 @@ impl super::MemorySystem {
             .filter(|e| !e.is_empty())
             .is_none()
             .then(|| query_embedding.clone());
-
-        // Secondary query embedding for dual-index competition (Nomic 768d)
-        let query_embedding_secondary: Option<Vec<f32>> = if self.embedder.has_secondary() {
-            self.secondary_query_embedding(query_text)
-        } else {
-            None
-        };
 
         let t_embedding = recall_start.elapsed();
         observe_recall_stage(RecallStage::Embedding, t_embedding - t_query_analysis);
