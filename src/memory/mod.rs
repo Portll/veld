@@ -9420,10 +9420,13 @@ impl MemorySystem {
             }
         }
 
-        // Check for branch signal in memory content
         if lineage::LineageGraph::detect_branch_signal(&new_memory.experience.content) {
-            // Ensure main branch exists
-            self.lineage_graph.ensure_main_branch(user_id)?;
+            if let Some(anchor) =
+                self.lineage_graph
+                    .open_pivot_branch(user_id, new_memory, candidate_memories)?
+            {
+                inferred_edges.push(anchor);
+            }
         }
 
         Ok(inferred_edges)
