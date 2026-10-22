@@ -2,9 +2,7 @@
 //!
 //! A project-pivot signal must open a branch and anchor it into the edge graph with a
 //! `BranchedFrom` edge tagged by the new `branch_id`, so the branch is reachable through
-//! `trace()` and `find_root_cause()`. veld detects the signal in `infer_lineage_for_memory`
-//! and then only ensures the `main` branch exists, so no branch is opened and no edge names
-//! one.
+//! `trace()` and `find_root_cause()`.
 
 use chrono::{DateTime, Duration, Utc};
 use tempfile::TempDir;
@@ -48,7 +46,6 @@ fn mem(content: &str, created_at: DateTime<Utc>) -> Memory {
 }
 
 #[test]
-#[ignore = "veld bug: a pivot signal only ensures the main branch; no branch is opened and no BranchedFrom edge anchors it (src/memory/mod.rs infer_lineage_for_memory)"]
 fn pivot_signal_opens_branch_and_anchors_branchedfrom_edge() {
     let (system, _tmp) = create_test_system();
     let user = "branch-user";
@@ -92,6 +89,45 @@ fn pivot_signal_opens_branch_and_anchors_branchedfrom_edge() {
     assert!(stored
         .iter()
         .any(|e| e.relation == CausalRelation::BranchedFrom && e.branch_id.is_some()));
+}
+
+#[test]
+fn reinferring_a_pivot_reuses_its_branch_and_anchor() {
+    let (system, _tmp) = create_test_system();
+    let user = "reinfer-user";
+    let now = Utc::now();
+    let prior = mem(
+        "Working on the Vamana index integration for vector search.",
+        now - Duration::days(1),
+    );
+    let pivot = mem(
+        "We need to abandon this and pivot to a different strategy entirely.",
+        now,
+    );
+
+    for _ in 0..2 {
+        system
+            .infer_lineage_for_memory(user, &pivot, std::slice::from_ref(&prior))
+            .expect("infer lineage");
+    }
+
+    let branches = system
+        .lineage_graph()
+        .list_branches(user)
+        .expect("branches");
+    assert_eq!(
+        branches.iter().filter(|b| b.id != "main").count(),
+        1,
+        "one branch per pivot: {branches:?}"
+    );
+    let anchors = system
+        .lineage_graph()
+        .get_edges_from(user, &pivot.id)
+        .expect("edges from")
+        .into_iter()
+        .filter(|e| e.relation == CausalRelation::BranchedFrom)
+        .count();
+    assert_eq!(anchors, 1, "one anchor per pivot");
 }
 
 #[test]

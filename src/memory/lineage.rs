@@ -148,6 +148,12 @@ impl LineageEdge {
         }
     }
 
+    /// Put this edge on a lineage branch; `None` keeps it on `main`.
+    pub fn with_branch(mut self, branch_id: Option<String>) -> Self {
+        self.branch_id = branch_id;
+        self
+    }
+
     /// Confirm an inferred edge
     pub fn confirm(&mut self) {
         self.source = LineageSource::Confirmed;
@@ -500,6 +506,72 @@ impl LineageGraph {
             self.store_branch(user_id, &LineageBranch::main())?;
         }
         Ok(())
+    }
+
+    /// Open a branch off `main` at a pivot memory and anchor it into the edge graph with a
+    /// `BranchedFrom` edge from the pivot to the most recent earlier candidate, the work it
+    /// turned away from, tagged with the branch id. A branch that no edge names is
+    /// unreachable by [`trace`](Self::trace) and [`find_root_cause`](Self::find_root_cause).
+    ///
+    /// Inferring the same pivot again reuses its branch, and no anchor is added where an
+    /// edge from the pivot to that candidate already exists. Returns the anchor edge when
+    /// one is stored.
+    pub fn open_pivot_branch(
+        &self,
+        user_id: &str,
+        pivot: &Memory,
+        candidates: &[Memory],
+    ) -> Result<Option<LineageEdge>> {
+        self.ensure_main_branch(user_id)?;
+        let existing = self
+            .list_branches(user_id)?
+            .into_iter()
+            .find(|b| b.branch_point.as_ref() == Some(&pivot.id));
+        let branch = match existing {
+            Some(branch) => branch,
+            None => {
+                let preview: String = pivot.experience.content.chars().take(80).collect();
+                let branch = self.create_branch(
+                    user_id,
+                    &format!("pivot-{}", Utc::now().format("%Y%m%d-%H%M%S")),
+                    "main",
+                    pivot.id.clone(),
+                    Some(&format!("Auto-detected pivot: {preview}")),
+                )?;
+                tracing::info!(
+                    user_id = %user_id,
+                    branch = %branch.name,
+                    memory_id = %pivot.id.0,
+                    "Opened a lineage branch at a pivot"
+                );
+                branch
+            }
+        };
+
+        let Some(origin) = candidates
+            .iter()
+            .filter(|c| c.id != pivot.id && c.created_at <= pivot.created_at)
+            .max_by_key(|c| c.created_at)
+        else {
+            return Ok(None);
+        };
+        if self.edge_exists(user_id, &pivot.id, &origin.id)? {
+            return Ok(None);
+        }
+        let confidence = *self
+            .config
+            .relation_confidence
+            .get(&CausalRelation::BranchedFrom)
+            .unwrap_or(&0.9);
+        let edge = LineageEdge::inferred(
+            pivot.id.clone(),
+            origin.id.clone(),
+            CausalRelation::BranchedFrom,
+            confidence,
+        )
+        .with_branch(Some(branch.id));
+        self.store_edge(user_id, &edge)?;
+        Ok(Some(edge))
     }
 
     // =========================================================================
