@@ -1511,7 +1511,7 @@ impl MultiUserMemoryManager {
         // Acquire per-user creation lock to serialize initialization
         let lock = self
             .user_memory_init_locks
-            .entry(user_id.to_string())
+            .entry(crate::validation::user_lock_key(user_id))
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _guard = lock.lock();
@@ -1661,7 +1661,7 @@ impl MultiUserMemoryManager {
     #[cfg(test)]
     pub(crate) fn user_memory_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
         self.user_memory_init_locks
-            .entry(user_id.to_string())
+            .entry(crate::validation::user_lock_key(user_id))
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone()
     }
@@ -1671,7 +1671,7 @@ impl MultiUserMemoryManager {
     #[cfg(test)]
     pub(crate) fn user_graph_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
         self.user_graph_init_locks
-            .entry(user_id.to_string())
+            .entry(crate::validation::user_lock_key(user_id))
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone()
     }
@@ -1681,9 +1681,29 @@ impl MultiUserMemoryManager {
     #[cfg(test)]
     pub(crate) fn journaled_writer_init_lock(&self, user_id: &str) -> Arc<parking_lot::Mutex<()>> {
         self.journaled_writer_init_locks
-            .entry(user_id.to_string())
+            .entry(crate::validation::user_lock_key(user_id))
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone()
+    }
+
+    /// Prune the per-user locks of users not in `active_users`, so the maps do not grow
+    /// without bound, but only locks nobody holds or waits on: a tenant still opening is
+    /// not cached yet, and dropping its entry let a second caller create a fresh lock and
+    /// open the same store beside the first.
+    fn prune_user_locks(&self, active_users: &std::collections::HashSet<String>) {
+        let active_keys: std::collections::HashSet<String> = active_users
+            .iter()
+            .map(|id| crate::validation::user_lock_key(id))
+            .collect();
+        for locks in [
+            &self.user_memory_init_locks,
+            &self.user_graph_init_locks,
+            &self.journaled_writer_init_locks,
+        ] {
+            locks.retain(|key, lock| active_keys.contains(key) || init_lock_in_use(lock));
+        }
+        super::consolidation::prune_consolidation_locks();
+        super::facts::prune_fact_purge_locks();
     }
 
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
@@ -2064,7 +2084,7 @@ impl MultiUserMemoryManager {
         // to avoid deadlock when get_user_memory() calls get_user_graph())
         let lock = self
             .user_graph_init_locks
-            .entry(user_id.to_string())
+            .entry(crate::validation::user_lock_key(user_id))
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _guard = lock.lock();
@@ -2314,7 +2334,7 @@ impl MultiUserMemoryManager {
         // Slow path — single-flight init under a per-user lock.
         let init_lock = self
             .journaled_writer_init_locks
-            .entry(user_id.to_string())
+            .entry(crate::validation::user_lock_key(user_id))
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _guard = init_lock.lock();
@@ -3554,17 +3574,12 @@ impl MultiUserMemoryManager {
                 tracing::warn!("Periodic flush failed: {}", e);
             }
 
-            // Prune init locks: remove entries for users no longer in cache.
-            // This prevents unbounded growth of the DashMaps over time.
             let active_users: std::collections::HashSet<String> = self
                 .user_memories
                 .iter()
                 .map(|(id, _)| id.to_string())
                 .collect();
-            self.user_memory_init_locks
-                .retain(|user_id, _| active_users.contains(user_id));
-            self.user_graph_init_locks
-                .retain(|user_id, _| active_users.contains(user_id));
+            self.prune_user_locks(&active_users);
             // Prune SlowStore cache for evicted users to prevent unbounded DashMap growth.
             // Each SlowStore holds an open SQLite connection with 8MB page cache.
             let pre_slow = self.slow_stores.len();
@@ -4090,12 +4105,12 @@ impl MultiUserMemoryManager {
         // a store opened mid-restore reads the old or half-written files and stays cached.
         let memory_lock = self
             .user_memory_init_locks
-            .entry(user_id.to_string())
+            .entry(crate::validation::user_lock_key(user_id))
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let graph_lock = self
             .user_graph_init_locks
-            .entry(user_id.to_string())
+            .entry(crate::validation::user_lock_key(user_id))
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _memory_guard = memory_lock.lock();
@@ -5173,6 +5188,15 @@ impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
             .map(|m| m.id.0.to_string())
             .collect()
     }
+}
+
+/// Whether a per-user open lock is held or about to be. A caller clones the lock out of
+/// its map entry while the map's shard is locked and keeps the clone while it waits and
+/// while it holds the lock, so a lock only the map references (`strong_count == 1`) has
+/// no holder and no waiter, and none can appear while `retain` holds the shard. The
+/// `try_lock` checks the holder directly as well.
+fn init_lock_in_use(lock: &Arc<parking_lot::Mutex<()>>) -> bool {
+    Arc::strong_count(lock) > 1 || lock.try_lock().is_none()
 }
 
 /// Intent-log frames queued for a tenant's next group commit by
@@ -6625,5 +6649,67 @@ mod deferred_vamana_tests {
                 Some(id.0.to_string())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod user_lock_pruning_tests {
+    use super::*;
+
+    fn manager(root: &std::path::Path) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: root.to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(root.to_path_buf(), config).unwrap()
+    }
+
+    /// A tenant whose open is still running is not cached yet; its open lock must
+    /// survive a prune, or a second caller makes a new lock and opens the store twice.
+    /// A lock nobody holds is dropped.
+    #[test]
+    fn pruning_keeps_a_held_open_lock_and_drops_an_idle_one() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        let none_active = std::collections::HashSet::new();
+
+        let opening = manager.user_memory_init_lock("still-opening");
+        let _held = opening.lock();
+        manager.prune_user_locks(&none_active);
+        assert!(
+            Arc::ptr_eq(&opening, &manager.user_memory_init_lock("still-opening")),
+            "the held lock was pruned"
+        );
+
+        let idle = Arc::downgrade(&manager.journaled_writer_init_lock("gone-idle"));
+        manager.prune_user_locks(&none_active);
+        assert!(idle.upgrade().is_none(), "an idle lock was kept");
+    }
+
+    /// Ids that name one directory on a case-insensitive filesystem open under one lock.
+    #[test]
+    fn ids_differing_in_case_open_under_one_lock() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = manager(root.path());
+        assert!(Arc::ptr_eq(
+            &manager.user_memory_init_lock("Mixed.Case"),
+            &manager.user_memory_init_lock("mixed.case"),
+        ));
+    }
+
+    #[test]
+    fn consolidation_locks_are_pruned_only_when_idle() {
+        let held = super::super::consolidation::consolidation_lock("prune-held-consolidation");
+        let _guard = held.try_lock().unwrap();
+        let idle = Arc::downgrade(&super::super::consolidation::consolidation_lock(
+            "prune-idle-consolidation",
+        ));
+        super::super::consolidation::prune_consolidation_locks();
+        assert!(Arc::ptr_eq(
+            &held,
+            &super::super::consolidation::consolidation_lock("Prune-Held-Consolidation"),
+        ));
+        assert!(idle.upgrade().is_none());
     }
 }

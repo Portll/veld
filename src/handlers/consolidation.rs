@@ -151,11 +151,21 @@ static CONSOLIDATION_LOCKS: std::sync::LazyLock<
 /// `user_id`'s consolidation lock. Scheduled maintenance try-locks it as well: it runs
 /// the same maintenance and edge strengthening, and two passes at once for one user
 /// double-strengthen edges.
+/// Keyed by [`validation::user_lock_key`], so ids naming one directory share it.
 pub(crate) fn consolidation_lock(user_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     CONSOLIDATION_LOCKS
-        .entry(user_id.to_string())
+        .entry(validation::user_lock_key(user_id))
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// Drop the consolidation locks nobody holds or waits on, so the map does not keep an
+/// entry for every user since the process started. A holder or waiter keeps a clone of
+/// the lock it took out of the map under the shard lock `retain` holds, so a lock with
+/// no clone has neither, and the next caller simply makes a new one.
+pub(crate) fn prune_consolidation_locks() {
+    CONSOLIDATION_LOCKS
+        .retain(|_, lock| std::sync::Arc::strong_count(lock) > 1 || lock.try_lock().is_err());
 }
 
 // =============================================================================
