@@ -3012,7 +3012,13 @@ impl MultiUserMemoryManager {
                     "C2 reconcile: memory live in the intent log but missing from the store; restored from its logged snapshot",
                 );
             }
-            restored = user_mem.read().upsert_memories(&restore)?;
+            let guard = user_mem.read();
+            let _gate = guard.journal_section();
+            // The tenant is serving: a write that stored one of these ids since the scan
+            // journals its own frame after the logged snapshot, and restoring the snapshot
+            // over it would leave the store behind the log.
+            restore.retain(|memory| !matches!(guard.is_stored(&memory.id), Ok(true)));
+            restored = guard.upsert_memories(&restore)?;
         }
 
         if restored_from_backup {
@@ -3293,29 +3299,53 @@ impl MultiUserMemoryManager {
                 None
             };
 
+            // The records maintenance rewrote or deleted get their frames, so replay and
+            // replicas follow the store; queued under the write gate from a fresh read.
+            if let (Some(result), Ok(memory_lock)) =
+                (&maintenance_result, self.get_user_memory(&user_id))
+            {
+                super::remember::journal_maintenance(
+                    self,
+                    &memory_lock,
+                    &user_id,
+                    &result.rewritten,
+                    &result.removed,
+                );
+            }
+
             // Direction 1: Edge strengthening + promotion boost propagation
             if let Some(ref result) = maintenance_result {
                 if !result.edge_boosts.is_empty() {
                     if let Ok(graph) = self.get_user_graph(&user_id) {
-                        let graph_guard = graph.read();
-                        match graph_guard
-                            .strengthen_memory_edges(&result.edge_boosts, "maintenance:replay")
-                        {
+                        // The graph guard is released before the boosts are applied: they
+                        // take the write gate, which comes before the graph in lock order.
+                        let strengthened = graph
+                            .read()
+                            .strengthen_memory_edges(&result.edge_boosts, "maintenance:replay");
+                        match strengthened {
                             Ok((count, promotion_boosts)) => {
                                 edges_strengthened += count;
 
                                 // Direction 1: Apply edge promotion boosts to memory importance
                                 if !promotion_boosts.is_empty() {
                                     if let Ok(memory_lock) = self.get_user_memory(&user_id) {
-                                        let memory = memory_lock.read();
-                                        match memory.apply_edge_promotion_boosts(&promotion_boosts)
-                                        {
-                                            Ok(boosted) => {
+                                        let boosted = memory_lock
+                                            .read()
+                                            .apply_edge_promotion_boosts(&promotion_boosts);
+                                        match boosted {
+                                            Ok((boosted, rewritten)) => {
                                                 tracing::debug!(
                                                     user_id = %user_id,
                                                     boosted,
                                                     promotions = promotion_boosts.len(),
                                                     "Applied edge promotion boosts"
+                                                );
+                                                super::remember::journal_maintenance(
+                                                    self,
+                                                    &memory_lock,
+                                                    &user_id,
+                                                    &rewritten,
+                                                    &[],
                                                 );
                                             }
                                             Err(e) => {

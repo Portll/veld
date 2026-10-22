@@ -1525,6 +1525,113 @@ mod tests {
         assert_eq!(journaled, expected, "the page's frames, once each");
     }
 
+    /// A tier move and a reinforcement used to write the store and no frame, so a
+    /// follower kept the old tier and importance; both now journal an `Update` carrying
+    /// the stored record, and the follower ends where the leader's store is.
+    #[tokio::test]
+    async fn a_tier_move_and_a_reinforcement_reach_the_follower() {
+        use crate::handlers::test_helpers::{post_json, send, TestHarness};
+        use axum::http::StatusCode;
+
+        let leader = TestHarness::new();
+        let user = "tier-replica-user";
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/remember",
+                &serde_json::json!({
+                    "user_id": user,
+                    "content": "the north breakwater lamp is serviced each spring",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id_text = body["id"]
+            .as_str()
+            .expect("remember returns its id")
+            .to_string();
+
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/memory/tier",
+                &serde_json::json!({
+                    "user_id": user,
+                    "memory_id": id_text,
+                    "target_tier": "archive",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/reinforce",
+                &serde_json::json!({
+                    "user_id": user,
+                    "ids": [id_text],
+                    "outcome": "helpful",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Let the deferred embedding land and journal, so the log's last frame for the
+        // memory is final before it is read.
+        leader.state().task_tracker.close();
+        leader.state().task_tracker.wait().await;
+
+        let id = MemoryId(uuid::Uuid::parse_str(&id_text).unwrap());
+        let stored = leader
+            .state()
+            .get_user_memory(user)
+            .unwrap()
+            .read()
+            .get_memory(&id)
+            .unwrap();
+        assert_eq!(stored.tier, crate::memory::MemoryTier::Archive);
+
+        let frames: Vec<(u64, IntentPayload)> = {
+            let writer = leader.state().get_user_journaled_writer(user).unwrap();
+            let writer = writer.lock();
+            writer
+                .log()
+                .iter()
+                .unwrap()
+                .map(|record| {
+                    let (lsn, payload) = payload::decode_record(&record.unwrap()).unwrap();
+                    (lsn.0, payload)
+                })
+                .collect()
+        };
+        let (follower, _tmp) = TestHarness::fresh_manager();
+        let follower = Arc::new(follower);
+        {
+            let follower = Arc::clone(&follower);
+            tokio::task::spawn_blocking(move || apply_replicated_page(&follower, user, frames))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let replica = follower
+            .get_user_memory(user)
+            .unwrap()
+            .read()
+            .get_memory(&id)
+            .unwrap();
+        assert_eq!(
+            replica.tier, stored.tier,
+            "the tier move reached the follower"
+        );
+        assert_eq!(
+            replica.importance(),
+            stored.importance(),
+            "the reinforcement reached the follower"
+        );
+    }
+
     /// An update, a bulk forget and a batch remember on the leader reach a follower
     /// through the leader's log, with their ids: the paths that did not journal before.
     #[tokio::test]

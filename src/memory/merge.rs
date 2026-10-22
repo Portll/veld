@@ -334,9 +334,10 @@ pub fn replay_merge_audits(store: &dyn PrimaryMemoryStore, user_id: &str) -> Res
 }
 
 /// Reclaim every tombstone for `user_id` that has no inbound refs and is past
-/// the quiescence or force window.  Returns the number reclaimed; a tombstone
-/// whose reclaim fails stays for the next cycle.
-pub fn gc_merge_tombstones(store: &dyn PrimaryMemoryStore, user_id: &str) -> Result<usize> {
+/// the quiescence or force window.  Returns the ids of the loser memories it
+/// deleted, which the intent log has to learn about; a tombstone whose reclaim
+/// fails stays for the next cycle.
+pub fn gc_merge_tombstones(store: &dyn PrimaryMemoryStore, user_id: &str) -> Result<Vec<MemoryId>> {
     let now = Utc::now();
     let kv = store.default_key_value_store();
     let prefix = format!("{TOMBSTONE_PREFIX}{user_id}:");
@@ -365,11 +366,11 @@ pub fn gc_merge_tombstones(store: &dyn PrimaryMemoryStore, user_id: &str) -> Res
         }
     }
     if to_gc.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     let audits = load_audits(kv.as_ref(), user_id)?;
-    let mut reclaimed = 0;
+    let mut reclaimed = Vec::new();
     for ts in to_gc {
         if let Err(e) = store.delete(&ts.loser_id) {
             tracing::warn!(
@@ -379,6 +380,7 @@ pub fn gc_merge_tombstones(store: &dyn PrimaryMemoryStore, user_id: &str) -> Res
             );
             continue;
         }
+        reclaimed.push(ts.loser_id.clone());
         let mut keys = vec![tombstone_key(user_id, &ts.loser_id).into_bytes()];
         keys.extend(
             audits
@@ -393,7 +395,6 @@ pub fn gc_merge_tombstones(store: &dyn PrimaryMemoryStore, user_id: &str) -> Res
                     winner_id = %ts.winner_id.0,
                     "S-R6 GC: tombstone reclaimed"
                 );
-                reclaimed += 1;
             }
             Err(e) => tracing::warn!(
                 loser_id = %ts.loser_id.0,
@@ -718,14 +719,14 @@ mod tests {
             );
             assert_eq!(
                 gc_merge_tombstones(store.as_ref(), USER).unwrap(),
-                0,
+                Vec::<MemoryId>::new(),
                 "{backend:?}: memory and fact cite it"
             );
 
             store.delete(&holder).unwrap();
             assert_eq!(
                 gc_merge_tombstones(store.as_ref(), USER).unwrap(),
-                0,
+                Vec::<MemoryId>::new(),
                 "{backend:?}: the fact still cites it"
             );
 
@@ -738,8 +739,8 @@ mod tests {
             );
             assert_eq!(
                 gc_merge_tombstones(store.as_ref(), USER).unwrap(),
-                1,
-                "{backend:?}"
+                vec![loser.clone()],
+                "{backend:?}: the reclaimed loser is reported"
             );
 
             assert!(
@@ -770,7 +771,7 @@ mod tests {
             execute_merge(store.as_ref(), &loser, &winner, USER).unwrap();
             assert_eq!(
                 gc_merge_tombstones(store.as_ref(), USER).unwrap(),
-                0,
+                Vec::<MemoryId>::new(),
                 "{backend:?}"
             );
             assert!(store.get_memory(&loser).unwrap().is_some(), "{backend:?}");
@@ -813,7 +814,10 @@ mod tests {
 
             let store: Arc<dyn PrimaryMemoryStore> = Arc::clone(store);
             assert_eq!(store.run_merge_pass(USER, 10).unwrap(), 0, "{backend:?}");
-            assert_eq!(store.gc_merge_tombstones(USER).unwrap(), 0, "{backend:?}");
+            assert!(
+                store.gc_merge_tombstones(USER).unwrap().is_empty(),
+                "{backend:?}"
+            );
             assert!(store.get_memory(&a.id).unwrap().is_some());
             assert!(store.get_memory(&b.id).unwrap().is_some());
             assert!(resolve_loser(store.as_ref(), &a.id, USER)

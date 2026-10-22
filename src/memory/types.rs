@@ -5908,6 +5908,14 @@ pub struct MaintenanceResult {
     pub facts_extracted: usize,
     /// Number of existing facts reinforced (dedup hit) during consolidation
     pub facts_reinforced: usize,
+    /// Records the pass rewrote in the store (tier promotion, replay boosts, closed
+    /// reconsolidation windows, compression), each once. A journaled caller owes the
+    /// intent log an `Update` snapshot of each, or replay and replicas keep them as they
+    /// were.
+    pub rewritten: Vec<MemoryId>,
+    /// Records the pass deleted from the store (reclaimed merge tombstones). A journaled
+    /// caller owes each a `Forget` frame.
+    pub removed: Vec<MemoryId>,
 }
 
 /// Signal emitted when an edge tier promotion occurs during strengthen().

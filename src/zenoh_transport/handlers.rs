@@ -625,6 +625,7 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     tokio::spawn(async move {
         // The graph pass can open the tenant's graph and writes it, so it leaves the worker.
         let graph_pass = {
+            let state = state.clone();
             let user_id = user_id.clone();
             let experience = experience.clone();
             let memory_id = memory_id.clone();
@@ -647,9 +648,12 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
                 let parent = MemoryId(parent_uuid);
                 let mem = user_mem.clone();
                 let mid = memory_id.clone();
+                let state = state.clone();
+                let user_id = user_id.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let guard = mem.read();
-                    guard.set_memory_parent(&mid, Some(parent))
+                    crate::handlers::remember::set_parent_journaled(
+                        &state, &mem, &user_id, &mid, parent,
+                    )
                 })
                 .await;
             }

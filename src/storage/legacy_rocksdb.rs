@@ -437,7 +437,7 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
     fn run_merge_pass(&self, user_id: &str, limit: usize) -> Result<usize> {
         crate::memory::merge::run_merge_pass(self, user_id, limit)
     }
-    fn gc_merge_tombstones(&self, user_id: &str) -> Result<usize> {
+    fn gc_merge_tombstones(&self, user_id: &str) -> Result<Vec<MemoryId>> {
         crate::memory::merge::gc_merge_tombstones(self, user_id)
     }
     fn has_any_inbound_refs(&self, target: &MemoryId, user_id: &str) -> Result<bool> {

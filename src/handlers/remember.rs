@@ -223,6 +223,45 @@ pub(crate) fn journal_stored(
     pending.wait_logged("stored snapshot");
 }
 
+/// Set `memory_id`'s parent and journal the record it rewrote, read and queued under
+/// the write gate as [`journal_stored`] does. A failure is logged: the link is
+/// bookkeeping a later write can repeat. Blocking.
+pub(crate) fn set_parent_journaled(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    memory_id: &crate::memory::MemoryId,
+    parent_id: crate::memory::MemoryId,
+) {
+    let linked = memory.read().set_memory_parent(memory_id, Some(parent_id));
+    match linked {
+        Ok(()) => journal_stored(
+            state,
+            memory,
+            user_id,
+            std::slice::from_ref(memory_id),
+            SnapshotKind::Update,
+        ),
+        Err(e) => tracing::debug!(memory_id = %memory_id.0, "Parent link failed: {e}"),
+    }
+}
+
+/// Journal what a maintenance pass did to the store: an `Update` snapshot of each
+/// record it rewrote, read and queued under the write gate as [`journal_stored`] does,
+/// and a `Forget` for each record it deleted that the store still lacks. Blocking.
+pub(crate) fn journal_maintenance(
+    state: &super::state::MultiUserMemoryManager,
+    memory: &SharedUserMemory,
+    user_id: &str,
+    rewritten: &[crate::memory::MemoryId],
+    removed: &[crate::memory::MemoryId],
+) {
+    journal_stored(state, memory, user_id, rewritten, SnapshotKind::Update);
+    if !removed.is_empty() {
+        super::crud::journal_bulk_forget(state, &memory.read(), user_id, removed.iter().cloned());
+    }
+}
+
 /// Complete a journaled write's deferred embedding and journal a snapshot of
 /// each record the pass rewrote: the memory once its vectors landed (a replica
 /// gets them from that frame), a write-gate survivor, and memories interference
@@ -1459,9 +1498,10 @@ pub async fn remember(
                 if let Some(resolved) = resolved_parent {
                     let mem = memory.clone();
                     let mid = memory_id.clone();
+                    let state = state.clone();
+                    let user_id = user_id.clone();
                     if let Err(e) = tokio::task::spawn_blocking(move || {
-                        let guard = mem.read();
-                        guard.set_memory_parent(&mid, Some(resolved))
+                        set_parent_journaled(&state, &mem, &user_id, &mid, resolved)
                     })
                     .await
                     {
@@ -2190,9 +2230,10 @@ pub async fn batch_remember(
 
                         if let Some(resolved) = resolved_parent {
                             let mem = memory.clone();
+                            let state = state.clone();
+                            let user_id = user_id.clone();
                             if let Err(e) = tokio::task::spawn_blocking(move || {
-                                let guard = mem.read();
-                                guard.set_memory_parent(&mid, Some(resolved))
+                                set_parent_journaled(&state, &mem, &user_id, &mid, resolved)
                             })
                             .await
                             {

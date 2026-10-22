@@ -636,18 +636,38 @@ async fn sync_memory_back_links(
         .await
         .map_err(AppError::Internal)?;
     let todo_id = *todo_id;
+    let state = state.clone();
+    let user_id = user_id.to_string();
     tokio::task::spawn_blocking(move || {
-        let guard = memory_system.read();
-        for memory_id in remove {
-            if let Err(e) = guard.unlink_related_todo(&memory_id, &todo_id) {
-                tracing::warn!(memory_id = %memory_id.0, todo_id = %todo_id, "Failed to remove todo back-link: {e}");
+        let mut linked = Vec::with_capacity(add.len() + remove.len());
+        {
+            let guard = memory_system.read();
+            for memory_id in remove {
+                match guard.unlink_related_todo(&memory_id, &todo_id) {
+                    Ok(()) => linked.push(memory_id),
+                    Err(e) => {
+                        tracing::warn!(memory_id = %memory_id.0, todo_id = %todo_id, "Failed to remove todo back-link: {e}")
+                    }
+                }
+            }
+            for memory_id in add {
+                match guard.link_related_todo(&memory_id, todo_id) {
+                    Ok(()) => linked.push(memory_id),
+                    Err(e) => {
+                        tracing::warn!(memory_id = %memory_id.0, todo_id = %todo_id, "Failed to write todo back-link: {e}")
+                    }
+                }
             }
         }
-        for memory_id in add {
-            if let Err(e) = guard.link_related_todo(&memory_id, todo_id) {
-                tracing::warn!(memory_id = %memory_id.0, todo_id = %todo_id, "Failed to write todo back-link: {e}");
-            }
-        }
+        // The back-links are part of the memory record, so replay and replicas get them
+        // from `Update` frames read and queued under the write gate.
+        crate::handlers::remember::journal_stored(
+            &state,
+            &memory_system,
+            &user_id,
+            &linked,
+            crate::handlers::remember::SnapshotKind::Update,
+        );
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Back-link task panicked: {e}")))

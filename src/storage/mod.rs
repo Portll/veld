@@ -584,7 +584,7 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn migrate_legacy(&self) -> Result<(usize, usize, usize)>;
     /// Semantic merge (S-R6), one implementation for every engine in `memory::merge`.
     fn run_merge_pass(&self, user_id: &str, limit: usize) -> Result<usize>;
-    fn gc_merge_tombstones(&self, user_id: &str) -> Result<usize>;
+    fn gc_merge_tombstones(&self, user_id: &str) -> Result<Vec<MemoryId>>;
     /// Whether any memory or fact still cites `target`: the merge GC's guard.
     fn has_any_inbound_refs(&self, target: &MemoryId, user_id: &str) -> Result<bool>;
 
