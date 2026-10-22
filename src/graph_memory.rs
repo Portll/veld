@@ -2270,7 +2270,7 @@ impl GraphMemory {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        crate::storage::rocksdb_set_compression(&mut opts);
         opts.set_write_buffer_size(ROCKSDB_GRAPH_WRITE_BUFFER_BYTES);
         opts.set_max_write_buffer_number(2);
 
@@ -2294,6 +2294,14 @@ impl GraphMemory {
         base_block_opts.set_block_cache(cache);
         base_block_opts.set_cache_index_and_filter_blocks(true);
         opts.set_block_based_table_factory(&base_block_opts);
+        // Ten families with two memtables each would otherwise sit outside the process cap
+        // the memory stores share, uncounted against the block cache. A standalone graph's
+        // cache is its own, and the manager must not be charged to it.
+        if shared_cache.is_some() {
+            opts.set_write_buffer_manager(crate::memory::storage::shared_write_buffer_manager(
+                cache,
+            ));
+        }
 
         // Bloom-filtered options for frequently point-queried CFs.
         // 10 bits/key gives ~1% false positive rate, reducing disk reads
