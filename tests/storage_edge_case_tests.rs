@@ -283,18 +283,20 @@ fn test_geo_location_invalid_coordinates() {
     let config = create_test_config(&temp_dir);
     let system = MemorySystem::new(config, None).expect("Failed to create memory system");
 
-    // Invalid coordinates (should be clamped/handled)
+    // lat > 90 and lon > 180. remember validates neither, and geohash_encode saturates
+    // instead of panicking, so the write succeeds and the coordinates are kept as given.
     let exp = Experience {
         content: "Invalid geo location".to_string(),
         experience_type: ExperienceType::Observation,
-        geo_location: Some([100.0, 200.0, 0.0]), // Invalid: lat > 90, lon > 180
+        geo_location: Some([100.0, 200.0, 0.0]),
         ..Default::default()
     };
 
-    // Should either clamp or reject gracefully
-    let result = system.remember(exp, None);
-    // Either way, it shouldn't crash
-    assert!(result.is_ok() || result.is_err());
+    let id = system
+        .remember(exp, None)
+        .expect("out-of-range coordinates are stored, not refused");
+    let stored = system.get_memory(&id).expect("read back the stored memory");
+    assert_eq!(stored.experience.geo_location, Some([100.0, 200.0, 0.0]));
 }
 
 #[test]
@@ -418,10 +420,16 @@ fn test_sensor_data_special_floats() {
         ..Default::default()
     };
 
-    // Should handle NaN/Infinity gracefully
-    let result = system.remember(exp, None);
-    // May succeed or fail, but shouldn't panic
-    assert!(result.is_ok() || result.is_err());
+    // sensor_data is stored, never scored, and the record is bincode, which carries
+    // NaN and the infinities unchanged.
+    let id = system
+        .remember(exp, None)
+        .expect("non-finite sensor values are stored, not refused");
+    let stored = system.get_memory(&id).expect("read back the stored memory");
+    let sensors = &stored.experience.sensor_data;
+    assert_eq!(sensors.get("infinity"), Some(&f64::INFINITY));
+    assert_eq!(sensors.get("neg_infinity"), Some(&f64::NEG_INFINITY));
+    assert!(sensors.get("nan").is_some_and(|v| v.is_nan()));
 }
 
 // ============================================================================
