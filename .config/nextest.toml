@@ -1,0 +1,9 @@
+# cargo-nextest runs each test in its own process, across every test binary at once. CI ran the
+# 66 binaries one after another under `cargo test`, and five of them held two thirds of the
+# 23 minutes (2026-10-21).
+
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+# No test binary on CI ran longer than 306 s, so no single test did; fifteen minutes is a hang.
+slow-timeout = { period = "60s", terminate-after = 15 }
