@@ -255,6 +255,10 @@ const MAX_REPAIR_CONTENT_LEN: usize = 1_000_000;
 /// Memories read per batch when an open decodes the ones its vector index lacks.
 const OPEN_READ_BATCH: usize = 256;
 
+/// Default-keyspace row an open writes once it has stripped every redundant
+/// `compressed_data` blob it could ([`MemorySystem::strip_redundant_compression_blobs`]).
+const COMPRESSED_BLOB_STRIP_DONE_KEY: &[u8] = b"maintenance:compressed_blob_strip:v1";
+
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
@@ -738,6 +742,17 @@ fn bm25_text_differs(before: &Memory, after: &Memory) -> bool {
     before.experience.content != after.experience.content
         || before.experience.tags != after.experience.tags
         || before.experience.entities != after.experience.entities
+}
+
+/// What one pass of [`MemorySystem::strip_redundant_compression_blobs`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BlobStripReport {
+    /// Records whose blob was a copy of their experience, now removed.
+    stripped: usize,
+    /// Records whose blob holds something else, left as they were.
+    kept: usize,
+    /// Records that did not decode.
+    unreadable: usize,
 }
 
 /// The long-term store's population (records not forgotten) and their importance sum,
@@ -1457,6 +1472,21 @@ impl MemorySystem {
         )
         .context("Failed to initialize retrieval engine")?;
         crate::metrics::observe_tenant_open_stage("vector_index", stage);
+
+        let stage = std::time::Instant::now();
+        match Self::strip_redundant_compression_blobs(primary_store.as_ref()) {
+            Ok(Some(report)) => {
+                tracing::info!(
+                    stripped = report.stripped,
+                    kept = report.kept,
+                    unreadable = report.unreadable,
+                    "redundant compressed_data blobs stripped"
+                );
+                crate::metrics::observe_tenant_open_stage("compressed_blob_strip", stage);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("compressed_data blobs not stripped; the next open retries: {e:#}"),
+        }
 
         // The one full read of the store an open makes: it seeds the stored totals behind
         // stats() and sizes the check for memories the vector index lacks. It was made twice.
@@ -5689,6 +5719,66 @@ impl MemorySystem {
     /// thread; see [`write_gate`] for the ordering it gives the intent log.
     pub fn journal_section(&self) -> write_gate::WriteGuard<'_> {
         self.write_lock.hold()
+    }
+
+    /// Remove, once per store, the `compressed_data` blob that records compressed before
+    /// 0e79f6c3 carry beside the full experience: a base64 LZ4 copy of that experience,
+    /// embeddings included, roughly doubling each such record. A record loses its blob only
+    /// when the blob decodes to the experience it already holds
+    /// ([`compression::CompressionPipeline::without_redundant_blob`]), so a restore returns
+    /// the same memory before and after.
+    ///
+    /// Run at open, before the system is shared: no writer can come between a record being
+    /// read and its stripped copy replacing it. Not journaled: no memory's content, vectors,
+    /// tags or restore result changes, only the two metadata keys describing the copy, and
+    /// every replica runs the pass over its own store. Behind a done-marker in the default
+    /// keyspace, written only when every rewrite succeeded; a record that does not decode
+    /// is counted and left for `cleanup_corrupted`, as it would otherwise make every open
+    /// rescan the store. `None` when the marker says the pass already ran.
+    fn strip_redundant_compression_blobs(
+        store: &dyn crate::storage::PrimaryMemoryStore,
+    ) -> Result<Option<BlobStripReport>> {
+        let kv = store.default_key_value_store();
+        if kv.get_bytes(COMPRESSED_BLOB_STRIP_DONE_KEY)?.is_some() {
+            return Ok(None);
+        }
+        let mut report = BlobStripReport::default();
+        let mut rewrites_failed = false;
+        for batch in store.get_all_ids()?.chunks(OPEN_READ_BATCH) {
+            let mut stripped = Vec::new();
+            for (id, read) in batch.iter().zip(store.get_many(batch)) {
+                match read {
+                    Ok(memory) if memory.experience.metadata.contains_key("compressed_data") => {
+                        match compression::CompressionPipeline::without_redundant_blob(&memory) {
+                            Some(without) => stripped.push(without),
+                            None => report.kept += 1,
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        report.unreadable += 1;
+                        tracing::debug!(memory_id = %id.0, "not read for the blob strip: {e:#}");
+                    }
+                }
+            }
+            if stripped.is_empty() {
+                continue;
+            }
+            match store.update_many(&stripped) {
+                Ok(()) => report.stripped += stripped.len(),
+                Err(e) => {
+                    rewrites_failed = true;
+                    tracing::warn!(
+                        records = stripped.len(),
+                        "compressed_data blobs not stripped from a batch: {e:#}"
+                    );
+                }
+            }
+        }
+        if !rewrites_failed {
+            kv.put_bytes(COMPRESSED_BLOB_STRIP_DONE_KEY, b"1")?;
+        }
+        Ok(Some(report))
     }
 
     /// Live memories in `store` that `retriever`'s index does not hold. Ids are enumerated
@@ -10281,7 +10371,26 @@ mod vector_index_reopen_tests {
     /// The server's construction: the tenant's store and its BM25 handle supplied, no
     /// standalone backfill, and the backlog drained by the server's tick.
     fn open_tenant(path: &std::path::Path, backend: crate::config::StorageBackend) -> MemorySystem {
-        let primary: Arc<dyn crate::storage::PrimaryMemoryStore> = match backend {
+        let bm25 = Arc::new(
+            hybrid_search::BM25Index::new(&path.join(BM25_INDEX_DIR)).expect("bm25 index"),
+        );
+        MemorySystem::with_primary_store_and_bm25_index(
+            MemoryConfig {
+                storage_path: path.to_path_buf(),
+                ..Default::default()
+            },
+            primary_store(path, backend),
+            None,
+            bm25,
+        )
+        .expect("memory system")
+    }
+
+    fn primary_store(
+        path: &std::path::Path,
+        backend: crate::config::StorageBackend,
+    ) -> Arc<dyn crate::storage::PrimaryMemoryStore> {
+        match backend {
             #[cfg(feature = "rocksdb")]
             crate::config::StorageBackend::RocksDb => Arc::new(
                 crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::open(path, None)
@@ -10293,20 +10402,89 @@ mod vector_index_reopen_tests {
             ),
             #[allow(unreachable_patterns)]
             other => panic!("{other:?} is not in this build"),
-        };
-        let bm25 = Arc::new(
-            hybrid_search::BM25Index::new(&path.join(BM25_INDEX_DIR)).expect("bm25 index"),
-        );
-        MemorySystem::with_primary_store_and_bm25_index(
-            MemoryConfig {
-                storage_path: path.to_path_buf(),
+        }
+    }
+
+    /// A record as compression wrote it before 0e79f6c3: its experience and, in metadata, a
+    /// base64 LZ4 copy of that experience as it was when compressed.
+    fn legacy_compressed(content: &str, then: Option<&str>) -> Memory {
+        use base64::Engine as _;
+        let mut memory = Memory::new(
+            MemoryId(Uuid::new_v4()),
+            Experience {
+                content: content.to_string(),
+                embeddings: Some(vec![0.25; 8]),
                 ..Default::default()
             },
-            primary,
+            0.9,
             None,
-            bm25,
-        )
-        .expect("memory system")
+            None,
+            None,
+            None,
+        );
+        let encoded =
+            bincode::serde::encode_to_vec(&memory.experience, bincode::config::standard())
+                .expect("encode experience");
+        let blob = base64::engine::general_purpose::STANDARD
+            .encode(lz4::block::compress(&encoded, None, false).expect("lz4"));
+        memory.compressed = true;
+        let meta = &mut memory.experience.metadata;
+        meta.insert("compressed_data".to_string(), blob);
+        meta.insert("compression_ratio".to_string(), "0.4".to_string());
+        meta.insert("compression_strategy".to_string(), "lz4".to_string());
+        if let Some(edited) = then {
+            memory.experience.content = edited.to_string();
+        }
+        memory
+    }
+
+    /// The pass runs before the tenant is shared, strips only blobs that copy their record,
+    /// and is not repeated once its marker is down.
+    #[test]
+    fn an_open_strips_redundant_compression_blobs_once() {
+        for backend in engines() {
+            let tmp = TempDir::new().expect("temp dir");
+            let redundant = legacy_compressed("The tide tables were reprinted.", None);
+            let edited = legacy_compressed(
+                "The pier was closed for repairs.",
+                Some("The pier reopened in May."),
+            );
+            {
+                let store = primary_store(tmp.path(), backend);
+                store.store(&redundant).expect("store");
+                store.store(&edited).expect("store");
+            }
+
+            let has_blob = |sys: &MemorySystem, id: &MemoryId| {
+                sys.long_term_memory
+                    .get(id)
+                    .expect("stored")
+                    .experience
+                    .metadata
+                    .contains_key("compressed_data")
+            };
+            {
+                let sys = open_tenant(tmp.path(), backend);
+                assert!(!has_blob(&sys, &redundant.id), "{backend:?}");
+                assert!(has_blob(&sys, &edited.id), "{backend:?}: its blob is not a copy");
+                let stripped = sys.long_term_memory.get(&redundant.id).expect("stored");
+                assert_eq!(stripped.experience.content, redundant.experience.content);
+                assert_eq!(stripped.experience.embeddings, redundant.experience.embeddings);
+                assert!(sys
+                    .long_term_memory
+                    .default_key_value_store()
+                    .get_bytes(COMPRESSED_BLOB_STRIP_DONE_KEY)
+                    .expect("read marker")
+                    .is_some());
+            }
+
+            let late = legacy_compressed("The buoy light was relit.", None);
+            primary_store(tmp.path(), backend)
+                .store(&late)
+                .expect("store");
+            let sys = open_tenant(tmp.path(), backend);
+            assert!(has_blob(&sys, &late.id), "{backend:?}: the marker ends the pass");
+        }
     }
 
     fn engines() -> Vec<crate::config::StorageBackend> {
