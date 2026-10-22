@@ -41,8 +41,11 @@ pub struct CompressedMemory {
 }
 
 /// Metadata a restore from a `compressed_data` blob removes from what it returns.
-const BLOB_RESTORE_REMOVES: [&str; 3] =
-    ["compressed_data", "compression_ratio", "compression_strategy"];
+const BLOB_RESTORE_REMOVES: [&str; 3] = [
+    "compressed_data",
+    "compression_ratio",
+    "compression_strategy",
+];
 
 /// Compression pipeline for optimizing memory storage
 pub struct CompressionPipeline {
@@ -2139,7 +2142,10 @@ mod tests {
         let meta = &stripped.experience.metadata;
         assert!(!meta.contains_key("compressed_data"));
         assert!(!meta.contains_key("compression_ratio"));
-        assert_eq!(meta.get("compression_strategy").map(String::as_str), Some("lz4"));
+        assert_eq!(
+            meta.get("compression_strategy").map(String::as_str),
+            Some("lz4")
+        );
         assert!(stripped.compressed);
         assert_eq!(
             json(&pipeline.decompress(&stripped).unwrap()),
@@ -2189,10 +2195,10 @@ mod tests {
         assert!(CompressionPipeline::without_redundant_blob(&tagged).is_none());
 
         let mut corrupt = legacy_lz4_record(&original);
-        corrupt
-            .experience
-            .metadata
-            .insert("compressed_data".to_string(), "not base64 at all!".to_string());
+        corrupt.experience.metadata.insert(
+            "compressed_data".to_string(),
+            "not base64 at all!".to_string(),
+        );
         assert!(CompressionPipeline::without_redundant_blob(&corrupt).is_none());
 
         assert!(CompressionPipeline::without_redundant_blob(&original).is_none());

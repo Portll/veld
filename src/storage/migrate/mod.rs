@@ -1581,15 +1581,24 @@ fn apply(
             let (primary, graph): (Vec<_>, Vec<_>) =
                 data.into_iter().partition(|r| r.cf.starts_with("primary/"));
             if !primary.is_empty() {
-                apply_redb(&dir.join("storage.redb"), RedbFileRole::Memories, &primary, |cf| {
-                    split_keyspace(cf, "primary")
-                        .filter(|t| ["default", "kv", "memories", "vector_mappings"].contains(t))
-                })?;
+                apply_redb(
+                    &dir.join("storage.redb"),
+                    RedbFileRole::Memories,
+                    &primary,
+                    |cf| {
+                        split_keyspace(cf, "primary").filter(|t| {
+                            ["default", "kv", "memories", "vector_mappings"].contains(t)
+                        })
+                    },
+                )?;
             }
             if !graph.is_empty() {
-                apply_redb(&dir.join("graph/graph.redb"), RedbFileRole::Graph, &graph, |cf| {
-                    split_keyspace(cf, "graph")
-                })?;
+                apply_redb(
+                    &dir.join("graph/graph.redb"),
+                    RedbFileRole::Graph,
+                    &graph,
+                    |cf| split_keyspace(cf, "graph"),
+                )?;
             }
         }
         #[cfg(feature = "storage-redb")]
@@ -1597,14 +1606,20 @@ fn apply(
             let (audit, shared): (Vec<_>, Vec<_>) =
                 data.into_iter().partition(|r| r.cf.starts_with("audit/"));
             if !audit.is_empty() {
-                apply_redb(&base.join("audit.redb"), RedbFileRole::Auxiliary, &audit, |cf| {
-                    (cf == "audit/audit").then_some("audit")
-                })?;
+                apply_redb(
+                    &base.join("audit.redb"),
+                    RedbFileRole::Auxiliary,
+                    &audit,
+                    |cf| (cf == "audit/audit").then_some("audit"),
+                )?;
             }
             if !shared.is_empty() {
-                apply_redb(&base.join("shared.redb"), RedbFileRole::Shared, &shared, |cf| {
-                    split_keyspace(cf, "shared").filter(|t| *t != "audit")
-                })?;
+                apply_redb(
+                    &base.join("shared.redb"),
+                    RedbFileRole::Shared,
+                    &shared,
+                    |cf| split_keyspace(cf, "shared").filter(|t| *t != "audit"),
+                )?;
             }
         }
         #[cfg(not(feature = "storage-redb"))]

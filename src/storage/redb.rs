@@ -2380,7 +2380,8 @@ pub struct RedbGraphStore {
 impl RedbGraphStore {
     pub fn open(path: &Path) -> Result<Self> {
         let tuning = StorageTuning::process();
-        let database = create_redb_database(&path.join("graph.redb"), &tuning, RedbFileRole::Graph)?;
+        let database =
+            create_redb_database(&path.join("graph.redb"), &tuning, RedbFileRole::Graph)?;
         init_tables(
             &database,
             tuning.durability,

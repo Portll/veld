@@ -48,8 +48,7 @@ use veld::graph_memory::{
 };
 use veld::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION;
 use veld::intent_log::{
-    CheckpointStore, IntentLog, IntentPayload, JournaledWriter, Lsn, SharedJournal,
-    TypedProjection,
+    CheckpointStore, IntentLog, IntentPayload, JournaledWriter, Lsn, SharedJournal, TypedProjection,
 };
 use veld::memory::hybrid_search::BM25Index;
 use veld::memory::{Bm25Projection, Memory, MemoryConfig, MemorySystem, BM25_INDEX_DIR};
@@ -208,7 +207,11 @@ fn bench_vamana_insert(c: &mut Criterion, sizes: &[usize]) -> Result<()> {
             use_mmap: false,
             ..Default::default()
         })?;
-        index.build((0..size).map(|_| random_unit_vector(&mut rng, dimension)).collect())?;
+        index.build(
+            (0..size)
+                .map(|_| random_unit_vector(&mut rng, dimension))
+                .collect(),
+        )?;
         let pool: Vec<Vec<f32>> = (0..PAYLOAD_POOL)
             .map(|_| random_unit_vector(&mut rng, dimension))
             .collect();
@@ -402,8 +405,8 @@ fn bench_tenant_open(c: &mut Criterion, fixtures: &[TenantFixture]) {
                             let system = fixture
                                 .open_memory_system()
                                 .expect("MemorySystem construction failed");
-                            let graph = open_graph(fixture.engine, &graph_base)
-                                .expect("graph open failed");
+                            let graph =
+                                open_graph(fixture.engine, &graph_base).expect("graph open failed");
                             let elapsed = started.elapsed();
                             drop(graph);
                             drop(system);

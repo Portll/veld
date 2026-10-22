@@ -3035,7 +3035,10 @@ impl GraphMemory {
         let mut cache = Vec::with_capacity(ENTITY_EMBEDDING_CACHE_MAX.min(name_index.len()));
         let uuids: Vec<Uuid> = name_index.values().copied().collect();
         'batches: for batch in uuids.chunks(READ_BATCH) {
-            let keys: Vec<&[u8]> = batch.iter().map(|uuid| uuid.as_bytes().as_slice()).collect();
+            let keys: Vec<&[u8]> = batch
+                .iter()
+                .map(|uuid| uuid.as_bytes().as_slice())
+                .collect();
             let Ok(values) = store.multi_get_cf(CF_ENTITIES, &keys) else {
                 continue;
             };
@@ -7102,22 +7105,18 @@ impl GraphMemory {
         rows_before: usize,
         activations_before: u64,
     ) {
-        let _ = self.relationship_count.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| {
-                let moved = current as i64 - rows_before as i64;
-                Some((census.rows as i64 + moved).max(0) as usize)
-            },
-        );
-        let _ = self.total_activations.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| {
-                let moved = i128::from(current) - i128::from(activations_before);
-                Some((i128::from(census.total_activations) + moved).max(0) as u64)
-            },
-        );
+        let _ =
+            self.relationship_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    let moved = current as i64 - rows_before as i64;
+                    Some((census.rows as i64 + moved).max(0) as usize)
+                });
+        let _ =
+            self.total_activations
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    let moved = i128::from(current) - i128::from(activations_before);
+                    Some((i128::from(census.total_activations) + moved).max(0) as u64)
+                });
     }
 
     /// Flush pending maintenance from opportunistic pruning queues.
@@ -12587,7 +12586,9 @@ mod edge_index_tests {
                 let mut graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
                 let [a, b, c] = ["Aspen", "Birch", "Cedar"]
                     .map(|name| graph.add_entity(named_entity(name)).unwrap());
-                graph.add_episode(episode_over(Uuid::new_v4(), vec![a, b])).unwrap();
+                graph
+                    .add_episode(episode_over(Uuid::new_v4(), vec![a, b]))
+                    .unwrap();
                 graph
                     .add_relationships(vec![
                         typed_edge(a, b, RelationType::RelatedTo, 0.5),
@@ -12623,14 +12624,20 @@ mod edge_index_tests {
             let after_write = {
                 let graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
                 assert!(
-                    store.get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY).unwrap().is_some(),
+                    store
+                        .get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY)
+                        .unwrap()
+                        .is_some(),
                     "{backend:?}: an open leaves the row until something writes"
                 );
                 graph
                     .add_relationship(typed_edge(a, b, RelationType::RelatedTo, 0.5))
                     .unwrap();
                 assert!(
-                    store.get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY).unwrap().is_none(),
+                    store
+                        .get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY)
+                        .unwrap()
+                        .is_none(),
                     "{backend:?}: the write took the row with it"
                 );
                 counts(&graph)
@@ -12665,7 +12672,10 @@ mod edge_index_tests {
                 .unwrap();
             let graph = GraphMemory::with_store(Arc::clone(&store)).unwrap();
             assert!(
-                store.get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY).unwrap().is_none(),
+                store
+                    .get_cf(CF_EDGE_INDEX, COUNTER_SNAPSHOT_KEY)
+                    .unwrap()
+                    .is_none(),
                 "{backend:?}"
             );
             assert!(counts(&graph).0 >= 1, "{backend:?}");
@@ -12691,7 +12701,11 @@ mod edge_index_tests {
 
             graph.apply_decay().unwrap();
 
-            let activations = graph.get_relationship(&id).unwrap().unwrap().activation_count;
+            let activations = graph
+                .get_relationship(&id)
+                .unwrap()
+                .unwrap()
+                .activation_count;
             assert_eq!(counts(&graph).0, stored_rows, "{backend:?}");
             assert_eq!(counts(&graph).2, u64::from(activations), "{backend:?}");
         }

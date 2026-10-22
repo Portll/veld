@@ -1342,6 +1342,9 @@ pub fn print_env_help() {
         crate::constants::ROCKSDB_SHARED_CACHE_BYTES
     );
     println!("                                    or a standalone store's own (default: {DEFAULT_ROCKSDB_STANDALONE_BLOCK_CACHE_BYTES})");
+    println!("  VELD_VECTOR_INDEX_SAVE_CHANGES  - Index changes that make a vector index save due, at least (default: 1000;");
+    println!("                                    5% of the index's vectors when that is more)");
+    println!("  VELD_VECTOR_INDEX_SAVE_INTERVAL_SECS - Longest an index change waits for a save (default: 900)");
     println!();
     println!("  RUST_LOG               - Log level (e.g., info, debug, trace)");
     println!();

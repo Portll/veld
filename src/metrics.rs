@@ -569,13 +569,15 @@ pub fn observe_tenant_open_stage(stage: &str, started: std::time::Instant) {
 /// One BM25 (tantivy) commit, whichever path ran it: the projection's background committer,
 /// an inline commit, or a search that committed pending writes first.
 pub static BM25_COMMIT_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
-    Histogram::with_opts(HistogramOpts::new(
-        "veld_bm25_commit_duration_seconds",
-        "BM25 index commit duration",
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "veld_bm25_commit_duration_seconds",
+            "BM25 index commit duration",
+        )
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ]),
     )
-    .buckets(vec![
-        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-    ]))
     .expect("BM25_COMMIT_DURATION metric must be valid at compile time")
 });
 
