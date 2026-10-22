@@ -2056,6 +2056,19 @@ impl super::MemorySystem {
                 }
             }
 
+            // The top RRF score, the unit the boosts below are shares of. RRF scores sit near
+            // weight / (k + rank), about 0.02-0.04 at k = 20, so an absolute +0.10 outweighs
+            // every rank difference the fusion produced: on LoCoMo the entity-overlap and
+            // temporal-fact boosts took gold hit@10 from 0.72 to 0.45.
+            let fusion_scale = {
+                let top = fused.values().copied().fold(0.0_f32, f32::max);
+                if top > 0.0 {
+                    top
+                } else {
+                    hybrid_w / (k + 1.0)
+                }
+            };
+
             // ===========================================================================
             // LAYER 4.5: ATTRIBUTE QUERY BOOST
             // ===========================================================================
@@ -2086,17 +2099,22 @@ impl super::MemorySystem {
             // ===========================================================================
             // LAYER 4.55: TEMPORAL FACT BOOST
             // ===========================================================================
-            // Source memories of matching temporal facts get a precision-tuned boost.
-            // Fires for all temporal intents (including WhenQuestion) and broader
-            // temporal keywords to surface fact-sourced memories.
-            // Uses temporal_recall_boost (0.20) — calibrated to lift temporal-source
-            // memories by ~2 RRF positions without overriding strong semantic matches.
-            if !temporal_fact_boost_ids.is_empty() {
+            // Source memories of matching temporal facts gain `temporal_recall_boost` (0.20) of
+            // the top fused score. Fires for all temporal intents (including WhenQuestion) and
+            // broader temporal keywords. The entity-only fallback in Layer 0.6 can name fifty
+            // sources for one person, so the boost has to stay a nudge within the fusion's
+            // scale: as an absolute +0.20 those fifty outranked every semantic match and took
+            // LoCoMo temporal hit@10 from 0.89 to 0.35.
+            // [signal: temporal_fact_boost] Gated by disabled_signals dial; default = always on.
+            if !temporal_fact_boost_ids.is_empty()
+                && early_dials_snapshot.signal_enabled("temporal_fact_boost")
+            {
                 let temporal_recall_boost = self
                     .cognitive_dials
                     .read()
                     .temporal_recall_boost
-                    .unwrap_or(crate::constants::TEMPORAL_RECALL_BOOST);
+                    .unwrap_or(crate::constants::TEMPORAL_RECALL_BOOST)
+                    * fusion_scale;
                 let mut boosted_count = 0;
                 for id in &temporal_fact_boost_ids {
                     if let Some(score) = fused.get_mut(id) {
@@ -2167,7 +2185,9 @@ impl super::MemorySystem {
             // Porter stemming resolves morphological mismatches: "bugs"->"bug",
             // "risks"->"risk", "testing"->"test". Stop word filtering prevents
             // false positives from "the" matching inside "prometheus" etc.
-            // Linear 0.10 per match, capped at 0.40.
+            // A word match adds 0.10 of the top fused score, capped at 0.40 of it.
+            // [signal: entity_overlap] Gated by disabled_signals dial; default = always on.
+            let entity_overlap_on = early_dials_snapshot.signal_enabled("entity_overlap");
             {
                 use rust_stemmers::{Algorithm, Stemmer};
                 let stemmer = Stemmer::create(Algorithm::English);
@@ -2220,23 +2240,31 @@ impl super::MemorySystem {
                             // `repo:admin/serve.mjs`) is not a generic stem — it matches at a
                             // name boundary or not at all — so it keeps the undampened rate
                             // whether or not the query was decomposed.
+                            //
+                            // Word matches are shares of the top fused score: a person's name
+                            // matches most of a conversation, so an absolute +0.10 per word
+                            // re-sorted the whole candidate set by match count. An identifier
+                            // stays absolute because a name-boundary match on `serve.mjs` is
+                            // meant to outrank any fusion score.
                             let identifiers =
                                 matched.iter().filter(|qs| is_structured_token(qs)).count();
                             let words = overlap - identifiers;
                             let per_match = if decomposed { 0.04 } else { 0.10 };
                             let cap = if decomposed { 0.16 } else { 0.40 };
-                            let boost = ((per_match * words as f32).min(cap)
-                                + 0.10 * identifiers as f32)
-                                .min(0.40);
-                            if let Some(score) = fused.get_mut(id) {
-                                *score += boost;
+                            let boost = (per_match * words as f32).min(cap) * fusion_scale
+                                + (0.10 * identifiers as f32).min(0.40);
+                            if entity_overlap_on {
+                                if let Some(score) = fused.get_mut(id) {
+                                    *score += boost;
+                                }
                             }
                             // Signal attribution: mark entity overlap
                             attr.entry(id.clone()).or_default().entity_overlap = true;
                         } else if overlap == 0 && !has_any_temporal_intent {
                             // Content-fallback: when no entity/tag overlap, check
                             // if query stems appear in memory content. Smaller boost
-                            // (+0.05/match, cap 0.20) to keep below tag-match priority.
+                            // (0.05 of the top fused score per match, cap 0.20) to keep
+                            // below tag-match priority.
                             // Gated: skip for temporal queries where content overlap
                             // would boost wrong-session memories indiscriminately.
                             // [signal: content_fallback] Gated by disabled_signals dial; default = always on.
@@ -2248,7 +2276,8 @@ impl super::MemorySystem {
                                         .filter(|qs| content_lower.contains(qs.as_str()))
                                         .count();
                                     if content_overlap >= 2 {
-                                        let boost = (0.05 * content_overlap as f32).min(0.20);
+                                        let boost = (0.05 * content_overlap as f32).min(0.20)
+                                            * fusion_scale;
                                         if let Some(score) = fused.get_mut(id) {
                                             *score += boost;
                                         }
@@ -2300,7 +2329,8 @@ impl super::MemorySystem {
             // This is the key signal that differentiates "we decided to use Rust"
             // (specific, focused) from "things that didn't go well: Rust, MongoDB..."
             // (broad retrospective).
-            {
+            // [signal: length_penalty] Gated by disabled_signals dial; default = always on.
+            if early_dials_snapshot.signal_enabled("length_penalty") {
                 let mut lengths: Vec<(MemoryId, usize)> = Vec::new();
                 for id in fused.keys() {
                     if let Some(view) = candidates.get(id) {
@@ -2400,7 +2430,13 @@ impl super::MemorySystem {
             // against light pollution from old-but-topical memories.
             // Only the top TEMPORAL_DEDUP_MAX_CANDIDATES by fused score are compared: the pass
             // is all-pairs over the fused set, which runs to hundreds of candidates.
-            if has_any_temporal_intent || has_temporal_keywords {
+            // Recency intent only: "when did X happen" asks for the memory where it happened,
+            // which is usually the oldest on its topic. Firing on every temporal query took
+            // LoCoMo temporal hit@10 to zero.
+            // [signal: temporal_topic_dedup] Gated by disabled_signals dial; default = always on.
+            if query_parser::has_recency_intent(query_text)
+                && early_dials_snapshot.signal_enabled("temporal_topic_dedup")
+            {
                 let demoted = temporal_topic_dedup(
                     &mut fused,
                     &candidates,
@@ -6087,10 +6123,12 @@ impl<'s, S: CandidateSource + ?Sized> RecallCandidates<'s, S> {
 }
 
 /// Layer 4.54 (temporal topic dedup) over the `cap` highest fused scores: for each pair of
-/// those whose lowercase entity sets have Jaccard > 0.40, the older is demoted ×0.85.
+/// those whose lowercase entity sets have Jaccard > 0.40, the older is demoted ×0.85, once
+/// however many newer memories share its topic. Compounded per pair, the oldest memory on a
+/// busy topic fell by 0.85^n and left the top 50 entirely.
 /// Pairs are visited in content order: when two same-topic memories share a timestamp the
 /// second one visited is demoted, so the order must not come from the map's hash order.
-/// Returns the number of demotions.
+/// Returns the number of memories demoted.
 fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
     fused: &mut std::collections::HashMap<MemoryId, f32>,
     candidates: &RecallCandidates<'_, S>,
@@ -6118,7 +6156,7 @@ fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
         .map(|(_, _, view)| view.entities_lower.iter().map(String::as_str).collect())
         .collect();
 
-    let mut demoted = 0usize;
+    let mut older: HashSet<&MemoryId> = HashSet::new();
     for i in 0..entries.len() {
         for j in (i + 1)..entries.len() {
             let (set_a, set_b) = (&entity_sets[i], &entity_sets[j]);
@@ -6135,19 +6173,20 @@ fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
                     entries[i].2.memory.created_at,
                     entries[j].2.memory.created_at,
                 );
-                let older_id = if ts_a < ts_b {
+                older.insert(if ts_a < ts_b {
                     &entries[i].0
                 } else {
                     &entries[j].0
-                };
-                if let Some(score) = fused.get_mut(older_id) {
-                    *score *= 0.85;
-                    demoted += 1;
-                }
+                });
             }
         }
     }
-    demoted
+    for id in &older {
+        if let Some(score) = fused.get_mut(*id) {
+            *score *= 0.85;
+        }
+    }
+    older.len()
 }
 
 /// Query words resolved to graph entities for recall.
@@ -7238,19 +7277,18 @@ mod candidate_projection_tests {
 
         let demoted = temporal_topic_dedup(&mut fused, &candidates, 50);
         assert_eq!(
-            demoted,
-            50 * 49 / 2,
-            "every pair among the top 50 overlaps fully"
+            demoted, 49,
+            "every compared memory but the newest has a newer one on its topic"
         );
         for id in &by_rank[..10] {
             assert_eq!(fused[id], before[id], "below the cap, nothing is compared");
         }
-        // The newest of the compared set loses no pair; the oldest of it loses every one.
         let newest = &by_rank[59];
         assert_eq!(fused[newest], before[newest]);
-        let oldest_compared = &by_rank[10];
-        let expected = before[oldest_compared] * 0.85_f32.powi(49);
-        assert!((fused[oldest_compared] - expected).abs() < 1e-4);
+        // The oldest compared memory loses to 49 newer ones and is still demoted only once.
+        for id in &by_rank[10..59] {
+            assert!((fused[id] - before[id] * 0.85).abs() < 1e-4);
+        }
     }
 }
 
