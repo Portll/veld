@@ -68,7 +68,7 @@ impl VectorStore {
             ));
         }
         let start = map.as_ptr() as usize + offset;
-        if start % std::mem::align_of::<f32>() != 0 {
+        if !start.is_multiple_of(std::mem::align_of::<f32>()) {
             return Err(anyhow!(
                 "vector section at offset {offset} is not aligned for f32"
             ));
@@ -95,8 +95,10 @@ impl VectorStore {
         }
         let mut store = Self::new(dimension);
         store.tail = bytes
-            .chunks_exact(std::mem::size_of::<f32>())
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         store.tail_rows = rows;
         Ok(store)

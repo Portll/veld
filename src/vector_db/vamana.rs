@@ -422,8 +422,8 @@ impl VamanaIndex {
                 .chunks_exact_mut(self.config.dimension * std::mem::size_of::<f32>())
                 .zip(&vectors)
             {
-                for (bytes, value) in chunk.chunks_exact_mut(4).zip(vec) {
-                    bytes.copy_from_slice(&value.to_ne_bytes());
+                for (bytes, value) in chunk.as_chunks_mut::<4>().0.iter_mut().zip(vec) {
+                    *bytes = value.to_ne_bytes();
                 }
             }
 
