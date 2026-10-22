@@ -3,6 +3,11 @@
 //! Temporal knowledge graph for tracking entities, relationships, and episodic memories.
 //! Implements bi-temporal tracking and hybrid retrieval (semantic + graph traversal).
 
+mod change_log;
+mod mirror_feed;
+
+pub use change_log::{ChangeCursor, GraphChangeLog, GraphChanges, CHANGE_LOG_CAPACITY};
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "rocksdb")]
@@ -2211,6 +2216,9 @@ pub struct GraphMemory {
         std::collections::HashSet<Uuid>,
         std::collections::VecDeque<Uuid>,
     )>,
+
+    /// Uuids of the entity and relationship rows written through `store`.
+    change_log: Arc<GraphChangeLog>,
 }
 
 impl GraphMemory {
@@ -2402,6 +2410,10 @@ impl GraphMemory {
             Self::load_entity_embedding_cache(store.as_ref(), &entity_name_index);
         let embedding_cache_size = entity_embedding_cache.len();
 
+        let change_log = Arc::new(GraphChangeLog::default());
+        let store: Arc<dyn crate::storage::ColumnStore> = Arc::new(
+            change_log::JournaledColumnStore::new(store, Arc::clone(&change_log)),
+        );
         let graph = Self {
             store,
             db,
@@ -2423,6 +2435,7 @@ impl GraphMemory {
                 std::collections::HashSet::new(),
                 std::collections::VecDeque::new(),
             )),
+            change_log,
         };
 
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
