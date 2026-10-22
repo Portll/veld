@@ -1610,152 +1610,190 @@ impl super::MemorySystem {
         let abstract_decomposed =
             decomposed && query_parser::expand_abstract_terms_for_bm25(query_text).is_some();
 
-        let mut vector_results: Vec<(MemoryId, f32)> = if decomposed {
-            // --- Decomposed path: weighted RRF merge of sub-query vector results ---
-            use crate::constants::QUERY_DECOMPOSITION_SUB_WEIGHT;
-            let decomp_rrf_k: f32 = self.cognitive_dials.read().rrf_k_decomp.unwrap_or(20.0);
+        // Layer 4's BM25 leg reads only the query text and its term weights, nothing the vector
+        // search produces, so it runs on its own thread beside the vector search. Each leg is
+        // timed by itself for the stage histogram.
+        let bm25_query_text = query_parser::expand_abstract_terms_for_bm25(query_text);
+        let bm25_query_ref: &str = bm25_query_text.as_deref().unwrap_or(query_text);
+        let term_weights = if ic_weights.is_empty() {
+            None
+        } else {
+            Some(&ic_weights)
+        };
+        let phrases = if phrase_boosts.is_empty() {
+            None
+        } else {
+            Some(phrase_boosts.as_slice())
+        };
+        let recall_span = tracing::Span::current();
+        let hybrid_search = &self.hybrid_search;
+        let ((vector_leg, vector_elapsed), (bm25_leg, bm25_elapsed)) =
+            std::thread::scope(|scope| {
+                let bm25 = scope.spawn(|| {
+                    let _span = recall_span.enter();
+                    let started = std::time::Instant::now();
+                    let leg = hybrid_search.bm25_leg(bm25_query_ref, term_weights, phrases);
+                    (leg, started.elapsed())
+                });
+                let started = std::time::Instant::now();
+                let vector = (|| -> Result<Vec<(MemoryId, f32)>> {
+                    Ok(if decomposed {
+                        // --- Decomposed path: weighted RRF merge of sub-query vector results ---
+                        use crate::constants::QUERY_DECOMPOSITION_SUB_WEIGHT;
+                        let decomp_rrf_k: f32 =
+                            self.cognitive_dials.read().rrf_k_decomp.unwrap_or(20.0);
 
-            let mut merged: std::collections::HashMap<MemoryId, f32> =
-                std::collections::HashMap::new();
-            // First-appearance order over the sub-query lists, kept by the stable sort below
-            // for equal fused scores.
-            let mut first_seen: Vec<MemoryId> = Vec::new();
+                        let mut merged: std::collections::HashMap<MemoryId, f32> =
+                            std::collections::HashMap::new();
+                        // First-appearance order over the sub-query lists, kept by the stable sort below
+                        // for equal fused scores.
+                        let mut first_seen: Vec<MemoryId> = Vec::new();
 
-            for (idx, sub_q) in sub_queries.iter().enumerate() {
-                let is_original = idx == 0;
-                // For abstract decomposition, INVERT weights: sub-queries ("performance",
-                // "improvements") are more targeted than the vague original, so they should
-                // contribute more to RRF scoring. For conjunction/entity decomposition,
-                // the original compound query is more informative — keep default weights.
-                let weight = if abstract_decomposed {
-                    if is_original {
-                        QUERY_DECOMPOSITION_SUB_WEIGHT
-                    } else {
-                        1.0_f32
-                    }
-                } else if is_original {
-                    1.0_f32
-                } else {
-                    QUERY_DECOMPOSITION_SUB_WEIGHT
-                };
+                        for (idx, sub_q) in sub_queries.iter().enumerate() {
+                            let is_original = idx == 0;
+                            // For abstract decomposition, INVERT weights: sub-queries ("performance",
+                            // "improvements") are more targeted than the vague original, so they should
+                            // contribute more to RRF scoring. For conjunction/entity decomposition,
+                            // the original compound query is more informative — keep default weights.
+                            let weight = if abstract_decomposed {
+                                if is_original {
+                                    QUERY_DECOMPOSITION_SUB_WEIGHT
+                                } else {
+                                    1.0_f32
+                                }
+                            } else if is_original {
+                                1.0_f32
+                            } else {
+                                QUERY_DECOMPOSITION_SUB_WEIGHT
+                            };
 
-                // Embed sub-query (original already has embedding; sub-queries need encoding)
-                let sub_embedding = if is_original {
-                    query_embedding.clone()
-                } else {
-                    let sub_hash = Self::sha256_hash(sub_q);
-                    if let Some(cached) = self.query_cache.get(&sub_hash) {
-                        cached.clone()
-                    } else {
-                        match self.embedder.as_ref().encode_for_query(sub_q) {
-                            Ok(emb) => {
-                                self.query_cache.insert(sub_hash, emb.clone());
-                                emb
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Layer 3: Failed to embed sub-query '{}': {}",
-                                    sub_q,
-                                    e
-                                );
-                                continue;
+                            // Embed sub-query (original already has embedding; sub-queries need encoding)
+                            let sub_embedding = if is_original {
+                                query_embedding.clone()
+                            } else {
+                                let sub_hash = Self::sha256_hash(sub_q);
+                                if let Some(cached) = self.query_cache.get(&sub_hash) {
+                                    cached.clone()
+                                } else {
+                                    match self.embedder.as_ref().encode_for_query(sub_q) {
+                                        Ok(emb) => {
+                                            self.query_cache.insert(sub_hash, emb.clone());
+                                            emb
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Layer 3: Failed to embed sub-query '{}': {}",
+                                                sub_q,
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+
+                            let sub_vector_query = Query {
+                                user_id: query.user_id.clone(),
+                                query_text: None,
+                                query_embedding: Some(sub_embedding),
+                                layers: query.layers,
+                                ner_entities: query.ner_entities.clone(),
+                                evidence_source: query.evidence_source.clone(),
+                                time_range: query.time_range,
+                                as_of: query.as_of,
+                                experience_types: query.experience_types.clone(),
+                                importance_threshold: query.importance_threshold,
+                                max_results: query.max_results,
+                                retrieval_mode: query.retrieval_mode.clone(),
+                                robot_id: query.robot_id.clone(),
+                                mission_id: query.mission_id.clone(),
+                                geo_filter: query.geo_filter.clone(),
+                                action_type: query.action_type.clone(),
+                                reward_range: query.reward_range,
+                                outcome_type: query.outcome_type.clone(),
+                                failures_only: query.failures_only,
+                                anomalies_only: query.anomalies_only,
+                                severity: query.severity.clone(),
+                                tags: query.tags.clone(),
+                                repo: query.repo.clone(),
+                                pattern_id: query.pattern_id.clone(),
+                                terrain_type: query.terrain_type.clone(),
+                                confidence_range: query.confidence_range,
+                                offset: query.offset,
+                                episode_id: query.episode_id.clone(),
+                                prospective_signals: query.prospective_signals.clone(),
+                                recency_weight: query.recency_weight,
+                                competition_mode: query.competition_mode,
+                                rrf_k: query.rrf_k,
+                                rerank_count: query.rerank_count,
+                                dual_index: query.dual_index,
+                            };
+
+                            let sub_results = self
+                                .retriever
+                                .search_ids(&sub_vector_query, query.max_results * 8)?;
+
+                            let filtered: Vec<(MemoryId, f32)> =
+                                if let Some(ref c) = episode_candidates {
+                                    sub_results
+                                        .into_iter()
+                                        .filter(|(id, _)| c.contains(id))
+                                        .collect()
+                                } else {
+                                    sub_results
+                                };
+
+                            // Weighted RRF: score = weight / (K + rank)
+                            for (rank, (id, _sim)) in filtered.iter().enumerate() {
+                                let rrf_score = weight / (decomp_rrf_k + (rank + 1) as f32);
+                                let entry = merged.entry(id.clone()).or_insert_with(|| {
+                                    first_seen.push(id.clone());
+                                    0.0
+                                });
+                                *entry = entry.max(rrf_score).max(*entry);
+                                // Use max-merge: keep the highest RRF contribution per memory
+                                // to prevent score inflation from appearing in multiple sub-queries
+                                *entry = *entry + rrf_score - entry.min(rrf_score);
                             }
                         }
-                    }
-                };
 
-                let sub_vector_query = Query {
-                    user_id: query.user_id.clone(),
-                    query_text: None,
-                    query_embedding: Some(sub_embedding),
-                    layers: query.layers,
-                    ner_entities: query.ner_entities.clone(),
-                    evidence_source: query.evidence_source.clone(),
-                    time_range: query.time_range,
-                    as_of: query.as_of,
-                    experience_types: query.experience_types.clone(),
-                    importance_threshold: query.importance_threshold,
-                    max_results: query.max_results,
-                    retrieval_mode: query.retrieval_mode.clone(),
-                    robot_id: query.robot_id.clone(),
-                    mission_id: query.mission_id.clone(),
-                    geo_filter: query.geo_filter.clone(),
-                    action_type: query.action_type.clone(),
-                    reward_range: query.reward_range,
-                    outcome_type: query.outcome_type.clone(),
-                    failures_only: query.failures_only,
-                    anomalies_only: query.anomalies_only,
-                    severity: query.severity.clone(),
-                    tags: query.tags.clone(),
-                    repo: query.repo.clone(),
-                    pattern_id: query.pattern_id.clone(),
-                    terrain_type: query.terrain_type.clone(),
-                    confidence_range: query.confidence_range,
-                    offset: query.offset,
-                    episode_id: query.episode_id.clone(),
-                    prospective_signals: query.prospective_signals.clone(),
-                    recency_weight: query.recency_weight,
-                    competition_mode: query.competition_mode,
-                    rrf_k: query.rrf_k,
-                    rerank_count: query.rerank_count,
-                    dual_index: query.dual_index,
-                };
+                        // Sort by fused score and convert back to (MemoryId, f32)
+                        let mut fused_vec: Vec<(MemoryId, f32)> = first_seen
+                            .into_iter()
+                            .map(|id| {
+                                let score = merged[&id];
+                                (id, score)
+                            })
+                            .collect();
+                        fused_vec.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-                let sub_results = self
-                    .retriever
-                    .search_ids(&sub_vector_query, query.max_results * 8)?;
+                        tracing::info!(
+                            "Layer 3: Decomposed into {} sub-queries, merged {} unique candidates",
+                            sub_queries.len(),
+                            fused_vec.len()
+                        );
 
-                let filtered: Vec<(MemoryId, f32)> = if let Some(ref c) = episode_candidates {
-                    sub_results
-                        .into_iter()
-                        .filter(|(id, _)| c.contains(id))
-                        .collect()
-                } else {
-                    sub_results
-                };
-
-                // Weighted RRF: score = weight / (K + rank)
-                for (rank, (id, _sim)) in filtered.iter().enumerate() {
-                    let rrf_score = weight / (decomp_rrf_k + (rank + 1) as f32);
-                    let entry = merged.entry(id.clone()).or_insert_with(|| {
-                        first_seen.push(id.clone());
-                        0.0
-                    });
-                    *entry = entry.max(rrf_score).max(*entry);
-                    // Use max-merge: keep the highest RRF contribution per memory
-                    // to prevent score inflation from appearing in multiple sub-queries
-                    *entry = *entry + rrf_score - entry.min(rrf_score);
-                }
-            }
-
-            // Sort by fused score and convert back to (MemoryId, f32)
-            let mut fused_vec: Vec<(MemoryId, f32)> = first_seen
-                .into_iter()
-                .map(|id| {
-                    let score = merged[&id];
-                    (id, score)
-                })
-                .collect();
-            fused_vec.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-            tracing::info!(
-                "Layer 3: Decomposed into {} sub-queries, merged {} unique candidates",
-                sub_queries.len(),
-                fused_vec.len()
-            );
-
-            fused_vec
-        } else {
-            // --- Standard path: single vector search ---
-            let vr = self
-                .retriever
-                .search_ids(&vector_query, query.max_results * 8)?;
-            if let Some(ref c) = episode_candidates {
-                vr.into_iter().filter(|(id, _)| c.contains(id)).collect()
-            } else {
-                vr
-            }
-        };
+                        fused_vec
+                    } else {
+                        // --- Standard path: single vector search ---
+                        let vr = self
+                            .retriever
+                            .search_ids(&vector_query, query.max_results * 8)?;
+                        if let Some(ref c) = episode_candidates {
+                            vr.into_iter().filter(|(id, _)| c.contains(id)).collect()
+                        } else {
+                            vr
+                        }
+                    })
+                })();
+                let vector_elapsed = started.elapsed();
+                let bm25 = bm25
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                ((vector, vector_elapsed), bm25)
+            });
+        let mut vector_results = vector_leg?;
+        observe_recall_stage(RecallStage::Bm25, bm25_elapsed);
 
         crate::memory::gold_funnel::record_scored(
             "vector",
@@ -1763,9 +1801,10 @@ impl super::MemorySystem {
         );
 
         let t_vector = recall_start.elapsed();
-        observe_recall_stage(RecallStage::Vector, t_vector - t_graph);
+        observe_recall_stage(RecallStage::Vector, vector_elapsed);
         tracing::info!(
-            vector_ms = format!("{:.2}", (t_vector - t_graph).as_secs_f64() * 1000.0),
+            vector_ms = format!("{:.2}", vector_elapsed.as_secs_f64() * 1000.0),
+            bm25_ms = format!("{:.2}", bm25_elapsed.as_secs_f64() * 1000.0),
             cumulative_ms = format!("{:.2}", t_vector.as_secs_f64() * 1000.0),
             vector_results = vector_results.len(),
             decomposed = decomposed,
@@ -1983,17 +2022,6 @@ impl super::MemorySystem {
 
         let (memory_ids, hebbian_scores, mut signal_attributions): FusionLayerOutput = {
             let get_content = |id: &MemoryId| -> Option<String> { candidates.content(id) };
-            // Use IC-weighted BM25 search with phrase matching
-            let term_weights = if ic_weights.is_empty() {
-                None
-            } else {
-                Some(&ic_weights)
-            };
-            let phrases = if phrase_boosts.is_empty() {
-                None
-            } else {
-                Some(phrase_boosts.as_slice())
-            };
             // Use dynamic weight adjustment based on YAKE keyword discriminativeness
             // High discriminativeness → boost BM25 weight for rare keywords
             let disc_opt = if keyword_disc > 0.3 {
@@ -2011,27 +2039,19 @@ impl super::MemorySystem {
             let mut bm25_raw: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
 
-            // ---------------------------------------------------------------
-            // BM25 CONCEPT EXPANSION: Expand abstract/meta-reasoning query
-            // terms with concrete synonyms so BM25 can match memories that
-            // describe specific instances of abstract concepts.
-            // e.g., "patterns" → also search "decisions choices recurring"
-            // Expansion terms use low boost (^0.3) to act as tiebreakers.
-            // ---------------------------------------------------------------
-            let bm25_query_text = query_parser::expand_abstract_terms_for_bm25(query_text);
-            let bm25_query_ref: &str = bm25_query_text.as_deref().unwrap_or(query_text);
-
-            let hybrid_ids = self
-                .hybrid_search
-                .search_with_dynamic_weights(
-                    bm25_query_ref,
-                    vector_results.clone(),
-                    get_content,
-                    term_weights,
-                    phrases,
-                    disc_opt,
-                    query.rerank_count, // FIX-11: per-query rerank count override
-                )
+            // The BM25 leg searched beside Layer 3 (IC-weighted, phrase-matched, with abstract
+            // terms expanded to concrete synonyms at a low boost); fuse it with the vector list.
+            let hybrid_ids = bm25_leg
+                .and_then(|leg| {
+                    self.hybrid_search.fuse_with_bm25_leg(
+                        bm25_query_ref,
+                        leg,
+                        vector_results.clone(),
+                        get_content,
+                        disc_opt,
+                        query.rerank_count, // FIX-11: per-query rerank count override
+                    )
+                })
                 .map(|r| {
                     let bm25_max = crate::memory::hybrid_search::SignalScores::query_bm25_max(&r);
                     r.into_iter()

@@ -1351,6 +1351,13 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
+/// BM25 hits for one query, with the dials snapshot they were searched under, so fusing them
+/// reads the same snapshot.
+pub struct Bm25Leg {
+    results: Vec<(MemoryId, f32)>,
+    dial: Option<crate::memory::dials::CognitiveDials>,
+}
+
 /// Unified hybrid search engine
 ///
 /// Combines BM25 + Vector + RRF + Cross-encoder + Cognitive signals.
@@ -1840,6 +1847,27 @@ impl HybridSearchEngine {
     where
         F: Fn(&MemoryId) -> Option<String>,
     {
+        let leg = self.bm25_leg(query, term_weights, phrase_boosts)?;
+        self.fuse_with_bm25_leg(
+            query,
+            leg,
+            vector_results,
+            get_content,
+            keyword_discriminativeness,
+            rerank_count_override,
+        )
+    }
+
+    /// The lexical leg of [`Self::search_with_dynamic_weights`]: commit what a read must see,
+    /// then BM25 with IC term weights and phrase boosts, hits under the score floor dropped.
+    /// It reads nothing the vector leg produces, so a caller may run the two side by side and
+    /// hand both to [`Self::fuse_with_bm25_leg`].
+    pub fn bm25_leg(
+        &self,
+        query: &str,
+        term_weights: Option<&HashMap<String, f32>>,
+        phrase_boosts: Option<&[(String, f32)]>,
+    ) -> Result<Bm25Leg> {
         // Runtime dial overrides snapshotted once. `None` (no dials attached, or a
         // given override unset) => exact engine/learned-weight behavior (parity).
         let dial = self.dials.read().as_ref().map(|h| h.read().clone());
@@ -1865,16 +1893,35 @@ impl HybridSearchEngine {
         )?;
 
         // Filter low BM25 scores
-        let bm25_results: Vec<_> = bm25_results
+        let min_score = dial
+            .as_ref()
+            .and_then(|d| d.bm25_min_score)
+            .unwrap_or(self.config.min_bm25_score);
+        let results = bm25_results
             .into_iter()
-            .filter(|(_, score)| {
-                *score
-                    >= dial
-                        .as_ref()
-                        .and_then(|d| d.bm25_min_score)
-                        .unwrap_or(self.config.min_bm25_score)
-            })
+            .filter(|(_, score)| *score >= min_score)
             .collect();
+        Ok(Bm25Leg { results, dial })
+    }
+
+    /// Fuse a [`Self::bm25_leg`] with the vector leg: RRF under the leg's dials snapshot, then
+    /// the optional refiner pass. `query` is the text the leg searched.
+    pub fn fuse_with_bm25_leg<F>(
+        &self,
+        query: &str,
+        leg: Bm25Leg,
+        vector_results: Vec<(MemoryId, f32)>,
+        get_content: F,
+        keyword_discriminativeness: Option<f32>,
+        rerank_count_override: Option<usize>,
+    ) -> Result<Vec<HybridSearchResult>>
+    where
+        F: Fn(&MemoryId) -> Option<String>,
+    {
+        let Bm25Leg {
+            results: bm25_results,
+            dial,
+        } = leg;
 
         // Calculate dynamic weights based on keyword discriminativeness
         // When YAKE identifies discriminative keywords, trust BM25 more
