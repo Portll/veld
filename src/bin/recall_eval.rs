@@ -1299,9 +1299,24 @@ fn summarise_multihop(report: &MultiHopReport) {
 
 fn summarise(report: &Report) {
     eprintln!(
-        "recall-eval: suite={} cases={} repeats={} embedder={} sha={}",
-        report.suite, report.case_count, report.repeats, report.embedder, report.git_sha
+        "recall-eval: suite={} cases={} repeats={} embedder={} ingest={:?} sha={}",
+        report.suite,
+        report.case_count,
+        report.repeats,
+        report.embedder,
+        report.ingest,
+        report.git_sha
     );
+    for (bar, count) in &report.similarity_bars {
+        if count.evaluated > 0 {
+            eprintln!(
+                "  similarity bar {bar:<28} fired {:>7} of {:>8} ({:.4})",
+                count.fired,
+                count.evaluated,
+                count.fired as f64 / count.evaluated as f64
+            );
+        }
+    }
     match &report.rerank {
         Some(r) if r.enabled => eprintln!(
             "recall-eval: rerank=cross-encoder model={} cap={}",
