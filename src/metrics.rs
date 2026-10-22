@@ -364,6 +364,19 @@ pub static RECALL_DATE_WINDOW_CANDIDATES_TOTAL: LazyLock<IntCounter> = LazyLock:
     .expect("RECALL_DATE_WINDOW_CANDIDATES_TOTAL metric must be valid at compile time")
 });
 
+/// Usage writes a recall queued for the background writer and lost because its queue was
+/// full, by kind: `retrieval_count`, `coactivation`, `competition`.
+pub static USAGE_WRITES_DROPPED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_usage_writes_dropped_total",
+            "Recall usage writes dropped because the background writer's queue was full",
+        ),
+        &["kind"],
+    )
+    .expect("USAGE_WRITES_DROPPED_TOTAL metric must be valid at compile time")
+});
+
 /// Cross-encoder (query, document) pairs by where their score came from: `model` for a
 /// forward pass, `cache` for a repeat of a pair already scored by the same reranker.
 pub static CROSS_ENCODER_PAIRS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1175,6 +1188,7 @@ fn do_register_metrics() -> Result<(), MetricsError> {
         RECALL_DATE_WINDOW_CANDIDATES_TOTAL,
         "RECALL_DATE_WINDOW_CANDIDATES_TOTAL"
     );
+    register!(USAGE_WRITES_DROPPED_TOTAL, "USAGE_WRITES_DROPPED_TOTAL");
     register!(CROSS_ENCODER_PAIRS_TOTAL, "CROSS_ENCODER_PAIRS_TOTAL");
     register!(CROSS_ENCODER_SESSIONS, "CROSS_ENCODER_SESSIONS");
     register!(LTR_TRACE_LABEL_JOIN_MISS, "LTR_TRACE_LABEL_JOIN_MISS");
