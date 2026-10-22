@@ -192,6 +192,15 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub graph_episode_entities: Option<usize>,
 
+    /// Whether the calibrated-confidence gate and abstention, which semantic recall applies
+    /// at Layer 5 and after competition, also apply to the recall paths outside it:
+    /// spreading-activation recall and filter-only recall (the gate scales their order,
+    /// then abstention filters), and tag, date and advanced-search recall (abstention
+    /// only; they order by time or by the store, so the multiplier moves nothing).
+    /// `None` and `Some(false)` leave those paths ungated.
+    #[serde(default)]
+    pub confidence_gate_all_paths: Option<bool>,
+
     /// How long, in milliseconds, a write may sit buffered in the BM25 index before a recall
     /// commits it itself. `None` commits every buffered write before the search, so a memory
     /// is keyword-findable on the first recall after its write. `Some(ms)` leaves younger
@@ -670,6 +679,7 @@ impl Default for CognitiveDials {
             date_window_leg: None,
             relative_priors: None,
             graph_episode_entities: None,
+            confidence_gate_all_paths: None,
             bm25_read_staleness_ms: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
@@ -864,7 +874,7 @@ impl CognitiveDials {
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
     /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG,
-    /// GRAPH_EPISODE_ENTITIES,BM25_READ_STALENESS_MS}`.
+    /// GRAPH_EPISODE_ENTITIES,CONFIDENCE_GATE_ALL_PATHS,BM25_READ_STALENESS_MS}`.
     pub fn from_env() -> Self {
         // An empty value is unset: the recall workflow passes '' for a dispatch input left
         // blank, and reading that as `false` would record an override the run never made.
@@ -931,6 +941,9 @@ impl CognitiveDials {
         }
         if let Some(v) = env_parse::<usize>("VELD_DIALS_GRAPH_EPISODE_ENTITIES") {
             d.graph_episode_entities = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_CONFIDENCE_GATE_ALL_PATHS") {
+            d.confidence_gate_all_paths = Some(v);
         }
         if let Some(v) = env_parse::<u64>("VELD_DIALS_BM25_READ_STALENESS_MS") {
             d.bm25_read_staleness_ms = Some(v);
@@ -1020,6 +1033,7 @@ mod tests {
         assert!(d.date_window_leg.is_none());
         assert!(d.relative_priors.is_none());
         assert!(d.graph_episode_entities.is_none());
+        assert!(d.confidence_gate_all_paths.is_none());
         assert!(d.bm25_read_staleness_ms.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,

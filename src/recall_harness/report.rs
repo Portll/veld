@@ -299,6 +299,10 @@ pub struct RetrievalDials {
     /// entity's episodes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_episode_entities: Option<usize>,
+    /// The `confidence_gate_all_paths` dial: `None` is the engine default (the gate on
+    /// semantic recall only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_gate_all_paths: Option<bool>,
 }
 
 impl RetrievalDials {
@@ -308,6 +312,7 @@ impl RetrievalDials {
             date_window_leg: dials.date_window_leg,
             relative_priors: dials.relative_priors,
             graph_episode_entities: dials.graph_episode_entities,
+            confidence_gate_all_paths: dials.confidence_gate_all_paths,
         }
     }
 
@@ -321,6 +326,9 @@ impl RetrievalDials {
         }
         if let Some(v) = self.graph_episode_entities {
             set.push(format!("graph_episode_entities={v}"));
+        }
+        if let Some(v) = self.confidence_gate_all_paths {
+            set.push(format!("confidence_gate_all_paths={v}"));
         }
         if set.is_empty() {
             "engine defaults".to_string()
@@ -1904,6 +1912,37 @@ mod tests {
             failures[0].detail.contains("relative_priors=true"),
             "{}",
             failures[0].detail
+        );
+    }
+
+    /// The confidence gate on every path changes which memories the non-semantic paths
+    /// return, so a run with it is refused against a baseline without it.
+    #[test]
+    fn confidence_gate_all_paths_on_one_side_refuses_the_comparison() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+        baseline.retrieval_dials = Some(RetrievalDials::default());
+        current.retrieval_dials = Some(RetrievalDials {
+            confidence_gate_all_paths: Some(true),
+            ..Default::default()
+        });
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        assert!(
+            failures[0]
+                .detail
+                .contains("confidence_gate_all_paths=true"),
+            "{}",
+            failures[0].detail
+        );
+        let dials = crate::memory::dials::CognitiveDials {
+            confidence_gate_all_paths: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            RetrievalDials::of(&dials).confidence_gate_all_paths,
+            Some(true)
         );
     }
 

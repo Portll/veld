@@ -87,9 +87,11 @@ pub async fn advanced_search(
         memory::storage::SearchCriteria::Combined(criterias)
     };
 
-    let raw_memories = memory_guard
-        .advanced_search(criteria)
-        .map_err(AppError::Internal)?;
+    let raw_memories = memory_guard.apply_recall_gates(
+        memory_guard
+            .advanced_search(criteria)
+            .map_err(AppError::Internal)?,
+    );
 
     let count = raw_memories.len();
     let memories: Vec<serde_json::Value> = raw_memories

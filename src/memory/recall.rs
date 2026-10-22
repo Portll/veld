@@ -242,19 +242,22 @@ impl super::MemorySystem {
         // Related memories in hierarchy get a decayed score boost
         self.expand_with_hierarchy(query, &mut memories, &mut seen_ids);
 
-        // Rank by importance * temporal relevance
+        // Rank by importance * temporal relevance, scaled by the calibrated-confidence gate
+        // under the `confidence_gate_all_paths` dial.
         let now = super::scoring_now();
-        memories.sort_by(|a, b| {
-            let age_days_a = (now - a.created_at).num_days();
-            let temporal_a = Self::calculate_temporal_relevance(age_days_a);
-            let score_a = a.importance() * temporal_a;
-
-            let age_days_b = (now - b.created_at).num_days();
-            let temporal_b = Self::calculate_temporal_relevance(age_days_b);
-            let score_b = b.importance() * temporal_b;
-
-            score_b.total_cmp(&score_a)
-        });
+        let gate = self.recall_gate_for_unranked_paths();
+        let order_score = |m: &SharedMemory| -> f32 {
+            let temporal = Self::calculate_temporal_relevance((now - m.created_at).num_days());
+            let score = m.importance() * temporal;
+            match &gate {
+                Some(gate) if gate.scales_scores => score * confidence_gate_factor(m),
+                _ => score,
+            }
+        };
+        memories.sort_by(|a, b| order_score(b).total_cmp(&order_score(a)));
+        if let Some(gate) = &gate {
+            memories.retain(|m| passes_abstention(m, gate.threshold, None));
+        }
 
         // Filter temporally invalidated memories before competition logic.
         memories.retain(|m| !m.is_expired());
@@ -401,7 +404,7 @@ impl super::MemorySystem {
         authored_only: bool,
     ) -> Result<Vec<Memory>> {
         let criteria = storage::SearchCriteria::ByTags(tags.to_vec());
-        let mut memories = self.advanced_search(criteria)?;
+        let mut memories = self.apply_recall_gates(self.advanced_search(criteria)?);
         if authored_only {
             memories.retain(|memory| self.matches_an_authored_tag(memory, tags));
         }
@@ -449,12 +452,60 @@ impl super::MemorySystem {
         limit: usize,
     ) -> Result<Vec<Memory>> {
         let criteria = storage::SearchCriteria::ByDate { start, end };
-        let mut memories = self.advanced_search(criteria)?;
+        let mut memories = self.apply_recall_gates(self.advanced_search(criteria)?);
         memories.truncate(limit);
         if !super::recall_readonly() {
             self.submit_usage_write(super::usage_writes::UsageWrite::RetrievalCounted);
         }
         Ok(memories)
+    }
+
+    /// The abstention threshold: the drift-calibrated one once maintenance has set it
+    /// (APP-5), else `ABSTENTION_THRESHOLD`, halved for a query naming lexical identifiers
+    /// (APP-4), whose vector similarity runs low because identifiers are out of the
+    /// embedding model's vocabulary.
+    fn abstention_threshold(&self, query_text: Option<&str>) -> f32 {
+        let calibrated_bits = self
+            .calibrated_abstention_threshold
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let base_threshold = if calibrated_bits != 0 {
+            f32::from_bits(calibrated_bits)
+        } else {
+            crate::constants::ABSTENTION_THRESHOLD
+        };
+        if query_text.is_some_and(query_parser::has_lexical_identifiers) {
+            let relaxed = base_threshold * 0.5;
+            tracing::debug!(
+                "Abstention: relaxed threshold {base_threshold} -> {relaxed} (lexical query)"
+            );
+            relaxed
+        } else {
+            base_threshold
+        }
+    }
+
+    /// The gate a recall path outside semantic recall applies, or `None` when the
+    /// `confidence_gate_all_paths` dial leaves those paths as they were.
+    fn recall_gate_for_unranked_paths(&self) -> Option<UnrankedPathGate> {
+        let dials = self.cognitive_dials.read();
+        (dials.confidence_gate_all_paths == Some(true)).then(|| UnrankedPathGate {
+            scales_scores: dials.signal_enabled("confidence_gate"),
+            threshold: self.abstention_threshold(None),
+        })
+    }
+
+    /// Abstention for memories a filter returned (tag, date and advanced-search recall),
+    /// under the `confidence_gate_all_paths` dial; the memories as given without it. The
+    /// gate's score multiplier has nothing to act on here: these paths order by creation
+    /// time or by the store, never by score.
+    pub fn apply_recall_gates(&self, memories: Vec<Memory>) -> Vec<Memory> {
+        match self.recall_gate_for_unranked_paths() {
+            Some(gate) => memories
+                .into_iter()
+                .filter(|m| passes_abstention(m, gate.threshold, None))
+                .collect(),
+            None => memories,
+        }
     }
 
     /// The date window candidate leg: memories whose `created_at` falls in a calendar day
@@ -3326,14 +3377,7 @@ impl super::MemorySystem {
                 // BRIDGE-3: Calibrated confidence gate (Bayesian alpha/beta)
                 // [signal: confidence_gate] Gated by disabled_signals dial; default = always on.
                 let confidence_gate = if dials_snapshot.signal_enabled("confidence_gate") {
-                    let obs = mem.confidence_observations();
-                    let total_obs = (obs - 2.0).max(0.0);
-                    if total_obs >= 5.0 {
-                        let bayesian = mem.calibrated_confidence();
-                        0.85 + 0.15 * bayesian
-                    } else {
-                        1.0
-                    }
+                    confidence_gate_factor(mem)
                 } else {
                     1.0
                 };
@@ -4336,50 +4380,15 @@ impl super::MemorySystem {
         // APP-6: Graph-connected memory insurance — memories found via graph
         // traversal with strong activation bypass abstention entirely.
         {
-            // APP-5: Use drift-adaptive threshold if calibrated, else static constant.
-            let calibrated_bits = self
-                .calibrated_abstention_threshold
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let base_threshold = if calibrated_bits != 0 {
-                f32::from_bits(calibrated_bits)
-            } else {
-                crate::constants::ABSTENTION_THRESHOLD
-            };
-
-            // APP-4: Relax threshold for lexical/identifier queries.
-            // Attribute queries targeting specific identifiers (ticket IDs, version
-            // strings, error codes) produce lower vector similarity scores because
-            // identifiers are out-of-vocabulary for the embedding model.
-            let threshold = if query_parser::has_lexical_identifiers(query_text) {
-                let relaxed = base_threshold * 0.5;
-                tracing::debug!(
-                    "Abstention: relaxed threshold {base_threshold} -> {relaxed} (lexical query)"
-                );
-                relaxed
-            } else {
-                base_threshold
-            };
+            let threshold = self.abstention_threshold(Some(query_text));
 
             let before = memories.len();
             memories.retain(|m| {
-                // Only abstain when memory has ≥ 2 actual feedback events (beyond prior of 2.0)
-                if m.confidence_observations() <= 4.0 {
-                    return true;
-                }
-
-                // APP-6: Graph-connected memory insurance.
-                // If this memory was found via graph traversal with activation > 0.3,
-                // it has strong relational evidence for relevance. Graph connectivity
-                // provides an orthogonal retrieval signal that should not be vetoed
-                // by importance decay — otherwise the graph "knows" about a memory
-                // that retrieval refuses to surface.
-                if let Some(attr) = signal_attributions.get(&m.id) {
-                    if attr.graph_contribution > 0.3 {
-                        return true;
-                    }
-                }
-
-                m.importance() * m.calibrated_confidence() >= threshold
+                passes_abstention(
+                    m,
+                    threshold,
+                    signal_attributions.get(&m.id).map(|a| a.graph_contribution),
+                )
             });
             if memories.len() < before {
                 tracing::debug!(
@@ -5015,6 +5024,22 @@ impl super::MemorySystem {
             graph_time_us = retrieval_stats.graph_time_us,
             "recall [spreading_activation] complete"
         );
+
+        // Under the `confidence_gate_all_paths` dial the calibrated-confidence gate scales each
+        // activation (stable re-sort) and abstention filters, with the graph insurance every
+        // memory here qualifies for by its activation.
+        let mut activated_memories = activated_memories;
+        if let Some(gate) = self.recall_gate_for_unranked_paths() {
+            if gate.scales_scores {
+                let gated = |am: &crate::memory::graph_retrieval::ActivatedMemory| -> f32 {
+                    am.final_score * confidence_gate_factor(&am.memory)
+                };
+                activated_memories.sort_by(|a, b| gated(b).total_cmp(&gated(a)));
+            }
+            activated_memories.retain(|am| {
+                passes_abstention(&am.memory, gate.threshold, Some(am.activation_score))
+            });
+        }
 
         // Extract SharedMemory from ActivatedMemory, preserving score ordering. The graph walk
         // applies no query filter, so a caller filter is applied here; unfiltered recall is as
@@ -5873,6 +5898,44 @@ fn people_score(content: &str) -> f32 {
 /// `#123`, `snake_case`, `kebab-case` — and stripping it turned `harvest.mjs` into `harvestmjs`,
 /// which matches nothing.
 const QUERY_TOKEN_KEEP: &[char] = &['.', '/', '_', ':', '@', '#', '-'];
+
+/// Layer 5's calibrated-confidence gate (BRIDGE-3): once a memory has five feedback
+/// observations beyond its Beta prior, its score is scaled by `0.85 + 0.15 × calibrated
+/// confidence`; before that by 1.
+pub(crate) fn confidence_gate_factor(memory: &Memory) -> f32 {
+    let total_obs = (memory.confidence_observations() - 2.0).max(0.0);
+    if total_obs >= 5.0 {
+        0.85 + 0.15 * memory.calibrated_confidence()
+    } else {
+        1.0
+    }
+}
+
+/// Abstention: whether `memory` stays in a result at `threshold`. A memory with at most two
+/// feedback events beyond its prior stays, and so does one graph traversal reached with an
+/// activation above 0.3 (`graph_activation`, APP-6): the graph's evidence for it is not
+/// vetoed by importance decay. Otherwise importance × calibrated confidence must reach the
+/// threshold.
+pub(crate) fn passes_abstention(
+    memory: &Memory,
+    threshold: f32,
+    graph_activation: Option<f32>,
+) -> bool {
+    if memory.confidence_observations() <= 4.0 {
+        return true;
+    }
+    if graph_activation.is_some_and(|activation| activation > 0.3) {
+        return true;
+    }
+    memory.importance() * memory.calibrated_confidence() >= threshold
+}
+
+/// The gate a path outside semantic recall applies under `confidence_gate_all_paths`.
+struct UnrankedPathGate {
+    /// Whether the score multiplier runs (the `confidence_gate` signal is enabled).
+    scales_scores: bool,
+    threshold: f32,
+}
 
 /// Layer 5's combination of a candidate's fused base score with the sum of its priors.
 /// Additive by default. With `relative`, the base is first divided by the best base among
@@ -7928,5 +7991,95 @@ mod usage_write_tests {
         });
         sys.flush_usage_writes();
         assert_eq!(sys.stats().total_retrievals, before + 2);
+    }
+}
+
+#[cfg(test)]
+mod recall_gate_tests {
+    use super::{confidence_gate_factor, passes_abstention};
+    use crate::memory::dials::CognitiveDials;
+    use crate::memory::types::{Experience, Memory, MemoryId};
+    use crate::memory::{MemoryConfig, MemorySystem};
+
+    fn memory(content: &str, misleading: usize, helpful: usize) -> Memory {
+        let m = Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                content: content.to_string(),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        for _ in 0..misleading {
+            m.update_confidence(false);
+        }
+        for _ in 0..helpful {
+            m.update_confidence(true);
+        }
+        m
+    }
+
+    /// The gate leaves a memory with little feedback alone and scales one with five or
+    /// more observations by `0.85 + 0.15 × confidence`; abstention drops a well-observed
+    /// low-confidence memory unless the graph reached it strongly.
+    #[test]
+    fn the_gate_and_abstention_follow_the_feedback() {
+        let fresh = memory("no feedback yet", 0, 0);
+        assert_eq!(confidence_gate_factor(&fresh), 1.0);
+        assert!(passes_abstention(&fresh, 0.1, None));
+
+        let few = memory("four observations", 4, 0);
+        assert_eq!(confidence_gate_factor(&few), 1.0);
+
+        let distrusted = memory("eight misleading outcomes", 8, 0);
+        let confidence = distrusted.calibrated_confidence();
+        assert!((confidence_gate_factor(&distrusted) - (0.85 + 0.15 * confidence)).abs() < 1e-6);
+        assert!(confidence_gate_factor(&distrusted) < 1.0);
+        assert!(!passes_abstention(&distrusted, 0.1, None));
+        assert!(!passes_abstention(&distrusted, 0.1, Some(0.3)));
+        assert!(passes_abstention(&distrusted, 0.1, Some(0.31)));
+
+        let trusted = memory("eight helpful outcomes", 0, 8);
+        assert!(passes_abstention(&trusted, 0.1, None));
+    }
+
+    /// Filtered recall paths keep every memory with the dial unset, and drop the ones
+    /// abstention refuses with it on, in the order given.
+    #[test]
+    fn the_dial_puts_abstention_on_filtered_recall() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let sys = MemorySystem::new(
+            MemoryConfig {
+                storage_path: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("memory system");
+        let batch = || {
+            vec![
+                memory("trusted note", 0, 8),
+                memory("distrusted note", 8, 0),
+                memory("unobserved note", 0, 0),
+            ]
+        };
+        let contents = |memories: Vec<Memory>| -> Vec<String> {
+            memories.into_iter().map(|m| m.experience.content).collect()
+        };
+
+        assert_eq!(contents(sys.apply_recall_gates(batch())).len(), 3);
+
+        sys.set_cognitive_dials(CognitiveDials {
+            confidence_gate_all_paths: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            contents(sys.apply_recall_gates(batch())),
+            vec!["trusted note".to_string(), "unobserved note".to_string()]
+        );
     }
 }
