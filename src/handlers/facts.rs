@@ -388,6 +388,13 @@ static FACT_PURGE_LOCKS: std::sync::LazyLock<
     dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 
+/// Drop the purge locks nobody holds or waits on, as
+/// [`super::consolidation::prune_consolidation_locks`] does for its map.
+pub(crate) fn prune_fact_purge_locks() {
+    FACT_PURGE_LOCKS
+        .retain(|_, lock| std::sync::Arc::strong_count(lock) > 1 || lock.try_lock().is_err());
+}
+
 /// UUID v4 regex (8-4-4-4-12 hex). Compiled once. Used by the context-block
 /// DIRTY scan: any UUID-shape substring found inside a context block's
 /// content is a *candidate* fact reference; false positives are tolerated
@@ -468,7 +475,7 @@ pub async fn facts_purge(
     }
 
     let lock = FACT_PURGE_LOCKS
-        .entry(req.user_id.clone())
+        .entry(crate::validation::user_lock_key(&req.user_id))
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     let _guard = lock.lock().await;

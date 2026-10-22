@@ -164,6 +164,7 @@ anyhow = "1.0"
 libc = "0.2"
 async-trait = "0.1"  # Object-safe async trait sugar (W4 RelationalStore, W6 query planner, W7 DatasetStore)
 thiserror = "2.0"
+unicode-normalization = "0.1"  # Per-user lock keys: one key per directory on APFS
 dotenvy = "0.15"  # Load .env files
 toml = { version = "0.8", default-features = false, features = ["parse"] }  # Parse veld init's config.toml
 veld-status-core = { path = "status-core" }  # `veld restart`: the monitor's restart path, shared

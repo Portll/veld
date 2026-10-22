@@ -45,6 +45,24 @@ pub fn is_reserved_data_dir(name: &str) -> bool {
         .any(|dir| dir.eq_ignore_ascii_case(name))
 }
 
+/// The key a per-user lock is held under: the id in NFC, lowercased. Two ids that
+/// differ only in letter case or Unicode normalization name one directory on a case-
+/// and normalization-insensitive filesystem (APFS, the macOS default), so they have to
+/// share one lock, or two opens of that directory, or two writers to it, run at once.
+/// Only locks use this key: the directory, and every cache of an open store, keep the
+/// id as given, so a tenant created under a mixed-case id opens as before, and on a
+/// case-sensitive filesystem two such ids remain two tenants that merely share a lock.
+pub fn user_lock_key(user_id: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    // Lowercasing can leave a sequence that is not in NFC, hence the second pass.
+    user_id
+        .nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .nfc()
+        .collect()
+}
+
 /// Validate user_id
 pub fn validate_user_id(user_id: &str) -> Result<()> {
     if user_id.is_empty() {
@@ -355,6 +373,21 @@ pub fn validate_reminder_timestamp(at: &chrono::DateTime<chrono::Utc>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ids one case- and normalization-insensitive filesystem stores in one directory
+    /// share a lock key; ids that are different names do not.
+    #[test]
+    fn ids_naming_one_directory_share_a_lock_key() {
+        assert_eq!(user_lock_key("Alice"), user_lock_key("alice"));
+        assert_eq!(
+            user_lock_key("ALICE@Example.COM"),
+            user_lock_key("alice@example.com")
+        );
+        // "é" precomposed and as "e" plus a combining acute accent.
+        assert_eq!(user_lock_key("Ren\u{e9}"), user_lock_key("rene\u{301}"));
+        assert_ne!(user_lock_key("alice"), user_lock_key("alicia"));
+        assert_eq!(user_lock_key("bob-1"), "bob-1");
+    }
 
     #[test]
     fn test_valid_user_id() {

@@ -6646,6 +6646,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "unicode-normalization",
  "ureq",
  "uuid",
  "veld-status-core",
