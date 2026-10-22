@@ -669,12 +669,12 @@ pub struct RebuildIndexRequest {
     pub user_id: String,
 }
 
+/// Answer to `POST /api/index/rebuild` and `POST /api/index/reembed`, whose work runs in
+/// the background.
 #[derive(Serialize)]
-pub struct RebuildIndexResponse {
-    pub success: bool,
-    pub storage_count: usize,
-    pub indexed_count: usize,
-    pub is_healthy: bool,
+pub struct IndexJobResponse {
+    pub accepted: bool,
+    pub message: String,
 }
 
 // =============================================================================
