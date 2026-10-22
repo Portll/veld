@@ -101,7 +101,7 @@ A graph-based retrieval technique where similarity scores propagate along Hebbia
 An approximate nearest-neighbour index optimised for disk-resident data. Available in `src/vector_db/` alongside HNSW. Used for LongTerm-tier retrieval when the 768d Nomic secondary index is enabled.
 
 **Wavelet session**
-A session-segmentation technique (`src/memory/wavelet_sessions.rs`) that uses wavelet analysis over the timeline of memory access patterns to detect session boundaries automatically, without relying on explicit "session start/end" signals.
+Gap-based session segmentation (`src/memory/wavelet_sessions.rs`; the module name is legacy, there is no wavelet transform). Memories are split into sessions where the gap between consecutive creation times exceeds a threshold: a fixed 2 hours, or an adaptive one found at the largest relative jump between sorted gaps inside 5 minutes to 8 hours. Recall uses it to resolve ordinal references such as "the second meeting".
 
 **Bincode**
 A compact binary serialization format. Used for `IntentPayload` encoding in the intent log — chosen over JSON for size and parse speed.
