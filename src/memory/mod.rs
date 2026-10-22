@@ -10964,3 +10964,8 @@ mod lifecycle_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod gap_scale_bench;
+#[cfg(test)]
+mod gap_scale_tests;
