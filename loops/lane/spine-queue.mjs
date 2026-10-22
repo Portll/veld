@@ -32,7 +32,8 @@ export async function spineQueue({ path, spineRepo = PATHS.SPINE_REPO } = {}) {
     for (const job of jobs) {
       if (index.has(job.id) || stateOf(job.id).status !== 'pending') continue;
       const planId = planFor(job);
-      lane.ensurePlan(db, planId, `veld lane: ${job.track || 'pli'} reader jobs`, { project: 'veld' });
+      lane.ensurePlan(db, planId, `Lane: ${job.track || 'pli'} reader jobs`, { project: 'veld',
+        description: `Jobs for the ${job.track || 'pli'} reader in cobolwork, banked by the loop producers and run by their runners; each holds a host slot, and its status here mirrors the runner's.` });
       const id = lane.bankJob(db, planId, { key: job.id, family: `veld-${job.type || 'draft'}`, title: job.title || job.id, route: 'veld', priority: job.priority || 0, round: job.round || 0 });
       if (id) { index.set(job.id, { planId, id, status: 'pending' }); filed++; }
     }
