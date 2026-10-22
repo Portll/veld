@@ -69,6 +69,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::metrics::{EMBEDDING_CACHE_CONTENT, EMBEDDING_CACHE_CONTENT_SIZE};
+use crate::similarity::bars::{SimilarityBar, WritePath};
 
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
@@ -2326,6 +2327,7 @@ impl MemorySystem {
                                     importance,
                                     memory.created_at,
                                     &similar_memories,
+                                    WritePath::Synchronous,
                                 );
 
                             // Apply retroactive interference (weaken old memories)
@@ -2893,8 +2895,10 @@ impl MemorySystem {
                                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                             })
                         {
-                            let survivor = (*best_sim
-                                >= crate::constants::WRITE_GATE_ABSORPTION_THRESHOLD)
+                            let candidate = SimilarityBar::WriteGateCandidate.record(
+                                *best_sim >= crate::constants::WRITE_GATE_ABSORPTION_THRESHOLD,
+                            );
+                            let survivor = candidate
                                 .then(|| uuid::Uuid::parse_str(best_id).ok())
                                 .flatten()
                                 .and_then(|id| self.long_term_memory.get(&MemoryId(id)).ok())
@@ -2905,6 +2909,9 @@ impl MemorySystem {
                                             &existing.experience.content,
                                         )
                                 });
+                            if candidate {
+                                SimilarityBar::WriteGateAbsorbed.record(survivor.is_some());
+                            }
                             if let Some(survivor) = survivor {
                                 outcome.note_rewritten(memory_id);
                                 outcome.note_rewritten(&survivor.id);
@@ -2931,6 +2938,7 @@ impl MemorySystem {
                                 importance,
                                 memory_arc.created_at,
                                 &similar_memories,
+                                WritePath::Deferred,
                             );
 
                         for (old_id, _similarity, decay_amount) in

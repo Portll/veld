@@ -39,6 +39,7 @@ use crate::graph_memory::{
     EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
     LtpStatus, RelationType, RelationshipEdge,
 };
+use crate::memory::tag_sources::{TagSource, TagSources};
 use crate::memory::{
     query_parser, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats,
     ProspectiveStore, SessionStore, TodoStore,
@@ -4235,17 +4236,19 @@ impl MultiUserMemoryManager {
         experience: &Experience,
         memory_id: &MemoryId,
     ) -> Result<()> {
-        self.rebuild_experience_graph_declared(user_id, experience, memory_id, &[])
+        self.rebuild_experience_graph_declared(user_id, experience, memory_id, &[], None)
     }
 
     /// [`rebuild_experience_graph`](Self::rebuild_experience_graph) with the writer's declared
-    /// entities, as [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared).
+    /// entities and tag provenance, as
+    /// [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared).
     pub fn rebuild_experience_graph_declared(
         &self,
         user_id: &str,
         experience: &Experience,
         memory_id: &MemoryId,
         declared: &[DeclaredEntity],
+        tag_sources: Option<&TagSources>,
     ) -> Result<()> {
         if let Ok(graph) = self.get_user_graph(user_id) {
             match graph.read().delete_episode(&memory_id.0) {
@@ -4261,7 +4264,13 @@ impl MultiUserMemoryManager {
                 ),
             }
         }
-        self.process_experience_into_graph_declared(user_id, experience, memory_id, declared)
+        self.process_experience_into_graph_declared(
+            user_id,
+            experience,
+            memory_id,
+            declared,
+            tag_sources,
+        )
     }
 
     /// Process an experience and extract entities/relationships into the graph
@@ -4278,7 +4287,7 @@ impl MultiUserMemoryManager {
         experience: &Experience,
         memory_id: &MemoryId,
     ) -> Result<()> {
-        self.process_experience_into_graph_declared(user_id, experience, memory_id, &[])
+        self.process_experience_into_graph_declared(user_id, experience, memory_id, &[], None)
     }
 
     /// [`process_experience_into_graph`](Self::process_experience_into_graph) plus the entities
@@ -4295,12 +4304,19 @@ impl MultiUserMemoryManager {
     /// Derived entities pass a stop list of words measured as hubs on a code-heavy store, and a
     /// derived entity already at `MAX_ENTITY_DEGREE` gets no new edges from this memory: at the
     /// cap, every new edge only bought a prune of an older one.
+    ///
+    /// `tag_sources` is the ledger row for the stored tags (see `crate::memory::tag_sources`).
+    /// With it, a causal edge forms only between names the writer or NER named: a caller tag, a
+    /// declared entity or an NER span. A YAKE or cold-start keyword, an ingest hint, a verb or a
+    /// regex term keeps `RelatedTo`. Without it, as on a path that records no provenance, any
+    /// name may take one.
     pub fn process_experience_into_graph_declared(
         &self,
         user_id: &str,
         experience: &Experience,
         memory_id: &MemoryId,
         declared: &[DeclaredEntity],
+        tag_sources: Option<&TagSources>,
     ) -> Result<()> {
         let graph = self.get_user_graph(user_id)?;
 
@@ -4327,6 +4343,11 @@ impl MultiUserMemoryManager {
         // A name the writer declared is the declared entity, not also a derived one.
         let declared_names: std::collections::HashSet<String> =
             declared.iter().map(|d| d.name.to_lowercase()).collect();
+
+        // The middle branch below reads `experience.entities`, which lists every tag, derived
+        // keywords included, so only the other two branches hold names NER produced.
+        let extracted_by_ner =
+            !experience.ner_entities.is_empty() || experience.entities.is_empty();
 
         // Use pre-extracted NER records for proper entity labels when available
         // This avoids redundant NER inference — the handler already ran NER in Pass 1
@@ -4383,6 +4404,30 @@ impl MultiUserMemoryManager {
                 }
             }
         };
+
+        // A keyword names no participant. In "A set B in motion." the keyword "set" sits between
+        // the two event names, so A -> set -> B would be typed causal in every chain that uses
+        // the phrase, and one entity would join them all.
+        let causal_named: Option<std::collections::HashSet<String>> = tag_sources.map(|sources| {
+            let ner_spans: &[crate::embeddings::ner::NerEntity] = if extracted_by_ner {
+                &extracted_entities
+            } else {
+                &[]
+            };
+            sources
+                .tags
+                .iter()
+                .filter(|t| {
+                    !t.redacted
+                        && matches!(
+                            t.source,
+                            TagSource::Caller | TagSource::Declared | TagSource::Ner
+                        )
+                })
+                .map(|t| t.tag.trim().to_lowercase())
+                .chain(ner_spans.iter().map(|e| e.text.trim().to_lowercase()))
+                .collect()
+        });
 
         // Filter noise entities
         let filtered_entities: Vec<_> = extracted_entities
@@ -4758,6 +4803,17 @@ impl MultiUserMemoryManager {
                 })
             })
             .collect();
+        let causal_candidate: Vec<bool> = entity_uuids
+            .iter()
+            .enumerate()
+            .map(|(k, (name, _))| {
+                !fragment_of_comention[k]
+                    && (declared_weight[k].is_some()
+                        || causal_named
+                            .as_ref()
+                            .is_none_or(|named| named.contains(&name.trim().to_lowercase())))
+            })
+            .collect();
 
         let mut hub_edges_skipped = 0u64;
         for i in 0..entity_uuids.len() {
@@ -4775,17 +4831,15 @@ impl MultiUserMemoryManager {
                     declared_strength.unwrap_or_else(|| EdgeTier::L1Working.initial_weight());
                 let mut from_entity = entity_uuids[i].1;
                 let mut to_entity = entity_uuids[j].1;
-                let cue_hit =
-                    if extract_predicates && !fragment_of_comention[i] && !fragment_of_comention[j]
-                    {
-                        crate::graph_memory::extract_directed_predicate(
-                            &experience.content,
-                            &entity_uuids[i].0,
-                            &entity_uuids[j].0,
-                        )
-                    } else {
-                        None
-                    };
+                let cue_hit = if extract_predicates && causal_candidate[i] && causal_candidate[j] {
+                    crate::graph_memory::extract_directed_predicate(
+                        &experience.content,
+                        &entity_uuids[i].0,
+                        &entity_uuids[j].0,
+                    )
+                } else {
+                    None
+                };
                 let relation_type = match cue_hit {
                     Some((rt, a_is_source)) => {
                         if !a_is_source {
