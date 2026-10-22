@@ -442,6 +442,14 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
         self.inner.search(criteria)
     }
 
+    fn ids_in_date_range(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<MemoryId>> {
+        self.inner.ids_in_date_range(start, end)
+    }
+
     fn get_vector_mapping(&self, id: &MemoryId) -> Result<Option<VectorMappingEntry>> {
         self.inner.get_vector_mapping(id)
     }

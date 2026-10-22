@@ -460,6 +460,11 @@ impl super::MemorySystem {
         Ok(memories)
     }
 
+    /// Whether `id` is held by the working or session tier.
+    fn is_tier_resident(&self, id: &MemoryId) -> bool {
+        self.working_memory.read().contains(id) || self.session_memory.read().contains(id)
+    }
+
     /// The abstention threshold: the drift-calibrated one once maintenance has set it
     /// (APP-5), else `ABSTENTION_THRESHOLD`, halved for a query naming lexical identifiers
     /// (APP-4), whose vector similarity runs low because identifiers are out of the
@@ -531,7 +536,7 @@ impl super::MemorySystem {
         query_embedding: &[f32],
         query_embedding_secondary: Option<&Vec<f32>>,
     ) -> Vec<(MemoryId, f32)> {
-        let (enabled, cap) = {
+        let (enabled, cap, index_vectors) = {
             let dials = self.cognitive_dials.read();
             (
                 dials.date_window_leg != Some(false),
@@ -539,6 +544,7 @@ impl super::MemorySystem {
                     .candidate_count
                     .unwrap_or(query.max_results * 8)
                     .max(1),
+                dials.date_window_index_vectors == Some(true),
             )
         };
         if !enabled {
@@ -550,9 +556,9 @@ impl super::MemorySystem {
         }
         crate::metrics::RECALL_DATE_WINDOW_QUERIES_TOTAL.inc();
 
-        let similarity = |mem: &Memory| -> f32 {
+        let vector_similarity = |primary: Option<&[f32]>, secondary: Option<&[f32]>| -> f32 {
             let mut best = 0.0f32;
-            if let Some(emb) = mem.experience.embeddings.as_ref().filter(|e| !e.is_empty()) {
+            if let Some(emb) = primary.filter(|e| !e.is_empty()) {
                 if !query_embedding.is_empty() {
                     best =
                         crate::memory::hybrid_search::cosine_similarity_pub(query_embedding, emb);
@@ -560,10 +566,7 @@ impl super::MemorySystem {
             }
             if let (Some(q_sec), Some(m_sec)) = (
                 query_embedding_secondary,
-                mem.experience
-                    .embeddings_secondary
-                    .as_ref()
-                    .filter(|e| !e.is_empty()),
+                secondary.filter(|e| !e.is_empty()),
             ) {
                 best = best.max(crate::memory::hybrid_search::cosine_similarity_pub(
                     q_sec, m_sec,
@@ -571,9 +574,18 @@ impl super::MemorySystem {
             }
             best
         };
+        let similarity = |mem: &Memory| -> f32 {
+            vector_similarity(
+                mem.experience.embeddings.as_deref(),
+                mem.experience.embeddings_secondary.as_deref(),
+            )
+        };
 
         let mut seen: HashSet<MemoryId> = HashSet::new();
-        let mut candidates: Vec<(MemoryId, f32, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        // The creation time is the tie-break after similarity; a candidate scored from the
+        // vector index alone has none (`None` orders first), and ties then fall to the id.
+        let mut candidates: Vec<(MemoryId, f32, Option<chrono::DateTime<chrono::Utc>>)> =
+            Vec::new();
         for window in &windows {
             let slack = match window.granularity {
                 query_parser::DateWindowGranularity::Day => {
@@ -592,23 +604,71 @@ impl super::MemorySystem {
                 .expect("end of day exists")
                 .and_utc();
 
+            let admissible = |mem: &Memory| {
+                mem.created_at >= start && mem.created_at <= end && !mem.is_forgotten()
+            };
+            if index_vectors {
+                match self.long_term_memory.ids_in_date_range(start, end) {
+                    Ok(ids) => {
+                        // A resident memory is scored from its tier record below. One the
+                        // vector index holds a single primary vector for is scored from the
+                        // index; the rest (chunked, unindexed, soft-forgotten — forgetting
+                        // removes the vectors) are read to check and score their record.
+                        let mut unindexed: Vec<MemoryId> = Vec::new();
+                        for id in ids {
+                            if seen.contains(&id) || self.is_tier_resident(&id) {
+                                continue;
+                            }
+                            match self.retriever.indexed_vectors(&id) {
+                                (Some(primary), secondary) => {
+                                    let score =
+                                        vector_similarity(Some(&primary), secondary.as_deref());
+                                    seen.insert(id.clone());
+                                    candidates.push((id, score, None));
+                                }
+                                (None, _) => unindexed.push(id),
+                            }
+                        }
+                        for mem in self
+                            .retriever
+                            .get_many_from_storage(&unindexed)
+                            .into_iter()
+                            .flatten()
+                        {
+                            if admissible(&mem) && seen.insert(mem.id.clone()) {
+                                candidates.push((
+                                    mem.id.clone(),
+                                    similarity(&mem),
+                                    Some(mem.created_at),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        window = %window.original_text,
+                        "date window leg: date index read failed (non-fatal): {e}"
+                    ),
+                }
+            }
             let mut in_window = |mem: &Memory| {
-                if mem.created_at < start || mem.created_at > end || mem.is_forgotten() {
+                if !admissible(mem) {
                     return;
                 }
                 if seen.insert(mem.id.clone()) {
-                    candidates.push((mem.id.clone(), similarity(mem), mem.created_at));
+                    candidates.push((mem.id.clone(), similarity(mem), Some(mem.created_at)));
                 }
             };
-            match self
-                .long_term_memory
-                .search(SearchCriteria::ByDate { start, end })
-            {
-                Ok(memories) => memories.iter().for_each(&mut in_window),
-                Err(e) => tracing::warn!(
-                    window = %window.original_text,
-                    "date window leg: long-term search failed (non-fatal): {e}"
-                ),
+            if !index_vectors {
+                match self
+                    .long_term_memory
+                    .search(SearchCriteria::ByDate { start, end })
+                {
+                    Ok(memories) => memories.iter().for_each(&mut in_window),
+                    Err(e) => tracing::warn!(
+                        window = %window.original_text,
+                        "date window leg: long-term search failed (non-fatal): {e}"
+                    ),
+                }
             }
             // The in-memory tiers hold what the long-term index may not have yet.
             for mem in self.working_memory.read().all_memories() {
@@ -7277,6 +7337,59 @@ mod date_window_leg_tests {
             ..Default::default()
         });
         assert!(leg(&sys, "What did Nate do for Joanna on 25 May, 2022?").is_empty());
+    }
+
+    /// With the tiers empty (a reopened store), the index-vector path reaches the same
+    /// window memories as the record path, scores them with the same embeddings, and drops
+    /// what forgetting removed from the index.
+    #[test]
+    fn index_vectors_reach_the_window_the_records_do() {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        {
+            let sys = MemorySystem::new(config.clone(), None).expect("memory system");
+            remember_on(&sys, "Nate brought Joanna a new pup", "2022-05-25");
+            remember_on(&sys, "Joanna named the pup Biscuit", "2022-05-26");
+            remember_on(&sys, "Nate fixed the fence", "2022-05-24");
+            remember_on(&sys, "A week later they went hiking", "2022-06-02");
+            sys.flush_storage().expect("flush");
+        }
+        let sys = MemorySystem::new(config, None).expect("reopened memory system");
+        let question = "What happened on 25 May, 2022?";
+        let embedding = sys
+            .recall_query_embedding(question)
+            .expect("query embedding");
+        let query = Query {
+            query_text: Some(question.to_string()),
+            ..Default::default()
+        };
+        let by_records = sys.date_window_candidates(question, &query, &embedding, None);
+        assert_eq!(by_records.len(), 3, "the day and one day either side");
+
+        sys.set_cognitive_dials(CognitiveDials {
+            date_window_index_vectors: Some(true),
+            ..Default::default()
+        });
+        let by_index = sys.date_window_candidates(question, &query, &embedding, None);
+        assert_eq!(by_index.len(), by_records.len());
+        for (id, score) in &by_records {
+            let indexed = by_index
+                .iter()
+                .find(|(other, _)| other == id)
+                .expect("the same memory");
+            assert!(
+                (indexed.1 - score).abs() < 1e-6,
+                "same embedding, same cosine"
+            );
+        }
+
+        sys.forget(ForgetCriteria::OlderThan(30)).expect("forget");
+        assert!(sys
+            .date_window_candidates(question, &query, &embedding, None)
+            .is_empty());
     }
 
     #[test]

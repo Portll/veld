@@ -1052,6 +1052,31 @@ impl RetrievalEngine {
 
     /// Get set of all indexed memory IDs (for integrity checking)
     /// Whether the vector index holds this memory, without cloning the whole id set.
+    /// The vectors the indexes hold for `memory_id`, read without its record: the primary
+    /// when the memory is indexed as a single vector (a chunked memory's vectors are its
+    /// chunks', not its record's embedding, and give `None`), and the secondary when one
+    /// is indexed.
+    pub fn indexed_vectors(&self, memory_id: &MemoryId) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
+        fn single(mapping: &IdMapping, memory_id: &MemoryId) -> Option<u32> {
+            match mapping.memory_to_vectors.get(memory_id).map(Vec::as_slice) {
+                Some([only]) => Some(*only),
+                _ => None,
+            }
+        }
+        // Each mapping is read and released before its index is read, so the lock order
+        // (index before mapping) is never inverted.
+        let primary_id = single(&self.id_mapping.read(), memory_id);
+        let primary = primary_id.and_then(|id| self.vector_index.read().vector(id).ok());
+        let secondary = match (&self.secondary_vector_index, &self.secondary_id_mapping) {
+            (Some(index), Some(mapping)) => {
+                let secondary_id = single(&mapping.read(), memory_id);
+                secondary_id.and_then(|id| index.read().vector(id).ok())
+            }
+            _ => None,
+        };
+        (primary, secondary)
+    }
+
     pub fn is_indexed(&self, memory_id: &MemoryId) -> bool {
         self.id_mapping
             .read()

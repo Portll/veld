@@ -2955,6 +2955,16 @@ impl MemoryStorage {
         Ok(memories)
     }
 
+    /// The ids the per-day date index files under the UTC days `start` to `end` cover,
+    /// without reading a record (see `PrimaryMemoryStore::ids_in_date_range`).
+    pub fn ids_in_date_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<MemoryId>> {
+        self.search_by_date_range(start, end)
+    }
+
     fn search_by_date_range(
         &self,
         start: DateTime<Utc>,
