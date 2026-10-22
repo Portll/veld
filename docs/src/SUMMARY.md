@@ -74,6 +74,7 @@
 - [0007 — RocksDB default engine](decisions/0007-rocksdb-default-engine.md)
   - [0007 — redb live soak log](decisions/0007-redb-soak-log.md)
 - [0008 — Local IPC transport](decisions/0008-local-ipc-transport.md)
+- [0009 — Embeddings out of the record](decisions/0009-embeddings-out-of-the-record.md)
 
 ---
 
