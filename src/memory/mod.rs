@@ -226,6 +226,7 @@ pub use crate::memory::temporal_facts::{
     ContradictionType, EventType, ResolvedTime, TemporalFact, TemporalFactStore,
 };
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
+pub use crate::memory::usage_writes::UsageWriteMode;
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
 
 /// Directory name used for the on-disk BM25 (tantivy) inverted index.
@@ -414,6 +415,7 @@ pub struct MemorySystem {
     /// Recall usage writes (retrieval counter, co-retrieval reinforcement, competition
     /// interference), applied in order by a background worker instead of inside recall.
     usage_writes: usage_writes::UsageWriter,
+    usage_write_mode: UsageWriteMode,
 
     /// Active reconsolidation shadows (FIX-R1): memories currently in the labile window.
     /// Key: MemoryId, Value: ReconsolidationShadow
@@ -1667,7 +1669,10 @@ impl MemorySystem {
             interference: Arc::clone(&interference_detector),
             events: Arc::clone(&consolidation_events),
         }
-        .into_writer(usage_writes::USAGE_WRITE_QUEUE_CAPACITY);
+        .into_writer(
+            usage_writes::USAGE_WRITE_QUEUE_CAPACITY,
+            UsageWriteMode::Inline,
+        );
 
         Ok(Self {
             config: config.clone(),
@@ -1717,6 +1722,7 @@ impl MemorySystem {
             memory_set_generation: std::sync::atomic::AtomicU64::new(0),
             session_map_cache: parking_lot::Mutex::new(None),
             usage_writes,
+            usage_write_mode: UsageWriteMode::Inline,
             // FIX-R1: Reconsolidation shadow map — tracks labile memories
             reconsolidation_shadows: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
@@ -1784,9 +1790,25 @@ impl MemorySystem {
         self.graph_memory = Some(graph);
         // The usage writer reinforces edges in the graph it was built with.
         self.usage_writes.shutdown();
+        self.usage_writes = self.usage_sinks().into_writer(
+            usage_writes::USAGE_WRITE_QUEUE_CAPACITY,
+            self.usage_write_mode,
+        );
+    }
+
+    /// Where recall's usage writes (retrieval count, co-retrieval edges, interference)
+    /// apply. A system starts `Inline`, so each recall's writes land before the next one
+    /// and the recall harness and tests rank reproducibly; the server switches its tenants
+    /// to `Background` to keep the writes off the read path.
+    pub fn set_usage_write_mode(&mut self, mode: UsageWriteMode) {
+        if mode == self.usage_write_mode {
+            return;
+        }
+        self.usage_writes.shutdown();
+        self.usage_write_mode = mode;
         self.usage_writes = self
             .usage_sinks()
-            .into_writer(usage_writes::USAGE_WRITE_QUEUE_CAPACITY);
+            .into_writer(usage_writes::USAGE_WRITE_QUEUE_CAPACITY, mode);
     }
 
     fn usage_sinks(&self) -> usage_writes::UsageSinks {
