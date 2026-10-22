@@ -22,7 +22,10 @@ impl VeldMcpServer {
             client: Arc::new(super::client::AsyncApiClient::new(
                 api_url, api_key, user_id,
             )),
-            tool_router: Self::tool_router(),
+            tokens: Arc::new(super::tools_memory::TokenTracker::from_env()),
+            tool_router: Self::tool_router()
+                + Self::memory_tool_router()
+                + Self::work_tool_router(),
         }
     }
 
@@ -907,6 +910,31 @@ impl VeldMcpServer {
             }),
         }
     }
+}
+
+impl VeldMcpServer {
+    /// Every routed tool name, for the parity test against the TypeScript server.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect()
+    }
+}
+
+/// The one error shape every tool returns for a failed API call.
+pub(crate) fn mcp_error(e: anyhow::Error) -> McpError {
+    McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: Cow::from(e.to_string()),
+        data: None,
+    }
+}
+
+/// Percent-encode a single URL path/query component, shared with the sibling tool files.
+pub(crate) fn url_encode_component_shared(s: &str) -> String {
+    url_encode_component(s)
 }
 
 /// Percent-encode a single URL path/query component (RFC 3986 unreserved

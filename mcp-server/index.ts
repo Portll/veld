@@ -1745,6 +1745,253 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["name", "row_pk", "kind", "target_id"],
         },
       },
+      // ── Agent self-paging: pin + tier control (parity with `veld serve`) ──
+      {
+        name: "pin_memory",
+        description:
+          "Pin a memory so it resists automatic decay and skips compression. Use for critical facts that must persist in working context (Letta-style core-memory anchor).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_id: {
+              type: "string",
+              description: "Memory ID (UUID string) to pin or unpin",
+            },
+          },
+          required: ["memory_id"],
+        },
+      },
+      {
+        name: "unpin_memory",
+        description:
+          "Unpin a previously pinned memory, allowing automatic decay and compression to apply again.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_id: {
+              type: "string",
+              description: "Memory ID (UUID string) to pin or unpin",
+            },
+          },
+          required: ["memory_id"],
+        },
+      },
+      {
+        name: "promote_to_hot",
+        description:
+          "Promote a memory back into the hot working tier. Use when an archived memory needs to be brought into immediate focus for the current task.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_id: {
+              type: "string",
+              description: "Memory ID (UUID string) to move",
+            },
+          },
+          required: ["memory_id"],
+        },
+      },
+      {
+        name: "demote_to_cold",
+        description:
+          "Push a memory down to cold archival storage. Use when a memory is no longer relevant to the current task but should be preserved for possible future recall.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_id: {
+              type: "string",
+              description: "Memory ID (UUID string) to move",
+            },
+          },
+          required: ["memory_id"],
+        },
+      },
+      {
+        name: "move_to_tier",
+        description:
+          "Move a memory to a specific tier. target_tier accepts: 'working', 'session', 'longterm', 'archive'. Prefer the named helpers (promote_to_hot, demote_to_cold) for the common cases.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_id: {
+              type: "string",
+              description: "Memory ID (UUID string) to move",
+            },
+            target_tier: {
+              type: "string",
+              enum: ["working", "session", "longterm", "archive"],
+              description:
+                "Target tier: \"working\" (hottest), \"session\", \"longterm\", \"archive\" (coldest)",
+            },
+          },
+          required: ["memory_id", "target_tier"],
+        },
+      },
+      // ── Closed-loop feedback ──
+      {
+        name: "reinforce_memories",
+        description:
+          "Give explicit feedback on memories that were surfaced by a recent recall. outcome: 'helpful' boosts (memories that helped solve the task), 'misleading' suppresses (memories that wasted time or were wrong), 'neutral' is a mild access bump. Feeds the closed-loop ranker — future recalls re-rank based on accumulated momentum.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_ids: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Memory IDs (UUID strings) that were surfaced. Mark them with the outcome — the feedback store updates each memory's momentum so future rankings prefer helpful memories and suppress misleading ones.",
+            },
+            outcome: {
+              type: "string",
+              enum: ["helpful", "misleading", "neutral"],
+              description:
+                "\"helpful\" — memories that helped solve the task (boost score); \"misleading\" — memories that misled or wasted time (suppress score); \"neutral\" — neither obviously helped nor hurt (mild access bump)",
+            },
+          },
+          required: ["memory_ids", "outcome"],
+        },
+      },
+      // ── Lineage: causal memory tracking ──
+      {
+        name: "lineage_trace",
+        description:
+          "Trace the causal lineage of a memory. Find what caused it (backward), what it led to (forward), or both. Useful for understanding 'why' something happened.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_id: {
+              type: "string",
+              description: "Memory ID to trace lineage from",
+            },
+            direction: {
+              type: "string",
+              enum: ["backward", "forward", "both"],
+              description:
+                "Direction: \"backward\" (find causes), \"forward\" (find effects), \"both\"",
+              default: "backward",
+            },
+            max_depth: {
+              type: "number",
+              description: "Maximum depth to traverse (default: 10)",
+              default: 10,
+            },
+          },
+          required: ["memory_id"],
+        },
+      },
+      {
+        name: "lineage_confirm",
+        description:
+          "Confirm an inferred causal relationship between memories. This improves the system's confidence and learning.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            edge_id: {
+              type: "string",
+              description: "ID of the inferred edge to confirm",
+            },
+          },
+          required: ["edge_id"],
+        },
+      },
+      {
+        name: "lineage_reject",
+        description:
+          "Reject an incorrectly inferred causal relationship. This helps the system learn better inference patterns.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            edge_id: {
+              type: "string",
+              description: "ID of the inferred edge to reject",
+            },
+          },
+          required: ["edge_id"],
+        },
+      },
+      {
+        name: "lineage_link",
+        description:
+          "Create an explicit causal link between two memories. Relations: Caused (Error→Todo), ResolvedBy (Todo→Learning), InformedBy, SupersededBy, TriggeredBy, BranchedFrom, RelatedTo.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            from_memory_id: {
+              type: "string",
+              description: "Source memory ID (the cause/origin)",
+            },
+            to_memory_id: {
+              type: "string",
+              description: "Target memory ID (the effect/result)",
+            },
+            relation: {
+              type: "string",
+              enum: [
+                "Caused",
+                "ResolvedBy",
+                "InformedBy",
+                "SupersededBy",
+                "TriggeredBy",
+                "BranchedFrom",
+                "RelatedTo",
+              ],
+              description:
+                "Relation type: Caused, ResolvedBy, InformedBy, SupersededBy, TriggeredBy, BranchedFrom, RelatedTo",
+            },
+          },
+          required: ["from_memory_id", "to_memory_id", "relation"],
+        },
+      },
+      {
+        name: "lineage_stats",
+        description:
+          "Get statistics about the causal lineage graph - edge counts, relation types, confidence distribution.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      // ── Knowledge-graph gap analysis ──
+      {
+        name: "gap_analyze",
+        description:
+          "Detect structural gaps in the knowledge graph. Finds missing connections (open triads), parallel paths not reconciled (diamonds), hub-spoke disconnects (stars), and cluster silos (orbits). Returns raw structural data.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "gap_mapper",
+        description:
+          "Run Mapper topological analysis on the knowledge graph. Produces a simplified graph that reveals branches, loops, flares, and connected components — topological structure invisible to standard clustering. Different filter functions reveal different aspects of the knowledge topology.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filter: {
+              type: "string",
+              enum: [
+                "centroid_distance",
+                "density",
+                "eccentricity",
+                "neighbor_distance",
+                "embedding_pc1",
+              ],
+              description:
+                "Filter function: 'centroid_distance' (default), 'density', 'eccentricity', 'neighbor_distance', or 'embedding_pc1'",
+            },
+            num_intervals: {
+              type: "number",
+              description: "Number of intervals in the cover (default 10)",
+            },
+            overlap: {
+              type: "number",
+              description:
+                "Overlap percentage between intervals, 0.0-1.0 (default 0.3)",
+            },
+          },
+        },
+      },
     ],
   };
 });
@@ -1779,6 +2026,124 @@ function autoStreamContext(
   if (context.length >= 20) {
     streamMemory(context, ["auto-context", toolName], "user");
   }
+}
+
+// ── Parity helpers for the tools mirrored from `veld serve` (src/mcp/tools.rs) ──
+const MEMORY_TIERS = ["working", "session", "longterm", "archive"];
+const REINFORCE_OUTCOMES = ["helpful", "misleading", "neutral"];
+const LINEAGE_DIRECTIONS = ["backward", "forward", "both"];
+const LINEAGE_RELATIONS = [
+  "Caused",
+  "ResolvedBy",
+  "InformedBy",
+  "SupersededBy",
+  "TriggeredBy",
+  "BranchedFrom",
+  "RelatedTo",
+];
+const MAPPER_FILTERS = [
+  "centroid_distance",
+  "density",
+  "eccentricity",
+  "neighbor_distance",
+  "embedding_pc1",
+];
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.trim().length > 0;
+}
+
+function shortId(id: string): string {
+  return id.slice(0, 8);
+}
+
+function argError(text: string): {
+  content: { type: string; text: string }[];
+  isError: true;
+} {
+  return { content: [{ type: "text", text }], isError: true };
+}
+
+interface AnchorResponse {
+  success: boolean;
+  memory_id: string;
+  anchored: boolean;
+}
+
+interface TierMoveResponse {
+  success: boolean;
+  memory_id: string;
+  previous_tier: string;
+  current_tier: string;
+}
+
+interface ReinforceResponse {
+  memories_processed: number;
+  associations_strengthened: number;
+  importance_boosts: number;
+  importance_decays: number;
+}
+
+interface LineageTraceResponse {
+  root: string;
+  direction: string;
+  edges: {
+    id: string;
+    from: string;
+    to: string;
+    relation: string;
+    confidence: number;
+    source: string;
+  }[];
+  path: string[];
+  depth: number;
+}
+
+interface LineageStatsResponse {
+  total_edges: number;
+  inferred_edges: number;
+  confirmed_edges: number;
+  explicit_edges: number;
+  total_branches: number;
+  active_branches: number;
+  edges_by_relation: Record<string, number>;
+  avg_confidence: number;
+}
+
+interface GapAnalyzeResponse {
+  gaps: {
+    id: string;
+    gap_type: string;
+    confidence: number;
+    impact_score: number;
+    entity_names: string[];
+  }[];
+  type_counts: Record<string, number>;
+  duration_ms: number;
+  status?: string;
+  computed_at?: string;
+}
+
+interface GapMapperResponse {
+  nodes: {
+    id: number;
+    member_names: string[];
+    size: number;
+    avg_filter_value: number;
+  }[];
+  edges: { from: number; to: number; weight: number }[];
+  num_components: number;
+  num_loops: number;
+  flare_count: number;
+  branch_count: number;
+  filter: string;
+  stats: {
+    entity_count: number;
+    interval_count: number;
+    cluster_count: number;
+    edge_count: number;
+    duration_ms: number;
+  };
 }
 
 // Handle tool calls
@@ -1899,6 +2264,311 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             { type: "text", text: result.linked ? "Linked." : "Link not created." },
           ],
         };
+      }
+
+      // ── Agent self-paging, feedback, lineage, gap analysis (parity with `veld serve`) ──
+      case "pin_memory":
+      case "unpin_memory": {
+        const { memory_id } = args as { memory_id?: string };
+        if (!isNonEmptyString(memory_id)) {
+          return argError("Error: 'memory_id' is required (UUID string).");
+        }
+        const anchor = name === "pin_memory";
+        const result = await apiCall<AnchorResponse>("/api/anchor", "POST", {
+          user_id: USER_ID,
+          memory_id,
+          anchor,
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${anchor ? "Pinned" : "Unpinned"} memory ${result.memory_id} (anchored=${result.anchored})`,
+            },
+          ],
+        };
+      }
+
+      case "promote_to_hot":
+      case "demote_to_cold":
+      case "move_to_tier": {
+        const { memory_id, target_tier } = args as {
+          memory_id?: string;
+          target_tier?: string;
+        };
+        if (!isNonEmptyString(memory_id)) {
+          return argError("Error: 'memory_id' is required (UUID string).");
+        }
+        const tier =
+          name === "promote_to_hot"
+            ? "working"
+            : name === "demote_to_cold"
+              ? "archive"
+              : target_tier;
+        if (!isNonEmptyString(tier) || !MEMORY_TIERS.includes(tier)) {
+          return argError(
+            `Error: 'target_tier' must be one of ${MEMORY_TIERS.join(", ")}.`,
+          );
+        }
+        const result = await apiCall<TierMoveResponse>(
+          "/api/memory/tier",
+          "POST",
+          { user_id: USER_ID, memory_id, target_tier: tier },
+        );
+        const verb =
+          name === "promote_to_hot"
+            ? "Promoted"
+            : name === "demote_to_cold"
+              ? "Demoted"
+              : "Moved";
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${verb} memory ${result.memory_id} from ${result.previous_tier} to ${result.current_tier}`,
+            },
+          ],
+        };
+      }
+
+      case "reinforce_memories": {
+        const { memory_ids, outcome } = args as {
+          memory_ids?: unknown;
+          outcome?: string;
+        };
+        if (
+          !Array.isArray(memory_ids) ||
+          memory_ids.length === 0 ||
+          !memory_ids.every(isNonEmptyString)
+        ) {
+          return argError(
+            "Error: 'memory_ids' must be a non-empty array of memory IDs.",
+          );
+        }
+        if (!isNonEmptyString(outcome) || !REINFORCE_OUTCOMES.includes(outcome)) {
+          return argError(
+            `Error: 'outcome' must be one of ${REINFORCE_OUTCOMES.join(", ")}.`,
+          );
+        }
+        const result = await apiCall<ReinforceResponse>(
+          "/api/reinforce",
+          "POST",
+          { user_id: USER_ID, ids: memory_ids, outcome },
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Reinforced ${result.memories_processed} memories — ${result.importance_boosts} boosts, ${result.importance_decays} decays, ${result.associations_strengthened} associations strengthened`,
+            },
+          ],
+        };
+      }
+
+      case "lineage_trace": {
+        const { memory_id, direction, max_depth } = args as {
+          memory_id?: string;
+          direction?: string;
+          max_depth?: number;
+        };
+        if (!isNonEmptyString(memory_id)) {
+          return argError("Error: 'memory_id' is required.");
+        }
+        const dir = isNonEmptyString(direction) ? direction : "backward";
+        if (!LINEAGE_DIRECTIONS.includes(dir)) {
+          return argError(
+            `Error: 'direction' must be one of ${LINEAGE_DIRECTIONS.join(", ")}.`,
+          );
+        }
+        const depth =
+          typeof max_depth === "number" && Number.isFinite(max_depth) && max_depth > 0
+            ? Math.floor(max_depth)
+            : 10;
+        const result = await apiCall<LineageTraceResponse>(
+          "/api/lineage/trace",
+          "POST",
+          { user_id: USER_ID, memory_id, direction: dir, max_depth: depth },
+        );
+        let text = `**Lineage Trace** (${result.direction})\n\nRoot: ${result.root}\nDepth: ${result.depth}\n\n`;
+        if (!result.edges || result.edges.length === 0) {
+          text += "No causal connections found.\n";
+        } else {
+          text += "**Causal Chain:**\n";
+          for (const edge of result.edges) {
+            const confidence = Math.trunc(edge.confidence * 100);
+            const sourceIcon =
+              edge.source === "Confirmed"
+                ? "✓"
+                : edge.source === "Explicit"
+                  ? "⚡"
+                  : "?";
+            text += `  ${shortId(edge.from)} --[${edge.relation} ${confidence}% ${sourceIcon}]--> ${shortId(edge.to)}\n`;
+          }
+          text += `\n**Path:** ${(result.path || []).join(" → ")}\n`;
+        }
+        return { content: [{ type: "text", text }] };
+      }
+
+      case "lineage_confirm": {
+        const { edge_id } = args as { edge_id?: string };
+        if (!isNonEmptyString(edge_id)) {
+          return argError("Error: 'edge_id' is required.");
+        }
+        const result = await apiCall<{ message: string; edge_id: string }>(
+          "/api/lineage/confirm",
+          "POST",
+          { user_id: USER_ID, edge_id },
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✓ Confirmed edge: ${result.edge_id} - ${result.message}`,
+            },
+          ],
+        };
+      }
+
+      case "lineage_reject": {
+        const { edge_id } = args as { edge_id?: string };
+        if (!isNonEmptyString(edge_id)) {
+          return argError("Error: 'edge_id' is required.");
+        }
+        const result = await apiCall<{ message: string; deleted: boolean }>(
+          "/api/lineage/reject",
+          "POST",
+          { user_id: USER_ID, edge_id },
+        );
+        return {
+          content: [{ type: "text", text: `✗ Rejected edge: ${result.message}` }],
+        };
+      }
+
+      case "lineage_link": {
+        const { from_memory_id, to_memory_id, relation } = args as {
+          from_memory_id?: string;
+          to_memory_id?: string;
+          relation?: string;
+        };
+        if (!isNonEmptyString(from_memory_id) || !isNonEmptyString(to_memory_id)) {
+          return argError(
+            "Error: 'from_memory_id' and 'to_memory_id' are required.",
+          );
+        }
+        if (!isNonEmptyString(relation) || !LINEAGE_RELATIONS.includes(relation)) {
+          return argError(
+            `Error: 'relation' must be one of ${LINEAGE_RELATIONS.join(", ")}.`,
+          );
+        }
+        const result = await apiCall<{ message: string; edge_id: string }>(
+          "/api/lineage/link",
+          "POST",
+          { user_id: USER_ID, from_memory_id, to_memory_id, relation },
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: `⚡ Created link: ${result.edge_id} - ${result.message}`,
+            },
+          ],
+        };
+      }
+
+      case "lineage_stats": {
+        const result = await apiCall<LineageStatsResponse>(
+          "/api/lineage/stats",
+          "POST",
+          { user_id: USER_ID },
+        );
+        let text = "**Lineage Graph Statistics**\n\n";
+        text += `**Edges:** ${result.total_edges}\n`;
+        text += `  ✓ Confirmed: ${result.confirmed_edges}\n`;
+        text += `  ? Inferred: ${result.inferred_edges}\n`;
+        text += `  ⚡ Explicit: ${result.explicit_edges}\n`;
+        text += `Average Confidence: ${(result.avg_confidence * 100).toFixed(1)}%\n\n`;
+        text += `**Branches:** ${result.total_branches} total, ${result.active_branches} active\n\n`;
+        const byRelation = Object.entries(result.edges_by_relation || {}).sort(
+          (a, b) => b[1] - a[1],
+        );
+        if (byRelation.length > 0) {
+          text += "**By Relation Type:**\n";
+          for (const [relation, count] of byRelation) {
+            text += `  ${relation}: ${count}\n`;
+          }
+        }
+        return { content: [{ type: "text", text }] };
+      }
+
+      case "gap_analyze": {
+        const result = await apiCall<GapAnalyzeResponse>(
+          "/api/gap/analyze",
+          "POST",
+          { user_id: USER_ID },
+        );
+        if (result.status === "running") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "**Structural Gap Analysis** is still running for this graph; ask again shortly.\n",
+              },
+            ],
+          };
+        }
+        const gaps = result.gaps || [];
+        let text = `**Structural Gap Analysis** (${gaps.length} gaps, ${result.duration_ms}ms)\n\n`;
+        if (result.status === "stale" && result.computed_at) {
+          text += `Computed at ${result.computed_at}; a newer analysis is running.\n\n`;
+        }
+        for (const [gapType, count] of Object.entries(result.type_counts || {})) {
+          text += `- ${gapType}: ${count}\n`;
+        }
+        text += "\n";
+        for (const gap of gaps) {
+          text += `### [${gap.gap_type}] ${gap.id} (confidence: ${Math.round(gap.confidence * 100)}%, impact: ${Math.round(gap.impact_score * 100)}%)\n  Entities: ${(gap.entity_names || []).join(", ")}\n\n`;
+        }
+        if (gaps.length === 0) {
+          text += "No structural gaps detected.\n";
+        }
+        return { content: [{ type: "text", text }] };
+      }
+
+      case "gap_mapper": {
+        const { filter, num_intervals, overlap } = args as {
+          filter?: string;
+          num_intervals?: number;
+          overlap?: number;
+        };
+        if (filter !== undefined && !MAPPER_FILTERS.includes(filter)) {
+          return argError(
+            `Error: 'filter' must be one of ${MAPPER_FILTERS.join(", ")}.`,
+          );
+        }
+        const body: Record<string, unknown> = { user_id: USER_ID };
+        if (filter !== undefined) body.filter = filter;
+        if (typeof num_intervals === "number") body.num_intervals = num_intervals;
+        if (typeof overlap === "number") body.overlap = overlap;
+        const result = await apiCall<GapMapperResponse>(
+          "/api/gap/mapper",
+          "POST",
+          body,
+        );
+        let text = `**Mapper Analysis** (filter: ${result.filter}, ${result.stats.entity_count} entities, ${result.stats.duration_ms}ms)\n\n`;
+        text += `**Topology:** ${result.num_components} components, ${result.num_loops} loops, ${result.flare_count} flares, ${result.branch_count} branches\n`;
+        text += `**Graph:** ${result.stats.cluster_count} clusters, ${result.stats.edge_count} edges\n\n`;
+        const nodes = result.nodes || [];
+        if (nodes.length > 0) {
+          text += "**Clusters:**\n";
+          for (const node of nodes) {
+            const preview = (node.member_names || []).slice(0, 5).join(", ");
+            const suffix = node.size > 5 ? ` +${node.size - 5} more` : "";
+            text += `  [${node.id}] size=${node.size}, filter=${node.avg_filter_value.toFixed(3)}: ${preview}${suffix}\n`;
+          }
+        } else {
+          text += "No clusters found. The knowledge graph may be too sparse for Mapper analysis.\n";
+        }
+        return { content: [{ type: "text", text }] };
       }
 
       case "remember": {
@@ -4618,6 +5288,27 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 - **list_reminders** - View pending reminders
 - **dismiss_reminder** - Mark reminder as handled
 
+## Memory Paging
+- **pin_memory** - Pin a memory so it resists decay and compression
+- **unpin_memory** - Let a pinned memory decay again
+- **promote_to_hot** - Bring a memory into the working tier
+- **demote_to_cold** - Push a memory to the archive tier
+- **move_to_tier** - Move a memory to working, session, longterm or archive
+
+## Feedback
+- **reinforce_memories** - Mark surfaced memories helpful, misleading or neutral
+
+## Lineage
+- **lineage_trace** - Trace what caused a memory or what it led to
+- **lineage_link** - Create an explicit causal link between two memories
+- **lineage_confirm** - Confirm an inferred causal edge
+- **lineage_reject** - Reject an inferred causal edge
+- **lineage_stats** - Edge counts, relation types and confidence
+
+## Knowledge Graph Analysis
+- **gap_analyze** - Find structural gaps (open triads, diamonds, stars, orbits)
+- **gap_mapper** - Mapper topology: components, loops, flares, branches
+
 ## Slash Commands (type / in chat)
 - **/mcp__veld__quick_recall** - Search memories
 - **/mcp__veld__session_summary** - Session overview
@@ -5462,7 +6153,7 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Veld MCP server v0.7.7 running");
+  console.error(`Veld MCP server v${resolveVersion()} running`);
   console.error(`Connecting to: ${API_URL}`);
   // digest, not the value: VELD_USER_ID often holds an email
   console.error(

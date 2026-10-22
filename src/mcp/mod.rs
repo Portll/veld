@@ -9,6 +9,8 @@
 
 pub mod client;
 pub mod tools;
+pub mod tools_memory;
+pub mod tools_work;
 pub mod types;
 
 use anyhow::Result;
@@ -29,6 +31,7 @@ use types::*;
 #[derive(Debug, Clone)]
 pub struct VeldMcpServer {
     pub(crate) client: Arc<AsyncApiClient>,
+    pub(crate) tokens: Arc<tools_memory::TokenTracker>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -42,6 +45,27 @@ impl VeldMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for VeldMcpServer {
+    /// Every tool call passes through here so the session token tracker, which
+    /// `token_status` reads, sees the text of every reply under the tool's name.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let name = request.name.to_string();
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = self.tool_router.call(tcc).await?;
+        let text: String = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.tokens.track(&name, &text);
+        Ok(result)
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::V_2024_11_05;

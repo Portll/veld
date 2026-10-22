@@ -6,7 +6,7 @@
 
 # MCP Tools
 
-The TypeScript MCP server (`@veld/memory-mcp`) exposes **54** tools over the HTTP API. The Rust binary (`veld serve`) exposes the same tools via stdio MCP using `rmcp`.
+The TypeScript MCP server (`@veld/memory-mcp`) exposes **60** tools over the HTTP API. The Rust binary (`veld serve`) exposes the same tools via stdio MCP using `rmcp`.
 
 Tools are listed alphabetically. For full parameter schemas, see [mcp-server/index.ts](https://github.com/Portll/veld/blob/main/mcp-server/index.ts).
 
@@ -24,7 +24,6 @@ Tools are listed alphabetically. For full parameter schemas, see [mcp-server/ind
 | `complete_todo` | Mark a todo as complete. For recurring tasks, automatically creates the next occurrence. |
 | `consolidation_report` | Get a report of what the memory system has been learning. Shows memory strengthening/decay events, edge formation, fact extraction, and maintenance cycles. Use this to understand how your memories are evolving. |
 | `context_summary` | Get a condensed summary of recent learnings, decisions, and context. Use this at the start of a session to quickly understand what you've learned before. |
-| `count` | Number of memories (default: 10) |
 | `dataset_create` | Create a relational dataset (table) for tabular data. Requires a configured relational backend. |
 | `dataset_link` | Link a dataset row to a knowledge-graph entity or a memory. |
 | `dataset_list` | List the datasets you own, with row counts. |
@@ -32,40 +31,47 @@ Tools are listed alphabetically. For full parameter schemas, see [mcp-server/ind
 | `delete_project` | Permanently delete a project. Use delete_todos=true to also delete all todos in the project. |
 | `delete_todo` | Delete a todo permanently. |
 | `delete_todo_comment` | Delete a comment from a todo. |
+| `demote_to_cold` | Push a memory down to cold archival storage. Use when a memory is no longer relevant to the current task but should be preserved for possible future recall. |
 | `dismiss_reminder` | Dismiss/acknowledge a triggered reminder. Call this after you've handled a reminder. |
 | `fact_narratives` | Get synthesized narratives from accumulated semantic facts, clustered by shared entities with confidence levels and heuristic causal chains. Shows what the system has learned, organized into coherent themes. Read-only; never modifies stored facts. Purged and time-invalidated facts are automatically excluded. |
 | `facts_preview_purge` | Preview the blast radius of a fact-purge pattern WITHOUT deleting anything. Returns a bucketed match count (none / few / some / many) — not an exact count — so the preview cannot become an oracle for fact existence. Use this BEFORE any destructive purge: agents should always preview-check a pattern, surface the bucket to the user, and only escalate to the destructive `/api/facts/purge` route after explicit confirmation. Pattern is substring match (not regex), case-insensitive, minimum 3 characters. |
 | `forget` | Delete a specific memory by ID |
+| `gap_analyze` | Detect structural gaps in the knowledge graph. Finds missing connections (open triads), parallel paths not reconciled (diamonds), hub-spoke disconnects (stars), and cluster silos (orbits). Returns raw structural data. |
+| `gap_mapper` | Run Mapper topological analysis on the knowledge graph. Produces a simplified graph that reveals branches, loops, flares, and connected components — topological structure invisible to standard clustering. Different filter functions reveal different aspects of the knowledge topology. |
 | `get_dials` | Read the current cognitive dials for this user: reconsolidation plasticity (labile-window close + graph/entity/embedding re-encode) and retrieval fast/accurate overrides. |
+| `lineage_confirm` | Confirm an inferred causal relationship between memories. This improves the system's confidence and learning. |
+| `lineage_link` | Create an explicit causal link between two memories. Relations: Caused (Error→Todo), ResolvedBy (Todo→Learning), InformedBy, SupersededBy, TriggeredBy, BranchedFrom, RelatedTo. |
+| `lineage_reject` | Reject an incorrectly inferred causal relationship. This helps the system learn better inference patterns. |
+| `lineage_stats` | Get statistics about the causal lineage graph - edge counts, relation types, confidence distribution. |
+| `lineage_trace` | Trace the causal lineage of a memory. Find what caused it (backward), what it led to (forward), or both. Useful for understanding 'why' something happened. |
 | `list_memories` | List all stored memories |
 | `list_projects` | List all projects with todo counts and status breakdown. |
 | `list_reminders` | List all pending reminders. Use to check what reminders are scheduled. |
 | `list_subtasks` | List subtasks of a parent todo. Use add_todo with parent_id to create subtasks. |
 | `list_todo_comments` | List all comments and activity history for a specific todo. |
 | `list_todos` | List or search todos. Supports semantic search via query parameter, or GTD-style filtering. Returns Linear-style formatted output grouped by status. |
-| `memory_health` | Check memory system status and statistics |
 | `memory_stats` | Get statistics about stored memories |
-| `pending_work` | Show todos and incomplete tasks |
-| `proactive_context` | REQUIRED: Call this tool with EVERY user message to surface relevant memories and build conversation history. Pass the user's message as context. This enables: (1) retrieving memories relevant to what the user is asking, (2) building persistent memory of the conversation for future sessions. The system analyzes entities, semantic similarity, and recency to find contextually appropriate memories. Auto-ingest stores the context automatically. USAGE: Always call this FIRST when you receive a user message, passing their message as the context parameter. |
-| `query` | What to search for in memories |
-| `quick_recall` | Search your memories for relevant context |
+| `move_to_tier` | Move a memory to a specific tier. target_tier accepts: 'working', 'session', 'longterm', 'archive'. Prefer the named helpers (promote_to_hot, demote_to_cold) for the common cases. |
+| `pin_memory` | Pin a memory so it resists automatic decay and skips compression. Use for critical facts that must persist in working context (Letta-style core-memory anchor). |
+| `proactive_context` | Surface memories relevant to the current task or question, ranked by entities, semantic similarity and recency. Call it when the task turns to something past sessions may have covered (a decision, a prior bug, a preference); it takes one to several seconds, so do not call it on every message. Pass the task or question as context. Set auto_ingest to true only when the context itself is worth remembering; hooks already record conversation turns. |
+| `promote_to_hot` | Promote a memory back into the hot working tier. Use when an archived memory needs to be brought into immediate focus for the current task. |
 | `read_memory` | Read the FULL content of a specific memory by ID. Use this when you need to see the complete text of a memory that was truncated in search results. |
 | `recall` | Search memories AND todos using semantic similarity. Returns both relevant memories and matching todos. Use this to find past experiences, decisions, context, or pending work. Modes: 'semantic' (vector similarity), 'associative' (graph traversal), 'hybrid' (combined). |
-| `recent_memories` | Show recently created memories |
+| `recall_by_tags` | Find memories by tags, newest first. Returns memories whose writer gave them ANY of the provided tags, e.g. 'decision', 'learning', 'error', 'project:veld'. |
+| `reinforce_memories` | Give explicit feedback on memories that were surfaced by a recent recall. outcome: 'helpful' boosts (memories that helped solve the task), 'misleading' suppresses (memories that wasted time or were wrong), 'neutral' is a mild access bump. Feeds the closed-loop ranker — future recalls re-rank based on accumulated momentum. |
+| `remember` | Store a memory for future recall. Use this to remember important information, decisions, user preferences, project context, or anything you want to recall later. |
 | `reorder_todo` | Move a todo up or down within its status group. Use to prioritize tasks manually. |
 | `repair_index` | Repair vector index by re-indexing orphaned memories. Use this when verify_index shows unhealthy status. Returns count of repaired memories. |
 | `reset_token_session` | Reset the token counter for a new session. Call this when starting a new conversation or after context has been compressed/summarized. |
 | `seed_project` | Scan a project directory and create foundational memories from config files, README, and source code. Enables rapid bootstrapping of memory for a new project. Idempotent: re-running deletes old seed memories first. |
-| `session_summary` | Get a summary of recent learnings, decisions, and context |
 | `set_dials` | Tune the cognitive dials for this user. Only the fields you set change; unset fields keep their current value. Reconsolidation re-encode runs in background maintenance (off the recall hot path); retrieval overrides apply per query. All reconsolidation toggles default OFF. |
 | `set_reminder` | Set a reminder for the future. Triggers on time (at specific time or after duration) or context match (when keywords appear in conversation). Reminders will surface automatically when conditions are met. |
 | `todo_stats` | Get statistics about your todos - counts by status, overdue items, etc. |
 | `token_status` | Get current token usage status for this session. Returns tokens used, budget remaining, and percentage consumed. Use this to check context window health. |
-| `topic` | The topic to explore |
+| `unpin_memory` | Unpin a previously pinned memory, allowing automatic decay and compression to apply again. |
 | `update_todo` | Update a todo's properties. Use short ID prefix (e.g., SHO-1a2b) or full ID. |
 | `update_todo_comment` | Update an existing comment on a todo. |
 | `verify_index` | Verify vector index integrity - diagnose orphaned memories that are stored but not searchable. Returns health status and count of orphaned memories. |
-| `what_i_know` | Surface everything related to a topic |
 
 ---
 
