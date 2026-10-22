@@ -37,6 +37,15 @@ differently. `bm25_read_staleness_ms` is not recorded: the gate ingests through
 `MemorySystem::remember`, which commits BM25 as it writes, so nothing is ever
 buffered when it recalls.
 
+### Signal switches
+
+`disabled_signals` (env `VELD_DIALS_DISABLE_SIGNALS`, comma-separated) switches named
+recall signals off; empty, the default, runs all of them. The ids are `SIGNAL_IDS` in
+`src/memory/dials.rs`, the set recall passes to `signal_enabled`. An id outside it
+disables nothing, so it is not accepted silently: `PUT /api/dials` refuses the body with
+a 400 naming the unknown id, and the env var and a persisted blob drop it with a warning
+naming it.
+
 ## Lifecycle
 
 ```mermaid
