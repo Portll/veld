@@ -11,12 +11,12 @@ use axum::{
 
 use super::state::MultiUserMemoryManager;
 use super::types::{
-    BackupResponse, CleanupCorruptedRequest, CleanupCorruptedResponse, ConsolidateRequest,
-    ConsolidateResponse, CreateBackupRequest, IndexJobResponse, ListBackupsRequest,
-    ListBackupsResponse, MemoryEvent, MemoryEventKind, MigrateLegacyRequest, MigrateLegacyResponse,
-    PurgeBackupsRequest, PurgeBackupsResponse, RebuildIndexRequest, RepairIndexRequest,
-    RepairIndexResponse, RestoreBackupRequest, RestoreBackupResponse, VerifyBackupRequest,
-    VerifyBackupResponse, VerifyIndexRequest,
+    AuditEventKind, BackupResponse, CleanupCorruptedRequest, CleanupCorruptedResponse,
+    ConsolidateRequest, ConsolidateResponse, CreateBackupRequest, IndexJobResponse,
+    ListBackupsRequest, ListBackupsResponse, MemoryEvent, MemoryEventKind, MigrateLegacyRequest,
+    MigrateLegacyResponse, PurgeBackupsRequest, PurgeBackupsResponse, RebuildIndexRequest,
+    RepairIndexRequest, RepairIndexResponse, RestoreBackupRequest, RestoreBackupResponse,
+    VerifyBackupRequest, VerifyBackupResponse, VerifyIndexRequest,
 };
 use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
@@ -1202,7 +1202,7 @@ pub async fn create_backup(
             let secondary_count = metadata.secondary_stores.len();
             state.log_event(
                 &req.user_id,
-                "BACKUP_CREATED",
+                AuditEventKind::BackupCreated,
                 &metadata.backup_id.to_string(),
                 &format!(
                     "Backup created: {} bytes + {} secondary stores ({} bytes)",
@@ -1298,7 +1298,7 @@ pub async fn purge_backups(
             if purged_count > 0 {
                 state.log_event(
                     &req.user_id,
-                    "BACKUP_PURGE",
+                    AuditEventKind::BackupPurge,
                     &format!("keep_{}", req.keep_count),
                     &format!("Purged {} old backups", purged_count),
                 );
@@ -1341,7 +1341,7 @@ pub async fn restore_backup(
 
     state.log_event(
         &user_id,
-        "BACKUP_RESTORED",
+        AuditEventKind::BackupRestored,
         &format!("backup_{}", req.backup_id.unwrap_or(0)),
         &format!(
             "Restored {} stores: {:?} (max_lsn={:?})",

@@ -52,7 +52,7 @@ use crate::storage::legacy_rocksdb::{
 use crate::storage::{AuditLogEntry, AuditStore, StorageCapabilities};
 use crate::streaming;
 
-use super::types::{AuditEvent, ContextStatus, MemoryEvent, MemoryEventKind};
+use super::types::{AuditEvent, AuditEventKind, ContextStatus, MemoryEvent, MemoryEventKind};
 
 /// Type alias for context sessions map
 pub type ContextSessions = DashMap<String, ContextStatus>;
@@ -1206,10 +1206,10 @@ impl MultiUserMemoryManager {
     }
 
     /// Log audit event (non-blocking with background persistence)
-    pub fn log_event(&self, user_id: &str, event_type: &str, memory_id: &str, details: &str) {
+    pub fn log_event(&self, user_id: &str, kind: AuditEventKind, memory_id: &str, details: &str) {
         let event = AuditEvent {
             timestamp: chrono::Utc::now(),
-            event_type: event_type.to_string(),
+            event_type: kind.as_str().to_string(),
             memory_id: memory_id.to_string(),
             details: details.to_string(),
         };
@@ -6291,7 +6291,7 @@ mod background_task_tests {
             for i in 0..events {
                 state.log_event(
                     "drain-probe",
-                    "PROBE",
+                    AuditEventKind::Update,
                     &format!("probe-{i}"),
                     "queued write",
                 );

@@ -7,7 +7,7 @@ use axum::{extract::State, response::Json};
 use serde::Deserialize;
 
 use super::state::MultiUserMemoryManager;
-use super::types::RetrieveResponse;
+use super::types::{AuditEventKind, RetrieveResponse};
 use super::utils::run_blocking;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{self, Query as MemoryQuery};
@@ -180,7 +180,7 @@ pub async fn multimodal_search(
 
     state.log_event(
         &req.user_id,
-        "MULTIMODAL_SEARCH",
+        AuditEventKind::MultimodalSearch,
         &req.mode,
         &format!("Retrieved {} memories using {} mode", count, req.mode),
     );
@@ -276,7 +276,7 @@ pub async fn robotics_search(
 
     state.log_event(
         &req.user_id,
-        "ROBOTICS_SEARCH",
+        AuditEventKind::RoboticsSearch,
         &req.mode,
         &format!(
             "Retrieved {} robotics memories (robot={:?}, mission={:?})",

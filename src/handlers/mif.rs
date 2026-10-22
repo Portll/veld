@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::state::MultiUserMemoryManager;
-use super::types::RetrieveResponse;
+use super::types::{AuditEventKind, RetrieveResponse};
 use super::utils::run_blocking;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::graph_memory;
@@ -156,7 +156,7 @@ pub async fn export_mif(
 
     state.log_event(
         &user_id,
-        "MIF_EXPORT",
+        AuditEventKind::MifExport,
         &export_id,
         &format!(
             "Exported {} memories, {} todos (format: {})",
@@ -339,7 +339,7 @@ pub async fn import_mif(
 
     state.log_event(
         &req.user_id,
-        "MIF_IMPORT",
+        AuditEventKind::MifImport,
         "import",
         &format!(
             "Imported {} memories, {} todos, {} projects, {} reminders, {} entities, {} edges. Skipped {} dupes, {} errors",
@@ -452,7 +452,7 @@ pub async fn add_entity(
 
     state.log_event(
         &req.user_id,
-        "ADD_ENTITY",
+        AuditEventKind::AddEntity,
         &req.name,
         &format!("Added entity '{}' with label {:?}", req.name, entity_label),
     );
@@ -571,7 +571,7 @@ pub async fn add_relationship(
 
     state.log_event(
         &req.user_id,
-        "ADD_RELATIONSHIP",
+        AuditEventKind::AddRelationship,
         &format!("{}->{}", req.from_entity, req.to_entity),
         &format!(
             "Added {:?} relationship from '{}' to '{}'",

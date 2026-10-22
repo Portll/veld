@@ -6,6 +6,7 @@ use axum::{extract::State, response::Json};
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
+use super::types::AuditEventKind;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{self, FactCluster, PurgeReason, SemanticFact, TemporalFact};
 use crate::validation;
@@ -559,12 +560,12 @@ pub async fn facts_purge(
         total_scanned,
         context_blocks_flagged
     );
-    let event_type = if dry_run {
-        "facts.purge.dryrun"
+    let kind = if dry_run {
+        AuditEventKind::FactsPurgeDryRun
     } else {
-        "facts.purge"
+        AuditEventKind::FactsPurge
     };
-    state.log_event(&req.user_id, event_type, "", &details);
+    state.log_event(&req.user_id, kind, "", &details);
 
     Ok(Json(FactsPurgeResponse {
         success: true,
@@ -606,7 +607,12 @@ fn scan_context_blocks_for_dead_refs(
                 block.key,
                 candidate_ids.join(",")
             );
-            state.log_event(user_id, "context_block.dirty", &block.key, &details);
+            state.log_event(
+                user_id,
+                AuditEventKind::ContextBlockDirty,
+                &block.key,
+                &details,
+            );
             flagged += 1;
         }
     }
@@ -751,7 +757,12 @@ pub async fn facts_preview_purge(
     // `log_event` enqueues async persistence; failures degrade silently with
     // a warn-level trace. `audit_recorded=true` indicates the enqueue
     // succeeded synchronously (the in-memory ring-buffer write).
-    state.log_event(&req.user_id, "facts.purge.preview", "", &details);
+    state.log_event(
+        &req.user_id,
+        AuditEventKind::FactsPurgePreview,
+        "",
+        &details,
+    );
 
     Ok(Json(FactsPreviewPurgeResponse {
         success: true,

@@ -14,7 +14,7 @@ use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
-use super::types::{MemoryEvent, MemoryEventKind};
+use super::types::{AuditEventKind, MemoryEvent, MemoryEventKind};
 use super::utils::resolve_request_user_id;
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
@@ -811,7 +811,7 @@ pub async fn create_reminder(
 
     state.log_event(
         &req.user_id,
-        "REMINDER_CREATE",
+        AuditEventKind::ReminderCreate,
         &task.id.to_string(),
         &format!(
             "Created reminder trigger={}: '{}'",
@@ -1400,7 +1400,7 @@ pub async fn create_todo(
 
     state.log_event(
         &req.user_id,
-        "TODO_CREATE",
+        AuditEventKind::TodoCreate,
         &todo.id.0.to_string(),
         &format!(
             "Created todo [{}] project={}: '{}'",
@@ -1974,7 +1974,7 @@ async fn update_todo_core(
 
     state.log_event(
         &req.user_id,
-        "TODO_UPDATE",
+        AuditEventKind::TodoUpdate,
         &todo.id.0.to_string(),
         &format!(
             "Updated todo [{}]: {}",
@@ -2154,7 +2154,7 @@ async fn complete_todo_core(
 
             state.log_event(
                 &req.user_id,
-                "TODO_COMPLETE",
+                AuditEventKind::TodoComplete,
                 &completed.id.0.to_string(),
                 &format!(
                     "Completed todo [{}]: '{}' (recurrence={})",
