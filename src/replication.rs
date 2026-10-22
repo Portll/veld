@@ -631,6 +631,15 @@ fn save_cursor(path: &Path, users: &BTreeMap<String, UserProgress>) -> Result<()
     Ok(())
 }
 
+/// [`save_cursor`] for the follower loop: the write and rename run on the blocking pool, as
+/// a slow or full disk would otherwise hold the runtime worker the poll is on.
+async fn persist_cursor(path: &Path, users: BTreeMap<String, UserProgress>) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || save_cursor(&path, &users))
+        .await
+        .map_err(|e| anyhow!("cursor save task: {e}"))?
+}
+
 /// Start (or switch) following `source`. The cursor saved for that source is
 /// resumed, so a follower that was stopped picks up where it left off. A poll still
 /// running for the previous target stops at its next page.
@@ -804,7 +813,7 @@ pub async fn source_follows(
 }
 
 /// Mark a tenant diverged and persist the cursor, if the poll is still current.
-fn mark_diverged(generation: u64, cursor: &Path, user_id: &str, reason: &str) -> Result<()> {
+async fn mark_diverged(generation: u64, cursor: &Path, user_id: &str, reason: &str) -> Result<()> {
     let users = {
         let mut status = FOLLOW.write();
         if status.generation != generation {
@@ -822,7 +831,7 @@ fn mark_diverged(generation: u64, cursor: &Path, user_id: &str, reason: &str) ->
         entry.diverged = Some(reason.to_string());
         status.users.clone()
     };
-    save_cursor(cursor, &users)
+    persist_cursor(cursor, users).await
 }
 
 /// Sync one tenant from its cursor to the leader's head, page by page, persisting
@@ -862,7 +871,7 @@ async fn sync_user(
         };
         head = page.head_lsn;
         if let Some(reason) = divergence(&progress, &page) {
-            mark_diverged(generation, cursor, &info.user_id, &reason)?;
+            mark_diverged(generation, cursor, &info.user_id, &reason).await?;
             return Ok(consumed);
         }
         let Some(last_lsn) = page.records.last().map(|r| r.lsn) else {
@@ -896,7 +905,7 @@ async fn sync_user(
         let Some(users) = saved else {
             return Ok(consumed);
         };
-        save_cursor(cursor, &users)?;
+        persist_cursor(cursor, users).await?;
         consumed += received;
         if !page.more {
             break;
@@ -913,7 +922,7 @@ async fn sync_user(
         entry.refresh_lag();
         status.users.clone()
     };
-    save_cursor(cursor, &users)?;
+    persist_cursor(cursor, users).await?;
     Ok(consumed)
 }
 
