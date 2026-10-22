@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::state::MultiUserMemoryManager;
-use super::utils::resolve_request_user_id;
+use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{self, MemoryId};
@@ -70,28 +70,37 @@ pub async fn decompress_memory(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
     let memory_id = MemoryId(
         uuid::Uuid::parse_str(&req.id).map_err(|_| AppError::InvalidMemoryId(req.id.clone()))?,
     );
 
-    // Get the memory
-    let memory = memory_guard
-        .get_memory(&memory_id)
-        .map_err(AppError::Internal)?;
+    let decompressed = run_blocking(move || {
+        let memory_guard = memory_sys.read();
 
-    if !memory.compressed {
+        // Get the memory
+        let memory = memory_guard
+            .get_memory(&memory_id)
+            .map_err(AppError::Internal)?;
+
+        if !memory.compressed {
+            return Ok(None);
+        }
+
+        // Decompress using compression pipeline
+        memory_guard
+            .decompress_memory(&memory)
+            .map(Some)
+            .map_err(AppError::Internal)
+    })
+    .await?;
+
+    let Some(decompressed) = decompressed else {
         return Ok(Json(serde_json::json!({
             "success": true,
             "message": "Memory is not compressed",
             "was_compressed": false
         })));
-    }
-
-    // Decompress using compression pipeline
-    let decompressed = memory_guard
-        .decompress_memory(&memory)
-        .map_err(AppError::Internal)?;
+    };
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -128,10 +137,14 @@ pub async fn get_storage_stats(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let stats = memory_guard
-        .get_storage_stats()
-        .map_err(AppError::Internal)?;
+    // Counts and sizes come from a scan of every stored record.
+    let stats = run_blocking(move || {
+        memory_sys
+            .read()
+            .get_storage_stats()
+            .map_err(AppError::Internal)
+    })
+    .await?;
 
     Ok(Json(stats))
 }

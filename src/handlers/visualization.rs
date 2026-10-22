@@ -10,10 +10,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
-use super::utils::resolve_request_user_id;
+use super::utils::{resolve_request_user_id, run_blocking};
 use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::GraphStats as VisualizationStats;
+use crate::user_memory::SharedUserMemory;
 use crate::validation;
 use std::sync::Arc;
 
@@ -69,6 +70,15 @@ pub async fn get_brain_state(
         .await
         .map_err(AppError::Internal)?;
 
+    // The long-term sample comes from a read of the whole store.
+    let response = run_blocking(move || Ok(brain_state(&memory))).await?;
+
+    Ok(Json(response))
+}
+
+/// [`get_brain_state`]'s tiers, read on the calling thread: the long-term sample is taken
+/// from a read of every stored memory.
+fn brain_state(memory: &SharedUserMemory) -> BrainStateResponse {
     let memory_guard = memory.read();
 
     let mut working_memory = Vec::new();
@@ -144,12 +154,12 @@ pub async fn get_brain_state(
         },
     };
 
-    Ok(Json(BrainStateResponse {
+    BrainStateResponse {
         working_memory,
         session_memory,
         longterm_memory,
         stats,
-    }))
+    }
 }
 
 /// GET /api/visualization/{user_id}/stats - Get visualization statistics
@@ -169,8 +179,8 @@ pub async fn get_visualization_stats(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory.read();
-    let stats = memory_guard.get_visualization_stats();
+    // The visualization graph's lock is held for writing through a whole build.
+    let stats = run_blocking(move || Ok(memory.read().get_visualization_stats())).await?;
 
     Ok(Json(stats))
 }
@@ -192,8 +202,8 @@ pub async fn get_visualization_dot(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory.read();
-    let dot = memory_guard.export_visualization_dot();
+    // Renders the whole visualization graph, whose lock is held for writing through a build.
+    let dot = run_blocking(move || Ok(memory.read().export_visualization_dot())).await?;
 
     Ok(dot)
 }
@@ -216,10 +226,14 @@ pub async fn build_visualization(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory.read();
-    let stats = memory_guard
-        .build_visualization_graph()
-        .map_err(AppError::Internal)?;
+    // Builds from every tier, the long-term one read from the store.
+    let stats = run_blocking(move || {
+        memory
+            .read()
+            .build_visualization_graph()
+            .map_err(AppError::Internal)
+    })
+    .await?;
 
     Ok(Json(stats))
 }
@@ -317,6 +331,16 @@ pub async fn get_graph_data(
         .await
         .map_err(AppError::Internal)?;
 
+    // Every entity and relationship, and a read of the whole store for the memory sample.
+    let response = run_blocking(move || graph_data(&memory)).await?;
+
+    Ok(Json(response))
+}
+
+/// [`get_graph_data`]'s nodes and edges, read on the calling thread: every entity and
+/// relationship in the graph store, and a sample of long-term memories from a read of the
+/// whole store.
+fn graph_data(memory: &SharedUserMemory) -> Result<GraphDataResponse, AppError> {
     let memory_guard = memory.read();
     let graph = memory_guard
         .graph_memory()
@@ -435,7 +459,7 @@ pub async fn get_graph_data(
         }
     }
 
-    Ok(Json(GraphDataResponse {
+    Ok(GraphDataResponse {
         stats: GraphDataStats {
             total_nodes: nodes.len(),
             total_edges: edges.len(),
@@ -445,7 +469,7 @@ pub async fn get_graph_data(
         },
         nodes,
         edges,
-    }))
+    })
 }
 
 /// Generate the HTML page for graph visualization (includes 2D/3D toggle)
