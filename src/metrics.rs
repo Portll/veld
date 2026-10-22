@@ -235,9 +235,12 @@ pub enum RecallStage {
     Embedding,
     /// Episode pre-filter and graph expansion (Layers 1-2).
     Graph,
-    /// Vector search, query decomposition included (Layer 3).
+    /// Vector search, query decomposition included (Layer 3), timed by itself.
     Vector,
-    /// BM25, RRF fusion and the Layer 4 boosts.
+    /// BM25 keyword search, Layer 4's lexical leg, run on its own thread beside the vector
+    /// search and timed by itself; it overlaps `Vector`.
+    Bm25,
+    /// RRF fusion and the Layer 4 boosts.
     Fusion,
     /// Candidate fetch and unified scoring (Layer 5).
     Fetch,
@@ -248,11 +251,12 @@ pub enum RecallStage {
 }
 
 impl RecallStage {
-    pub const ALL: [RecallStage; 8] = [
+    pub const ALL: [RecallStage; 9] = [
         RecallStage::QueryAnalysis,
         RecallStage::Embedding,
         RecallStage::Graph,
         RecallStage::Vector,
+        RecallStage::Bm25,
         RecallStage::Fusion,
         RecallStage::Fetch,
         RecallStage::CrossEncoder,
@@ -265,6 +269,7 @@ impl RecallStage {
             RecallStage::Embedding => "embedding",
             RecallStage::Graph => "graph",
             RecallStage::Vector => "vector",
+            RecallStage::Bm25 => "bm25",
             RecallStage::Fusion => "fusion",
             RecallStage::Fetch => "fetch",
             RecallStage::CrossEncoder => "cross_encoder",
