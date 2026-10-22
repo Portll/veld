@@ -40,6 +40,16 @@ pub struct Report {
     /// [`compare_to_baseline`] refuses them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tape: Option<String>,
+    /// The write path ingest took. A report written before this field existed ingested
+    /// synchronously, which is what the default reads it as; [`compare_to_baseline`] refuses
+    /// two paths.
+    #[serde(default)]
+    pub ingest: IngestPath,
+    /// Comparisons and fires per similarity bar (see `crate::similarity::bars`) across every
+    /// repeat's ingest and queries, keyed by bar label. Empty on reports written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub similarity_bars: BTreeMap<String, BarCount>,
     /// Git SHA of the working tree the run was produced from.
     pub git_sha: String,
     /// RFC3339 timestamp at the start of the run.
@@ -65,6 +75,46 @@ pub struct Report {
 
 fn default_repeats() -> usize {
     1
+}
+
+/// The write path the harness ingests through (`SHODH_EVAL_INGEST`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IngestPath {
+    /// `MemorySystem::remember`: embeds inline and indexes BM25 directly, so the write gate,
+    /// the deferred interference check and the journaled BM25 projection never run.
+    #[default]
+    Synchronous,
+    /// The remember handler's path: a deferred, journaled write whose embedding, write gate
+    /// and interference run after its `Remember` frame, with BM25 fed by the journal.
+    Deferred,
+}
+
+impl IngestPath {
+    /// `SHODH_EVAL_INGEST`: unset or `sync` ingests synchronously, `deferred` as the handler
+    /// does. Any other value is refused, so a typo cannot measure the wrong pipeline.
+    pub fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("SHODH_EVAL_INGEST") {
+            Ok(value) => Self::parse(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Synchronous),
+            Err(e) => anyhow::bail!("SHODH_EVAL_INGEST: {e}"),
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "sync" | "synchronous" => Ok(Self::Synchronous),
+            "deferred" => Ok(Self::Deferred),
+            other => anyhow::bail!("SHODH_EVAL_INGEST={other:?}: expected sync or deferred"),
+        }
+    }
+}
+
+/// One similarity bar's comparisons over a run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BarCount {
+    pub evaluated: u64,
+    pub fired: u64,
 }
 
 /// Layer 5.3's cross-encoder budget for an undecomposed query when the `rerank_count` dial is
@@ -774,6 +824,18 @@ pub fn compare_to_baseline(
             ),
         }];
     }
+    if baseline.ingest != current.ingest {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "ingest path differs: baseline {:?}, current {:?}. Only the deferred path runs \
+                 the write gate, the deferred interference check and the journaled BM25 \
+                 projection, so the difference is not a change in the code. Compare against a \
+                 baseline recorded under the same SHODH_EVAL_INGEST",
+                baseline.ingest, current.ingest
+            ),
+        }];
+    }
     let (base_rerank, cur_rerank) = match (&baseline.rerank, &current.rerank) {
         (Some(b), Some(c)) => (b, c),
         (b, _) => {
@@ -1249,6 +1311,8 @@ mod tests {
             }),
             retrieval_dials: Some(RetrievalDials::default()),
             model_tape: None,
+            ingest: IngestPath::Synchronous,
+            similarity_bars: BTreeMap::new(),
             git_sha: "deadbeef".to_string(),
             timestamp: chrono::Utc::now(),
             layers,
@@ -1338,6 +1402,31 @@ mod tests {
         v.as_object_mut().unwrap().remove("model_tape");
         let parsed: Report = serde_json::from_value(v).expect("old report must parse");
         assert_eq!(parsed.model_tape, None);
+    }
+
+    #[test]
+    fn report_without_ingest_key_parses_as_synchronous_and_a_deferred_run_is_refused() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("ingest");
+        let baseline: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(baseline.ingest, IngestPath::Synchronous);
+        assert!(baseline.similarity_bars.is_empty());
+
+        let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+        assert!(compare_to_baseline(&baseline, &current, 0.0).is_empty());
+        current.ingest = IngestPath::Deferred;
+        let failures = compare_to_baseline(&baseline, &current, 0.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].detail.contains("ingest path differs"));
+    }
+
+    #[test]
+    fn ingest_path_parses_sync_and_deferred_and_refuses_anything_else() {
+        for value in ["", "sync", "Synchronous", " sync "] {
+            assert_eq!(IngestPath::parse(value).unwrap(), IngestPath::Synchronous);
+        }
+        assert_eq!(IngestPath::parse("deferred").unwrap(), IngestPath::Deferred);
+        assert!(IngestPath::parse("defered").is_err());
     }
 
     /// A run with reranking off against the reranked baseline is two pipelines, not a
