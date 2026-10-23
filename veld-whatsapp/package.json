@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
-    "@anthropic-ai/sdk": "^0.52.0",
+    "@anthropic-ai/sdk": "^0.135.0",
     "groq-sdk": "^0.8.0",
     "openai": "^4.77.0",
     "qrcode-terminal": "^0.12.0",
