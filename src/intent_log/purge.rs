@@ -48,12 +48,15 @@ pub struct PurgeReport {
 
 /// Rewrite the sealed segments of the log at `log_path` without the frames of
 /// every memory whose `Forget` lies in a segment last written at least
-/// `min_age` before `now`. `cryptor` is the journal's key, needed to read the
-/// memory ids of a sealed journal; frames it cannot read are kept.
+/// `min_age` before `now`, and, when `follower_floor` is set, at or below it:
+/// the lowest LSN a replication follower has read past, so no follower misses
+/// a `Forget` it has not read. `cryptor` is the journal's key, needed to read
+/// the memory ids of a sealed journal; frames it cannot read are kept.
 pub fn purge_forgotten(
     log_path: &Path,
     cryptor: Option<&SecretCryptor>,
     min_age: Duration,
+    follower_floor: Option<Lsn>,
     now: SystemTime,
 ) -> Result<PurgeReport, IntentLogError> {
     let cutoff = now.checked_sub(min_age).unwrap_or(SystemTime::UNIX_EPOCH);
@@ -74,7 +77,9 @@ pub fn purge_forgotten(
     for segment in &eligible {
         scan(segment, cryptor, |lsn, payload| {
             if let Some(IntentPayload::Forget { memory_id, .. }) = payload {
-                forgotten.insert(memory_id.clone(), lsn);
+                if follower_floor.is_none_or(|floor| lsn <= floor) {
+                    forgotten.insert(memory_id.clone(), lsn);
+                }
             }
             Ok(())
         })?;
@@ -318,7 +323,7 @@ mod tests {
         std::fs::hard_link(&first, &linked).unwrap();
         let next = log.next_lsn();
 
-        let report = purge_forgotten(log.path(), None, 7 * DAY, SystemTime::now()).unwrap();
+        let report = purge_forgotten(log.path(), None, 7 * DAY, None, SystemTime::now()).unwrap();
 
         assert_eq!(report.memories_purged, 1);
         assert_eq!(report.frames_dropped, 3, "two snapshots and the Forget");
@@ -344,9 +349,35 @@ mod tests {
             "a later memory under the id stays"
         );
 
-        let again = purge_forgotten(log.path(), None, 7 * DAY, SystemTime::now()).unwrap();
+        let again = purge_forgotten(log.path(), None, 7 * DAY, None, SystemTime::now()).unwrap();
         assert_eq!(again.frames_dropped, 0);
         assert_eq!(again.segments_rewritten, 0);
+    }
+
+    /// A Forget past the lowest cursor a replication follower has read past is
+    /// kept, so that follower still reads it; once followers are past it, it goes.
+    #[test]
+    fn a_forget_no_follower_has_read_yet_is_kept() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (log, forget_lsn) = written(&dir, None);
+        age_sealed(&log, 10 * DAY);
+        let behind = Lsn(forget_lsn.0 - 1);
+
+        let held =
+            purge_forgotten(log.path(), None, 7 * DAY, Some(behind), SystemTime::now()).unwrap();
+        assert_eq!(held.frames_dropped, 0);
+        assert!(contains(&journal_bytes(&dir), "alpha-secret"));
+
+        let read = purge_forgotten(
+            log.path(),
+            None,
+            7 * DAY,
+            Some(forget_lsn),
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(read.frames_dropped, 3);
+        assert!(!contains(&journal_bytes(&dir), "alpha-secret"));
     }
 
     #[test]
@@ -354,7 +385,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (log, _) = written(&dir, None);
         age_sealed(&log, 2 * DAY);
-        let report = purge_forgotten(log.path(), None, 7 * DAY, SystemTime::now()).unwrap();
+        let report = purge_forgotten(log.path(), None, 7 * DAY, None, SystemTime::now()).unwrap();
         assert_eq!(report.segments_eligible, 0);
         assert!(contains(&journal_bytes(&dir), "alpha-secret"));
     }
@@ -366,10 +397,11 @@ mod tests {
         let (log, _) = written(&dir, Some(key()));
         age_sealed(&log, 10 * DAY);
 
-        let keyless = purge_forgotten(log.path(), None, 7 * DAY, SystemTime::now()).unwrap();
+        let keyless = purge_forgotten(log.path(), None, 7 * DAY, None, SystemTime::now()).unwrap();
         assert_eq!(keyless.frames_dropped, 0, "frames it cannot read are kept");
 
-        let keyed = purge_forgotten(log.path(), Some(&key()), 7 * DAY, SystemTime::now()).unwrap();
+        let keyed =
+            purge_forgotten(log.path(), Some(&key()), 7 * DAY, None, SystemTime::now()).unwrap();
         assert_eq!(keyed.frames_dropped, 3);
         assert!(memory_ids(&log).iter().all(|(_, id)| id != "a"));
     }
@@ -379,7 +411,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (mut log, forget_lsn) = written(&dir, None);
         age_sealed(&log, 10 * DAY);
-        purge_forgotten(log.path(), None, 7 * DAY, SystemTime::now()).unwrap();
+        purge_forgotten(log.path(), None, 7 * DAY, None, SystemTime::now()).unwrap();
 
         log.truncate_to_lsn(forget_lsn).unwrap();
         let kept = memory_ids(&log);

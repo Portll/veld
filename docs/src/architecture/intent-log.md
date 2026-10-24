@@ -87,9 +87,13 @@ backup is purged. A legacy segment without a header is left as it is, and so
 is a sealed journal whose key the server does not hold. A point-in-time
 restore to an erased LSN cuts after the last frame below it.
 
-The window must be longer than any replication follower can fall behind: a
-follower that applied a memory but had not yet read its `Forget` never sees
-that `Forget` once it is erased, and keeps the memory.
+Replication followers are protected for as long as the window. The leader
+keeps, per tenant and by hour, the lowest cursor a follower asked its feed to
+read past (`<data>/replication/feed-floors.json`, recorded only while erasure
+is on), and erases a `Forget` only once that floor is at or past it. A follower
+that does not poll for longer than the window is no longer counted: if it had
+applied a memory but not its `Forget`, it keeps the memory. The server warns at
+startup when erasure is on and it can feed followers.
 
 ## Payload shape
 

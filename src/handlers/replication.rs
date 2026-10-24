@@ -110,6 +110,7 @@ pub async fn records(
             json!({"error": "no_such_log", "detail": format!("no intent log for tenant '{}'", q.user_id)}),
         );
     }
+    state.note_feed_cursor(&q.user_id, q.after_lsn);
     let limit = q.limit.unwrap_or(replication::FEED_LIMIT).clamp(1, 5000);
     let page = tokio::task::spawn_blocking(move || {
         replication::feed(&state, &q.user_id, q.after_lsn, limit)

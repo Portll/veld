@@ -2663,6 +2663,7 @@ mod tests {
             &head,
             None,
             std::time::Duration::from_secs(7 * 86_400),
+            None,
             std::time::SystemTime::now(),
         )
         .unwrap();
