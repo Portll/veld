@@ -14,7 +14,7 @@
 - On **macOS**, prefer `./scripts/cargo-dev.sh ...` so Cargo inherits the local `libclang` workaround needed by the current RocksDB build path. (See `scripts/setup-libclang-env.sh`.)
 - **No git-commit signatures** — no "Generated with Claude Code", no "Co-Authored-By" lines. Clean commit messages only.
 - Maintain the per-user lock pattern (see [src/handlers/consolidation.rs](src/handlers/consolidation.rs) `CONSOLIDATION_LOCKS`) for any new write path that mutates shared per-user state.
-- When you must serialize a new field on `Memory`, make it backwards-compatible: `Option<T>` with `#[serde(default)]`, or wire a migration in [src/storage/](src/storage/).
+- `Memory` and every type inside it (`Experience` included) are stored as positional bincode, so `#[serde(default)]` does **not** make a new field safe: an added or reordered field makes every stored record undecodable. Keep new data off the record where you can, or add a legacy decode arm; see Record-schema migration below.
 
 ---
 
@@ -225,7 +225,7 @@ Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (be
   ```
 
 - **Background work**: long-running handlers spawn a detached `tokio::task` and return 202 Accepted. This avoids the 60s HTTP timeout killing pipelines mid-flight.
-- **Storage migrations**: when adding a `Memory` field, deserialize with `#[serde(default)]`; existing on-disk records must round-trip.
+- **Storage migrations**: a change to the field layout of any type reachable from `Memory` needs a legacy decode arm for the old shape, and existing on-disk records must round-trip. `tests/persisted_layout.rs` fails at the commit that changes the layout.
 - **Public route safety**: only public-router probes (`/health/*`) may live without auth. The `public_router_has_no_per_user_handlers` test enforces no public handler reads `?user_id=`. Do not bypass it.
 
 ---
@@ -343,7 +343,14 @@ See [decision 0001](docs/src/decisions/0001-redb-migration.md) (amended) and [de
 
 ### Record-schema migration
 
-When you add a field on `Memory`, make it backwards-compatible: `Option<T>` with `#[serde(default)]`. The legacy `bincode1` format support in [Cargo.toml](Cargo.toml) handles pre-2.0 memories. Forward-incompatible changes need an explicit migration in [src/storage/](src/storage/); these are rare and should land paired with a `## Schema Version & CHANGELOG` entry once that section exists (LLM-Wiki Phase 1).
+`Memory` is bincode-encoded by position, and so is every type reachable from it, `Experience` included. `#[serde(default)]` does nothing there: a field added, removed or reordered on any of those types makes every record written before it undecodable (4a54053 appended two fields to `AgentSession` and 24 live records stopped decoding). `tests/persisted_layout.rs` snapshots the traced layout and fails at the commit that changes it.
+
+In order of preference:
+
+1. **Keep the data off the record.** Write-time-only data travels as a parameter, as the graph build's `Option<&TagSources>` does. Data that must persist can live beside the record in the user's key-value keyspace, keyed by memory id, as `memory::tag_sources` does.
+2. **If it must be on the record**, add a legacy decode arm for the old shape (the `Legacy*` structs in [src/memory/storage.rs](src/memory/storage.rs)), then accept the new layout as the header of `tests/persisted_layout.rs` describes.
+
+The legacy `bincode1` format support in [Cargo.toml](Cargo.toml) handles pre-2.0 memories. These changes are rare and should land paired with a `## Schema Version & CHANGELOG` entry once that section exists (LLM-Wiki Phase 1).
 
 ### Distribution-binary scaling
 
