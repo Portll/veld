@@ -316,7 +316,14 @@ pub struct RecallMemory {
     pub experience: RecallExperience,
     pub importance: f32,
     pub created_at: String,
+    /// The pipeline's unified score divided by the top result's, so it sits in `[0, 1]`,
+    /// falls with rank, and the gap between two results means something. Rank-based when
+    /// the pipeline attached no score.
     pub score: f32,
+    /// The unified score as the pipeline left it, unnormalised, so a reader can check a
+    /// ranking against its signal attribution. Absent when the pipeline attached none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_score: Option<f32>,
     pub tier: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub competition_conflict: Option<bool>,

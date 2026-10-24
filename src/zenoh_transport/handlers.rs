@@ -806,10 +806,11 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
 
     // Convert to response format
     let total = memories.len();
+    let top_score = memories.first().and_then(|m| m.score);
     let recall_memories: Vec<RecallMemory> = memories
         .iter()
         .enumerate()
-        .map(|(rank, m)| recall_memory_view(m, rank, total))
+        .map(|(rank, m)| recall_memory_view(m, rank, total, top_score))
         .collect();
 
     // Search related todos

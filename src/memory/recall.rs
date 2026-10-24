@@ -3332,6 +3332,13 @@ impl super::MemorySystem {
             }
         }
 
+        // Layer 5.2: rank on the unified score. The fetch above kept fusion order, so until
+        // 2026-10-24 the cross-encoder took its budget from the fused list and every layer
+        // that does not re-sort (5.7, 5.8, the final cut when 5.35 and 5.36 stay quiet) ran on
+        // an order the Layer 5 signals had never touched. Stable, so fused ties keep their
+        // content-ordered tie-break.
+        memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+
         // =====================================================================
         // LAYER 5.3: CROSS-ENCODER RERANKING (BRIDGE-2)
         // =====================================================================
