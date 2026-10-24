@@ -5018,7 +5018,8 @@ impl MemorySystem {
         // Use validated pattern compilation with ReDoS protection
         let regex = crate::validation::validate_and_compile_pattern(pattern)
             .map_err(|e| anyhow::anyhow!("Invalid pattern: {e}"))?;
-        let mut count = 0;
+        let mut removed: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
+        let mut deindexed = 0;
         let mut working_removed = 0;
         let mut session_removed = 0;
         let mut long_term_removed = 0;
@@ -5038,10 +5039,10 @@ impl MemorySystem {
             let mut working = self.working_memory.write();
             for id in &working_ids {
                 if working.remove(id).is_ok() {
-                    self.retriever.remove_memory(id);
+                    deindexed += usize::from(self.retriever.remove_memory(id));
                     self.bm25_remove_direct(id, bm25);
                     working_removed += 1;
-                    count += 1;
+                    removed.insert(id.clone());
                 }
             }
         }
@@ -5061,10 +5062,10 @@ impl MemorySystem {
             let mut session = self.session_memory.write();
             for id in &session_ids {
                 if session.remove(id).is_ok() {
-                    self.retriever.remove_memory(id);
+                    deindexed += usize::from(self.retriever.remove_memory(id));
                     self.bm25_remove_direct(id, bm25);
                     session_removed += 1;
-                    count += 1;
+                    removed.insert(id.clone());
                 }
             }
         }
@@ -5074,12 +5075,12 @@ impl MemorySystem {
         for memory in self.long_term_memories_for_erasure()? {
             if regex.is_match(&memory.experience.content) {
                 lt_ids.push(memory.id.clone());
-                self.retriever.remove_memory(&memory.id);
+                deindexed += usize::from(self.retriever.remove_memory(&memory.id));
                 self.bm25_remove_direct(&memory.id, bm25);
                 self.long_term_memory.delete(&memory.id)?;
                 self.note_removed(memory.importance());
                 long_term_removed += 1;
-                count += 1;
+                removed.insert(memory.id.clone());
             }
         }
 
@@ -5092,19 +5093,14 @@ impl MemorySystem {
         self.cleanup_graph_for_ids(&all_ids);
         self.cleanup_interference_for_ids(&all_ids);
 
-        // Update stats
-        {
-            let mut stats = self.stats.write();
-            stats.total_memories = stats.total_memories.saturating_sub(count);
-            stats.working_memory_count = stats.working_memory_count.saturating_sub(working_removed);
-            stats.session_memory_count = stats.session_memory_count.saturating_sub(session_removed);
-            stats.long_term_memory_count = stats
-                .long_term_memory_count
-                .saturating_sub(long_term_removed);
-            stats.vector_index_count = stats.vector_index_count.saturating_sub(count);
-        }
-
-        Ok(count)
+        self.note_bulk_forget(
+            removed.len(),
+            working_removed,
+            session_removed,
+            long_term_removed,
+            deindexed,
+        );
+        Ok(removed.len())
     }
 
     /// Forget memories matching ANY of the specified tags
@@ -5117,7 +5113,8 @@ impl MemorySystem {
     }
 
     fn forget_by_tags_with(&self, tags: &[String], bm25: Bm25Sync) -> Result<usize> {
-        let mut count = 0;
+        let mut removed: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
+        let mut deindexed = 0;
         let mut working_removed = 0;
         let mut session_removed = 0;
         let mut long_term_removed = 0;
@@ -5134,10 +5131,10 @@ impl MemorySystem {
                 .collect();
             for id in &ids_to_remove {
                 if working.remove(id).is_ok() {
-                    self.retriever.remove_memory(id);
+                    deindexed += usize::from(self.retriever.remove_memory(id));
                     self.bm25_remove_direct(id, bm25);
                     working_removed += 1;
-                    count += 1;
+                    removed.insert(id.clone());
                 }
             }
             all_deleted_ids.extend(ids_to_remove);
@@ -5154,10 +5151,10 @@ impl MemorySystem {
                 .collect();
             for id in &ids_to_remove {
                 if session.remove(id).is_ok() {
-                    self.retriever.remove_memory(id);
+                    deindexed += usize::from(self.retriever.remove_memory(id));
                     self.bm25_remove_direct(id, bm25);
                     session_removed += 1;
-                    count += 1;
+                    removed.insert(id.clone());
                 }
             }
             all_deleted_ids.extend(ids_to_remove);
@@ -5167,12 +5164,12 @@ impl MemorySystem {
         for memory in self.long_term_memories_for_erasure()? {
             if memory.experience.tags.iter().any(|t| tags.contains(t)) {
                 all_deleted_ids.push(memory.id.clone());
-                self.retriever.remove_memory(&memory.id);
+                deindexed += usize::from(self.retriever.remove_memory(&memory.id));
                 self.bm25_remove_direct(&memory.id, bm25);
                 self.long_term_memory.delete(&memory.id)?;
                 self.note_removed(memory.importance());
                 long_term_removed += 1;
-                count += 1;
+                removed.insert(memory.id.clone());
             }
         }
 
@@ -5180,19 +5177,14 @@ impl MemorySystem {
         self.cleanup_graph_for_ids(&all_deleted_ids);
         self.cleanup_interference_for_ids(&all_deleted_ids);
 
-        // Update stats
-        {
-            let mut stats = self.stats.write();
-            stats.total_memories = stats.total_memories.saturating_sub(count);
-            stats.working_memory_count = stats.working_memory_count.saturating_sub(working_removed);
-            stats.session_memory_count = stats.session_memory_count.saturating_sub(session_removed);
-            stats.long_term_memory_count = stats
-                .long_term_memory_count
-                .saturating_sub(long_term_removed);
-            stats.vector_index_count = stats.vector_index_count.saturating_sub(count);
-        }
-
-        Ok(count)
+        self.note_bulk_forget(
+            removed.len(),
+            working_removed,
+            session_removed,
+            long_term_removed,
+            deindexed,
+        );
+        Ok(removed.len())
     }
 
     /// Forget memories within a date range (inclusive)
@@ -5202,7 +5194,8 @@ impl MemorySystem {
         end: chrono::DateTime<chrono::Utc>,
         bm25: Bm25Sync,
     ) -> Result<usize> {
-        let mut count = 0;
+        let mut removed: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
+        let mut deindexed = 0;
         let mut working_removed = 0;
         let mut session_removed = 0;
         let mut long_term_removed = 0;
@@ -5222,10 +5215,10 @@ impl MemorySystem {
             let mut working = self.working_memory.write();
             for id in &working_ids {
                 if working.remove(id).is_ok() {
-                    self.retriever.remove_memory(id);
+                    deindexed += usize::from(self.retriever.remove_memory(id));
                     self.bm25_remove_direct(id, bm25);
                     working_removed += 1;
-                    count += 1;
+                    removed.insert(id.clone());
                 }
             }
         }
@@ -5245,10 +5238,10 @@ impl MemorySystem {
             let mut session = self.session_memory.write();
             for id in &session_ids {
                 if session.remove(id).is_ok() {
-                    self.retriever.remove_memory(id);
+                    deindexed += usize::from(self.retriever.remove_memory(id));
                     self.bm25_remove_direct(id, bm25);
                     session_removed += 1;
-                    count += 1;
+                    removed.insert(id.clone());
                 }
             }
         }
@@ -5260,14 +5253,14 @@ impl MemorySystem {
         let mut lt_ids = Vec::new();
         for memory in memories {
             lt_ids.push(memory.id.clone());
-            self.retriever.remove_memory(&memory.id);
+            deindexed += usize::from(self.retriever.remove_memory(&memory.id));
             self.bm25_remove_direct(&memory.id, bm25);
             self.long_term_memory.delete(&memory.id)?;
             if !memory.is_forgotten() {
                 self.note_removed(memory.importance());
             }
             long_term_removed += 1;
-            count += 1;
+            removed.insert(memory.id.clone());
         }
 
         // Clean up graph episodes and interference records for all deleted memories
@@ -5279,24 +5272,20 @@ impl MemorySystem {
         self.cleanup_graph_for_ids(&all_ids);
         self.cleanup_interference_for_ids(&all_ids);
 
-        // Update stats
-        {
-            let mut stats = self.stats.write();
-            stats.total_memories = stats.total_memories.saturating_sub(count);
-            stats.working_memory_count = stats.working_memory_count.saturating_sub(working_removed);
-            stats.session_memory_count = stats.session_memory_count.saturating_sub(session_removed);
-            stats.long_term_memory_count = stats
-                .long_term_memory_count
-                .saturating_sub(long_term_removed);
-            stats.vector_index_count = stats.vector_index_count.saturating_sub(count);
-        }
-
-        Ok(count)
+        self.note_bulk_forget(
+            removed.len(),
+            working_removed,
+            session_removed,
+            long_term_removed,
+            deindexed,
+        );
+        Ok(removed.len())
     }
 
     /// Forget memories of a specific type
     fn forget_by_type(&self, exp_type: ExperienceType, bm25: Bm25Sync) -> Result<usize> {
-        let mut count = 0;
+        let mut removed: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
+        let mut deindexed = 0;
         let mut working_removed = 0;
         let mut session_removed = 0;
         let mut long_term_removed = 0;
@@ -5316,10 +5305,10 @@ impl MemorySystem {
             let mut working = self.working_memory.write();
             for id in &working_ids {
                 if working.remove(id).is_ok() {
-                    self.retriever.remove_memory(id);
+                    deindexed += usize::from(self.retriever.remove_memory(id));
                     self.bm25_remove_direct(id, bm25);
                     working_removed += 1;
-                    count += 1;
+                    removed.insert(id.clone());
                 }
             }
         }
@@ -5339,10 +5328,10 @@ impl MemorySystem {
             let mut session = self.session_memory.write();
             for id in &session_ids {
                 if session.remove(id).is_ok() {
-                    self.retriever.remove_memory(id);
+                    deindexed += usize::from(self.retriever.remove_memory(id));
                     self.bm25_remove_direct(id, bm25);
                     session_removed += 1;
-                    count += 1;
+                    removed.insert(id.clone());
                 }
             }
         }
@@ -5354,14 +5343,14 @@ impl MemorySystem {
         let mut lt_ids = Vec::new();
         for memory in memories {
             lt_ids.push(memory.id.clone());
-            self.retriever.remove_memory(&memory.id);
+            deindexed += usize::from(self.retriever.remove_memory(&memory.id));
             self.bm25_remove_direct(&memory.id, bm25);
             self.long_term_memory.delete(&memory.id)?;
             if !memory.is_forgotten() {
                 self.note_removed(memory.importance());
             }
             long_term_removed += 1;
-            count += 1;
+            removed.insert(memory.id.clone());
         }
 
         // Clean up graph episodes and interference records for all deleted memories
@@ -5373,19 +5362,32 @@ impl MemorySystem {
         self.cleanup_graph_for_ids(&all_ids);
         self.cleanup_interference_for_ids(&all_ids);
 
-        // Update stats
-        {
-            let mut stats = self.stats.write();
-            stats.total_memories = stats.total_memories.saturating_sub(count);
-            stats.working_memory_count = stats.working_memory_count.saturating_sub(working_removed);
-            stats.session_memory_count = stats.session_memory_count.saturating_sub(session_removed);
-            stats.long_term_memory_count = stats
-                .long_term_memory_count
-                .saturating_sub(long_term_removed);
-            stats.vector_index_count = stats.vector_index_count.saturating_sub(count);
-        }
+        self.note_bulk_forget(
+            removed.len(),
+            working_removed,
+            session_removed,
+            long_term_removed,
+            deindexed,
+        );
+        Ok(removed.len())
+    }
 
-        Ok(count)
+    /// Stats after a bulk forget. A memory counts once however many tiers held a copy of it,
+    /// as `remember` counted it once; `deindexed` is the vector entries actually removed.
+    fn note_bulk_forget(
+        &self,
+        memories: usize,
+        working: usize,
+        session: usize,
+        long_term: usize,
+        deindexed: usize,
+    ) {
+        let mut stats = self.stats.write();
+        stats.total_memories = stats.total_memories.saturating_sub(memories);
+        stats.working_memory_count = stats.working_memory_count.saturating_sub(working);
+        stats.session_memory_count = stats.session_memory_count.saturating_sub(session);
+        stats.long_term_memory_count = stats.long_term_memory_count.saturating_sub(long_term);
+        stats.vector_index_count = stats.vector_index_count.saturating_sub(deindexed);
     }
 
     /// Forget ALL memories for a user (GDPR compliance - right to erasure)
@@ -5398,7 +5400,8 @@ impl MemorySystem {
         // (graph/long-term) is already deleted. Working/session memory is
         // ephemeral and will be empty on restart anyway.
 
-        let mut count = 0;
+        // A memory counts once however many tiers held a copy of it.
+        let mut erased: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
 
         // Step 1: Clear knowledge graph first (GDPR - complete erasure)
         // Graph references memories, so clean references before deleting memories
@@ -5423,7 +5426,6 @@ impl MemorySystem {
         // not through get_all: that leaves soft-forgotten records out, and an erasure
         // must also reach a record that no longer decodes.
         let long_term_ids = self.long_term_memory.get_all_ids()?;
-        let long_term_count = long_term_ids.len();
         for id in &long_term_ids {
             let live_importance = self
                 .long_term_memory
@@ -5438,7 +5440,7 @@ impl MemorySystem {
                 self.note_removed(importance);
             }
         }
-        count += long_term_count;
+        erased.extend(long_term_ids);
 
         // Step 3: Clear session memory (ephemeral — lost on restart anyway)
         let session_ids: Vec<MemoryId> = {
@@ -5449,7 +5451,6 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        let session_count = session_ids.len();
         for id in &session_ids {
             self.retriever.remove_memory(id);
             self.bm25_remove_direct(id, bm25);
@@ -5458,7 +5459,7 @@ impl MemorySystem {
             let mut session = self.session_memory.write();
             session.clear();
         }
-        count += session_count;
+        erased.extend(session_ids);
 
         // Step 4: Clear working memory (ephemeral — lost on restart anyway)
         let working_ids: Vec<MemoryId> = {
@@ -5469,7 +5470,6 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        let working_count = working_ids.len();
         for id in &working_ids {
             self.retriever.remove_memory(id);
             self.bm25_remove_direct(id, bm25);
@@ -5478,7 +5478,7 @@ impl MemorySystem {
             let mut working = self.working_memory.write();
             working.clear();
         }
-        count += working_count;
+        erased.extend(working_ids);
 
         // Step 5: Commit BM25 deletions
         self.bm25_commit_direct(bm25);
@@ -5566,7 +5566,7 @@ impl MemorySystem {
             stats.vector_index_count = 0;
         }
 
-        Ok(count)
+        Ok(erased.len())
     }
 
     /// Show memory visualization (ASCII art of memory graph)
@@ -7913,7 +7913,9 @@ impl MemorySystem {
     /// Returns the number of memories warmed into the session tier (0 when
     /// disabled, when no rhythm/context signal exists, or when nothing was due).
     pub fn run_prefetch_tick(&self, user_id: &str) -> usize {
-        let now = chrono::Utc::now();
+        // The scoring clock: which memories are due, and so what is warmed into the session
+        // tier that recall searches, is an elapsed-time judgement like recency.
+        let now = scoring_now();
 
         // --- Kill-switch / re-probe gate (I4/J5) -----------------------------
         // Decide up front whether to run at all, without holding any tier lock.
@@ -7990,22 +7992,21 @@ impl MemorySystem {
         // Recent entities are seeded from the due memories so the existing
         // entity_query path can broaden beyond the exact due set; falls back to
         // the temporal-pattern query (time-of-day) when no entities are present.
+        // Most overdue first. The entities are joined into the query text, so their order
+        // decides what is warmed and must not follow the session map's hash order.
         let mut recent_entities: Vec<String> = Vec::new();
         if due_ids.len() >= crate::constants::PREFETCH_MIN_DUE_CANDIDATES {
-            let due_set: std::collections::HashSet<&MemoryId> = due_ids.iter().collect();
             let session = self.session_memory.read();
-            for mem in session.all_memories() {
-                if due_set.contains(&mem.id) {
-                    for e in mem.experience.entities.iter().take(3) {
-                        if !recent_entities.contains(e) {
-                            recent_entities.push(e.clone());
-                        }
+            for mem in due_ids.iter().filter_map(|id| session.get(id)) {
+                for e in mem.experience.entities.iter().take(3) {
+                    if !recent_entities.contains(e) {
+                        recent_entities.push(e.clone());
                     }
                 }
             }
         }
 
-        let mut context = retrieval::PrefetchContext::from_current_time();
+        let mut context = retrieval::PrefetchContext::at(now);
         context.recent_entities = recent_entities;
 
         let engine =
@@ -9190,23 +9191,68 @@ mod prefetch_tick_integration_tests {
         (sys, tmp)
     }
 
-    fn remember_now(sys: &MemorySystem, content: &str) -> MemoryId {
+    fn remember_at(
+        sys: &MemorySystem,
+        content: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> MemoryId {
         let exp = Experience {
             content: content.to_string(),
             ..Default::default()
         };
-        sys.remember(exp, Some(chrono::Utc::now()))
-            .expect("remember")
+        sys.remember(exp, Some(at)).expect("remember")
+    }
+
+    fn remember_now(sys: &MemorySystem, content: &str) -> MemoryId {
+        remember_at(sys, content, chrono::Utc::now())
+    }
+
+    /// `VELD_EVAL_NOW` pinned for one test, restored on drop. The tick reads the scoring
+    /// clock, and a harness test in this binary pins `SHODH_EVAL_NOW` for the rest of the
+    /// process; `VELD_` wins over it.
+    struct PinnedScoringClock {
+        _env: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl PinnedScoringClock {
+        fn at(rfc3339: &str) -> (Self, chrono::DateTime<chrono::Utc>) {
+            let env = crate::memory::ablation::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("VELD_EVAL_NOW").ok();
+            std::env::set_var("VELD_EVAL_NOW", rfc3339);
+            let now = chrono::DateTime::parse_from_rfc3339(rfc3339)
+                .expect("an RFC 3339 instant")
+                .with_timezone(&chrono::Utc);
+            (
+                Self {
+                    _env: env,
+                    previous,
+                },
+                now,
+            )
+        }
+    }
+
+    impl Drop for PinnedScoringClock {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("VELD_EVAL_NOW", value),
+                None => std::env::remove_var("VELD_EVAL_NOW"),
+            }
+        }
     }
 
     /// A memory accessed on a synthetic weekly rhythm is warmed back into the
-    /// session tier by a simulated heavy prefetch tick.
+    /// session tier by a simulated heavy prefetch tick. The rhythm is laid out on a
+    /// scoring clock far from the wall clock, so the tick must judge it on that clock.
     #[test]
     fn periodic_memory_is_warm_in_session_after_tick() {
+        let (_clock, now) = PinnedScoringClock::at("2025-03-04T12:00:00Z");
         let (sys, _tmp) = fresh_system();
-        let now = chrono::Utc::now();
 
-        let id = remember_now(&sys, "weekly standup notes for the platform team");
+        let id = remember_at(&sys, "weekly standup notes for the platform team", now);
 
         // Synthetic weekly rhythm: last access exactly one fallback-period
         // (7 days) ago => the due-predictor marks it due under the default
@@ -10913,6 +10959,90 @@ mod lifecycle_tests {
                 system.long_term_memory.get_memory(&kept).unwrap().is_some(),
                 "{backend}: a memory neither criterion names was erased"
             );
+        }
+    }
+
+    /// Remember `content` and give it a session-tier copy too, as a prefetch tick warms one:
+    /// the memory then sits in the working tier, the session tier and the store at once.
+    fn remember_in_every_tier(
+        system: &MemorySystem,
+        experience_type: ExperienceType,
+        content: &str,
+        tags: &[&str],
+    ) -> MemoryId {
+        let id = system
+            .remember(
+                Experience {
+                    experience_type,
+                    content: content.to_string(),
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let shared = system.working_memory.read().get(&id).expect("working copy");
+        let mut session = system.session_memory.write();
+        if !session.contains(&id) {
+            session.add_shared(shared).unwrap();
+        }
+        id
+    }
+
+    /// A bulk forget reports memories, not copies. Which memories have tier copies depends
+    /// on what a prefetch tick warmed, so counting copies made one corpus report a different
+    /// count from one run to the next (recall_engine_parity's forget:tags and forget:pattern).
+    #[test]
+    fn a_bulk_forget_counts_a_memory_once_however_many_tiers_hold_it() {
+        for (backend, system, _tmp) in systems() {
+            remember_in_every_tier(
+                &system,
+                ExperienceType::Observation,
+                "The arcade league meets on Thursdays.",
+                &["gaming"],
+            );
+            remember_in_every_tier(
+                &system,
+                ExperienceType::Observation,
+                "The turtle census starts at dawn.",
+                &[],
+            );
+            remember_in_every_tier(
+                &system,
+                ExperienceType::Discovery,
+                "The cache key omits the tenant.",
+                &[],
+            );
+            remember_in_every_tier(
+                &system,
+                ExperienceType::Observation,
+                "The harbour closes at noon.",
+                &[],
+            );
+
+            for (criterion, label) in [
+                (ForgetCriteria::ByTags(vec!["gaming".to_string()]), "tags"),
+                (
+                    ForgetCriteria::Pattern("turtle census".to_string()),
+                    "pattern",
+                ),
+                (ForgetCriteria::ByType(ExperienceType::Discovery), "type"),
+                (ForgetCriteria::All, "all"),
+            ] {
+                let before = system.stats().total_memories;
+                assert_eq!(
+                    system.forget(criterion).unwrap(),
+                    1,
+                    "{backend}: forget by {label} counted tier copies"
+                );
+                if label != "all" {
+                    assert_eq!(
+                        system.stats().total_memories,
+                        before - 1,
+                        "{backend}: forget by {label} moved total_memories by copies"
+                    );
+                }
+            }
         }
     }
 

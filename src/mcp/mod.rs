@@ -203,7 +203,7 @@ pub fn handle_prompt_submit(api_url: &str, api_key: &str, user_id: &str, message
         if !ctx.memories.is_empty() {
             context_parts.push("## Relevant Memories (auto-surfaced)\n".to_string());
             for mem in ctx.memories.iter() {
-                let relevance = (mem.relevance_score * 100.0) as u32;
+                let relevance = (mem.score * 100.0) as u32;
                 context_parts.push(format!(
                     "- [{}%] **{}**: {}",
                     relevance,
@@ -321,5 +321,91 @@ pub async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
         cmd.args(&args);
         let status = cmd.status()?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server() -> VeldMcpServer {
+        VeldMcpServer::new(
+            "http://127.0.0.1:1".to_string(),
+            "test-key".to_string(),
+            "test-user".to_string(),
+        )
+    }
+
+    /// The tool names are the MCP contract: a client's saved tool calls break if one
+    /// is renamed or dropped, whatever the rmcp version underneath.
+    #[test]
+    fn tool_list_is_the_published_contract() {
+        let tools = server().tool_router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(
+            names,
+            [
+                "dataset_create",
+                "dataset_link",
+                "dataset_list",
+                "dataset_query",
+                "demote_to_cold",
+                "gap_analyze",
+                "gap_mapper",
+                "get_dials",
+                "lineage_confirm",
+                "lineage_link",
+                "lineage_reject",
+                "lineage_stats",
+                "lineage_trace",
+                "move_to_tier",
+                "pin_memory",
+                "proactive_context",
+                "promote_to_hot",
+                "recall",
+                "reinforce_memories",
+                "remember",
+                "set_dials",
+                "unpin_memory",
+            ]
+        );
+        for tool in &tools {
+            assert_eq!(
+                tool.input_schema.get("type").and_then(|v| v.as_str()),
+                Some("object"),
+                "{} input schema is not an object",
+                tool.name
+            );
+            assert!(
+                tool.description.as_deref().is_some_and(|d| !d.is_empty()),
+                "{} has no description",
+                tool.name
+            );
+        }
+
+        let remember = tools.iter().find(|t| t.name == "remember").unwrap();
+        let properties = remember
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["content", "tags", "type"]);
+        assert_eq!(
+            remember.input_schema.get("required"),
+            Some(&serde_json::json!(["content"]))
+        );
+    }
+
+    #[test]
+    fn server_info_advertises_tools_on_the_2024_11_05_protocol() {
+        let info = server().get_info();
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2024_11_05);
+        assert!(info.capabilities.tools.is_some());
+        assert!(info
+            .instructions
+            .as_deref()
+            .is_some_and(|i| i.starts_with("Veld Memory")));
     }
 }

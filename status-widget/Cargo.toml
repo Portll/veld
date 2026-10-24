@@ -7,7 +7,7 @@ description = "Ratatui rendering primitives for Veld status surfaces"
 license = "LicenseRef-Veld-Evaluation-1.0"
 
 [dependencies]
-ratatui = "0.28"
+ratatui = "0.30"
 chrono = { version = "0.4", features = ["serde"] }
 veld-status-core = { path = "../status-core" }
 

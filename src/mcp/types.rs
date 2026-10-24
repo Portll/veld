@@ -270,7 +270,7 @@ pub(crate) struct SurfacedMemory {
     pub id: String,
     pub content: String,
     pub memory_type: String,
-    pub relevance_score: f32,
+    pub score: f32,
 }
 
 #[derive(Deserialize)]
@@ -289,10 +289,12 @@ pub(crate) struct Todo {
     pub project: Option<String>,
 }
 
+/// `POST /api/remember` answers the id and whether the write stored a new record.
 #[derive(Deserialize)]
 pub(crate) struct RememberResponse {
     pub id: String,
-    pub message: String,
+    #[serde(default)]
+    pub stored: bool,
 }
 
 #[derive(Deserialize)]
@@ -300,14 +302,21 @@ pub(crate) struct RecallResponse {
     pub memories: Vec<RecalledMemory>,
 }
 
+/// One row of `POST /api/recall`: the text sits under `experience`, the rank under `score`.
 #[derive(Deserialize)]
 pub(crate) struct RecalledMemory {
     pub id: String,
+    pub experience: RecalledExperience,
+    pub score: f32,
+    #[serde(default)]
+    pub tier: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RecalledExperience {
     pub content: String,
-    pub memory_type: String,
-    pub similarity: f32,
-    #[allow(dead_code)]
-    pub tags: Vec<String>,
+    #[serde(default)]
+    pub memory_type: Option<String>,
 }
 
 // Lineage API response types
@@ -333,21 +342,21 @@ pub(crate) struct LineageEdgeInfo {
 
 #[derive(Deserialize)]
 pub(crate) struct LineageConfirmResponse {
-    pub message: String,
-    pub edge_id: String,
+    pub confirmed: bool,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct LineageRejectResponse {
-    pub message: String,
-    #[allow(dead_code)]
-    pub deleted: bool,
+    pub rejected: bool,
 }
 
+/// `POST /api/lineage/link` answers the edge it created.
 #[derive(Deserialize)]
 pub(crate) struct LineageAddResponse {
-    pub message: String,
-    pub edge_id: String,
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub relation: String,
 }
 
 #[derive(Deserialize)]

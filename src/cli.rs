@@ -23,8 +23,8 @@ use clap::{Parser, Subcommand};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, ErrorCode, Implementation, ProtocolVersion, ServerCapabilities,
-        ServerInfo,
+        CallToolResult, ContentBlock, ErrorCode, Implementation, ProtocolVersion,
+        ServerCapabilities, ServerInfo,
     },
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
@@ -2154,7 +2154,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Stored memory: {}",
                 resp.id
             ))])),
@@ -2198,7 +2198,7 @@ impl VeldMcpServer {
                         mem.experience.content
                     ));
                 }
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -2239,7 +2239,7 @@ impl VeldMcpServer {
                         mem.content.chars().take(200).collect::<String>()
                     ));
                 }
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -2304,7 +2304,7 @@ impl VeldMcpServer {
                     output.push_str(&format!("\n**Path:** {}\n", resp.path.join(" → ")));
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -2333,7 +2333,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "✓ Confirmed edge: {} - {}",
                 resp.edge_id, resp.message
             ))])),
@@ -2364,7 +2364,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "✗ Rejected edge: {}",
                 resp.message
             ))])),
@@ -2397,7 +2397,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "⚡ Created link: {} - {}",
                 resp.edge_id, resp.message
             ))])),
@@ -2451,7 +2451,7 @@ impl VeldMcpServer {
                     }
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
