@@ -17,6 +17,8 @@
 //! `Queue::distinct_users` + per-user `next_unclaimed_for_user`.
 
 use chrono::Utc;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::sync::watch;
@@ -95,9 +97,21 @@ pub async fn run_worker(
             SleepMode::Rem => REM_DEADLINE_SECS,
         };
 
-        let process_fut = process_item(&orch, &worker_id, claimed.clone());
-        let outcome = tokio::select! {
-            _ = cancel_rx.changed() => {
+        let deadline = tokio::time::sleep(StdDuration::from_secs(deadline_secs));
+        tokio::pin!(deadline);
+        let processed = process_item(
+            &orch,
+            &worker_id,
+            claimed.clone(),
+            &mut PassLimits {
+                cancel_rx: &mut cancel_rx,
+                deadline,
+            },
+        )
+        .await;
+        let outcome = match processed {
+            Ok(outcome) => outcome,
+            Err(Interrupted::Cancelled) => {
                 // Cancellation mid-process: release the claim so a future
                 // restart can retry. We don't try to charge for in-flight
                 // tokens — the LLM call (if any) was aborted by the runtime.
@@ -107,7 +121,7 @@ pub async fn run_worker(
                 tracing::info!(worker = %worker_id, "sleep-time worker cancelled mid-process");
                 return;
             }
-            _ = tokio::time::sleep(StdDuration::from_secs(deadline_secs)) => {
+            Err(Interrupted::DeadlineExceeded) => {
                 tracing::warn!(
                     worker = %worker_id,
                     user_id = %claimed.user_id,
@@ -118,19 +132,22 @@ pub async fn run_worker(
                 // Best-effort event emission. If the user memory can't be
                 // resolved (deletion race), skip the event but still release.
                 if let Ok(user_mem) = orch.user_memory_async(&claimed.user_id).await {
-                    let guard = user_mem.read();
-                    emit_aborted(
-                        guard.as_memory_system(),
-                        &claimed.user_id,
-                        None,
-                        claimed.mode,
-                        "deadline exceeded",
-                    );
+                    let (user_id, mode) = (claimed.user_id.clone(), claimed.mode);
+                    on_blocking_pool(move || {
+                        let guard = user_mem.read();
+                        emit_aborted(
+                            guard.as_memory_system(),
+                            &user_id,
+                            None,
+                            mode,
+                            "deadline exceeded",
+                        );
+                    })
+                    .await;
                 }
                 let _ = orch.queue().release(&claimed);
                 continue;
             }
-            outcome = process_fut => outcome,
         };
 
         match outcome {
@@ -207,19 +224,61 @@ enum ProcessOutcome {
     Drop,
 }
 
+/// Why a pass ended before it had an outcome.
+#[derive(Debug, PartialEq, Eq)]
+enum Interrupted {
+    /// The worker was told to shut down.
+    Cancelled,
+    /// The pass ran past its per-mode deadline.
+    DeadlineExceeded,
+}
+
+/// What ends a pass early: shutdown and the per-mode deadline. They are checked only where the
+/// pass waits on its tenant, the rewriter or its graph. A blocking phase, once started, runs to
+/// the end and its outcome stands, as it did when the phases ran inline on the worker.
+struct PassLimits<'a> {
+    cancel_rx: &'a mut watch::Receiver<bool>,
+    deadline: Pin<&'a mut tokio::time::Sleep>,
+}
+
+impl PassLimits<'_> {
+    async fn until<T>(&mut self, work: impl Future<Output = T>) -> Result<T, Interrupted> {
+        tokio::select! {
+            _ = self.cancel_rx.changed() => Err(Interrupted::Cancelled),
+            _ = self.deadline.as_mut() => Err(Interrupted::DeadlineExceeded),
+            out = work => Ok(out),
+        }
+    }
+}
+
+/// Runs `work` on the blocking pool. It reads or writes the tenant's store under the tenant's
+/// lock, which waits behind any writer, and a tokio worker held that long is one fewer for every
+/// other request. A panic in `work` resumes here, as it would have inline. `None` when the
+/// runtime is shutting down and never started it.
+async fn on_blocking_pool<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(out) => Some(out),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => None,
+    }
+}
+
 async fn process_item(
     orch: &Arc<SleepTimeOrchestrator>,
     worker_id: &str,
     item: QueueItem,
-) -> ProcessOutcome {
+    limits: &mut PassLimits<'_>,
+) -> Result<ProcessOutcome, Interrupted> {
     let user_id = &item.user_id;
     let mode = item.mode;
 
     // Resolve the user's memory (multi-tenant routing). We acquire the read
-    // guard *only* during the synchronous evidence-assembly and post-LLM
-    // application phases — never across an `.await`, because parking_lot's
-    // guard is `!Send`.
-    let user_mem = match orch.user_memory_async(user_id).await {
+    // guard *only* inside the evidence-assembly and post-LLM application
+    // phases, each a blocking-pool task — never across an `.await`, because
+    // parking_lot's guard is `!Send`.
+    let user_mem = match limits.until(orch.user_memory_async(user_id)).await? {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
@@ -228,236 +287,271 @@ async fn process_item(
                 error = %e,
                 "could not resolve user memory; releasing claim"
             );
-            return ProcessOutcome::Retryable;
+            return Ok(ProcessOutcome::Retryable);
         }
     };
 
-    // ---- Phase A (sync): assemble evidence + pre-flight budget --------------
-    let phase_a = (|| -> Result<Option<super::types::EvidencePack>, ProcessOutcome> {
-        let user_mem_guard = user_mem.read();
-        let mem_sys = user_mem_guard.as_memory_system();
+    // ---- Phase A (blocking pool): assemble evidence + pre-flight budget -----
+    let phase_a = {
+        let (orch, user_mem) = (Arc::clone(orch), Arc::clone(&user_mem));
+        let (worker_id, user_id, trigger) = (worker_id.to_string(), user_id.clone(), item.trigger);
+        move || -> Result<Option<super::types::EvidencePack>, ProcessOutcome> {
+            let (worker_id, user_id) = (worker_id.as_str(), user_id.as_str());
+            let user_mem_guard = user_mem.read();
+            let mem_sys = user_mem_guard.as_memory_system();
 
-        let pack = match assemble_evidence_pack(
-            mem_sys,
-            orch.block_store(),
-            orch.budget(),
-            orch.graduation(),
-            user_id,
-            mode,
-            item.trigger,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(
-                    worker = %worker_id,
-                    user_id = %user_id,
-                    error = %e,
-                    "evidence-pack assembly failed; releasing claim"
-                );
-                return Err(ProcessOutcome::Retryable);
-            }
-        };
-
-        if pack.memories.is_empty() && pack.blocks.is_empty() {
-            tracing::debug!(worker = %worker_id, user_id = %user_id, "evidence pack empty; skipping");
-            return Ok(None);
-        }
-
-        let projected = orch.rewriter().project_tokens(&pack);
-        if let Err(e) = orch.try_charge_call(user_id, projected) {
-            match e {
-                SleepTimeError::BudgetExhausted { what, .. } => {
-                    emit_budget_exhausted(mem_sys, user_id, &what);
-                    return Err(ProcessOutcome::Drop);
-                }
-                other => {
-                    tracing::warn!(
-                        worker = %worker_id,
-                        user_id = %user_id,
-                        error = %other,
-                        "unexpected budget error; releasing claim"
-                    );
-                    return Err(ProcessOutcome::Retryable);
-                }
-            }
-        }
-
-        Ok(Some(pack))
-    })();
-
-    let pack = match phase_a {
-        Ok(Some(pack)) => pack,
-        Ok(None) => return ProcessOutcome::Completed,
-        Err(outcome) => return outcome,
-    };
-
-    // ---- Phase B (async): LLM call — NO user memory guard held --------------------
-    let rewriter_result = orch.rewriter().rewrite(&pack).await;
-
-    // Resolved before Phase C takes its guard: a graph not yet open is opened on the
-    // blocking pool, and the guard cannot be held across that await.
-    let edge_graph = match &rewriter_result {
-        Ok(out) if !out.edge_proposals.is_empty() => Some(orch.user_graph_async(user_id).await),
-        _ => None,
-    };
-
-    // ---- Phase C (sync): settle spend, apply, persist, emit -----------------
-    let user_mem_guard = user_mem.read();
-    let mem_sys = user_mem_guard.as_memory_system();
-
-    let rewriter_output = match rewriter_result {
-        Ok(out) => out,
-        Err(e) => {
-            // Always settle actual spend even on error — if any tokens were
-            // billed they belong to the user's ledger.
-            let _ = orch.budget().record_actual_spend(user_id, 0);
-            tracing::warn!(
-                worker = %worker_id,
-                user_id = %user_id,
-                error = %e,
-                "rewriter call failed"
-            );
-            match e {
-                SleepTimeError::OutputValidation(reason) | SleepTimeError::ParseError(reason) => {
-                    emit_aborted(mem_sys, user_id, None, mode, &reason);
-                    return ProcessOutcome::Drop;
-                }
-                SleepTimeError::BlockLocked { block_key } => {
-                    emit_aborted(mem_sys, user_id, Some(&block_key), mode, "locked");
-                    return ProcessOutcome::Drop;
-                }
-                _ => return ProcessOutcome::Retryable,
-            }
-        }
-    };
-
-    if let Err(e) = orch
-        .budget()
-        .record_actual_spend(user_id, rewriter_output.total_tokens)
-    {
-        tracing::warn!(
-            worker = %worker_id,
-            user_id = %user_id,
-            error = %e,
-            "failed to record actual spend"
-        );
-    }
-
-    for proposal in &rewriter_output.proposals {
-        match apply_proposal(orch, mem_sys, user_id, &item.trigger, proposal) {
-            Ok(()) => {}
-            Err(e) => {
-                tracing::warn!(
-                    worker = %worker_id,
-                    user_id = %user_id,
-                    block_key = %proposal.block_key,
-                    error = %e,
-                    "failed to apply rewrite proposal"
-                );
-            }
-        }
-    }
-
-    // R43: REM-mode edge proposals. Apply BEFORE observations so any
-    // entity references the observations contain are guaranteed to have
-    // their graph edges live by the time downstream retrieval runs.
-    // NREM mode produces no edge proposals (filtered at rewriter parse
-    // time), so this is a no-op for NREM.
-    if let Some(edge_graph) = edge_graph {
-        match edge_graph {
-            Ok(graph) => match super::edge_proposals::apply_edge_proposals(
-                &graph,
-                &rewriter_output.edge_proposals,
+            let pack = match assemble_evidence_pack(
+                mem_sys,
+                orch.block_store(),
+                orch.budget(),
+                orch.graduation(),
+                user_id,
+                mode,
+                trigger,
             ) {
-                Ok(result) => {
-                    if result.applied > 0 {
-                        tracing::info!(
-                            worker = %worker_id,
-                            user_id = %user_id,
-                            applied = result.applied,
-                            dropped_unresolved = result.dropped_unresolved_entity,
-                            dropped_self_loop = result.dropped_self_loop,
-                            errors = result.errors,
-                            "REM edge proposals applied to graph"
-                        );
-                    }
-                }
+                Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(
                         worker = %worker_id,
                         user_id = %user_id,
                         error = %e,
-                        "edge-proposal apply failed (continuing)"
+                        "evidence-pack assembly failed; releasing claim"
                     );
+                    return Err(ProcessOutcome::Retryable);
                 }
-            },
-            Err(e) => {
+            };
+
+            if pack.memories.is_empty() && pack.blocks.is_empty() {
+                tracing::debug!(worker = %worker_id, user_id = %user_id, "evidence pack empty; skipping");
+                return Ok(None);
+            }
+
+            let projected = orch.rewriter().project_tokens(&pack);
+            if let Err(e) = orch.try_charge_call(user_id, projected) {
+                match e {
+                    SleepTimeError::BudgetExhausted { what, .. } => {
+                        emit_budget_exhausted(mem_sys, user_id, &what);
+                        return Err(ProcessOutcome::Drop);
+                    }
+                    other => {
+                        tracing::warn!(
+                            worker = %worker_id,
+                            user_id = %user_id,
+                            error = %other,
+                            "unexpected budget error; releasing claim"
+                        );
+                        return Err(ProcessOutcome::Retryable);
+                    }
+                }
+            }
+
+            Ok(Some(pack))
+        }
+    };
+
+    let pack = match on_blocking_pool(phase_a).await {
+        Some(Ok(Some(pack))) => pack,
+        Some(Ok(None)) => return Ok(ProcessOutcome::Completed),
+        Some(Err(outcome)) => return Ok(outcome),
+        None => {
+            tracing::warn!(
+                worker = %worker_id,
+                user_id = %user_id,
+                "evidence assembly did not run (runtime shutting down); releasing claim"
+            );
+            return Ok(ProcessOutcome::Retryable);
+        }
+    };
+
+    // ---- Phase B (async): LLM call — NO user memory guard held --------------------
+    let rewriter_result = limits.until(orch.rewriter().rewrite(&pack)).await?;
+
+    // Resolved before Phase C takes its guard: a graph not yet open is opened on the
+    // blocking pool, and the guard cannot be held across that await.
+    let edge_graph = match &rewriter_result {
+        Ok(out) if !out.edge_proposals.is_empty() => {
+            Some(limits.until(orch.user_graph_async(user_id)).await?)
+        }
+        _ => None,
+    };
+
+    // ---- Phase C (blocking pool): settle spend, apply, persist, emit --------
+    let phase_c = {
+        let (orch, user_mem) = (Arc::clone(orch), Arc::clone(&user_mem));
+        let (worker_id, user_id, trigger) = (worker_id.to_string(), user_id.clone(), item.trigger);
+        move || -> ProcessOutcome {
+            let (worker_id, user_id) = (worker_id.as_str(), user_id.as_str());
+            let user_mem_guard = user_mem.read();
+            let mem_sys = user_mem_guard.as_memory_system();
+
+            let rewriter_output = match rewriter_result {
+                Ok(out) => out,
+                Err(e) => {
+                    // Always settle actual spend even on error — if any tokens were
+                    // billed they belong to the user's ledger.
+                    let _ = orch.budget().record_actual_spend(user_id, 0);
+                    tracing::warn!(
+                        worker = %worker_id,
+                        user_id = %user_id,
+                        error = %e,
+                        "rewriter call failed"
+                    );
+                    match e {
+                        SleepTimeError::OutputValidation(reason)
+                        | SleepTimeError::ParseError(reason) => {
+                            emit_aborted(mem_sys, user_id, None, mode, &reason);
+                            return ProcessOutcome::Drop;
+                        }
+                        SleepTimeError::BlockLocked { block_key } => {
+                            emit_aborted(mem_sys, user_id, Some(&block_key), mode, "locked");
+                            return ProcessOutcome::Drop;
+                        }
+                        _ => return ProcessOutcome::Retryable,
+                    }
+                }
+            };
+
+            if let Err(e) = orch
+                .budget()
+                .record_actual_spend(user_id, rewriter_output.total_tokens)
+            {
                 tracing::warn!(
                     worker = %worker_id,
                     user_id = %user_id,
                     error = %e,
-                    "could not resolve user graph for edge proposals (continuing)"
+                    "failed to record actual spend"
                 );
             }
-        }
-    }
 
-    for draft in rewriter_output.observations {
-        let supersedes = draft.supersedes.clone();
-        match persist_observation(&draft, mem_sys) {
-            Ok(super::observation::PersistOutcome::Stored(memory_id))
-            | Ok(super::observation::PersistOutcome::Deduped(memory_id)) => {
-                emit_observation_emitted(
-                    mem_sys,
-                    user_id,
-                    &memory_id.0.to_string(),
-                    &draft,
-                    rewriter_output.total_tokens,
-                );
-                // R42 + R59: if the draft carried an explicit `supersedes`
-                // link, write the bidirectional supersession edge so
-                // retrieval can find either end in O(1). Best-effort: a
-                // store failure is logged but does not fail the rewrite —
-                // the observation itself is already persisted, and the V3
-                // maintenance pass will repair missing edges by scanning
-                // observation metadata.
-                if let Some(older) = supersedes {
-                    if let Err(e) = orch.supersession().record(
-                        &memory_id,
-                        &older,
-                        super::supersession::DEFAULT_SUPERSESSION_CONFIDENCE,
-                    ) {
+            for proposal in &rewriter_output.proposals {
+                match apply_proposal(&orch, mem_sys, user_id, &trigger, proposal) {
+                    Ok(()) => {}
+                    Err(e) => {
                         tracing::warn!(
                             worker = %worker_id,
                             user_id = %user_id,
-                            superseder = %memory_id.0,
-                            superseded = %older.0,
+                            block_key = %proposal.block_key,
                             error = %e,
-                            "failed to record supersession edge (observation already persisted)"
-                        );
-                    } else {
-                        tracing::debug!(
-                            worker = %worker_id,
-                            user_id = %user_id,
-                            superseder = %memory_id.0,
-                            superseded = %older.0,
-                            "supersession edge recorded"
+                            "failed to apply rewrite proposal"
                         );
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    worker = %worker_id,
-                    user_id = %user_id,
-                    error = %e,
-                    "failed to persist observation"
-                );
+
+            // R43: REM-mode edge proposals. Apply BEFORE observations so any
+            // entity references the observations contain are guaranteed to have
+            // their graph edges live by the time downstream retrieval runs.
+            // NREM mode produces no edge proposals (filtered at rewriter parse
+            // time), so this is a no-op for NREM.
+            if let Some(edge_graph) = edge_graph {
+                match edge_graph {
+                    Ok(graph) => match super::edge_proposals::apply_edge_proposals(
+                        &graph,
+                        &rewriter_output.edge_proposals,
+                    ) {
+                        Ok(result) => {
+                            if result.applied > 0 {
+                                tracing::info!(
+                                    worker = %worker_id,
+                                    user_id = %user_id,
+                                    applied = result.applied,
+                                    dropped_unresolved = result.dropped_unresolved_entity,
+                                    dropped_self_loop = result.dropped_self_loop,
+                                    errors = result.errors,
+                                    "REM edge proposals applied to graph"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                worker = %worker_id,
+                                user_id = %user_id,
+                                error = %e,
+                                "edge-proposal apply failed (continuing)"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            worker = %worker_id,
+                            user_id = %user_id,
+                            error = %e,
+                            "could not resolve user graph for edge proposals (continuing)"
+                        );
+                    }
+                }
             }
+
+            for draft in rewriter_output.observations {
+                let supersedes = draft.supersedes.clone();
+                match persist_observation(&draft, mem_sys) {
+                    Ok(super::observation::PersistOutcome::Stored(memory_id))
+                    | Ok(super::observation::PersistOutcome::Deduped(memory_id)) => {
+                        emit_observation_emitted(
+                            mem_sys,
+                            user_id,
+                            &memory_id.0.to_string(),
+                            &draft,
+                            rewriter_output.total_tokens,
+                        );
+                        // R42 + R59: if the draft carried an explicit `supersedes`
+                        // link, write the bidirectional supersession edge so
+                        // retrieval can find either end in O(1). Best-effort: a
+                        // store failure is logged but does not fail the rewrite —
+                        // the observation itself is already persisted, and the V3
+                        // maintenance pass will repair missing edges by scanning
+                        // observation metadata.
+                        if let Some(older) = supersedes {
+                            if let Err(e) = orch.supersession().record(
+                                &memory_id,
+                                &older,
+                                super::supersession::DEFAULT_SUPERSESSION_CONFIDENCE,
+                            ) {
+                                tracing::warn!(
+                                    worker = %worker_id,
+                                    user_id = %user_id,
+                                    superseder = %memory_id.0,
+                                    superseded = %older.0,
+                                    error = %e,
+                                    "failed to record supersession edge (observation already persisted)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    worker = %worker_id,
+                                    user_id = %user_id,
+                                    superseder = %memory_id.0,
+                                    superseded = %older.0,
+                                    "supersession edge recorded"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            worker = %worker_id,
+                            user_id = %user_id,
+                            error = %e,
+                            "failed to persist observation"
+                        );
+                    }
+                }
+            }
+
+            ProcessOutcome::Completed
+        }
+    };
+
+    match on_blocking_pool(phase_c).await {
+        Some(outcome) => Ok(outcome),
+        None => {
+            tracing::warn!(
+                worker = %worker_id,
+                user_id = %user_id,
+                "rewrite application did not run (runtime shutting down); releasing claim"
+            );
+            Ok(ProcessOutcome::Retryable)
         }
     }
-
-    ProcessOutcome::Completed
 }
 
 // =============================================================================
@@ -643,10 +737,17 @@ fn trigger_str(trigger: &SleepTimeTrigger) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::SleepTimeProfile;
-    use crate::handlers::test_helpers::{hold_init_lock, TestHarness};
+    use crate::graph_memory::GraphMemory;
+    use crate::handlers::test_helpers::{hold_init_lock, hold_write_lock, TestHarness};
     use crate::handlers::MultiUserMemoryManager;
     use crate::memory::sleep_time::rewriter::{MockRewriter, Rewriter};
+    use crate::memory::sleep_time::types::{EdgeProposalDraft, RewriterOutput};
     use std::time::Duration;
+
+    const WORKER: &str = "sleep-worker-test";
+    const NO_DEADLINE: Duration = Duration::from_secs(3600);
+    /// Tokens the scripted rewrite bills; Phase C settles them before it applies anything.
+    const SETTLED_TOKENS: u32 = 7;
 
     #[test]
     fn process_outcome_eq() {
@@ -654,17 +755,106 @@ mod tests {
         assert_ne!(ProcessOutcome::Completed, ProcessOutcome::Retryable);
     }
 
-    fn orchestrator_over(manager: &Arc<MultiUserMemoryManager>) -> Arc<SleepTimeOrchestrator> {
+    fn orchestrator_with(
+        manager: &Arc<MultiUserMemoryManager>,
+        rewriter: Rewriter,
+    ) -> Arc<SleepTimeOrchestrator> {
         Arc::new(
             SleepTimeOrchestrator::new(
                 SleepTimeProfile::Balanced.to_config(),
                 manager.shared_db.column_store(),
                 Arc::downgrade(manager),
                 Arc::clone(&manager.context_block_store),
-                Rewriter::Mock(MockRewriter::new("mock")),
+                rewriter,
             )
             .expect("orchestrator over the manager's shared database"),
         )
+    }
+
+    fn orchestrator_over(manager: &Arc<MultiUserMemoryManager>) -> Arc<SleepTimeOrchestrator> {
+        orchestrator_with(manager, Rewriter::Mock(MockRewriter::new("mock")))
+    }
+
+    fn claim(orch: &SleepTimeOrchestrator, tenant: &str, mode: SleepMode) -> QueueItem {
+        assert!(orch
+            .enqueue(tenant, mode, SleepTimeTrigger::Manual)
+            .expect("enqueue"));
+        next_claim(orch.queue(), WORKER, 60)
+            .expect("claim")
+            .expect("the queued item")
+    }
+
+    /// A pass under the limits the worker loop sets: shutdown read from `shutdown_rx`, and
+    /// `deadline` from the start.
+    async fn run_pass(
+        orch: Arc<SleepTimeOrchestrator>,
+        item: QueueItem,
+        mut shutdown_rx: watch::Receiver<bool>,
+        deadline: Duration,
+    ) -> Result<ProcessOutcome, Interrupted> {
+        let deadline = tokio::time::sleep(deadline);
+        tokio::pin!(deadline);
+        let mut limits = PassLimits {
+            cancel_rx: &mut shutdown_rx,
+            deadline,
+        };
+        process_item(&orch, WORKER, item, &mut limits).await
+    }
+
+    /// An open tenant with one context block, so its pass reaches the rewriter, and a rewriter
+    /// that proposes one graph edge, so the pass's Phase C takes the tenant graph's write lock
+    /// once it has settled the rewrite's spend.
+    fn a_pass_that_applies_an_edge(
+        harness: &TestHarness,
+        tenant: &str,
+    ) -> (
+        Arc<SleepTimeOrchestrator>,
+        QueueItem,
+        Arc<parking_lot::RwLock<GraphMemory>>,
+    ) {
+        harness.manager.get_user_memory(tenant).expect("open");
+        harness
+            .manager
+            .context_block_store
+            .set(tenant, "persona", "prefers short answers", None)
+            .expect("context block");
+        let rewriter = MockRewriter::new("mock");
+        rewriter.push(RewriterOutput {
+            proposals: Vec::new(),
+            observations: Vec::new(),
+            edge_proposals: vec![EdgeProposalDraft {
+                from_entity: "alpha".to_string(),
+                to_entity: "beta".to_string(),
+                relation: "related_to".to_string(),
+                confidence: 0.9,
+                rationale: String::new(),
+            }],
+            total_tokens: SETTLED_TOKENS,
+            model: "mock".to_string(),
+            elapsed_ms: 0,
+        });
+        let orch = orchestrator_with(&harness.manager, Rewriter::Mock(rewriter));
+        let item = claim(&orch, tenant, SleepMode::Rem);
+        let graph = harness.manager.get_user_graph(tenant).expect("graph");
+        (orch, item, graph)
+    }
+
+    /// Yields to the runtime until the pass has settled its spend, the first thing Phase C does.
+    async fn wait_for_settled_spend(orch: &SleepTimeOrchestrator, tenant: &str) {
+        let give_up = tokio::time::Instant::now() + Duration::from_secs(5);
+        while orch
+            .user_status(tenant)
+            .expect("budget")
+            .budget
+            .tokens_this_hour
+            < SETTLED_TOKENS
+        {
+            assert!(
+                tokio::time::Instant::now() < give_up,
+                "the pass never reached Phase C"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// The test runtime has one thread, so a pass that opened the tenant on it would stall the
@@ -674,17 +864,11 @@ mod tests {
         const TENANT: &str = "sleep-tenant-mid-open";
         let harness = TestHarness::new();
         let orch = orchestrator_over(&harness.manager);
-        assert!(orch
-            .enqueue(TENANT, SleepMode::Nrem, SleepTimeTrigger::Manual)
-            .expect("enqueue"));
-        let item = next_claim(orch.queue(), "sleep-worker-test", 60)
-            .expect("claim")
-            .expect("the queued item");
+        let item = claim(&orch, TENANT, SleepMode::Nrem);
 
         let (release, opener) = hold_init_lock(harness.manager.user_memory_init_lock(TENANT));
-        let pass_orch = Arc::clone(&orch);
-        let mut pass =
-            tokio::spawn(async move { process_item(&pass_orch, "sleep-worker-test", item).await });
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let mut pass = tokio::spawn(run_pass(Arc::clone(&orch), item, shutdown_rx, NO_DEADLINE));
         let waited = tokio::time::timeout(Duration::from_millis(200), &mut pass).await;
         assert!(
             waited.is_err(),
@@ -694,11 +878,120 @@ mod tests {
 
         release.send(()).expect("opener waits for release");
         opener.join().expect("opener thread");
-        assert_eq!(pass.await.expect("pass task"), ProcessOutcome::Completed);
+        assert_eq!(
+            pass.await.expect("pass task"),
+            Ok(ProcessOutcome::Completed)
+        );
         assert!(
             harness.manager.user_memories.get(TENANT).is_some(),
             "the pass opened the tenant"
         );
+    }
+
+    /// Phase A reads the tenant under its read guard, which waits while a writer holds the
+    /// tenant. Made on the one runtime thread, that wait would stall the timeout below.
+    #[tokio::test(flavor = "current_thread")]
+    async fn evidence_assembly_behind_a_tenant_writer_leaves_the_runtime_thread_free() {
+        const TENANT: &str = "sleep-evidence-behind-writer";
+        let harness = TestHarness::new();
+        let orch = orchestrator_over(&harness.manager);
+        let tenant = harness.manager.get_user_memory(TENANT).expect("open");
+        let item = claim(&orch, TENANT, SleepMode::Nrem);
+
+        let (release, writer) = hold_write_lock(tenant);
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let mut pass = tokio::spawn(run_pass(Arc::clone(&orch), item, shutdown_rx, NO_DEADLINE));
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut pass).await;
+        assert!(
+            waited.is_err(),
+            "the pass finished while a writer held its tenant, so evidence assembly held the \
+             runtime thread until the writer let go"
+        );
+
+        release.send(()).expect("writer waits for release");
+        writer.join().expect("writer thread");
+        assert_eq!(
+            pass.await.expect("pass task"),
+            Ok(ProcessOutcome::Completed)
+        );
+    }
+
+    /// Phase C applies the edge proposal under the graph's write lock, which waits while another
+    /// writer holds the graph. Made on the one runtime thread, that wait would stall the timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn applying_a_rewrite_behind_a_graph_writer_leaves_the_runtime_thread_free() {
+        const TENANT: &str = "sleep-apply-behind-writer";
+        let harness = TestHarness::new();
+        let (orch, item, graph) = a_pass_that_applies_an_edge(&harness, TENANT);
+
+        let (release, writer) = hold_write_lock(graph);
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let mut pass = tokio::spawn(run_pass(Arc::clone(&orch), item, shutdown_rx, NO_DEADLINE));
+        wait_for_settled_spend(&orch, TENANT).await;
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut pass).await;
+        assert!(
+            waited.is_err(),
+            "the pass finished while a writer held its graph, so applying the rewrite held the \
+             runtime thread until the writer let go"
+        );
+
+        release.send(()).expect("writer waits for release");
+        writer.join().expect("writer thread");
+        assert_eq!(
+            pass.await.expect("pass task"),
+            Ok(ProcessOutcome::Completed)
+        );
+    }
+
+    /// Inline, Phase C could not be cut short: shutdown and the deadline were only seen at the
+    /// pass's awaits. On the blocking pool it must still run to its outcome.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_during_phase_c_leaves_its_outcome_standing() {
+        const TENANT: &str = "sleep-shutdown-mid-apply";
+        let harness = TestHarness::new();
+        let (orch, item, graph) = a_pass_that_applies_an_edge(&harness, TENANT);
+
+        let (release, writer) = hold_write_lock(graph);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let mut pass = tokio::spawn(run_pass(Arc::clone(&orch), item, shutdown_rx, NO_DEADLINE));
+        wait_for_settled_spend(&orch, TENANT).await;
+        shutdown.send(true).expect("the pass watches for shutdown");
+        let waited = tokio::time::timeout(Duration::from_millis(100), &mut pass).await;
+        assert!(waited.is_err(), "the pass ended while its graph was held");
+
+        release.send(()).expect("writer waits for release");
+        writer.join().expect("writer thread");
+        assert_eq!(
+            pass.await.expect("pass task"),
+            Ok(ProcessOutcome::Completed),
+            "shutdown cut short a pass already applying its rewrite"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_deadline_still_ends_a_pass_waiting_on_its_tenant() {
+        const TENANT: &str = "sleep-deadline-mid-open";
+        let harness = TestHarness::new();
+        let orch = orchestrator_over(&harness.manager);
+        let item = claim(&orch, TENANT, SleepMode::Nrem);
+
+        let (release, opener) = hold_init_lock(harness.manager.user_memory_init_lock(TENANT));
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let ended = run_pass(
+            Arc::clone(&orch),
+            item,
+            shutdown_rx,
+            Duration::from_millis(100),
+        )
+        .await;
+        release.send(()).expect("opener waits for release");
+        opener.join().expect("opener thread");
+        assert_eq!(ended, Err(Interrupted::DeadlineExceeded));
+        harness
+            .manager
+            .get_user_memory_async(TENANT)
+            .await
+            .expect("the open the pass started finishes");
     }
 
     #[tokio::test(flavor = "current_thread")]
