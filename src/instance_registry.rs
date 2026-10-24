@@ -22,6 +22,7 @@
 //! ships today; a `ZenohDiscovery` / mDNS provider can be added later and merged
 //! into the same consumer code without changes here.
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +57,9 @@ pub struct InstanceInfo {
     pub port: u16,
     /// Ready-to-use base URL built from `connect_host` + `port`.
     pub base_url: String,
+    /// The TLS listener's URL, when one is serving. Absent on entries from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_url: Option<String>,
     /// Storage directory this instance is serving (distinguishes scratch vs real).
     pub data_path: String,
     /// Crate version of the running binary.
@@ -132,6 +136,23 @@ fn connectable_host(host: &str) -> String {
         "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
         other => other.to_string(),
     }
+}
+
+/// `https://` URL of a TLS listener bound to `addr`. A wildcard bind is named by the
+/// machine's hostname: the URL is for clients on other machines (local ones use
+/// `base_url`), and to them 127.0.0.1 is their own loopback.
+fn tls_url(addr: SocketAddr) -> String {
+    let host = if addr.ip().is_unspecified() {
+        sysinfo::System::host_name()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string())
+    } else {
+        match addr.ip() {
+            IpAddr::V6(ip) => format!("[{ip}]"),
+            ip => ip.to_string(),
+        }
+    };
+    format!("https://{host}:{}", addr.port())
 }
 
 fn derive_label(data_path: &Path) -> String {
@@ -281,7 +302,13 @@ impl Drop for RegistryGuard {
 /// `last_heartbeat` every [`HEARTBEAT_INTERVAL`] until [`RegistryGuard::deregister`]
 /// (or drop). On any I/O failure this logs and returns `None` — discovery is a
 /// convenience and must never take the server down.
-pub fn register(host: &str, port: u16, data_path: &Path) -> Option<RegistryGuard> {
+/// `tls`: the address the TLS listener bound, when it is on.
+pub fn register(
+    host: &str,
+    port: u16,
+    tls: Option<SocketAddr>,
+    data_path: &Path,
+) -> Option<RegistryGuard> {
     let dir = instances_dir();
     let now = Utc::now();
     reap_stale(&dir, now);
@@ -296,6 +323,7 @@ pub fn register(host: &str, port: u16, data_path: &Path) -> Option<RegistryGuard
         connect_host: connect_host.clone(),
         port,
         base_url: format!("http://{}:{}", connect_host, port),
+        tls_url: tls.map(tls_url),
         data_path: data_path.to_string_lossy().to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         label: derive_label(data_path),
@@ -358,6 +386,7 @@ mod tests {
             connect_host: "127.0.0.1".to_string(),
             port,
             base_url: format!("http://127.0.0.1:{port}"),
+            tls_url: None,
             data_path: "/tmp/veld".to_string(),
             version: "test".to_string(),
             label: "veld".to_string(),
@@ -407,6 +436,32 @@ mod tests {
         let stale = sample(2, 3031, now - chrono::Duration::seconds(120));
         assert!(fresh.is_live(now, STALE_TTL));
         assert!(!stale.is_live(now, STALE_TTL));
+    }
+
+    #[test]
+    fn tls_url_names_the_bound_host_and_port() {
+        assert_eq!(
+            tls_url("10.0.0.2:3443".parse().unwrap()),
+            "https://10.0.0.2:3443"
+        );
+        assert_eq!(tls_url("[::1]:3443".parse().unwrap()), "https://[::1]:3443");
+        let wildcard = tls_url("0.0.0.0:3443".parse().unwrap());
+        assert!(wildcard.starts_with("https://") && wildcard.ends_with(":3443"));
+        assert!(!wildcard.contains("0.0.0.0"), "{wildcard}");
+    }
+
+    #[test]
+    fn entries_without_a_tls_url_still_deserialize() {
+        let plain = serde_json::to_string(&sample(9, 3030, Utc::now())).unwrap();
+        assert!(!plain.contains("tls_url"));
+        let back: InstanceInfo = serde_json::from_str(&plain).unwrap();
+        assert_eq!(back.tls_url, None);
+
+        let mut info = sample(10, 3030, Utc::now());
+        info.tls_url = Some("https://veld.example:3443".into());
+        let back: InstanceInfo =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(back.tls_url.as_deref(), Some("https://veld.example:3443"));
     }
 
     #[test]

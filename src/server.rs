@@ -52,6 +52,8 @@ pub struct ServerRunConfig {
     pub production: bool,
     pub rate_limit: u64,
     pub max_concurrent: usize,
+    /// The optional TLS listener beside the plain one.
+    pub tls: crate::config::TlsSettings,
 }
 
 /// Start the veld HTTP server.
@@ -67,6 +69,7 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
     let file_limit = raise_open_file_limit();
     let local_dev_rate_limit_default = !config.production
         && crate::config::is_local_bind_host(&config.host)
+        && !config.tls.exposes_network()
         && std::env::var("VELD_RATE_LIMIT").is_err()
         && config.rate_limit == 4000;
     let effective_rate_limit = if local_dev_rate_limit_default {
@@ -93,6 +96,11 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
         }
         std::env::set_var("VELD_RATE_LIMIT", effective_rate_limit.to_string());
         std::env::set_var("VELD_MAX_CONCURRENT", config.max_concurrent.to_string());
+        for (name, value) in config.tls.vars() {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            }
+        }
     }
 
     // Pre-initialize ORT_DYLIB_PATH before any threads are spawned.
@@ -257,6 +265,12 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
     }
     log_production_security_warnings(&server_config);
     print_config(&server_config);
+
+    // Before any store opens, so a TLS misconfiguration refuses the start at once.
+    let tls_setup = server_config
+        .tls_listener()
+        .and_then(|listener| listener.map(|l| crate::tls::TlsSetup::load(&l)).transpose())
+        .context("Refusing to start: the TLS listener is misconfigured")?;
 
     // Before any tenant opens: a tenant enrolled in the keyring may have no other way in.
     crate::keyring::install(&server_config.storage_path).context("Failed to unseal the keyring")?;
@@ -533,47 +547,71 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind TCP listener on {}", addr))?;
+    let tls_listener = match &tls_setup {
+        Some(setup) => {
+            Some(crate::tls::TlsListener::bind(setup.addr, Arc::clone(&setup.config)).await?)
+        }
+        None => None,
+    };
+    let tls_ready = tls_listener
+        .as_ref()
+        .zip(tls_setup.as_ref())
+        .map(|(listener, setup)| (listener.addr(), setup.client_auth));
 
     // Small delay for log flush
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    print_ready_message(addr);
+    print_ready_message(addr, tls_ready);
 
     // Make this instance discoverable to the Veld Monitor / statusline via the
     // shared filesystem registry. Best-effort: a failure here never blocks serving.
     // Registered only after a successful bind, so a port-collision loser never
     // advertises itself.
-    let registry_guard =
-        crate::instance_registry::register(host, port, &server_config.storage_path);
+    let registry_guard = crate::instance_registry::register(
+        host,
+        port,
+        tls_ready.map(|(tls_addr, _)| tls_addr),
+        &server_config.storage_path,
+    );
 
-    // Use a notify to signal the server to stop accepting new connections
-    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let shutdown_listener = shutdown_notify.clone();
+    // Cancelled to make every listener stop accepting new connections
+    let stop_serving = tokio_util::sync::CancellationToken::new();
 
+    let tls_server = tls_listener.map(|listener| {
+        crate::tls::serve(
+            listener,
+            app.clone(),
+            stop_serving.clone().cancelled_owned(),
+        )
+    });
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async move {
-        shutdown_listener.notified().await;
-    });
+    .with_graceful_shutdown(stop_serving.clone().cancelled_owned());
 
-    let mut server_handle = tokio::spawn(async move { server.await });
+    let mut servers = vec![ServerTask::spawn("http", async move { server.await })];
+    if let Some(tls_server) = tls_server {
+        servers.push(ServerTask::spawn("https", tls_server));
+    }
+    if let Some(setup) = tls_setup {
+        crate::tls::spawn_reloader(setup.certs, stop_serving.clone());
+    }
 
     // Wait for shutdown signal (Ctrl+C / SIGTERM)
     shutdown_signal_with_drain().await;
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
     replication_shutdown.cancel();
 
-    // Tell the server to stop accepting new connections
-    shutdown_notify.notify_one();
+    // Tell the servers to stop accepting new connections
+    stop_serving.cancel();
 
-    // Give the server a brief moment to finish in-flight requests
+    // Give the servers a brief moment to finish in-flight requests
     info!(
         "Waiting up to {}s for in-flight requests...",
         SERVER_DRAIN_TIMEOUT_SECS
     );
-    let drained = await_server_stop(&mut server_handle, SERVER_DRAIN_TIMEOUT_SECS).await;
+    let drained = await_servers_stop(&mut servers, SERVER_DRAIN_TIMEOUT_SECS).await;
 
     // Requests accepted before the signal can still be queued on a tenant's write gate,
     // each served in turn. Aborting the server task does not stop them (each connection
@@ -585,9 +623,11 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
             "Server drain timed out after {}s; writes are closed, waiting up to {}s for the queued requests' 503s",
             SERVER_DRAIN_TIMEOUT_SECS, CLOSED_WRITES_DRAIN_TIMEOUT_SECS
         );
-        if !await_server_stop(&mut server_handle, CLOSED_WRITES_DRAIN_TIMEOUT_SECS).await {
+        if !await_servers_stop(&mut servers, CLOSED_WRITES_DRAIN_TIMEOUT_SECS).await {
             info!("Connections still open (event streams, websockets); aborting server task");
-            server_handle.abort();
+            for server in &mut servers {
+                server.abort();
+            }
         }
     }
 
@@ -609,26 +649,51 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
     Ok(())
 }
 
-/// Wait up to `secs` for the server task to finish. False when it is still running.
-async fn await_server_stop(
-    server_handle: &mut tokio::task::JoinHandle<std::io::Result<()>>,
-    secs: u64,
-) -> bool {
-    match tokio::time::timeout(std::time::Duration::from_secs(secs), server_handle).await {
-        Ok(Ok(Ok(()))) => {
-            info!("Server stopped gracefully");
-            true
+/// One listener's `axum::serve` task; `handle` is `None` once it has been seen to end.
+struct ServerTask {
+    listener: &'static str,
+    handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+}
+
+impl ServerTask {
+    fn spawn(
+        listener: &'static str,
+        serve: impl std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+    ) -> Self {
+        Self {
+            listener,
+            handle: Some(tokio::spawn(serve)),
         }
-        Ok(Ok(Err(e))) => {
-            error!("Server error: {}", e);
-            true
-        }
-        Ok(Err(e)) => {
-            error!("Server task panicked: {}", e);
-            true
-        }
-        Err(_) => false,
     }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Wait up to `secs`, all told, for every server task to finish. False when one is
+/// still running.
+async fn await_servers_stop(servers: &mut [ServerTask], secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut stopped = true;
+    for server in servers.iter_mut() {
+        let Some(handle) = server.handle.as_mut() else {
+            continue;
+        };
+        let Ok(outcome) = tokio::time::timeout_at(deadline, handle).await else {
+            stopped = false;
+            continue;
+        };
+        server.handle = None;
+        match outcome {
+            Ok(Ok(())) => info!(listener = server.listener, "Server stopped gracefully"),
+            Ok(Err(e)) => error!(listener = server.listener, "Server error: {}", e),
+            Err(e) => error!(listener = server.listener, "Server task panicked: {}", e),
+        }
+    }
+    stopped
 }
 
 /// Close every tenant's write gate on the blocking pool; the wait is for the write in
@@ -1169,10 +1234,12 @@ fn log_production_security_warnings(config: &ServerConfig) {
         warn!("PRODUCTION WARNING: rate limiting is disabled (VELD_RATE_LIMIT=0).");
     }
 
-    // TLS posture: Veld does not terminate TLS itself. Binding to a non-local
-    // interface in production means the operator must have a TLS-terminating
-    // reverse proxy in front (nginx/Caddy/ALB/Cloudflare) — otherwise API
-    // keys, memory content, and webhook payloads cross the wire in plaintext.
+    // TLS posture: the plain listener does not terminate TLS. Binding it to a
+    // non-local interface in production means the operator must have a
+    // TLS-terminating reverse proxy in front (nginx/Caddy/ALB/Cloudflare) —
+    // otherwise API keys, memory content, and webhook payloads cross the wire in
+    // plaintext. The native alternative is the TLS listener (VELD_TLS_PORT) with
+    // the plain listener left on loopback.
     //
     // Operators who have such a proxy can set `VELD_TLS_ACK=true` to silence
     // this warning. Localhost binds never warn because the loopback interface
@@ -1187,11 +1254,12 @@ fn log_production_security_warnings(config: &ServerConfig) {
         if !tls_ack {
             warn!(
                 bind = %config.host,
-                "PRODUCTION WARNING: Veld does not terminate TLS. Bind host '{}' is not \
-                 a loopback interface — API keys and memory content will cross the wire \
-                 in plaintext unless a TLS-terminating reverse proxy (nginx/Caddy/ALB/\
-                 Cloudflare) is in front of this process. Set VELD_TLS_ACK=true to \
-                 acknowledge and silence this warning.",
+                "PRODUCTION WARNING: the plain listener does not terminate TLS. Bind host \
+                 '{}' is not a loopback interface — API keys and memory content will cross \
+                 the wire in plaintext unless a TLS-terminating reverse proxy (nginx/Caddy/\
+                 ALB/Cloudflare) is in front of this process. To serve TLS natively, set \
+                 VELD_TLS_PORT, VELD_TLS_CERT and VELD_TLS_KEY and keep VELD_HOST on \
+                 loopback. Set VELD_TLS_ACK=true to acknowledge and silence this warning.",
                 config.host
             );
         }
@@ -1219,7 +1287,8 @@ fn print_storage_stats(storage_path: &std::path::Path) {
     }
 }
 
-fn print_ready_message(addr: SocketAddr) {
+/// `tls`: the TLS listener's address and whether it requires a client certificate.
+fn print_ready_message(addr: SocketAddr, tls: Option<(SocketAddr, bool)>) {
     use std::io::Write;
     let _ = std::io::stderr().flush();
     eprintln!();
@@ -1227,6 +1296,18 @@ fn print_ready_message(addr: SocketAddr) {
     eprintln!("     API:       http://{}", addr);
     eprintln!("     Health:    http://{}/health", addr);
     eprintln!("     Stream:    ws://{}/api/stream", addr);
+    if let Some((tls_addr, client_auth)) = tls {
+        eprintln!(
+            "     HTTPS:     https://{}{}",
+            tls_addr,
+            if client_auth {
+                " (client certificate required)"
+            } else {
+                ""
+            }
+        );
+        info!(addr = %tls_addr, client_auth, "TLS listener ready: https://{}", tls_addr);
+    }
     #[cfg(feature = "zenoh")]
     {
         let zenoh_enabled = std::env::var("VELD_ZENOH_ENABLED")

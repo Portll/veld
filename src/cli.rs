@@ -94,6 +94,26 @@ enum Commands {
         /// Maximum concurrent requests before load shedding
         #[arg(long, env = "VELD_MAX_CONCURRENT", default_value_t = 200)]
         max_concurrent: usize,
+
+        /// PEM certificate chain for the HTTPS listener (with --tls-key and --tls-port)
+        #[arg(long, env = "VELD_TLS_CERT")]
+        tls_cert: Option<PathBuf>,
+
+        /// PEM private key for the HTTPS listener: PKCS#8, RSA or SEC1
+        #[arg(long, env = "VELD_TLS_KEY")]
+        tls_key: Option<PathBuf>,
+
+        /// Port of an HTTPS listener serving the same API beside the plain one
+        #[arg(long, env = "VELD_TLS_PORT")]
+        tls_port: Option<u16>,
+
+        /// Bind address of the HTTPS listener [default: 0.0.0.0]
+        #[arg(long, env = "VELD_TLS_HOST")]
+        tls_host: Option<String>,
+
+        /// CA a client certificate must chain to on the HTTPS listener (mTLS)
+        #[arg(long, env = "VELD_TLS_CLIENT_CA")]
+        tls_client_ca: Option<PathBuf>,
     },
 
     /// Launch the TUI dashboard
@@ -483,6 +503,11 @@ async fn main() -> Result<()> {
             production,
             rate_limit,
             max_concurrent,
+            tls_cert,
+            tls_key,
+            tls_port,
+            tls_host,
+            tls_client_ca,
         } => {
             // server::run() builds its own tokio runtime, so we need to exit
             // the current one first. Drop the async context and call synchronously.
@@ -497,6 +522,13 @@ async fn main() -> Result<()> {
                     production,
                     rate_limit,
                     max_concurrent,
+                    tls: veld::config::TlsSettings {
+                        cert: tls_cert,
+                        key: tls_key,
+                        port: tls_port.map(|p| p.to_string()),
+                        host: tls_host,
+                        client_ca: tls_client_ca,
+                    },
                 })
             })
             .await?;
