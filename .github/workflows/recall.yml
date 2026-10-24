@@ -95,6 +95,16 @@ on:
         default: 'minilm-l6-v2'
         type: choice
         options: ['minilm-l6-v2', 'arctic-embed-xs', 'nomic-embed-text-v1.5']
+      neural_ner:
+        description: >-
+          TinyBERT neural NER (VELD_NEURAL_NER). false is what veld ships, the rule-based
+          extractor. true fetches the model and withdraws the fallback override, so a model
+          that fails to load stops the run instead of measuring the rule-based arm twice. Not
+          gated: pair it with record=true.
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
 
 permissions:
   contents: read
@@ -125,6 +135,7 @@ env:
   # The report's `embedder` field names what produced it. VELD_EMBEDDER selects it explicitly in
   # the eval step, so an arm never reaches its embedder through the fallback order.
   EMBEDDER: ${{ github.event.inputs.embedder || 'minilm-l6-v2' }}
+  NEURAL_NER: ${{ github.event.inputs.neural_ner || 'false' }}
 
 jobs:
   gate:
@@ -236,13 +247,20 @@ jobs:
       - name: Build recall-eval
         run: cargo build --release --bin recall-eval ${{ matrix.features }}
 
+      # After the build, so model-fetch links the library it just compiled. The models cache
+      # above is keyed by embedder alone and may hold no NER model.
+      - name: Fetch the NER model
+        if: env.NEURAL_NER == 'true'
+        run: cargo run --release --quiet --bin model-fetch ${{ matrix.features }} -- --ner
+
       - name: Run the LoCoMo gate
         id: run
         env:
           # veld ships with neural NER off (VELD_NEURAL_NER defaults to false), so the rule-based
           # NER is the shipped system here; the harness's refusal of it is upstream's, which ships
-          # GLiNER.
-          SHODH_ALLOW_FALLBACK_NER: '1'
+          # GLiNER. The neural arm keeps the refusal.
+          SHODH_ALLOW_FALLBACK_NER: ${{ env.NEURAL_NER == 'true' && '0' || '1' }}
+          VELD_NEURAL_NER: ${{ env.NEURAL_NER }}
           # A second, 100-deep recall per case fills the per-case recall@50/@100 fields so a miss
           # can be read as rank-low (gold in 11..100) or never retrieved. The headline metrics come
           # from the production-depth query alone (src/recall_harness/runner.rs, diag_k).
