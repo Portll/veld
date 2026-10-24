@@ -56,6 +56,7 @@ fn generate_title(state: &AppState) -> String {
         ViewMode::Git => "Git",
         ViewMode::Dials => "Dials",
         ViewMode::Loops => "Loops",
+        ViewMode::Spine => "Spine",
     };
 
     format!("🌾 Veld - {}", view_name)
@@ -1789,6 +1790,14 @@ async fn run_tui(
                             }
                         }
                         KeyCode::Char('6') => g.set_view(ViewMode::Loops),
+                        KeyCode::Char('7') => g.set_view(ViewMode::Spine),
+                        KeyCode::Char('o') if matches!(g.view_mode, ViewMode::Spine) => tabs::spine::action("open", false),
+                        KeyCode::Char('i') if matches!(g.view_mode, ViewMode::Spine) => tabs::spine::action("install", false),
+                        KeyCode::Char('u') if matches!(g.view_mode, ViewMode::Spine) => tabs::spine::arm_uninstall(),
+                        KeyCode::Char('y') if matches!(g.view_mode, ViewMode::Spine) && tabs::spine::confirming() => tabs::spine::action("uninstall", false),
+                        KeyCode::Char('Y') if matches!(g.view_mode, ViewMode::Spine) && tabs::spine::confirming() => tabs::spine::action("uninstall", true),
+                        KeyCode::Char('n') if matches!(g.view_mode, ViewMode::Spine) && tabs::spine::confirming() => tabs::spine::cancel(),
+                        KeyCode::Char('r') if matches!(g.view_mode, ViewMode::Spine) => tabs::spine::refresh(),
                         KeyCode::Char('d') => g.set_view(ViewMode::Dashboard),
                         KeyCode::Char('p') => g.set_view(ViewMode::Projects),
                         KeyCode::Char('a') => g.set_view(ViewMode::ActivityLogs),

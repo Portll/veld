@@ -29,6 +29,7 @@
 # Reference
 
 - [HTTP API](reference/http-api.md)
+- [HTTP API schemas](reference/schemas.md)
 - [MCP tools](reference/mcp-tools.md)
 - [Configuration](reference/config.md)
 - [CLI](reference/cli.md)
