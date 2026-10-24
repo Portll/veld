@@ -1562,7 +1562,10 @@ mod tests {
     fn tracker_accumulates_and_alerts_at_threshold() {
         let t = TokenTracker::new(100, 0.9);
         t.track("recall", &"x".repeat(356));
-        assert!(t.status().alert.is_none(), "89 of 100 is under the 90% threshold");
+        assert!(
+            t.status().alert.is_none(),
+            "89 of 100 is under the 90% threshold"
+        );
         t.track("recall", &"x".repeat(8));
         let s = t.status();
         assert_eq!(s.tokens, 91);

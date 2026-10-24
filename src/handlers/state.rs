@@ -39,6 +39,7 @@ use crate::graph_memory::{
     EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
     LtpStatus, RelationType, RelationshipEdge,
 };
+use crate::memory::tag_sources::{TagSource, TagSources};
 use crate::memory::{
     query_parser, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats,
     ProspectiveStore, SessionStore, TodoStore,
@@ -83,6 +84,26 @@ struct MultiUserMemoryManagerRotationHelper {
 
 #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 const CF_AUDIT: &str = "audit";
+
+/// Last audit timestamp handed out, in nanoseconds since the epoch.
+///
+/// The audit stores key a row by `user_id:timestamp_nanos`, so two events
+/// stamped in the same nanosecond overwrite each other. Concurrent writes for
+/// one user do land in the same nanosecond on a coarse clock, and so do
+/// back-to-back events on a frozen test clock. Every audit event therefore
+/// draws its timestamp from here: the wall clock when it has advanced, else
+/// one nanosecond past the previous stamp.
+static LAST_AUDIT_STAMP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn next_audit_stamp(now_nanos: i64, last: &std::sync::atomic::AtomicI64) -> i64 {
+    use std::sync::atomic::Ordering;
+    let mut stamp = now_nanos;
+    let _ = last.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+        stamp = now_nanos.max(prev.saturating_add(1));
+        Some(stamp)
+    });
+    stamp
+}
 
 impl From<&AuditEvent> for AuditLogEntry {
     fn from(event: &AuditEvent) -> Self {
@@ -1169,8 +1190,13 @@ impl MultiUserMemoryManager {
 
     /// Log audit event (non-blocking with background persistence)
     pub fn log_event(&self, user_id: &str, event_type: &str, memory_id: &str, details: &str) {
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("audit event timestamp outside i64 nanos range, using 0");
+            0
+        });
+        let stamp = next_audit_stamp(now_nanos, &LAST_AUDIT_STAMP);
         let event = AuditEvent {
-            timestamp: chrono::Utc::now(),
+            timestamp: chrono::DateTime::from_timestamp_nanos(stamp),
             event_type: event_type.to_string(),
             memory_id: memory_id.to_string(),
             details: details.to_string(),
@@ -2279,12 +2305,13 @@ impl MultiUserMemoryManager {
         // the frames appended after them; a hint that does not verify
         // against the file is ignored.
         let frame_index_hint = checkpoint_store.lock().frame_index();
-        let log = crate::intent_log::IntentLog::open_with_index(
+        let mut log = crate::intent_log::IntentLog::open_with_index(
             &log_path,
             journal_cryptor,
             frame_index_hint,
         )
         .with_context(|| format!("open intent log for user {user_id}"))?;
+        log.set_segment_bytes(self.server_config.intent_log_segment_bytes());
 
         // SQLite slow store projection — first in the replay pass.
         let slow_store = self.get_user_slow_store(user_id)?;
@@ -4096,14 +4123,26 @@ impl MultiUserMemoryManager {
                 false,
             )?;
             let staged_user = staging.join(live_user.file_name().unwrap_or_default());
+            // The journal's sealed segments as restored, and the live ones the
+            // backup does not hold, which go aside with the head they followed.
+            let segments: std::collections::BTreeSet<String> = [&staged_user, &live_user]
+                .into_iter()
+                .map(|dir| crate::intent_log::sealed_segments(&dir.join("intent.log")))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
             let pairs: Vec<(std::path::PathBuf, std::path::PathBuf)> = [
                 "storage.redb",
                 "graph/graph.redb",
                 "intent.log",
                 "projection_checkpoints.bin",
             ]
-            .iter()
-            .map(|rel| (staged_user.join(rel), live_user.join(rel)))
+            .into_iter()
+            .map(str::to_string)
+            .chain(segments)
+            .map(|rel| (staged_user.join(&rel), live_user.join(&rel)))
             .collect();
 
             let writer = self.journaled_writers.get(user_id).map(|w| w.clone());
@@ -4222,17 +4261,19 @@ impl MultiUserMemoryManager {
         experience: &Experience,
         memory_id: &MemoryId,
     ) -> Result<()> {
-        self.rebuild_experience_graph_declared(user_id, experience, memory_id, &[])
+        self.rebuild_experience_graph_declared(user_id, experience, memory_id, &[], None)
     }
 
     /// [`rebuild_experience_graph`](Self::rebuild_experience_graph) with the writer's declared
-    /// entities, as [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared).
+    /// entities and tag provenance, as
+    /// [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared).
     pub fn rebuild_experience_graph_declared(
         &self,
         user_id: &str,
         experience: &Experience,
         memory_id: &MemoryId,
         declared: &[DeclaredEntity],
+        tag_sources: Option<&TagSources>,
     ) -> Result<()> {
         if let Ok(graph) = self.get_user_graph(user_id) {
             match graph.read().delete_episode(&memory_id.0) {
@@ -4248,7 +4289,13 @@ impl MultiUserMemoryManager {
                 ),
             }
         }
-        self.process_experience_into_graph_declared(user_id, experience, memory_id, declared)
+        self.process_experience_into_graph_declared(
+            user_id,
+            experience,
+            memory_id,
+            declared,
+            tag_sources,
+        )
     }
 
     /// Process an experience and extract entities/relationships into the graph
@@ -4265,7 +4312,7 @@ impl MultiUserMemoryManager {
         experience: &Experience,
         memory_id: &MemoryId,
     ) -> Result<()> {
-        self.process_experience_into_graph_declared(user_id, experience, memory_id, &[])
+        self.process_experience_into_graph_declared(user_id, experience, memory_id, &[], None)
     }
 
     /// [`process_experience_into_graph`](Self::process_experience_into_graph) plus the entities
@@ -4282,12 +4329,19 @@ impl MultiUserMemoryManager {
     /// Derived entities pass a stop list of words measured as hubs on a code-heavy store, and a
     /// derived entity already at `MAX_ENTITY_DEGREE` gets no new edges from this memory: at the
     /// cap, every new edge only bought a prune of an older one.
+    ///
+    /// `tag_sources` is the ledger row for the stored tags (see `crate::memory::tag_sources`).
+    /// With it, a causal edge forms only between names the writer or NER named: a caller tag, a
+    /// declared entity or an NER span. A YAKE or cold-start keyword, an ingest hint, a verb or a
+    /// regex term keeps `RelatedTo`. Without it, as on a path that records no provenance, any
+    /// name may take one.
     pub fn process_experience_into_graph_declared(
         &self,
         user_id: &str,
         experience: &Experience,
         memory_id: &MemoryId,
         declared: &[DeclaredEntity],
+        tag_sources: Option<&TagSources>,
     ) -> Result<()> {
         let graph = self.get_user_graph(user_id)?;
 
@@ -4314,6 +4368,11 @@ impl MultiUserMemoryManager {
         // A name the writer declared is the declared entity, not also a derived one.
         let declared_names: std::collections::HashSet<String> =
             declared.iter().map(|d| d.name.to_lowercase()).collect();
+
+        // The middle branch below reads `experience.entities`, which lists every tag, derived
+        // keywords included, so only the other two branches hold names NER produced.
+        let extracted_by_ner =
+            !experience.ner_entities.is_empty() || experience.entities.is_empty();
 
         // Use pre-extracted NER records for proper entity labels when available
         // This avoids redundant NER inference — the handler already ran NER in Pass 1
@@ -4370,6 +4429,30 @@ impl MultiUserMemoryManager {
                 }
             }
         };
+
+        // A keyword names no participant. In "A set B in motion." the keyword "set" sits between
+        // the two event names, so A -> set -> B would be typed causal in every chain that uses
+        // the phrase, and one entity would join them all.
+        let causal_named: Option<std::collections::HashSet<String>> = tag_sources.map(|sources| {
+            let ner_spans: &[crate::embeddings::ner::NerEntity] = if extracted_by_ner {
+                &extracted_entities
+            } else {
+                &[]
+            };
+            sources
+                .tags
+                .iter()
+                .filter(|t| {
+                    !t.redacted
+                        && matches!(
+                            t.source,
+                            TagSource::Caller | TagSource::Declared | TagSource::Ner
+                        )
+                })
+                .map(|t| t.tag.trim().to_lowercase())
+                .chain(ner_spans.iter().map(|e| e.text.trim().to_lowercase()))
+                .collect()
+        });
 
         // Filter noise entities
         let filtered_entities: Vec<_> = extracted_entities
@@ -4745,6 +4828,17 @@ impl MultiUserMemoryManager {
                 })
             })
             .collect();
+        let causal_candidate: Vec<bool> = entity_uuids
+            .iter()
+            .enumerate()
+            .map(|(k, (name, _))| {
+                !fragment_of_comention[k]
+                    && (declared_weight[k].is_some()
+                        || causal_named
+                            .as_ref()
+                            .is_none_or(|named| named.contains(&name.trim().to_lowercase())))
+            })
+            .collect();
 
         let mut hub_edges_skipped = 0u64;
         for i in 0..entity_uuids.len() {
@@ -4762,17 +4856,15 @@ impl MultiUserMemoryManager {
                     declared_strength.unwrap_or_else(|| EdgeTier::L1Working.initial_weight());
                 let mut from_entity = entity_uuids[i].1;
                 let mut to_entity = entity_uuids[j].1;
-                let cue_hit =
-                    if extract_predicates && !fragment_of_comention[i] && !fragment_of_comention[j]
-                    {
-                        crate::graph_memory::extract_directed_predicate(
-                            &experience.content,
-                            &entity_uuids[i].0,
-                            &entity_uuids[j].0,
-                        )
-                    } else {
-                        None
-                    };
+                let cue_hit = if extract_predicates && causal_candidate[i] && causal_candidate[j] {
+                    crate::graph_memory::extract_directed_predicate(
+                        &experience.content,
+                        &entity_uuids[i].0,
+                        &entity_uuids[j].0,
+                    )
+                } else {
+                    None
+                };
                 let relation_type = match cue_hit {
                     Some((rt, a_is_source)) => {
                         if !a_is_source {
@@ -6186,6 +6278,41 @@ mod reconcile_restore_tests {
         assert!(
             !live(&manager).contains(&orphan),
             "nothing to restore from, so replay is made to agree with the store"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_stamp_tests {
+    use super::next_audit_stamp;
+    use std::sync::atomic::AtomicI64;
+
+    #[test]
+    fn audit_stamps_are_unique_on_a_frozen_clock() {
+        let last = AtomicI64::new(0);
+        let frozen = 1_700_000_000_000_000_000;
+        let stamps: Vec<i64> = (0..100).map(|_| next_audit_stamp(frozen, &last)).collect();
+        assert_eq!(stamps[0], frozen);
+        for pair in stamps.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "a frozen clock must still yield distinct keys"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_stamp_follows_the_clock_once_it_moves_past_the_last_stamp() {
+        let last = AtomicI64::new(0);
+        let t0 = 1_700_000_000_000_000_000;
+        next_audit_stamp(t0, &last);
+        next_audit_stamp(t0, &last);
+        assert_eq!(next_audit_stamp(t0 + 5_000, &last), t0 + 5_000);
+        assert_eq!(
+            next_audit_stamp(t0, &last),
+            t0 + 5_001,
+            "a clock that steps back never reuses a stamp"
         );
     }
 }

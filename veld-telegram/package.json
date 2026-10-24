@@ -10,7 +10,7 @@
     "node-telegram-bot-api": "^0.66.0",
     "screenshot-desktop": "^1.15.0",
     "systeminformation": "^5.23.5",
-    "open": "^10.1.0"
+    "open": "^11.0.4"
   },
   "devDependencies": {
     "@types/node-telegram-bot-api": "^0.64.7",
