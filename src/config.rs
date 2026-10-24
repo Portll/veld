@@ -322,6 +322,135 @@ pub fn is_local_bind_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// Bind address of the TLS listener when `VELD_TLS_HOST` is unset.
+pub const TLS_HOST_DEFAULT: &str = "0.0.0.0";
+
+/// The native TLS listener's settings as given: `VELD_TLS_*`, config.toml `tls_*`, or
+/// `veld server --tls-*`. [`TlsSettings::validate`] turns them into a
+/// [`TlsListenerConfig`], or into the refusal that names what is wrong.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsSettings {
+    pub cert: Option<PathBuf>,
+    pub key: Option<PathBuf>,
+    pub port: Option<String>,
+    pub host: Option<String>,
+    pub client_ca: Option<PathBuf>,
+}
+
+/// A TLS listener whose settings are complete: where it binds and the files it serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsListenerConfig {
+    pub addr: std::net::SocketAddr,
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    /// When set, a client must present a certificate that chains to this CA.
+    pub client_ca: Option<PathBuf>,
+}
+
+impl TlsSettings {
+    /// Read the `VELD_TLS_*` variables through `get`; a blank value counts as unset.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let set = |name: &str| {
+            get(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Self {
+            cert: set("VELD_TLS_CERT").map(PathBuf::from),
+            key: set("VELD_TLS_KEY").map(PathBuf::from),
+            port: set("VELD_TLS_PORT"),
+            host: set("VELD_TLS_HOST"),
+            client_ca: set("VELD_TLS_CLIENT_CA").map(PathBuf::from),
+        }
+    }
+
+    /// Each variable with its value, `None` where unset.
+    pub fn vars(&self) -> [(&'static str, Option<String>); 5] {
+        let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.to_string_lossy().into_owned());
+        [
+            ("VELD_TLS_CERT", path(&self.cert)),
+            ("VELD_TLS_KEY", path(&self.key)),
+            ("VELD_TLS_PORT", self.port.clone()),
+            ("VELD_TLS_HOST", self.host.clone()),
+            ("VELD_TLS_CLIENT_CA", path(&self.client_ca)),
+        ]
+    }
+
+    /// Whether the TLS listener is asked for on an interface other machines can reach.
+    pub fn exposes_network(&self) -> bool {
+        self.port.is_some() && !is_local_bind_host(self.host.as_deref().unwrap_or(TLS_HOST_DEFAULT))
+    }
+
+    /// `Ok(None)` when no `VELD_TLS_*` variable is set. Setting any of them asks for the
+    /// listener, which then needs all of cert, key and port; the error names the missing
+    /// ones. The port may not be the plain listener's on an overlapping host.
+    pub fn validate(
+        &self,
+        plain_host: &str,
+        plain_port: u16,
+    ) -> anyhow::Result<Option<TlsListenerConfig>> {
+        let vars = self.vars();
+        let given: Vec<&str> = vars
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(n, _)| *n)
+            .collect();
+        if given.is_empty() {
+            return Ok(None);
+        }
+        let (cert, key, port) = match (&self.cert, &self.key, &self.port) {
+            (Some(cert), Some(key), Some(port)) => (cert, key, port),
+            _ => {
+                let missing: Vec<&str> = vars[..3]
+                    .iter()
+                    .filter(|(_, v)| v.is_none())
+                    .map(|(n, _)| *n)
+                    .collect();
+                anyhow::bail!(
+                    "the TLS listener is half configured: {} set, {} missing. Set all of \
+                     VELD_TLS_CERT, VELD_TLS_KEY and VELD_TLS_PORT, or none of the VELD_TLS_* \
+                     variables",
+                    given.join(", "),
+                    missing.join(", ")
+                );
+            }
+        };
+        let port: u16 = port
+            .parse()
+            .map_err(|_| anyhow::anyhow!("VELD_TLS_PORT='{port}' is not a port number"))?;
+        let host = self.host.as_deref().unwrap_or(TLS_HOST_DEFAULT);
+        let ip = bind_ip(host).ok_or_else(|| {
+            anyhow::anyhow!("VELD_TLS_HOST='{host}' is not an IP address or localhost")
+        })?;
+        let plain_ip = bind_ip(plain_host).unwrap_or(std::net::Ipv4Addr::LOCALHOST.into());
+        let overlapping = ip == plain_ip || ip.is_unspecified() || plain_ip.is_unspecified();
+        if port != 0 && port == plain_port && overlapping {
+            anyhow::bail!(
+                "VELD_TLS_PORT={port} is the plain listener's port on an overlapping host \
+                 (VELD_HOST={plain_host}, VELD_TLS_HOST={host}); give the TLS listener its own port"
+            );
+        }
+        Ok(Some(TlsListenerConfig {
+            addr: std::net::SocketAddr::new(ip, port),
+            cert: cert.clone(),
+            key: key.clone(),
+            client_ca: self.client_ca.clone(),
+        }))
+    }
+}
+
+/// The address a bind host names: an IP literal (IPv6 with or without brackets) or
+/// `localhost`.
+fn bind_ip(host: &str) -> Option<std::net::IpAddr> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Some(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
 /// Path to the Veld `config.toml`, the file written by `veld init`.
 ///
 /// Always `<platform config dir>/veld/config.toml` (e.g. `~/.config/veld/config.toml`
@@ -389,6 +518,11 @@ fn load_config_path_into_env(path: &std::path::Path) {
         ("api_key", "VELD_API_KEY"),
         ("host", "VELD_HOST"),
         ("port", "VELD_PORT"),
+        ("tls_cert", "VELD_TLS_CERT"),
+        ("tls_key", "VELD_TLS_KEY"),
+        ("tls_port", "VELD_TLS_PORT"),
+        ("tls_host", "VELD_TLS_HOST"),
+        ("tls_client_ca", "VELD_TLS_CLIENT_CA"),
         ("storage", "VELD_MEMORY_PATH"),
         ("storage_backend", "VELD_STORAGE_BACKEND"),
         ("mcp", "VELD_MCP_ENABLED"),
@@ -667,6 +801,10 @@ pub struct ServerConfig {
     /// Server port (default: 3030)
     pub port: u16,
 
+    /// The optional TLS listener beside the plain one, as configured;
+    /// [`ServerConfig::tls_listener`] validates it.
+    pub tls: TlsSettings,
+
     /// Storage path for the selected storage backend.
     pub storage_path: PathBuf,
 
@@ -792,6 +930,7 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 3030,
+            tls: TlsSettings::default(),
             storage_path: default_storage_path(),
             requested_storage_backend: default_requested_storage_backend(),
             effective_storage_backend: effective_storage_backend_for_current_build(
@@ -887,6 +1026,11 @@ impl ServerConfig {
             .then(|| self.intent_log_segment_mb.saturating_mul(1024 * 1024))
     }
 
+    /// The TLS listener to start, `None` when it is off, or why the settings refuse.
+    pub fn tls_listener(&self) -> anyhow::Result<Option<TlsListenerConfig>> {
+        self.tls.validate(&self.host, self.port)
+    }
+
     /// Load configuration from environment variables with defaults
     #[allow(clippy::field_reassign_with_default)] // Environment overrides require mutable config
     pub fn from_env() -> Self {
@@ -911,6 +1055,8 @@ impl ServerConfig {
                 config.port = port;
             }
         }
+
+        config.tls = TlsSettings::from_lookup(|name| env::var(name).ok());
 
         // Storage path
         if let Ok(val) = env::var("VELD_MEMORY_PATH") {
@@ -995,7 +1141,12 @@ impl ServerConfig {
         // Rate limiting is disabled on localhost in dev mode for convenience.
         // Risk: a compromised local process or SSRF can exhaust memory without limit.
         // Set VELD_RATE_LIMIT explicitly (or use production mode) to enable limiting.
-        if !config.is_production && is_local_bind_host(&config.host) && !rate_limit_explicit {
+        // A TLS listener on a reachable interface makes the server not local.
+        if !config.is_production
+            && is_local_bind_host(&config.host)
+            && !config.tls.exposes_network()
+            && !rate_limit_explicit
+        {
             config.rate_limit_per_second = 0;
             tracing::info!(
                 bind = %config.host,
@@ -1299,7 +1450,13 @@ pub fn print_env_help() {
     println!("  VELD_ENV              - Set to 'production' or 'prod' for production mode");
     println!("  VELD_HOST             - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)");
     println!("  VELD_PORT             - Server port (default: 3030)");
-    println!("  VELD_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/veld/)");
+    println!("  VELD_TLS_PORT         - Port of an HTTPS listener serving the same API beside the plain one (default: off)");
+    println!("  VELD_TLS_CERT         - PEM certificate chain for the HTTPS listener (required with VELD_TLS_PORT)");
+    println!("  VELD_TLS_KEY          - PEM private key for it, PKCS#8, RSA or SEC1 (required with VELD_TLS_PORT)");
+    println!("                          Cert and key reload when either file changes (checked every 30s) or on SIGHUP");
+    println!("  VELD_TLS_HOST         - Bind address of the HTTPS listener (default: 0.0.0.0)");
+    println!("  VELD_TLS_CLIENT_CA    - CA a client certificate must chain to on the HTTPS listener (mTLS; default: none)");
+    println!("  VELD_MEMORY_PATH     - Storage directory (default: platform data dir, e.g. ~/.local/share/veld/)");
     println!("  VELD_STORAGE_BACKEND  - Storage engine: rocksdb (default, ADR 0007) or redb");
     println!(
         "  VELD_REPLICATE_FROM   - Base URL of a veld instance to follow (live memory replication)"
@@ -1714,6 +1871,173 @@ mod tests {
         assert_eq!(config.rate_limit_per_second, 4000);
 
         env::remove_var("VELD_RATE_LIMIT");
+    }
+
+    fn tls(pairs: &[(&str, &str)]) -> TlsSettings {
+        let vars: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+        TlsSettings::from_lookup(|name| vars.get(name).map(|v| v.to_string()))
+    }
+
+    const TLS_COMPLETE: [(&str, &str); 3] = [
+        ("VELD_TLS_CERT", "/etc/veld/chain.pem"),
+        ("VELD_TLS_KEY", "/etc/veld/key.pem"),
+        ("VELD_TLS_PORT", "3443"),
+    ];
+
+    #[test]
+    fn tls_is_off_when_no_variable_is_set() {
+        assert_eq!(tls(&[]).validate("127.0.0.1", 3030).unwrap(), None);
+        assert_eq!(
+            tls(&[("VELD_TLS_PORT", "  ")])
+                .validate("127.0.0.1", 3030)
+                .unwrap(),
+            None,
+            "a blank value is unset"
+        );
+    }
+
+    #[test]
+    fn a_half_configured_tls_listener_names_what_is_missing() {
+        let err = tls(&[("VELD_TLS_CERT", "/etc/veld/chain.pem")])
+            .validate("127.0.0.1", 3030)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VELD_TLS_CERT set"), "{err}");
+        assert!(err.contains("VELD_TLS_KEY, VELD_TLS_PORT missing"), "{err}");
+
+        let err = tls(&TLS_COMPLETE[..2])
+            .validate("127.0.0.1", 3030)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VELD_TLS_CERT, VELD_TLS_KEY set"), "{err}");
+        assert!(err.contains(", VELD_TLS_PORT missing"), "{err}");
+
+        // A client CA without the listener would guard nothing, so it asks for the listener.
+        let err = tls(&[("VELD_TLS_CLIENT_CA", "/etc/veld/ca.pem")])
+            .validate("127.0.0.1", 3030)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("VELD_TLS_CERT, VELD_TLS_KEY, VELD_TLS_PORT missing"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_complete_tls_listener_binds_where_asked() {
+        let config = tls(&TLS_COMPLETE)
+            .validate("127.0.0.1", 3030)
+            .unwrap()
+            .expect("all three set");
+        assert_eq!(config.addr, "0.0.0.0:3443".parse().unwrap());
+        assert_eq!(config.cert, PathBuf::from("/etc/veld/chain.pem"));
+        assert_eq!(config.key, PathBuf::from("/etc/veld/key.pem"));
+        assert_eq!(config.client_ca, None);
+
+        let mut more = TLS_COMPLETE.to_vec();
+        more.extend([
+            ("VELD_TLS_HOST", "[::1]"),
+            ("VELD_TLS_CLIENT_CA", "/etc/veld/ca.pem"),
+        ]);
+        let config = tls(&more).validate("127.0.0.1", 3030).unwrap().unwrap();
+        assert_eq!(config.addr, "[::1]:3443".parse().unwrap());
+        assert_eq!(config.client_ca, Some(PathBuf::from("/etc/veld/ca.pem")));
+    }
+
+    #[test]
+    fn tls_refuses_a_port_or_host_it_cannot_bind() {
+        let mut bad_port = TLS_COMPLETE.to_vec();
+        bad_port[2] = ("VELD_TLS_PORT", "https");
+        let err = tls(&bad_port)
+            .validate("127.0.0.1", 3030)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VELD_TLS_PORT='https'"), "{err}");
+
+        let mut bad_host = TLS_COMPLETE.to_vec();
+        bad_host.push(("VELD_TLS_HOST", "veld.example.com"));
+        let err = tls(&bad_host)
+            .validate("127.0.0.1", 3030)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VELD_TLS_HOST='veld.example.com'"), "{err}");
+    }
+
+    #[test]
+    fn tls_refuses_the_plain_port_on_an_overlapping_host() {
+        let mut same_port = TLS_COMPLETE.to_vec();
+        same_port[2] = ("VELD_TLS_PORT", "3030");
+        let err = tls(&same_port)
+            .validate("127.0.0.1", 3030)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VELD_TLS_PORT=3030"), "{err}");
+        assert!(tls(&same_port).validate("0.0.0.0", 3030).is_err());
+
+        let mut localhost = same_port.clone();
+        localhost.push(("VELD_TLS_HOST", "localhost"));
+        assert!(tls(&localhost).validate("127.0.0.1", 3030).is_err());
+
+        let mut disjoint = same_port.clone();
+        disjoint.push(("VELD_TLS_HOST", "::1"));
+        assert!(tls(&disjoint)
+            .validate("127.0.0.1", 3030)
+            .unwrap()
+            .is_some());
+        assert!(tls(&same_port)
+            .validate("127.0.0.1", 3031)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_tls_listener_on_the_network_keeps_rate_limiting_on() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for name in ["VELD_RATE_LIMIT", "VELD_HOST", "VELD_ENV", "VELD_TLS_HOST"] {
+            env::remove_var(name);
+        }
+        for (name, value) in TLS_COMPLETE {
+            env::set_var(name, value);
+        }
+
+        assert_eq!(ServerConfig::from_env().rate_limit_per_second, 4000);
+        env::set_var("VELD_TLS_HOST", "127.0.0.1");
+        assert_eq!(ServerConfig::from_env().rate_limit_per_second, 0);
+
+        for (name, _) in TlsSettings::default().vars() {
+            env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn test_config_file_bridges_the_tls_keys() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(
+            &file,
+            "tls_cert = \"/etc/veld/chain.pem\"\ntls_key = \"/etc/veld/key.pem\"\n\
+             tls_port = 3443\ntls_host = \"10.0.0.2\"\ntls_client_ca = \"/etc/veld/ca.pem\"\n",
+        )
+        .unwrap();
+        for (name, _) in TlsSettings::default().vars() {
+            env::remove_var(name);
+        }
+
+        load_config_path_into_env(&file);
+        let config = ServerConfig::from_env();
+        let listener = config
+            .tls_listener()
+            .unwrap()
+            .expect("bridged from the file");
+        assert_eq!(listener.addr, "10.0.0.2:3443".parse().unwrap());
+        assert_eq!(listener.cert, PathBuf::from("/etc/veld/chain.pem"));
+        assert_eq!(listener.key, PathBuf::from("/etc/veld/key.pem"));
+        assert_eq!(listener.client_ca, Some(PathBuf::from("/etc/veld/ca.pem")));
+
+        for (name, _) in TlsSettings::default().vars() {
+            env::remove_var(name);
+        }
     }
 
     #[test]
