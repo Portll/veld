@@ -519,6 +519,58 @@ async fn recall_by_tags_returns_the_newest_matches_without_embeddings() {
 }
 
 #[tokio::test]
+async fn recall_by_tags_leaves_out_annotations_and_context_unless_asked() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({
+                "user_id": "lean-tag-user",
+                "content": "Caroline told Melanie in Wellington that the Redis cluster moved to Auckland.",
+                "tags": ["lean-tag"],
+                "repo": "Portll/veld"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remember failed: {body}");
+
+    let recall = |extra: serde_json::Value| {
+        let mut request = json!({"user_id": "lean-tag-user", "tags": ["lean-tag"]});
+        request
+            .as_object_mut()
+            .expect("request object")
+            .extend(extra.as_object().expect("extra object").clone());
+        authed_post("/api/recall/tags", request)
+    };
+
+    let (status, lean) = json_of(h.app(), recall(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "recall by tags failed: {lean}");
+    let experience = &lean["memories"][0]["experience"];
+    assert_eq!(
+        experience["content"],
+        "Caroline told Melanie in Wellington that the Redis cluster moved to Auckland."
+    );
+    assert!(experience["context"].is_null(), "{experience}");
+    assert_eq!(experience["ner_entities"], json!([]), "{experience}");
+    assert_eq!(experience["cooccurrence_pairs"], json!([]), "{experience}");
+
+    let (status, full) = json_of(
+        h.app(),
+        recall(json!({"include_annotations": true, "include_context": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "recall by tags failed: {full}");
+    let experience = &full["memories"][0]["experience"];
+    assert!(
+        experience["context"].is_object(),
+        "the repo was stored in the context: {experience}"
+    );
+    assert!(experience["ner_entities"].is_array(), "{experience}");
+}
+
+#[tokio::test]
 async fn recall_by_tags_matches_derived_tags_only_when_asked() {
     let h = Harness::new();
     let (status, body) = json_of(
