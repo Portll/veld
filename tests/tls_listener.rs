@@ -203,7 +203,7 @@ async fn https_serves_the_router_with_peer_address_and_tls_mark() {
 }
 
 #[tokio::test]
-async fn the_plain_listener_does_not_mark_requests_tls() {
+async fn a_router_served_without_tls_carries_no_tls_mark() {
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     let server = tokio::spawn(async move {
