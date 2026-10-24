@@ -55,7 +55,18 @@ pub const ENV_INTERVAL_SECS: &str = "VELD_REPLICATE_INTERVAL_SECS";
 /// Set to `1` to follow a leader on another host over plain http. The admin key and
 /// API key then cross the network in cleartext; meant for a private link only.
 pub const ENV_INSECURE_HTTP: &str = "VELD_REPLICATE_INSECURE_HTTP";
+/// Path to a PEM bundle of extra trust roots, added to the built-in webpki roots,
+/// for a leader whose certificate a private CA signed.
+pub const ENV_CA_CERT: &str = "VELD_CA_CERT";
+/// The follower's client certificate chain (PEM, leaf first) and its private key
+/// (PEM), presented to a leader whose TLS listener requires one. Both or neither.
+pub const ENV_CLIENT_CERT: &str = "VELD_REPLICATE_CLIENT_CERT";
+pub const ENV_CLIENT_KEY: &str = "VELD_REPLICATE_CLIENT_KEY";
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+/// Per-request timeout of the client that polls the leader.
+const POLL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-request timeout of the follow route's check that the leader does not follow us.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Frames per page of the feed; a page is one HTTP round trip.
 pub const FEED_LIMIT: usize = 500;
 /// Largest leader reply the follower will hold. A 500-frame page of snapshots with
@@ -101,6 +112,9 @@ pub struct FollowTarget {
     pub admin_key: String,
     #[serde(skip)]
     pub api_key: String,
+    /// Built by [`follow`] from the TLS variables as they stood then.
+    #[serde(skip)]
+    pub http: reqwest::Client,
     pub since: DateTime<Utc>,
 }
 
@@ -303,6 +317,92 @@ fn normalize_source_with(raw: &str, allow_insecure_http: bool) -> Result<String>
 pub fn normalize_source(raw: &str) -> Result<String> {
     let insecure = std::env::var(ENV_INSECURE_HTTP).is_ok_and(|v| v.trim() == "1");
     normalize_source_with(raw, insecure)
+}
+
+/// Extra trust roots and an optional client identity for reaching a leader.
+#[derive(Debug, Default)]
+struct LeaderTls {
+    roots: Vec<reqwest::Certificate>,
+    identity: Option<reqwest::Identity>,
+    /// `NAME=path` for each file in use, so a client that will not build names them.
+    files: Vec<String>,
+}
+
+fn read_named(var: &str, path: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("{var}={path}: cannot read the file"))
+}
+
+fn pem_certificates(var: &str, path: &str, pem: &[u8]) -> Result<Vec<reqwest::Certificate>> {
+    let certs = reqwest::Certificate::from_pem_bundle(pem)
+        .with_context(|| format!("{var}={path}: not a PEM certificate bundle"))?;
+    if certs.is_empty() {
+        bail!("{var}={path}: no PEM certificate in the file");
+    }
+    Ok(certs)
+}
+
+impl LeaderTls {
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let get = |var: &str| {
+            get(var)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let mut tls = Self::default();
+        if let Some(path) = get(ENV_CA_CERT) {
+            tls.roots = pem_certificates(ENV_CA_CERT, &path, &read_named(ENV_CA_CERT, &path)?)?;
+            tls.files.push(format!("{ENV_CA_CERT}={path}"));
+        }
+        let (cert, key) = match (get(ENV_CLIENT_CERT), get(ENV_CLIENT_KEY)) {
+            (None, None) => return Ok(tls),
+            (Some(_), None) => bail!(
+                "{ENV_CLIENT_CERT} is set but {ENV_CLIENT_KEY} is not: a client identity needs both"
+            ),
+            (None, Some(_)) => bail!(
+                "{ENV_CLIENT_KEY} is set but {ENV_CLIENT_CERT} is not: a client identity needs both"
+            ),
+            (Some(cert), Some(key)) => (cert, key),
+        };
+        let mut pem = read_named(ENV_CLIENT_CERT, &cert)?;
+        pem_certificates(ENV_CLIENT_CERT, &cert, &pem)?;
+        pem.push(b'\n');
+        pem.extend(read_named(ENV_CLIENT_KEY, &key)?);
+        let identity = reqwest::Identity::from_pem(&pem).with_context(|| {
+            format!(
+                "{ENV_CLIENT_CERT}={cert} with {ENV_CLIENT_KEY}={key}: \
+                 not a PEM certificate chain and private key"
+            )
+        })?;
+        tls.identity = Some(identity);
+        tls.files.push(format!("{ENV_CLIENT_CERT}={cert}"));
+        tls.files.push(format!("{ENV_CLIENT_KEY}={key}"));
+        Ok(tls)
+    }
+
+    fn client(self, timeout: Duration) -> Result<reqwest::Client> {
+        let mut builder = reqwest::Client::builder().timeout(timeout);
+        for root in self.roots {
+            builder = builder.add_root_certificate(root);
+        }
+        if let Some(identity) = self.identity {
+            builder = builder.identity(identity);
+        }
+        builder.build().with_context(|| {
+            if self.files.is_empty() {
+                "building the HTTP client".to_string()
+            } else {
+                format!("building the HTTP client with {}", self.files.join(", "))
+            }
+        })
+    }
+}
+
+/// The client a follower reaches its leader with: the built-in webpki roots plus
+/// any in [`ENV_CA_CERT`], presenting [`ENV_CLIENT_CERT`] and [`ENV_CLIENT_KEY`]
+/// when both are set. The files are read on every call, so following again after a
+/// certificate rotation picks up the new ones.
+pub fn leader_client(timeout: Duration) -> Result<reqwest::Client> {
+    LeaderTls::from_lookup(|var| std::env::var(var).ok())?.client(timeout)
 }
 
 /// Leader side: every user's log length, by `stat` alone.
@@ -628,7 +728,8 @@ fn save_cursor(path: &Path, users: &BTreeMap<String, UserProgress>) -> Result<()
 
 /// Start (or switch) following `source`. The cursor saved for that source is
 /// resumed, so a follower that was stopped picks up where it left off. A poll still
-/// running for the previous target stops at its next page.
+/// running for the previous target stops at its next page. Fails, naming the
+/// variable and the file, when the TLS variables do not yield a client.
 pub fn follow(
     base: &Path,
     source: &str,
@@ -643,6 +744,7 @@ pub fn follow(
         .ok_or_else(|| {
             anyhow!("no API key for the leader {source}: pass its key, or set {ENV_API_KEY}")
         })?;
+    let http = leader_client(POLL_TIMEOUT)?;
     let users = load_cursor(&cursor_path(base, &source));
     let mut status = FOLLOW.write();
     let generation = status.generation + 1;
@@ -651,6 +753,7 @@ pub fn follow(
             source,
             admin_key: admin_key.to_string(),
             api_key,
+            http,
             since: Utc::now(),
         }),
         generation,
@@ -740,13 +843,10 @@ async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>>
     Ok(buf)
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(
-    http: &reqwest::Client,
-    target: &FollowTarget,
-    path: &str,
-) -> Result<T> {
+async fn get_json<T: serde::de::DeserializeOwned>(target: &FollowTarget, path: &str) -> Result<T> {
     let url = format!("{}{}", target.source, path);
-    let resp = http
+    let resp = target
+        .http
         .get(&url)
         .header("X-API-Key", &target.api_key)
         .header(
@@ -777,22 +877,23 @@ struct LeaderStatus {
     following: Option<serde_json::Value>,
 }
 
-/// What the leader reports following, if anything: used to refuse a loop.
+/// What the leader reports following, if anything: used to refuse a loop. `http`
+/// comes from [`leader_client`], so the caller can tell a TLS configuration fault
+/// from an unreachable leader.
 pub async fn source_follows(
+    http: reqwest::Client,
     source: &str,
     admin_key: &str,
     api_key: &str,
 ) -> Result<Option<String>> {
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
     let target = FollowTarget {
         source: normalize_source(source)?,
         admin_key: admin_key.to_string(),
         api_key: api_key.to_string(),
+        http,
         since: Utc::now(),
     };
-    let leader: LeaderStatus = get_json(&http, &target, "/api/admin/replication/status").await?;
+    let leader: LeaderStatus = get_json(&target, "/api/admin/replication/status").await?;
     Ok(leader
         .following
         .and_then(|f| f.get("target")?.get("source")?.as_str().map(str::to_string)))
@@ -824,7 +925,6 @@ fn mark_diverged(generation: u64, cursor: &Path, user_id: &str, reason: &str) ->
 /// the cursor after each page. Returns the frames consumed.
 async fn sync_user(
     manager: &Arc<MultiUserMemoryManager>,
-    http: &reqwest::Client,
     target: &FollowTarget,
     generation: u64,
     cursor: &Path,
@@ -852,7 +952,7 @@ async fn sync_user(
                 .unwrap_or_default()
         );
         let page: FeedPage = tokio::select! {
-            page = get_json(http, target, &path) => page?,
+            page = get_json(target, &path) => page?,
             () = shutdown.cancelled() => return Ok(consumed),
         };
         head = page.head_lsn;
@@ -917,14 +1017,13 @@ async fn sync_user(
 /// status cannot be read.
 async fn poll_once(
     manager: &Arc<MultiUserMemoryManager>,
-    http: &reqwest::Client,
     target: &FollowTarget,
     generation: u64,
     interval: Duration,
     shutdown: &CancellationToken,
 ) -> Result<u64> {
     let leader: LeaderStatus = tokio::select! {
-        leader = get_json(http, target, "/api/admin/replication/status") => leader?,
+        leader = get_json(target, "/api/admin/replication/status") => leader?,
         () = shutdown.cancelled() => return Ok(0),
     };
     let cursor = cursor_path(&manager.base_path, &target.source);
@@ -975,7 +1074,7 @@ async fn poll_once(
             }
         }
         set_syncing(Some(&info.user_id));
-        match sync_user(manager, http, target, generation, &cursor, info, shutdown).await {
+        match sync_user(manager, target, generation, &cursor, info, shutdown).await {
             Ok(n) => {
                 consumed += n;
                 let mut status = FOLLOW.write();
@@ -1016,16 +1115,6 @@ async fn poll_once(
 /// the vector-index save at shutdown see no later writes.
 pub async fn run_follower(manager: Arc<MultiUserMemoryManager>, shutdown: CancellationToken) {
     let interval = interval_from_env();
-    let http = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "replication: no HTTP client; follower disabled");
-            return;
-        }
-    };
     let mut failures = 0u32;
     loop {
         let (target, generation) = {
@@ -1034,8 +1123,7 @@ pub async fn run_follower(manager: Arc<MultiUserMemoryManager>, shutdown: Cancel
         };
         let mut wait = interval;
         if let Some(target) = target {
-            let outcome =
-                poll_once(&manager, &http, &target, generation, interval, &shutdown).await;
+            let outcome = poll_once(&manager, &target, generation, interval, &shutdown).await;
             if shutdown.is_cancelled() {
                 break;
             }
@@ -1667,5 +1755,116 @@ mod tests {
         )
         .unwrap();
         assert_eq!(back.memory_id(), "m");
+    }
+
+    fn tls_fixture(name: &str) -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tls")
+            .join(name)
+            .display()
+            .to_string()
+    }
+
+    fn tls_from(vars: &[(&str, &str)]) -> Result<LeaderTls> {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        LeaderTls::from_lookup(|k| vars.get(k).cloned())
+    }
+
+    fn tls_refusal(vars: &[(&str, &str)]) -> String {
+        let err = tls_from(vars).expect_err("the TLS variables are refused");
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn no_tls_variables_give_a_plain_client() {
+        let tls = tls_from(&[]).unwrap();
+        assert!(tls.roots.is_empty());
+        assert!(tls.identity.is_none());
+        tls.client(PROBE_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn a_client_identity_needs_both_halves() {
+        let cert = tls_fixture("test-ca-bundle.pem");
+        let only_cert = tls_refusal(&[(ENV_CLIENT_CERT, &cert)]);
+        assert!(
+            only_cert.contains(&format!(
+                "{ENV_CLIENT_CERT} is set but {ENV_CLIENT_KEY} is not"
+            )),
+            "{only_cert}"
+        );
+        let only_key = tls_refusal(&[(ENV_CLIENT_CERT, "  "), (ENV_CLIENT_KEY, &cert)]);
+        assert!(
+            only_key.contains(&format!(
+                "{ENV_CLIENT_KEY} is set but {ENV_CLIENT_CERT} is not"
+            )),
+            "{only_key}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_ca_bundle_names_the_variable_and_the_path() {
+        let missing = tls_fixture("no-such-bundle.pem");
+        let err = tls_refusal(&[(ENV_CA_CERT, &missing)]);
+        assert!(err.contains(&format!("{ENV_CA_CERT}={missing}")), "{err}");
+    }
+
+    #[test]
+    fn a_bad_pem_names_the_variable_and_the_path() {
+        let corrupt = tls_fixture("corrupt-cert.pem");
+        let err = tls_refusal(&[(ENV_CA_CERT, &corrupt)]);
+        assert!(
+            err.contains(&format!(
+                "{ENV_CA_CERT}={corrupt}: not a PEM certificate bundle"
+            )),
+            "{err}"
+        );
+
+        let not_pem = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("Cargo.toml")
+            .display()
+            .to_string();
+        let err = tls_refusal(&[(ENV_CA_CERT, &not_pem)]);
+        assert!(
+            err.contains(&format!("{ENV_CA_CERT}={not_pem}: no PEM certificate")),
+            "{err}"
+        );
+        let err = tls_refusal(&[(ENV_CLIENT_CERT, &not_pem), (ENV_CLIENT_KEY, &not_pem)]);
+        assert!(
+            err.contains(&format!("{ENV_CLIENT_CERT}={not_pem}: no PEM certificate")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_ca_bundle_adds_every_certificate_in_it() {
+        let bundle = tls_fixture("test-ca-bundle.pem");
+        let tls = tls_from(&[(ENV_CA_CERT, &bundle)]).unwrap();
+        assert_eq!(tls.roots.len(), 2);
+        assert_eq!(tls.files, vec![format!("{ENV_CA_CERT}={bundle}")]);
+        assert!(tls.identity.is_none());
+        tls.client(PROBE_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn a_client_identity_without_a_key_names_both_files() {
+        let cert = tls_fixture("test-ca-bundle.pem");
+        let err = tls_refusal(&[(ENV_CLIENT_CERT, &cert), (ENV_CLIENT_KEY, &cert)]);
+        assert!(
+            err.contains(&format!(
+                "{ENV_CLIENT_CERT}={cert} with {ENV_CLIENT_KEY}={cert}"
+            )),
+            "{err}"
+        );
+
+        let missing = tls_fixture("no-such-key.pem");
+        let err = tls_refusal(&[(ENV_CLIENT_CERT, &cert), (ENV_CLIENT_KEY, &missing)]);
+        assert!(
+            err.contains(&format!("{ENV_CLIENT_KEY}={missing}")),
+            "{err}"
+        );
     }
 }
