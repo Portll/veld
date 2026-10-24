@@ -75,8 +75,12 @@ The same settings are `tls_cert`, `tls_key`, `tls_port`, `tls_host` and `tls_cli
   reloaded when either changes; on Unix, `SIGHUP` reloads them at once. A reload that fails
   logs an error naming the file and keeps serving the previous certificate. While the TLS
   listener runs, `SIGHUP` no longer stops the process. The client CA is read at start only.
-- **Handshakes** run off the accept loop, at most 256 at a time, each with a 10-second
-  limit, so a client that connects and stays silent does not hold up others.
+- **Handshakes** run off the accept loop, each with a 10-second limit, so a client that
+  connects and stays silent does not hold up others. At most 256 run at a time, and at
+  most 16 from one IP address. One IP address may also hold at most 64 TLS connections,
+  handshaking or established. A connection over either per-address cap is closed as soon
+  as it is accepted. The caps bound what one host can hold; they do not stop a flood from
+  many addresses.
 - **Protocols:** TLS 1.2 and 1.3, ALPN `http/1.1` only. A client that offers `h2` gets
   HTTP/1.1, so WebSocket upgrades, the `?api_key=` WebSocket fallback and passkey sign-in,
   which reads the `Host` header, work as on the plain listener.

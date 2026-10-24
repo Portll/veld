@@ -3,16 +3,20 @@
 //! The plain listener is unchanged and keeps every local client on http over loopback.
 //! This one starts when `VELD_TLS_CERT`, `VELD_TLS_KEY` and `VELD_TLS_PORT` are all set
 //! (see [`crate::config::TlsSettings`]). Handshakes run off the accept loop, bounded in
-//! number and time, so a slow or hostile client cannot stall other connections. The
+//! number and time, so a slow or hostile client cannot stall other connections, and one
+//! peer address is capped in the handshakes and connections it may hold. The
 //! certificate reloads when its files change and on SIGHUP, without a restart.
 //!
 //! Crypto is rustls on ring, named explicitly: the tree carries no aws-lc-rs and the
 //! process-default provider is never consulted.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -24,6 +28,7 @@ use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_rustls::server::TlsStream;
@@ -39,6 +44,14 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Handshakes in progress at once. At the limit the listener stops accepting, and the
 /// kernel's backlog holds new connections until a handshake ends.
 pub const MAX_CONCURRENT_HANDSHAKES: usize = 256;
+
+/// Handshakes one peer IP address may have in progress at once, so one host cannot take
+/// every slot of [`MAX_CONCURRENT_HANDSHAKES`]. A connection over it is closed at accept.
+pub const MAX_HANDSHAKES_PER_PEER: usize = 16;
+
+/// TLS connections, handshaking or established, one peer IP address may hold at once.
+/// A connection over it is closed at accept.
+pub const MAX_CONNECTIONS_PER_PEER: usize = 64;
 
 /// How often the certificate and key files are checked for a change.
 pub const RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -365,11 +378,109 @@ fn der_time(input: &[u8]) -> Option<(DateTime<Utc>, &[u8])> {
     Some((time.and_utc(), rest))
 }
 
+/// Slots held per peer IP address, up to a cap. An address's entry is removed when its
+/// count returns to zero, so the map holds only addresses with something open.
+#[derive(Debug)]
+struct PeerSlots {
+    cap: usize,
+    held: parking_lot::Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl PeerSlots {
+    fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            cap,
+            held: parking_lot::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// A slot for `ip`, or `None` when it already holds `cap`.
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PeerSlot> {
+        let mut held = self.held.lock();
+        let count = held.get(&ip).copied().unwrap_or(0);
+        if count >= self.cap {
+            return None;
+        }
+        held.insert(ip, count + 1);
+        Some(PeerSlot {
+            slots: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+/// One slot of a [`PeerSlots`], given back on drop.
+#[derive(Debug)]
+struct PeerSlot {
+    slots: Arc<PeerSlots>,
+    ip: IpAddr,
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut held = self.slots.held.lock();
+        if let Some(count) = held.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// A TLS connection from the listener. It holds its peer's slot of
+/// [`MAX_CONNECTIONS_PER_PEER`] until it is dropped.
+#[derive(Debug)]
+pub struct TlsConnection {
+    stream: TlsStream<TcpStream>,
+    _slot: PeerSlot,
+}
+
+impl AsyncRead for TlsConnection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TlsConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
 /// The TLS listener: accepts TCP, runs each handshake on its own task, and hands
 /// finished streams to `axum::serve`.
 pub struct TlsListener {
     addr: SocketAddr,
-    ready: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
+    ready: mpsc::Receiver<(TlsConnection, SocketAddr)>,
     accepting: tokio::task::JoinHandle<()>,
 }
 
@@ -403,7 +514,7 @@ impl Drop for TlsListener {
 }
 
 impl axum::serve::Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
+    type Io = TlsConnection;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -424,9 +535,11 @@ impl axum::serve::Listener for TlsListener {
 async fn accept_loop(
     tcp: TcpListener,
     acceptor: TlsAcceptor,
-    handoff: mpsc::Sender<(TlsStream<TcpStream>, SocketAddr)>,
+    handoff: mpsc::Sender<(TlsConnection, SocketAddr)>,
 ) {
     let handshakes = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+    let peer_handshakes = PeerSlots::new(MAX_HANDSHAKES_PER_PEER);
+    let peer_connections = PeerSlots::new(MAX_CONNECTIONS_PER_PEER);
     loop {
         let Ok(permit) = Arc::clone(&handshakes).acquire_owned().await else {
             return;
@@ -438,14 +551,28 @@ async fn accept_loop(
                 continue;
             }
         };
+        let ip = peer.ip().to_canonical();
+        let Some(connection) = peer_connections.try_acquire(ip) else {
+            debug!(%peer, "TLS connection closed: the peer holds {MAX_CONNECTIONS_PER_PEER} connections");
+            continue;
+        };
+        let Some(handshake) = peer_handshakes.try_acquire(ip) else {
+            debug!(%peer, "TLS connection closed: the peer has {MAX_HANDSHAKES_PER_PEER} handshakes in progress");
+            continue;
+        };
         let acceptor = acceptor.clone();
         let handoff = handoff.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _handshake = handshake;
             // Debug, not warn: scanners and port probes fail handshakes all day.
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-                Ok(Ok(tls)) => {
-                    let _ = handoff.send((tls, peer)).await;
+                Ok(Ok(stream)) => {
+                    let connection = TlsConnection {
+                        stream,
+                        _slot: connection,
+                    };
+                    let _ = handoff.send((connection, peer)).await;
                 }
                 Ok(Err(e)) => debug!(%peer, "TLS handshake failed: {e}"),
                 Err(_) => debug!(
@@ -512,6 +639,48 @@ mod tests {
             "2051-05-17T00:00:00+00:00",
             "years from 2050 are GeneralizedTime"
         );
+    }
+
+    #[test]
+    fn one_peer_at_its_handshake_cap_leaves_room_for_another() {
+        let slots = PeerSlots::new(MAX_HANDSHAKES_PER_PEER);
+        let busy: IpAddr = "192.0.2.1".parse().unwrap();
+        let other: IpAddr = "2001:db8::2".parse().unwrap();
+        let held: Vec<_> = (0..MAX_HANDSHAKES_PER_PEER)
+            .map(|_| slots.try_acquire(busy).expect("under the cap"))
+            .collect();
+        assert!(slots.try_acquire(busy).is_none(), "over the cap");
+        assert!(
+            slots.try_acquire(other).is_some(),
+            "another peer has its own"
+        );
+        drop(held);
+        assert!(slots.try_acquire(busy).is_some());
+    }
+
+    #[test]
+    fn a_peer_slot_is_given_back_on_drop_and_an_idle_peer_leaves_the_map() {
+        let slots = PeerSlots::new(2);
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        let first = slots.try_acquire(a).unwrap();
+        let second = slots.try_acquire(a).unwrap();
+        assert!(slots.try_acquire(a).is_none());
+        let on_b = slots.try_acquire(b).unwrap();
+        assert_eq!(slots.held.lock().get(&a), Some(&2));
+
+        drop(first);
+        assert_eq!(slots.held.lock().get(&a), Some(&1));
+        let third = slots.try_acquire(a).expect("a dropped slot is given back");
+        drop((second, third));
+        assert!(!slots.held.lock().contains_key(&a), "a peer at zero leaves");
+        assert_eq!(slots.held.lock().get(&b), Some(&1));
+        drop(on_b);
+        assert!(slots.held.lock().is_empty());
+
+        let none = PeerSlots::new(0);
+        assert!(none.try_acquire(a).is_none());
+        assert!(none.held.lock().is_empty(), "a refusal leaves no entry");
     }
 
     #[test]

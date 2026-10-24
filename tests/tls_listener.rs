@@ -26,7 +26,9 @@ use tower::ServiceExt;
 
 use veld::config::{ServerConfig, TlsListenerConfig};
 use veld::handlers::{build_protected_routes, MultiUserMemoryManager};
-use veld::tls::{ArrivedOverTls, CertReloader, TlsListener, TlsSetup};
+use veld::tls::{
+    ArrivedOverTls, CertReloader, TlsListener, TlsSetup, HANDSHAKE_TIMEOUT, MAX_HANDSHAKES_PER_PEER,
+};
 
 struct Ca {
     issuer: CertifiedIssuer<'static, KeyPair>,
@@ -377,6 +379,42 @@ async fn a_silent_client_does_not_stall_other_handshakes() {
     .unwrap();
     assert_eq!(body, "tls 127.0.0.1");
     drop(silent);
+    served.stop().await;
+}
+
+#[tokio::test]
+async fn one_peer_is_held_to_its_share_of_handshakes() {
+    let dir = TempDir::new().unwrap();
+    let ca = Ca::new("veld test CA");
+    let leaf = ca.server_leaf(1);
+    let cert = write(dir.path(), "chain.pem", &leaf.cert_pem);
+    let key = write(dir.path(), "key.pem", &leaf.key_pem);
+    let served = serve(&cert, &key, None).await;
+
+    let mut silent = Vec::new();
+    for _ in 0..MAX_HANDSHAKES_PER_PEER {
+        silent.push(tokio::net::TcpStream::connect(served.addr).await.unwrap());
+    }
+    let mut over = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(HANDSHAKE_TIMEOUT / 2, over.read(&mut byte))
+        .await
+        .expect("a connection over the peer's cap is closed at accept, not left to time out");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+
+    drop(silent);
+    let client = client(&ca.issuer.pem(), None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let body = loop {
+        match get_health(&client, &served.url()).await {
+            Ok((body, _)) => break body,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("the peer's slots come back when its connections close: {e}"),
+        }
+    };
+    assert_eq!(body, "tls 127.0.0.1");
     served.stop().await;
 }
 
