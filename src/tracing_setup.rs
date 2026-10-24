@@ -16,7 +16,7 @@ use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 #[cfg(feature = "telemetry")]
 use opentelemetry_sdk::{
-    trace::{RandomIdGenerator, Sampler, TracerProvider},
+    trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
     Resource,
 };
 #[cfg(feature = "telemetry")]
@@ -24,38 +24,47 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 /// Global tracer provider for shutdown
 #[cfg(feature = "telemetry")]
-static TRACER_PROVIDER: std::sync::OnceLock<TracerProvider> = std::sync::OnceLock::new();
+static TRACER_PROVIDER: std::sync::OnceLock<SdkTracerProvider> = std::sync::OnceLock::new();
 
 /// Initialize distributed tracing with OpenTelemetry
 ///
 /// Configuration via environment variables:
+/// - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: OTLP endpoint for traces; takes precedence over
+///   OTEL_EXPORTER_OTLP_ENDPOINT
 /// - OTEL_EXPORTER_OTLP_ENDPOINT: OTLP endpoint (default: http://localhost:4317)
 /// - OTEL_SERVICE_NAME: Service name (default: veld)
 /// - OTEL_TRACE_SAMPLER: Sampling strategy (default: parentbased_always_on)
 /// - RUST_LOG: Log level filter (default: info)
 #[cfg(feature = "telemetry")]
 pub fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
-    // Read configuration from environment
-    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+    // Read configuration from environment. The traces-specific variable wins over the
+    // general one, as the exporter itself resolved them before opentelemetry-otlp 0.28;
+    // since then an endpoint set in code overrides both, so it is resolved here.
+    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
         .unwrap_or_else(|_| "http://localhost:4317".to_string());
 
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "veld".to_string());
 
-    // Build span exporter using the new builder API (opentelemetry 0.27+)
+    // Build span exporter (gRPC over tonic)
     let exporter = SpanExporter::builder()
         .with_tonic()
         .with_endpoint(&otlp_endpoint)
         .build()?;
 
-    // Build resource with service metadata
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", service_name.clone()),
-        KeyValue::new("service.version", env!("VELD_VERSION_FULL")),
-    ]);
+    // Build resource with service metadata. `builder_empty` carries only these two
+    // attributes, without the SDK's default resource detectors.
+    let resource = Resource::builder_empty()
+        .with_attributes([
+            KeyValue::new("service.name", service_name.clone()),
+            KeyValue::new("service.version", env!("VELD_VERSION_FULL")),
+        ])
+        .build();
 
-    // Build tracer provider using the new builder API
-    let tracer_provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    // Build tracer provider. The batch span processor exports from its own
+    // background thread; the tonic exporter is built here, inside the Tokio runtime.
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
         .with_id_generator(RandomIdGenerator::default())
         .with_resource(resource)
@@ -141,9 +150,12 @@ pub mod trace_propagation {
         let parent_cx =
             global::get_text_map_propagator(|propagator| propagator.extract(&extractor));
 
-        // Set parent context on current span
+        // Set parent context on current span. A span that no subscriber records has no
+        // OpenTelemetry data to re-parent, and the request proceeds without one.
         let current_span = Span::current();
-        current_span.set_parent(parent_cx);
+        if let Err(e) = current_span.set_parent(parent_cx) {
+            tracing::trace!("trace context not attached to the request span: {e}");
+        }
 
         // Continue processing
         next.run(req).await
@@ -154,10 +166,12 @@ pub mod trace_propagation {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_tracing_init_no_panic() {
+    #[tokio::test]
+    async fn test_tracing_init_no_panic() {
         // Test that init doesn't panic even if OTLP endpoint is unavailable
-        // In production, traces will be buffered and retried
+        // In production, traces will be buffered and retried. The tonic exporter
+        // spawns its channel worker on the Tokio runtime, so init runs inside one,
+        // as it does in `async_main`.
         let _ = init_tracing();
     }
 }
