@@ -1018,15 +1018,21 @@ fn anchor(key: &str) -> String {
         .join("-")
 }
 
+/// `text` as a code span when none of its names is a documented type, otherwise the names
+/// linked to their sections with the rest escaped, since a link cannot live inside a code span.
 fn link_names(text: &str, keys: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
     let mut word = String::new();
-    let flush = |word: &mut String, out: &mut String| {
+    let mut linked = false;
+    let flush = |word: &mut String, out: &mut String, linked: &mut bool| {
         if word.is_empty() {
             return;
         }
         match keys.get(word.as_str()) {
-            Some(key) => out.push_str(&format!("[{}](#{})", word, anchor(key))),
+            Some(key) => {
+                out.push_str(&format!("[`{}`](#{})", word, anchor(key)));
+                *linked = true;
+            }
             None => out.push_str(word),
         }
         word.clear();
@@ -1035,12 +1041,21 @@ fn link_names(text: &str, keys: &BTreeMap<String, String>) -> String {
         if c.is_ascii_alphanumeric() || c == '_' {
             word.push(c);
         } else {
-            flush(&mut word, &mut out);
-            out.push(c);
+            flush(&mut word, &mut out, &mut linked);
+            match c {
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '|' => out.push_str("\\|"),
+                _ => out.push(c),
+            }
         }
     }
-    flush(&mut word, &mut out);
-    out
+    flush(&mut word, &mut out, &mut linked);
+    if linked {
+        out
+    } else {
+        format!("`{}`", text.replace('|', "\\|"))
+    }
 }
 
 fn group_of(path: &str) -> String {
@@ -1121,13 +1136,13 @@ fn render_markdown(out: &Output, skipped: usize) -> String {
         for r in sorted {
             let mut request = Vec::new();
             if let Some(b) = &r.body {
-                request.push(format!("body `{}`", link_names(b, &keys)));
+                request.push(format!("body {}", link_names(b, &keys)));
             }
             if let Some(q) = &r.query {
-                request.push(format!("query `{}`", link_names(q, &keys)));
+                request.push(format!("query {}", link_names(q, &keys)));
             }
             if let Some(p) = &r.path_params {
-                request.push(format!("path `{}`", link_names(p, &keys)));
+                request.push(format!("path {}", link_names(p, &keys)));
             }
             let request = if request.is_empty() {
                 "none".to_string()
@@ -1135,7 +1150,7 @@ fn render_markdown(out: &Output, skipped: usize) -> String {
                 request.join("; ")
             };
             md.push_str(&format!(
-                "| `{}` | `{}` | {} | `{}` |\n",
+                "| `{}` | `{}` | {} | {} |\n",
                 r.method,
                 r.path,
                 request,
@@ -1165,7 +1180,7 @@ fn render_markdown(out: &Output, skipped: usize) -> String {
                         notes.push(f.doc.clone());
                     }
                     md.push_str(&format!(
-                        "| `{}` | `{}` | {} | {} |\n",
+                        "| `{}` | {} | {} | {} |\n",
                         f.name,
                         link_names(&f.ty, &keys),
                         if f.required { "yes" } else { "no" },
@@ -1176,7 +1191,7 @@ fn render_markdown(out: &Output, skipped: usize) -> String {
             }
             Shape::Newtype { inner, .. } => {
                 md.push_str(&format!(
-                    "On the wire this is its inner value, `{}`.\n\n",
+                    "On the wire this is its inner value, {}.\n\n",
                     link_names(inner, &keys)
                 ));
             }
@@ -1192,7 +1207,7 @@ fn render_markdown(out: &Output, skipped: usize) -> String {
                         v.name,
                         v.payload
                             .as_ref()
-                            .map(|p| format!("`{}`", link_names(p, &keys)))
+                            .map(|p| link_names(p, &keys))
                             .unwrap_or_else(|| "none".to_string()),
                         v.doc.replace('|', "\\|")
                     ));
