@@ -313,11 +313,10 @@ pub fn user_logs(manager: &MultiUserMemoryManager) -> Vec<UserLogInfo> {
         .list_users()
         .into_iter()
         .filter_map(|user_id| {
-            let dir = manager.user_dir(&user_id).ok()?;
-            let log = std::fs::metadata(dir.join("intent.log")).ok()?;
-            log.is_file().then_some(UserLogInfo {
+            let head = manager.user_dir(&user_id).ok()?.join("intent.log");
+            head.is_file().then(|| UserLogInfo {
+                log_bytes: crate::intent_log::log_bytes(&head).unwrap_or(0),
                 user_id,
-                log_bytes: log.len(),
             })
         })
         .collect();
@@ -350,7 +349,14 @@ pub fn feed(
             } => created_unix_secs,
             LogMode::Legacy => 0,
         };
-        (guard.log().iter()?, guard.log().next_lsn().0, log_created)
+        let floor = after_lsn.map(|l| l + 1).unwrap_or(0);
+        // Only from the frame the follower needs: a page used to read the log
+        // from its first frame and skip every one below the cursor.
+        (
+            guard.log().iter_from(crate::intent_log::Lsn(floor))?,
+            guard.log().next_lsn().0,
+            log_created,
+        )
     };
     let floor = after_lsn.map(|l| l + 1).unwrap_or(0);
     let (records, more) = page_below_head(iter, floor, head_lsn, limit)?;

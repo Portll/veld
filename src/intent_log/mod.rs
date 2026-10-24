@@ -68,6 +68,24 @@
 //! to a scan from the start of the frame region, so a stale or corrupt index
 //! costs time, never correctness.
 //!
+//! ## Segments
+//!
+//! A log is a head file (the path the log is opened at, e.g. `intent.log`)
+//! and, once it has rotated, sealed segments beside it named
+//! `<head>.seg.<base LSN, 20 digits>`. With a segment size set
+//! ([`IntentLog::set_segment_bytes`]), a sync that leaves the head at least
+//! that long renames it to a segment and opens a new head whose header names
+//! the LSN its first frame will carry ([`IntentLogHeader::base_lsn`]) and keeps
+//! the log's creation time, which identifies the log to replication followers.
+//! Rotation happens only at a sync point, so no frame straddles two files and
+//! a rolled-back write never reaches into a sealed one. Sealed segments are
+//! never written again, which lets a backup hard-link them instead of copying.
+//!
+//! Readers ([`IntentLog::iter`], [`IntentLog::iter_from`],
+//! [`IntentLog::iter_at`]) cross segments in LSN order and refuse a gap
+//! between them. The [`FrameIndex`] covers the head file; positions recorded
+//! before a rotation still resolve, in the segment that now holds them.
+//!
 //! ## What this module is NOT
 //!
 //! This is the storage primitive only. The `Projection` trait, replay driver,
@@ -75,6 +93,7 @@
 //! Keeping the primitive isolated lets it be tested exhaustively before any
 //! projection depends on it.
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -153,6 +172,14 @@ pub enum IntentLogError {
     /// before performing the operation.
     #[error("operation requires a versioned intent log; this file is in legacy mode")]
     LegacyModeUnsupported,
+    /// The frames of consecutive log files do not continue each other: a
+    /// segment is missing or was replaced.
+    #[error("intent log segment {path:?} starts at LSN {found}, but the frames before it end at {expected}")]
+    SegmentGap {
+        path: PathBuf,
+        expected: u64,
+        found: u64,
+    },
 }
 
 /// Hard cap on a single payload's size. 16 MiB is far larger than any
@@ -342,10 +369,145 @@ impl FrameIndex {
     }
 }
 
+/// Separates a sealed segment's file name from its head file's name.
+const SEGMENT_INFIX: &str = ".seg.";
+const SEGMENT_DIGITS: usize = 20;
+
+/// A sealed segment: a former head file, renamed at rotation and never
+/// written again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    /// LSN of its first frame.
+    pub base: Lsn,
+    pub path: PathBuf,
+    /// Byte offset its frames start at: past the header, or 0 for a legacy
+    /// (header-less) file.
+    pub frame_start: u64,
+}
+
+/// The path a segment of the log at `log_path` whose first frame is `base` is
+/// sealed under.
+pub fn segment_path(log_path: &Path, base: Lsn) -> PathBuf {
+    let mut name = log_path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        "{SEGMENT_INFIX}{:0width$}",
+        base.0,
+        width = SEGMENT_DIGITS
+    ));
+    log_path.with_file_name(name)
+}
+
+/// The base LSN `file_name` carries when it is a sealed segment of the log
+/// whose head file is named `log_name`.
+pub fn segment_base(log_name: &str, file_name: &str) -> Option<Lsn> {
+    let digits = file_name
+        .strip_prefix(log_name)?
+        .strip_prefix(SEGMENT_INFIX)?;
+    if digits.len() != SEGMENT_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().map(Lsn)
+}
+
+/// Whether `file_name` holds frames of the log whose head file is named
+/// `log_name`: the head file itself or one of its sealed segments.
+pub fn is_log_file(log_name: &str, file_name: &str) -> bool {
+    file_name == log_name || segment_base(log_name, file_name).is_some()
+}
+
+/// The sealed segments of the log at `log_path`, oldest first.
+pub fn sealed_segments(log_path: &Path) -> Result<Vec<Segment>, IntentLogError> {
+    let Some(log_name) = log_path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let dir = match log_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut segments = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(base) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| segment_base(log_name, name))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        let frame_start = probe_mode(&path)?.frame_region_start();
+        segments.push(Segment {
+            base,
+            path,
+            frame_start,
+        });
+    }
+    segments.sort_by_key(|s| s.base);
+    Ok(segments)
+}
+
+/// Every file holding frames of the log at `log_path`, in LSN order: its
+/// sealed segments, then the head file when it exists.
+pub fn log_files(log_path: &Path) -> Result<Vec<PathBuf>, IntentLogError> {
+    let mut files: Vec<PathBuf> = sealed_segments(log_path)?
+        .into_iter()
+        .map(|s| s.path)
+        .collect();
+    if log_path.is_file() {
+        files.push(log_path.to_path_buf());
+    }
+    Ok(files)
+}
+
+/// Bytes the log at `log_path` occupies across its files.
+pub fn log_bytes(log_path: &Path) -> Result<u64, IntentLogError> {
+    let mut total = 0;
+    for file in log_files(log_path)? {
+        total += std::fs::metadata(&file)?.len();
+    }
+    Ok(total)
+}
+
+/// Where a rotation stages the next head file before renaming it into place.
+fn rotation_tmp_path(log_path: &Path) -> PathBuf {
+    let mut name = log_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".rotate.tmp");
+    log_path.with_file_name(name)
+}
+
+/// Make a rename in `path`'s directory durable.
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// The LSN after the last frame of `segment`: its base when it holds none.
+fn segment_next_lsn(segment: &Segment) -> Result<Lsn, IntentLogError> {
+    let (_, _, index) = scan_for_tail(&segment.path, segment.frame_start, None)?;
+    Ok(index.latest().map_or(segment.base, |p| p.lsn.next()))
+}
+
 /// Append-only durable intent log.
 ///
-/// One file per log. Opens in append mode; reads scan from the start.
-/// `append` writes are buffered; call `sync` to force them to disk.
+/// A head file plus any sealed segments (see the module docs). Opens the head
+/// in append mode; reads scan from the oldest segment. `append` writes are
+/// buffered; call `sync` to force them to disk.
 pub struct IntentLog {
     path: PathBuf,
     writer: BufWriter<LogFile>,
@@ -381,6 +543,17 @@ pub struct IntentLog {
     /// Offset hints for the frames in this file, kept current by `append`
     /// and the truncation paths. See the module docs.
     index: FrameIndex,
+    /// Sealed segments before the head file, oldest first.
+    sealed: Vec<Segment>,
+    /// LSN of the head file's first frame.
+    base_lsn: Lsn,
+    /// A sync that leaves the head file at least this long rotates it.
+    /// `None` never rotates.
+    segment_bytes: Option<u64>,
+    /// After a failed rotation, the head length at which the next attempt is
+    /// made, so a lasting failure is retried (and logged) every so often
+    /// rather than at every sync.
+    retry_rotation_at: u64,
 }
 
 /// The file under the log's `BufWriter`. A newtype rather than a bare `File`
@@ -449,6 +622,16 @@ pub enum LogMode {
 }
 
 impl LogMode {
+    /// The creation time a versioned header records; 0 for a legacy file.
+    pub fn created_unix_secs(&self) -> u64 {
+        match self {
+            LogMode::Versioned {
+                created_unix_secs, ..
+            } => *created_unix_secs,
+            LogMode::Legacy => 0,
+        }
+    }
+
     /// Byte offset at which frames start, relative to byte 0 of the file.
     pub fn frame_region_start(&self) -> u64 {
         match self {
@@ -500,17 +683,59 @@ impl IntentLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // A rotation that died before renaming its new head into place leaves
+        // it staged; the head it would have replaced is intact.
+        let staged = rotation_tmp_path(&path);
+        if staged.exists() {
+            std::fs::remove_file(&staged)?;
+        }
+        let mut sealed = sealed_segments(&path)?;
 
         // Probe the file shape: new / versioned / legacy. The probe also
         // tells us the byte offset at which frames begin (after a header,
         // for versioned files; at 0, for legacy files).
-        let mode = probe_mode(&path)?;
+        let (mode, header_base) = probe_header(&path)?;
+        if header_base > 0 {
+            // Segments at or past the head's base are what an interrupted
+            // truncation into a sealed segment was dropping. They are set
+            // aside rather than deleted, and out of the way of the name the
+            // head will be sealed under.
+            let stale = sealed.partition_point(|s| s.base.0 < header_base);
+            for segment in sealed.drain(stale..) {
+                let mut aside = segment.path.as_os_str().to_os_string();
+                aside.push(".orphaned");
+                std::fs::rename(&segment.path, &aside)?;
+                tracing::warn!(
+                    path = %segment.path.display(),
+                    head_base = header_base,
+                    "intent log segment starts at or after the head; set aside as .orphaned",
+                );
+            }
+        }
 
         // Now scan frames from the appropriate offset to discover next
         // LSN + durable_end. A corrupt or truncated tail is reported via
         // the returned offset — open() does not truncate.
-        let (next_lsn, durable_end, index) =
+        let (scanned_next, durable_end, index) =
             scan_for_tail(&path, mode.frame_region_start(), hint.as_ref())?;
+
+        // The head's first LSN is what its header names. A head with base 0
+        // after sealed segments is one a rotation never finished stamping (or
+        // that a build without segments created): it continues the last one.
+        // So does a head holding no frames yet, whatever its header says: a
+        // rotation that failed part-way may have left frames in the segment
+        // after the LSN the new head was stamped with.
+        let base_lsn = match sealed.last() {
+            Some(last) if header_base == 0 || index.latest().is_none() => {
+                segment_next_lsn(last)?.max(Lsn(header_base))
+            }
+            _ => Lsn(header_base),
+        };
+        let next_lsn = if index.latest().is_some() {
+            scanned_next
+        } else {
+            base_lsn
+        };
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -523,9 +748,25 @@ impl IntentLog {
         // detect "new" by combining the probe result with the file's
         // current length: a brand-new file is in `Versioned` mode (probe
         // returned that for an empty file) but its on-disk length is 0.
-        let actual_len = file.metadata()?.len();
+        let mut actual_len = file.metadata()?.len();
+        // An empty head whose header names another base than it continues is
+        // stamped again, so later opens, once it holds frames, read it right.
+        let restamp = mode.is_versioned()
+            && actual_len == HEADER_BYTES as u64
+            && index.latest().is_none()
+            && base_lsn.0 != header_base;
+        if restamp {
+            OpenOptions::new().write(true).open(&path)?.set_len(0)?;
+            actual_len = 0;
+        }
         let mode = if mode.is_versioned() && actual_len == 0 {
-            let header = IntentLogHeader::new_current();
+            let header = match sealed.last() {
+                Some(last) => IntentLogHeader::for_segment(
+                    probe_mode(&last.path)?.created_unix_secs(),
+                    base_lsn.0,
+                ),
+                None => IntentLogHeader::new_current(),
+            };
             file.write_all(&header.to_bytes())?;
             file.sync_data()?;
             LogMode::Versioned {
@@ -564,6 +805,10 @@ impl IntentLog {
             mode,
             cryptor,
             index,
+            sealed,
+            base_lsn,
+            segment_bytes: None,
+            retry_rotation_at: 0,
         };
         if actual_len > durable_end {
             if tail_is_torn(&log.path, durable_end, actual_len, next_lsn)? {
@@ -781,6 +1026,138 @@ impl IntentLog {
         self.synced_end_offset = self.durable_end_offset;
         self.synced_index_latest = self.index.latest();
         INTENT_LOG_SYNC_TOTAL.with_label_values(&["ok"]).inc();
+        let due = self
+            .segment_bytes
+            .is_some_and(|limit| self.durable_end_offset >= limit.max(self.retry_rotation_at));
+        if due && self.index.latest().is_some() {
+            // The frames are durable either way; a head that could not rotate
+            // keeps taking appends and is tried again once it has grown by
+            // another eighth of a segment.
+            if let Err(e) = self.rotate() {
+                let limit = self.segment_bytes.unwrap_or_default();
+                self.retry_rotation_at = self.durable_end_offset + (limit / 8).max(1);
+                tracing::error!(
+                    path = %self.path.display(),
+                    bytes = self.durable_end_offset,
+                    retry_at = self.retry_rotation_at,
+                    error = %e,
+                    "intent log rotation failed; appending to the current head",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Rotate the head file once a sync leaves it at least `limit` bytes
+    /// long; `None` never rotates.
+    pub fn set_segment_bytes(&mut self, limit: Option<u64>) {
+        self.segment_bytes = limit;
+    }
+
+    /// The sealed segments before the head file, oldest first.
+    pub fn sealed(&self) -> &[Segment] {
+        &self.sealed
+    }
+
+    /// LSN of the head file's first frame.
+    pub fn base_lsn(&self) -> Lsn {
+        self.base_lsn
+    }
+
+    /// Seal the head file as a segment and open a new one. Called only right
+    /// after a successful sync, so everything written is durable and the
+    /// buffer is empty. The new head is staged, and renamed into place only
+    /// after the old one is sealed: a crash at any point leaves either the
+    /// old head, or the sealed segment with a head (or none, which the next
+    /// open creates) continuing it.
+    fn rotate(&mut self) -> Result<(), IntentLogError> {
+        let started = std::time::Instant::now();
+        let sealed_path = segment_path(&self.path, self.base_lsn);
+        if sealed_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("segment {} already exists", sealed_path.display()),
+            )
+            .into());
+        }
+        let created = match self.mode {
+            LogMode::Versioned {
+                created_unix_secs, ..
+            } => created_unix_secs,
+            LogMode::Legacy => IntentLogHeader::new_current().created_unix_secs,
+        };
+        let header = IntentLogHeader::for_segment(created, self.next_lsn.0);
+        let staged = rotation_tmp_path(&self.path);
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)?;
+            file.write_all(&header.to_bytes())?;
+            file.sync_data()?;
+        }
+        // Both handles follow their files through the renames (std opens them
+        // shareable for delete, so Windows allows it): until the switch below,
+        // every append still lands after the frames it follows, whatever the
+        // old head is called by then.
+        let next_writer = match append_writer(&staged) {
+            Ok(writer) => writer,
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = std::fs::rename(&self.path, &sealed_path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e.into());
+        }
+        let placed =
+            std::fs::rename(&staged, &self.path).and_then(|()| sync_parent_dir(&self.path));
+        if let Err(e) = placed {
+            let restored = if staged.exists() {
+                std::fs::rename(&sealed_path, &self.path)
+            } else {
+                std::fs::rename(&self.path, &staged)
+                    .and_then(|()| std::fs::rename(&sealed_path, &self.path))
+            };
+            if let Err(undo) = restored {
+                tracing::error!(
+                    path = %self.path.display(),
+                    sealed = %sealed_path.display(),
+                    error = %undo,
+                    "intent log rotation could not restore the head; the next open continues the sealed segment",
+                );
+            }
+            let _ = std::fs::remove_file(&staged);
+            return Err(e.into());
+        }
+        self.writer = next_writer;
+
+        let sealed_bytes = self.durable_end_offset;
+        self.sealed.push(Segment {
+            base: self.base_lsn,
+            path: sealed_path,
+            frame_start: self.mode.frame_region_start(),
+        });
+        self.base_lsn = self.next_lsn;
+        self.mode = LogMode::Versioned {
+            format_version: header.format_version,
+            created_unix_secs: header.created_unix_secs,
+        };
+        self.durable_end_offset = HEADER_BYTES as u64;
+        self.synced_end_offset = self.durable_end_offset;
+        self.index = FrameIndex::default();
+        self.synced_index_latest = None;
+        self.retry_rotation_at = 0;
+        INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(self.durable_end_offset as i64);
+        tracing::info!(
+            path = %self.path.display(),
+            sealed_bytes,
+            segments = self.sealed.len(),
+            next_lsn = self.next_lsn.0,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "intent log rotated its head into a sealed segment",
+        );
         Ok(())
     }
 
@@ -836,17 +1213,46 @@ impl IntentLog {
         self.durable_end_offset
     }
 
-    /// Iterate every frame from the start of the frame region. Stops at
-    /// the first corrupt or truncated frame; returns an `IntentLogError`
-    /// for that frame so the caller can decide whether to truncate. The
-    /// iterator is independent of the writer — it opens its own read
-    /// handle. The header (if any) is skipped before iteration begins.
+    /// Iterate every frame, from the oldest sealed segment through the head.
+    /// Stops at the first corrupt or truncated frame; returns an
+    /// `IntentLogError` for that frame so the caller can decide whether to
+    /// truncate. The iterator is independent of the writer — it opens its
+    /// own read handles. Headers are skipped.
     pub fn iter(&self) -> Result<IntentLogIter, IntentLogError> {
-        IntentLogIter::open(
-            &self.path,
-            self.mode.frame_region_start(),
-            self.cryptor.clone(),
-        )
+        self.iter_files(0, None)
+    }
+
+    /// An iterator over the sealed segments from `first` on, then the head,
+    /// starting in the first of them at `offset` (its frame start when
+    /// `None`).
+    fn iter_files(
+        &self,
+        first: usize,
+        offset: Option<u64>,
+    ) -> Result<IntentLogIter, IntentLogError> {
+        // Every file is opened now: a rotation while the iterator is in use
+        // renames the head, and a handle follows its file where a path would
+        // land on the new head.
+        let mut files = VecDeque::new();
+        for segment in &self.sealed[first.min(self.sealed.len())..] {
+            files.push_back(NextFile::open(&segment.path, segment.frame_start)?);
+        }
+        files.push_back(NextFile::open(&self.path, self.mode.frame_region_start())?);
+        let first = files.pop_front().expect("the head is always listed");
+        let start = offset.unwrap_or(first.frame_start);
+        let mut iter = IntentLogIter::from_file(first.file, start, self.cryptor.clone())?;
+        iter.rest = files;
+        Ok(iter)
+    }
+
+    /// The sealed segment holding `lsn`, when `lsn` precedes the head.
+    fn sealed_holding(&self, lsn: Lsn) -> Option<usize> {
+        if lsn >= self.base_lsn {
+            return None;
+        }
+        self.sealed
+            .partition_point(|s| s.base <= lsn)
+            .checked_sub(1)
     }
 
     /// Like [`iter`](Self::iter), but positioned at the indexed frame with
@@ -857,6 +1263,11 @@ impl IntentLog {
     /// does not carry the recorded LSN and CRC, iteration starts at the first
     /// frame.
     pub fn iter_from(&self, target: Lsn) -> Result<IntentLogIter, IntentLogError> {
+        if target < self.base_lsn {
+            // Sealed segments carry no offset hints: read the one holding
+            // `target` from its first frame.
+            return self.iter_files(self.sealed_holding(target).unwrap_or(0), None);
+        }
         let region_start = self.mode.frame_region_start();
         if let Some(pos) = self.index.seek_hint(target) {
             if pos.offset > region_start && pos.offset < self.durable_end_offset {
@@ -867,7 +1278,7 @@ impl IntentLog {
                     path = %self.path.display(),
                     lsn = pos.lsn.0,
                     offset = pos.offset,
-                    "intent log offset hint did not verify; reading from the first frame",
+                    "intent log offset hint did not verify; reading the head from its first frame",
                 );
             }
         }
@@ -877,10 +1288,21 @@ impl IntentLog {
     /// An iterator positioned at `pos`, or `None` when the frame found there
     /// is not the one `pos` describes.
     pub fn iter_at(&self, pos: FramePosition) -> Result<Option<IntentLogIter>, IntentLogError> {
-        if pos.offset < self.mode.frame_region_start() || pos.offset >= self.durable_end_offset {
-            return Ok(None);
-        }
-        let mut iter = IntentLogIter::open(&self.path, pos.offset, self.cryptor.clone())?;
+        let mut iter = if pos.lsn < self.base_lsn {
+            let Some(at) = self.sealed_holding(pos.lsn) else {
+                return Ok(None);
+            };
+            if pos.offset < self.sealed[at].frame_start {
+                return Ok(None);
+            }
+            self.iter_files(at, Some(pos.offset))?
+        } else {
+            if pos.offset < self.mode.frame_region_start() || pos.offset >= self.durable_end_offset
+            {
+                return Ok(None);
+            }
+            IntentLogIter::open(&self.path, pos.offset, self.cryptor.clone())?
+        };
         if iter.verify_and_rewind(pos)? {
             Ok(Some(iter))
         } else {
@@ -939,6 +1361,9 @@ impl IntentLog {
     /// - Returns [`IntentLogError::Io`] (NotFound) if `max_lsn` is greater
     ///   than every LSN actually present in the file.
     pub fn truncate_to_lsn(&mut self, max_lsn: Lsn) -> Result<u64, IntentLogError> {
+        if let Some(at) = self.sealed_holding(max_lsn) {
+            self.reopen_at_segment(at)?;
+        }
         // Flush any buffered append so the on-disk image is what we scan.
         self.writer.flush()?;
 
@@ -1009,6 +1434,29 @@ impl IntentLog {
     }
 }
 
+impl IntentLog {
+    /// Make sealed segment `at` the head again, dropping the head and every
+    /// later segment, so a truncation can cut inside it. The segment is
+    /// copied to a fresh file first: a backup may hold a hard link to it, and
+    /// the cut must not reach that copy.
+    fn reopen_at_segment(&mut self, at: usize) -> Result<(), IntentLogError> {
+        self.writer.flush()?;
+        let path = self.path.clone();
+        let staged = rotation_tmp_path(&path);
+        std::fs::copy(&self.sealed[at].path, &staged)?;
+        OpenOptions::new().write(true).open(&staged)?.sync_data()?;
+        std::fs::rename(&staged, &path)?;
+        for later in self.sealed[at..].iter().rev() {
+            std::fs::remove_file(&later.path)?;
+        }
+        sync_parent_dir(&path)?;
+        let segment_bytes = self.segment_bytes;
+        *self = Self::open_with_index(&path, self.cryptor.clone(), None)?;
+        self.segment_bytes = segment_bytes;
+        Ok(())
+    }
+}
+
 /// One frame returned by [`IntentLogIter`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentRecord {
@@ -1061,6 +1509,31 @@ pub struct IntentLogIter {
     body: Vec<u8>,
     /// Payload length of the frame in `body`.
     body_len: usize,
+    /// Log files still to read after this one, oldest first.
+    rest: VecDeque<NextFile>,
+    /// LSN of the last frame read, which the first frame of the next file
+    /// must follow.
+    last_lsn: Option<Lsn>,
+    /// The current file was entered from the previous one and its first
+    /// frame has not been read yet.
+    entered: Option<PathBuf>,
+}
+
+/// A log file an [`IntentLogIter`] reads after the current one.
+struct NextFile {
+    path: PathBuf,
+    file: File,
+    frame_start: u64,
+}
+
+impl NextFile {
+    fn open(path: &Path, frame_start: u64) -> Result<Self, IntentLogError> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: File::open(path)?,
+            frame_start,
+        })
+    }
 }
 
 impl IntentLogIter {
@@ -1083,7 +1556,14 @@ impl IntentLogIter {
         start_offset: u64,
         cryptor: Option<crate::keystore::SecretCryptor>,
     ) -> Result<Self, IntentLogError> {
-        let mut file = File::open(path)?;
+        Self::from_file(File::open(path)?, start_offset, cryptor)
+    }
+
+    fn from_file(
+        mut file: File,
+        start_offset: u64,
+        cryptor: Option<crate::keystore::SecretCryptor>,
+    ) -> Result<Self, IntentLogError> {
         file.seek(SeekFrom::Start(start_offset))?;
         Ok(Self {
             reader: BufReader::with_capacity(READ_BUFFER_BYTES, file),
@@ -1092,7 +1572,27 @@ impl IntentLogIter {
             cryptor,
             body: Vec::new(),
             body_len: 0,
+            rest: VecDeque::new(),
+            last_lsn: None,
+            entered: None,
         })
+    }
+
+    /// Move to the next log file, or report that there is none.
+    fn enter_next_file(&mut self) -> Result<bool, IntentLogError> {
+        let Some(NextFile {
+            path,
+            mut file,
+            frame_start,
+        }) = self.rest.pop_front()
+        else {
+            return Ok(false);
+        };
+        file.seek(SeekFrom::Start(frame_start))?;
+        self.reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
+        self.offset = frame_start;
+        self.entered = Some(path);
+        Ok(true)
     }
 
     /// Byte offset of the next frame to be read. After `next()` returns
@@ -1110,11 +1610,34 @@ impl IntentLogIter {
         if self.finished {
             return Ok(None);
         }
-        let result = self.read_frame_inner();
+        let result = self.read_frame_across_files();
         if !matches!(result, Ok(Some(_))) {
             self.finished = true;
         }
         result
+    }
+
+    fn read_frame_across_files(&mut self) -> Result<Option<FrameMeta>, IntentLogError> {
+        loop {
+            match self.read_frame_inner()? {
+                Some(frame) => {
+                    if let Some(path) = self.entered.take() {
+                        let expected = self.last_lsn.map_or(frame.lsn, Lsn::next);
+                        if frame.lsn != expected {
+                            return Err(IntentLogError::SegmentGap {
+                                path,
+                                expected: expected.0,
+                                found: frame.lsn.0,
+                            });
+                        }
+                    }
+                    self.last_lsn = Some(frame.lsn);
+                    return Ok(Some(frame));
+                }
+                None if self.enter_next_file()? => continue,
+                None => return Ok(None),
+            }
+        }
     }
 
     fn read_frame_inner(&mut self) -> Result<Option<FrameMeta>, IntentLogError> {
@@ -1230,7 +1753,8 @@ impl IntentLogIter {
     /// Read the frame at the current offset and check it is the frame `pos`
     /// records; on success rewind so that frame is read again next.
     fn verify_and_rewind(&mut self, pos: FramePosition) -> Result<bool, IntentLogError> {
-        let matches = match self.read_frame() {
+        // Only the file `pos` was recorded in: never the first frame of the next.
+        let matches = match self.read_frame_inner() {
             Ok(Some(meta)) => meta.position() == pos,
             Ok(None) | Err(_) => false,
         };
@@ -1408,21 +1932,32 @@ fn frame_starts_at(bytes: &[u8], lsns: &std::ops::RangeInclusive<u64>) -> bool {
 ///   future-version condition that callers must surface, not silently
 ///   recover from.
 fn probe_mode(path: &Path) -> Result<LogMode, IntentLogError> {
+    probe_header(path).map(|(mode, _)| mode)
+}
+
+/// [`probe_mode`], with the base LSN the header names (0 when it names none).
+fn probe_header(path: &Path) -> Result<(LogMode, u64), IntentLogError> {
     if !path.exists() {
         // Fresh file — the open() caller will write a header.
-        return Ok(LogMode::Versioned {
-            format_version: CURRENT_FORMAT_VERSION,
-            // Placeholder; the real timestamp is stamped at write time.
-            created_unix_secs: 0,
-        });
+        return Ok((
+            LogMode::Versioned {
+                format_version: CURRENT_FORMAT_VERSION,
+                // Placeholder; the real timestamp is stamped at write time.
+                created_unix_secs: 0,
+            },
+            0,
+        ));
     }
     let len = std::fs::metadata(path)?.len();
     if len == 0 {
         // Touched but never written — treat as fresh.
-        return Ok(LogMode::Versioned {
-            format_version: CURRENT_FORMAT_VERSION,
-            created_unix_secs: 0,
-        });
+        return Ok((
+            LogMode::Versioned {
+                format_version: CURRENT_FORMAT_VERSION,
+                created_unix_secs: 0,
+            },
+            0,
+        ));
     }
 
     let mut file = File::open(path)?;
@@ -1432,10 +1967,10 @@ fn probe_mode(path: &Path) -> Result<LogMode, IntentLogError> {
     // Too short to even hold the magic — treat as legacy (whoever owns
     // this file can take it from there).
     if n < 8 {
-        return Ok(LogMode::Legacy);
+        return Ok((LogMode::Legacy, 0));
     }
     if &magic_buf != MAGIC {
-        return Ok(LogMode::Legacy);
+        return Ok((LogMode::Legacy, 0));
     }
 
     // Magic matches — parse the rest of the header. The file MUST be
@@ -1450,10 +1985,13 @@ fn probe_mode(path: &Path) -> Result<LogMode, IntentLogError> {
     }
     file.seek(SeekFrom::Start(0))?;
     let header = IntentLogHeader::read_from(&mut file)?;
-    Ok(LogMode::Versioned {
-        format_version: header.format_version,
-        created_unix_secs: header.created_unix_secs,
-    })
+    Ok((
+        LogMode::Versioned {
+            format_version: header.format_version,
+            created_unix_secs: header.created_unix_secs,
+        },
+        header.base_lsn,
+    ))
 }
 
 #[cfg(test)]
@@ -2287,5 +2825,244 @@ mod tests {
         assert_eq!(seen, 5);
         assert_eq!(payload_decrypts_on_this_thread() - before, 1);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+
+    /// A log in its own directory that rotates whenever a sync leaves the head
+    /// at `limit` bytes or more.
+    fn rotating_log(dir: &tempfile::TempDir, limit: u64) -> IntentLog {
+        let mut log = IntentLog::open(dir.path().join("intent.log")).unwrap();
+        log.set_segment_bytes(Some(limit));
+        log
+    }
+
+    fn append_synced(log: &mut IntentLog, count: u64) {
+        for _ in 0..count {
+            let lsn = log.next_lsn().0;
+            log.append(format!("frame-{lsn}").as_bytes()).unwrap();
+            log.sync().unwrap();
+        }
+    }
+
+    fn lsns(iter: IntentLogIter) -> Vec<u64> {
+        iter.map(|r| r.unwrap().lsn.0).collect()
+    }
+
+    /// Each frame here is 4 + 8 + len("frame-N") + 4 bytes; a 100-byte limit
+    /// rotates every few frames.
+    const LIMIT: u64 = 100;
+
+    #[test]
+    fn a_rotating_log_reads_back_every_frame_in_order_across_its_segments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = rotating_log(&dir, LIMIT);
+        let created = log.mode().created_unix_secs();
+        append_synced(&mut log, 20);
+
+        assert!(log.sealed().len() >= 3, "{} segments", log.sealed().len());
+        let names: Vec<String> = log
+            .sealed()
+            .iter()
+            .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names[0], "intent.log.seg.00000000000000000000");
+        assert_eq!(lsns(log.iter().unwrap()), (0..20).collect::<Vec<_>>());
+        assert_eq!(
+            log.mode().created_unix_secs(),
+            created,
+            "rotation keeps the log's identity"
+        );
+
+        drop(log);
+        let reopened = IntentLog::open(dir.path().join("intent.log")).unwrap();
+        assert_eq!(reopened.next_lsn(), Lsn(20));
+        assert_eq!(reopened.mode().created_unix_secs(), created);
+        assert_eq!(lsns(reopened.iter().unwrap()), (0..20).collect::<Vec<_>>());
+        let records: Vec<IntentRecord> = reopened.iter().unwrap().map(Result::unwrap).collect();
+        assert_eq!(records[7].payload, b"frame-7");
+    }
+
+    #[test]
+    fn a_log_without_a_segment_size_never_rotates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = IntentLog::open(dir.path().join("intent.log")).unwrap();
+        append_synced(&mut log, 20);
+        assert!(log.sealed().is_empty());
+        assert_eq!(
+            log_files(log.path()).unwrap(),
+            vec![log.path().to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn iter_from_and_iter_at_find_frames_in_sealed_segments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = rotating_log(&dir, LIMIT);
+        append_synced(&mut log, 3);
+        let early = {
+            let mut iter = log.iter().unwrap();
+            iter.read_frame().unwrap();
+            iter.read_frame().unwrap().unwrap().position()
+        };
+        append_synced(&mut log, 17);
+        assert!(
+            early.lsn < log.base_lsn(),
+            "the position is now in a sealed segment"
+        );
+
+        let from: Vec<u64> = lsns(log.iter_from(Lsn(5)).unwrap())
+            .into_iter()
+            .filter(|lsn| *lsn >= 5)
+            .collect();
+        assert_eq!(from, (5..20).collect::<Vec<_>>());
+
+        let at = log
+            .iter_at(early)
+            .unwrap()
+            .expect("a position recorded before rotation still resolves");
+        assert_eq!(lsns(at), (early.lsn.0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_missing_middle_segment_is_reported_not_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = rotating_log(&dir, LIMIT);
+        append_synced(&mut log, 20);
+        let middle = log.sealed()[1].path.clone();
+        drop(log);
+        std::fs::remove_file(&middle).unwrap();
+
+        let log = IntentLog::open(dir.path().join("intent.log")).unwrap();
+        let err = log
+            .iter()
+            .unwrap()
+            .find_map(Result::err)
+            .expect("the gap surfaces as an error");
+        assert!(matches!(err, IntentLogError::SegmentGap { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_head_lost_between_the_renames_is_recreated_from_the_sealed_tail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = rotating_log(&dir, LIMIT);
+        append_synced(&mut log, 20);
+        let created = log.mode().created_unix_secs();
+        let head = log.path().to_path_buf();
+        let (base, next) = (log.base_lsn(), log.next_lsn());
+        drop(log);
+        // What a crash between sealing the head and renaming the new one in
+        // leaves: every frame sealed, and no head file.
+        std::fs::rename(&head, segment_path(&head, base)).unwrap();
+
+        let mut reopened = IntentLog::open(&head).unwrap();
+        assert_eq!(reopened.next_lsn(), next);
+        assert_eq!(reopened.base_lsn(), next);
+        assert_eq!(reopened.mode().created_unix_secs(), created);
+        reopened.append(b"after").unwrap();
+        reopened.sync().unwrap();
+        assert_eq!(
+            lsns(reopened.iter().unwrap()),
+            (0..=next.0).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn truncating_into_a_sealed_segment_leaves_a_hard_linked_copy_whole() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = rotating_log(&dir, LIMIT);
+        append_synced(&mut log, 20);
+        let first = log.sealed()[0].clone();
+        let linked = dir.path().join("backup-of-first-segment");
+        std::fs::hard_link(&first.path, &linked).unwrap();
+        let linked_len = std::fs::metadata(&linked).unwrap().len();
+        let target = Lsn(first.base.0 + 1);
+
+        log.truncate_to_lsn(target).unwrap();
+
+        assert!(log.sealed().is_empty());
+        assert_eq!(log.next_lsn(), target.next());
+        assert_eq!(
+            lsns(log.iter().unwrap()),
+            (0..=target.0).collect::<Vec<_>>()
+        );
+        assert!(sealed_segments(log.path()).unwrap().is_empty());
+        assert_eq!(std::fs::metadata(&linked).unwrap().len(), linked_len);
+        log.append(b"next").unwrap();
+        log.sync().unwrap();
+        assert_eq!(lsns(log.iter().unwrap()).last(), Some(&target.next().0));
+    }
+
+    #[test]
+    fn a_rotation_that_fails_keeps_every_frame_and_waits_before_trying_again() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = rotating_log(&dir, LIMIT);
+        let blocker = segment_path(log.path(), Lsn::ZERO);
+        std::fs::write(&blocker, b"not a segment").unwrap();
+        append_synced(&mut log, 6);
+        assert!(
+            log.sealed().is_empty(),
+            "the name it would seal under is taken"
+        );
+        assert!(log.retry_rotation_at > log.durable_end_offset() - 30);
+
+        std::fs::remove_file(&blocker).unwrap();
+        append_synced(&mut log, 14);
+        assert!(!log.sealed().is_empty(), "it rotates once the way is clear");
+        assert_eq!(lsns(log.iter().unwrap()), (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_segment_left_past_the_head_is_set_aside_and_rotation_carries_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = rotating_log(&dir, LIMIT);
+        append_synced(&mut log, 20);
+        let target = Lsn(log.sealed()[1].base.0 + 1);
+        let dropped = log.sealed()[2].path.clone();
+        drop(log);
+        // An interrupted truncation into segment 1: the head is already its
+        // copy, the later segments still lie beside it.
+        let head = dir.path().join("intent.log");
+        std::fs::copy(segment_path(&head, Lsn(target.0 - 1)), &head).unwrap();
+
+        let mut reopened = IntentLog::open(&head).unwrap();
+        reopened.set_segment_bytes(Some(LIMIT));
+        assert!(!dropped.exists());
+        let mut aside = dropped.into_os_string();
+        aside.push(".orphaned");
+        assert!(std::path::Path::new(&aside).exists());
+        assert!(reopened
+            .sealed()
+            .iter()
+            .all(|s| s.base < reopened.base_lsn()));
+        reopened.truncate_to_lsn(target).unwrap();
+        append_synced(&mut reopened, 10);
+        let read = lsns(reopened.iter().unwrap());
+        assert_eq!(read, (0..=target.0 + 10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn segment_names_belong_to_their_log_only() {
+        assert!(is_log_file("intent.log", "intent.log"));
+        assert!(is_log_file(
+            "intent.log",
+            "intent.log.seg.00000000000000000042"
+        ));
+        assert_eq!(
+            segment_base("intent.log", "intent.log.seg.00000000000000000042"),
+            Some(Lsn(42))
+        );
+        for other in [
+            "intent.log.pre_restore",
+            "intent.log.seg.42",
+            "intent.log.seg.00000000000000000042.sha256",
+            "intent.log.rotate.tmp",
+            "other.log.seg.00000000000000000042",
+        ] {
+            assert!(!is_log_file("intent.log", other), "{other}");
+        }
     }
 }

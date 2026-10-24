@@ -13,7 +13,7 @@ Protocol:
 
 Requirements:
     pip install -r requirements-longmemeval.txt
-    # veld server must be running on localhost:3030
+    # veld server must be running on localhost:3030, or pass --spawn for a scratch one
 
 Usage:
     # Quick smoke test
@@ -24,7 +24,20 @@ Usage:
 
     # With Claude for answers, GPT-4o for judge
     python longmemeval_eval.py --split s \\
-        --answer-provider anthropic --answer-model claude-sonnet-4-20250514
+        --answer-provider anthropic --answer-model claude-opus-5-5
+
+    # LongMemEval-S once with claude-opus-5-5 as reader and judge, on a scratch veld server
+    # (from the repository root; venv per benchmarks/locomo_qa_eval.py; resumable with
+    # --resume <output>, which retries questions whose Claude call failed)
+    ~/.venvs/veld-bench/bin/python benchmarks/longmemeval_eval.py --split s --spawn \\
+        --answer-provider anthropic --judge-provider anthropic \\
+        --output ~/.cache/veld-bench/results/longmemeval_s_claude.json
+
+With --answer-provider/--judge-provider anthropic: no temperature is sent, thinking is always
+on (reader effort medium, judge effort low), server-side refusal fallbacks are enabled, and the
+judge answers through structured output {"answer": "yes"|"no"}. Published LongMemEval accuracies
+are judged by GPT-4o with the official evaluator (and published LoCoMo J figures use
+gpt-4o-mini), so a Claude-judged run is not comparable with them.
 
 Reference: https://github.com/xiaowu0162/LongMemEval
 Dataset:   https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned
@@ -34,6 +47,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -43,6 +57,8 @@ from typing import Optional
 
 import numpy as np
 import requests
+
+from locomo_qa_eval import DEFAULT_BINARY, PRICE_PER_MTOK, ScratchServer, call_claude, call_cost
 
 # Load .env file if present (for API keys)
 _env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -87,6 +103,19 @@ QUESTION_TYPES = [
 ]
 
 RECALL_K_VALUES = [1, 3, 5, 10, 30, 50]
+
+DEFAULT_MODELS = {"openai": "gpt-4o", "openai-compatible": "gpt-4o",
+                  "anthropic": "claude-opus-5-5"}
+ANTHROPIC_READER_EFFORT = "medium"
+ANTHROPIC_JUDGE_EFFORT = "low"
+ANTHROPIC_READER_MAX_TOKENS = 8000
+ANTHROPIC_JUDGE_MAX_TOKENS = 4000
+JUDGE_YES_NO_SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "string", "enum": ["yes", "no"]}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
 
 # Map question_id prefixes to canonical types for metrics
 TASK2TYPE = {
@@ -169,13 +198,16 @@ class VeldMemoryClient:
 def llm_complete(provider: str, model: str, prompt: str,
                  temperature: float = 0, max_tokens: int = 500,
                  api_key: Optional[str] = None,
-                 api_base: Optional[str] = None) -> str:
+                 api_base: Optional[str] = None,
+                 effort: str = ANTHROPIC_READER_EFFORT,
+                 schema: Optional[dict] = None,
+                 meta: Optional[dict] = None) -> str:
     if provider == "openai" or provider == "openai-compatible":
         return _openai_complete(model, prompt, temperature, max_tokens,
                                 api_key, api_base)
     elif provider == "anthropic":
-        return _anthropic_complete(model, prompt, temperature, max_tokens,
-                                   api_key)
+        return _anthropic_complete(model, prompt, max_tokens, api_key,
+                                   effort=effort, schema=schema, meta=meta)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -196,22 +228,40 @@ def _openai_complete(model, prompt, temperature, max_tokens,
     return resp.choices[0].message.content.strip()
 
 
-def _anthropic_complete(model, prompt, temperature, max_tokens, api_key=None):
-    import anthropic
-    client = anthropic.Anthropic(
-        api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"),
-    )
-    resp = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return resp.content[0].text.strip()
+class ClaudeCallError(RuntimeError):
+    pass
+
+
+_ANTHROPIC_CLIENTS = {}
+
+
+def _anthropic_client(api_key=None):
+    if api_key not in _ANTHROPIC_CLIENTS:
+        import anthropic
+        kwargs = {"api_key": api_key} if api_key else {}
+        _ANTHROPIC_CLIENTS[api_key] = anthropic.Anthropic(max_retries=5, **kwargs)
+    return _ANTHROPIC_CLIENTS[api_key]
+
+
+def _anthropic_complete(model, prompt, max_tokens, api_key=None,
+                        effort=ANTHROPIC_READER_EFFORT, schema=None, meta=None):
+    record, text = call_claude(_anthropic_client(api_key), prompt, effort, max_tokens,
+                               schema=schema, model=model)
+    if meta is not None:
+        meta.update(record)
+    if record["error"]:
+        raise ClaudeCallError(f"{record['error']} (request_id {record['request_id']})")
+    return text
 
 
 def _llm_with_retry(provider, model, prompt, temperature=0, max_tokens=500,
-                     api_key=None, api_base=None, max_retries=5):
+                     api_key=None, api_base=None, max_retries=5,
+                     effort=ANTHROPIC_READER_EFFORT, schema=None, meta=None):
+    if provider == "anthropic":
+        # The SDK already retries 429, 5xx and connection errors (max_retries=5); a refusal
+        # or a truncation would come back again on a resend, at full price.
+        return llm_complete(provider, model, prompt, max_tokens=max_tokens,
+                            api_key=api_key, effort=effort, schema=schema, meta=meta)
     for attempt in range(max_retries):
         try:
             return llm_complete(provider, model, prompt, temperature,
@@ -576,7 +626,8 @@ def format_retrieved_context(memories: list, max_tokens: int = 12000) -> str:
 def generate_answer(provider: str, model: str, question: str,
                     question_date: str, memories: list,
                     question_type: str = "", abstention: bool = False,
-                    api_key: str = None, api_base: str = None) -> str:
+                    api_key: str = None, api_base: str = None,
+                    meta: Optional[dict] = None) -> str:
     # For answer generation: use top-50 non-summary memories.
     # Session summaries help retrieval diversity but lack specifics for QA.
     # Retrieve 100 for metrics, generate from best 50 turn-level memories.
@@ -597,6 +648,10 @@ def generate_answer(provider: str, model: str, question: str,
         question_date=question_date,
         question=question,
     )
+    if provider == "anthropic":
+        return _llm_with_retry(provider, model, prompt,
+                               max_tokens=ANTHROPIC_READER_MAX_TOKENS, api_key=api_key,
+                               effort=ANTHROPIC_READER_EFFORT, meta=meta)
     return _llm_with_retry(provider, model, prompt, temperature=0,
                            max_tokens=500, api_key=api_key, api_base=api_base)
 
@@ -695,10 +750,21 @@ def get_judge_prompt(question_type: str, abstention: bool,
 def judge_answer(question_type: str, abstention: bool,
                  question: str, gold_answer: str, hypothesis: str,
                  judge_model: str = "gpt-4o",
-                 api_key: str = None) -> tuple:
+                 api_key: str = None,
+                 judge_provider: str = "openai",
+                 meta: Optional[dict] = None) -> tuple:
     """Returns (correct: bool, raw_judge_response: str)."""
     prompt = get_judge_prompt(question_type, abstention,
                               question, gold_answer, hypothesis)
+    if judge_provider == "anthropic":
+        response = _llm_with_retry("anthropic", judge_model, prompt,
+                                   max_tokens=ANTHROPIC_JUDGE_MAX_TOKENS, api_key=api_key,
+                                   effort=ANTHROPIC_JUDGE_EFFORT, schema=JUDGE_YES_NO_SCHEMA,
+                                   meta=meta)
+        verdict = json.loads(response)["answer"]
+        if verdict not in ("yes", "no"):
+            raise ClaudeCallError(f"judge answered {verdict!r}, not yes or no")
+        return verdict == "yes", response
     response = _llm_with_retry("openai", judge_model, prompt,
                                 temperature=0, max_tokens=10,
                                 api_key=api_key)
@@ -726,6 +792,8 @@ def run_evaluation(args):
         with open(args.resume) as f:
             checkpoint = json.load(f)
         for r in checkpoint.get("per_question", []):
+            if r.get("answer_error") or r.get("judge_error"):
+                continue
             completed[r["question_id"]] = r
         print(f"Resuming from checkpoint: {len(completed)} questions already done")
 
@@ -787,27 +855,39 @@ def run_evaluation(args):
                 retrieved_corpus_ids, answer_session_ids, args.granularity)
 
         # Phase 3: Generate answer
+        answer_call, answer_error = {}, None
         t_start = time.time()
         try:
             hypothesis = generate_answer(
                 args.answer_provider, args.answer_model,
                 question, question_date, memories,
                 question_type=question_type, abstention=abstention,
-                api_key=args.answer_api_key, api_base=args.answer_api_base)
+                api_key=args.answer_api_key, api_base=args.answer_api_base,
+                meta=answer_call)
         except Exception as e:
             print(f"  Answer generation failed for {qid}: {e}")
-            hypothesis = "I don't have enough information to answer this question."
+            if args.answer_provider == "anthropic":
+                hypothesis, answer_error = None, str(e)
+            else:
+                hypothesis = "I don't have enough information to answer this question."
         t_generate = (time.time() - t_start) * 1000
 
         # Phase 4: Judge
+        judge_call, judge_error = {}, None
         t_start = time.time()
-        try:
-            correct, judge_raw = judge_answer(
-                question_type, abstention, question, gold_answer, hypothesis,
-                judge_model=args.judge_model, api_key=args.judge_api_key)
-        except Exception as e:
-            print(f"  Judge failed for {qid}: {e}")
-            correct, judge_raw = False, f"ERROR: {e}"
+        if answer_error:
+            correct, judge_raw = False, None
+        else:
+            try:
+                correct, judge_raw = judge_answer(
+                    question_type, abstention, question, gold_answer, hypothesis,
+                    judge_model=args.judge_model, api_key=args.judge_api_key,
+                    judge_provider=args.judge_provider, meta=judge_call)
+            except Exception as e:
+                print(f"  Judge failed for {qid}: {e}")
+                correct, judge_raw = False, f"ERROR: {e}"
+                if args.judge_provider == "anthropic":
+                    judge_error = str(e)
         t_judge = (time.time() - t_start) * 1000
 
         result = {
@@ -829,7 +909,16 @@ def run_evaluation(args):
                 "judge_ms": round(t_judge, 1),
             },
         }
+        for key, value in (("answer_call", answer_call), ("judge_call", judge_call),
+                           ("answer_error", answer_error), ("judge_error", judge_error)):
+            if value:
+                result[key] = value
         results.append(result)
+        if answer_call.get("fatal") or judge_call.get("fatal"):
+            _save_checkpoint(results, args)
+            sys.exit("Stopping: a non-retryable Claude API error (see above) would fail every "
+                     "question the same way. Fix it, then rerun with --resume "
+                     f"{_checkpoint_path(args)}")
 
         # Cleanup
         client.delete_user(user_id)
@@ -903,7 +992,7 @@ def aggregate_results(results: list, args) -> dict:
     except Exception:
         pass
 
-    return {
+    output = {
         "benchmark": "LongMemEval",
         "version": "0.5.0",
         "build": git_hash,
@@ -916,6 +1005,7 @@ def aggregate_results(results: list, args) -> dict:
             "granularity": args.granularity,
             "answer_provider": args.answer_provider,
             "answer_model": args.answer_model,
+            "judge_provider": args.judge_provider,
             "judge_model": args.judge_model,
         },
         "qa_metrics": {
@@ -930,11 +1020,55 @@ def aggregate_results(results: list, args) -> dict:
         "retrieval_metrics": retrieval_metrics,
         "per_question": results,
     }
+    note = comparability_note(args)
+    if note:
+        output["comparability_note"] = note
+    claude = claude_report(results)
+    if claude:
+        output["claude"] = claude
+    return output
+
+
+def comparability_note(args) -> Optional[str]:
+    if "anthropic" not in (args.answer_provider, args.judge_provider):
+        return None
+    return (f"Not comparable with published LongMemEval accuracies: this run uses "
+            f"{args.answer_model} ({args.answer_provider}) as reader and {args.judge_model} "
+            f"({args.judge_provider}) as judge, while published LongMemEval numbers are judged "
+            "by GPT-4o with the official evaluator and published LoCoMo J figures use "
+            "gpt-4o-mini. Compare only runs made with the same models.")
+
+
+def claude_report(results: list) -> Optional[dict]:
+    calls = {"answer": [r["answer_call"] for r in results if r.get("answer_call")],
+             "judge": [r["judge_call"] for r in results if r.get("judge_call")]}
+    if not calls["answer"] and not calls["judge"]:
+        return None
+    every = calls["answer"] + calls["judge"]
+    report = {
+        kind: {
+            "calls": len(mine),
+            "errors": sum(1 for c in mine if c["error"]),
+            "refusals": sum(1 for c in mine if c["stop_reason"] == "refusal"),
+            "truncated": sum(1 for c in mine if c["stop_reason"] == "max_tokens"),
+            "fallback_served": sum(1 for c in mine if c["fallback"]),
+        }
+        for kind, mine in calls.items()
+    }
+    report["unjudged_questions"] = sum(1 for r in results
+                                       if r.get("answer_error") or r.get("judge_error"))
+    report["tokens"] = {key: sum(c.get(key, 0) for c in every) for key in PRICE_PER_MTOK}
+    report["estimated_cost_usd"] = round(sum(call_cost(c) for c in every), 4)
+    return report
+
+
+def _checkpoint_path(args):
+    path = args.output or _default_output_path(args)
+    return path.replace(".json", "_checkpoint.json")
 
 
 def _save_checkpoint(results, args):
-    path = args.output or _default_output_path(args)
-    checkpoint_path = path.replace(".json", "_checkpoint.json")
+    checkpoint_path = _checkpoint_path(args)
     os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
     with open(checkpoint_path, "w") as f:
         json.dump({"per_question": results}, f)
@@ -977,6 +1111,24 @@ def print_summary(output: dict):
         for k in sorted(ret.keys()):
             print(f"    {k:<20} {ret[k]:.3f}")
 
+    claude = output.get("claude")
+    if claude:
+        print("\n  Claude calls:")
+        for kind in ("answer", "judge"):
+            c = claude[kind]
+            print(f"    {kind:<7} {c['calls']} calls, errors {c['errors']} "
+                  f"(refusals {c['refusals']}, truncated {c['truncated']}), "
+                  f"served by a fallback model {c['fallback_served']}")
+        if claude["unjudged_questions"]:
+            print(f"    {claude['unjudged_questions']} questions failed a Claude call and count "
+                  "as incorrect; rerun with --resume <output> to retry them")
+        t = claude["tokens"]
+        print(f"    tokens: input {t['input_tokens']:,}, output {t['output_tokens']:,}, "
+              f"cache read {t['cache_read_input_tokens']:,}; estimated cost "
+              f"${claude['estimated_cost_usd']:.2f} at $4 / $20 / $0.20 per MTok")
+    if output.get("comparability_note"):
+        print(f"\n  {output['comparability_note']}")
+
     print(f"\n  Content Hash: {output['content_hash']}")
     print("=" * 70)
 
@@ -1000,22 +1152,40 @@ def main():
 
     parser.add_argument("--answer-provider", default="openai",
                         choices=["openai", "anthropic", "openai-compatible"])
-    parser.add_argument("--answer-model", default="gpt-4o")
+    parser.add_argument("--answer-model", default=None,
+                        help="Default: gpt-4o, or claude-opus-5-5 for anthropic")
     parser.add_argument("--answer-api-key", default=None)
     parser.add_argument("--answer-api-base", default=None)
 
-    parser.add_argument("--judge-model", default="gpt-4o")
+    parser.add_argument("--judge-provider", default="openai",
+                        choices=["openai", "anthropic"])
+    parser.add_argument("--judge-model", default=None,
+                        help="Default: gpt-4o, or claude-opus-5-5 for anthropic")
     parser.add_argument("--judge-api-key", default=None)
 
     parser.add_argument("--veld-url", default="http://127.0.0.1:3030")
     parser.add_argument("--api-key", default="sk-veld-dev-local-testing-key")
+    parser.add_argument("--spawn", action="store_true",
+                        help="Run against a scratch veld server (temporary store, random key, "
+                             "production embedder settings) instead of --veld-url")
+    parser.add_argument("--binary", default=str(DEFAULT_BINARY),
+                        help="veld binary for --spawn")
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--resume", default=None,
                         help="Resume from checkpoint JSON")
 
     args = parser.parse_args()
-    run_evaluation(args)
+    args.answer_model = args.answer_model or DEFAULT_MODELS[args.answer_provider]
+    args.judge_model = args.judge_model or DEFAULT_MODELS[args.judge_provider]
+    if not args.spawn:
+        run_evaluation(args)
+        return
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
+    with ScratchServer(args.binary) as scratch:
+        args.veld_url, args.api_key = scratch.url, scratch.api_key
+        run_evaluation(args)
 
 
 if __name__ == "__main__":
