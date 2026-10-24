@@ -42,6 +42,7 @@ import {
 } from "./string-utils";
 import { TokenTracker } from "./token-tracking";
 import {
+  autoStreamText,
   extractStringContextFromArgs,
   formatResetTokenSessionText,
   formatTokenStatusText,
@@ -1749,36 +1750,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// Auto-stream context from tool arguments (captures conversation intent)
 function autoStreamContext(
   toolName: string,
   args: Record<string, unknown>,
 ): void {
-  // Skip tools that already handle their own streaming or are meta/diagnostic
-  if (
-    [
-      "proactive_context",
-      "streaming_status",
-      "token_status",
-      "reset_token_session",
-    ].includes(toolName)
-  )
-    return;
-
-  // Extract meaningful context from tool arguments
-  let context = "";
-  if (args.query && typeof args.query === "string") {
-    context = `Query: ${args.query}`;
-  } else if (args.content && typeof args.content === "string") {
-    context = args.content;
-  } else if (args.context && typeof args.context === "string") {
-    context = args.context;
-  }
-
-  // Stream if we have meaningful context
-  if (context.length >= 20) {
-    streamMemory(context, ["auto-context", toolName], "user");
-  }
+  const text = autoStreamText(toolName, args);
+  if (text) streamMemory(text, ["auto-context", toolName], "user");
 }
 
 // Handle tool calls

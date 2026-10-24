@@ -87,3 +87,36 @@ export function extractStringContextFromArgs(
 
   return contextParts.join(" ").slice(0, maxLen);
 }
+
+const AUTO_STREAM_EXCLUDED_TOOLS = new Set([
+  "remember",
+  "proactive_context",
+  "streaming_status",
+  "token_status",
+  "reset_token_session",
+]);
+
+const AUTO_STREAM_MIN_LENGTH = 20;
+
+/**
+ * The text a tool call contributes to the memory stream, or null when it contributes nothing.
+ *
+ * A question is not knowledge. Streaming `args.query` stored every recall as a memory of its
+ * own, and because the stored text matched the next identical question better than any answer,
+ * the question came back as the top result. `remember` is excluded because it stores its content
+ * itself; the meta tools because they carry no conversation content.
+ */
+export function autoStreamText(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+): string | null {
+  if (AUTO_STREAM_EXCLUDED_TOOLS.has(toolName) || !args) return null;
+  if (typeof args.query === "string") return null;
+  const text =
+    typeof args.content === "string"
+      ? args.content
+      : typeof args.context === "string"
+        ? args.context
+        : "";
+  return text.length >= AUTO_STREAM_MIN_LENGTH ? text : null;
+}
