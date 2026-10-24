@@ -12289,6 +12289,11 @@ mod edge_index_tests {
 
     #[test]
     fn a_queued_prune_spares_an_edge_strengthened_since() {
+        // The prune decides on the scoring clock, which other tests in this binary pin; an edge
+        // stamped with the wall clock reads as years old while one of them holds it.
+        let _env = crate::memory::ablation::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
         let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
         let [a, b, c] =
@@ -12302,7 +12307,7 @@ mod edge_index_tests {
 
         let mut strengthened = graph.get_relationship(&ids[0]).unwrap().unwrap();
         strengthened.strength = 0.9;
-        strengthened.last_activated = Utc::now();
+        strengthened.last_activated = crate::memory::scoring_now();
         graph.put_relationship_record(&strengthened).unwrap();
 
         graph.flush_pending_maintenance().unwrap();
