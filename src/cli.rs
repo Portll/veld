@@ -95,17 +95,20 @@ enum Commands {
         #[arg(long, env = "VELD_MAX_CONCURRENT", default_value_t = 200)]
         max_concurrent: usize,
 
+        // The --tls-* values are text, not u16 or paths: clap refuses a blank or padded
+        // VELD_TLS_* value as either and exits, and a supervisor then respawns it every
+        // few seconds. TlsSettings trims them, treats blank as unset and names a bad port.
         /// PEM certificate chain for the HTTPS listener (with --tls-key and --tls-port)
         #[arg(long, env = "VELD_TLS_CERT")]
-        tls_cert: Option<PathBuf>,
+        tls_cert: Option<String>,
 
         /// PEM private key for the HTTPS listener: PKCS#8, RSA or SEC1
         #[arg(long, env = "VELD_TLS_KEY")]
-        tls_key: Option<PathBuf>,
+        tls_key: Option<String>,
 
         /// Port of an HTTPS listener serving the same API beside the plain one
         #[arg(long, env = "VELD_TLS_PORT")]
-        tls_port: Option<u16>,
+        tls_port: Option<String>,
 
         /// Bind address of the HTTPS listener [default: 0.0.0.0]
         #[arg(long, env = "VELD_TLS_HOST")]
@@ -113,7 +116,7 @@ enum Commands {
 
         /// CA a client certificate must chain to on the HTTPS listener (mTLS)
         #[arg(long, env = "VELD_TLS_CLIENT_CA")]
-        tls_client_ca: Option<PathBuf>,
+        tls_client_ca: Option<String>,
     },
 
     /// Launch the TUI dashboard
@@ -523,11 +526,11 @@ async fn main() -> Result<()> {
                     rate_limit,
                     max_concurrent,
                     tls: veld::config::TlsSettings {
-                        cert: tls_cert,
-                        key: tls_key,
-                        port: tls_port.map(|p| p.to_string()),
+                        cert: tls_cert.map(PathBuf::from),
+                        key: tls_key.map(PathBuf::from),
+                        port: tls_port,
                         host: tls_host,
-                        client_ca: tls_client_ca,
+                        client_ca: tls_client_ca.map(PathBuf::from),
                     },
                 })
             })
@@ -2696,6 +2699,24 @@ mod tests {
             launch: None,
             tls_url: None,
         }
+    }
+
+    #[test]
+    fn server_takes_blank_and_padded_tls_values_as_text() {
+        for given in ["", " 3443 "] {
+            let cli = Cli::try_parse_from(["veld", "server", "--tls-port", given])
+                .unwrap_or_else(|e| panic!("--tls-port {given:?}: {e}"));
+            assert!(
+                matches!(&cli.command, Commands::Server { tls_port: Some(p), .. } if p == given),
+                "{given:?}"
+            );
+        }
+        let cli = Cli::try_parse_from(["veld", "server", "--tls-cert", "", "--tls-key", " "])
+            .expect("a blank path is left to TlsSettings, which reads it as unset");
+        assert!(matches!(
+            &cli.command,
+            Commands::Server { tls_cert: Some(c), tls_key: Some(k), .. } if c.is_empty() && k == " "
+        ));
     }
 
     #[test]

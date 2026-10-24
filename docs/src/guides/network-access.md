@@ -65,7 +65,9 @@ The same settings are `tls_cert`, `tls_key`, `tls_port`, `tls_host` and `tls_cli
 `--tls-client-ca` on `veld server`.
 
 - **All or none.** The listener starts when `VELD_TLS_CERT`, `VELD_TLS_KEY` and
-  `VELD_TLS_PORT` are all set. Any of the five set without those three refuses to boot,
+  `VELD_TLS_PORT` are all set. Values are trimmed, and a blank one counts as unset, from
+  the environment, `config.toml` or the command line alike. Any of the five set without
+  those three refuses to boot,
   naming what is set and what is missing; so does a certificate, key or client CA that does
   not parse, a key that does not match the certificate, or the plain listener's port on an
   overlapping host. The refusal comes before any store opens.

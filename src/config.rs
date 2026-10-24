@@ -376,20 +376,34 @@ impl TlsSettings {
         ]
     }
 
+    /// These settings as [`Self::from_lookup`] reads them: each value trimmed, a blank one
+    /// unset. `veld server --tls-*` values arrive as given.
+    fn normalized(&self) -> Self {
+        let vars = self.vars();
+        Self::from_lookup(|name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .and_then(|(_, v)| v.clone())
+        })
+    }
+
     /// Whether the TLS listener is asked for on an interface other machines can reach.
     pub fn exposes_network(&self) -> bool {
-        self.port.is_some() && !is_local_bind_host(self.host.as_deref().unwrap_or(TLS_HOST_DEFAULT))
+        let tls = self.normalized();
+        tls.port.is_some() && !is_local_bind_host(tls.host.as_deref().unwrap_or(TLS_HOST_DEFAULT))
     }
 
     /// `Ok(None)` when no `VELD_TLS_*` variable is set. Setting any of them asks for the
     /// listener, which then needs all of cert, key and port; the error names the missing
-    /// ones. The port may not be the plain listener's on an overlapping host.
+    /// ones. The port may not be the plain listener's on an overlapping host. Values are
+    /// trimmed and a blank one is unset, wherever they came from.
     pub fn validate(
         &self,
         plain_host: &str,
         plain_port: u16,
     ) -> anyhow::Result<Option<TlsListenerConfig>> {
-        let vars = self.vars();
+        let tls = self.normalized();
+        let vars = tls.vars();
         let given: Vec<&str> = vars
             .iter()
             .filter(|(_, v)| v.is_some())
@@ -398,7 +412,7 @@ impl TlsSettings {
         if given.is_empty() {
             return Ok(None);
         }
-        let (cert, key, port) = match (&self.cert, &self.key, &self.port) {
+        let (cert, key, port) = match (&tls.cert, &tls.key, &tls.port) {
             (Some(cert), Some(key), Some(port)) => (cert, key, port),
             _ => {
                 let missing: Vec<&str> = vars[..3]
@@ -418,7 +432,7 @@ impl TlsSettings {
         let port: u16 = port
             .parse()
             .map_err(|_| anyhow::anyhow!("VELD_TLS_PORT='{port}' is not a port number"))?;
-        let host = self.host.as_deref().unwrap_or(TLS_HOST_DEFAULT);
+        let host = tls.host.as_deref().unwrap_or(TLS_HOST_DEFAULT);
         let ip = bind_ip(host).ok_or_else(|| {
             anyhow::anyhow!("VELD_TLS_HOST='{host}' is not an IP address or localhost")
         })?;
@@ -434,7 +448,7 @@ impl TlsSettings {
             addr: std::net::SocketAddr::new(ip, port),
             cert: cert.clone(),
             key: key.clone(),
-            client_ca: self.client_ca.clone(),
+            client_ca: tls.client_ca.clone(),
         }))
     }
 }
@@ -1991,6 +2005,46 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_or_padded_tls_port_as_the_command_line_gives_it_is_trimmed() {
+        let given = |port: &str| TlsSettings {
+            cert: Some(PathBuf::from("/etc/veld/chain.pem")),
+            key: Some(PathBuf::from("/etc/veld/key.pem")),
+            port: Some(port.to_string()),
+            ..TlsSettings::default()
+        };
+
+        let config = given(" 3443 ")
+            .validate("127.0.0.1", 3030)
+            .unwrap()
+            .expect("a space-padded port is a port");
+        assert_eq!(config.addr, "0.0.0.0:3443".parse().unwrap());
+
+        for blank in ["", "   "] {
+            let err = given(blank)
+                .validate("127.0.0.1", 3030)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("VELD_TLS_CERT, VELD_TLS_KEY set, VELD_TLS_PORT missing"),
+                "{blank:?}: {err}"
+            );
+        }
+
+        let err = given(" https ")
+            .validate("127.0.0.1", 3030)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VELD_TLS_PORT='https'"), "{err}");
+
+        let blank_alone = TlsSettings {
+            port: Some(" ".to_string()),
+            ..TlsSettings::default()
+        };
+        assert_eq!(blank_alone.validate("127.0.0.1", 3030).unwrap(), None);
+        assert!(!blank_alone.exposes_network());
+    }
+
+    #[test]
     fn tls_refuses_the_plain_port_on_an_overlapping_host() {
         let mut same_port = TLS_COMPLETE.to_vec();
         same_port[2] = ("VELD_TLS_PORT", "3030");
@@ -2078,6 +2132,34 @@ mod tests {
         assert_eq!(ServerConfig::from_env().rate_limit_per_second, 4000);
         env::set_var("VELD_TLS_HOST", "127.0.0.1");
         assert_eq!(ServerConfig::from_env().rate_limit_per_second, 0);
+
+        for (name, _) in TlsSettings::default().vars() {
+            env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn a_padded_tls_port_in_config_toml_is_trimmed_like_the_variable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(
+            &file,
+            "tls_cert = \"/etc/veld/chain.pem\"\ntls_key = \"/etc/veld/key.pem\"\n\
+             tls_port = \" 3443 \"\n",
+        )
+        .unwrap();
+        for (name, _) in TlsSettings::default().vars() {
+            env::remove_var(name);
+        }
+
+        load_config_path_into_env(&file);
+        assert_eq!(env::var("VELD_TLS_PORT").unwrap(), " 3443 ");
+        let listener = ServerConfig::from_env()
+            .tls_listener()
+            .unwrap()
+            .expect("bridged from the file");
+        assert_eq!(listener.addr.port(), 3443);
 
         for (name, _) in TlsSettings::default().vars() {
             env::remove_var(name);
