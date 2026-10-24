@@ -22,7 +22,8 @@ to reach the server from another machine, and how each client is configured to t
   bind gets the default of 4000 requests per second, counted per client IP address
   (`VELD_RATE_LIMIT`, `VELD_RATE_BURST`).
 - The key-management routes (`/api/user_auth/admin/keys/*`, which carry passphrases) answer
-  `403 TLS_REQUIRED` on a non-loopback bind unless `VELD_TLS_ACK=true`.
+  `403 TLS_REQUIRED` on a non-loopback bind unless `VELD_TLS_ACK=true` or the request
+  arrived over the native TLS listener.
 
 Use one of the options below instead.
 
@@ -59,8 +60,30 @@ Veld can run a TLS listener beside the loopback HTTP listener, which stays as it
 | `VELD_TLS_HOST` | Address the TLS listener binds (default `0.0.0.0`) |
 | `VELD_TLS_CLIENT_CA` | Optional. PEM bundle of the CA that signs client certificates; setting it enables mutual TLS on the TLS listener |
 
+The same settings are `tls_cert`, `tls_key`, `tls_port`, `tls_host` and `tls_client_ca` in
+`config.toml`, and `--tls-cert`, `--tls-key`, `--tls-port`, `--tls-host` and
+`--tls-client-ca` on `veld server`.
+
+- **All or none.** The listener starts when `VELD_TLS_CERT`, `VELD_TLS_KEY` and
+  `VELD_TLS_PORT` are all set. Any of the five set without those three refuses to boot,
+  naming what is set and what is missing; so does a certificate, key or client CA that does
+  not parse, a key that does not match the certificate, or the plain listener's port on an
+  overlapping host. The refusal comes before any store opens.
+- **Certificate rotation.** The certificate and key files are checked every 30 seconds and
+  reloaded when either changes; on Unix, `SIGHUP` reloads them at once. A reload that fails
+  logs an error naming the file and keeps serving the previous certificate. While the TLS
+  listener runs, `SIGHUP` no longer stops the process. The client CA is read at start only.
+- **Handshakes** run off the accept loop, at most 256 at a time, each with a 10-second
+  limit, so a client that connects and stays silent does not hold up others.
+- **Protocols:** TLS 1.2 and 1.3, ALPN `h2` and `http/1.1`.
+- **Rate limiting** stays on when the TLS listener binds anything other than loopback, even
+  with the plain listener on `127.0.0.1`.
+- **Key management:** a request that arrives over the TLS listener counts as private
+  transport, so the key-management routes accept it whatever `VELD_HOST` is.
+
 The server's entry in the [instance registry](../architecture/instance-registry.md) gains
-`tls_url` for the TLS listener. `base_url` stays the loopback HTTP URL, so the monitor and
+`tls_url` for the TLS listener, named by the machine's hostname when the listener binds a
+wildcard address. `base_url` stays the loopback HTTP URL, so the monitor and
 other local tools keep connecting over loopback.
 
 The certificate must name the host clients connect to in its subjectAltName. A leaf issued

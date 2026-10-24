@@ -2694,6 +2694,7 @@ mod tests {
             started_at: None,
             last_heartbeat: chrono::Utc::now(),
             launch: None,
+            tls_url: None,
         }
     }
 
