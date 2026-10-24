@@ -2377,9 +2377,12 @@ impl MultiUserMemoryManager {
 
         // Third projection: BM25 inverted index.
         let bm25_index = self.get_user_bm25_index(user_id)?;
-        // An in-memory index starts empty every time, so its projection replays
-        // the whole log rather than resuming from the checkpoint a past index wrote.
-        let mut bm25_projection = if bm25_index.is_in_memory() {
+        // An in-memory index starts empty every time, and an on-disk index that
+        // `BM25Index::new` recreated after a schema change is empty too, so both
+        // replay the whole log rather than resuming from the checkpoint a past
+        // index wrote. The marker stays until this replay has committed.
+        let bm25_rebuilding = bm25_index.rebuild_pending();
+        let mut bm25_projection = if bm25_index.is_in_memory() || bm25_rebuilding {
             crate::memory::Bm25Projection::new_from_start(
                 bm25_index.clone(),
                 checkpoint_store.clone(),
@@ -2438,9 +2441,14 @@ impl MultiUserMemoryManager {
         let wiki_name = wiki_projection
             .as_ref()
             .map(|wp| crate::intent_log::ReplayTarget::target_name(wp).to_string());
+        let bm25_name = crate::intent_log::ReplayTarget::target_name(&bm25_projection).to_string();
+        let mut bm25_rebuilt = None;
         let mut first_failure = None;
         for (name, result) in replay_results {
             match result {
+                Ok(applied) if bm25_rebuilding && name == bm25_name => {
+                    bm25_rebuilt = Some(applied);
+                }
                 Ok(applied) if applied > 0 => tracing::info!(
                     user_id = %user_id,
                     projection = %name,
@@ -2470,6 +2478,16 @@ impl MultiUserMemoryManager {
         if let Some(e) = first_failure {
             return Err(
                 anyhow::Error::new(e).context(format!("replay intent log for user {user_id}"))
+            );
+        }
+        if let Some(applied) = bm25_rebuilt {
+            bm25_index.finish_rebuild().with_context(|| {
+                format!("clear the BM25 rebuild marker after replay for user {user_id}")
+            })?;
+            tracing::info!(
+                user_id = %user_id,
+                applied,
+                "BM25 index rebuilt from the intent log after a schema change",
             );
         }
 
@@ -4432,25 +4450,7 @@ impl MultiUserMemoryManager {
         // Filter noise entities
         let filtered_entities: Vec<_> = extracted_entities
             .into_iter()
-            .filter(|e| {
-                let name = e.text.trim();
-                if name.len() < 3 {
-                    return false;
-                }
-                if !name.chars().any(|c| c.is_uppercase()) && e.confidence < 0.7 {
-                    return false;
-                }
-                if stop_words.contains(name.to_lowercase().as_str()) {
-                    return false;
-                }
-                if name.len() < 5 && e.confidence < 0.8 {
-                    return false;
-                }
-                if declared_names.contains(&name.to_lowercase()) {
-                    return false;
-                }
-                true
-            })
+            .filter(|e| ner_span_becomes_node(e, &stop_words, &declared_names))
             .collect();
 
         tracing::debug!(
@@ -5615,6 +5615,116 @@ mod shared_store_bootstrap_tests {
     }
 }
 
+/// Whether a NER span becomes a graph node.
+///
+/// Port of upstream shodh-memory #573 (902daf83), adapted to veld's typer.
+/// Upstream found that a confidence floor calibrated for BERT-tiny's per-token
+/// softmax, where real names score 0.9+, rejected 88–95% of the spans GLiNER's
+/// per-span sigmoid commits (every PER span on the first 50 LoCoMo gate turns),
+/// and redefined the floor as the typer's own commit threshold. veld's two
+/// confidence rules here were written against the same BERT-tiny distribution:
+/// a lowercase span needed 0.7 and a span under five characters needed 0.8.
+/// The rule-based fallback typer scales salience into 0.54–0.81, so a
+/// four-letter name it typed `PER` ("Nate") failed the short-span rule and
+/// never became a node while a six-letter one ("Joanna") did, and GLiNER's
+/// PER spans fail both rules.
+///
+/// A PER, ORG or LOC label is the typer's claim that the span denotes a person,
+/// organisation or place; that claim is the authority for a node, and a
+/// confidence number from a differently scaled model must not overrule it.
+/// Both confidence rules therefore apply only to `MISC`, the label the typers
+/// give to spans they could not place and the fallback NER gives to generic
+/// nouns, where a confidence floor still earns its keep against verb noise.
+/// There is no absolute floor: the fallback typer runs in the gate, and its
+/// salience-derived confidence is not the quantity a floor would be set in.
+///
+/// The length, stop-word and declared-name rules are unchanged and apply to
+/// every label: a declared name is already the declared entity, and a stop
+/// word names nothing whatever label it carries.
+fn ner_span_becomes_node(
+    span: &crate::embeddings::ner::NerEntity,
+    stop_words: &std::collections::HashSet<&str>,
+    declared_names: &std::collections::HashSet<String>,
+) -> bool {
+    let name = span.text.trim();
+    if name.len() < 3 {
+        return false;
+    }
+    let lower = name.to_lowercase();
+    if stop_words.contains(lower.as_str()) || declared_names.contains(&lower) {
+        return false;
+    }
+    if matches!(span.entity_type, NerEntityType::Misc) {
+        if !name.chars().any(|c| c.is_uppercase()) && span.confidence < 0.7 {
+            return false;
+        }
+        if name.len() < 5 && span.confidence < 0.8 {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod ner_span_admission_tests {
+    use super::*;
+    use crate::embeddings::ner::NerEntity;
+
+    fn span(text: &str, entity_type: NerEntityType, confidence: f32) -> NerEntity {
+        NerEntity {
+            text: text.to_string(),
+            entity_type,
+            confidence,
+            start: 0,
+            end: text.len(),
+        }
+    }
+
+    fn admitted(span: &NerEntity) -> bool {
+        let stop_words: std::collections::HashSet<&str> = ["the", "team"].into_iter().collect();
+        let declared: std::collections::HashSet<String> = ["joanna".to_string()].into();
+        ner_span_becomes_node(span, &stop_words, &declared)
+    }
+
+    /// A four-letter PER span at the fallback typer's confidence was the exact
+    /// shape the short-span rule rejected: "Nate" at 0.72 never became a node.
+    #[test]
+    fn a_short_typed_person_span_is_admitted_at_fallback_confidence() {
+        assert!(admitted(&span("Nate", NerEntityType::Person, 0.72)));
+    }
+
+    /// GLiNER commits PER spans in the 0.3–0.6 band; the label is the authority.
+    #[test]
+    fn typed_spans_are_admitted_regardless_of_confidence() {
+        for ty in [
+            NerEntityType::Person,
+            NerEntityType::Organization,
+            NerEntityType::Location,
+        ] {
+            assert!(admitted(&span("Nate", ty, 0.31)), "{ty:?}");
+            assert!(admitted(&span("nate", ty, 0.31)));
+        }
+    }
+
+    /// MISC keeps both confidence rules: it is where verb noise lands.
+    #[test]
+    fn misc_spans_still_need_confidence() {
+        assert!(!admitted(&span("decided", NerEntityType::Misc, 0.65)));
+        assert!(admitted(&span("decided", NerEntityType::Misc, 0.7)));
+        assert!(!admitted(&span("Oslo", NerEntityType::Misc, 0.79)));
+        assert!(admitted(&span("Oslo", NerEntityType::Misc, 0.8)));
+        assert!(admitted(&span("Covid", NerEntityType::Misc, 0.5)));
+    }
+
+    /// Length, stop-word and declared-name rules bind every label.
+    #[test]
+    fn structural_rules_apply_to_typed_spans_too() {
+        assert!(!admitted(&span("Al", NerEntityType::Person, 0.99)));
+        assert!(!admitted(&span("Team", NerEntityType::Organization, 0.99)));
+        assert!(!admitted(&span("Joanna", NerEntityType::Person, 0.99)));
+    }
+}
+
 /// Annotate a query with NER-extracted entity names.
 ///
 /// Off with `VELD_QUERY_NER=0`. Entities below 0.5 confidence or shorter than
@@ -6069,6 +6179,94 @@ mod reserved_dir_tests {
         assert!(manager.get_user_memory("instances").is_err());
         assert!(!root.path().join("instances").exists());
         assert!(manager.user_dir("alice").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod bm25_rebuild_replay_tests {
+    use super::*;
+    use crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION;
+    use crate::intent_log::IntentPayload;
+    use crate::memory::types::Experience;
+
+    fn manager(root: &std::path::Path) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: root.to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(root.to_path_buf(), config).unwrap()
+    }
+
+    fn lighthouse_hits(manager: &MultiUserMemoryManager) -> usize {
+        manager
+            .get_user_bm25_index("u")
+            .unwrap()
+            .search("lighthouse", 5)
+            .unwrap()
+            .len()
+    }
+
+    /// The BM25 checkpoint describes the index `BM25Index::new` discarded, so a writer open
+    /// that finds the rebuild marker must replay the log from its start, not resume.
+    #[test]
+    fn a_rebuilt_index_is_refilled_from_the_whole_log_and_its_marker_cleared() {
+        let root = tempfile::TempDir::new().unwrap();
+        {
+            let manager = manager(root.path());
+            let user_mem = manager.get_user_memory("u").unwrap();
+            let id = user_mem
+                .read()
+                .remember(
+                    Experience {
+                        content: "the lighthouse keeper writes letters every winter".into(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let mem = user_mem.read().get_memory(&id).unwrap();
+            let memory_bincode =
+                bincode::serde::encode_to_vec(&mem, bincode::config::standard()).unwrap();
+            manager
+                .journal_and_apply(
+                    "u",
+                    &IntentPayload::Remember {
+                        user_id: "u".into(),
+                        memory_id: id.0.to_string(),
+                        memory_bincode,
+                        schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+                    },
+                )
+                .unwrap();
+        }
+        let bm25_path = {
+            // This open's replay commits the index and persists a checkpoint past the record.
+            let manager = manager(root.path());
+            manager.get_user_journaled_writer("u").unwrap();
+            assert_eq!(lighthouse_hits(&manager), 1);
+            manager
+                .user_dir("u")
+                .unwrap()
+                .join(crate::memory::BM25_INDEX_DIR)
+        };
+
+        // A start that died after `BM25Index::new` recreated the index and before the replay
+        // committed: an empty index under the current schema, the marker still present.
+        std::fs::remove_dir_all(&bm25_path).unwrap();
+        crate::memory::BM25Index::new(&bm25_path).unwrap();
+        let marker =
+            bm25_path.with_file_name(format!("{}.rebuild-pending", crate::memory::BM25_INDEX_DIR));
+        std::fs::write(&marker, b"").unwrap();
+
+        let manager = manager(root.path());
+        manager.get_user_journaled_writer("u").unwrap();
+        assert_eq!(
+            lighthouse_hits(&manager),
+            1,
+            "resuming from the checkpoint would leave the rebuilt index empty"
+        );
+        assert!(!marker.exists(), "the marker outlived a committed replay");
     }
 }
 
