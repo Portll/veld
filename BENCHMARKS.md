@@ -132,21 +132,37 @@ and drain throughput per batch size against a real host when `VELD_BENCH_EMBEDDE
 It writes a JSON report under `evaluations/spaces/`. The plan's rows use
 `VELD_BENCH_SPACE_SIZES=10000,100000`.
 
-Every later step of the plan re-runs it and adds a row here, so each step has a before and after.
-No numbers are recorded yet: the baseline is the first run, before deferred embedding lands.
+Measured 2026-10-24 on the operator's M5 Pro, both runs back to back, compiled without LTO and
+with 16 codegen units (the `local` profile's settings, by `CARGO_PROFILE_BENCH_*`), under load from
+other sessions: load average about 45 during the baseline, about 40 during the head run. Absolute
+latencies are noisy at that load; the ratios are measured within one run and hold better.
 
-| Step | Commit | Memories | Spaces | Search p95 | Query p95, 2 spaces ÷ 1 | RSS per space | Stored, 2 spaces ÷ 1 | pq recall@10 | Write per memory | Drain at 64 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| baseline | | 10k | 1 / 2 | | | | | | | |
-| baseline | | 100k | 1 / 2 | | | | | | | |
+| Step | Commit | Memories | Search p95, 1 / 2 spaces | Query p95, 2 spaces ÷ 1 (sequential / at once) | Stored, 2 spaces ÷ 1 | pq recall@10 | Write per memory, 1 / 2 spaces |
+|---|---|---|---|---|---|---|---|
+| baseline (before step 9) | `fc38cc63` | 10k | 2.26 / 5.27 ms | not measured (rows added in step 10) | 1.50x (second space f32) | not measured | 12.7 / 18.4 ms |
+| baseline (before step 9) | `fc38cc63` | 100k | 4.80 / 4.08 ms | not measured | 1.50x | not measured | (as above) |
+| branch head | `bedbe286` | 10k | 1.67 / 1.99 ms (f32), 2.12 ms (pq) | 1.69x / **1.13x** | **1.03x** (second space pq) | 0.886 | 6.2 / 10.3 ms |
+| branch head | `bedbe286` | 100k | 6.52 / 9.21 ms (f32), 6.29 ms (pq) | 1.87x / **1.29x** | **1.02x** | 0.756 | (as above) |
 
-Step 10 is done when the query p95 with two spaces at once is within 1.3x of one space at 100k
-memories. Step 11 is done when two spaces, the second as `pq`, hold under 1.3x of one at 100k
-(the `two/one` row, by bytes and by RSS). The `pq` search rows rerank against vectors in memory;
-the server reads them from the records, one read per candidate. The bench's query rows leave out graph traversal and BM25, which the second space's
-search also overlaps in recall.
-
-The LoCoMo gate under each space configuration runs in CI (`.github/workflows/recall.yml`).
+- **Step 10** is done when the query p95 with two spaces at once is within 1.3x of one space at
+  100k memories: 1.29x, against 1.87x in sequence. The query rows embed through a paced embedder
+  (3.2 ms per call) and leave out graph traversal and BM25, which the second space's search also
+  overlaps in recall.
+- **Step 11** is done when two spaces, the second as `pq`, hold under 1.3x of one at 100k: 1.02x by
+  stored bytes (305 071 KiB against 300 000 KiB), where the baseline's second space in full vectors
+  held 1.50x. RSS is not reported: the probe (`sysinfo` process memory) read +0 KiB across builds
+  of 300 MB on this machine, so it measures nothing here.
+- **pq recall@10** is the share of each query's exact top ten the `pq` index returns after
+  reranking twice the results asked for against the full vectors. The f32 row in the JSON
+  (1.000 at 10k, 0.378 at 100k) searches the graph with 60 candidates, an eighth of the 480 recall asks
+  the primary for, so it is not comparable with the `pq` row.
+- **Write per memory** is inline, through the retrieval engine, with the paced embedder; the head's
+  second space is a `pq` index, cheaper to add to than a second graph. The baseline ran at the
+  higher load.
+- **Drain at 64** is not measured: it needs `VELD_BENCH_EMBEDDER_URL`, and the only embedder hosts
+  here serve the live servers.
+- The step-12 goal of a LoCoMo gate per space configuration is not met: the gate in CI
+  (`.github/workflows/recall.yml`) runs one embedder.
 
 ---
 
