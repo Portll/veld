@@ -35,6 +35,13 @@ fn failed(e: anyhow::Error) -> Response {
     )
 }
 
+fn would_loop(detail: String) -> Response {
+    respond(
+        StatusCode::CONFLICT,
+        json!({"error": "would_loop", "detail": detail}),
+    )
+}
+
 fn own_base_url(state: &AppState) -> String {
     let cfg = state.server_config();
     let host = match cfg.host.as_str() {
@@ -63,6 +70,7 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         StatusCode::OK,
         json!({
             "base_url": own_base_url(&state),
+            "instance_id": replication::instance_id(),
             "users": users,
             "following": following.target.is_some().then_some(following),
         }),
@@ -124,8 +132,9 @@ pub struct FollowRequest {
     pub api_key: Option<String>,
 }
 
-/// Start tailing `source`. Refused when the source is this instance, or when the
-/// source reports following this instance: either would echo frames forever.
+/// Start tailing `source`. Refused when the source is this instance, by its address
+/// or by the instance id its status reports, or when the source reports following
+/// this instance: either would echo frames forever.
 pub async fn follow(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(refusal) = require_admin_key(&headers) {
         return refusal;
@@ -141,10 +150,7 @@ pub async fn follow(State(state): State<AppState>, headers: HeaderMap, body: Byt
     let me = own_base_url(&state);
     let cfg = state.server_config();
     if source == me || replication::is_same_instance(&source, &cfg.host, cfg.port) {
-        return respond(
-            StatusCode::CONFLICT,
-            json!({"error": "would_loop", "detail": format!("{source} is this instance")}),
-        );
+        return would_loop(format!("{source} is this instance"));
     }
     let api_key = match req
         .api_key
@@ -163,20 +169,23 @@ pub async fn follow(State(state): State<AppState>, headers: HeaderMap, body: Byt
         Ok(c) => c,
         Err(e) => return failed(e),
     };
-    match replication::source_follows(probe, &source, &req.admin_key, &api_key).await {
-        Ok(Some(upstream)) if upstream == me => {
-            return respond(
-                StatusCode::CONFLICT,
-                json!({"error": "would_loop", "detail": format!("{source} already follows {me}; frames would echo")}),
-            );
-        }
-        Ok(_) => {}
+    let leader = match replication::probe_leader(probe, &source, &req.admin_key, &api_key).await {
+        Ok(leader) => leader,
         Err(e) => {
             return respond(
                 StatusCode::BAD_GATEWAY,
                 json!({"error": "source_unreachable", "detail": format!("{e:#}")}),
             );
         }
+    };
+    match replication::follow_loop(&leader, replication::instance_id(), &me) {
+        Some(replication::FollowLoop::Itself) => {
+            return would_loop(format!("{source} is this instance"));
+        }
+        Some(replication::FollowLoop::Mutual) => {
+            return would_loop(format!("{source} already follows {me}; frames would echo"));
+        }
+        None => {}
     }
     match replication::follow(&state.base_path, &source, &req.admin_key, Some(&api_key)) {
         Ok(status) => respond(StatusCode::OK, json!({"following": status})),

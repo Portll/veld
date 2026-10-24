@@ -156,9 +156,12 @@ follow again or restart the server.
 A leader on another host must still be `https`. `VELD_REPLICATE_INSECURE_HTTP=1` accepts
 plain HTTP on a private link, and then no certificate is presented.
 
-The follow route refuses a leader that already follows this instance by comparing URLs: it
-catches a leader that follows this instance's loopback URL, not one that follows its TLS
-URL or a proxy URL. Do not point two instances at each other.
+The follow route refuses to follow this instance itself by any URL, its TLS URL included:
+the leader's status reports an instance id, new at every start, and a leader that reports
+this process's id is refused with `409 would_loop`. A leader too old to report an id is
+followed. A leader that already follows this instance is refused by comparing URLs: it is
+caught when it follows this instance's loopback URL, not its TLS URL or a proxy URL. Do not
+point two instances at each other.
 
 ### MCP server and hooks
 

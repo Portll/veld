@@ -20,9 +20,9 @@ reach.
 
 | Route | Role | Purpose |
 |---|---|---|
-| `GET status` | both | `users: [{user_id, log_bytes}]` this instance can feed; `following` when it tails a leader |
+| `GET status` | both | `instance_id`, this process's id, new at every start; `users: [{user_id, log_bytes}]` this instance can feed; `following` when it tails a leader |
 | `GET records?user_id&after_lsn&limit` | leader | Frames after `after_lsn`, decrypted, base64, with `head_lsn`, `more` and `log_created`. 404 for a tenant with no log; it never creates one |
-| `POST follow {source, admin_key, api_key?}` | follower | Start tailing; refused when the source is this instance (any loopback name with this port) or already follows it |
+| `POST follow {source, admin_key, api_key?}` | follower | Start tailing; refused when the source is this instance (any loopback name with this port, or a source whose status reports this process's `instance_id`) or already follows it. A leader whose status carries no `instance_id` (an older build) is followed |
 | `POST unfollow` | follower | Stop; a poll in progress stops at its next page; the cursor is kept |
 
 At boot: `VELD_REPLICATE_FROM`, `VELD_REPLICATE_ADMIN_KEY`, `VELD_REPLICATE_API_KEY`,

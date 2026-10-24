@@ -7,7 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{extract::ConnectInfo, routing::get, Extension, Router};
+use axum::{
+    body::Body,
+    extract::ConnectInfo,
+    http::{Method, Request, StatusCode},
+    routing::get,
+    Extension, Router,
+};
+use http_body_util::BodyExt;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose,
@@ -15,8 +22,10 @@ use rcgen::{
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
 
-use veld::config::TlsListenerConfig;
+use veld::config::{ServerConfig, TlsListenerConfig};
+use veld::handlers::{build_protected_routes, MultiUserMemoryManager};
 use veld::tls::{ArrivedOverTls, CertReloader, TlsListener, TlsSetup};
 
 struct Ca {
@@ -117,6 +126,10 @@ impl Served {
 }
 
 async fn serve(cert: &Path, key: &Path, client_ca: Option<&Path>) -> Served {
+    serve_router(cert, key, client_ca, app()).await
+}
+
+async fn serve_router(cert: &Path, key: &Path, client_ca: Option<&Path>, router: Router) -> Served {
     let setup = TlsSetup::load(&TlsListenerConfig {
         addr: "127.0.0.1:0".parse().unwrap(),
         cert: cert.to_path_buf(),
@@ -131,7 +144,7 @@ async fn serve(cert: &Path, key: &Path, client_ca: Option<&Path>) -> Served {
     let stop = CancellationToken::new();
     let task = tokio::spawn(veld::tls::serve(
         listener,
-        app(),
+        router,
         stop.clone().cancelled_owned(),
     ));
     Served {
@@ -365,6 +378,90 @@ async fn a_silent_client_does_not_stall_other_handshakes() {
     .unwrap();
     assert_eq!(body, "tls 127.0.0.1");
     drop(silent);
+    served.stop().await;
+}
+
+const API_KEY: &str = "tls-listener-test-key";
+const ADMIN_KEY: &str = "tls-listener-test-admin-key";
+
+/// `uri` on `router` with both keys, and the reply's status and JSON body.
+async fn admin_call(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-api-key", API_KEY)
+        .header(veld::handlers::admin::ADMIN_API_KEY_HEADER, ADMIN_KEY)
+        .header("content-type", "application/json")
+        .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn following_this_instance_through_its_tls_url_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let ca = Ca::new("veld test CA");
+    let leaf = ca.server_leaf(1);
+    let cert = write(dir.path(), "chain.pem", &leaf.cert_pem);
+    let key = write(dir.path(), "key.pem", &leaf.key_pem);
+    let ca_path = write(dir.path(), "ca.pem", &ca.issuer.pem());
+    std::env::set_var("VELD_API_KEYS", API_KEY);
+    std::env::set_var(veld::handlers::admin::ADMIN_API_KEY_ENV, ADMIN_KEY);
+    std::env::set_var(veld::replication::ENV_CA_CERT, &ca_path);
+    std::env::set_var("VELD_LAZY_CROSS_ENCODER", "1");
+
+    let storage = dir.path().join("data");
+    std::fs::create_dir_all(&storage).unwrap();
+    let config = ServerConfig {
+        storage_path: storage.clone(),
+        backup_enabled: false,
+        ..ServerConfig::default()
+    };
+    let (plain_host, plain_port) = (config.host.clone(), config.port);
+    let manager = Arc::new(MultiUserMemoryManager::new(storage, config).unwrap());
+    let router = build_protected_routes(manager, false)
+        .layer(axum::middleware::from_fn(veld::auth::auth_middleware));
+    let served = serve_router(&cert, &key, None, router.clone()).await;
+
+    let (status, body) =
+        admin_call(&router, Method::GET, "/api/admin/replication/status", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["instance_id"],
+        veld::replication::instance_id().to_string()
+    );
+
+    let source = format!("https://127.0.0.1:{}", served.addr.port());
+    assert!(
+        !veld::replication::is_same_instance(&source, &plain_host, plain_port),
+        "the address check alone does not know the TLS port"
+    );
+    let (status, body) = admin_call(
+        &router,
+        Method::POST,
+        "/api/admin/replication/follow",
+        Some(serde_json::json!({
+            "source": source,
+            "admin_key": ADMIN_KEY,
+            "api_key": API_KEY,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "would_loop", "{body}");
+    assert_eq!(body["detail"], format!("{source} is this instance"));
+    assert!(veld::replication::status().target.is_none());
     served.stop().await;
 }
 

@@ -237,6 +237,15 @@ impl FollowStatus {
 static FOLLOW: LazyLock<RwLock<FollowStatus>> =
     LazyLock::new(|| RwLock::new(FollowStatus::default()));
 
+static INSTANCE_ID: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
+
+/// This process's identity, new at every start. The status route reports it, so the
+/// follow route recognises this process behind any URL: the TLS listener, a DNS name,
+/// a proxy.
+pub fn instance_id() -> uuid::Uuid {
+    *INSTANCE_ID
+}
+
 pub fn status() -> FollowStatus {
     FOLLOW.read().clone()
 }
@@ -869,23 +878,70 @@ async fn get_json<T: serde::de::DeserializeOwned>(target: &FollowTarget, path: &
     serde_json::from_slice(&body).with_context(|| format!("GET {url}: decoding the reply"))
 }
 
-/// The leader's own view: its users' logs and whom it follows, from its status route.
+/// The leader's own view: its users' logs, which process it is and whom it follows,
+/// from its status route.
 #[derive(Debug, Deserialize)]
 struct LeaderStatus {
     users: Vec<UserLogInfo>,
+    /// Absent from a leader built before the status route reported it.
+    #[serde(default)]
+    instance_id: Option<uuid::Uuid>,
     #[serde(default)]
     following: Option<serde_json::Value>,
 }
 
-/// What the leader reports following, if anything: used to refuse a loop. `http`
+/// What a prospective leader says about itself, read before following it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderIdentity {
+    /// `None` from a leader too old to report one.
+    pub instance_id: Option<uuid::Uuid>,
+    /// The source the leader follows, if any.
+    pub follows: Option<String>,
+}
+
+impl From<LeaderStatus> for LeaderIdentity {
+    fn from(leader: LeaderStatus) -> Self {
+        Self {
+            instance_id: leader.instance_id,
+            follows: leader
+                .following
+                .and_then(|f| f.get("target")?.get("source")?.as_str().map(str::to_string)),
+        }
+    }
+}
+
+/// Why following a leader would echo frames forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowLoop {
+    /// The leader is this process, reached by a URL the address check does not know.
+    Itself,
+    /// The leader already follows this instance.
+    Mutual,
+}
+
+/// Whether following `leader` would loop, for an instance whose id is `own_id` and
+/// whose base URL is `own_base_url`. A leader that reports no id is not taken for
+/// this process.
+pub fn follow_loop(
+    leader: &LeaderIdentity,
+    own_id: uuid::Uuid,
+    own_base_url: &str,
+) -> Option<FollowLoop> {
+    if leader.instance_id == Some(own_id) {
+        return Some(FollowLoop::Itself);
+    }
+    (leader.follows.as_deref() == Some(own_base_url)).then_some(FollowLoop::Mutual)
+}
+
+/// Which process the leader is and what it follows: used to refuse a loop. `http`
 /// comes from [`leader_client`], so the caller can tell a TLS configuration fault
 /// from an unreachable leader.
-pub async fn source_follows(
+pub async fn probe_leader(
     http: reqwest::Client,
     source: &str,
     admin_key: &str,
     api_key: &str,
-) -> Result<Option<String>> {
+) -> Result<LeaderIdentity> {
     let target = FollowTarget {
         source: normalize_source(source)?,
         admin_key: admin_key.to_string(),
@@ -894,9 +950,7 @@ pub async fn source_follows(
         since: Utc::now(),
     };
     let leader: LeaderStatus = get_json(&target, "/api/admin/replication/status").await?;
-    Ok(leader
-        .following
-        .and_then(|f| f.get("target")?.get("source")?.as_str().map(str::to_string)))
+    Ok(leader.into())
 }
 
 /// Mark a tenant diverged and persist the cursor, if the poll is still current.
@@ -1280,6 +1334,89 @@ mod tests {
     #[test]
     fn the_server_key_is_only_offered_to_a_local_leader() {
         assert!(default_api_key_for("https://leader.example:3030").is_none());
+    }
+
+    #[test]
+    fn a_leader_reporting_this_instance_id_is_this_instance_whatever_its_url() {
+        let me = uuid::Uuid::new_v4();
+        let own_url = "http://127.0.0.1:3030";
+        let leader = |instance_id, follows: Option<&str>| LeaderIdentity {
+            instance_id,
+            follows: follows.map(str::to_string),
+        };
+
+        assert_eq!(
+            follow_loop(&leader(Some(me), None), me, own_url),
+            Some(FollowLoop::Itself)
+        );
+        assert_eq!(
+            follow_loop(&leader(Some(me), Some(own_url)), me, own_url),
+            Some(FollowLoop::Itself)
+        );
+        assert_eq!(
+            follow_loop(
+                &leader(Some(uuid::Uuid::new_v4()), Some(own_url)),
+                me,
+                own_url
+            ),
+            Some(FollowLoop::Mutual)
+        );
+        assert_eq!(
+            follow_loop(&leader(None, Some(own_url)), me, own_url),
+            Some(FollowLoop::Mutual)
+        );
+        assert_eq!(
+            follow_loop(
+                &leader(Some(uuid::Uuid::new_v4()), Some("http://127.0.0.1:3031")),
+                me,
+                own_url
+            ),
+            None
+        );
+        assert_eq!(
+            follow_loop(&leader(None, None), me, own_url),
+            None,
+            "a leader too old to report an id is followed"
+        );
+    }
+
+    #[test]
+    fn the_leader_status_reports_its_instance_id_and_an_older_one_reads_as_unknown() {
+        let id = uuid::Uuid::new_v4();
+        let current: LeaderStatus = serde_json::from_value(serde_json::json!({
+            "base_url": "http://127.0.0.1:3030",
+            "instance_id": id,
+            "users": [],
+            "following": {"target": {"source": "https://leader.example:3443"}},
+        }))
+        .unwrap();
+        assert_eq!(
+            LeaderIdentity::from(current),
+            LeaderIdentity {
+                instance_id: Some(id),
+                follows: Some("https://leader.example:3443".to_string()),
+            }
+        );
+
+        let older: LeaderStatus = serde_json::from_value(serde_json::json!({
+            "base_url": "http://127.0.0.1:3030",
+            "users": [],
+            "following": null,
+        }))
+        .unwrap();
+        assert_eq!(
+            LeaderIdentity::from(older),
+            LeaderIdentity {
+                instance_id: None,
+                follows: None,
+            }
+        );
+    }
+
+    #[test]
+    fn the_instance_id_is_fixed_for_the_process() {
+        assert_eq!(instance_id(), instance_id());
+        assert_eq!(instance_id().get_version_num(), 4);
     }
 
     fn page(head_lsn: u64, log_created: u64) -> FeedPage {
