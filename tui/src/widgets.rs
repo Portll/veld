@@ -571,7 +571,7 @@ fn render_search_results(f: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 format!(" [{}] ", state.search_mode.label()),
                 Style::default().fg(Color::Rgb(255, 200, 150)),
             ))
@@ -796,7 +796,7 @@ fn render_search_detail(f: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 " Esc=back ",
                 Style::default().fg(Color::DarkGray),
             ))
@@ -4444,7 +4444,7 @@ fn render_activity_feed(f: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 " j/k Enter ",
                 Style::default().fg(Color::DarkGray),
             ))
@@ -4746,7 +4746,7 @@ fn render_event_card(f: &mut Frame, area: Rect, event: &DisplayEvent, _index: us
             title_style,
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 format!(" {} ", event.time_ago()),
                 Style::default().fg(if is_new {
                     Color::White
@@ -4820,7 +4820,7 @@ fn render_event_detail(f: &mut Frame, area: Rect, event: &DisplayEvent, state: &
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 right_hint,
                 Style::default().fg(Color::DarkGray),
             ))
@@ -5202,7 +5202,7 @@ fn render_activity_logs(f: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 format!(" {} events ", state.events.len()),
                 Style::default().fg(Color::Magenta),
             ))
@@ -5643,7 +5643,7 @@ fn render_graph_entity_selector(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 format!(" {} ", entity_count),
                 Style::default().fg(TEXT_DISABLED),
             ))
@@ -5767,7 +5767,7 @@ fn render_graph_connections_panel(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(" ←→ ", Style::default().fg(TEXT_DISABLED)))
+            Line::from(Span::styled(" ←→ ", Style::default().fg(TEXT_DISABLED)))
                 .alignment(Alignment::Right),
         );
     let inner = block.inner(area);
@@ -5921,7 +5921,7 @@ fn render_graph_visualization(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 " ↑↓ navigate ",
                 Style::default().fg(TEXT_DISABLED),
             ))
@@ -6158,7 +6158,7 @@ fn render_graph_top_entities(f: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 format!(" [{}/{}] ", selected_idx + 1, node_count),
                 Style::default().fg(Color::Yellow),
             ))
@@ -6294,7 +6294,7 @@ fn render_graph_focus_view(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 " ↑↓ navigate ",
                 Style::default().fg(TEXT_DISABLED),
             ))
@@ -6498,7 +6498,7 @@ fn render_graph_type_summary(f: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
-            block::Title::from(Span::styled(
+            Line::from(Span::styled(
                 format!(" {}e ", state.graph_data.edges.len()),
                 Style::default().fg(Color::Yellow),
             ))
