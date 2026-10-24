@@ -48,3 +48,4 @@ clock and names the cause.
 | Day | Date | Refusals | Decode failures | Panics | Note |
 |---|---|---|---|---|---|
 | 0 | 2026-10-21 | 0 | 0 | 0 | clock start |
+| 1 | 2026-10-22 | 0 | 0 | 0 | data directory 18.7 GiB to 2.7 GiB: the checkpoint store compacted the `portll` and `spine` projection side-data files at first open on the new build (log 13:35Z, 14:06Z, 14:46Z); user count unchanged at 46 |
