@@ -48,10 +48,10 @@ impl VeldMcpServer {
 
         match result {
             Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                if resp.stored {
+                if resp.success {
                     format!("Stored memory: {}", resp.id)
                 } else {
-                    format!("Memory already held as {}", resp.id)
+                    format!("Memory {} was not stored", resp.id)
                 },
             )])),
             Err(e) => Err(McpError {
