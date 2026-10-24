@@ -121,9 +121,7 @@ pub fn cap_by_selectivity(
 /// tags. A commit hash, a version such as `v0.8.4` and `R@10` pass; a bare date or a line range
 /// does not, and dates already live in `temporal_refs`.
 pub fn derived_tag_is_well_formed(tag: &str) -> bool {
-    tag.chars().count() >= 2
-        && tag.chars().any(char::is_alphabetic)
-        && !tag
+    !tag
             .chars()
             .any(|c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | '"' | ',' | ';' | '='))
 }
