@@ -20,6 +20,10 @@ const STALE_TTL: Duration = Duration::from_secs(30);
 pub struct DiscoveredInstance {
     /// Ready-to-use base URL, e.g. `http://127.0.0.1:3030`.
     pub base_url: String,
+    /// The TLS listener's URL when the server runs one, for display; clients here
+    /// still connect to `base_url`.
+    #[serde(default)]
+    pub tls_url: Option<String>,
     #[serde(default)]
     pub label: String,
     #[serde(default)]

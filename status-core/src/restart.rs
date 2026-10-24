@@ -837,6 +837,7 @@ mod tests {
     fn instance_on(port: u16) -> DiscoveredInstance {
         DiscoveredInstance {
             base_url: format!("http://127.0.0.1:{port}"),
+            tls_url: None,
             label: String::new(),
             pid: 4242,
             host: "127.0.0.1".into(),
