@@ -88,7 +88,7 @@ enum Commands {
         production: bool,
 
         /// Rate limit: max requests per second per client (0 = disabled)
-        #[arg(long, env = "VELD_RATE_LIMIT", default_value_t = 4000)]
+        #[arg(long, env = "VELD_RATE_LIMIT", default_value_t = veld::config::RATE_LIMIT_DEFAULT)]
         rate_limit: u64,
 
         /// Maximum concurrent requests before load shedding

@@ -451,6 +451,28 @@ fn bind_ip(host: &str) -> Option<std::net::IpAddr> {
         .ok()
 }
 
+/// Requests per second per client when nothing sets `VELD_RATE_LIMIT` and the
+/// local-development default does not switch limiting off.
+pub const RATE_LIMIT_DEFAULT: u64 = 4000;
+
+/// Whether the local-development default switches rate limiting off: outside
+/// production, with the plain listener on loopback, no TLS listener asked for on a
+/// reachable interface, and no limit asked for (`VELD_RATE_LIMIT` unset and the limit
+/// at [`RATE_LIMIT_DEFAULT`]).
+pub fn local_dev_disables_rate_limit(
+    production: bool,
+    host: &str,
+    tls: &TlsSettings,
+    rate_limit_env_set: bool,
+    rate_limit: u64,
+) -> bool {
+    !production
+        && is_local_bind_host(host)
+        && !tls.exposes_network()
+        && !rate_limit_env_set
+        && rate_limit == RATE_LIMIT_DEFAULT
+}
+
 /// Path to the Veld `config.toml`, the file written by `veld init`.
 ///
 /// Always `<platform config dir>/veld/config.toml` (e.g. `~/.config/veld/config.toml`
@@ -940,7 +962,7 @@ impl Default for ServerConfig {
             audit_max_entries_per_user: 10_000,
             audit_rotation_check_interval: 100,
             audit_retention_days: 30,
-            rate_limit_per_second: 4000,
+            rate_limit_per_second: RATE_LIMIT_DEFAULT,
             rate_limit_burst: 8000,
             max_concurrent_requests: 200,
             request_timeout_secs: 60,
@@ -1142,11 +1164,13 @@ impl ServerConfig {
         // Risk: a compromised local process or SSRF can exhaust memory without limit.
         // Set VELD_RATE_LIMIT explicitly (or use production mode) to enable limiting.
         // A TLS listener on a reachable interface makes the server not local.
-        if !config.is_production
-            && is_local_bind_host(&config.host)
-            && !config.tls.exposes_network()
-            && !rate_limit_explicit
-        {
+        if local_dev_disables_rate_limit(
+            config.is_production,
+            &config.host,
+            &config.tls,
+            rate_limit_explicit,
+            config.rate_limit_per_second,
+        ) {
             config.rate_limit_per_second = 0;
             tracing::info!(
                 bind = %config.host,
@@ -1855,6 +1879,9 @@ mod tests {
         env::remove_var("VELD_RATE_LIMIT");
         env::remove_var("VELD_HOST");
         env::remove_var("VELD_ENV");
+        for (name, _) in TlsSettings::default().vars() {
+            env::remove_var(name);
+        }
 
         let config = ServerConfig::from_env();
         assert_eq!(config.rate_limit_per_second, 0);
@@ -1988,6 +2015,54 @@ mod tests {
             .validate("127.0.0.1", 3031)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn the_local_dev_default_disables_rate_limiting_only_when_nothing_is_reachable() {
+        let no_tls = TlsSettings::default();
+        let tls_on = |host: Option<&str>| {
+            let mut pairs = TLS_COMPLETE.to_vec();
+            pairs.extend(host.map(|h| ("VELD_TLS_HOST", h)));
+            tls(&pairs)
+        };
+        let dev = |host, tls: &TlsSettings| {
+            local_dev_disables_rate_limit(false, host, tls, false, RATE_LIMIT_DEFAULT)
+        };
+
+        assert!(dev("127.0.0.1", &no_tls));
+        assert!(dev("::1", &no_tls));
+        assert!(
+            dev("localhost", &tls_on(Some("127.0.0.1"))),
+            "a TLS listener on loopback leaves the server local"
+        );
+        assert!(
+            !dev("127.0.0.1", &tls_on(None)),
+            "TLS on a non-loopback host keeps it on: the default TLS host is 0.0.0.0"
+        );
+        assert!(
+            !dev("127.0.0.1", &tls_on(Some("10.0.0.2"))),
+            "TLS on a non-loopback host keeps it on"
+        );
+        assert!(!dev("0.0.0.0", &no_tls));
+
+        let local = "127.0.0.1";
+        assert!(!local_dev_disables_rate_limit(
+            true,
+            local,
+            &no_tls,
+            false,
+            RATE_LIMIT_DEFAULT
+        ));
+        assert!(!local_dev_disables_rate_limit(
+            false,
+            local,
+            &no_tls,
+            true,
+            RATE_LIMIT_DEFAULT
+        ));
+        assert!(!local_dev_disables_rate_limit(
+            false, local, &no_tls, false, 100
+        ));
     }
 
     #[test]

@@ -67,16 +67,7 @@ pub struct ServerRunConfig {
 /// threads exist yet. This avoids the `set_var` unsoundness on multi-threaded runtimes.
 pub fn run(config: ServerRunConfig) -> Result<()> {
     let file_limit = raise_open_file_limit();
-    let local_dev_rate_limit_default = !config.production
-        && crate::config::is_local_bind_host(&config.host)
-        && !config.tls.exposes_network()
-        && std::env::var("VELD_RATE_LIMIT").is_err()
-        && config.rate_limit == 4000;
-    let effective_rate_limit = if local_dev_rate_limit_default {
-        0
-    } else {
-        config.rate_limit
-    };
+    let rate_limit_env_set = std::env::var("VELD_RATE_LIMIT").is_ok();
 
     // SAFETY: These set_var calls run before any threads are spawned — the tokio
     // runtime is not yet built, and pre_init_ort_runtime (below) is also single-threaded.
@@ -94,7 +85,6 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
         if config.production {
             std::env::set_var("VELD_ENV", "production");
         }
-        std::env::set_var("VELD_RATE_LIMIT", effective_rate_limit.to_string());
         std::env::set_var("VELD_MAX_CONCURRENT", config.max_concurrent.to_string());
         for (name, value) in config.tls.vars() {
             if let Some(value) = value {
@@ -115,6 +105,24 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
 
     // Load .env file if present (won't override CLI-set vars)
     let _ = dotenvy::dotenv();
+
+    // Decided after .env loads, from what ServerConfig::from_env will read, so TLS
+    // settings or VELD_ENV given only in .env count.
+    let effective_rate_limit = if crate::config::local_dev_disables_rate_limit(
+        crate::auth::is_production_mode(),
+        &config.host,
+        &crate::config::TlsSettings::from_lookup(|name| std::env::var(name).ok()),
+        rate_limit_env_set,
+        config.rate_limit,
+    ) {
+        0
+    } else {
+        config.rate_limit
+    };
+    // SAFETY: Still single-threaded — the runtime is built below.
+    unsafe {
+        std::env::set_var("VELD_RATE_LIMIT", effective_rate_limit.to_string());
+    }
 
     // Build and enter the tokio runtime
     let runtime = tokio::runtime::Builder::new_multi_thread()
