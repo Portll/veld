@@ -778,7 +778,7 @@ pub const ENTITY_COLD_START_YAKE_BOOST: f32 = 0.5;
 /// ranges), and every one became a BM25 token and a graph entity: 117k entities on 17k memories.
 /// Twelve keeps the rarest dozen by selectivity (`crate::entity_cap`); the writer's own tags are
 /// never counted against it.
-pub const DERIVED_TAG_BUDGET: usize = 12;
+pub const DERIVED_TAG_BUDGET: usize = 50;
 
 // =============================================================================
 // DEFAULT CONFIGURATION VALUES
