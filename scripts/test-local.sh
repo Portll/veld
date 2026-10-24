@@ -40,8 +40,8 @@ usage: scripts/test-local.sh <cargo test selectors and flags>
 Tier 1 needs at least one selector, for example:
   scripts/test-local.sh --lib write_gate --test handler_tests
   scripts/test-local.sh --no-default-features --features storage-redb --test handler_tests
-Tier 2 runs fmt, clippy and the tests and bench builds of every feature leg CI runs,
-skipping the tests listed in scripts/test-local.known-red.
+Tier 2 runs what CI runs: fmt, clippy, then per feature leg nextest (ci profile), the
+doctests and a bench build, skipping the tests listed in scripts/test-local.known-red.
 EOF
 }
 
@@ -103,13 +103,13 @@ cargo_niced() {
   nice -n 10 "$repo_root/scripts/cargo-dev.sh" "$@"
 }
 
-known_red_skips() {
+known_red_names() {
   [[ -f "$known_red_file" ]] || return 0
   local name
   while IFS= read -r name; do
     name="${name%%#*}"
     name="${name//[[:space:]]/}"
-    [[ -n "$name" ]] && printf -- '--skip\n%s\n' "$name"
+    [[ -n "$name" ]] && printf '%s\n' "$name"
   done <"$known_red_file"
 }
 
@@ -136,9 +136,16 @@ run_full_matrix() {
   take_full_suite_lock
   local log_dir="${CARGO_TARGET_DIR:-$repo_root/target}-logs"
   mkdir -p "$log_dir"
-  local -a skips=()
-  local skip
-  while IFS= read -r skip; do skips+=("$skip"); done < <(known_red_skips)
+  # The test legs run what CI's do since 900b190b: nextest with the ci profile (one process per
+  # test, per-test timeouts from .config/nextest.toml), then the doctests nextest does not run,
+  # then a compile of the benches. A plain `cargo test` here missed a failure that only
+  # per-process isolation shows (ner_tests::test_many_entities, 2026-10-23).
+  local -a filter=()
+  local name expr=""
+  while IFS= read -r name; do
+    expr="${expr:+$expr | }test(~$name)"
+  done < <(known_red_names)
+  if [[ -n "$expr" ]]; then filter=(-E "not ($expr)"); fi
   local failed=()
 
   cd "$repo_root"
@@ -155,23 +162,28 @@ run_full_matrix() {
 
   for features in "" "--no-default-features --features storage-redb" "--no-default-features --features rocksdb"; do
     local log="$log_dir/test-${features// /_}.log"
-    step "test ${features:-default} (log: $log)"
+    step "nextest ${features:-default} (log: $log)"
     # shellcheck disable=SC2086
-    if ! cargo_niced test --no-fail-fast $features -- ${skips[@]+"${skips[@]}"} >"$log" 2>&1; then
-      failed+=("test ${features:-default}")
+    if ! cargo_niced nextest run --profile ci --test-threads "$RUST_TEST_THREADS" $features \
+      ${filter[@]+"${filter[@]}"} >"$log" 2>&1; then
+      failed+=("nextest ${features:-default}")
     fi
-    grep -E '^test result: FAILED|^test .* FAILED$' "$log" | head -20 || true
-    step "bench --no-run ${features:-default}"
+    grep -E '^\s+(FAIL|TIMEOUT|SIGSEGV|SIGABRT) |^\s+Summary ' "$log" | head -20 || true
+    step "doctests ${features:-default}"
     # shellcheck disable=SC2086
-    cargo_niced bench --no-run $features >"$log_dir/bench-${features// /_}.log" 2>&1 \
-      || failed+=("bench --no-run ${features:-default}")
+    cargo_niced test --doc $features >"$log_dir/doctest-${features// /_}.log" 2>&1 \
+      || failed+=("doctests ${features:-default}")
+    step "bench build ${features:-default}"
+    # shellcheck disable=SC2086
+    cargo_niced test --benches --no-run $features >"$log_dir/bench-${features// /_}.log" 2>&1 \
+      || failed+=("bench build ${features:-default}")
   done
 
   if ((${#failed[@]})); then
     printf '\nFAILED: %s\n' "${failed[@]}"
     exit 1
   fi
-  printf '\ngreen (skipped %d known-red tests)\n' "$((${#skips[@]} / 2))"
+  printf '\ngreen (filter: %s)\n' "${expr:-none}"
   finished=1
 }
 
