@@ -6,7 +6,7 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **119** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **122** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
@@ -50,6 +50,9 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_ENV` | — | `src/config.rs` |
 | `VELD_EVAL_NOW` | — | `src/memory/ablation.rs` |
 | `VELD_GAP_TIMEOUT` | — | `src/config.rs` |
+| `VELD_GAP_WORKER_CHUNK_ROWS` | — | `src/config.rs` |
+| `VELD_GAP_WORKER_CPU_PCT` | — | `src/config.rs` |
+| `VELD_GAP_WORKER_NICE` | — | `src/config.rs` |
 | `VELD_GRAPH_MIRROR_SYNC_SECS` | — | `src/config.rs` |
 | `VELD_HIDE_DEV_KEY` | — | `src/auth.rs` |
 | `VELD_HOST` | — | `src/config.rs` |

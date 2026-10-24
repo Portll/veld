@@ -6,7 +6,7 @@
 use anyhow::Result;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, ErrorCode},
+    model::{CallToolResult, ContentBlock, ErrorCode},
     tool, tool_router, ErrorData as McpError,
 };
 use std::borrow::Cow;
@@ -50,11 +50,11 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
-                if resp.stored {
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                if resp.success {
                     format!("Stored memory: {}", resp.id)
                 } else {
-                    format!("Memory already held as {}", resp.id)
+                    format!("Memory {} was not stored", resp.id)
                 },
             )])),
             Err(e) => Err(McpError {
@@ -72,9 +72,9 @@ impl VeldMcpServer {
         let path = format!("/api/dials?user_id={}", self.client.user_id);
         let result: Result<crate::memory::CognitiveDials> = self.client.get(&path).await;
         match result {
-            Ok(d) => Ok(CallToolResult::success(vec![Content::text(format_dials(
-                &d,
-            ))])),
+            Ok(d) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                format_dials(&d),
+            )])),
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
                 message: Cow::from(e.to_string()),
@@ -139,7 +139,7 @@ impl VeldMcpServer {
         let result: Result<crate::memory::CognitiveDials> =
             self.client.put("/api/dials", &body).await;
         match result {
-            Ok(d) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(d) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Dials updated.\n{}",
                 format_dials(&d)
             ))])),
@@ -189,7 +189,7 @@ impl VeldMcpServer {
                         mem.experience.content
                     ));
                 }
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -230,7 +230,7 @@ impl VeldMcpServer {
                         mem.content.chars().take(200).collect::<String>()
                     ));
                 }
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -264,7 +264,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Pinned memory {} (anchored={})",
                 resp.memory_id, resp.anchored
             ))])),
@@ -296,7 +296,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Unpinned memory {} (anchored={})",
                 resp.memory_id, resp.anchored
             ))])),
@@ -328,7 +328,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Promoted memory {} from {} to {}",
                 resp.memory_id, resp.previous_tier, resp.current_tier
             ))])),
@@ -360,7 +360,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Demoted memory {} from {} to {}",
                 resp.memory_id, resp.previous_tier, resp.current_tier
             ))])),
@@ -392,7 +392,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Reinforced {} memories — {} boosts, {} decays, {} associations strengthened",
                 resp.memories_processed,
                 resp.importance_boosts,
@@ -427,7 +427,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Moved memory {} from {} to {}",
                 resp.memory_id, resp.previous_tier, resp.current_tier
             ))])),
@@ -494,7 +494,7 @@ impl VeldMcpServer {
                     output.push_str(&format!("\n**Path:** {}\n", resp.path.join(" → ")));
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -524,7 +524,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 if resp.confirmed {
                     format!("✓ Confirmed edge {edge_id}")
                 } else {
@@ -559,7 +559,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 if resp.rejected {
                     format!("✗ Rejected edge {edge_id}")
                 } else {
@@ -595,7 +595,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "⚡ Created link {}: {} --[{}]--> {}",
                 resp.id, resp.from, resp.relation, resp.to
             ))])),
@@ -649,7 +649,7 @@ impl VeldMcpServer {
                     }
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -675,7 +675,7 @@ impl VeldMcpServer {
 
         match result {
             Ok(resp) if resp.status.as_deref() == Some("running") => {
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     "**Structural Gap Analysis** is still running for this graph; ask again shortly.\n",
                 )]))
             }
@@ -709,7 +709,7 @@ impl VeldMcpServer {
                     output.push_str("No structural gaps detected.\n");
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -784,7 +784,7 @@ impl VeldMcpServer {
                     output.push_str("No clusters found. The knowledge graph may be too sparse for Mapper analysis.\n");
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -816,7 +816,7 @@ impl VeldMcpServer {
             )
             .await;
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Created dataset '{}' (table {})",
                 resp.dataset.name, resp.dataset.table
             ))])),
@@ -844,7 +844,7 @@ impl VeldMcpServer {
                 for d in resp.datasets {
                     output.push_str(&format!("- {} ({} rows)\n", d.name, d.row_count));
                 }
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -882,7 +882,7 @@ impl VeldMcpServer {
                     output.push_str(&cells.join(", "));
                     output.push('\n');
                 }
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -913,7 +913,7 @@ impl VeldMcpServer {
             )
             .await;
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 if resp.linked {
                     "Linked.".to_string()
                 } else {
