@@ -347,3 +347,127 @@ pub async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server() -> VeldMcpServer {
+        VeldMcpServer::new(
+            "http://127.0.0.1:1".to_string(),
+            "test-key".to_string(),
+            "test-user".to_string(),
+        )
+    }
+
+    /// The tool names are the MCP contract: a client's saved tool calls break if one
+    /// is renamed or dropped, whatever the rmcp version underneath.
+    #[test]
+    fn tool_list_is_the_published_contract() {
+        let tools = server().tool_router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(
+            names,
+            [
+                "add_project",
+                "add_todo",
+                "add_todo_comment",
+                "archive_project",
+                "backup_create",
+                "backup_list",
+                "backup_purge",
+                "backup_restore",
+                "backup_verify",
+                "complete_todo",
+                "consolidation_report",
+                "context_summary",
+                "dataset_create",
+                "dataset_link",
+                "dataset_list",
+                "dataset_query",
+                "delete_project",
+                "delete_todo",
+                "delete_todo_comment",
+                "demote_to_cold",
+                "dismiss_reminder",
+                "fact_narratives",
+                "facts_preview_purge",
+                "forget",
+                "gap_analyze",
+                "gap_mapper",
+                "get_dials",
+                "lineage_confirm",
+                "lineage_link",
+                "lineage_reject",
+                "lineage_stats",
+                "lineage_trace",
+                "list_memories",
+                "list_projects",
+                "list_reminders",
+                "list_subtasks",
+                "list_todo_comments",
+                "list_todos",
+                "memory_stats",
+                "move_to_tier",
+                "pin_memory",
+                "proactive_context",
+                "promote_to_hot",
+                "read_memory",
+                "recall",
+                "recall_by_tags",
+                "reinforce_memories",
+                "remember",
+                "reorder_todo",
+                "repair_index",
+                "reset_token_session",
+                "seed_project",
+                "set_dials",
+                "set_reminder",
+                "todo_stats",
+                "token_status",
+                "unpin_memory",
+                "update_todo",
+                "update_todo_comment",
+                "verify_index",
+            ]
+        );
+        for tool in &tools {
+            assert_eq!(
+                tool.input_schema.get("type").and_then(|v| v.as_str()),
+                Some("object"),
+                "{} input schema is not an object",
+                tool.name
+            );
+            assert!(
+                tool.description.as_deref().is_some_and(|d| !d.is_empty()),
+                "{} has no description",
+                tool.name
+            );
+        }
+
+        let remember = tools.iter().find(|t| t.name == "remember").unwrap();
+        let properties = remember
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["content", "tags", "type"]);
+        assert_eq!(
+            remember.input_schema.get("required"),
+            Some(&serde_json::json!(["content"]))
+        );
+    }
+
+    #[test]
+    fn server_info_advertises_tools_on_the_2024_11_05_protocol() {
+        let info = server().get_info();
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2024_11_05);
+        assert!(info.capabilities.tools.is_some());
+        assert!(info
+            .instructions
+            .as_deref()
+            .is_some_and(|i| i.starts_with("Veld Memory")));
+    }
+}

@@ -10,7 +10,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     schemars, tool, tool_router, ErrorData as McpError,
 };
 use serde::{Deserialize, Serialize};
@@ -304,7 +304,7 @@ fn clamp_limit(raw: Option<u32>, default: u32) -> u32 {
 }
 
 fn text_error(message: impl Into<String>) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(message.into())])
+    CallToolResult::error(vec![ContentBlock::text(message.into())])
 }
 
 // =============================================================================
@@ -735,7 +735,7 @@ impl VeldMcpServer {
         let resp = result.map_err(mcp_error)?;
         let joined = tags.join(", ");
         if resp.memories.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "No memories found matching tags: {joined}"
             ))]));
         }
@@ -753,7 +753,7 @@ impl VeldMcpServer {
                 m.id
             ));
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             out.trim_end().to_string(),
         )]))
     }
@@ -783,7 +783,7 @@ impl VeldMcpServer {
         let memories = result.map_err(mcp_error)?.memories;
 
         if memories.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "🌾 Context Summary\n{RULE_42}\nNo memories stored yet.\nStart remembering to build context!"
             ))]));
         }
@@ -834,7 +834,7 @@ impl VeldMcpServer {
                 "ℹ️  Tip: Use types like Decision, Learning, Context when remembering\n   to build richer context summaries.",
             );
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             out.trim_end().to_string(),
         )]))
     }
@@ -859,7 +859,7 @@ impl VeldMcpServer {
         memories.truncate(limit as usize);
 
         if memories.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "🌾 Memory List\n{RULE_42}\nNo memories stored yet."
             ))]));
         }
@@ -896,7 +896,7 @@ impl VeldMcpServer {
                 m.id
             ));
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             out.trim_end().to_string(),
         )]))
     }
@@ -921,7 +921,7 @@ impl VeldMcpServer {
             )
             .await;
         let resp = result.map_err(mcp_error)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "🌾 Memory Deleted\n{RULE_30}\n✓ Removed: {}",
             resp.id
         ))]))
@@ -960,7 +960,7 @@ impl VeldMcpServer {
                 ));
             }
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             out.trim_end().to_string(),
         )]))
     }
@@ -996,7 +996,7 @@ impl VeldMcpServer {
                 "{RULE_42}\n⚠️ Run repair_index to fix orphaned memories"
             ));
         }
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 
     #[tool(
@@ -1025,7 +1025,7 @@ impl VeldMcpServer {
         if r.failed > 0 {
             out.push_str(&format!("{RULE_42}\n⚠️ {} could not be repaired", r.failed));
         }
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 
     #[tool(
@@ -1078,7 +1078,7 @@ impl VeldMcpServer {
                 out.push_str(&format!("✗ Failed: {msg}\n"));
             }
         }
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 
     #[tool(
@@ -1114,7 +1114,7 @@ impl VeldMcpServer {
                 ));
             }
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             out.trim_end().to_string(),
         )]))
     }
@@ -1147,7 +1147,7 @@ impl VeldMcpServer {
         } else {
             r.message.as_str()
         };
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "🌾 Backup Verification\n{RULE_42}\n{icon} Backup #{}: {status}\n{RULE_42}\n{message}",
             params.backup_id
         ))]))
@@ -1180,7 +1180,7 @@ impl VeldMcpServer {
                 r.purged_count
             )
         };
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "🌾 Backup Purge\n{RULE_42}\n{body}"
         ))]))
     }
@@ -1229,7 +1229,7 @@ impl VeldMcpServer {
             };
             out.push_str(&format!("✗ Restore failed: {message}"));
         }
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 
     #[tool(
@@ -1322,7 +1322,7 @@ impl VeldMcpServer {
                 "ℹ️ No consolidation activity in this period.\n   Store and access memories to trigger learning.",
             );
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             out.trim_end().to_string(),
         )]))
     }
@@ -1354,7 +1354,7 @@ impl VeldMcpServer {
             let scope = entity_filter
                 .map(|f| format!(" related to \"{f}\""))
                 .unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "ℹ️ No fact narratives found{scope}. Store more memories to build the fact corpus."
             ))]));
         }
@@ -1382,7 +1382,7 @@ impl VeldMcpServer {
             }
             out.push('\n');
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             out.trim_end().to_string(),
         )]))
     }
@@ -1424,7 +1424,7 @@ impl VeldMcpServer {
         if !r.audit_recorded {
             out.push_str("⚠️ Audit entry did NOT persist — check server logs.\n");
         }
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 
     #[tool(
@@ -1435,7 +1435,7 @@ impl VeldMcpServer {
         Parameters(_params): Parameters<NoParams>,
     ) -> Result<CallToolResult, McpError> {
         let status = self.tokens.status();
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             format_token_status(&status, self.tokens.session_minutes()),
         )]))
     }
@@ -1450,7 +1450,7 @@ impl VeldMcpServer {
         let previous = self.tokens.session_tokens();
         self.tokens.reset();
         let budget = self.tokens.status().budget;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "🌾 Token Session Reset\n{RULE_30}\nPrevious: {} tokens\nCurrent: 0 tokens\nBudget: {} tokens\n{RULE_30}\n✓ Counter cleared",
             thousands(previous),
             thousands(budget)
@@ -1480,7 +1480,7 @@ impl VeldMcpServer {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("[Memory] Failed to fetch memory {memory_id}: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(format!(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Memory not found: {memory_id}"
                 ))]));
             }
@@ -1512,7 +1512,7 @@ impl VeldMcpServer {
             ));
         }
         out.push_str(&format!("{RULE_52}\n\n{}", m.experience.content));
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 
     #[tool(
@@ -1540,7 +1540,7 @@ impl VeldMcpServer {
             )
             .await;
         let r = result.map_err(mcp_error)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Seeded project \"{}\": {} memories created from {} files scanned.",
             r.project_name, r.memories_created, r.files_scanned
         ))]))

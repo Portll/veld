@@ -24,6 +24,8 @@ use std::path::PathBuf;
 use tower_http::services::ServeDir;
 
 #[cfg(feature = "embedded-docs")]
+use axum::extract::Path as AxumPath;
+#[cfg(feature = "embedded-docs")]
 use rust_embed::Embed;
 
 /// Compile-time embed of `docs/book/` — populated when the `embedded-docs`
@@ -78,7 +80,7 @@ mdbook build docs</pre>
 <p class="muted">Override the directory with the <code>VELD_DOCS_DIR</code> environment variable. Public site (built by CI): <a href="https://portll.github.io/veld/">portll.github.io/veld</a>.</p>
 </body>
 </html>"#,
-        resolved = resolved.display(),
+        resolved = escape_html(&resolved.display().to_string()),
     );
     (
         StatusCode::NOT_FOUND,
@@ -162,27 +164,71 @@ fn serve_embedded(key: &str) -> axum::response::Response {
             )
                 .into_response()
         }
-        None => {
-            // Not in the embedded set — degrade to the placeholder.
-            // (futures::executor::block_on is overkill here; we just build
-            // the body inline.)
-            let body = format!(
-                "<!doctype html><meta charset=utf-8><title>Veld docs — 404</title>\
-                 <p style=\"font-family: system-ui, sans-serif; max-width: 40em; margin: 4rem auto\">\
-                 The path <code>{key}</code> is not present in the embedded docs bundle. \
-                 If you're running a custom build, set <code>VELD_DOCS_DIR</code> to a directory \
-                 produced by <code>mdbook build docs</code>.</p>"
-            );
-            (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                Html(body),
-            )
-                .into_response()
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            Html(embedded_not_found_body(key)),
+        )
+            .into_response(),
+    }
+}
+
+/// The 404 page for a path the embedded bundle lacks. The path comes from the request URL, so it is
+/// escaped: unescaped, `/docs/x.html"><script>…` ran on veld's origin.
+#[cfg_attr(not(feature = "embedded-docs"), allow(dead_code))]
+fn embedded_not_found_body(key: &str) -> String {
+    format!(
+        "<!doctype html><meta charset=utf-8><title>Veld docs — 404</title>\
+         <p style=\"font-family: system-ui, sans-serif; max-width: 40em; margin: 4rem auto\">\
+         The path <code>{key}</code> is not present in the embedded docs bundle. \
+         If you're running a custom build, set <code>VELD_DOCS_DIR</code> to a directory \
+         produced by <code>mdbook build docs</code>.</p>",
+        key = escape_html(key),
+    )
+}
+
+/// Text made safe to place in HTML element content or a quoted attribute.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
         }
     }
+    out
 }
 
 /// Public-facing URL for the docs root, relative to the server's bind address.
 /// Used by the TUI to construct `http://<host>:<port>/docs/`.
 pub const DOCS_URL_PATH: &str = "/docs/";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_requested_path_is_escaped_in_the_embedded_404_page() {
+        let body = embedded_not_found_body("x.html\"><script>alert(document.domain)</script>");
+        assert!(
+            !body.contains("<script>"),
+            "markup from the URL must not reach the page: {body}"
+        );
+        assert!(body.contains(
+            "<code>x.html&quot;&gt;&lt;script&gt;alert(document.domain)&lt;/script&gt;</code>"
+        ));
+    }
+
+    #[test]
+    fn escaping_covers_the_five_html_metacharacters_and_nothing_else() {
+        assert_eq!(
+            escape_html(r#"<a href="x" title='y'>&</a>"#),
+            "&lt;a href=&quot;x&quot; title=&#39;y&#39;&gt;&amp;&lt;/a&gt;"
+        );
+        assert_eq!(escape_html("guide/intro.html"), "guide/intro.html");
+    }
+}

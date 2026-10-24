@@ -72,7 +72,7 @@ impl SlowStore {
         impact_score: f32,
         scope: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO gap_topologies
@@ -115,7 +115,7 @@ impl SlowStore {
         impact_score: f32,
         entities_json: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO thoughts
@@ -179,7 +179,7 @@ impl SlowStore {
 
     /// Mark a thought as surfaced (increment count)
     pub fn mark_thought_surfaced(&self, thought_id: &str) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer();
         conn.execute(
             "UPDATE thoughts SET surfaced_count = surfaced_count + 1 WHERE id = ?1",
             params![thought_id],
@@ -189,7 +189,7 @@ impl SlowStore {
 
     /// Dismiss a thought (user decided it's not useful)
     pub fn dismiss_thought(&self, thought_id: &str) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer();
         conn.execute(
             "UPDATE thoughts SET dismissed = 1 WHERE id = ?1",
             params![thought_id],
@@ -199,7 +199,7 @@ impl SlowStore {
 
     /// Mark a gap as resolved (an edge was created that closes it)
     pub fn resolve_gap(&self, gap_id: &str) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE gap_topologies SET resolved_at = ?1 WHERE id = ?2",
@@ -319,7 +319,7 @@ impl SlowStore {
     /// number resolved. A re-detected gap is re-opened by `store_gap` clearing
     /// `resolved_at`.
     pub fn resolve_stale_gaps(&self, scope: &str, cutoff_rfc3339: &str) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.writer();
         let now = Utc::now().to_rfc3339();
         let n = conn.execute(
             "UPDATE gap_topologies SET resolved_at = ?1
@@ -348,7 +348,7 @@ impl SlowStore {
         if self.encryptor.is_none() || !self.enc.payload {
             anyhow::bail!("the slow store has no key, or payload encryption is turned off");
         }
-        let mut conn = self.conn.lock();
+        let mut conn = self.writer();
         let tx = conn.transaction()?;
         let rows: Vec<(String, String, Vec<u8>)> = {
             let mut stmt = tx.prepare("SELECT user_id, memory_id, memory_bincode FROM memories")?;
@@ -393,7 +393,7 @@ impl SlowStore {
         // Encrypt the payload at rest when a key is configured (parity with the
         // RocksDB primary store); no-op passthrough otherwise.
         let stored = self.maybe_encrypt(memory_id, memory_bincode)?;
-        let conn = self.conn.lock();
+        let conn = self.writer();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO memories
@@ -427,7 +427,7 @@ impl SlowStore {
         lsn: u64,
         importance: f32,
     ) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE memories
@@ -442,7 +442,7 @@ impl SlowStore {
     /// against a non-existent row returns successfully with zero rows
     /// affected.
     pub fn delete_memory(&self, user_id: &str, memory_id: &str) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer();
         conn.execute(
             "DELETE FROM memories WHERE user_id = ?1 AND memory_id = ?2",
             params![user_id, memory_id],

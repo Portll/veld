@@ -5,7 +5,7 @@
 use anyhow::Result;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     schemars, tool, tool_router, ErrorData as McpError,
 };
 use serde::{Deserialize, Serialize};
@@ -497,12 +497,12 @@ struct FormattedResponse {
 // =============================================================================
 
 fn text_ok(text: impl Into<String>) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 /// The TypeScript server answers input errors as an error result, not a protocol error.
 fn text_error(text: impl Into<String>) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::error(vec![Content::text(text)]))
+    Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
 }
 
 fn formatted(result: Result<FormattedResponse>) -> Result<CallToolResult, McpError> {
