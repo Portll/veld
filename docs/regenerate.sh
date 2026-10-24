@@ -18,6 +18,9 @@ cd "$(dirname "$0")/generators"
 echo "==> gen-http-api"
 cargo run --quiet --bin gen-http-api
 
+echo "==> gen-schemas"
+cargo run --quiet --bin gen-schemas
+
 echo "==> gen-mcp-tools"
 cargo run --quiet --bin gen-mcp-tools
 
