@@ -144,7 +144,7 @@ jobs:
           - engine: redb
             features: '--no-default-features --features storage-redb'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -159,7 +159,7 @@ jobs:
       # The harness refuses the hash embedder, so the ONNX runtime and the arm's embedder are
       # fetched, pinned and SHA-256 verified by veld's own downloader. The key names the embedder,
       # so each arm restores a cache holding its own model.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: models
         with:
           path: ~/.cache/veld
@@ -173,14 +173,14 @@ jobs:
       # The cross-encoder downloads itself on first use; the models cache above is saved only on
       # a miss, so without this it would download every run, and a failed download in one repeat
       # makes the repeats diverge.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/veld/cross-encoder
           key: veld-cross-encoder-${{ runner.os }}-${{ hashFiles('src/embeddings/cross_encoder.rs') }}
 
       - name: Cache the pinned model tape
         if: env.MODEL_TAPE == 'pinned' && hashFiles('tests/recall/model-tape.json') != ''
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: model-tape
           key: model-tape-${{ hashFiles('tests/recall/model-tape.json') }}
@@ -291,7 +291,7 @@ jobs:
             --current-per-case "per-case-${{ matrix.engine }}.json" > "recall-diff-${{ matrix.engine }}.md"
           cat "recall-diff-${{ matrix.engine }}.md" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: recall-${{ matrix.engine }}
@@ -305,7 +305,7 @@ jobs:
 
       - name: Upload the model tape
         if: always() && env.MODEL_TAPE == 'record' && hashFiles(format('model-tape-{0}.jsonl.gz', matrix.engine)) != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: model-tape-${{ matrix.engine }}
           path: model-tape-${{ matrix.engine }}.jsonl.gz
@@ -332,8 +332,8 @@ jobs:
     if: always() && needs.gate.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: recall-*
           merge-multiple: true

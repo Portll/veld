@@ -24,7 +24,7 @@ jobs:
     name: Version Consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check version consistency across packages
         run: |
           # Extract versions from all package files
@@ -72,7 +72,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The check resolves every veld commit the ledger names.
           fetch-depth: 0
@@ -87,7 +87,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -98,7 +98,7 @@ jobs:
     name: Clippy Analysis
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -120,6 +120,11 @@ jobs:
           # stopped compiling unnoticed (twelve errors, found 2026-10-21) while the handlers it
           # mirrors moved on; this keeps it type-checked against them. Check only, no test run.
           cargo clippy --all-targets --features zenoh -- -W clippy::all -D clippy::correctness 2>&1 | tee -a clippy-output.txt
+          # embedded-docs, which release builds use, is likewise compiled by no other job: a cargo fix
+          # run without it dropped an import it needs (2026-05-30) and the release build stopped
+          # compiling unseen. rust-embed only needs the folder to exist; the release job builds the book.
+          mkdir -p docs/book && touch docs/book/index.html
+          cargo clippy --all-targets --features embedded-docs -- -W clippy::all -D clippy::correctness 2>&1 | tee -a clippy-output.txt
           WARNINGS=$(grep -c "warning:" clippy-output.txt || true)
           echo "### Clippy Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -144,7 +149,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -199,7 +204,7 @@ jobs:
 
       - name: Upload binary (Linux)
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: veld-linux
           path: |
@@ -209,7 +214,7 @@ jobs:
 
       - name: Upload binary (macOS)
         if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: veld-macos
           path: |
@@ -219,7 +224,7 @@ jobs:
 
       - name: Upload binary (Windows)
         if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: veld-windows
           path: |
@@ -268,7 +273,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -288,7 +293,7 @@ jobs:
       - name: Model pins
         id: pins
         run: echo "hash=$(grep -hoE '[0-9a-f]{64}' src/embeddings/downloader.rs src/embeddings/cross_encoder.rs | sort | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: models
         with:
           path: ~/.cache/veld
