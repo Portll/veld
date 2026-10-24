@@ -24,7 +24,7 @@ jobs:
     name: Version Consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check version consistency across packages
         run: |
           # Extract versions from all package files
@@ -72,7 +72,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The check resolves every veld commit the ledger names.
           fetch-depth: 0
@@ -87,7 +87,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -98,7 +98,7 @@ jobs:
     name: Clippy Analysis
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -144,7 +144,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -199,7 +199,7 @@ jobs:
 
       - name: Upload binary (Linux)
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: veld-linux
           path: |
@@ -209,7 +209,7 @@ jobs:
 
       - name: Upload binary (macOS)
         if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: veld-macos
           path: |
@@ -219,7 +219,7 @@ jobs:
 
       - name: Upload binary (Windows)
         if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: veld-windows
           path: |
@@ -230,6 +230,8 @@ jobs:
   test:
     name: Tests (${{ matrix.engines }})
     runs-on: ubuntu-latest
+    # The three-engine job took 72-83 min with the bench rebuild; past this it is hung, not slow.
+    timeout-minutes: 90
     # One job per engine set, so a red RocksDB-and-redb run cannot hide whether either engine alone
     # still builds and passes: the second set used to run only if the first came back green. The
     # default build carries both engines; the redb-only and rocksdb-only builds keep each engine
@@ -266,7 +268,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -281,36 +283,55 @@ jobs:
       # (216 of them on 2026-09-27: ort is load-dynamic and the runner has neither). Fetched by
       # veld's own downloader, pinned and SHA-256 verified, into the cache the tests search, and
       # cached by the file that pins them.
-      - uses: actions/cache@v4
+      # Keyed on the pinned digests alone: keyed on the two source files, every edit to download
+      # logic evicted the cache and cost each job a 6-9 min refetch (2026-10-21).
+      - name: Model pins
+        id: pins
+        run: echo "hash=$(grep -hoE '[0-9a-f]{64}' src/embeddings/downloader.rs src/embeddings/cross_encoder.rs | sort | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
         id: models
         with:
           path: ~/.cache/veld
-          key: veld-models-${{ runner.os }}-${{ hashFiles('src/embeddings/downloader.rs', 'src/embeddings/cross_encoder.rs') }}
+          key: veld-models-${{ runner.os }}-${{ steps.pins.outputs.hash }}
       - name: Fetch the ONNX runtime, MiniLM and the reranker
         if: steps.models.outputs.cache-hit != 'true'
         run: cargo run --quiet --bin model-fetch -- --onnxruntime --minilm --cross-encoder
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Run all tests
         # pipefail: without it the step's status is tee's, and neither a failing test nor a compile
-        # error could fail this job.
+        # error could fail this job. nextest does not run doctests, so `cargo test --doc` follows,
+        # and runs even when nextest fails so one red set cannot hide the other.
         run: |
           set -o pipefail
-          cargo test --no-fail-fast ${{ matrix.cargo_features }} 2>&1 | tee test-output.txt
+          status=0
+          cargo nextest run --profile ci ${{ matrix.cargo_features }} 2>&1 | tee test-output.txt || status=$?
+          cargo test --doc ${{ matrix.cargo_features }} 2>&1 | tee -a test-output.txt || status=$?
+          exit $status
 
       # Compile-only: benches are timing harnesses, but a bench that no longer builds goes unnoticed
       # until someone wants a number. Covers storage_engine_benchmarks and cold_start_benchmarks
-      # along with the rest of the [[bench]] targets in Cargo.toml.
+      # along with the rest of the [[bench]] targets in Cargo.toml. Built under the test profile so
+      # they reuse the artifacts `cargo test` just made; `cargo bench --no-run` compiled the whole
+      # graph a second time at opt-level 3 with LTO, 39 min of every job (2026-10-21).
       - name: Build the benches (no run)
-        run: cargo bench --no-run ${{ matrix.cargo_features }}
+        run: cargo test --benches --no-run ${{ matrix.cargo_features }}
 
       - name: Generate test summary
         if: always()
         run: |
-          # Summed over every test binary; `tail -1` reported only the last one.
-          count() { grep -oE "[0-9]+ $1;" test-output.txt | awk '{s+=$1} END {print s+0}'; }
-          PASSED=$(count passed)
-          FAILED=$(count failed)
-          IGNORED=$(count ignored)
+          # CARGO_TERM_COLOR=always puts escape codes between nextest's numbers and words.
+          sed 's/\x1b\[[0-9;]*m//g' test-output.txt > test-output.plain
+          # nextest's final Summary line, plus the doctests' libtest result lines.
+          SUMMARY=$(grep -E '^ *Summary \[' test-output.plain | tail -1)
+          from_nextest() { echo "$SUMMARY" | grep -oE "[0-9]+ $1" | grep -oE '^[0-9]+' || echo 0; }
+          from_doctests() { grep -oE "[0-9]+ $1;" test-output.plain | awk '{s+=$1} END {print s+0}'; }
+          PASSED=$(( $(from_nextest passed) + $(from_doctests passed) ))
+          FAILED=$(( $(from_nextest failed) + $(from_nextest 'timed out') + $(from_doctests failed) ))
+          IGNORED=$(( $(from_nextest skipped) + $(from_doctests ignored) ))
 
           echo "## Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -324,7 +345,8 @@ jobs:
           if [ "$FAILED" != "0" ]; then
             echo "### Failed Tests" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -A 5 "FAILED" test-output.txt >> $GITHUB_STEP_SUMMARY || true
+            grep -E '^ *(FAIL|TIMEOUT|SIGSEGV|SIGABRT|SIGKILL) ' test-output.plain >> $GITHUB_STEP_SUMMARY || true
+            grep -A 5 "FAILED" test-output.plain >> $GITHUB_STEP_SUMMARY || true
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
 

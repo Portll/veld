@@ -106,11 +106,9 @@ exclude = [
 [lib]
 name = "veld"
 path = "src/lib.rs"
-# rlib: for Rust library usage (tests, benchmarks, binary)
-# cdylib: for Python bindings (PyO3/maturin needs shared library)
-# The cdylib gives this lib an unhashed filename, which is why [profile.release] must not set
-# `panic`: see the note there.
-crate-type = ["rlib", "cdylib"]
+# rlib only. The Python cdylib is the `veld-py` workspace member: a cdylib here was linked on
+# every build beside the binary, for an artifact only maturin consumes.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "veld"
@@ -175,7 +173,7 @@ tokio-util = { version = "0.7", features = ["rt"] }  # TaskTracker: shutdown wai
 futures = "0.3"  # Stream utilities for SSE
 axum = { version = "0.8", features = ["json", "ws"] }
 tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
-tower-http = { version = "0.6", features = ["cors", "fs", "timeout"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "timeout"] }
 
 # Optional: compile-time docs embedding for self-contained release binaries.
 # Off by default — dev builds stay lean and use the filesystem at docs/book/.
@@ -334,7 +332,7 @@ zenoh = { version = "1.1", default-features = false, features = ["transport_tcp"
 # LLM-based query parsing (optional - heavy dependency)
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 http-body-util = "0.1"
 proptest = "1"
 serde-reflection = "0.6.0"
@@ -443,12 +441,28 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Argon2 is the one dependency the tests run hot: the keystore and user-auth tests unseal at
+# production cost (256 MiB, 3 passes) through the real binary and HTTP API, and unoptimised that
+# held four integration binaries at 67-192 s each on CI (2026-10-21). Parameters and code paths
+# are unchanged; only the KDF's own codegen is.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 # Stated, not inherited, so an edit to [profile.dev] does not silently change what tests emit.
 [profile.test]
 debug = "line-tables-only"
 
 [profile.test.package."*"]
 debug = false
+
+[profile.test.package.argon2]
+opt-level = 3
+
+[profile.test.package.blake2]
+opt-level = 3
 
 [profile.dev-debug]
 inherits = "dev"
@@ -459,12 +473,18 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true  # Reduce binary size
-# No `panic = "abort"` while [lib] builds a cdylib. A cdylib lib is emitted under one unhashed
-# filename, and abort makes cargo build the lib twice whenever a test harness is in the graph
-# (harnesses need unwind): both variants write the same rlib, one clobbers the other, and the
-# consumer links against the wrong one (rust-lang/cargo#6313), so `cargo test --release` cannot
-# build. Unwinding also keeps a panicking request on its own task: tokio turns it into a
-# JoinError instead of the panic ending the server.
+# No `panic = "abort"`: unwinding keeps a panicking request on its own task, so tokio turns it
+# into a JoinError instead of the panic ending the server. (The cdylib clobbering that also
+# forbade it, rust-lang/cargo#6313, went with the cdylib to the veld-py crate.)
+
+# The local install loop: `cargo build --profile local --bin veld`. No LTO and incremental codegen:
+# a one-file edit builds in 22 s against 137 s with thin LTO, and the LoCoMo gate returned
+# identical quality with latency no worse (A/B, 2026-10-21). Tagged releases keep [profile.release].
+[profile.local]
+inherits = "release"
+lto = false
+incremental = true
+codegen-units = 16
 
 [profile.bench]
 # Inherits release.
@@ -568,6 +588,7 @@ rocksdb = { version = "0.24", default-features = false, features = ["lz4", "jema
 rocksdb = { version = "0.24", default-features = false, features = ["lz4"], optional = true }
 
 [workspace]
+members = ["veld-py"]
 # Standalone workspace - not part of parent kalki-v2
 # status-core keeps its own workspace and lockfile, as the monitor and the status
 # TUI and widget that also depend on it do; a path dependency inside this directory
