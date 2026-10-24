@@ -169,13 +169,34 @@ fn load_certified_key(cert: &Path, key: &Path) -> Result<CertifiedKey> {
     Ok(certified)
 }
 
-type FileStamp = Option<(SystemTime, u64)>;
+/// What a poll compares to see that a file changed. On Unix it includes the device and
+/// inode: `fs::metadata` follows symlinks, so a symlink moved to a new target, as
+/// certbot and Kubernetes secret volumes do, reads as changed even when the new file's
+/// mtime and size match the old one's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    dev_ino: (u64, u64),
+}
 
-fn stamps(cert: &Path, key: &Path) -> (FileStamp, FileStamp) {
-    let stamp = |path: &Path| {
-        let meta = std::fs::metadata(path).ok()?;
-        Some((meta.modified().ok()?, meta.len()))
-    };
+fn stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified: meta.modified().ok()?,
+        len: meta.len(),
+        #[cfg(unix)]
+        dev_ino: {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        },
+    })
+}
+
+type Stamps = (Option<FileStamp>, Option<FileStamp>);
+
+fn stamps(cert: &Path, key: &Path) -> Stamps {
     (stamp(cert), stamp(key))
 }
 
@@ -185,7 +206,7 @@ pub struct CertReloader {
     cert: PathBuf,
     key: PathBuf,
     current: ArcSwap<CertifiedKey>,
-    seen: parking_lot::Mutex<(FileStamp, FileStamp)>,
+    seen: parking_lot::Mutex<Stamps>,
 }
 
 impl std::fmt::Debug for CertReloader {
@@ -639,6 +660,34 @@ mod tests {
             "2051-05-17T00:00:00+00:00",
             "years from 2050 are GeneralizedTime"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_moved_to_a_file_of_the_same_mtime_and_size_reads_as_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        for (name, contents) in [("a.pem", "first"), ("b.pem", "other")] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+        let link = dir.path().join("chain.pem");
+        std::os::unix::fs::symlink(dir.path().join("a.pem"), &link).unwrap();
+        let before = stamp(&link).unwrap();
+
+        let next = dir.path().join("chain.pem.next");
+        std::os::unix::fs::symlink(dir.path().join("b.pem"), &next).unwrap();
+        std::fs::rename(&next, &link).unwrap();
+        let after = stamp(&link).unwrap();
+
+        assert_eq!((after.modified, after.len), (before.modified, before.len));
+        assert_ne!(after, before, "the inode differs");
     }
 
     #[test]
