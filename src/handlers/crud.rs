@@ -547,6 +547,14 @@ pub async fn count_memories(
         .await
         .map_err(AppError::Internal)?;
 
+    let tags = parse_tag_filter(params.tags.as_deref());
+    // With no filter, every stored memory not forgotten counts, which is the maintained
+    // total; decoding the whole store to count it cost 0.4 s on a 15k-memory tenant.
+    if params.memory_type.is_none() && tags.is_empty() {
+        let total = memory.read().stored_count();
+        return Ok(Json(CountResponse { total, tags }));
+    }
+
     let all_memories = {
         let memory = memory.clone();
         tokio::task::spawn_blocking(move || {
@@ -558,7 +566,6 @@ pub async fn count_memories(
         .map_err(AppError::Internal)?
     };
 
-    let tags = parse_tag_filter(params.tags.as_deref());
     let total = apply_list_filters(all_memories, params.memory_type.as_deref(), None, &tags).len();
 
     Ok(Json(CountResponse { total, tags }))
@@ -2132,6 +2139,42 @@ mod tests {
             body["total"], 1u64,
             "prefix of a longer tag must not match it"
         );
+    }
+
+    /// The unfiltered count answers from the maintained total, not a scan; it must agree
+    /// with the listing's scanned total after writes and after a forget.
+    #[tokio::test]
+    async fn unfiltered_count_agrees_with_the_list_total_across_a_forget() {
+        let harness = TestHarness::new();
+        let user_id = "count-fast-path-user";
+        let ids = tag_fixture(&harness, user_id);
+
+        let count = || test_helpers::get(&format!("/api/memories/count?user_id={user_id}"));
+        let list_total = || {
+            test_helpers::post_json(
+                "/api/memories",
+                &serde_json::json!({ "user_id": user_id, "limit": 1 }),
+            )
+        };
+
+        let (_, counted) = test_helpers::send(harness.router(), count()).await;
+        let (_, listed) = test_helpers::send(harness.router(), list_total()).await;
+        assert_eq!(counted["total"], 5u64);
+        assert_eq!(counted["total"], listed["total"]);
+
+        {
+            let memory = harness.manager.get_user_memory(user_id).unwrap();
+            let id = crate::memory::MemoryId(uuid::Uuid::parse_str(&ids[0]).unwrap());
+            memory
+                .read()
+                .forget(crate::memory::ForgetCriteria::ById(id))
+                .unwrap();
+        }
+
+        let (_, counted) = test_helpers::send(harness.router(), count()).await;
+        let (_, listed) = test_helpers::send(harness.router(), list_total()).await;
+        assert_eq!(counted["total"], 4u64);
+        assert_eq!(counted["total"], listed["total"]);
     }
 
     #[test]

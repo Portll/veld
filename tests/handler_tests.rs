@@ -334,6 +334,24 @@ async fn health_index_user_reports_coverage() {
         Some(vector_indexed < stored || lexically_indexed < stored),
         "shortfall flag disagrees with the counts it summarises: {cov}"
     );
+    assert_eq!(
+        cov.get("stored_source").and_then(|v| v.as_str()),
+        Some("maintained")
+    );
+
+    // An explicit recount names itself and agrees with the maintained count on a store
+    // whose writes all went through the counted paths.
+    let (status, exact) = json_of(
+        h.app(),
+        authed_get("/api/health/index?user_id=test-user&exact=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        exact["index_coverage"]["stored_source"].as_str(),
+        Some("recount")
+    );
+    assert_eq!(exact["index_coverage"]["stored"].as_u64(), Some(stored));
 }
 
 #[tokio::test]
