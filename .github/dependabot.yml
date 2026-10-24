@@ -1,6 +1,7 @@
 # Weekly version updates for the workflows' actions, every Cargo lockfile, the Node integrations and
 # the Python package. Minor and patch bumps arrive as one pull request per ecosystem; a major bump
-# arrives alone. Spine's bin/dependabot-sync.mjs files each pull request and alert as a task in the
+# arrives alone, except for crate and package families that only work at matching versions, which
+# move together whatever the bump. Spine's bin/dependabot-sync.mjs files each pull request and alert as a task in the
 # veld-dependencies plan. A release younger than seven days is not proposed.
 version: 2
 updates:
@@ -30,6 +31,9 @@ updates:
       default-days: 7
     open-pull-requests-limit: 5
     groups:
+      # #83 moved opentelemetry_sdk to 0.32 alone and broke the telemetry feature (2026-10-24).
+      opentelemetry:
+        patterns: ["opentelemetry*", "tracing-opentelemetry"]
       cargo-minor-patch:
         update-types: [minor, patch]
     commit-message:
@@ -46,6 +50,9 @@ updates:
       default-days: 7
     open-pull-requests-limit: 5
     groups:
+      # @vitest/coverage-v8 5 needs vitest 5: #57 and #61 had to be merged as a pair.
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
       npm-minor-patch:
         update-types: [minor, patch]
     commit-message:
@@ -54,6 +61,10 @@ updates:
     directories:
       - /
       - /python
+    # A library's `>=` floor already admits every newer release; raising it only forces users up.
+    # Six floor raises arrived on 2026-10-21, and one (#65, langchain-core to 1.6) broke the
+    # LangChain adapter. Proposals now come only when a range excludes a new release.
+    versioning-strategy: increase-if-necessary
     schedule:
       interval: weekly
     cooldown:

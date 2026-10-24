@@ -13,3 +13,21 @@ slow-timeout = { period = "60s", terminate-after = 15 }
 [[profile.ci.overrides]]
 filter = 'binary(recall_engine_parity)'
 slow-timeout = { period = "120s", terminate-after = 15 }
+
+# Pull requests that do not touch recall, storage, embeddings or vector code skip the tests that
+# take over 100 s each on CI (2026-10-22): together they held the both-engines job at 38 min. Main,
+# the nightly run and any pull request touching those paths run them under `ci`.
+[profile.ci-pr]
+fail-fast = false
+failure-output = "immediate-final"
+slow-timeout = { period = "60s", terminate-after = 15 }
+default-filter = """
+not (
+    binary(recall_engine_parity)
+    | test(=recall_harness::forgetting_harness::planted_tests::repetition_from_one_source_does_not_move_a_planted_memory_but_corroboration_does)
+    | test(=recall_harness::runner::tests::runner_executes_smoke_suite_and_produces_well_formed_report)
+    | test(=storage::differential_tests::primary_memory_store_engines_agree_after_every_step)
+    | (binary(integration_tests) & test(=test_stress_scenarios))
+    | (binary(bug_regression_tests) & test(=test_bug007_combined_search_scales_linearly))
+)
+"""
