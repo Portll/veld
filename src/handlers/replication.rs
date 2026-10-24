@@ -159,7 +159,11 @@ pub async fn follow(State(state): State<AppState>, headers: HeaderMap, body: Byt
             )
         }
     };
-    match replication::source_follows(&source, &req.admin_key, &api_key).await {
+    let probe = match replication::leader_client(replication::PROBE_TIMEOUT) {
+        Ok(c) => c,
+        Err(e) => return failed(e),
+    };
+    match replication::source_follows(probe, &source, &req.admin_key, &api_key).await {
         Ok(Some(upstream)) if upstream == me => {
             return respond(
                 StatusCode::CONFLICT,

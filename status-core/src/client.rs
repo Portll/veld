@@ -86,10 +86,7 @@ impl StatusClient {
         };
         let snapshot = Arc::new(RwLock::new(initial));
 
-        let http = Client::builder()
-            .timeout(config.request_timeout)
-            .user_agent(concat!("veld-status-core/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+        let http = http_client(config.request_timeout)?;
 
         let poll_task = tokio::spawn(run_poll_loop(
             http.clone(),
@@ -128,7 +125,7 @@ impl StatusClient {
         timeout: Duration,
     ) -> Result<Vec<String>> {
         let base = normalize_base_url(base_url)?;
-        let http = Client::builder().timeout(timeout).build()?;
+        let http = http_client(timeout)?;
         let url = format!("{}/api/users", base);
         let resp = http.get(&url).header("X-API-Key", api_key).send().await?;
         let status = resp.status();
@@ -153,7 +150,7 @@ impl StatusClient {
         timeout: Duration,
     ) -> Result<serde_json::Value> {
         let base = normalize_base_url(base_url)?;
-        let http = Client::builder().timeout(timeout).build()?;
+        let http = http_client(timeout)?;
         let url = format!("{}/api/dials", base);
         let resp = http
             .get(&url)
@@ -184,7 +181,7 @@ impl StatusClient {
         timeout: Duration,
     ) -> Result<serde_json::Value> {
         let base = normalize_base_url(base_url)?;
-        let http = Client::builder().timeout(timeout).build()?;
+        let http = http_client(timeout)?;
         let url = format!("{}/api/dials", base);
         let payload = serde_json::json!({ "user_id": user_id, "dials": dials });
         let resp = http
@@ -216,7 +213,7 @@ impl StatusClient {
         timeout: Duration,
     ) -> Result<serde_json::Value> {
         let base = normalize_base_url(base_url)?;
-        let http = Client::builder().timeout(timeout).build()?;
+        let http = http_client(timeout)?;
         let url = format!("{}/api/seed", base);
         let payload = serde_json::json!({ "user_id": user_id, "project_path": project_path });
         let resp = http
@@ -257,7 +254,7 @@ impl StatusClient {
                 "not a /api/user_auth/ path".to_string(),
             ));
         }
-        let http = Client::builder().timeout(timeout).build()?;
+        let http = http_client(timeout)?;
         let url = format!("{base}{path}");
         let mut request = match method {
             "GET" => http.get(&url),
@@ -319,7 +316,7 @@ impl StatusClient {
                 "not a data-management path".to_string(),
             ));
         }
-        let http = Client::builder().timeout(timeout).build()?;
+        let http = http_client(timeout)?;
         let url = format!("{base}{path}");
         let mut request = match method {
             "GET" => http.get(&url),
@@ -355,6 +352,66 @@ impl Drop for StatusClient {
         self.poll_task.abort();
         self.sse_task.abort();
     }
+}
+
+/// Path to a PEM bundle of extra trust roots, added to the built-in webpki roots,
+/// for a server whose certificate a private CA signed.
+pub const ENV_CA_CERT: &str = "VELD_CA_CERT";
+
+/// The HTTP client every request in this crate goes through: the built-in webpki
+/// roots plus any in [`ENV_CA_CERT`], read on each call. A bundle that cannot be
+/// read or holds no certificate is a [`StatusError::CaBundle`], never skipped.
+fn http_client(timeout: Duration) -> Result<Client> {
+    http_client_with(std::env::var(ENV_CA_CERT).ok().as_deref(), timeout)
+}
+
+fn http_client_with(ca_bundle: Option<&str>, timeout: Duration) -> Result<Client> {
+    let builder = Client::builder()
+        .timeout(timeout)
+        .user_agent(concat!("veld-status-core/", env!("CARGO_PKG_VERSION")));
+    let Some(path) = ca_bundle.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(builder.build()?);
+    };
+    extra_roots(path)?
+        .into_iter()
+        .fold(builder, |b, cert| b.add_root_certificate(cert))
+        .build()
+        .map_err(|e| ca_bundle_error(path, format!("refused by the TLS client: {}", chain(&e))))
+}
+
+fn extra_roots(path: &str) -> Result<Vec<reqwest::Certificate>> {
+    let pem = std::fs::read(path)
+        .map_err(|e| ca_bundle_error(path, format!("cannot read the file: {e}")))?;
+    let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+        ca_bundle_error(path, format!("not a PEM certificate bundle: {}", chain(&e)))
+    })?;
+    if certs.is_empty() {
+        return Err(ca_bundle_error(
+            path,
+            "no PEM certificate in the file".into(),
+        ));
+    }
+    Ok(certs)
+}
+
+fn ca_bundle_error(path: &str, reason: String) -> StatusError {
+    StatusError::CaBundle {
+        path: path.to_string(),
+        reason,
+    }
+}
+
+/// `err` and its sources joined: reqwest's own message for a builder fault is only
+/// "builder error", with the cause one level down.
+fn chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 fn normalize_base_url(raw: &str) -> Result<String> {
@@ -594,5 +651,67 @@ fn opt_string(s: String) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/../tests/fixtures/tls/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    fn refusal(bundle: &str) -> String {
+        let err = http_client_with(Some(bundle), TIMEOUT).expect_err("the bundle is refused");
+        assert!(matches!(err, StatusError::CaBundle { .. }), "{err}");
+        err.to_string()
+    }
+
+    #[test]
+    fn no_bundle_gives_a_plain_client() {
+        http_client_with(None, TIMEOUT).unwrap();
+        http_client_with(Some("  "), TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn a_bundle_adds_every_certificate_in_it() {
+        let bundle = fixture("test-ca-bundle.pem");
+        assert_eq!(extra_roots(&bundle).unwrap().len(), 2);
+        http_client_with(Some(&bundle), TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_bundle_names_the_variable_and_the_path() {
+        let missing = fixture("no-such-bundle.pem");
+        let err = refusal(&missing);
+        assert!(
+            err.starts_with(&format!("{ENV_CA_CERT}={missing}: cannot read")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bad_pem_names_the_variable_and_the_path() {
+        let corrupt = fixture("corrupt-cert.pem");
+        let err = refusal(&corrupt);
+        assert!(
+            err.starts_with(&format!(
+                "{ENV_CA_CERT}={corrupt}: not a PEM certificate bundle"
+            )),
+            "{err}"
+        );
+
+        let not_pem = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        let err = refusal(&not_pem);
+        assert_eq!(
+            err,
+            format!("{ENV_CA_CERT}={not_pem}: no PEM certificate in the file")
+        );
     }
 }
