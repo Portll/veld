@@ -214,13 +214,21 @@ mod tests {
     #[test]
     fn a_requested_path_is_escaped_in_the_embedded_404_page() {
         let body = embedded_not_found_body("x.html\"><script>alert(document.domain)</script>");
-        assert!(!body.contains("<script>"), "markup from the URL must not reach the page: {body}");
-        assert!(body.contains("<code>x.html&quot;&gt;&lt;script&gt;alert(document.domain)&lt;/script&gt;</code>"));
+        assert!(
+            !body.contains("<script>"),
+            "markup from the URL must not reach the page: {body}"
+        );
+        assert!(body.contains(
+            "<code>x.html&quot;&gt;&lt;script&gt;alert(document.domain)&lt;/script&gt;</code>"
+        ));
     }
 
     #[test]
     fn escaping_covers_the_five_html_metacharacters_and_nothing_else() {
-        assert_eq!(escape_html(r#"<a href="x" title='y'>&</a>"#), "&lt;a href=&quot;x&quot; title=&#39;y&#39;&gt;&amp;&lt;/a&gt;");
+        assert_eq!(
+            escape_html(r#"<a href="x" title='y'>&</a>"#),
+            "&lt;a href=&quot;x&quot; title=&#39;y&#39;&gt;&amp;&lt;/a&gt;"
+        );
         assert_eq!(escape_html("guide/intro.html"), "guide/intro.html");
     }
 }

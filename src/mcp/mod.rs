@@ -203,7 +203,7 @@ pub fn handle_prompt_submit(api_url: &str, api_key: &str, user_id: &str, message
         if !ctx.memories.is_empty() {
             context_parts.push("## Relevant Memories (auto-surfaced)\n".to_string());
             for mem in ctx.memories.iter() {
-                let relevance = (mem.relevance_score * 100.0) as u32;
+                let relevance = (mem.score * 100.0) as u32;
                 context_parts.push(format!(
                     "- [{}%] **{}**: {}",
                     relevance,
