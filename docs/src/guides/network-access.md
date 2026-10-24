@@ -171,8 +171,10 @@ plain HTTP on a private link, and then no certificate is presented.
 
 The follow route refuses to follow this instance itself by any URL, its TLS URL included:
 the leader's status reports an instance id, new at every start, and a leader that reports
-this process's id is refused with `409 would_loop`. A leader too old to report an id is
-followed. A leader that already follows this instance is refused by comparing URLs: it is
+this process's id is refused with `409 would_loop`. A follow started at boot with
+`VELD_REPLICATE_FROM` makes the same check on its first poll: it stops following, logs an
+error and leaves `<source> is this instance; following stopped` in the status route's
+`last_error`. A leader too old to report an id is followed. A leader that already follows this instance is refused by comparing URLs: it is
 caught when it follows this instance's loopback URL, not its TLS URL or a proxy URL. Do not
 point two instances at each other.
 

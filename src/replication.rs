@@ -1080,6 +1080,17 @@ async fn poll_once(
         leader = get_json(target, "/api/admin/replication/status") => leader?,
         () = shutdown.cancelled() => return Ok(0),
     };
+    if leader.instance_id == Some(instance_id()) {
+        let mut status = FOLLOW.write();
+        if status.generation == generation {
+            let message = format!("{} is this instance; following stopped", target.source);
+            tracing::error!(source = %target.source, "replication: {message}");
+            status.target = None;
+            status.generation += 1;
+            status.last_error = Some(message);
+        }
+        return Ok(0);
+    }
     let cursor = cursor_path(&manager.base_path, &target.source);
     let set_syncing = |tenant: Option<&str>| {
         let mut status = FOLLOW.write();
