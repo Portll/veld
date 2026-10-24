@@ -5,17 +5,18 @@
 //! These return raw structural data — interpretation is left to consumers.
 
 use axum::{extract::State, http::StatusCode, response::Json};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::sync::watch;
 
+use super::gap_runs::{detection, is_running, Detected, GapKey, Served};
 use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::gap_topology::{GapDetectionConfig, GapDetectionResult, GapDetector};
+use crate::memory::gap_topology::{
+    run_gap_analysis, GapDetectionConfig, GapRunParams, GapScope, MirrorReport, ScopeReport,
+};
+use crate::memory::graph_mirror::sync_mirror;
 use crate::memory::mapper::{compute_mapper, MapperConfig, MapperFilter};
 use crate::memory::persistence::{self, PersistenceConfig};
 use crate::memory::slow_store::SlowStore;
@@ -38,10 +39,6 @@ const MAX_NUM_INTERVALS: usize = 200;
 const MIN_OVERLAP: f32 = 0.0;
 const MAX_OVERLAP: f32 = 0.9;
 const MAX_ENTITIES: usize = 2000;
-/// How long a gap detection result is served as fresh.
-const GAP_FRESH_SECS: i64 = 300;
-/// Detection results kept at most, the oldest dropped first.
-const GAP_RESULTS_KEPT: usize = 64;
 
 fn validate_range_f32(value: f32, min: f32, max: f32, name: &str) -> Result<f32, AppError> {
     if !value.is_finite() {
@@ -60,6 +57,11 @@ fn validate_range_usize(value: usize, max: usize, _name: &str) -> Result<usize, 
 // =============================================================================
 // GAP DETECTION
 // =============================================================================
+
+/// Longest `namespace` or `project` filter.
+const MAX_SCOPE_FILTER_LEN: usize = 128;
+/// Most `entity_types` a request may name.
+const MAX_ENTITY_TYPES: usize = 32;
 
 #[derive(Debug, Deserialize)]
 pub struct GapAnalysisRequest {
@@ -81,6 +83,18 @@ pub struct GapAnalysisRequest {
     /// Minimum cluster size for orbit detection (default 3)
     #[serde(default)]
     pub orbit_min_cluster_size: Option<usize>,
+    /// Only entities named `{namespace}:…`.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Only entities linked to the tag entity `project:{project}`.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Only entities carrying one of these labels.
+    #[serde(default)]
+    pub entity_types: Vec<String>,
+    /// Analyze at most this many entities, the most salient in scope.
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
 }
 
 fn default_limit() -> usize {
@@ -99,13 +113,24 @@ pub struct GapAnalysisResponse {
     pub gaps: Vec<GapSummary>,
     pub total_count: usize,
     pub type_counts: std::collections::HashMap<String, usize>,
+    /// Mirror sync and detection of the run that produced the result.
     pub duration_ms: u64,
+    /// Detection alone.
+    pub detect_ms: u64,
     /// `fresh`: computed within the last five minutes. `stale`: an older result,
     /// served while a new run goes on (or after it failed). `running`: no result
     /// yet, the run goes on (status 202).
     pub status: &'static str,
     /// When the result was computed, RFC 3339; absent while `running`.
     pub computed_at: Option<String>,
+    /// Seconds since `computed_at`.
+    pub age_secs: Option<i64>,
+    /// A run for these parameters is under way.
+    pub refreshing: bool,
+    /// The part of the graph the result covers; absent while `running`.
+    pub scope: Option<ScopeReport>,
+    /// How the run brought the graph mirror up to the graph; absent while `running`.
+    pub mirror: Option<MirrorReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,151 +152,11 @@ pub struct ShapeSummary {
     pub sparsity: f32,
 }
 
-/// What a detection depends on; offset and limit only page its result.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GapKey {
-    user_id: String,
-    min_strength: u32,
-    max_gaps: usize,
-    min_embedding_similarity: Option<u32>,
-    star_min_spokes: Option<usize>,
-    orbit_min_cluster_size: Option<usize>,
-}
-
-#[derive(Clone)]
-struct Detected {
-    result: Arc<GapDetectionResult>,
-    at: chrono::DateTime<chrono::Utc>,
-}
-
-impl Detected {
-    fn is_fresh(&self) -> bool {
-        chrono::Utc::now() - self.at < chrono::Duration::seconds(GAP_FRESH_SECS)
-    }
-}
-
-/// A run's end: its result, or why it failed.
-type Outcome = Option<Result<Detected, String>>;
-
-#[derive(Default)]
-struct GapEntry {
-    last: Option<Detected>,
-    running: Option<watch::Receiver<Outcome>>,
-}
-
-/// Detection results by user and parameters, and the run under way for each.
-static GAP_RUNS: LazyLock<Mutex<HashMap<GapKey, GapEntry>>> = LazyLock::new(Default::default);
-
-enum Served {
-    /// Computed within the freshness window.
-    Fresh(Detected),
-    /// An older result, while a new run goes on or after it failed.
-    Stale(Detected),
-    /// No result yet; the run goes on.
-    Running,
-}
-
-/// The detection for `key`: a fresh result at once; otherwise the end of a run,
-/// started here unless one is under way, if it comes within `wait`; otherwise
-/// the last result while the run goes on. One run per key at a time, and a run
-/// finishes and is kept whether or not anyone is still waiting for it.
-async fn detection(
-    key: GapKey,
-    wait: Duration,
-    job: impl FnOnce() -> anyhow::Result<GapDetectionResult> + Send + 'static,
-) -> Result<Served, AppError> {
-    let (mut run, last) = {
-        let mut runs = GAP_RUNS.lock();
-        let entry = runs.entry(key.clone()).or_default();
-        if let Some(last) = entry.last.as_ref().filter(|d| d.is_fresh()) {
-            return Ok(Served::Fresh(last.clone()));
-        }
-        // A run whose task died without an outcome has dropped its sender; start another.
-        let run = match entry.running.as_ref().filter(|r| r.has_changed().is_ok()) {
-            Some(run) => run.clone(),
-            None => {
-                let run = start(key, job);
-                entry.running = Some(run.clone());
-                run
-            }
-        };
-        (run, entry.last.clone())
-    };
-    let ended = match tokio::time::timeout(wait, run.wait_for(Option::is_some)).await {
-        Ok(Ok(outcome)) => Option::clone(&outcome),
-        Ok(Err(_)) => Some(Err("the gap detection run ended without a result".into())),
-        Err(_) => None,
-    };
-    Ok(match ended {
-        Some(Ok(detected)) => Served::Fresh(detected),
-        Some(Err(error)) => match last {
-            Some(last) => Served::Stale(last),
-            None => return Err(AppError::Internal(anyhow::anyhow!(error))),
-        },
-        None => last.map_or(Served::Running, Served::Stale),
-    })
-}
-
-/// Runs `job` off the async runtime and keeps its result under `key`.
-fn start(
-    key: GapKey,
-    job: impl FnOnce() -> anyhow::Result<GapDetectionResult> + Send + 'static,
-) -> watch::Receiver<Outcome> {
-    let (done, run) = watch::channel(None);
-    tokio::spawn(async move {
-        let outcome = match tokio::task::spawn_blocking(job).await {
-            Ok(Ok(result)) => Ok(Detected {
-                result: Arc::new(result),
-                at: chrono::Utc::now(),
-            }),
-            Ok(Err(e)) => Err(format!("{e:#}")),
-            Err(e) => Err(format!("gap detection task failed: {e}")),
-        };
-        if let Err(e) = &outcome {
-            tracing::warn!(user_id = %key.user_id, error = %e, "gap detection failed");
-        }
-        {
-            let mut runs = GAP_RUNS.lock();
-            let entry = runs.entry(key).or_default();
-            entry.running = None;
-            if let Ok(detected) = &outcome {
-                entry.last = Some(detected.clone());
-            }
-            prune(&mut runs);
-        }
-        done.send_replace(Some(outcome));
-    });
-    run
-}
-
-/// Drops results more than an hour old, then the oldest beyond the cap; a key
-/// with a run under way is kept.
-fn prune(runs: &mut HashMap<GapKey, GapEntry>) {
-    let now = chrono::Utc::now();
-    runs.retain(|_, e| {
-        e.running.is_some()
-            || e.last
-                .as_ref()
-                .is_some_and(|d| now - d.at < chrono::Duration::hours(1))
-    });
-    let excess = runs.len().saturating_sub(GAP_RESULTS_KEPT);
-    if excess > 0 {
-        let mut idle: Vec<(GapKey, chrono::DateTime<chrono::Utc>)> = runs
-            .iter()
-            .filter(|(_, e)| e.running.is_none())
-            .filter_map(|(k, e)| e.last.as_ref().map(|d| (k.clone(), d.at)))
-            .collect();
-        idle.sort_by_key(|(_, at)| *at);
-        for (k, _) in idle.into_iter().take(excess) {
-            runs.remove(&k);
-        }
-    }
-}
-
-/// One page of a detection result.
+/// One page of a result.
 fn summarize(
     detected: Option<&Detected>,
     status: &'static str,
+    refreshing: bool,
     offset: usize,
     limit: usize,
 ) -> GapAnalysisResponse {
@@ -281,11 +166,17 @@ fn summarize(
             total_count: 0,
             type_counts: HashMap::new(),
             duration_ms: 0,
+            detect_ms: 0,
             status,
             computed_at: None,
+            age_secs: None,
+            refreshing,
+            scope: None,
+            mirror: None,
         };
     };
-    let result = &detected.result;
+    let run = &detected.run;
+    let result = &run.result;
     GapAnalysisResponse {
         gaps: result
             .gaps
@@ -309,20 +200,58 @@ fn summarize(
             .collect(),
         total_count: result.gaps.len(),
         type_counts: result.type_counts.clone(),
-        duration_ms: result.duration_ms,
+        duration_ms: run.duration_ms,
+        detect_ms: run.detect_ms,
         status,
         computed_at: Some(detected.at.to_rfc3339()),
+        age_secs: Some((chrono::Utc::now() - detected.at).num_seconds().max(0)),
+        refreshing,
+        scope: Some(run.scope.clone()),
+        mirror: Some(run.mirror.clone()),
     }
+}
+
+/// A scope filter of at most `MAX_SCOPE_FILTER_LEN` characters.
+fn validate_scope_filter(value: &Option<String>, field: &str) -> Result<(), AppError> {
+    match value {
+        Some(v) if v.chars().count() > MAX_SCOPE_FILTER_LEN => Err(AppError::InvalidInput {
+            field: field.to_string(),
+            reason: format!("{field} is longer than {MAX_SCOPE_FILTER_LEN} characters"),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The scope a request asks for.
+fn requested_scope(req: &GapAnalysisRequest) -> Result<GapScope, AppError> {
+    validate_scope_filter(&req.namespace, "namespace")?;
+    validate_scope_filter(&req.project, "project")?;
+    if req.entity_types.len() > MAX_ENTITY_TYPES {
+        return Err(AppError::InvalidInput {
+            field: "entity_types".to_string(),
+            reason: format!("at most {MAX_ENTITY_TYPES} entity types"),
+        });
+    }
+    for t in &req.entity_types {
+        validate_scope_filter(&Some(t.clone()), "entity_types")?;
+    }
+    Ok(GapScope::new(
+        req.namespace.clone(),
+        req.project.clone(),
+        req.entity_types.clone(),
+        req.max_nodes,
+    ))
 }
 
 /// Detect structural gaps in the knowledge graph.
 ///
 /// POST /api/gap/analyze
 ///
-/// Detection runs in the background, one run per user and parameters, and its
-/// result is kept. A request gets a result from the last five minutes at once;
-/// otherwise it waits for a run until shortly before the route's timeout, then
-/// gets the last result marked `stale`, or 202 with `running` when there is none.
+/// Analysis runs on the gap worker thread, one run per user, parameters and
+/// scope, and its result is kept. A request gets a result from the last five
+/// minutes at once; otherwise it waits for a run until shortly before the
+/// route's timeout, then gets the last result marked `stale`, or 202 with
+/// `running` when there is none.
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 #[allow(clippy::manual_clamp)]
 pub async fn analyze_gaps(
@@ -338,6 +267,7 @@ pub async fn analyze_gaps(
     )?;
     let offset = req.offset;
     let limit = validate_range_usize(req.limit.max(1), MAX_GAPS_PER_TYPE, "limit")?;
+    let scope = requested_scope(&req)?;
 
     let key = GapKey {
         user_id: req.user_id.clone(),
@@ -346,42 +276,45 @@ pub async fn analyze_gaps(
         min_embedding_similarity: req.min_embedding_similarity.map(f32::to_bits),
         star_min_spokes: req.star_min_spokes,
         orbit_min_cluster_size: req.orbit_min_cluster_size,
+        scope: scope.clone(),
     };
+    let server_config = state.server_config();
     // Answer a few seconds inside the route's timeout rather than let it cut the request off.
     let wait = Duration::from_secs(
-        state
-            .server_config()
+        server_config
             .gap_request_timeout_secs
             .saturating_sub(5)
             .max(1),
     );
+    let worker = server_config.gap_worker_config();
+
+    let mut config = GapDetectionConfig {
+        min_edge_strength: min_strength,
+        max_gaps_per_type: max_gaps,
+        ..Default::default()
+    };
+    if let Some(v) = req.min_embedding_similarity {
+        config.min_embedding_similarity = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = req.star_min_spokes {
+        config.star_min_spokes = v.max(2).min(20);
+    }
+    if let Some(v) = req.orbit_min_cluster_size {
+        config.orbit_min_cluster_size = v.max(2).min(50);
+    }
+    let params = GapRunParams {
+        config,
+        scope,
+        mirror: server_config.graph_mirror_options(),
+    };
     let job_state = state.clone();
     let user_id = req.user_id.clone();
-    let (min_embedding_similarity, star_min_spokes, orbit_min_cluster_size) = (
-        req.min_embedding_similarity,
-        req.star_min_spokes,
-        req.orbit_min_cluster_size,
-    );
-    let served = detection(key, wait, move || {
+    let served = detection(key.clone(), wait, worker, move || {
+        let graph = job_state
+            .get_user_graph(&user_id)
+            .map_err(|e| anyhow::anyhow!("Failed to get graph for user {user_id}: {e}"))?;
         let store = get_or_create_slow_store(&job_state, &user_id)?;
-        sync_graph_to_slow_store(&job_state, &user_id, &store)?;
-
-        let mut config = GapDetectionConfig {
-            min_edge_strength: min_strength,
-            max_gaps_per_type: max_gaps,
-            ..Default::default()
-        };
-        if let Some(v) = min_embedding_similarity {
-            config.min_embedding_similarity = v.clamp(0.0, 1.0);
-        }
-        if let Some(v) = star_min_spokes {
-            config.star_min_spokes = v.max(2).min(20);
-        }
-        if let Some(v) = orbit_min_cluster_size {
-            config.orbit_min_cluster_size = v.max(2).min(50);
-        }
-
-        let result = GapDetector::detect(store.as_ref(), &config)?;
+        let run = run_gap_analysis(&graph, &store, &params)?;
         job_state.emit_event(MemoryEvent {
             event_type: "gap_analysis_complete".to_string(),
             timestamp: chrono::Utc::now(),
@@ -390,30 +323,31 @@ pub async fn analyze_gaps(
             content_preview: None,
             memory_type: None,
             importance: None,
-            count: Some(result.gaps.len()),
+            count: Some(run.result.gaps.len()),
             entities: None,
             results: Some(serde_json::json!({
                 "type": "gap_analysis_complete",
-                "gap_count": result.gaps.len(),
-                "duration_ms": result.duration_ms,
+                "gap_count": run.result.gaps.len(),
+                "duration_ms": run.duration_ms,
             })),
         });
-        Ok(result)
+        Ok(run)
     })
     .await?;
 
+    let refreshing = is_running(&key);
     Ok(match served {
         Served::Fresh(d) => (
             StatusCode::OK,
-            Json(summarize(Some(&d), "fresh", offset, limit)),
+            Json(summarize(Some(&d), "fresh", refreshing, offset, limit)),
         ),
         Served::Stale(d) => (
             StatusCode::OK,
-            Json(summarize(Some(&d), "stale", offset, limit)),
+            Json(summarize(Some(&d), "stale", refreshing, offset, limit)),
         ),
         Served::Running => (
             StatusCode::ACCEPTED,
-            Json(summarize(None, "running", offset, limit)),
+            Json(summarize(None, "running", refreshing, offset, limit)),
         ),
     })
 }
@@ -921,130 +855,63 @@ fn get_or_create_slow_store(
         .map_err(|e| anyhow::anyhow!("Failed to get slow store for user {user_id}: {e}"))
 }
 
-/// Sync graph data from RocksDB (GraphMemory) into SQLite (SlowStore).
-/// Serves the existing mirror when a rebuild is already in flight or the last
-/// one finished less than the configured `graph_mirror_sync_secs` ago.
+/// Bring the user's SQLite graph mirror up to the graph: the rows changed
+/// since the last sync, or a chunked full copy at most once per
+/// `graph_mirror_sync_secs`.
 fn sync_graph_to_slow_store(
     state: &MultiUserMemoryManager,
     user_id: &str,
     store: &SlowStore,
 ) -> Result<(), anyhow::Error> {
-    let Some(sync) = store.begin_sync(state.server_config().graph_mirror_sync_ttl()) else {
-        tracing::debug!("SlowStore sync skipped: rebuild in flight or within TTL");
-        return Ok(());
-    };
-
     let graph = state
         .get_user_graph(user_id)
         .map_err(|e| anyhow::anyhow!("Failed to get graph for user {user_id}: {e}"))?;
-    // Hold the graph read lock only for the snapshot, not the SQLite writes.
-    let (entities, edges) = {
-        let graph_guard = graph.read();
-        (
-            graph_guard.get_all_entities()?,
-            graph_guard.get_all_relationships()?,
-        )
-    };
-
-    sync.rebuild(&entities, &edges)?;
+    sync_mirror(&graph, store, &state.server_config().graph_mirror_options())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn key(user: &str) -> GapKey {
-        GapKey {
-            user_id: user.to_string(),
-            min_strength: 0.2f32.to_bits(),
-            max_gaps: 50,
-            min_embedding_similarity: None,
-            star_min_spokes: None,
-            orbit_min_cluster_size: None,
+    fn request(json: serde_json::Value) -> GapAnalysisRequest {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_request_without_scope_fields_covers_the_whole_graph() {
+        let req = request(serde_json::json!({ "user_id": "u" }));
+        assert!(requested_scope(&req).unwrap().is_whole_graph());
+    }
+
+    #[test]
+    fn scope_fields_become_a_normalized_scope() {
+        let req = request(serde_json::json!({
+            "user_id": "u",
+            "namespace": "File:",
+            "project": "Veld",
+            "entity_types": ["Person", "concept"],
+            "max_nodes": 500
+        }));
+        let scope = requested_scope(&req).unwrap();
+        assert_eq!(scope.namespace.as_deref(), Some("file"));
+        assert_eq!(scope.project.as_deref(), Some("veld"));
+        assert_eq!(scope.entity_types, vec!["concept", "person"]);
+        assert_eq!(scope.max_nodes, Some(500));
+    }
+
+    #[test]
+    fn oversized_scope_filters_are_refused() {
+        let long = "x".repeat(MAX_SCOPE_FILTER_LEN + 1);
+        for json in [
+            serde_json::json!({ "user_id": "u", "namespace": long }),
+            serde_json::json!({ "user_id": "u", "project": long }),
+            serde_json::json!({ "user_id": "u", "entity_types": vec!["t"; MAX_ENTITY_TYPES + 1] }),
+        ] {
+            assert!(matches!(
+                requested_scope(&request(json)),
+                Err(AppError::InvalidInput { .. })
+            ));
         }
-    }
-
-    fn result(duration_ms: u64) -> GapDetectionResult {
-        GapDetectionResult {
-            gaps: Vec::new(),
-            type_counts: HashMap::new(),
-            duration_ms,
-        }
-    }
-
-    fn counted(
-        runs: &Arc<AtomicUsize>,
-        took: Duration,
-        duration_ms: u64,
-    ) -> impl FnOnce() -> anyhow::Result<GapDetectionResult> + Send + 'static {
-        let runs = Arc::clone(runs);
-        move || {
-            runs.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(took);
-            Ok(result(duration_ms))
-        }
-    }
-
-    #[tokio::test]
-    async fn concurrent_requests_share_one_run_and_a_fresh_result_needs_none() {
-        let runs = Arc::new(AtomicUsize::new(0));
-        let wait = Duration::from_secs(5);
-        let took = Duration::from_millis(200);
-        let (a, b) = tokio::join!(
-            detection(key("gap-shared"), wait, counted(&runs, took, 7)),
-            detection(key("gap-shared"), wait, counted(&runs, took, 7)),
-        );
-        let (Served::Fresh(a), Served::Fresh(b)) = (a.unwrap(), b.unwrap()) else {
-            panic!("both requests get the run's result");
-        };
-        assert_eq!(a.at, b.at);
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-
-        let again = detection(key("gap-shared"), wait, counted(&runs, took, 7))
-            .await
-            .unwrap();
-        assert!(matches!(again, Served::Fresh(d) if d.at == a.at));
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn a_run_outlasting_the_wait_answers_running_and_its_result_is_kept() {
-        let runs = Arc::new(AtomicUsize::new(0));
-        let short = Duration::from_millis(50);
-        let first = detection(
-            key("gap-slow"),
-            short,
-            counted(&runs, Duration::from_millis(300), 1),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(first, Served::Running));
-
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        let later = detection(key("gap-slow"), short, counted(&runs, Duration::ZERO, 2))
-            .await
-            .unwrap();
-        assert!(matches!(later, Served::Fresh(d) if d.result.duration_ms == 1));
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn a_failed_first_run_is_an_error_and_a_failed_refresh_serves_the_last_result() {
-        let k = key("gap-fails");
-        let wait = Duration::from_secs(5);
-        assert!(detection(k.clone(), wait, || anyhow::bail!("no graph"))
-            .await
-            .is_err());
-
-        GAP_RUNS.lock().entry(k.clone()).or_default().last = Some(Detected {
-            result: Arc::new(result(3)),
-            at: chrono::Utc::now() - chrono::Duration::seconds(GAP_FRESH_SECS + 1),
-        });
-        let served = detection(k, wait, || anyhow::bail!("no graph"))
-            .await
-            .unwrap();
-        assert!(matches!(served, Served::Stale(d) if d.result.duration_ms == 3));
     }
 }

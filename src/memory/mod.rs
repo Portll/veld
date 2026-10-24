@@ -23,6 +23,7 @@ pub mod files;
 pub mod fusion_features;
 pub mod gap_topology;
 pub mod gold_funnel;
+pub mod graph_mirror;
 pub mod graph_retrieval;
 pub mod hybrid_search;
 pub mod injection;
@@ -33,6 +34,7 @@ pub mod llm;
 pub mod llm_refiner;
 pub mod mapper;
 pub mod merge;
+pub mod pacing;
 pub mod pattern_detection;
 pub mod persistence;
 pub mod prefetch_tick;
@@ -11092,3 +11094,8 @@ mod lifecycle_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod gap_scale_bench;
+#[cfg(test)]
+mod gap_scale_tests;
