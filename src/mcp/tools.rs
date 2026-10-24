@@ -893,7 +893,7 @@ impl VeldMcpServer {
     }
 
     #[tool(
-        description = "Link a dataset row to a knowledge-graph entity or a memory. `row_pk` is { columns: { <pk_col>: <value> } }, `kind` is 'entity' or 'memory', `target_id` is the entity/memory id."
+        description = "Link a dataset row to a knowledge-graph entity or a memory. `row_pk` is { values: [<pk value>, ...] } (the primary-key values in column order), `kind` is 'entity' or 'memory', `target_id` is the entity/memory id."
     )]
     async fn dataset_link(
         &self,
