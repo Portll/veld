@@ -37,6 +37,13 @@ follower offers its own key only to a leader on this host; a remote leader must 
 its key. A leader's error body is echoed back in at most 300 characters, and a reply over
 256 MB is refused.
 
+`VELD_CA_CERT` adds a PEM bundle of trust roots to the built-in ones, for a leader whose
+certificate a private CA signed. `VELD_REPLICATE_CLIENT_CERT` and
+`VELD_REPLICATE_CLIENT_KEY`, set together, present a client certificate to a leader that
+requires one. The client is built when a follow starts, so a missing, unreadable or
+unparseable file fails the follow with the variable and the path named. See
+[Network access](../guides/network-access.md).
+
 ## Follower loop
 
 Every interval: `GET status` on the leader; then each tenant is synced on its own:
