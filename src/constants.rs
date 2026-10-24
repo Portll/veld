@@ -2392,6 +2392,11 @@ pub const SEMANTIC_CLUSTER_THRESHOLD: f32 = 0.75;
 /// - Longer windows would merge unrelated sessions
 pub const TEMPORAL_CLUSTER_WINDOW_SECS: i64 = 1800;
 
+/// Layer 4.525's boost for one query word that matches a memory's entities, as a share of the
+/// top fused score, before the word is weighted by how few candidates carry it
+/// (`entity_match_specificity`). Four full-weight matches are the cap.
+pub const ENTITY_OVERLAP_SHARE: f32 = 1.0;
+
 /// Boost for memories whose IDs appear in temporal fact matches, as a share of the top
 /// fused score.
 ///

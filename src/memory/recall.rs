@@ -2196,7 +2196,8 @@ impl super::MemorySystem {
             // Porter stemming resolves morphological mismatches: "bugs"->"bug",
             // "risks"->"risk", "testing"->"test". Stop word filtering prevents
             // false positives from "the" matching inside "prometheus" etc.
-            // A word match adds 0.10 of the top fused score, capped at 0.40 of it.
+            // A word match adds up to ENTITY_OVERLAP_SHARE of the top fused score, weighted by
+            // how few candidates it matches; four full matches are the cap.
             // [signal: entity_overlap] Gated by disabled_signals dial; default = always on.
             let entity_overlap_on = early_dials_snapshot.signal_enabled("entity_overlap");
             {
@@ -2223,46 +2224,69 @@ impl super::MemorySystem {
 
                 if !query_stems.is_empty() {
                     let ids: Vec<MemoryId> = fused.keys().cloned().collect();
-                    for id in &ids {
-                        let view = candidates.get(id);
-                        let entity_stems: Vec<String> = view
-                            .as_ref()
-                            .map(|v| {
-                                v.entities_lower
-                                    .iter()
-                                    .map(|e| stem_query_token(&stemmer, e))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let matched: Vec<&String> = query_stems
-                            .iter()
-                            .filter(|qs| {
-                                entity_stems
-                                    .iter()
-                                    .any(|es| query_token_matches_entity(qs, es))
-                            })
-                            .collect();
+                    let mut with_entities = 0usize;
+                    let matches: Vec<Vec<&String>> = ids
+                        .iter()
+                        .map(|id| {
+                            let entity_stems: Vec<String> = candidates
+                                .get(id)
+                                .map(|v| {
+                                    v.entities_lower
+                                        .iter()
+                                        .map(|e| stem_query_token(&stemmer, e))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !entity_stems.is_empty() {
+                                with_entities += 1;
+                            }
+                            query_stems
+                                .iter()
+                                .filter(|qs| {
+                                    entity_stems
+                                        .iter()
+                                        .any(|es| query_token_matches_entity(qs, es))
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let mut matching_candidates: std::collections::HashMap<&String, usize> =
+                        std::collections::HashMap::new();
+                    for matched in &matches {
+                        for qs in matched {
+                            *matching_candidates.entry(*qs).or_default() += 1;
+                        }
+                    }
+
+                    let share = crate::constants::ENTITY_OVERLAP_SHARE;
+                    // Abstract/decomposed queries match generic stems like "perform" on many
+                    // memories equally, so a word match there counts for 0.4 of its share.
+                    let per_match = if decomposed { 0.4 * share } else { share };
+                    for (id, matched) in ids.iter().zip(&matches) {
                         let overlap = matched.len();
                         if overlap >= 1 {
-                            // Dampen entity overlap for abstract/decomposed queries:
-                            // generic stems like "perform" match many memories equally,
-                            // adding noise rather than signal. Reduce from 0.10 to 0.04.
+                            // A word match adds `per_match` of the top fused score, weighted by
+                            // how few candidates the word matches: a speaker's name is an
+                            // entity on half of a conversation and says nothing about which
+                            // turn is meant, while `thiserror` on one memory says everything.
                             // An identifier match ("serve.mjs" against a declared
-                            // `repo:admin/serve.mjs`) is not a generic stem — it matches at a
-                            // name boundary or not at all — so it keeps the undampened rate
-                            // whether or not the query was decomposed.
-                            //
-                            // Word matches are shares of the top fused score: a person's name
-                            // matches most of a conversation, so an absolute +0.10 per word
-                            // re-sorted the whole candidate set by match count. An identifier
-                            // stays absolute because a name-boundary match on `serve.mjs` is
-                            // meant to outrank any fusion score.
+                            // `repo:admin/serve.mjs`) matches at a name boundary or not at
+                            // all, so it stays an absolute +0.10 that outranks any fusion
+                            // score, decomposed or not.
                             let identifiers =
                                 matched.iter().filter(|qs| is_structured_token(qs)).count();
-                            let words = overlap - identifiers;
-                            let per_match = if decomposed { 0.04 } else { 0.10 };
-                            let cap = if decomposed { 0.16 } else { 0.40 };
-                            let boost = (per_match * words as f32).min(cap) * fusion_scale
+                            let word_weight: f32 = matched
+                                .iter()
+                                .filter(|qs| !is_structured_token(qs))
+                                .map(|qs| {
+                                    entity_match_specificity(
+                                        with_entities,
+                                        matching_candidates[*qs],
+                                    )
+                                })
+                                .sum();
+                            let boost = (per_match * word_weight).min(4.0 * per_match)
+                                * fusion_scale
                                 + (0.10 * identifiers as f32).min(0.40);
                             if entity_overlap_on {
                                 if let Some(score) = fused.get_mut(id) {
@@ -2271,7 +2295,7 @@ impl super::MemorySystem {
                             }
                             // Signal attribution: mark entity overlap
                             attr.entry(id.clone()).or_default().entity_overlap = true;
-                        } else if overlap == 0 && !has_any_temporal_intent {
+                        } else if !has_any_temporal_intent {
                             // Content-fallback: when no entity/tag overlap, check
                             // if query stems appear in memory content. Smaller boost
                             // (0.05 of the top fused score per match, cap 0.20) to keep
@@ -2280,7 +2304,7 @@ impl super::MemorySystem {
                             // would boost wrong-session memories indiscriminately.
                             // [signal: content_fallback] Gated by disabled_signals dial; default = always on.
                             if early_dials_snapshot.signal_enabled("content_fallback") {
-                                if let Some(view) = view.as_ref() {
+                                if let Some(view) = candidates.get(id) {
                                     let content_lower = &view.content_lower;
                                     let content_overlap = query_stems
                                         .iter()
@@ -6133,6 +6157,16 @@ impl<'s, S: CandidateSource + ?Sized> RecallCandidates<'s, S> {
     }
 }
 
+/// Layer 4.525's weight for a query word that matches the entities of `matching` of the `n`
+/// candidates carrying entities: `ln(n / matching) / ln(n)`, 1 for a word only one candidate
+/// carries and 0 for a word every candidate carries.
+fn entity_match_specificity(n: usize, matching: usize) -> f32 {
+    if n <= 1 || matching == 0 {
+        return 1.0;
+    }
+    ((n as f32 / matching as f32).ln() / (n as f32).ln()).clamp(0.0, 1.0)
+}
+
 /// Layer 4.54 (temporal topic dedup) over the `cap` highest fused scores: for each pair of
 /// those whose lowercase entity sets have Jaccard > 0.40, the older is demoted ×0.85, once
 /// however many newer memories share its topic. Compounded per pair, the oldest memory on a
@@ -7141,7 +7175,10 @@ mod vector_rung_tests {
 
 #[cfg(test)]
 mod candidate_projection_tests {
-    use super::{temporal_topic_dedup, CandidateSource, CandidateTier, RecallCandidates};
+    use super::{
+        entity_match_specificity, temporal_topic_dedup, CandidateSource, CandidateTier,
+        RecallCandidates,
+    };
     use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId, SharedMemory};
     use anyhow::Result;
     use std::cell::RefCell;
@@ -7268,6 +7305,22 @@ mod candidate_projection_tests {
         assert!(candidates.get(&late_id).is_some());
         assert!(candidates.get(&late_id).is_some());
         assert_eq!(source.reads_of(&late_id), 1);
+    }
+
+    #[test]
+    fn an_entity_word_weighs_by_how_few_candidates_carry_it() {
+        assert_eq!(entity_match_specificity(200, 1), 1.0);
+        assert_eq!(entity_match_specificity(200, 200), 0.0);
+        let speaker_name = entity_match_specificity(200, 100);
+        let topic = entity_match_specificity(200, 5);
+        assert!(speaker_name < 0.15, "{speaker_name}");
+        assert!(topic > 0.65, "{topic}");
+        assert_eq!(
+            entity_match_specificity(1, 1),
+            1.0,
+            "one candidate: nothing to compare"
+        );
+        assert_eq!(entity_match_specificity(0, 0), 1.0);
     }
 
     #[test]
