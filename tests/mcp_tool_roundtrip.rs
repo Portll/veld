@@ -359,7 +359,7 @@ async fn every_tool_answers_over_mcp() -> Result<()> {
     live.answers("dataset_list", json!({})).await?;
     live.answers("dataset_query", json!({"name": "parity_rows"}))
         .await?;
-    live.answers("dataset_link", json!({"name": "parity_rows", "row_pk": {"columns": {"id": 1}}, "kind": "memory", "target_id": first_id})).await?;
+    live.answers("dataset_link", json!({"name": "parity_rows", "row_pk": {"values": [1]}, "kind": "memory", "target_id": first_id})).await?;
 
     // Index, facts, consolidation, seeding, tokens.
     live.ok("verify_index", json!({})).await?;

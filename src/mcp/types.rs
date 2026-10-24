@@ -488,7 +488,7 @@ pub(crate) struct DatasetQueryParams {
 pub(crate) struct DatasetLinkParams {
     /// Dataset name.
     pub name: String,
-    /// Row primary key: `{ "columns": { "<pk_col>": <value>, ... } }`.
+    /// Row primary key: `{ "values": [<pk value>, ...] }`, the primary-key values in column order.
     pub row_pk: serde_json::Value,
     /// Link kind: `"entity"` or `"memory"`.
     pub kind: String,

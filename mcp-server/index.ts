@@ -1730,7 +1730,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             name: { type: "string", description: "Dataset name." },
             row_pk: {
               type: "object",
-              description: "Row primary key: { columns: { <pk_col>: <value> } }.",
+              description: "Row primary key: { values: [<pk value>, ...] } (the primary-key values in column order).",
             },
             kind: {
               type: "string",
