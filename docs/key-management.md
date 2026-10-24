@@ -112,9 +112,10 @@ The routes are under `/api/user_auth/admin/keys/`: `status`, `init`, `recovery_c
 `revoke`, `rotate_passphrase`, `rotate_data_keys`, `rotate_master_keys`, `factors` and
 `passkey`. A change carries the unlock factor in its body as one of
 `{"passphrase": …}`, `{"recovery_code": …}`, `{"secure_enclave": {"id", "secret"}}` or
-`{"passkey": {"id", "secret"}}`. Failed unlocks share one budget across the server. On a
-non-loopback bind the routes refuse unless `VELD_TLS_ACK=true` says TLS terminates in
-front of veld, because the bodies carry passphrases. Every change is in the audit trail.
+`{"passkey": {"id", "secret"}}`. Failed unlocks share one budget across the server. The
+bodies carry passphrases, so a request is refused unless it arrived over the TLS listener
+(`VELD_TLS_PORT`), the plain listener is on loopback, or `VELD_TLS_ACK=true` says TLS
+terminates in front of veld. Every change is in the audit trail.
 
 ## Rotate
 

@@ -5,8 +5,9 @@
 //! body: the passphrase, a recovery code, or a device secret. Failed unlocks share
 //! one budget across the server.
 //!
-//! The bodies carry passphrases and key material, so on a non-loopback bind the
-//! routes refuse unless VELD_TLS_ACK says TLS terminates in front of the server.
+//! The bodies carry passphrases and key material, so a request is refused unless it
+//! arrived over the TLS listener, the plain listener is on loopback, or VELD_TLS_ACK
+//! says TLS terminates in front of the server.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +27,7 @@ use super::state::MultiUserMemoryManager;
 use super::user_admin::{audit, require_admin, require_admin_step_up};
 use crate::keyring::{self, passkey};
 use crate::keystore::{Factor, PROVIDER_PASSKEY, PROVIDER_SECURE_ENCLAVE};
+use crate::tls::ArrivedOverTls;
 use crate::user_auth::{
     runtime::UserAuthRuntime, AuthError, SessionTokenExt, SessionUser, UserRecord,
 };
@@ -137,22 +139,27 @@ fn runtime(state: &AppState) -> Result<&UserAuthRuntime, KeysError> {
         .ok_or(KeysError::Auth(AuthError::Disabled))
 }
 
-fn transport_is_private(state: &AppState) -> bool {
-    crate::config::is_local_bind_host(&state.server_config.host)
+/// The TLS listener marks its requests [`ArrivedOverTls`]; a client cannot.
+type OverTls = Option<Extension<ArrivedOverTls>>;
+
+fn transport_is_private(plain_host: &str, over_tls: bool) -> bool {
+    over_tls
+        || crate::config::is_local_bind_host(plain_host)
         || std::env::var("VELD_TLS_ACK")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
 }
 
-fn require_private_transport(state: &AppState) -> Result<(), KeysError> {
-    if transport_is_private(state) {
+fn require_private_transport(state: &AppState, over_tls: &OverTls) -> Result<(), KeysError> {
+    if transport_is_private(&state.server_config.host, over_tls.is_some()) {
         Ok(())
     } else {
         Err(KeysError::Status(
             StatusCode::FORBIDDEN,
             "TLS_REQUIRED",
-            "key management carries passphrases; bind to loopback, or terminate TLS in front \
-             of veld and set VELD_TLS_ACK=true"
+            "key management carries passphrases; call over the TLS listener (VELD_TLS_PORT), \
+             bind the plain listener to loopback, or terminate TLS in front of veld and set \
+             VELD_TLS_ACK=true"
                 .into(),
         ))
     }
@@ -187,11 +194,12 @@ async fn keyring_op<T: serde::Serialize + Send + 'static>(
 /// Private transport, an Admin session, and step-up.
 fn gate(
     state: &AppState,
+    over_tls: &OverTls,
     caller: &UserRecord,
     session: &str,
     headers: &HeaderMap,
 ) -> Result<(), KeysError> {
-    require_private_transport(state)?;
+    require_private_transport(state, over_tls)?;
     require_admin_step_up(runtime(state)?, caller, session, headers)?;
     Ok(())
 }
@@ -206,10 +214,11 @@ fn respond(result: KeysResult) -> Response {
 /// `GET /api/user_auth/admin/keys/status` — what is enrolled where; nothing is unsealed.
 pub async fn status(
     State(state): State<AppState>,
+    over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
 ) -> Response {
     let result = async {
-        require_private_transport(&state)?;
+        require_private_transport(&state, &over_tls)?;
         runtime(&state)?;
         require_admin(&caller.0)?;
         let storage = state.base_path.clone();
@@ -235,13 +244,14 @@ pub struct InitBody {
 /// `POST /api/user_auth/admin/keys/init` — step-up. Create the keyring and the first kit.
 pub async fn init(
     State(state): State<AppState>,
+    over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<InitBody>,
 ) -> Response {
     let result = async {
-        gate(&state, &caller.0, &token.0, &headers)?;
+        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
         let rt = runtime(&state)?;
         let storage = state.base_path.clone();
         let passphrase = Zeroizing::new(body.passphrase);
@@ -272,13 +282,14 @@ pub struct IssueBody {
 /// shown once.
 pub async fn add_recovery_code(
     State(state): State<AppState>,
+    over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<IssueBody>,
 ) -> Response {
     let result = async {
-        gate(&state, &caller.0, &token.0, &headers)?;
+        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
         let rt = runtime(&state)?;
         let storage = state.base_path.clone();
         let unlock = Unlock::from_body(body.unlock)?;
@@ -308,13 +319,14 @@ pub struct RevokeBody {
 /// `POST /api/user_auth/admin/keys/revoke` — step-up.
 pub async fn revoke(
     State(state): State<AppState>,
+    over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<RevokeBody>,
 ) -> Response {
     let result = async {
-        gate(&state, &caller.0, &token.0, &headers)?;
+        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
         let rt = runtime(&state)?;
         let storage = state.base_path.clone();
         let unlock = Unlock::from_body(body.unlock)?;
@@ -344,13 +356,14 @@ pub struct RotatePassphraseBody {
 /// with whatever its environment holds: set the new passphrase there before restart.
 pub async fn rotate_passphrase(
     State(state): State<AppState>,
+    over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<RotatePassphraseBody>,
 ) -> Response {
     let result = async {
-        gate(&state, &caller.0, &token.0, &headers)?;
+        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
         let rt = runtime(&state)?;
         let storage = state.base_path.clone();
         let (old, new) = (Zeroizing::new(body.old), Zeroizing::new(body.new));
@@ -371,13 +384,14 @@ pub struct UnlockOnlyBody {
 /// `POST /api/user_auth/admin/keys/rotate_data_keys` — step-up.
 pub async fn rotate_data_keys(
     State(state): State<AppState>,
+    over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<UnlockOnlyBody>,
 ) -> Response {
     let result = async {
-        gate(&state, &caller.0, &token.0, &headers)?;
+        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
         let rt = runtime(&state)?;
         let storage = state.base_path.clone();
         let unlock = Unlock::from_body(body.unlock)?;
@@ -396,13 +410,14 @@ pub async fn rotate_data_keys(
 /// and device factor and issues a new kit.
 pub async fn rotate_master_keys(
     State(state): State<AppState>,
+    over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<InitBody>,
 ) -> Response {
     let result = async {
-        gate(&state, &caller.0, &token.0, &headers)?;
+        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
         let rt = runtime(&state)?;
         let storage = state.base_path.clone();
         let passphrase = Zeroizing::new(body.passphrase);
@@ -437,13 +452,14 @@ pub struct EnrolBody {
 /// `POST /api/user_auth/admin/keys/factors` — step-up. Enrol a device secret.
 pub async fn enrol_factor(
     State(state): State<AppState>,
+    over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<EnrolBody>,
 ) -> Response {
     let result = async {
-        gate(&state, &caller.0, &token.0, &headers)?;
+        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
         let rt = runtime(&state)?;
         if body.provider != PROVIDER_SECURE_ENCLAVE {
             return Err(KeysError::bad(
@@ -534,13 +550,14 @@ pub struct PasskeyStartBody {
 /// which creates the passkey and posts its PRF secret back.
 pub async fn passkey_start(
     State(state): State<AppState>,
+    over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<PasskeyStartBody>,
 ) -> Response {
     let result = async {
-        gate(&state, &caller.0, &token.0, &headers)?;
+        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
         let unlock = Unlock::from_body(body.unlock)?;
         let mut raw = [0u8; 24];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw);
@@ -715,4 +732,19 @@ pub async fn passkey_result(
         };
     }
     status.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transport_is_private;
+
+    #[test]
+    fn a_request_over_tls_is_private_whatever_the_plain_bind() {
+        assert!(transport_is_private("0.0.0.0", true));
+        assert!(transport_is_private("10.0.0.2", true));
+        assert!(transport_is_private("127.0.0.1", false));
+        if std::env::var_os("VELD_TLS_ACK").is_none() {
+            assert!(!transport_is_private("0.0.0.0", false));
+        }
+    }
 }
