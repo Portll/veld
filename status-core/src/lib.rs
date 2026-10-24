@@ -11,7 +11,7 @@ mod restart;
 mod snapshot;
 mod sse;
 
-pub use client::{StatusClient, StatusClientConfig};
+pub use client::{StatusClient, StatusClientConfig, ENV_CA_CERT};
 pub use discovery::{discover_instances, instances_dir, DiscoveredInstance, LaunchRecipe};
 pub use restart::{
     inspect_process, launch_recipes_path, load_launch_recipes, parse_env_file, restart_instance,
@@ -51,6 +51,8 @@ pub enum StatusError {
     Restart(String),
     #[error("launch recipes: {0}")]
     LaunchRecipes(String),
+    #[error("{}={path}: {reason}", ENV_CA_CERT)]
+    CaBundle { path: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, StatusError>;
