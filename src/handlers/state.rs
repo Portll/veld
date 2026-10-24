@@ -85,6 +85,26 @@ struct MultiUserMemoryManagerRotationHelper {
 #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 const CF_AUDIT: &str = "audit";
 
+/// Last audit timestamp handed out, in nanoseconds since the epoch.
+///
+/// The audit stores key a row by `user_id:timestamp_nanos`, so two events
+/// stamped in the same nanosecond overwrite each other. Concurrent writes for
+/// one user do land in the same nanosecond on a coarse clock, and so do
+/// back-to-back events on a frozen test clock. Every audit event therefore
+/// draws its timestamp from here: the wall clock when it has advanced, else
+/// one nanosecond past the previous stamp.
+static LAST_AUDIT_STAMP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn next_audit_stamp(now_nanos: i64, last: &std::sync::atomic::AtomicI64) -> i64 {
+    use std::sync::atomic::Ordering;
+    let mut stamp = now_nanos;
+    let _ = last.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+        stamp = now_nanos.max(prev.saturating_add(1));
+        Some(stamp)
+    });
+    stamp
+}
+
 impl From<&AuditEvent> for AuditLogEntry {
     fn from(event: &AuditEvent) -> Self {
         Self {
@@ -1170,8 +1190,13 @@ impl MultiUserMemoryManager {
 
     /// Log audit event (non-blocking with background persistence)
     pub fn log_event(&self, user_id: &str, event_type: &str, memory_id: &str, details: &str) {
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("audit event timestamp outside i64 nanos range, using 0");
+            0
+        });
+        let stamp = next_audit_stamp(now_nanos, &LAST_AUDIT_STAMP);
         let event = AuditEvent {
-            timestamp: chrono::Utc::now(),
+            timestamp: chrono::DateTime::from_timestamp_nanos(stamp),
             event_type: event_type.to_string(),
             memory_id: memory_id.to_string(),
             details: details.to_string(),
@@ -6310,6 +6335,41 @@ mod reconcile_restore_tests {
         assert!(
             !live(&manager).contains(&orphan),
             "nothing to restore from, so replay is made to agree with the store"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_stamp_tests {
+    use super::next_audit_stamp;
+    use std::sync::atomic::AtomicI64;
+
+    #[test]
+    fn audit_stamps_are_unique_on_a_frozen_clock() {
+        let last = AtomicI64::new(0);
+        let frozen = 1_700_000_000_000_000_000;
+        let stamps: Vec<i64> = (0..100).map(|_| next_audit_stamp(frozen, &last)).collect();
+        assert_eq!(stamps[0], frozen);
+        for pair in stamps.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "a frozen clock must still yield distinct keys"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_stamp_follows_the_clock_once_it_moves_past_the_last_stamp() {
+        let last = AtomicI64::new(0);
+        let t0 = 1_700_000_000_000_000_000;
+        next_audit_stamp(t0, &last);
+        next_audit_stamp(t0, &last);
+        assert_eq!(next_audit_stamp(t0 + 5_000, &last), t0 + 5_000);
+        assert_eq!(
+            next_audit_stamp(t0, &last),
+            t0 + 5_001,
+            "a clock that steps back never reuses a stamp"
         );
     }
 }
