@@ -2789,11 +2789,11 @@ pub const QUERY_COVERAGE_MIN_TERMS: usize = 2;
 /// band and cannot lift an irrelevant memory over a strong match.
 ///
 /// Off by default. Measured 2026-10-20 at 0.15 it moved nothing on LOCOMO-20 or the recall
-/// gate, because the rule-based `EntityExtractor` it reads labels a bare capitalised name
-/// ("Sarah", "Raj") as unknown or concept and marks it seen before its person rule can
-/// fire; only a title ("Dr", "Mrs") yields a Person. At 0 the layer is skipped, so
-/// who-questions do not pay for an extraction pass that finds no one. Raise it once person
-/// detection is fixed.
+/// gate, with the rule-based extractor and with neural NER alike, so the bound is too small
+/// to reorder the answers people questions miss, not short of person labels. (The
+/// extractor's labels were also wrong in both directions: every mid-sentence proper noun
+/// was a Person, `Redis` included, and a name opening a sentence was dropped;
+/// `EntityExtractor::has_person_cue` now decides.) At 0 the layer is skipped.
 pub const PEOPLE_BOOST_MAX: f32 = 0.0;
 
 /// Pseudo-relevance feedback: a second lexical pass whose query is the original plus terms
