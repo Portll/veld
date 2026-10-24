@@ -50,10 +50,13 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Stored memory: {} ({})",
-                resp.id, resp.message
-            ))])),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
+                if resp.stored {
+                    format!("Stored memory: {}", resp.id)
+                } else {
+                    format!("Memory already held as {}", resp.id)
+                },
+            )])),
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
                 message: Cow::from(e.to_string()),
@@ -172,12 +175,18 @@ impl VeldMcpServer {
             Ok(resp) => {
                 let mut output = format!("Found {} memories:\n\n", resp.memories.len());
                 for mem in resp.memories {
+                    let tier = if mem.tier.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {}", mem.tier)
+                    };
                     output.push_str(&format!(
-                        "**[{}]** {} (similarity: {:.0}%)\n{}\n\n",
-                        mem.memory_type,
+                        "**[{}]** {} (score: {:.0}%{})\n{}\n\n",
+                        mem.experience.memory_type.as_deref().unwrap_or("Memory"),
                         &mem.id[..8.min(mem.id.len())],
-                        mem.similarity * 100.0,
-                        mem.content
+                        mem.score * 100.0,
+                        tier,
+                        mem.experience.content
                     ));
                 }
                 Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -216,7 +225,7 @@ impl VeldMcpServer {
                 for mem in resp.memories {
                     output.push_str(&format!(
                         "- [{}%] **{}**: {}\n",
-                        (mem.relevance_score * 100.0) as u32,
+                        (mem.score * 100.0) as u32,
                         mem.memory_type,
                         mem.content.chars().take(200).collect::<String>()
                     ));
@@ -502,6 +511,7 @@ impl VeldMcpServer {
         &self,
         Parameters(params): Parameters<LineageConfirmParams>,
     ) -> Result<CallToolResult, McpError> {
+        let edge_id = params.edge_id.clone();
         let result: Result<LineageConfirmResponse> = self
             .client
             .post(
@@ -514,10 +524,13 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "✓ Confirmed edge: {} - {}",
-                resp.edge_id, resp.message
-            ))])),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
+                if resp.confirmed {
+                    format!("✓ Confirmed edge {edge_id}")
+                } else {
+                    format!("Edge {edge_id} was not an inferred edge awaiting confirmation")
+                },
+            )])),
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
                 message: Cow::from(e.to_string()),
@@ -533,6 +546,7 @@ impl VeldMcpServer {
         &self,
         Parameters(params): Parameters<LineageRejectParams>,
     ) -> Result<CallToolResult, McpError> {
+        let edge_id = params.edge_id.clone();
         let result: Result<LineageRejectResponse> = self
             .client
             .post(
@@ -545,10 +559,13 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "✗ Rejected edge: {}",
-                resp.message
-            ))])),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
+                if resp.rejected {
+                    format!("✗ Rejected edge {edge_id}")
+                } else {
+                    format!("Edge {edge_id} was not an inferred edge, nothing rejected")
+                },
+            )])),
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
                 message: Cow::from(e.to_string()),
@@ -579,8 +596,8 @@ impl VeldMcpServer {
 
         match result {
             Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "⚡ Created link: {} - {}",
-                resp.edge_id, resp.message
+                "⚡ Created link {}: {} --[{}]--> {}",
+                resp.id, resp.from, resp.relation, resp.to
             ))])),
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
