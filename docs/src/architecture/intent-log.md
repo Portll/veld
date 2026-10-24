@@ -66,8 +66,30 @@ puts back the archive's segments and removes the live ones sealed after the
 backup. A point-in-time restore into a sealed segment copies it before cutting
 it, so the archive's link keeps every frame.
 
-A log that has rotated needs a build that reads segments. Nothing removes old
-segments yet: the log's total size still grows with every write.
+A log that has rotated needs a build that reads segments. Segments are kept:
+the log's total size grows with every write.
+
+## Erasing forgotten memories
+
+A hard forget journals a `Forget` frame, and every earlier frame of that memory
+stays in the log. With `VELD_JOURNAL_FORGET_PURGE_DAYS` (config.toml
+`journal_forget_purge_days`; 0, the default, never erases), the heavy maintenance
+cycle (every six hours, for each tenant the server has open) rewrites each sealed segment last written at least that many days ago
+without the frames of the memories forgotten in them, the `Forget` included.
+Replay from the first frame still reaches the same live state, and the memory's
+content leaves the live journal. A memory created again under the same id keeps
+its later frames. The head is never rewritten.
+
+A rewritten segment carries a `sparse` header flag, because its LSNs now skip
+numbers, and keeps the old file's modification time. It replaces the old file
+by rename, so a backup's hard link keeps the frames it captured until that
+backup is purged. A legacy segment without a header is left as it is, and so
+is a sealed journal whose key the server does not hold. A point-in-time
+restore to an erased LSN cuts after the last frame below it.
+
+The window must be longer than any replication follower can fall behind: a
+follower that applied a memory but had not yet read its `Forget` never sees
+that `Forget` once it is erased, and keeps the memory.
 
 ## Payload shape
 

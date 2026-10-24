@@ -110,6 +110,7 @@ pub mod journal;
 pub mod migrations;
 pub mod payload;
 pub mod projection;
+pub mod purge;
 pub mod reseal;
 pub use checkpoint_store::{CheckpointStore, CheckpointStoreError};
 pub use header::{HeaderError, IntentLogHeader, CURRENT_FORMAT_VERSION, HEADER_BYTES, MAGIC};
@@ -1241,6 +1242,7 @@ impl IntentLog {
         let first = files.pop_front().expect("the head is always listed");
         let start = offset.unwrap_or(first.frame_start);
         let mut iter = IntentLogIter::from_file(first.file, start, self.cryptor.clone())?;
+        iter.sparse = first.sparse;
         iter.rest = files;
         Ok(iter)
     }
@@ -1361,7 +1363,12 @@ impl IntentLog {
     /// - Returns [`IntentLogError::Io`] (NotFound) if `max_lsn` is greater
     ///   than every LSN actually present in the file.
     pub fn truncate_to_lsn(&mut self, max_lsn: Lsn) -> Result<u64, IntentLogError> {
-        if let Some(at) = self.sealed_holding(max_lsn) {
+        if let Some(mut at) = self.sealed_holding(max_lsn) {
+            // A segment frames were purged from may hold none at or below
+            // `max_lsn`; the cut then falls in the one before it.
+            while at > 0 && !first_frame_at_or_below(&self.sealed[at], max_lsn)? {
+                at -= 1;
+            }
             self.reopen_at_segment(at)?;
         }
         // Flush any buffered append so the on-disk image is what we scan.
@@ -1371,14 +1378,22 @@ impl IntentLog {
         // dropped before we attempt the truncate. Windows refuses
         // `set_len` while another read handle is open against the same
         // file, even though POSIX is happy with it.
+        // A file frames were purged from may lack `max_lsn` itself; the cut
+        // then falls after the last frame below it.
+        let sparse = is_sparse(&self.path)?;
         let (last_good_offset, last_frame) = {
             let mut iter = IntentLogIter::open_for_scan(&self.path)?;
             let mut found: Option<(u64, FramePosition)> = None;
             let mut highest_seen: Option<Lsn> = None;
+            let mut below: Option<(u64, FramePosition)> = None;
             while let Some(frame) = iter.read_frame()? {
                 highest_seen = Some(frame.lsn);
                 if frame.lsn == max_lsn {
                     found = Some((iter.current_offset(), frame.position()));
+                    break;
+                }
+                if frame.lsn.0 > max_lsn.0 && sparse && below.is_some() {
+                    found = below;
                     break;
                 }
                 if frame.lsn.0 > max_lsn.0 {
@@ -1393,8 +1408,9 @@ impl IntentLog {
                         ),
                     )));
                 }
+                below = Some((iter.current_offset(), frame.position()));
             }
-            match found {
+            match found.or(below.filter(|_| sparse)) {
                 Some(found) => found,
                 None => {
                     return Err(IntentLogError::Io(io::Error::new(
@@ -1517,6 +1533,11 @@ pub struct IntentLogIter {
     /// The current file was entered from the previous one and its first
     /// frame has not been read yet.
     entered: Option<PathBuf>,
+    /// Frames were purged from the current file.
+    sparse: bool,
+    /// The step into the current file may skip LSNs: it or the file before
+    /// it is sparse.
+    gaps_allowed: bool,
 }
 
 /// A log file an [`IntentLogIter`] reads after the current one.
@@ -1524,6 +1545,7 @@ struct NextFile {
     path: PathBuf,
     file: File,
     frame_start: u64,
+    sparse: bool,
 }
 
 impl NextFile {
@@ -1532,8 +1554,27 @@ impl NextFile {
             path: path.to_path_buf(),
             file: File::open(path)?,
             frame_start,
+            sparse: is_sparse(path)?,
         })
     }
+}
+
+/// Whether `segment`'s first frame is at or below `lsn`; false for a segment
+/// purging left without frames.
+fn first_frame_at_or_below(segment: &Segment, lsn: Lsn) -> Result<bool, IntentLogError> {
+    let mut frames = IntentLogIter::open(&segment.path, segment.frame_start, None)?;
+    Ok(frames.read_frame()?.is_some_and(|first| first.lsn <= lsn))
+}
+
+/// Whether frames were purged from the log file at `path` (its header's
+/// [`header::FLAG_SPARSE`]); false for a legacy or header-less file.
+fn is_sparse(path: &Path) -> Result<bool, IntentLogError> {
+    let mut buf = [0u8; HEADER_BYTES];
+    let mut file = File::open(path)?;
+    if read_full(&mut file, &mut buf)? < HEADER_BYTES || &buf[..8] != MAGIC {
+        return Ok(false);
+    }
+    Ok(IntentLogHeader::parse(&buf)?.is_sparse())
 }
 
 impl IntentLogIter {
@@ -1575,6 +1616,8 @@ impl IntentLogIter {
             rest: VecDeque::new(),
             last_lsn: None,
             entered: None,
+            sparse: false,
+            gaps_allowed: false,
         })
     }
 
@@ -1584,10 +1627,13 @@ impl IntentLogIter {
             path,
             mut file,
             frame_start,
+            sparse,
         }) = self.rest.pop_front()
         else {
             return Ok(false);
         };
+        self.gaps_allowed = self.sparse || sparse;
+        self.sparse = sparse;
         file.seek(SeekFrom::Start(frame_start))?;
         self.reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
         self.offset = frame_start;
@@ -1623,7 +1669,12 @@ impl IntentLogIter {
                 Some(frame) => {
                     if let Some(path) = self.entered.take() {
                         let expected = self.last_lsn.map_or(frame.lsn, Lsn::next);
-                        if frame.lsn != expected {
+                        let follows = if self.gaps_allowed {
+                            frame.lsn >= expected
+                        } else {
+                            frame.lsn == expected
+                        };
+                        if !follows {
                             return Err(IntentLogError::SegmentGap {
                                 path,
                                 expected: expected.0,

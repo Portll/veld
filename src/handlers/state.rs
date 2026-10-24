@@ -164,6 +164,11 @@ impl MultiUserMemoryManagerRotationHelper {
     }
 }
 
+/// One journal purge of forgotten memories per tenant at a time.
+static JOURNAL_PURGE_LOCKS: std::sync::LazyLock<
+    dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
 /// Multi-user Veld manager for the server runtime.
 pub struct MultiUserMemoryManager {
     /// Per-user UserMemory handles with LRU eviction.
@@ -3100,6 +3105,50 @@ impl MultiUserMemoryManager {
     }
 
     /// Run maintenance on all cached user memories
+    /// Erase from `user_id`'s sealed journal segments the frames of memories
+    /// forgotten more than `min_age` ago (see [`crate::intent_log::purge`]). One
+    /// pass per tenant at a time; best effort, a failure is logged.
+    fn purge_forgotten_journal(&self, user_id: &str, min_age: std::time::Duration) {
+        let lock = JOURNAL_PURGE_LOCKS
+            .entry(user_id.to_string())
+            .or_default()
+            .clone();
+        let Ok(_purging) = lock.try_lock() else {
+            return;
+        };
+        let Ok(log) = self.user_dir(user_id).map(|dir| dir.join("intent.log")) else {
+            return;
+        };
+        if !log.is_file() {
+            return;
+        }
+        let outcome = self
+            .purpose_cryptor(user_id, "journal")
+            .and_then(|cryptor| {
+                crate::intent_log::purge::purge_forgotten(
+                    &log,
+                    cryptor.as_ref(),
+                    min_age,
+                    std::time::SystemTime::now(),
+                )
+                .map_err(anyhow::Error::from)
+            });
+        match outcome {
+            Ok(report) if report.frames_dropped > 0 => tracing::info!(
+                user_id,
+                memories = report.memories_purged,
+                frames = report.frames_dropped,
+                segments = report.segments_rewritten,
+                bytes = report.bytes_reclaimed,
+                "erased the journal frames of forgotten memories",
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(user_id, error = %e, "journal purge of forgotten memories failed")
+            }
+        }
+    }
+
     pub fn run_maintenance_all_users(&self) -> usize {
         let cycle = self
             .maintenance_cycle
@@ -3436,6 +3485,17 @@ impl MultiUserMemoryManager {
                         );
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // Heavy cycle: erase from sealed journal segments the frames of memories
+        // forgotten longer ago than the configured window. Off unless
+        // VELD_JOURNAL_FORGET_PURGE_DAYS is set.
+        if is_heavy {
+            if let Some(min_age) = self.server_config.journal_forget_purge_age() {
+                for (user_id_arc, _) in self.user_memories.iter() {
+                    self.purge_forgotten_journal(user_id_arc.as_ref(), min_age);
                 }
             }
         }
