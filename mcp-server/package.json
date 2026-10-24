@@ -31,7 +31,7 @@
   "dependencies": {},
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.24.0",
-    "@types/node": "^25.9.1",
+    "@types/node": "^26.6.5",
     "@vitest/coverage-v8": "^5.0.4",
     "vitest": "^4.1.11"
   },
