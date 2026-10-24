@@ -289,12 +289,12 @@ pub(crate) struct Todo {
     pub project: Option<String>,
 }
 
-/// `POST /api/remember` answers the id and whether the write stored a new record.
+/// `POST /api/remember` answers `{ id, success }` (src/handlers/remember.rs).
 #[derive(Deserialize)]
 pub(crate) struct RememberResponse {
     pub id: String,
     #[serde(default)]
-    pub stored: bool,
+    pub success: bool,
 }
 
 #[derive(Deserialize)]
