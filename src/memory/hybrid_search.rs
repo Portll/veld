@@ -1121,17 +1121,37 @@ impl CrossEncoderReranker {
     /// `None`, the document content is embedded on the fly.
     ///
     /// Uses 70/30 cross-encoder/bi-encoder blend when cross-encoder is available,
-    /// falls back to pure bi-encoder cosine similarity otherwise.
+    /// falls back to pure bi-encoder cosine similarity otherwise, or returns `None`
+    /// instead of falling back when `allow_bi_encoder_only` is false.
     pub fn rerank(
         &self,
         query: &str,
         candidates: Vec<(MemoryId, String, f32, Option<Vec<f32>>)>,
-    ) -> Result<Vec<(MemoryId, f32)>> {
+        allow_bi_encoder_only: bool,
+    ) -> Result<Option<Vec<(MemoryId, f32)>>> {
         if candidates.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
 
-        // Always compute bi-encoder scores (fast, used for blending or fallback).
+        // The model is read once per call so a dial turned mid-query scores every candidate of
+        // this query with one model.
+        let cross_encoder = self.model();
+        let ce_scores = if cross_encoder.is_available() {
+            let doc_texts: Vec<&str> = candidates.iter().map(|(_, c, _, _)| c.as_str()).collect();
+            match cross_encoder.score_pairs(query, &doc_texts) {
+                Ok(scores) => Some(scores),
+                Err(e) => {
+                    tracing::debug!("Cross-encoder inference failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if ce_scores.is_none() && !allow_bi_encoder_only {
+            return Ok(None);
+        }
+
         // Query side uses encode_for_query so asymmetric models apply the query prefix.
         let query_embedding = self.embedder.encode_for_query(query)?;
         let query_dim = query_embedding.len();
@@ -1147,36 +1167,17 @@ impl CrossEncoderReranker {
             bi_scores.push(bi);
         }
 
-        // Try cross-encoder for blended scoring. The model is read once per call so a dial
-        // turned mid-query scores every candidate of this query with one model.
-        let cross_encoder = self.model();
-        let use_cross_encoder = cross_encoder.is_available();
-        let blended_scores = if use_cross_encoder {
-            let doc_texts: Vec<&str> = candidates.iter().map(|(_, c, _, _)| c.as_str()).collect();
-            match cross_encoder.score_pairs(query, &doc_texts) {
-                Ok(ce_scores) => {
+        let blended_scores: Vec<f32> = match ce_scores {
+            Some(ce_scores) => bi_scores
+                .iter()
+                .zip(ce_scores)
+                .map(|(&bi, ce)| {
                     // Normalize cross-encoder logits to [0,1] via sigmoid
-                    let ce_normalized: Vec<f32> = ce_scores
-                        .iter()
-                        .map(|&s| 1.0 / (1.0 + (-s).exp()))
-                        .collect();
-
-                    // Blend: 70% cross-encoder + 30% bi-encoder
-                    bi_scores
-                        .iter()
-                        .zip(ce_normalized.iter())
-                        .map(|(&bi, &ce)| {
-                            BI_ENCODER_BLEND_WEIGHT * bi + CROSS_ENCODER_BLEND_WEIGHT * ce
-                        })
-                        .collect()
-                }
-                Err(e) => {
-                    tracing::debug!("Cross-encoder inference failed, using bi-encoder: {e}");
-                    bi_scores.clone()
-                }
-            }
-        } else {
-            bi_scores.clone()
+                    let ce = 1.0 / (1.0 + (-ce).exp());
+                    BI_ENCODER_BLEND_WEIGHT * bi + CROSS_ENCODER_BLEND_WEIGHT * ce
+                })
+                .collect(),
+            None => bi_scores,
         };
 
         let mut results: Vec<(MemoryId, f32)> = candidates
@@ -1186,7 +1187,7 @@ impl CrossEncoderReranker {
             .collect();
 
         results.sort_by(|a, b| b.1.total_cmp(&a.1));
-        Ok(results)
+        Ok(Some(results))
     }
 }
 
@@ -1822,7 +1823,7 @@ impl HybridSearchEngine {
                     .collect();
 
                 if !to_rerank.is_empty() {
-                    let reranked = reranker.rerank(query, to_rerank)?;
+                    let reranked = reranker.rerank(query, to_rerank, true)?.unwrap_or_default();
 
                     // Build rerank map with cosine similarities (range [-1, 1])
                     let rerank_map: HashMap<MemoryId, f32> = reranked.into_iter().collect();
@@ -1960,6 +1961,83 @@ impl HybridSearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LengthEmbedder;
+
+    impl Embedder for LengthEmbedder {
+        fn id(&self) -> &str {
+            "length"
+        }
+        fn encode(&self, text: &str) -> Result<Vec<f32>> {
+            let seed = text.len() as f32;
+            Ok((0..8).map(|i| ((seed + i as f32) * 0.1).sin()).collect())
+        }
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
+
+    enum StubCrossEncoder {
+        Unavailable,
+        Failing,
+        Prefers(&'static str),
+    }
+
+    impl crate::embeddings::cross_encoder::CrossEncoderModel for StubCrossEncoder {
+        fn id(&self) -> &str {
+            "stub"
+        }
+        fn is_available(&self) -> bool {
+            !matches!(self, StubCrossEncoder::Unavailable)
+        }
+        fn score_pairs(&self, _query: &str, documents: &[&str]) -> Result<Vec<f32>> {
+            match self {
+                StubCrossEncoder::Prefers(word) => Ok(documents
+                    .iter()
+                    .map(|d| if d.contains(word) { 8.0 } else { -8.0 })
+                    .collect()),
+                _ => anyhow::bail!("no model"),
+            }
+        }
+    }
+
+    fn candidates() -> Vec<(MemoryId, String, f32, Option<Vec<f32>>)> {
+        [
+            "server.mjs was renamed",
+            "moved the auth check ahead of dispatch",
+        ]
+        .into_iter()
+        .map(|c| (MemoryId(uuid::Uuid::new_v4()), c.to_string(), 0.5, None))
+        .collect()
+    }
+
+    fn reranker(ce: StubCrossEncoder) -> CrossEncoderReranker {
+        CrossEncoderReranker::with_cross_encoder(Arc::new(LengthEmbedder), Arc::new(ce))
+    }
+
+    #[test]
+    fn without_a_cross_encoder_bi_encoder_scores_come_back_only_when_allowed() {
+        for ce in [StubCrossEncoder::Unavailable, StubCrossEncoder::Failing] {
+            let reranker = reranker(ce);
+            assert!(reranker.rerank("q", candidates(), false).unwrap().is_none());
+            let scored = reranker.rerank("q", candidates(), true).unwrap();
+            assert_eq!(scored.map(|s| s.len()), Some(2));
+        }
+    }
+
+    #[test]
+    fn a_cross_encoder_orders_the_candidates_whether_or_not_a_fallback_is_allowed() {
+        for allow_bi_encoder_only in [false, true] {
+            let cands = candidates();
+            let auth = cands[1].0.clone();
+            let scored = reranker(StubCrossEncoder::Prefers("auth"))
+                .rerank("q", cands, allow_bi_encoder_only)
+                .unwrap()
+                .expect("scores");
+            assert_eq!(scored.len(), 2);
+            assert_eq!(scored[0].0, auth);
+        }
+    }
 
     /// An encrypted tenant's index never reaches disk, and an index left there from
     /// before encryption is removed rather than reopened.

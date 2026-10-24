@@ -3389,11 +3389,22 @@ impl super::MemorySystem {
                 // entity signal before it. When the query names an identifier the memory
                 // carries as an entity, that entity is put in front of the text the
                 // cross-encoder reads. Nothing changes for a query with no identifier in it.
+                //
+                // Without a cross-encoder only dense similarity is left, and it cannot tell
+                // `serve.mjs` from `server.mjs`. A query that names a path some candidate
+                // declared keeps its fused order, which already carries the identifier boost.
+                // Hyphenated words ("dairy-free") are identifiers above but not paths here: the
+                // dense fallback ranks them better than fusion does.
+                let mut declared_path_named = false;
                 let query_identifiers: Vec<String> = query_text
                     .split_whitespace()
                     .map(clean_query_token)
                     .map(|t| t.to_lowercase())
                     .filter(|t| is_structured_token(t))
+                    .collect();
+                let query_paths: Vec<&String> = query_identifiers
+                    .iter()
+                    .filter(|t| is_path_shaped_token(t))
                     .collect();
                 let candidates: Vec<(MemoryId, String, f32, Option<Vec<f32>>)> = memories
                     .iter()
@@ -3414,6 +3425,12 @@ impl super::MemorySystem {
                                 .map(String::as_str)
                                 .collect()
                         };
+                        declared_path_named |= named.iter().any(|e| {
+                            let e = e.to_lowercase();
+                            query_paths
+                                .iter()
+                                .any(|q| query_token_matches_entity(q, &e))
+                        });
                         let text = if named.is_empty() {
                             m.experience.content.clone()
                         } else {
@@ -3428,8 +3445,13 @@ impl super::MemorySystem {
                     })
                     .collect();
 
-                match reranker.rerank(query_text, candidates) {
-                    Ok(reranked) => {
+                match reranker.rerank(query_text, candidates, !declared_path_named) {
+                    Ok(None) => {
+                        tracing::debug!(
+                            "Layer 5.3: no cross-encoder for a declared path, keeping the fused order"
+                        );
+                    }
+                    Ok(Some(reranked)) => {
                         // Build score lookup from cross-encoder results
                         let ce_scores: std::collections::HashMap<MemoryId, f32> =
                             reranked.into_iter().collect();
@@ -5762,6 +5784,11 @@ pub(crate) fn clean_query_token(word: &str) -> String {
         .to_string()
 }
 
+/// A token that could name a file: `serve.mjs`, `admin/serve.mjs`.
+pub(crate) fn is_path_shaped_token(token: &str) -> bool {
+    token.contains('.') || token.contains('/')
+}
+
 /// A token carrying interior [`QUERY_TOKEN_KEEP`] punctuation is an identifier, not a word.
 pub(crate) fn is_structured_token(token: &str) -> bool {
     token.chars().any(|c| QUERY_TOKEN_KEEP.contains(&c))
@@ -6148,7 +6175,7 @@ pub(crate) fn resolve_query_entities(
     // path-shaped word, at most FILE_PATH_SUFFIX_MAX_CANDIDATES entity reads each.
     for word in query_text.split_whitespace() {
         let token = clean_query_token(word);
-        if !token.contains('.') && !token.contains('/') {
+        if !is_path_shaped_token(&token) {
             continue;
         }
         if let Ok(found) = graph.find_file_paths_by_suffix(&token) {
