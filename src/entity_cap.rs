@@ -115,6 +115,41 @@ pub fn cap_by_selectivity(
     (out, report)
 }
 
+/// Whether a derived tag can name something: two characters, a letter among them, and none of
+/// the characters that mark a code fragment, a metric label or a number list. On the live store
+/// (2026-10-24) `veld_recall_stage_duration_seconds{stage="post`, `6.8(f` and `2,041` were all
+/// tags. A commit hash, a version such as `v0.8.4` and `R@10` pass; a bare date or a line range
+/// does not, and dates already live in `temporal_refs`.
+pub fn derived_tag_is_well_formed(tag: &str) -> bool {
+    tag.chars().count() >= 2
+        && tag.chars().any(char::is_alphabetic)
+        && !tag
+            .chars()
+            .any(|c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | '"' | ',' | ';' | '='))
+}
+
+/// Keep the authored head as it is and drop the malformed derived entries. Returns the list and
+/// the number dropped. Authored tags are never judged: the writer chose them.
+pub fn well_formed_derived(entities: Vec<String>, authored: usize) -> (Vec<String>, usize) {
+    let authored = authored.min(entities.len());
+    let before = entities.len();
+    let mut kept: Vec<String> = entities[..authored].to_vec();
+    kept.extend(
+        entities[authored..]
+            .iter()
+            .filter(|t| derived_tag_is_well_formed(t))
+            .cloned(),
+    );
+    let malformed = before - kept.len();
+    (kept, malformed)
+}
+
+/// The list length at which the derived tail is capped: the authored count plus the derived
+/// budget, never above the record-wide maximum.
+pub fn derived_cap(authored: usize, budget: usize, max_total: usize) -> usize {
+    authored.saturating_add(budget).min(max_total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +261,78 @@ mod tests {
             "an authored count larger than the cap cannot overflow it"
         );
         assert_eq!(rep.authored, 2);
+    }
+
+    #[test]
+    fn a_derived_tag_needs_a_letter_and_no_code_punctuation() {
+        for ok in [
+            "5d61fd90",
+            "fusion_features",
+            "docs/src/reference/metrics",
+            "veld-7d",
+            "v0.8.4",
+            "R@10",
+            "408s",
+        ] {
+            assert!(derived_tag_is_well_formed(ok), "{ok} should pass");
+        }
+        for bad in [
+            "2,041",
+            "6.8(f",
+            "veld_recall_stage_duration_seconds{stage=\"post",
+            "15-159",
+            "2026-10-19",
+            "40053469645",
+            "a",
+            "[x]",
+        ] {
+            assert!(!derived_tag_is_well_formed(bad), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn malformed_derived_entries_go_and_authored_ones_stay_whatever_they_look_like() {
+        let input = v(&[
+            "2026-10-19",
+            "kind:task",
+            "fusion_features",
+            "2,041",
+            "6.8(f",
+            "veld-7d",
+        ]);
+        let (out, malformed) = well_formed_derived(input, 2);
+        assert_eq!(
+            out,
+            v(&["2026-10-19", "kind:task", "fusion_features", "veld-7d"])
+        );
+        assert_eq!(malformed, 2);
+    }
+
+    #[test]
+    fn the_derived_cap_is_authored_plus_budget_under_the_record_maximum() {
+        assert_eq!(derived_cap(9, 12, 50), 21);
+        assert_eq!(derived_cap(45, 12, 50), 50);
+        assert_eq!(derived_cap(0, 12, 50), 12);
+    }
+
+    #[test]
+    fn budget_and_selectivity_keep_the_rarest_dozen_after_the_authored_head() {
+        let mut input = v(&["project:veld", "kind:task"]);
+        let derived: Vec<String> = (0..30).map(|i| format!("derived{i}")).collect();
+        input.extend(derived.clone());
+        let mentions: HashMap<String, usize> = derived
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.clone(), 100 - i))
+            .collect();
+        let cap = derived_cap(2, 12, 50);
+        let (out, rep) = cap_by_selectivity(input, 2, cap, &mentions);
+        assert_eq!(out.len(), 14);
+        assert_eq!(&out[..2], &v(&["project:veld", "kind:task"])[..]);
+        assert_eq!(
+            out[2], "derived29",
+            "the least-mentioned derived entry leads the tail"
+        );
+        assert_eq!(rep.dropped, 18);
     }
 }
