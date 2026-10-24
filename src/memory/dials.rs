@@ -984,6 +984,7 @@ mod tests {
             "query_coverage",
             "people_density",
             "prf",
+            "duplicate_derank",
         ];
         for id in &all_ids {
             assert!(
