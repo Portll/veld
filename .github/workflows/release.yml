@@ -86,10 +86,10 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-
 
+      # Prebuilt release binaries; `cargo install` compiled all three from source on every runner.
+      - uses: cargo-bins/cargo-binstall@main
       - name: Install mdBook (for embedded-docs feature)
-        run: |
-          cargo install --locked mdbook --version "^0.4"
-          cargo install --locked mdbook-mermaid mdbook-toc
+        run: cargo binstall -y --locked mdbook@0.4 mdbook-mermaid mdbook-toc
 
       - name: Build the docs sidecar (input to embedded-docs)
         # `--features embedded-docs` embeds docs/book/ into the veld binary

@@ -224,6 +224,7 @@ Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (be
   Run tests through [scripts/test-local.sh](scripts/test-local.sh), not bare `cargo test`. It runs them niced with `RUST_TEST_THREADS=4` and a private target dir. It gives them a throwaway `HOME`, sharing only the model cache, and strips every inherited `VELD_*`/`SHODH_*` variable, so a test that forgets its own storage path cannot reach a live tenant. Tier 2 holds a machine-wide lock: full matrices run side by side pushed the load to 37 on 2026-10-21 and made tests flake. Tier 2 skips only the tests listed in [scripts/test-local.known-red](scripts/test-local.known-red), each with an owner and a task.
 - **Push gate**: a push to `main`, a `v*` tag or a PR branch needs a green tier 2 for the pushed commit. GitHub CI stays the authority for what is on origin.
 - **On macOS**, prefix Cargo calls with `./scripts/cargo-dev.sh` so libclang/RocksDB build path picks up the env shim.
+- **Local install builds** use `cargo build --profile local --bin veld` in a private `CARGO_TARGET_DIR` (no LTO, incremental codegen); `--release` (fat LTO, one unit) is for tagged releases. The Python cdylib is the `veld-py` crate, built only by maturin; `build.rs` reruns only when git HEAD moves, so a no-change rebuild is a no-op.
 - **Per-user locking**: any new write handler that mutates shared per-user state should follow the `CONSOLIDATION_LOCKS` pattern in [src/handlers/consolidation.rs](src/handlers/consolidation.rs):
 
   ```rust
