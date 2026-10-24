@@ -75,7 +75,9 @@ The same settings are `tls_cert`, `tls_key`, `tls_port`, `tls_host` and `tls_cli
   listener runs, `SIGHUP` no longer stops the process. The client CA is read at start only.
 - **Handshakes** run off the accept loop, at most 256 at a time, each with a 10-second
   limit, so a client that connects and stays silent does not hold up others.
-- **Protocols:** TLS 1.2 and 1.3, ALPN `h2` and `http/1.1`.
+- **Protocols:** TLS 1.2 and 1.3, ALPN `http/1.1` only. A client that offers `h2` gets
+  HTTP/1.1, so WebSocket upgrades, the `?api_key=` WebSocket fallback and passkey sign-in,
+  which reads the `Host` header, work as on the plain listener.
 - **Rate limiting** stays on when the TLS listener binds anything other than loopback, even
   with the plain listener on `127.0.0.1`.
 - **Key management:** a request that arrives over the TLS listener counts as private

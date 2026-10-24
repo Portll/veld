@@ -112,7 +112,9 @@ fn server_config(
         }
     };
     let mut config = builder.with_cert_resolver(certs);
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // Not h2: browser WebSockets over h2 need RFC 8441, and both the `?api_key=`
+    // WebSocket fallback and passkey `relying_party()` read HTTP/1.1's `Host` header.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 

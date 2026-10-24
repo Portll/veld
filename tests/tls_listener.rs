@@ -1,6 +1,6 @@
-//! The native TLS listener (`src/tls.rs`), served in-process on port 0: https and h2,
-//! client certificates, certificate reload, handshakes off the accept loop, and the
-//! refusals at load. Certificates are minted per test with rcgen.
+//! The native TLS listener (`src/tls.rs`), served in-process on port 0: https over
+//! HTTP/1.1, client certificates, certificate reload, handshakes off the accept loop,
+//! and the refusals at load. Certificates are minted per test with rcgen.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -228,7 +228,7 @@ async fn the_plain_listener_does_not_mark_requests_tls() {
 }
 
 #[tokio::test]
-async fn alpn_offers_h2_and_the_server_speaks_it() {
+async fn alpn_negotiates_http1_even_when_the_client_offers_h2_first() {
     let dir = TempDir::new().unwrap();
     let ca = Ca::new("veld test CA");
     let leaf = ca.server_leaf(1);
@@ -249,7 +249,7 @@ async fn alpn_offers_h2_and_the_server_speaks_it() {
     .unwrap()
     .with_root_certificates(roots)
     .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec()];
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let tcp = tokio::net::TcpStream::connect(served.addr).await.unwrap();
     let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(
@@ -258,20 +258,19 @@ async fn alpn_offers_h2_and_the_server_speaks_it() {
         )
         .await
         .unwrap();
-    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
 
-    // The client preface and an empty SETTINGS frame; an h2 server answers with SETTINGS.
-    tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+    tls.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
-    let mut header = [0u8; 9];
-    tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut header))
+    let mut reply = Vec::new();
+    // What was read stays in `reply` whether the close carries close_notify or not.
+    let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut reply))
         .await
-        .expect("the server answers the preface")
-        .unwrap();
-    assert_eq!(header[3], 0x04, "the first frame is SETTINGS: {header:?}");
-    // An open h2 connection holds graceful shutdown for a ping this client never answers.
-    drop(tls);
+        .expect("the server answers and closes");
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(reply.ends_with("tls 127.0.0.1"), "{reply}");
     served.stop().await;
 }
 

@@ -171,7 +171,7 @@ tokio = { version = "1.48", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }  # SSE event streaming (sync for BroadcastStream)
 tokio-util = { version = "0.7", features = ["rt"] }  # TaskTracker: shutdown waits for background writes
 futures = "0.3"  # Stream utilities for SSE
-axum = { version = "0.8", features = ["json", "ws", "http2"] }  # http2: the TLS listener offers h2 by ALPN
+axum = { version = "0.8", features = ["json", "ws"] }
 tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "timeout"] }
 
