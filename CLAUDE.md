@@ -313,6 +313,8 @@ Tags are the cheap "what kind of thing" signal (scoring signal 15). Keep them sh
 
 A memory typically carries one domain + one kind tag (`["storage", "decision"]`); add more only if you'll search by them.
 
+Veld adds derived tags of its own (NER, YAKE, ingest hints, cold-start extraction) and keeps at most `DERIVED_TAG_BUDGET` (12, env `VELD_DERIVED_TAG_BUDGET`) of them per record, the rarest by graph mention count, after dropping any without a letter or carrying code punctuation ([src/entity_cap.rs](src/entity_cap.rs)). Authored tags are never counted against that budget; the record-wide limit stays 50.
+
 ### Citation format
 
 Reference code locations as `[path/to/file.rs:42](src/path/to/file.rs#L42)`. Reference decisions as `[0001-redb-migration.md](docs/src/decisions/0001-redb-migration.md)`. Reference HTTP routes as `` `POST /api/remember` `` (backticks, full path). The wiki-render layer (LLM-Wiki Phase 3) consumes this format directly; sticking to it now means no migration cost later.

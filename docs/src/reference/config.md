@@ -36,6 +36,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_CORS_WARN` | — | `src/config.rs` |
 | `VELD_CROSS_ENCODER` | — | `src/embeddings/cross_encoder.rs` |
 | `VELD_CROSS_ENCODERS` | — | `src/embeddings/cross_encoder.rs` |
+| `VELD_DERIVED_TAG_BUDGET` | — | `src/config.rs` |
 | `VELD_DEV_API_KEY` | — | `src/auth.rs` |
 | `VELD_DIALS_DISABLE_SIGNALS` | — | `src/memory/dials.rs` |
 | `VELD_DOCS_DIR` | — | `src/handlers/docs.rs` |

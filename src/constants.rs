@@ -770,6 +770,16 @@ pub const ENTITY_COLD_START_THRESHOLD: usize = 50;
 /// Multiplier that doubles YAKE keyword budget during cold start
 pub const ENTITY_COLD_START_YAKE_BOOST: f32 = 0.5;
 
+/// Derived tags a write may keep: NER, YAKE, ingest hints and cold-start extraction together.
+///
+/// Measured 2026-10-24 on the live portll tenant over its 300 newest records: the writer authored
+/// about nine tags, the median record carried 31, and 107 of the 300 sat at the 50-entity cap.
+/// The surplus was derived from technical text (commit hashes, counters, metric labels, line
+/// ranges), and every one became a BM25 token and a graph entity: 117k entities on 17k memories.
+/// Twelve keeps the rarest dozen by selectivity (`crate::entity_cap`); the writer's own tags are
+/// never counted against it.
+pub const DERIVED_TAG_BUDGET: usize = 12;
+
 // =============================================================================
 // DEFAULT CONFIGURATION VALUES
 // =============================================================================
