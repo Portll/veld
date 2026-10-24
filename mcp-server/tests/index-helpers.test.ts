@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  autoStreamText,
   buildProgressBar,
   extractStringContextFromArgs,
   formatResetTokenSessionText,
@@ -111,5 +112,40 @@ describe("extractStringContextFromArgs", () => {
   it("returns empty string for non-object args", () => {
     expect(extractStringContextFromArgs(null)).toBe("");
     expect(extractStringContextFromArgs("text")).toBe("");
+  });
+});
+
+describe("autoStreamText", () => {
+  const question = "why was the launchd restart changed to kickstart instead of relaunch";
+
+  it("never streams a query, whatever the tool", () => {
+    for (const tool of ["recall", "quick_recall", "query", "topic", "what_i_know", "list_todos"]) {
+      expect(autoStreamText(tool, { query: question })).toBeNull();
+    }
+  });
+
+  it("prefers nothing over a query even when content is also present", () => {
+    expect(autoStreamText("list_todos", { query: question, context: question })).toBeNull();
+  });
+
+  it("streams content and context from tools that carry conversation", () => {
+    expect(autoStreamText("add_todo", { content: "Pin the commit-msg gate to a committed revision" })).toBe(
+      "Pin the commit-msg gate to a committed revision",
+    );
+    expect(autoStreamText("set_reminder", { context: "Re-run the recall gate after the merge lands" })).toBe(
+      "Re-run the recall gate after the merge lands",
+    );
+  });
+
+  it("does not stream remember, which stores its own content", () => {
+    expect(autoStreamText("remember", { content: "a decision worth keeping for later sessions" })).toBeNull();
+  });
+
+  it("skips the meta tools and short or missing text", () => {
+    expect(autoStreamText("token_status", { context: "a long enough piece of context text" })).toBeNull();
+    expect(autoStreamText("add_todo", { content: "too short" })).toBeNull();
+    expect(autoStreamText("add_todo", {})).toBeNull();
+    expect(autoStreamText("add_todo", undefined)).toBeNull();
+    expect(autoStreamText("add_todo", { content: 42 })).toBeNull();
   });
 });
