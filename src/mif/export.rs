@@ -29,6 +29,10 @@ pub struct ExportOptions {
     pub include_graph: bool,
     pub redact_pii: bool,
     pub since: Option<DateTime<Utc>>,
+    /// The space the corpus's primary vectors are in, for vectors stored before spaces were
+    /// recorded. An exported vector names the space it is in; a reader re-embeds one it cannot
+    /// use instead of comparing it across spaces.
+    pub index_space: Option<crate::embeddings::space::SpaceId>,
 }
 
 /// Build a complete MIF v2 document from veld internals.
@@ -168,11 +172,18 @@ pub fn build_document(
         all_entities.append(&mut extra_entities);
 
         let embeddings = if options.include_embeddings {
-            m.experience.embeddings.as_ref().map(|v| MifEmbedding {
-                model: "minilm-l6-v2".to_string(),
-                dimensions: v.len(),
-                vector: v.clone(),
-                normalized: true,
+            m.experience.embeddings.as_ref().map(|v| {
+                let space = crate::embeddings::space::resolve(
+                    m.experience.embedding_space.as_ref(),
+                    v.len(),
+                    options.index_space.as_ref(),
+                );
+                MifEmbedding {
+                    model: space.model().to_string(),
+                    dimensions: space.dimension(),
+                    vector: v.clone(),
+                    normalized: true,
+                }
             })
         } else {
             None
@@ -605,6 +616,81 @@ mod tests {
     use super::relation_type_to_string;
     use crate::graph_memory::RelationType;
     use crate::mif::import::parse_relation_type;
+
+    /// An exported vector names the space it is in, and an import reads it back as that space:
+    /// the exporter used to label every vector `minilm-l6-v2` whatever wrote it.
+    #[test]
+    fn an_exported_vector_names_its_space_and_the_import_reads_it() {
+        use crate::embeddings::space::SpaceId;
+        use crate::memory::types::{Experience, Memory, MemoryId};
+        let nomic = SpaceId::new("nomic-embed-text-v1.5", 8);
+        let mut stamped = Experience {
+            content: "written by nomic".to_string(),
+            ..Default::default()
+        };
+        stamped.set_primary_vector(vec![0.5; 8], nomic.clone());
+        let legacy = Experience {
+            content: "written before spaces were recorded".to_string(),
+            embeddings: Some(vec![0.5; 8]),
+            ..Default::default()
+        };
+        let memories: Vec<std::sync::Arc<Memory>> = [stamped, legacy]
+            .into_iter()
+            .map(|e| {
+                std::sync::Arc::new(Memory::new(
+                    MemoryId(uuid::Uuid::new_v4()),
+                    e,
+                    0.5,
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+            })
+            .collect();
+        let corpus = SpaceId::new("minilm-l6-v2", 8);
+        let doc = super::build_document(
+            &memories,
+            None,
+            &[],
+            &[],
+            &[],
+            &super::ExportOptions {
+                user_id: "u".to_string(),
+                include_embeddings: true,
+                include_graph: false,
+                redact_pii: false,
+                since: None,
+                index_space: Some(corpus.clone()),
+            },
+        )
+        .unwrap();
+        let models: Vec<&str> = doc
+            .memories
+            .iter()
+            .map(|m| m.embeddings.as_ref().unwrap().model.as_str())
+            .collect();
+        assert!(models.contains(&"nomic-embed-text-v1.5"), "{models:?}");
+        assert!(
+            models.contains(&"minilm-l6-v2"),
+            "a vector with no recorded space is the corpus's: {models:?}"
+        );
+
+        let (prepared, _) = crate::mif::import::prepare_memories(
+            &doc,
+            &Default::default(),
+            &crate::mif::import::ImportOptions {
+                user_id: "u".to_string(),
+                skip_duplicates: false,
+            },
+        );
+        let spaces: Vec<Option<SpaceId>> = prepared
+            .iter()
+            .map(|(_, e, _)| e.embedding_space.clone())
+            .collect();
+        assert!(spaces.contains(&Some(nomic)));
+        assert!(spaces.contains(&Some(corpus)));
+    }
 
     /// Regression: export lowercased Custom relation names while import maps any
     /// unrecognised name back to Custom verbatim, so a backup/restore renamed the

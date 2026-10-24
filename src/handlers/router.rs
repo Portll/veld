@@ -15,7 +15,7 @@ use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, keys,
     lineage, memory_ops, mif, prompt_gen, query, recall, remember, replication, search, seed,
-    sessions, sleep_time, storage_migration, todos, ui, user_admin, user_auth, users,
+    sessions, sleep_time, spaces, storage_migration, todos, ui, user_admin, user_auth, users,
     visualization, webhooks,
 };
 
@@ -443,6 +443,9 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             "/api/embeddings/backlog/drain",
             post(consolidation::drain_embedding_backlog),
         )
+        .route("/api/spaces", get(spaces::list_spaces))
+        .route("/api/spaces/align", post(spaces::align_spaces))
+        .route("/api/spaces/retire", post(spaces::retire_space))
         .route(
             "/api/storage/cleanup",
             post(consolidation::cleanup_corrupted),

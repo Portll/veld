@@ -332,6 +332,7 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
         replication_shutdown.clone(),
     ));
     start_embedding_backlog_drainer(Arc::clone(&manager));
+    start_embed_queue_drainer(Arc::clone(&manager));
 
     // Start backup scheduler if enabled
     if server_config.backup_enabled && server_config.backup_interval_secs > 0 {
@@ -1356,6 +1357,46 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} bytes", bytes)
     }
+}
+
+/// Gives memories written without a vector their vectors, a batch per tenant per tick, so one
+/// embedder call carries many texts and no request waits on the embedder. Tick from
+/// VELD_EMBED_QUEUE_INTERVAL_MS (default 250), batch from VELD_EMBED_BATCH (default 64, at
+/// most 256). A tick that finds work runs the next at once; an idle one waits the interval.
+fn start_embed_queue_drainer(manager: AppState) {
+    let interval_ms = std::env::var("VELD_EMBED_QUEUE_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(250);
+    let batch = std::env::var("VELD_EMBED_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(64)
+        .min(256);
+    tokio::spawn(async move {
+        let idle = std::time::Duration::from_millis(interval_ms);
+        loop {
+            if shutting_down() {
+                return;
+            }
+            let manager_clone = Arc::clone(&manager);
+            let drained =
+                match tokio::task::spawn_blocking(move || manager_clone.drain_embed_queues(batch))
+                    .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("Embed queue drainer task panicked: {e}");
+                        0
+                    }
+                };
+            if drained == 0 {
+                tokio::time::sleep(idle).await;
+            }
+        }
+    });
 }
 
 /// Gives backlogged memories their vectors once the embedder answers again. Interval from

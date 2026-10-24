@@ -1088,13 +1088,16 @@ impl MiniLMEmbedder {
     }
 }
 
+/// The model name this embedder reports, and the one a corpus marker of `minilm` maps to.
+pub const MODEL_ID: &str = "minilm-l6-v2";
+
 impl Embedder for MiniLMEmbedder {
     fn id(&self) -> &str {
         "minilm"
     }
 
     fn model_id(&self) -> &str {
-        "minilm-l6-v2"
+        MODEL_ID
     }
 
     fn encode(&self, text: &str) -> Result<Vec<f32>> {

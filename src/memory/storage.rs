@@ -489,6 +489,9 @@ impl LegacyExperienceV1 {
             cooccurrence_pairs: Vec::new(),
             embedding_degraded: false,
             embeddings_secondary: None,
+            embedding_space: None,
+            embedding_space_secondary: None,
+            other_vectors: Vec::new(),
         }
     }
 }
@@ -937,6 +940,35 @@ struct LegacyMemoryThroughPreWriterSession {
 /// Default `DeclaredWriter` (six `None`s) followed by default `VerifiedWriter` (two `None`s).
 const PRE_WRITER_SESSION_GAP: [u8; 8] = [0; 8];
 
+/// How many fields may have been appended to `MemoryFlat` since a record was written, at most.
+/// Each appended field encodes its default as one zero byte (see the rule on `MemoryFlat`).
+const MAX_TRAILING_DEFAULTS: usize = 16;
+
+/// A record in the current layout, or in one that ends before fields appended since: `data`,
+/// then as many zero bytes as the missing fields' defaults take, must decode as `Memory` and
+/// consume every byte. Only one count can do that, since a decode reads a fixed sequence of
+/// fields, so the result is exact. 2026-10-19: the embedding-space fields were the first
+/// appended under this rule, and every record on disk ends before them.
+fn decode_with_trailing_defaults(data: &[u8]) -> Option<(Memory, usize)> {
+    let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
+    if let Ok((memory, n)) = bincode::serde::decode_from_slice::<Memory, _>(data, cfg) {
+        if n == data.len() {
+            return Some((memory, 0));
+        }
+    }
+    let mut padded = Vec::with_capacity(data.len() + MAX_TRAILING_DEFAULTS);
+    padded.extend_from_slice(data);
+    for appended in 1..=MAX_TRAILING_DEFAULTS {
+        padded.push(0);
+        if let Ok((memory, n)) = bincode::serde::decode_from_slice::<Memory, _>(&padded, cfg) {
+            if n == padded.len() {
+                return Some((memory, appended));
+            }
+        }
+    }
+    None
+}
+
 /// Recovers a record persisted with a populated context before 4a54053 appended two structs to
 /// `AgentSession`. bincode is positional, so `#[serde(default)]` on the appended fields does
 /// nothing for bytes already on disk: the decoder reads the next field's bytes as the missing
@@ -959,10 +991,8 @@ fn recover_pre_writer_session(data: &[u8]) -> Option<(Memory, &'static str)> {
     spliced.extend_from_slice(&PRE_WRITER_SESSION_GAP);
     spliced.extend_from_slice(&data[gap_at..]);
 
-    if let Ok((memory, n)) = bincode::serde::decode_from_slice::<Memory, _>(&spliced, cfg) {
-        if n == spliced.len() {
-            return Some((memory, "bincode2_pre_writer_session"));
-        }
+    if let Some((memory, _)) = decode_with_trailing_defaults(&spliced) {
+        return Some((memory, "bincode2_pre_writer_session"));
     }
     // edfb43f (2026-09-02) inserted `persistent` mid-struct, so the same window of records is
     // also V3-shaped, with the W3.4 facets trailing.
@@ -987,6 +1017,9 @@ fn recover_pre_writer_session(data: &[u8]) -> Option<(Memory, &'static str)> {
 /// journaled before a positional layout change needs the legacy arms, not a bare
 /// `decode_from_slice`. The bm25 projection sat at lsn 12753 from 2026-09-03 to 2026-09-16
 /// because it decoded with the current layout only.
+///
+/// The redb store reads its records here too, for the same reason: a plain current-layout
+/// decode fails on every record written before a field was appended to `MemoryFlat`.
 pub fn decode_memory_snapshot(bytes: &[u8]) -> Result<Memory> {
     deserialize_memory(bytes).map(|(memory, _)| memory)
 }
@@ -1054,6 +1087,18 @@ fn deserialize_legacy_fallback(
     // later schema with appended fields, not a misread — see the note on each arm.
     let mut errors: Vec<(&str, String)> = Vec::new();
     errors.push(("bincode2 Memory", first_error.to_string()));
+
+    // A current-layout record written before the latest appended fields. Tried before every
+    // other arm: the V3 arm below tolerates trailing bytes, so it would read such a record as
+    // V3 and drop the W3 facets that follow V3's last field.
+    if let Some((memory, _)) = decode_with_trailing_defaults(data) {
+        record_branch("bincode2_trailing_defaults");
+        return Ok((memory, true));
+    }
+    errors.push((
+        "bincode2 Memory with appended defaults",
+        "no count of appended defaults consumed the record".to_string(),
+    ));
 
     // Try the prior-current schema (pre-W3.4 — before kind/what/when were
     // appended to MemoryFlat). Tried first in the fallback chain so data
@@ -5279,6 +5324,120 @@ mod tests {
         assert!(storage.db.get(memory.id.0.as_bytes()).unwrap().is_some());
     }
 
+    /// Strips the encoding of the fields appended for embedding spaces — two `None` spaces and
+    /// an empty `other_vectors` — the wire every record had before they were appended.
+    pub(crate) fn strip_space_fields(current: &[u8]) -> Vec<u8> {
+        assert_eq!(
+            &current[current.len() - 3..],
+            &[0, 0, 0],
+            "fixture must carry no spaces"
+        );
+        current[..current.len() - 3].to_vec()
+    }
+
+    #[test]
+    fn a_record_from_before_the_space_fields_reads_back_whole() {
+        let original = memory_with_session("written before spaces were named");
+        let old = strip_space_fields(&encode(&original));
+        assert!(
+            bincode::serde::decode_from_slice::<Memory, _>(&old, bincode::config::standard())
+                .is_err(),
+            "the current layout must refuse the old wire, or this test guards nothing"
+        );
+        let (back, is_legacy) = deserialize_with_fallback(&old).expect("trailing-defaults arm");
+        assert!(is_legacy, "must be re-serialised on the way back");
+        assert_eq!(back.id, original.id);
+        assert_eq!(
+            back.when.episode_ordinal,
+            Some(3),
+            "the W3 facets after V3's last field survive, so the V3 arm did not read it"
+        );
+        assert_eq!(back.experience.embeddings, original.experience.embeddings);
+        assert_eq!(back.experience.embedding_space, None);
+        assert_eq!(
+            back.experience
+                .context
+                .as_ref()
+                .unwrap()
+                .session
+                .branch
+                .as_deref(),
+            Some("feature/x")
+        );
+        assert_eq!(decode_memory_snapshot(&old).unwrap().id, original.id);
+    }
+
+    /// The portable dump, and so the redb backup and `veld migrate`, carries a record's
+    /// spaces with it.
+    #[test]
+    fn a_portable_dump_carries_the_spaces() {
+        use crate::storage::portable::{read_all, PortableRecord, PortableWriter};
+        let mut original = memory_with_session("dumped and restored");
+        original.experience.embedding_space = SpaceId::parse("minilm-l6-v2@4");
+        original
+            .experience
+            .keep_vector(SpaceId::new("nomic-embed-text-v1.5", 8), vec![0.5; 8]);
+        let value = portable_memory_value(&encode(&original))
+            .unwrap()
+            .into_owned();
+        let mut buf = Vec::new();
+        let mut writer = PortableWriter::new(&mut buf).unwrap();
+        writer
+            .write_record(&PortableRecord {
+                cf: "default".to_string(),
+                key: original.id.0.as_bytes().to_vec(),
+                value,
+            })
+            .unwrap();
+        writer.finish().unwrap();
+        let records = read_all(&buf[..]).unwrap();
+        let back = decode_memory_snapshot(&records[0].value).unwrap();
+        assert_eq!(
+            back.experience.embedding_space,
+            original.experience.embedding_space
+        );
+        assert_eq!(
+            back.experience.other_vectors,
+            original.experience.other_vectors
+        );
+    }
+
+    #[test]
+    fn a_record_with_its_spaces_is_current_and_keeps_them() {
+        let mut original = memory_with_session("written with spaces");
+        original.experience.embedding_space = SpaceId::parse("minilm-l6-v2@4");
+        original
+            .experience
+            .set_secondary_vector(vec![0.5; 8], SpaceId::new("nomic-embed-text-v1.5", 8));
+        let bytes = encode(&original);
+        assert!(is_current_memory_encoding(&bytes));
+        let (back, is_legacy) = deserialize_with_fallback(&bytes).unwrap();
+        assert!(!is_legacy);
+        assert_eq!(
+            back.experience.embedding_space,
+            original.experience.embedding_space
+        );
+        assert_eq!(
+            back.experience
+                .embedding_space_secondary
+                .as_ref()
+                .map(SpaceId::as_str),
+            Some("nomic-embed-text-v1.5@8")
+        );
+    }
+
+    #[test]
+    fn a_pre_writer_record_from_before_the_space_fields_recovers_losslessly() {
+        let original = memory_with_session("pre-writer and pre-space");
+        let old = strip_space_fields(&strip_writer_structs(&encode(&original)));
+        let (back, is_legacy) = deserialize_with_fallback(&old).expect("splice arm");
+        assert!(is_legacy);
+        assert_eq!(back.id, original.id);
+        assert_eq!(back.when.episode_ordinal, Some(3));
+        let session = &back.experience.context.as_ref().unwrap().session;
+        assert_eq!(session.branch.as_deref(), Some("feature/x"));
+    }
+
     #[test]
     fn a_record_with_a_pre_writer_session_recovers_through_the_splice() {
         let original = memory_with_session("written with a six-field session");
@@ -5302,7 +5461,8 @@ mod tests {
     #[test]
     fn a_v3_record_with_a_pre_writer_session_recovers_and_keeps_its_facets() {
         let original = memory_with_session("written before persistent was inserted");
-        let current = encode(&original);
+        // A V3 record predates the space fields too.
+        let current = strip_space_fields(&encode(&original));
         let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
         let (_, persistent_at) = bincode::serde::decode_from_slice::<
             (

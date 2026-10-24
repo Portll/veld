@@ -1026,6 +1026,23 @@
         "when": {
           "TYPENAME": "WhenFacet"
         }
+      },
+      {
+        "embedding_space": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "embedding_space_secondary": {
+          "OPTION": "STR"
+        }
+      },
+      {
+        "other_vectors": {
+          "SEQ": {
+            "TYPENAME": "SpaceVector"
+          }
+        }
       }
     ]
   },
@@ -1648,6 +1665,18 @@
         "Unknown": "UNIT"
       }
     }
+  },
+  "SpaceVector": {
+    "STRUCT": [
+      {
+        "space": "STR"
+      },
+      {
+        "vector": {
+          "SEQ": "F32"
+        }
+      }
+    ]
   },
   "TemporalContext": {
     "STRUCT": [

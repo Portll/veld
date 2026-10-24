@@ -17,6 +17,7 @@
 - [Intent log](architecture/intent-log.md)
 - [Knowledge graph](architecture/knowledge-graph.md)
 - [Alignment](architecture/alignment.md)
+- [Embedding spaces](architecture/embedding-spaces.md)
 - [Wiki render](architecture/wiki-render.md)
 - [Epistemic hygiene](architecture/epistemic-hygiene.md)
 - [Cognitive dials](architecture/dials.md)

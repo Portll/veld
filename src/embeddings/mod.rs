@@ -26,6 +26,7 @@ pub mod alignment_config;
 pub mod alignment_csls;
 pub mod alignment_procrustes;
 pub mod alignment_ridge;
+pub mod alignment_spaces;
 pub mod arctic;
 pub mod chunking;
 pub mod circuit_breaker;
@@ -38,6 +39,7 @@ pub mod minilm;
 pub mod model_tape;
 pub mod ner;
 pub mod nomic;
+pub mod space;
 #[cfg(feature = "zenoh")]
 pub mod zenoh_embedder;
 
@@ -68,6 +70,7 @@ pub use circuit_breaker::{
 
 // Re-export competitive embedder
 pub use competitive::CompetitiveEmbedder;
+pub use space::SpaceId;
 
 pub use minilm::OrtThreading;
 

@@ -26,6 +26,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 use super::alignment::Alignment;
+use super::space::SpaceId;
 use super::Embedder;
 
 type DualEmbeddingBatch = (Vec<Vec<f32>>, Option<Vec<Vec<f32>>>);
@@ -52,11 +53,18 @@ pub struct CompetitiveEmbedder {
     secondary: Option<Arc<dyn Embedder>>,
     /// Cached secondary dimension (avoids repeated vtable calls).
     secondary_dim: Option<usize>,
-    /// Optional learned projection from secondary-space into primary-space.
-    /// Installed via [`install_alignment`] after construction (the embedder is
-    /// typically held as `Arc<CompetitiveEmbedder>` so the slot must be
-    /// interior-mutable).
-    alignment: RwLock<Option<Arc<dyn Alignment>>>,
+    /// Fitted maps between spaces, by `(from, to)`, each with the confidence recall weighs
+    /// what it reaches by. The secondary→primary map the aligned recall leg uses is one of
+    /// them. Interior-mutable because the embedder is held as `Arc<CompetitiveEmbedder>`.
+    bridges: RwLock<std::collections::HashMap<(SpaceId, SpaceId), Bridge>>,
+}
+
+/// A fitted map from one space into another, and how far to trust it.
+#[derive(Clone)]
+pub struct Bridge {
+    pub alignment: Arc<dyn Alignment>,
+    /// Held-out mean paired cosine of the fit, in `[0, 1]`; 1 for a map that never recorded one.
+    pub confidence: f32,
 }
 
 impl CompetitiveEmbedder {
@@ -70,7 +78,7 @@ impl CompetitiveEmbedder {
             primary,
             secondary,
             secondary_dim,
-            alignment: RwLock::new(None),
+            bridges: RwLock::new(Default::default()),
         }
     }
 
@@ -80,7 +88,7 @@ impl CompetitiveEmbedder {
             primary,
             secondary: None,
             secondary_dim: None,
-            alignment: RwLock::new(None),
+            bridges: RwLock::new(Default::default()),
         }
     }
 
@@ -102,6 +110,15 @@ impl CompetitiveEmbedder {
             }
             None => Ok(None),
         }
+    }
+
+    /// Encode a query with the secondary model, as a query: the side an asymmetric model
+    /// such as nomic embeds a search with. `Ok(None)` when no secondary model is configured.
+    pub fn encode_secondary_query(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        self.secondary
+            .as_ref()
+            .map(|embedder| embedder.encode_for_query(text))
+            .transpose()
     }
 
     /// Encode with both models in a single call.
@@ -172,6 +189,28 @@ impl CompetitiveEmbedder {
         self.primary.id()
     }
 
+    /// The space the primary writes, and so the space of the primary index.
+    pub fn primary_space(&self) -> SpaceId {
+        SpaceId::of(self.primary.as_ref())
+    }
+
+    /// The space the secondary writes, when one is configured.
+    pub fn secondary_space(&self) -> Option<SpaceId> {
+        self.secondary.as_ref().map(|e| SpaceId::of(e.as_ref()))
+    }
+
+    /// The space of a vector the primary produced.
+    pub fn primary_space_for(&self, vector: &[f32]) -> SpaceId {
+        SpaceId::for_vector(self.primary.as_ref(), vector)
+    }
+
+    /// The space of a vector the secondary produced.
+    pub fn secondary_space_for(&self, vector: &[f32]) -> Option<SpaceId> {
+        self.secondary
+            .as_ref()
+            .map(|e| SpaceId::for_vector(e.as_ref(), vector))
+    }
+
     /// Get a reference to the primary embedder.
     pub fn primary_embedder(&self) -> &Arc<dyn Embedder> {
         &self.primary
@@ -205,18 +244,83 @@ impl CompetitiveEmbedder {
                 self.primary.dimension()
             );
         }
-        *self.alignment.write() = Some(alignment);
+        let (Some(from), to) = (self.secondary_space(), self.primary_space()) else {
+            anyhow::bail!("cannot install alignment: no secondary embedder configured");
+        };
+        let confidence = super::alignment_spaces::confidence_of(alignment.as_ref());
+        self.bridges.write().insert(
+            (from, to),
+            Bridge {
+                alignment,
+                confidence,
+            },
+        );
         Ok(())
     }
 
-    /// True if an alignment is installed.
-    pub fn has_alignment(&self) -> bool {
-        self.alignment.read().is_some()
+    /// Install a map from `from` into `to`. Refused when its widths are not the spaces'.
+    pub fn install_bridge(
+        &self,
+        from: SpaceId,
+        to: SpaceId,
+        alignment: Arc<dyn Alignment>,
+        confidence: f32,
+    ) -> Result<()> {
+        if alignment.in_dim() != from.dimension() || alignment.out_dim() != to.dimension() {
+            anyhow::bail!(
+                "a {}→{} map cannot bridge {from} to {to}",
+                alignment.in_dim(),
+                alignment.out_dim()
+            );
+        }
+        self.bridges.write().insert(
+            (from, to),
+            Bridge {
+                alignment,
+                confidence: confidence.clamp(0.0, 1.0),
+            },
+        );
+        Ok(())
     }
 
-    /// Snapshot the current alignment (clone of the `Arc`) without holding the lock.
+    /// Remove the map from `from` into `to`. Returns whether there was one.
+    pub fn remove_bridge(&self, from: &SpaceId, to: &SpaceId) -> bool {
+        self.bridges
+            .write()
+            .remove(&(from.clone(), to.clone()))
+            .is_some()
+    }
+
+    /// The map from `from` into `to`, when one is installed.
+    pub fn alignment_between(&self, from: &SpaceId, to: &SpaceId) -> Option<Bridge> {
+        self.bridges
+            .read()
+            .get(&(from.clone(), to.clone()))
+            .cloned()
+    }
+
+    /// Every installed map, in a stable order.
+    pub fn bridges(&self) -> Vec<(SpaceId, SpaceId, Bridge)> {
+        let mut out: Vec<(SpaceId, SpaceId, Bridge)> = self
+            .bridges
+            .read()
+            .iter()
+            .map(|((from, to), b)| (from.clone(), to.clone(), b.clone()))
+            .collect();
+        out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        out
+    }
+
+    /// True if the secondary→primary map is installed.
+    pub fn has_alignment(&self) -> bool {
+        self.alignment_snapshot().is_some()
+    }
+
+    /// The secondary→primary map, when installed.
     pub fn alignment_snapshot(&self) -> Option<Arc<dyn Alignment>> {
-        self.alignment.read().clone()
+        let from = self.secondary_space()?;
+        self.alignment_between(&from, &self.primary_space())
+            .map(|b| b.alignment)
     }
 
     /// Encode with the secondary embedder (selecting query or doc face) and
@@ -284,6 +388,10 @@ impl Embedder for CompetitiveEmbedder {
     // swapping it does not invalidate anything already written.
     fn id(&self) -> &str {
         self.primary.id()
+    }
+
+    fn model_id(&self) -> &str {
+        self.primary.model_id()
     }
 
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
@@ -442,7 +550,7 @@ mod tests {
     }
 
     /// Defect 3 routing decision: recall routes the secondary leg through the
-    /// aligned path (`search_ids_aligned` / `encode_aligned`) iff
+    /// aligned path (an aligned leg over the primary index) iff
     /// `has_alignment()` is true for the active pair. Before install the gate is
     /// false (recall takes the byte-identical raw-secondary path); after install
     /// it is true (recall takes the aligned, projected-into-primary path), and

@@ -2393,11 +2393,22 @@ impl MultiUserMemoryManager {
                     distance_metric: crate::vector_db::DistanceMetric::default(),
                 },
             };
-            vamana_projections.push(crate::vector_db::VamanaProjection::lazy(
-                kind,
-                bootstrap,
-                checkpoint_store.clone(),
-            ));
+            // The primary text index holds the tenant's active space: the embedder this process
+            // runs, else what the corpus markers name. Bound before replay, so a log that
+            // spans an embedder change does not build it in the old space.
+            let active_space = (kind == crate::vector_db::VamanaEmbeddingKind::TextPrimary)
+                .then(|| {
+                    crate::embeddings::primary_embedder_info()
+                        .map(|info| {
+                            crate::embeddings::space::SpaceId::new(&info.model, info.dimension)
+                        })
+                        .or_else(|| crate::embeddings::space::corpus_space(&user_path))
+                })
+                .flatten();
+            vamana_projections.push(
+                crate::vector_db::VamanaProjection::lazy(kind, bootstrap, checkpoint_store.clone())
+                    .bind_space(active_space),
+            );
         }
 
         // Third projection: BM25 inverted index.
@@ -2741,7 +2752,7 @@ impl MultiUserMemoryManager {
                 return Ok(false); // no real change
             }
             mem.experience.content = new_content;
-            mem.experience.embeddings = None; // force re-embed / re-index
+            mem.experience.clear_primary_vector(); // force re-embed / re-index
             guard.update_memory_journaled(&mem)?;
             bincode::serde::encode_to_vec(&mem, bincode::config::standard())
                 .map_err(|e| anyhow::anyhow!("wiki edit-back bincode: {e}"))?
@@ -6019,6 +6030,52 @@ mod background_task_tests {
 }
 
 impl MultiUserMemoryManager {
+    /// How this server reads a vector slot of `user_id`'s that records no space: from the
+    /// tenant's memory system when it is open, else the space registry beside its store, else
+    /// the corpus markers. `None` when none of them says. Opens nothing.
+    pub fn slot_spaces(&self, user_id: &str) -> Option<crate::embeddings::space::SlotSpaces> {
+        use crate::embeddings::space::{corpus_space, SlotSpaces, SpaceRegistry};
+        if let Some(memory) = self.user_memories.get(user_id) {
+            return Some(memory.read().slot_spaces());
+        }
+        let dir = self.user_dir(user_id).ok()?;
+        if let Ok(Some(registry)) = SpaceRegistry::read(&dir) {
+            return Some(SlotSpaces {
+                primary: registry.index_space,
+                secondary: registry.secondary_index_space,
+            });
+        }
+        corpus_space(&dir).map(|primary| SlotSpaces {
+            primary,
+            secondary: None,
+        })
+    }
+
+    /// Embed one batch of every cached user's embed queue, journaling the records the write
+    /// gate changed. Returns how many memories were taken off the queues. Users not in the
+    /// cache have nothing queued: the queue lives in the user's memory system.
+    pub fn drain_embed_queues(&self, batch: usize) -> usize {
+        let mut drained = 0;
+        for user_id in self.list_cached_users() {
+            let Some(memory) = self.user_memories.get(&user_id) else {
+                continue;
+            };
+            if memory.read().embed_queue_len() == 0 {
+                continue;
+            }
+            let drain = memory.read().drain_embed_queue_journaled(batch);
+            crate::handlers::remember::journal_stored(
+                self,
+                &memory,
+                &user_id,
+                &drain.rewritten,
+                crate::handlers::remember::SnapshotKind::Update,
+            );
+            drained += drain.taken;
+        }
+        drained
+    }
+
     /// Drain every cached user's embedding backlog, reconciling first when asked. Only users
     /// already in the cache: loading a cold user is seconds of work that a tick must not do.
     pub fn drain_embedding_backlogs(

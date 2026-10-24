@@ -85,6 +85,34 @@ pages applied, polls (passes over every tenant) finished, when the current pass 
 initial sync is a single pass that can last hours, so `polls` stays at 0 through it;
 `pages`, `syncing` and `last_applied` show it moving.
 
+## Across embedding spaces
+
+A follower may run another embedder than its leader. Every page says how the leader reads a
+vector slot that records no space (`slot_spaces`: its primary and secondary index spaces), and
+lists the spaces of the vectors its snapshots hold (`spaces`). The leader takes `slot_spaces`
+from the tenant's open memory system, else the space registry beside its store, else the corpus
+markers; it opens nothing to answer. The follower shows the last page's `spaces` per tenant
+as `leader_spaces` in its status.
+
+The follower reads each snapshot as the leader does, then keeps in its slots only vectors in its
+own spaces (`MemorySystem::normalise_replicated`):
+
+- A slot recording no space takes the leader's space for it. A snapshot journaled before spaces
+  were recorded, with a vector as wide as the follower's, is not read as the follower's.
+- A vector in a space the follower does not write moves to the memory's kept vectors. The
+  memory is queued for a vector in the follower's space, a batch per embedder call. A replica
+  gets its vectors only: the write gate and interference detection are the leader's, and its
+  frames carry what they decided.
+- The frame journaled on the follower is the snapshot as the follower stores it, so its own
+  projections never read the leader's vectors as its own.
+
+While the queue catches up, the follower counts the leader-space vectors it keeps. From 256 of
+them, it fits a map from its own space into the leader's on the memories already holding both
+(`POST /api/spaces/align` does the same by hand). A fit that finds too few pairs is tried again
+after twice as many arrivals. Once a map exists, the leader's space gets an index here from the
+kept vectors, and recall reaches a memory not yet embedded through it. A leader that predates
+spaces declares nothing; the follower then reads unrecorded slots as its own, as before.
+
 ## Limits, stated
 
 - **One direction.** A follower is read-mostly; writes made on it are not sent back. Two
@@ -92,9 +120,8 @@ initial sync is a single pass that can last hours, so `polls` stays at 0 through
   that reports following us. A three-node cycle is not detected.
 - **Memories only.** Todos, reminders, projects, context blocks and dials are not journaled
   and do not replicate. The knowledge graph is rebuilt by the follower's own consolidation.
-- **Same embedding space.** A snapshot whose vector dimension differs from the follower's
-  index is stored but not vector-indexed (BM25 and graph still find it). The embedding
-  spaces plan (`docs/EXECUTION-embedding-spaces-2026-10-19.md`, step 4) lifts this.
+- **Another embedder converges, then searches its own space.** See
+  [Across embedding spaces](#across-embedding-spaces).
 - **Frames leave the leader decrypted** and are sealed again by the follower's keystore on
   append.
 - **Upgrade followers before the leader** when the log gains a frame type. Anchoring now

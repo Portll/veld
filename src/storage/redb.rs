@@ -976,7 +976,7 @@ impl RedbPrimaryMemoryStore {
     /// epoch's key; one that cannot be opened is an error, never a plaintext read.
     fn open_record(&self, key: &[u8], bytes: &[u8]) -> Result<Memory> {
         if !crate::keystore::is_encrypted_record(bytes) {
-            return open_legacy_field(decode::<Memory>(bytes)?);
+            return open_legacy_field(crate::memory::storage::decode_memory_snapshot(bytes)?);
         }
         let cryptors = self.cryptors.as_ref().ok_or_else(|| {
             anyhow!("encountered an encrypted record but no keystore/key is configured")
@@ -992,7 +992,7 @@ impl RedbPrimaryMemoryStore {
         let plaintext = cryptor
             .decrypt_record(bytes, key)
             .context("Failed to decrypt memory record")?;
-        open_legacy_field(decode::<Memory>(&plaintext)?)
+        open_legacy_field(crate::memory::storage::decode_memory_snapshot(&plaintext)?)
     }
 
     /// The live database handle, for stores that must share it rather than open the
@@ -1841,7 +1841,9 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
                     if crate::keystore::is_encrypted_record(v.value()) {
                         return None;
                     }
-                    decode::<Memory>(v.value()).err().map(|_| key)
+                    crate::memory::storage::decode_memory_snapshot(v.value())
+                        .err()
+                        .map(|_| key)
                 })
                 .collect();
             for key in &doomed {
@@ -2748,6 +2750,32 @@ mod redb_domain_tests {
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    /// redb read its records with the current layout only, so the first field appended to
+    /// `MemoryFlat` would have made every record undecodable, and `cleanup_corrupted` would
+    /// then have deleted them.
+    #[test]
+    fn a_record_from_before_the_space_fields_reads_and_survives_cleanup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = RedbPrimaryMemoryStore::open(tmp.path()).expect("open");
+        let memory = memory_with("written by an older binary", &["Veld"], &[]);
+        let id = memory.id.clone();
+        let current = encode(&memory).unwrap();
+        assert_eq!(&current[current.len() - 3..], &[0, 0, 0]);
+        table_put(
+            &store.database,
+            store.durability(),
+            MEMORIES_TABLE,
+            id.0.as_bytes(),
+            &current[..current.len() - 3],
+        )
+        .unwrap();
+
+        let fetched = store.get(&id).expect("old record decodes");
+        assert_eq!(fetched.experience.content, "written by an older binary");
+        assert_eq!(store.cleanup_corrupted().unwrap(), 0);
+        assert!(store.get_memory(&id).unwrap().is_some());
     }
 
     fn found_by_tag(store: &RedbPrimaryMemoryStore, tag: &str) -> Vec<MemoryId> {

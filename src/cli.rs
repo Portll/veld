@@ -164,6 +164,29 @@ enum Commands {
     /// Diagnose common issues (storage, ONNX, port, server health)
     Doctor,
 
+    /// Embedding spaces of one user's corpus, through the running server
+    Spaces {
+        #[command(subcommand)]
+        action: SpacesAction,
+
+        /// API URL for the Veld server
+        #[arg(long, env = "VELD_API_URL", default_value = "http://127.0.0.1:3030")]
+        api_url: String,
+
+        /// API key for authentication
+        #[arg(
+            long,
+            env = "VELD_API_KEY",
+            hide_env_values = true,
+            default_value = "sk-veld-dev-local-testing-key"
+        )]
+        api_key: String,
+
+        /// User whose corpus to act on
+        #[arg(long, env = "VELD_USER_ID", default_value = "claude-code")]
+        user_id: String,
+    },
+
     /// Stop a running veld server by its port
     Stop {
         /// Port the target server is listening on (e.g. --port 3032)
@@ -387,6 +410,24 @@ enum KeysAction {
 }
 
 #[derive(Subcommand)]
+enum SpacesAction {
+    /// The spaces the corpus holds, the maps between them, and any migration
+    List,
+    /// Fit and install the map from one space into another
+    Align {
+        /// The space queries arrive in, `<model>@<dimension>`
+        from: String,
+        /// The space they are searched in
+        to: String,
+    },
+    /// Drop a space's kept vectors, index and maps; refused while any memory has only that space
+    Retire {
+        /// The space to retire, `<model>@<dimension>`
+        space: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum HookType {
     /// Session start hook - restore context
     SessionStart {
@@ -546,6 +587,19 @@ async fn main() -> Result<()> {
         // =====================================================================
         Commands::Status { api_url, api_key } => {
             handle_status(&api_url, &api_key)?;
+        }
+
+        // The blocking client builds its own runtime, which must not be dropped inside this
+        // async context, so the request runs on its own thread (as the hooks do).
+        Commands::Spaces {
+            action,
+            api_url,
+            api_key,
+            user_id,
+        } => {
+            std::thread::spawn(move || handle_spaces(action, &api_url, &api_key, &user_id))
+                .join()
+                .map_err(|_| anyhow::anyhow!("the spaces request panicked"))??;
         }
 
         // =====================================================================
@@ -877,6 +931,42 @@ fn handle_init() -> Result<()> {
     eprintln!("  Documentation: https://github.com/Portll/veld");
     eprintln!();
 
+    Ok(())
+}
+
+fn handle_spaces(action: SpacesAction, api_url: &str, api_key: &str, user_id: &str) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()?;
+    let response = match &action {
+        SpacesAction::List => client
+            .get(format!("{api_url}/api/spaces"))
+            .query(&[("user_id", user_id)])
+            .header("X-API-Key", api_key)
+            .send()?,
+        SpacesAction::Align { from, to } => client
+            .post(format!("{api_url}/api/spaces/align"))
+            .header("X-API-Key", api_key)
+            .json(&serde_json::json!({"user_id": user_id, "from": from, "to": to}))
+            .send()?,
+        SpacesAction::Retire { space } => client
+            .post(format!("{api_url}/api/spaces/retire"))
+            .header("X-API-Key", api_key)
+            .json(&serde_json::json!({"user_id": user_id, "space": space}))
+            .send()?,
+    };
+    let status = response.status();
+    let body: serde_json::Value = response.json().unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        anyhow::bail!(
+            "{status}: {}",
+            body.get("error")
+                .and_then(|e| e.get("message").or(Some(e)))
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| body.to_string())
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
 }
 
@@ -1236,7 +1326,12 @@ fn handle_doctor() -> Result<()> {
         }
     }
 
-    // 5. Server health (if running)
+    // 5. Embedding spaces, from each tenant's registry: the store is not opened to ask.
+    if !doctor_embedding_spaces(&storage) {
+        all_ok = false;
+    }
+
+    // 6. Server health (if running)
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()?;
@@ -1269,6 +1364,61 @@ fn handle_doctor() -> Result<()> {
     eprintln!();
 
     Ok(())
+}
+
+/// One line per tenant whose corpus holds a vector no index here can serve: stored in a space an
+/// index refused, or waiting in the backlog. False when any tenant's registry does not parse.
+fn doctor_embedding_spaces(storage: &std::path::Path) -> bool {
+    use veld::embeddings::space::SpaceRegistry;
+    let Ok(entries) = std::fs::read_dir(storage) else {
+        return true;
+    };
+    let mut tenants = 0usize;
+    let mut ok = true;
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        let tenant = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match SpaceRegistry::read(&dir) {
+            Ok(Some(registry)) => {
+                tenants += 1;
+                let waiting: usize = registry.spaces.iter().map(|s| s.backlog).sum();
+                let stranded: Vec<String> = registry
+                    .spaces
+                    .iter()
+                    .filter(|s| s.stranded > 0)
+                    .map(|s| format!("{} in {}", s.stranded, s.id))
+                    .collect();
+                if waiting > 0 || !stranded.is_empty() {
+                    eprintln!(
+                        "  ⚠ {tenant}: index {} — {waiting} waiting for a vector{}",
+                        registry.index_space,
+                        if stranded.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; stored in a refused space: {}", stranded.join(", "))
+                        }
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("  ✗ {tenant}: {e}");
+                ok = false;
+            }
+        }
+    }
+    if tenants > 0 {
+        eprintln!("  ✓ Embedding space registries read for {tenants} tenant(s)");
+    }
+    ok
 }
 
 /// Tenant entries `veld doctor` sizes, in report order.
