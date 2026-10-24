@@ -12,7 +12,14 @@
 //! - **Orbit Gap**: Two clusters share attractors but no cross-links.
 
 mod detectors;
+pub mod run;
+mod scope;
 mod scoring;
+pub mod worker;
+
+pub use run::{run_gap_analysis, GapRun, GapRunParams, MirrorReport};
+pub use scope::{GapScope, ScopeReport, MAX_SCOPE_NODES, MIN_SCOPE_NODES};
+pub use worker::GapWorkerConfig;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
