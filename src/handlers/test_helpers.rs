@@ -240,3 +240,19 @@ pub fn hold_init_lock(
     held_rx.recv().expect("init lock held");
     (release_tx, opener)
 }
+
+/// Holds `lock` for writing on another thread, as a long write holds a tenant or its graph,
+/// until the returned sender fires or 5 s pass. Join the handle after releasing.
+pub fn hold_write_lock<T: Send + Sync + 'static>(
+    lock: Arc<parking_lot::RwLock<T>>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        let _write = lock.write();
+        held_tx.send(()).expect("test waits for the hold");
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+    });
+    held_rx.recv().expect("write lock held");
+    (release_tx, writer)
+}
