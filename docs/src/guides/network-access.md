@@ -134,8 +134,12 @@ and the operating system's certificate store is not read. It is read by:
 
 - the replication follower, when a follow starts (`VELD_REPLICATE_FROM` at boot, or
   `POST /api/admin/replication/follow`);
-- status-core, on every request: the Veld GUI (monitor), the status TUI and the status
-  widget;
+- status-core, used by the Veld GUI (monitor), the status TUI and the status widget. Its
+  poller and its event-stream (SSE) client are built once, when `StatusClient::spawn`
+  runs, and read it then; each one-shot call (users, dials, seeding, the security and
+  data requests) reads it again. `restart_instance` keeps a plain client, without
+  `VELD_CA_CERT`, for its `/health` probes of the server's `base_url`, which the registry
+  keeps on loopback HTTP;
 - the terminal dashboard (`veld-tui`), once at start. A bad bundle stops it before the
   screen opens. Its `statusline` mode, whose only output is the line Claude Code shows,
   falls back to the built-in roots instead, so its fire-and-forget report fails like any
@@ -145,7 +149,8 @@ A file that cannot be read, holds no certificate or does not parse is an error n
 variable and the path; it is never skipped. The follower then does not follow: at boot the
 log shows `Replication: not following at boot: VELD_CA_CERT=…`, and the follow route
 answers `500 replication_failed` with the message in `detail`. status-core returns the
-error from each call instead of connecting without the CA.
+error from `StatusClient::spawn` or from the one-shot call instead of connecting without
+the CA.
 
 Use absolute paths. The path is opened as given, and `~` is not expanded.
 

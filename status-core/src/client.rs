@@ -358,9 +358,10 @@ impl Drop for StatusClient {
 /// for a server whose certificate a private CA signed.
 pub const ENV_CA_CERT: &str = "VELD_CA_CERT";
 
-/// The HTTP client every request in this crate goes through: the built-in webpki
-/// roots plus any in [`ENV_CA_CERT`], read on each call. A bundle that cannot be
-/// read or holds no certificate is a [`StatusError::CaBundle`], never skipped.
+/// The HTTP client of [`StatusClient::spawn`] and the one-shot calls: the built-in
+/// webpki roots plus any in [`ENV_CA_CERT`], read each time a client is built. A
+/// bundle that cannot be read or holds no certificate is a [`StatusError::CaBundle`],
+/// never skipped.
 fn http_client(timeout: Duration) -> Result<Client> {
     http_client_with(std::env::var(ENV_CA_CERT).ok().as_deref(), timeout)
 }
