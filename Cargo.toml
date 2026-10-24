@@ -152,7 +152,7 @@ path = "src/bin/recall_eval.rs"
 
 [dependencies]
 # MCP Protocol
-rmcp = { version = "1.8", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 # Global allocator — replaces Windows default heap (eliminates segment doubling / commit bloat)
 mimalloc = "0.1"
@@ -237,11 +237,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.14"
 
 # Distributed Tracing (P1.6) - OPTIONAL (heavy, ~200 packages, not needed for edge)
-# NOTE: tracing-opentelemetry 0.28 requires opentelemetry 0.27
-tracing-opentelemetry = { version = "0.28", optional = true }
-opentelemetry = { version = "0.27", features = ["trace"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"], optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"], optional = true }
+# NOTE: tracing-opentelemetry 0.33 requires opentelemetry 0.32. opentelemetry_sdk
+# 0.32.1 is the floor (GHSA-w9wp-h8wv-79jx). The otlp exporter keeps only gRPC
+# (tonic): its 0.32 defaults switched to HTTP with a blocking reqwest client.
+tracing-opentelemetry = { version = "0.33", optional = true }
+opentelemetry = { version = "0.32", features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "internal-logs"], optional = true }
+opentelemetry_sdk = { version = "0.32.1", features = ["trace"], optional = true }
 
 # FFT for spectral analysis of access patterns (learned decay scales)
 rustfft = "6"
@@ -272,8 +274,9 @@ ndarray = "0.16"
 # Graph visualization
 petgraph = "0.8"
 
-# Full-text search (BM25)
-tantivy = "0.25"
+# Full-text search (BM25). 0.26 is the first release on lru >= 0.16.3
+# (GHSA-rhfx-m35p-ff5j); its on-disk index format is still version 7, as in 0.25.
+tantivy = "0.26.2"
 
 # Bloom filter
 bloomfilter = "3.0"
