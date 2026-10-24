@@ -189,12 +189,23 @@ fn find_uuid(text: &str) -> Option<String> {
     })
 }
 
+/// A todo's short id as the server prints it: `SHO-1a2b` for a todo without a project, or
+/// the project's prefix and sequence number, `PAR-1`, for one inside a project. Both forms
+/// are accepted wherever a todo id is taken.
 fn find_short_todo_id(text: &str) -> Option<String> {
-    text.split(|c: char| c.is_whitespace() || c == '[' || c == ']' || c == '(' || c == ')')
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
         .find(|word| {
-            word.len() == 8
-                && word.starts_with("SHO-")
-                && word[4..].bytes().all(|b| b.is_ascii_hexdigit())
+            let Some((prefix, rest)) = word.split_once('-') else {
+                return false;
+            };
+            let prefix_ok = (2..=8).contains(&prefix.len())
+                && prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+            let rest_ok = !rest.is_empty()
+                && (rest.bytes().all(|b| b.is_ascii_digit())
+                    || (rest.len() == 4 && rest.bytes().all(|b| b.is_ascii_hexdigit())));
+            prefix_ok && rest_ok
         })
         .map(str::to_string)
 }
