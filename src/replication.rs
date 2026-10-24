@@ -1542,6 +1542,86 @@ mod tests {
         assert!(page.is_empty() && !more);
     }
 
+    /// A follower whose cursor lies inside a range the leader erased (a forgotten
+    /// memory's frames purged from a sealed segment) reads on from the next frame
+    /// left: the page starts past the gap, as `feed` pages it. A follower that had
+    /// applied the memory before its `Forget` was erased keeps it, which is why the
+    /// purge window must outlast follower lag.
+    #[test]
+    fn a_cursor_inside_an_erased_range_reads_on_past_it() {
+        use crate::intent_log::{payload, purge, IntentLog, Lsn};
+        let snapshot = |id: &str| {
+            payload::encode(&IntentPayload::Remember {
+                user_id: "u".to_string(),
+                memory_id: id.to_string(),
+                memory_bincode: format!("{id}-content").into_bytes(),
+                schema_version: None,
+            })
+            .unwrap()
+        };
+        let forget = |id: &str| {
+            payload::encode(&IntentPayload::Forget {
+                user_id: "u".to_string(),
+                memory_id: id.to_string(),
+                schema_version: None,
+            })
+            .unwrap()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = IntentLog::open(dir.path().join("intent.log")).unwrap();
+        log.set_segment_bytes(Some(120));
+        for frame in [
+            snapshot("a"),
+            snapshot("b"),
+            snapshot("a"),
+            forget("a"),
+            snapshot("c"),
+            snapshot("b"),
+        ] {
+            log.append(&frame).unwrap();
+            log.sync().unwrap();
+        }
+        let ten_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+        for segment in log.sealed() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&segment.path)
+                .unwrap()
+                .set_modified(ten_days_ago)
+                .unwrap();
+        }
+        let report = purge::purge_forgotten(
+            log.path(),
+            None,
+            std::time::Duration::from_secs(7 * 86_400),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(report.frames_dropped, 3, "a's two snapshots and its Forget");
+        let head = log.next_lsn().0;
+        let page_from = |floor: u64, limit: usize| {
+            page_below_head(log.iter_from(Lsn(floor)).unwrap(), floor, head, limit).unwrap()
+        };
+
+        let (page, more) = page_from(1, 500);
+        assert_eq!(lsns(&page), vec![1, 4, 5]);
+        assert!(!more);
+        let (page, more) = page_from(2, 500);
+        assert_eq!(
+            lsns(&page),
+            vec![4, 5],
+            "a cursor on an erased LSN resumes at the next frame"
+        );
+        assert!(!more);
+        let (page, more) = page_from(2, 1);
+        assert_eq!(lsns(&page), vec![4]);
+        assert!(more);
+        let (page, more) = page_from(5, 1);
+        assert_eq!(lsns(&page), vec![5]);
+        assert!(!more);
+    }
+
     fn frame(lsn: u64, id: &str, kind: &str) -> (u64, IntentPayload) {
         frame_for("u", lsn, id, kind)
     }

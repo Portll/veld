@@ -1446,6 +1446,12 @@ impl IntentLog {
         self.synced_end_offset = last_good_offset;
         self.synced_index_latest = self.index.latest();
         self.cut_pending = false;
+        if last_frame.lsn < max_lsn {
+            // The cut fell below an erased `max_lsn`. A reopen would continue
+            // from the last frame kept and hand out erased LSNs again; a new
+            // head stamped with the next one keeps the numbering.
+            self.rotate()?;
+        }
         Ok(last_good_offset)
     }
 }

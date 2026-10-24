@@ -2606,6 +2606,108 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
+    /// A journal a purge erased frames from backs up and restores like any other:
+    /// its sparse segments come back as captured, reading across them raises no
+    /// gap, and a point-in-time restore to an erased LSN cuts below it.
+    #[test]
+    fn a_journal_with_erased_frames_restores_whole_and_to_an_erased_lsn() {
+        use crate::intent_log::{payload, purge, IntentLogHeader, IntentPayload};
+        let snapshot = |id: &str| {
+            payload::encode(&IntentPayload::Remember {
+                user_id: "erased".to_string(),
+                memory_id: id.to_string(),
+                memory_bincode: format!("{id}-content").into_bytes(),
+                schema_version: None,
+            })
+            .unwrap()
+        };
+        let forget = |id: &str| {
+            payload::encode(&IntentPayload::Forget {
+                user_id: "erased".to_string(),
+                memory_id: id.to_string(),
+                schema_version: None,
+            })
+            .unwrap()
+        };
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let user_dir = temp_dir.path().join("tenant");
+        let db_path = user_dir.join("storage");
+        let user_id = "erased";
+        let db = open_db_with_user_auth(&db_path);
+        let head = user_dir.join("intent.log");
+        let mut log = IntentLog::open(&head).unwrap();
+        log.set_segment_bytes(Some(120));
+        for frame in [
+            snapshot("a"),
+            snapshot("b"),
+            snapshot("a"),
+            forget("a"),
+            snapshot("c"),
+            snapshot("b"),
+        ] {
+            log.append(&frame).unwrap();
+            log.sync().unwrap();
+        }
+        let ten_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+        for segment in log.sealed() {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&segment.path)
+                .unwrap()
+                .set_modified(ten_days_ago)
+                .unwrap();
+        }
+        purge::purge_forgotten(
+            &head,
+            None,
+            std::time::Duration::from_secs(7 * 86_400),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        drop(log);
+        fs::write(user_dir.join("projection_checkpoints.bin"), b"checkpoints").unwrap();
+
+        let spec = IntentLogBackupSpec::per_user(user_dir.clone());
+        let engine = VeldBackupEngine::new(backup_root).unwrap();
+        let metadata = engine
+            .create_comprehensive_backup_with_intent_log(&db, user_id, &[], None, Some(&spec))
+            .unwrap();
+        drop(db);
+        assert_eq!(metadata.journal_cut_lsn, Some(5));
+        assert!(engine.verify_backup(user_id, metadata.backup_id).unwrap());
+
+        let restore = |max_lsn| {
+            engine
+                .restore_comprehensive_backup_with_intent_log(
+                    user_id,
+                    Some(metadata.backup_id),
+                    &db_path,
+                    &[],
+                    Some(&spec),
+                    &RestoreOptions { max_lsn },
+                )
+                .unwrap();
+            let log = IntentLog::open(&head).unwrap();
+            let lsns: Vec<u64> = log.iter().unwrap().map(|r| r.unwrap().lsn.0).collect();
+            (lsns, log)
+        };
+
+        let (lsns, log) = restore(None);
+        assert_eq!(lsns, vec![1, 4, 5]);
+        assert!(log.sealed().iter().any(|segment| {
+            IntentLogHeader::read_from(&mut fs::File::open(&segment.path).unwrap())
+                .unwrap()
+                .is_sparse()
+        }));
+        drop(log);
+
+        let (lsns, log) = restore(Some(3));
+        assert_eq!(lsns, vec![1], "the cut falls below the erased LSN 3");
+        assert_eq!(log.next_lsn(), Lsn(4));
+    }
+
     #[test]
     fn restore_rejects_archive_with_corrupt_intent_log_frame() {
         let temp_dir = TempDir::new().unwrap();
