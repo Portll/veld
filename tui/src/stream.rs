@@ -203,7 +203,7 @@ impl MemoryStream {
             api_key: api_key.to_string(),
             user_id: user_id.to_string(),
             state,
-            client: Client::new(),
+            client: crate::http::client(),
         }
     }
 
@@ -870,7 +870,7 @@ pub async fn complete_todo(
     user_id: &str,
     todo_id: &str,
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let resp = client
         .post(format!("{}/api/todos/{}/complete", base_url, todo_id))
         .header("X-API-Key", api_key)
@@ -895,7 +895,7 @@ pub async fn update_todo_status(
     todo_id: &str,
     new_status: &str,
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let resp = client
         .post(format!("{}/api/todos/{}/update", base_url, todo_id))
         .header("X-API-Key", api_key)
@@ -922,7 +922,7 @@ pub async fn delete_todo(
     user_id: &str,
     todo_id: &str,
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let resp = client
         .delete(format!("{}/api/todos/{}", base_url, todo_id))
         .header("X-API-Key", api_key)
@@ -958,7 +958,7 @@ pub async fn update_todo_priority(
     todo_id: &str,
     priority: &str,
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let resp = client
         .post(format!("{}/api/todos/{}/update", base_url, todo_id))
         .header("X-API-Key", api_key)
@@ -986,7 +986,7 @@ pub async fn reorder_todo(
     todo_id: &str,
     direction: &str,
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let resp = client
         .post(format!("{}/api/todos/{}/reorder", base_url, todo_id))
         .header("X-API-Key", api_key)
@@ -1014,7 +1014,7 @@ pub async fn refresh_todos(
     state: &std::sync::Arc<tokio::sync::Mutex<crate::types::AppState>>,
 ) -> Result<(), String> {
     // Reuse the existing poll_todos function
-    let client = Client::new();
+    let client = crate::http::client();
     match MemoryStream::poll_todos(&client, base_url, api_key, user_id).await {
         Ok((todos, projects, stats)) => {
             let mut s = state.lock().await;
@@ -1049,7 +1049,7 @@ pub async fn fetch_lineage_trace(
     direction: &str,
     state: &std::sync::Arc<tokio::sync::Mutex<crate::types::AppState>>,
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/lineage/trace", base_url);
 
     #[derive(serde::Serialize)]
@@ -1173,7 +1173,7 @@ pub async fn fetch_lineage_with_details(
     direction: &str,
     state: &std::sync::Arc<tokio::sync::Mutex<crate::types::AppState>>,
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/lineage/trace", base_url);
 
     #[derive(serde::Serialize)]
@@ -1370,7 +1370,7 @@ pub async fn confirm_lineage_edge(
     user_id: &str,
     edge_id: &str,
 ) -> Result<String, String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/lineage/confirm", base_url);
 
     #[derive(serde::Serialize)]
@@ -1419,7 +1419,7 @@ pub async fn reject_lineage_edge(
     user_id: &str,
     edge_id: &str,
 ) -> Result<String, String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/lineage/reject", base_url);
 
     #[derive(serde::Serialize)]
@@ -1472,7 +1472,7 @@ pub async fn fetch_project_files(
     user_id: &str,
     project_id: &str,
 ) -> Result<Vec<TuiFileMemory>, String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/projects/{}/files", base_url, project_id);
 
     #[derive(serde::Serialize)]
@@ -1562,7 +1562,7 @@ pub async fn scan_project_codebase(
     project_id: &str,
     root_path: &str,
 ) -> Result<usize, String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/projects/{}/scan", base_url, project_id);
 
     #[derive(serde::Serialize)]
@@ -1616,7 +1616,7 @@ pub async fn index_project_codebase(
     project_id: &str,
     root_path: &str,
 ) -> Result<usize, String> {
-    let client = Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/projects/{}/index", base_url, project_id);
 
     #[derive(serde::Serialize)]

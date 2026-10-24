@@ -104,9 +104,11 @@ and the operating system's certificate store is not read. It is read by:
 - the replication follower, when a follow starts (`VELD_REPLICATE_FROM` at boot, or
   `POST /api/admin/replication/follow`);
 - status-core, on every request: the Veld GUI (monitor), the status TUI and the status
-  widget.
-
-The terminal dashboard (`veld tui`) does not read it.
+  widget;
+- the terminal dashboard (`veld-tui`), once at start. A bad bundle stops it before the
+  screen opens. Its `statusline` mode, whose only output is the line Claude Code shows,
+  falls back to the built-in roots instead, so its fire-and-forget report fails like any
+  unreachable server.
 
 A file that cannot be read, holds no certificate or does not parse is an error naming the
 variable and the path; it is never skipped. The follower then does not follow: at boot the
