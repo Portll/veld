@@ -39,10 +39,10 @@ Documentation = "https://github.com/Portll/veld"
 "Bug Tracker" = "https://github.com/Portll/veld/issues"
 
 [project.optional-dependencies]
-langchain = ["langchain-core>=0.2.0"]
+langchain = ["langchain-core>=0.2.0,<1.0"]
 llamaindex = ["llama-index-core>=0.10.0"]
 openai-agents = ["openai-agents>=0.24.0", "pydantic>=2.14.1"]
-all = ["langchain-core>=0.2.0", "llama-index-core>=0.10.0", "openai-agents>=0.24.0", "pydantic>=2.14.1"]
+all = ["langchain-core>=0.2.0,<1.0", "llama-index-core>=0.10.0", "openai-agents>=0.24.0", "pydantic>=2.14.1"]
 
 [tool.maturin]
 manifest-path = "veld-py/Cargo.toml"

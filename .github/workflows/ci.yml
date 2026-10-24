@@ -9,6 +9,9 @@ on:
     branches: [main]
   # Run the full macOS + Windows + Linux build on demand.
   workflow_dispatch:
+  # Everything, every night: every job, all three engine sets in full, the slow tests included.
+  schedule:
+    - cron: '23 17 * * *'
 
 # A newer push to the same ref cancels the run it supersedes: only the latest commit's result matters,
 # and on a private repository every superseded minute is billed.
@@ -20,6 +23,103 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Which parts of the repository this run has to prove. A pull request and a push to main run only
+  # the jobs whose inputs changed; the nightly run, a dispatch and a release tag run every job. On
+  # 2026-10-24, 14 of 20 open dependabot pull requests changed only npm, Python, workflow or tui
+  # files, yet each ran three Rust test jobs of 17-38 min while nothing tested what they changed.
+  changes:
+    name: Changed areas
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.scope.outputs.all == 'true' || steps.rust.outputs.rust == 'true' }}
+      slow: ${{ steps.scope.outputs.all == 'true' || github.event_name == 'push' || steps.areas.outputs.slow == 'true' }}
+      node: ${{ steps.scope.outputs.all == 'true' || steps.areas.outputs.node == 'true' }}
+      python: ${{ steps.scope.outputs.all == 'true' || steps.areas.outputs.python == 'true' }}
+      tui: ${{ steps.scope.outputs.all == 'true' || steps.areas.outputs.tui == 'true' }}
+      apps: ${{ steps.scope.outputs.all == 'true' || steps.areas.outputs.apps == 'true' }}
+      every-engine: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Scope
+        id: scope
+        run: echo "all=${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}" >> "$GITHUB_OUTPUT"
+      # Rust runs unless every changed file sits in a part of the tree no Rust target reads. The
+      # exclusions were checked against the crate: src/, tests/ and benches/ read docs/,
+      # evaluations/ and manifests/, so those stay in. status-core is a dependency of the crate.
+      - uses: dorny/paths-filter@v3
+        id: rust
+        if: steps.scope.outputs.all != 'true'
+        with:
+          predicate-quantifier: every
+          filters: |
+            rust:
+              - '**'
+              - '!mcp-server/**'
+              - '!veld-telegram/**'
+              - '!veld-whatsapp/**'
+              - '!veld-todoist/**'
+              - '!python/**'
+              - '!pyproject.toml'
+              - '!benchmarks/requirements*.txt'
+              - '!tui/**'
+              - '!monitor/**'
+              - '!status-tui/**'
+              - '!status-widget/**'
+              - '!scripts/**'
+              - '!*.md'
+              - '!.github/dependabot.yml'
+              - '!.github/workflows/docs.yml'
+              - '!.github/workflows/recall-guard.yml'
+              - '!.github/workflows/recall.yml'
+              - '!.github/workflows/release.yml'
+              - '!.github/workflows/store-size-latency.yml'
+              - '!.github/workflows/upstream-watch.yml'
+      - uses: dorny/paths-filter@v3
+        id: areas
+        if: steps.scope.outputs.all != 'true'
+        with:
+          filters: |
+            workflow: &workflow
+              - '.github/workflows/ci.yml'
+            slow:
+              - *workflow
+              - '.config/nextest.toml'
+              - 'Cargo.lock'
+              - 'src/memory/**'
+              - 'src/storage/**'
+              - 'src/recall_harness/**'
+              - 'src/embeddings/**'
+              - 'src/vector_db/**'
+              - 'src/graph_memory.rs'
+              - 'tests/recall_engine_parity.rs'
+              - 'tests/integration_tests.rs'
+              - 'tests/bug_regression_tests.rs'
+            node:
+              - *workflow
+              - 'mcp-server/**'
+              - 'veld-telegram/**'
+              - 'veld-whatsapp/**'
+              - 'veld-todoist/**'
+            python:
+              - *workflow
+              - 'python/**'
+              - 'pyproject.toml'
+              - 'benchmarks/longmemeval_eval.py'
+              - 'benchmarks/requirements-longmemeval.txt'
+              - 'scripts/ci/python_extras.py'
+            tui:
+              - *workflow
+              - 'tui/**'
+            apps:
+              - *workflow
+              - 'status-core/**'
+              - 'status-tui/**'
+              - 'status-widget/**'
+              - 'monitor/src-tauri/**'
+
   version-check:
     name: Version Consistency
     runs-on: ubuntu-latest
@@ -85,6 +185,8 @@ jobs:
 
   format:
     name: Format Check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -96,6 +198,8 @@ jobs:
 
   clippy:
     name: Clippy Analysis
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -120,6 +224,9 @@ jobs:
           # stopped compiling unnoticed (twelve errors, found 2026-10-21) while the handlers it
           # mirrors moved on; this keeps it type-checked against them. Check only, no test run.
           cargo clippy --all-targets --features zenoh -- -W clippy::all -D clippy::correctness 2>&1 | tee -a clippy-output.txt
+          # The same for the OpenTelemetry exporters behind `telemetry`: #83 bumped one crate of that
+          # family and broke the feature (2026-10-24) with every other job green.
+          cargo clippy --lib --features telemetry -- -W clippy::all -D clippy::correctness 2>&1 | tee -a clippy-output.txt
           WARNINGS=$(grep -c "warning:" clippy-output.txt || true)
           echo "### Clippy Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -229,6 +336,8 @@ jobs:
 
   test:
     name: Tests (${{ matrix.engines }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     # The three-engine job took 72-83 min with the bench rebuild; past this it is hung, not slow.
     timeout-minutes: 90
@@ -264,9 +373,15 @@ jobs:
     # hebbian_learning_tests (ld SIGBUS, "No space left on device"): every integration test is its
     # own binary carrying full DWARF for the crate, RocksDB and ONNX Runtime. Panic messages keep
     # their file:line without it; the cc-built C++ objects drop -g as well.
+    # A pull request runs the whole suite on the default build, which carries both engines, and only
+    # compiles the single-engine builds: they exist to catch one engine leaning on the other, which
+    # surfaces as a compile error. Pushes to main, the nightly run and dispatches run all three.
+    # The tests over 100 s run unless a pull request leaves their code alone (.config/nextest.toml).
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      RUN_TESTS: ${{ needs.changes.outputs.every-engine == 'true' || matrix.engines == 'rocksdb-and-redb' }}
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.slow == 'true' && 'ci' || 'ci-pr' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -285,30 +400,38 @@ jobs:
       # cached by the file that pins them.
       # Keyed on the pinned digests alone: keyed on the two source files, every edit to download
       # logic evicted the cache and cost each job a 6-9 min refetch (2026-10-21).
+      - name: Compile every target (no run)
+        if: env.RUN_TESTS != 'true'
+        run: cargo test --no-run --all-targets ${{ matrix.cargo_features }}
+
       - name: Model pins
+        if: env.RUN_TESTS == 'true'
         id: pins
         run: echo "hash=$(grep -hoE '[0-9a-f]{64}' src/embeddings/downloader.rs src/embeddings/cross_encoder.rs | sort | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6
+        if: env.RUN_TESTS == 'true'
         id: models
         with:
           path: ~/.cache/veld
           key: veld-models-${{ runner.os }}-${{ steps.pins.outputs.hash }}
       - name: Fetch the ONNX runtime, MiniLM and the reranker
-        if: steps.models.outputs.cache-hit != 'true'
+        if: env.RUN_TESTS == 'true' && steps.models.outputs.cache-hit != 'true'
         run: cargo run --quiet --bin model-fetch -- --onnxruntime --minilm --cross-encoder
 
       - uses: taiki-e/install-action@v2
+        if: env.RUN_TESTS == 'true'
         with:
           tool: cargo-nextest
 
       - name: Run all tests
+        if: env.RUN_TESTS == 'true'
         # pipefail: without it the step's status is tee's, and neither a failing test nor a compile
         # error could fail this job. nextest does not run doctests, so `cargo test --doc` follows,
         # and runs even when nextest fails so one red set cannot hide the other.
         run: |
           set -o pipefail
           status=0
-          cargo nextest run --profile ci ${{ matrix.cargo_features }} 2>&1 | tee test-output.txt || status=$?
+          cargo nextest run --profile "$NEXTEST_PROFILE" ${{ matrix.cargo_features }} 2>&1 | tee test-output.txt || status=$?
           cargo test --doc ${{ matrix.cargo_features }} 2>&1 | tee -a test-output.txt || status=$?
           exit $status
 
@@ -318,10 +441,11 @@ jobs:
       # they reuse the artifacts `cargo test` just made; `cargo bench --no-run` compiled the whole
       # graph a second time at opt-level 3 with LTO, 39 min of every job (2026-10-21).
       - name: Build the benches (no run)
+        if: env.RUN_TESTS == 'true'
         run: cargo test --benches --no-run ${{ matrix.cargo_features }}
 
       - name: Generate test summary
-        if: always()
+        if: always() && env.RUN_TESTS == 'true'
         run: |
           # CARGO_TERM_COLOR=always puts escape codes between nextest's numbers and words.
           sed 's/\x1b\[[0-9;]*m//g' test-output.txt > test-output.plain
@@ -350,48 +474,160 @@ jobs:
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
 
+  # The TypeScript packages had no CI at all: vitest 5, @types/node 26 and open 11 were merged on
+  # 2026-10-24 after a local check, not because anything here ran. No package commits a lockfile,
+  # so each run resolves the ranges the way a fresh install does.
+  node:
+    name: Node packages
+    needs: changes
+    if: needs.changes.outputs.node == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: lts/*
+      - name: mcp-server type-check and tests
+        working-directory: mcp-server
+        run: |
+          npm install --ignore-scripts --no-audit --no-fund
+          npx --yes -p typescript@5 tsc --noEmit -p .
+          npx vitest run
+      - name: Bots type-check
+        run: |
+          status=0
+          for pkg in veld-telegram veld-whatsapp veld-todoist; do
+            echo "== $pkg"
+            (cd "$pkg" && npm install --ignore-scripts --no-audit --no-fund && npx --yes -p typescript@5 tsc --noEmit -p .) || status=1
+          done
+          exit $status
+
+  # The integrations import their packages inside try/except ImportError, so a removed name fails
+  # quietly at runtime: langchain-core 1.0 dropped langchain_core.memory and nothing noticed. Each
+  # extra is installed alone, at its floor and at the newest version its range allows, and every
+  # name its adapter imports must resolve. The benchmark's requirements are checked at latest only:
+  # they pin a script's environment, not a published floor.
+  python:
+    name: Python integrations
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Each extra imports at its floor and at the newest allowed
+        run: |
+          status=0
+          check() {
+            name=$1 mode=$2 file=$3; shift 3
+            env_dir="$RUNNER_TEMP/$name-$mode"
+            python -m venv "$env_dir"
+            python scripts/ci/python_extras.py "$@" "$mode" > "$env_dir.txt"
+            echo "== $name $mode: $(tr '\n' ' ' < "$env_dir.txt")"
+            if ! "$env_dir/bin/pip" install -q --disable-pip-version-check -r "$env_dir.txt" \
+              || ! "$env_dir/bin/python" -I scripts/ci/python_extras.py check "$file"; then
+              status=1
+            fi
+          }
+          for extra in $(python scripts/ci/python_extras.py extras); do
+            for mode in floor latest; do
+              check "$extra" "$mode" "python/veld/integrations/${extra//-/_}.py" requirements "$extra"
+            done
+          done
+          check longmemeval latest benchmarks/longmemeval_eval.py requirements-file benchmarks/requirements-longmemeval.txt
+          exit $status
+
+  # tui is its own crate with its own lockfile, outside every other job: git2 0.21 broke it on
+  # 2026-10-24 and the bump's checks were green.
+  tui:
+    name: TUI
+    needs: changes
+    if: needs.changes.outputs.tui == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+      - name: Clippy
+        working-directory: tui
+        run: cargo clippy --all-targets -- -W clippy::all -D clippy::correctness
+
+  # The status crates and the Tauri monitor, each with its own lockfile. macOS, where they run;
+  # building the monitor on Linux would need the WebKitGTK stack for no added coverage.
+  apps:
+    name: Status crates and monitor
+    needs: changes
+    if: needs.changes.outputs.apps == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            status-core
+            status-widget
+            status-tui
+            monitor/src-tauri
+      - name: Check
+        run: |
+          status=0
+          for crate in status-core status-widget status-tui monitor/src-tauri; do
+            echo "== $crate"
+            (cd "$crate" && cargo check --all-targets) || status=1
+          done
+          exit $status
+
   summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [version-check, format, clippy, build, test]
+    needs: [changes, version-check, format, clippy, build, test, node, python, tui, apps]
     if: always()
+    # A job skipped because its area did not change passes; a job its area required must succeed.
+    # The release build is required on tags and dispatches only.
+    env:
+      RESULTS: >-
+        Changes=${{ needs.changes.result }}:true
+        Version=${{ needs.version-check.result }}:true
+        Format=${{ needs.format.result }}:${{ needs.changes.outputs.rust }}
+        Clippy=${{ needs.clippy.result }}:${{ needs.changes.outputs.rust }}
+        Tests=${{ needs.test.result }}:${{ needs.changes.outputs.rust }}
+        Node=${{ needs.node.result }}:${{ needs.changes.outputs.node }}
+        Python=${{ needs.python.result }}:${{ needs.changes.outputs.python }}
+        TUI=${{ needs.tui.result }}:${{ needs.changes.outputs.tui }}
+        Apps=${{ needs.apps.result }}:${{ needs.changes.outputs.apps }}
+        Build=${{ needs.build.result }}:${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - name: Generate final summary
         run: |
-          echo "# CI Pipeline Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-
-          version_icon="${{ needs.version-check.result == 'success' && '✅' || '❌' }}"
-          format_icon="${{ needs.format.result == 'success' && '✅' || '❌' }}"
-          clippy_icon="${{ needs.clippy.result == 'success' && '✅' || '❌' }}"
-          # A skipped build passes only where the policy skips it: a push or PR that is not a release
-          # tag. On a tag or a dispatch the build must run, and a skip there is a failure.
-          build_expected="${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}"
-          build_result="${{ needs.build.result }}"
-          if [[ "$build_result" == "success" || ( "$build_result" == "skipped" && "$build_expected" == "false" ) ]]; then build_ok=true; else build_ok=false; fi
-          if [[ "$build_result" == "skipped" && "$build_ok" == "true" ]]; then build_icon="⏭"; elif [[ "$build_ok" == "true" ]]; then build_icon="✅"; else build_icon="❌"; fi
-          # Tests run on every event, so only success passes; a skip is a failure.
-          test_result="${{ needs.test.result }}"
-          if [[ "$test_result" == "success" ]]; then test_ok=true; else test_ok=false; fi
-          if [[ "$test_ok" == "true" ]]; then test_icon="✅"; else test_icon="❌"; fi
-
-          echo "| Version | $version_icon ${{ needs.version-check.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Format | $format_icon ${{ needs.format.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Clippy | $clippy_icon ${{ needs.clippy.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Build | $build_icon $build_result$([[ "$build_icon" == "⏭" ]] && echo ' (release tags and dispatch only)') |" >> $GITHUB_STEP_SUMMARY
-          echo "| Tests | $test_icon $test_result |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [[ "${{ needs.version-check.result }}" == "success" && \
-                "${{ needs.format.result }}" == "success" && \
-                "${{ needs.clippy.result }}" == "success" && \
-                "$build_ok" == "true" && \
-                "$test_ok" == "true" ]]; then
-            echo "### All critical checks passed" >> $GITHUB_STEP_SUMMARY
-            exit 0
+          {
+            echo "# CI Pipeline Results"
+            echo ""
+            echo "| Check | Status |"
+            echo "|-------|--------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for entry in $RESULTS; do
+            name=${entry%%=*} rest=${entry#*=}
+            result=${rest%%:*} required=${rest#*:}
+            if [[ "$result" == success ]]; then
+              icon="✅"
+            elif [[ "$result" == skipped && "$required" != true ]]; then
+              icon="⏭"; result="skipped (not affected)"
+            else
+              icon="❌"; failed=1
+            fi
+            echo "| $name | $icon $result |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [[ $failed == 0 ]]; then
+            echo "### All required checks passed" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### Some checks failed" >> $GITHUB_STEP_SUMMARY
-            exit 1
+            echo "### Some checks failed" >> "$GITHUB_STEP_SUMMARY"
           fi
+          exit $failed

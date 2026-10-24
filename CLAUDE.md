@@ -226,6 +226,7 @@ Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (be
 
 - **Background work**: long-running handlers spawn a detached `tokio::task` and return 202 Accepted. This avoids the 60s HTTP timeout killing pipelines mid-flight.
 - **Storage migrations**: when adding a `Memory` field, deserialize with `#[serde(default)]`; existing on-disk records must round-trip.
+- **What CI runs** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): a `changes` job routes each run by the paths it touches. Rust jobs run unless every changed file is outside what the crate reads; the TypeScript packages, the Python extras (`scripts/ci/python_extras.py`: each extra imported at its floor and at the newest allowed), `tui`, and the status crates plus monitor each have their own job. A pull request runs the full nextest suite on the default build and only compiles the redb-only and rocksdb-only builds; profile `ci-pr` in [.config/nextest.toml](.config/nextest.toml) skips the tests over 100 s unless recall, storage, embeddings or vector code changed. Pushes to main, the nightly schedule and dispatches run everything.
 - **Public route safety**: only public-router probes (`/health/*`) may live without auth. The `public_router_has_no_per_user_handlers` test enforces no public handler reads `?user_id=`. Do not bypass it.
 
 ---
