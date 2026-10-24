@@ -22,7 +22,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # for gen-changelog (needs full git history)
 
@@ -30,7 +30,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry + generator target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -39,7 +39,7 @@ jobs:
           key: docs-generators-${{ runner.os }}-${{ hashFiles('docs/generators/Cargo.lock') }}
 
       - name: Cache veld build (for gen-cli-ref)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target
           key: veld-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
@@ -128,7 +128,7 @@ jobs:
         # `keep_files: true` preserves the other version subdirs already on
         # gh-pages. `destination_dir` puts this build under /<latest|vX.Y>/.
         if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || steps.subdir.outputs.is_tag == 'true'
-        uses: peaceiris/actions-gh-pages@v3
+        uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: docs/book
@@ -137,7 +137,7 @@ jobs:
 
       - name: Upload book artifact (PRs)
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docs-book
           path: docs/book
@@ -160,7 +160,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: gh-pages
       - name: Prune

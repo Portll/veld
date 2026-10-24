@@ -173,7 +173,7 @@ tokio-util = { version = "0.7", features = ["rt"] }  # TaskTracker: shutdown wai
 futures = "0.3"  # Stream utilities for SSE
 axum = { version = "0.8", features = ["json", "ws"] }
 tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
-tower-http = { version = "0.6", features = ["cors", "fs", "timeout"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "timeout"] }
 
 # Optional: compile-time docs embedding for self-contained release binaries.
 # Off by default — dev builds stay lean and use the filesystem at docs/book/.
@@ -332,7 +332,7 @@ zenoh = { version = "1.1", default-features = false, features = ["transport_tcp"
 # LLM-based query parsing (optional - heavy dependency)
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 http-body-util = "0.1"
 proptest = "1"
 serde-reflection = "0.6.0"
