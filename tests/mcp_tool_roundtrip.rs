@@ -173,16 +173,19 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
 }
 
+/// The first UUID in `text`. Works on bytes so a multi-byte glyph before the id does not
+/// put a slice boundary inside a character.
 fn find_uuid(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
-    let is_hex = |b: u8| b.is_ascii_hexdigit();
     (0..bytes.len().saturating_sub(35)).find_map(|i| {
-        let candidate = &text[i..i + 36];
-        let shape = candidate.bytes().enumerate().all(|(j, b)| match j {
-            8 | 13 | 18 | 23 => b == b'-',
-            _ => is_hex(b),
+        let window = &bytes[i..i + 36];
+        let shape = window.iter().enumerate().all(|(j, b)| match j {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
         });
-        shape.then(|| candidate.to_string())
+        shape
+            .then(|| std::str::from_utf8(window).ok().map(str::to_string))
+            .flatten()
     })
 }
 
