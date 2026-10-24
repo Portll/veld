@@ -74,6 +74,18 @@ jobs:
           VELD_BIN: ${{ github.workspace }}/target/release/veld
         run: bash regenerate.sh
 
+      - name: Upload the generated reference pages
+        # The pages are committed, so a contributor without the toolchain can take them
+        # from here after a run instead of regenerating locally.
+        uses: actions/upload-artifact@v7
+        with:
+          name: generated-reference
+          path: |
+            docs/src/reference/schemas.md
+            docs/src/reference/schemas.json
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Verify no generator drift
         # Only enforced on PRs (where contributors are expected to have
         # run regenerate.sh locally). On main and tags the build is
