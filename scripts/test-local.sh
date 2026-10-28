@@ -136,7 +136,7 @@ run_full_matrix() {
   take_full_suite_lock
   local log_dir="${CARGO_TARGET_DIR:-$repo_root/target}-logs"
   mkdir -p "$log_dir"
-  # The test legs run what CI's do since 900b190b: nextest with the ci profile (one process per
+  # The test legs run what CI's do since bff68abf: nextest with the ci profile (one process per
   # test, per-test timeouts from .config/nextest.toml), then the doctests nextest does not run,
   # then a compile of the benches. A plain `cargo test` here missed a failure that only
   # per-process isolation shows (ner_tests::test_many_entities, 2026-10-23).

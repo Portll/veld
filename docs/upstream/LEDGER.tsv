@@ -3,7 +3,7 @@ in	286461b3		2026-03-27	infra	-	declined		rustfmt line-wrapping only, in handler
 in	0b40a0df	141	2026-03-28	graph	W3	pending		
 in	0ed19a54	137	2026-03-28	graph	W3	pending		
 in	f3cba6da	154	2026-03-29	http-api	W10	pending		
-in	390a2075	155	2026-03-29	security	W1	partial	3e4d7ca7	the recall auth bypass fix is in veld since the import (3e4d7ca7: a payload-less recall query is refused when an API key is set). The forget user_id fallback, req.created_at for temporal facts and the recall_memories use-after-move are not ported: veld's zenoh feature does not compile at 5dd17e67 (10 type errors, which stop rustc before borrow checking would report that move too), so they wait for W12a
+in	390a2075	155	2026-03-29	security	W1	partial	3e4d7ca7	the recall auth bypass fix is in veld since the import (3e4d7ca7: a payload-less recall query is refused when an API key is set). The forget user_id fallback, req.created_at for temporal facts and the recall_memories use-after-move are not ported: veld's zenoh feature does not compile at 0eb73e38 (10 type errors, which stop rustc before borrow checking would report that move too), so they wait for W12a
 in	d45dc56a	156	2026-03-29	retrieval	W2	pending		
 in	9bd59c27	157	2026-03-29	storage-integrity	W7	pending		
 in	1e528403	158	2026-03-29	retrieval	W2	pending		
@@ -15,9 +15,9 @@ in	ca1eef91	178	2026-03-29	retrieval	W2	pending
 in	60e7e5da	179	2026-03-29	http-api	W10	pending		
 in	9a81dd7f	180	2026-03-29	lineage	W4	pending		
 in	7b70730a	181	2026-03-30	mcp-hooks	W9	pending		
-in	2092c858		2026-03-30	security	W10	adapted	97800bd7,980b722c	codebase scan/index confined to a canonical project directory, by path component, with macOS and Windows forms and veld's data directory refused; the LLM parser escapes the query. In veld already: no fixed dev key (veld generates one per instance), and the lz4_flex, rustls-webpki and tar versions it bumped or newer
-in	59dae70f	183	2026-03-31	security	W1	partial	137858d9	recall_by_tags MCP tool ported (#130). The proactive_context tag boost changes ranking and waits for the W2 recall gate. The session-start tag fetch reads session-summary memories that only upstream #189's stop hook writes (in #191, not ported), so it waits for W9. The zenoh constant-time compare (#136) waits for W12a: veld's zenoh feature does not compile (10 errors at 5dd17e67). The files.rs change is rustfmt of pr-133's codebase-path blocklist, which veld lacks (row 2092c858)
-in	7a0f0357	191	2026-03-31	http-api	W10	partial	08c84a77	#188 ported (15931cf8): a TaskTracker on the manager, drained at shutdown before the flush; veld tracks remember, batch remember, deferred embedding, ingest and todo-memory writes. #184-#187, #189, #190 and the BatchRememberOptions and branch-signal fixes not yet triaged
+in	2092c858		2026-03-30	security	W10	adapted	8352c1f1,d40c6096	codebase scan/index confined to a canonical project directory, by path component, with macOS and Windows forms and veld's data directory refused; the LLM parser escapes the query. In veld already: no fixed dev key (veld generates one per instance), and the lz4_flex, rustls-webpki and tar versions it bumped or newer
+in	59dae70f	183	2026-03-31	security	W1	partial	bc43958c	recall_by_tags MCP tool ported (#130). The proactive_context tag boost changes ranking and waits for the W2 recall gate. The session-start tag fetch reads session-summary memories that only upstream #189's stop hook writes (in #191, not ported), so it waits for W9. The zenoh constant-time compare (#136) waits for W12a: veld's zenoh feature does not compile (10 errors at 0eb73e38). The files.rs change is rustfmt of pr-133's codebase-path blocklist, which veld lacks (row 2092c858)
+in	7a0f0357	191	2026-03-31	http-api	W10	partial	4dd628e4	#188 ported (15931cf8): a TaskTracker on the manager, drained at shutdown before the flush; veld tracks remember, batch remember, deferred embedding, ingest and todo-memory writes. #184-#187, #189, #190 and the BatchRememberOptions and branch-signal fixes not yet triaged
 in	6653000d	194	2026-04-01	storage-integrity	W7	pending		
 in	aa387b9e	195	2026-04-01	mcp-hooks	W9	pending		
 in	2f8ab23f	196	2026-04-01	mcp-hooks	W9	pending		
@@ -28,7 +28,7 @@ in	b18d8e65	200	2026-04-03	graph	W3	pending
 in	1ffe73cf	201	2026-04-05	mcp-hooks	W9	pending		
 in	20f1b0a7	202	2026-04-05	mcp-hooks	W9	pending		
 in	9eecf0f9	203	2026-04-07	mcp-hooks	W9	pending		
-in	5aa1d5d3	204	2026-04-07	robotics-geo	W12	partial	29108a10	recall tags only; the robotics API surface belongs to W12a
+in	5aa1d5d3	204	2026-04-07	robotics-geo	W12	partial	68f98a5a	recall tags only; the robotics API surface belongs to W12a
 in	002493b1	211	2026-04-07	lineage	W4	pending		
 in	03e1a040	212	2026-04-08	lineage	W4	pending		
 in	ee9fc43b	213	2026-04-08	graph	W3	pending		
@@ -41,7 +41,7 @@ in	1faafc88	220	2026-04-09	graph	W3	pending		only the graph_memory.rs line appli
 in	e3544189		2026-04-09	infra	-	declined		upstream's own package version (shodh-memory 0.1.91 to 0.2.0) in Cargo.lock; veld versions itself (veld 0.7.39)
 in	cd6b02c8	221	2026-04-09	infra	-	declined		pins model URLs in upstream's pypi.yml; veld has no pypi.yml and its release.yml builds no wheels, and veld's downloader already checks models against SHA-256 pins (ModelChecksums in src/embeddings/downloader.rs)
 in	260ce9b5	222	2026-04-09	infra	-	declined		adds importance_override and session_id to the python.rs constructors; veld's Experience and Query have neither field, and veld's python.rs builds both with ..Default::default(), so a field added later compiles without an edit there
-in	61d117bd	225	2026-04-10	embeddings-vectors	W8	ported	ee166804	
+in	61d117bd	225	2026-04-10	embeddings-vectors	W8	ported	34fdf3a8	
 in	1e158e53	224	2026-04-10	robotics-geo	W12	pending		
 in	a4a896c4	226	2026-04-10	embeddings-vectors	W8	pending		veld's repair_vector_index and rebuild_index (src/memory/mod.rs) still return without retriever.save()
 in	f7bd0b4c	227	2026-04-10	lineage	W4	pending		
@@ -51,54 +51,54 @@ in	5359c7e7	230	2026-04-12	http-api	W10	pending		HTTP remember-to-recall tests t
 in	49cc4a82	233	2026-04-15	embeddings-vectors	W8	pending		
 in	ef0de730	232	2026-04-15	http-api	W10	pending		
 in	dacebb0c	234	2026-04-16	embeddings-vectors	W8	pending		
-in	05a0ef89	235	2026-04-17	facts-todos	W5	ported	2b92620c	build_fact_narratives; veld adds purged_at and is_active
-in	0738ba85	236	2026-04-17	facts-todos	W5	partial	3a2741dc	the session-start briefing rewrite in hooks/memory-hook.ts is not taken: it reads /api/sessions/history, which veld does not serve (W9); the purge endpoint is veld's soft purge (5ce880f7), whose route this restores; no destructive purge MCP tool for agents
-in	a3f87a1e	237	2026-04-19	facts-todos	W5	ported	2b92620c	
+in	05a0ef89	235	2026-04-17	facts-todos	W5	ported	63153cd0	build_fact_narratives; veld adds purged_at and is_active
+in	0738ba85	236	2026-04-17	facts-todos	W5	partial	17fe6771	the session-start briefing rewrite in hooks/memory-hook.ts is not taken: it reads /api/sessions/history, which veld does not serve (W9); the purge endpoint is veld's soft purge (b2feaf75), whose route this restores; no destructive purge MCP tool for agents
+in	a3f87a1e	237	2026-04-19	facts-todos	W5	ported	63153cd0	
 in	b08fa351	239	2026-04-19	robotics-geo	W12	pending		
 in	00695870	241	2026-04-19	http-api	W10	pending		
 in	7b882ace	240	2026-04-19	http-api	W10	pending		
-in	82cf1c90	242	2026-04-19	facts-todos	W5	adapted	7dfa0892	the spatial/mission and session_id pre-flight in /api/recall does not apply (veld's recall has neither); veld's backup already refuses without its graph; a batch reports an unknown type per item instead of failing the batch
-in	674abc7c	243	2026-04-19	storage-integrity	W1	adapted	aef47086	only the iterator-error propagation in the legacy-DB migrations applies, now in veld at all three sites (the two in memory/storage.rs and import_separate_db_into_cf); the lint fixes are to upstream's own code
+in	82cf1c90	242	2026-04-19	facts-todos	W5	adapted	b2fcb75a	the spatial/mission and session_id pre-flight in /api/recall does not apply (veld's recall has neither); veld's backup already refuses without its graph; a batch reports an unknown type per item instead of failing the batch
+in	674abc7c	243	2026-04-19	storage-integrity	W1	adapted	f08d1865	only the iterator-error propagation in the legacy-DB migrations applies, now in veld at all three sites (the two in memory/storage.rs and import_separate_db_into_cf); the lint fixes are to upstream's own code
 in	38b818dd	244	2026-04-19	robotics-geo	W12	pending		
 in	25d54a51	245	2026-04-19	ner-entities	W6	pending		
-in	5e59f676		2026-04-19	facts-todos	W5	ported	288a2d2a	
-in	9dbe3a73	246	2026-04-19	facts-todos	W5	partial	2cb14cbb	the entity-blocklist edits wait on #214 (72dfb6ce, W6), which brings the blocklist; a stronger lineage re-inference updates inferred edges only
+in	5e59f676		2026-04-19	facts-todos	W5	ported	657ebb88	
+in	9dbe3a73	246	2026-04-19	facts-todos	W5	partial	90ab56a1	the entity-blocklist edits wait on #214 (72dfb6ce, W6), which brings the blocklist; a stronger lineage re-inference updates inferred edges only
 in	193bfff6	247	2026-04-19	retrieval	W2	pending		
 in	0184d6de	248	2026-04-20	robotics-geo	W12	pending		
 in	ca5a4638	249	2026-04-21	web-ui	W11	pending		
-in	000b68f4	252	2026-04-23	embeddings-vectors	W8	ported	ee166804	
+in	000b68f4	252	2026-04-23	embeddings-vectors	W8	ported	34fdf3a8	
 in	9e69ca9b	254	2026-04-23	eval	W0	veld-layer		veld's ci.yml runs the test suite on release tags and dispatch and has it verified locally before a push (operator decision 2026-09-27, recorded in ci.yml); upstream's tiered per-PR test gates would spend the Actions budget that ruling protects
 in	e66ad34d	255	2026-04-23	infra	-	declined		an opt-in heartbeat whose default endpoint is upstream's (https://shodh-memory.com/api/telemetry), counting upstream's installs; veld reports nothing to upstream
 in	da23add0	256	2026-04-27	mcp-hooks	W9	pending		
-in	1a6708e9	257	2026-04-27	security	W1	partial	af09e173,0e8df63e,3e4d7ca7	Ported: graph handlers on the blocking pool (plus veld-only delete_entity and invalidate_relationship), fact updates rebuild their indices, ResilientEmbedder batch delegation, the start-graph test. In veld already: the O(n*d) Vamana start graph (9a6b2609), backup rename-aside and SPANN insert after load (0e8df63e, which keeps the loaded postings upstream's empty partitions hid), the /api/stats user_id check (3e4d7ca7). Not applicable: the five MCP callBrain calls, which veld's MCP server never had. Superseded: persisting access updates on recall, replaced upstream by #297 (W2). Declined: for_each_memory, which has no caller and adds a raw RocksDB iterator outside the storage traits. Waiting for W3: remember_with_agent's duplicate graph pass (veld's copy also makes causal edges only there), strengthen_episode_entity_edges (revives a no-op, moves graph weights), CoRetrieved edges in entity_edges (veld's coactivation is directional; upstream later stopped making them), the batch_weaken_synapses LTP guard (that function arrives with upstream d392c022)
+in	1a6708e9	257	2026-04-27	security	W1	partial	f2c4653c,c9953577,3e4d7ca7	Ported: graph handlers on the blocking pool (plus veld-only delete_entity and invalidate_relationship), fact updates rebuild their indices, ResilientEmbedder batch delegation, the start-graph test. In veld already: the O(n*d) Vamana start graph (ce32a46d), backup rename-aside and SPANN insert after load (c9953577, which keeps the loaded postings upstream's empty partitions hid), the /api/stats user_id check (3e4d7ca7). Not applicable: the five MCP callBrain calls, which veld's MCP server never had. Superseded: persisting access updates on recall, replaced upstream by #297 (W2). Declined: for_each_memory, which has no caller and adds a raw RocksDB iterator outside the storage traits. Waiting for W3: remember_with_agent's duplicate graph pass (veld's copy also makes causal edges only there), strengthen_episode_entity_edges (revives a no-op, moves graph weights), CoRetrieved edges in entity_edges (veld's coactivation is directional; upstream later stopped making them), the batch_weaken_synapses LTP guard (that function arrives with upstream d392c022)
 in	9a009cd7	258	2026-04-27	ner-entities	W6	pending		
 in	0fb9bbb4	259	2026-04-29	graph	W3	pending		
 in	0d9d8973	260	2026-04-29	ner-entities	W6	pending		
 in	e7cd526e	261	2026-04-29	ner-entities	W6	pending		re-waved from W0 in triage: raises the NER entity length and confidence floors and adds a verb blocklist at graph insertion, which changes the graph and so what veld ranks
 in	fe26edd3	262	2026-04-29	storage-integrity	W7	pending		
-in	9b237617	271	2026-05-02	eval	W0	declined		a planning draft (drafts/recall-audit.md); veld keeps no drafts/ and already has the layout it chose: src/recall_harness/ (4d5d44d9) and src/bin/recall_eval.rs (e2502e73)
-in	d4806274	272	2026-05-02	eval	W0	ported	4d5d44d9	harness metrics, fixtures and corpora copied byte-identical
-in	036d9953	273	2026-05-02	eval	W0	ported	4d5d44d9	
-in	67566650	274	2026-05-03	eval	W0	ported	4d5d44d9	
-in	4330aca5	276	2026-05-04	eval	W0	already-in-veld	4d5d44d9	tests/recall/baseline.json and its README came with the harness import; the smoke baseline is upstream's MiniLM run, and the gate reads only locomo-gate-baseline.json
-in	4bbc5176		2026-05-04	eval	W0	superseded	e2502e73	scripts/recall_diff.py arrived whole in e2502e73 at upstream 20de49c3's revision, which contains this commit; e2502e73 names 20de49c3 rather than this commit
-in	1ebc54e1		2026-05-04	eval	W0	veld-layer	e2502e73	veld's own recall gate (.github/workflows/recall.yml, e2502e73) replaces this per-PR smoke gate: the LoCoMo gate weekly and on dispatch, per storage engine, with an engines-equal job; per-PR runs are off for the Actions budget ruling recall.yml cites
+in	9b237617	271	2026-05-02	eval	W0	declined		a planning draft (drafts/recall-audit.md); veld keeps no drafts/ and already has the layout it chose: src/recall_harness/ (acb4ccda) and src/bin/recall_eval.rs (99001be8)
+in	d4806274	272	2026-05-02	eval	W0	ported	acb4ccda	harness metrics, fixtures and corpora copied byte-identical
+in	036d9953	273	2026-05-02	eval	W0	ported	acb4ccda	
+in	67566650	274	2026-05-03	eval	W0	ported	acb4ccda	
+in	4330aca5	276	2026-05-04	eval	W0	already-in-veld	acb4ccda	tests/recall/baseline.json and its README came with the harness import; the smoke baseline is upstream's MiniLM run, and the gate reads only locomo-gate-baseline.json
+in	4bbc5176		2026-05-04	eval	W0	superseded	99001be8	scripts/recall_diff.py arrived whole in 99001be8 at upstream 20de49c3's revision, which contains this commit; 99001be8 names 20de49c3 rather than this commit
+in	1ebc54e1		2026-05-04	eval	W0	veld-layer	99001be8	veld's own recall gate (.github/workflows/recall.yml, 99001be8) replaces this per-PR smoke gate: the LoCoMo gate weekly and on dispatch, per storage engine, with an engines-equal job; per-PR runs are off for the Actions budget ruling recall.yml cites
 in	e69f4dee		2026-05-04	eval	W0	ported	c5c9ed0f	RH-10 (#290)
 in	ca350b14		2026-05-04	eval	W0	ported	c5c9ed0f	RH-10 id and recency tie-breaks (#290)
-in	deb42840		2026-05-04	eval	W0	already-in-veld	4d5d44d9	pin_harness_threads came with the harness import
+in	deb42840		2026-05-04	eval	W0	already-in-veld	acb4ccda	pin_harness_threads came with the harness import
 in	b7f0477f		2026-05-05	graph	W3	pending		
-in	ff565ddd		2026-05-05	eval	W0	already-in-veld	4d5d44d9	the runner's cross-repeat rank-list check came with the harness import; upstream's smoke-suite tests/recall_determinism.rs is replaced by veld's LoCoMo-gate determinism test (9d2be1bc)
+in	ff565ddd		2026-05-05	eval	W0	already-in-veld	acb4ccda	the runner's cross-repeat rank-list check came with the harness import; upstream's smoke-suite tests/recall_determinism.rs is replaced by veld's LoCoMo-gate determinism test (8c88b17f)
 in	3961ad34		2026-05-05	infra	-	declined		rustfmt line-wrapping only, in memory/retrieval.rs, vector_db/vamana.rs and tests/recall_determinism.rs; veld's CI format job (cargo fmt --all -- --check in ci.yml) keeps veld's own copies formatted
 in	860bfa39		2026-05-06	retrieval	W2	pending		re-waved from W0 in triage: polarity-aware multi-pool retrieval changes query parsing, the BM25 pool and fusion, so it changes what veld ranks
-in	e611a7a3		2026-05-07	eval	W0	already-in-veld	4d5d44d9	N-repeat ingest and per-case median latency in the runner and report came with the harness import; recall-eval arrived whole in e2502e73, with recall_diff.py; veld's recall.yml is its own
-in	45e7b2b6	287	2026-05-24	storage-integrity	W7	ported	643dbd5a	
+in	e611a7a3		2026-05-07	eval	W0	already-in-veld	acb4ccda	N-repeat ingest and per-case median latency in the runner and report came with the harness import; recall-eval arrived whole in 99001be8, with recall_diff.py; veld's recall.yml is its own
+in	45e7b2b6	287	2026-05-24	storage-integrity	W7	ported	ead4a2d9	
 in	2a8e78f6		2026-05-29	storage-integrity	W7	pending		
 in	b57b9e95		2026-05-29	embeddings-vectors	W8	pending		
 in	45990686		2026-05-29	retrieval	W2	ported	c5c9ed0f	RH-10 (#290)
 in	b3f68b50		2026-05-29	storage-integrity	W7	pending		
-in	dde789f0	270	2026-05-29	eval	W0	partial	7caedd3d	LayerMode, Query.layers and five stage gates are in (7caedd3d); memory/recall.rs gates no stage on PlusBm25, so BM25 runs on every rung and +bm25 equals +spreading. That gate is owed in memory/recall.rs, which the cobolwork-de session (fix/hebbian-learned) is rewriting; the python binding is not taken
-in	8018e62d		2026-05-29	eval	W0	partial	3e2d6eb8	the /api/recall layers field is in; benchmarks/locomo_layer_eval.py, an LLM-judged per-layer benchmark, is not taken. The row named 7caedd3d before, which is #270's LayerMode port (dde789f0) and carried neither
-in	275f47bf		2026-05-29	eval	W0	already-in-veld	4d5d44d9,a1525934	decay_sim and the age-aware runner came with the harness import; MemorySystem::simulate_edge_aging and the clock-injected graph decay are veld's own (a1525934)
+in	dde789f0	270	2026-05-29	eval	W0	partial	66c49e48	LayerMode, Query.layers and five stage gates are in (66c49e48); memory/recall.rs gates no stage on PlusBm25, so BM25 runs on every rung and +bm25 equals +spreading. That gate is owed in memory/recall.rs, which the cobolwork-de session (fix/hebbian-learned) is rewriting; the python binding is not taken
+in	8018e62d		2026-05-29	eval	W0	partial	4eff1288	the /api/recall layers field is in; benchmarks/locomo_layer_eval.py, an LLM-judged per-layer benchmark, is not taken. The row named 66c49e48 before, which is #270's LayerMode port (dde789f0) and carried neither
+in	275f47bf		2026-05-29	eval	W0	already-in-veld	acb4ccda,3c93ffb3	decay_sim and the age-aware runner came with the harness import; MemorySystem::simulate_edge_aging and the clock-injected graph decay are veld's own (3c93ffb3)
 in	56771577		2026-05-29	eval	W0	declined		nothing to port: it repairs upstream's benches for upstream struct fields veld lacks (EntityNode.selectivity, RelationshipEdge.forman_curvature and endpoint_selectivity); veld's benches build under clippy --all-targets
 in	3af1dddb		2026-05-29	retrieval	W2	pending		
 in	1419a630	297	2026-05-29	retrieval	W2	pending		
@@ -110,26 +110,26 @@ in	3d37bf88	302	2026-05-29	retrieval	W2	pending
 in	92872f42	303	2026-05-29	ner-entities	W6	pending		
 in	c4937162	304	2026-05-29	retrieval	W2	pending		
 in	ee062736	305	2026-05-30	lineage	W4	pending		
-in	0d7b57c2	306	2026-05-30	eval	W0	already-in-veld	4d5d44d9	the 108-case smoke suite came with the harness import
+in	0d7b57c2	306	2026-05-30	eval	W0	already-in-veld	acb4ccda	the 108-case smoke suite came with the harness import
 in	6002c524	307	2026-05-30	retrieval	W2	pending		
-in	3791399c	308	2026-05-30	eval	W0	ported	4d5d44d9,adb99e27	per-layer per-case records came with the harness import; the workflow's layer dispatch input is the port
+in	3791399c	308	2026-05-30	eval	W0	ported	acb4ccda,e433c434	per-layer per-case records came with the harness import; the workflow's layer dispatch input is the port
 in	474ef526	309	2026-05-30	retrieval	W2	pending		veld still deletes the suppressed set: memories.retain(winners) under ResolveNewest and ResolveStrongest, the default for recall (src/memory/recall.rs:3748)
-in	9c86d086	310	2026-05-30	eval	W0	already-in-veld	4d5d44d9	upstream's regenerated smoke baseline came with the harness import
-in	ab0bce52	312	2026-05-30	eval	W0	ported	4d5d44d9	
-in	9908d304	313	2026-05-30	eval	W0	partial	4d5d44d9	suite-aware validation and the deduplicated locomo_cases.jsonl came with the harness import; benchmarks/locomo_to_harness.py and locomo-recall.yml are not taken: veld keeps the converted fixtures and regenerates none
+in	9c86d086	310	2026-05-30	eval	W0	already-in-veld	acb4ccda	upstream's regenerated smoke baseline came with the harness import
+in	ab0bce52	312	2026-05-30	eval	W0	ported	acb4ccda	
+in	9908d304	313	2026-05-30	eval	W0	partial	acb4ccda	suite-aware validation and the deduplicated locomo_cases.jsonl came with the harness import; benchmarks/locomo_to_harness.py and locomo-recall.yml are not taken: veld keeps the converted fixtures and regenerates none
 in	c1098786	284	2026-06-05	security	W1	veld-origin		Portll PR
-in	86dc3af7	325	2026-06-12	eval	W0	partial	78a530d5,3c8a3028,433ad8a0,003a0645	no silent hash embeddings, gold_funnel and fusion_features, causal cue extractor, the hebbian term off by default (#321; a learned replacement is SPINE veld-embedder-long-inputs-20261003 task 8.6); OpenIE, CATENA, spaCy and the relation typer not ported
-in	34abc71c	326	2026-06-13	eval	W0	declined		the LongMemEval-S workflow: the full suite is about 80 runner-hours by upstream's own arithmetic, against an Actions budget that ran out twice in September (ci.yml), and it fetches GLiNER from a release asset veld does not publish. The harness entry point run_longmemeval is in (4d5d44d9)
-in	4e04649a	327	2026-06-13	eval	W0	partial	4d5d44d9	the runner's LongMemEval and NER-replay paths came with the harness import, recall-eval arrived whole in e2502e73; the graph-side determinism edits are graph code and veld's ranks are repeat-stable by its own fixes (9d2be1bc); benchmarks/longmemeval_to_harness.py goes with the declined workflow (#326)
-in	2f413837	328	2026-06-13	eval	W0	partial	4d5d44d9	the gate corpus, cases and fixture paths came with the harness import, recall-eval arrived whole in e2502e73; veld's recall.yml (e2502e73) and baseline (796e27b1) are its own; benchmarks/build_locomo_gate.py is not taken
+in	86dc3af7	325	2026-06-12	eval	W0	partial	5c9e6908,2ba48db5,fc7a5389,cddb7b7c	no silent hash embeddings, gold_funnel and fusion_features, causal cue extractor, the hebbian term off by default (#321; a learned replacement is SPINE veld-embedder-long-inputs-20261003 task 8.6); OpenIE, CATENA, spaCy and the relation typer not ported
+in	34abc71c	326	2026-06-13	eval	W0	declined		the LongMemEval-S workflow: the full suite is about 80 runner-hours by upstream's own arithmetic, against an Actions budget that ran out twice in September (ci.yml), and it fetches GLiNER from a release asset veld does not publish. The harness entry point run_longmemeval is in (acb4ccda)
+in	4e04649a	327	2026-06-13	eval	W0	partial	acb4ccda	the runner's LongMemEval and NER-replay paths came with the harness import, recall-eval arrived whole in 99001be8; the graph-side determinism edits are graph code and veld's ranks are repeat-stable by its own fixes (8c88b17f); benchmarks/longmemeval_to_harness.py goes with the declined workflow (#326)
+in	2f413837	328	2026-06-13	eval	W0	partial	acb4ccda	the gate corpus, cases and fixture paths came with the harness import, recall-eval arrived whole in 99001be8; veld's recall.yml (99001be8) and baseline (cd56cfef) are its own; benchmarks/build_locomo_gate.py is not taken
 in	a91aa80c	330	2026-06-22	lineage	W4	pending		
-in	35dfd97f	334	2026-06-22	infra	-	ported	643dbd5a	
+in	35dfd97f	334	2026-06-22	infra	-	ported	ead4a2d9	
 in	bc32da12	332	2026-06-22	retrieval	W2	pending		
-in	e776e954	331	2026-06-22	eval	W0	already-in-veld	4d5d44d9	the per-category regression gate in compare_to_baseline came with the harness import
-in	e0e6c513	337	2026-06-25	eval	W0	already-in-veld	4d5d44d9	SHODH_LINEAGE_HARD came with the harness import
+in	e776e954	331	2026-06-22	eval	W0	already-in-veld	acb4ccda	the per-category regression gate in compare_to_baseline came with the harness import
+in	e0e6c513	337	2026-06-25	eval	W0	already-in-veld	acb4ccda	SHODH_LINEAGE_HARD came with the harness import
 in	a8ea9eeb	336	2026-06-25	graph	W3	pending		
 in	68438ef8	341	2026-07-01	ner-entities	W6	pending		
-in	51a9e406	329	2026-07-01	eval	W0	partial	4d5d44d9	the per-layer LongMemEval ablation in the runner came with the harness import, recall-eval arrived whole in e2502e73; the longmemeval.yml hunk goes with the declined workflow (#326)
+in	51a9e406	329	2026-07-01	eval	W0	partial	acb4ccda	the per-layer LongMemEval ablation in the runner came with the harness import, recall-eval arrived whole in 99001be8; the longmemeval.yml hunk goes with the declined workflow (#326)
 in	558133f2	340	2026-07-01	storage-integrity	W7	pending		
 in	a4065957	339	2026-07-01	retrieval	W2	pending		
 in	9a1dc7a8	333	2026-07-01	graph	W3	pending		
@@ -145,17 +145,17 @@ in	fd255b8b	350	2026-07-02	ner-entities	W6	pending
 in	d054e4a1	353	2026-07-02	anomaly	W12	pending		
 in	bd478863	354	2026-07-02	anomaly	W12	pending		
 in	ec740532	356	2026-07-02	anomaly	W12	pending		
-in	4dc8bdd5	351	2026-07-02	graph	W3	pending		re-waved from W0 in triage: the counter sits in graph_memory's typed-pair collapse, graph code that veld has not ported; recall-eval prints DIRECTED_REVERSE_COLLAPSE=n/a until then (feb4a42a), and the LongMemEval-S gate workflow goes with #326
+in	4dc8bdd5	351	2026-07-02	graph	W3	pending		re-waved from W0 in triage: the counter sits in graph_memory's typed-pair collapse, graph code that veld has not ported; recall-eval prints DIRECTED_REVERSE_COLLAPSE=n/a until then (c9daf38d), and the LongMemEval-S gate workflow goes with #326
 in	530ad9c5	358	2026-07-03	retrieval	W2	pending		
 in	c8d32418	359	2026-07-03	retrieval	W2	pending		
-in	284bfd93	361	2026-07-03	infra	-	veld-layer	fce5e337	veld's docs site covers systemd: docs/src/guides/deploying.md points at packaging/linux/veld.service (fce5e337)
+in	284bfd93	361	2026-07-03	infra	-	veld-layer	514d7edf	veld's docs site covers systemd: docs/src/guides/deploying.md points at packaging/linux/veld.service (514d7edf)
 in	06e120ed	357	2026-07-03	anomaly	W12	pending		
 in	851289e5	352	2026-07-03	mcp-hooks	W9	pending		the same defects are in veld's docs: mcp-server/README.md lists a reinforce tool that index.ts does not register and keeps the old count of 47, and BENCHMARKS.md claims v0.1.5+; the counts must be veld's own
-in	f7cd364c	362	2026-07-03	http-api	W10	ported	643dbd5a	
+in	f7cd364c	362	2026-07-03	http-api	W10	ported	ead4a2d9	
 in	c2e44f09	363	2026-07-03	embeddings-vectors	W8	pending		veld's ONNX runtime directory is unversioned (get_onnx_runtime_dir, src/embeddings/downloader.rs:140) and LazyNerModel::new opens sessions without the ORT_PATH_INIT guard
 in	efe0c4e9	364	2026-07-03	graph	W3	pending		re-waved from W0 in triage: turns the PMI gate on at edge birth, a graph change veld does not have
 in	8c0e9f39	365	2026-07-03	http-api	W10	pending		
-in	f3e7f65a	366	2026-07-03	eval	W0	superseded	796e27b1	upstream's ratcheted gate numbers; veld's gate baseline is veld's own recording (796e27b1)
+in	f3e7f65a	366	2026-07-03	eval	W0	superseded	cd56cfef	upstream's ratcheted gate numbers; veld's gate baseline is veld's own recording (cd56cfef)
 in	4b81ff59	368	2026-07-03	eval	W0	declined		pins dataset revisions in upstream workflows and converters veld does not carry, and adds weekly-trend.yml; veld's recall.yml already runs weekly
 in	7c4462d1	369	2026-07-03	infra	-	declined		a one-off diagnostic for upstream issue #90: an #[ignore]d RSS probe of MiniLM and BERT-NER plus a workflow to run it on ubuntu; it changes no behaviour and gates nothing
 in	a4d65ee2	370	2026-07-03	retrieval	W2	pending		
@@ -172,22 +172,22 @@ in	b4c6d4c2	385	2026-07-10	ner-entities	W6	pending
 in	e6f49ba2	386	2026-07-10	ner-entities	W6	pending		
 in	10b6f60e	387	2026-07-10	ner-entities	W6	pending		
 in	374f67eb	388	2026-07-10	ner-entities	W6	pending		
-in	f6e326b9	393	2026-07-14	facts-todos	W5	ported	b7fff76c	
-in	bad83cae	389	2026-07-14	http-api	W10	partial	433ad8a0	causal cue extractor only
-in	162a4289	379	2026-07-14	eval	W0	partial	4d5d44d9	SHODH_DUMP_CONTEXT in run_longmemeval came with the harness import; the reader-composition workflow and benchmark (a llama-server reader over LongMemEval) are not taken, with #326
+in	f6e326b9	393	2026-07-14	facts-todos	W5	ported	f621ce2e	
+in	bad83cae	389	2026-07-14	http-api	W10	partial	fc7a5389	causal cue extractor only
+in	162a4289	379	2026-07-14	eval	W0	partial	acb4ccda	SHODH_DUMP_CONTEXT in run_longmemeval came with the harness import; the reader-composition workflow and benchmark (a llama-server reader over LongMemEval) are not taken, with #326
 in	631da3d8	380	2026-07-14	web-ui	W11	pending		
 in	fc718019	394	2026-07-14	ner-entities	W6	pending		
 in	2843d91f	399	2026-07-15	security	W1	pending		awaiting ADR 0008
-in	fed58c53	397	2026-07-15	graph	W3	pending		re-waved from W0 in triage: bridge_harness.rs and recall-eval's bridge mode are in (4d5d44d9); the topology decay, block-key and fs_matcher changes are graph work
+in	fed58c53	397	2026-07-15	graph	W3	pending		re-waved from W0 in triage: bridge_harness.rs and recall-eval's bridge mode are in (acb4ccda); the topology decay, block-key and fs_matcher changes are graph work
 in	e0469ba7	398	2026-07-15	mcp-hooks	W9	pending		
-in	51130424	400	2026-07-15	graph	W3	ported	2c3f1a59,afc83727	read-only recall, hub-cap order
+in	51130424	400	2026-07-15	graph	W3	ported	bad93a6e,67c54972	read-only recall, hub-cap order
 in	1cd66bc5	404	2026-07-15	retrieval	W2	pending		
 in	ee51a60e	381	2026-07-15	ner-entities	W6	pending		
 in	11eeb6e2	408	2026-07-15	mcp-hooks	W9	pending		
 in	2a521429	410	2026-07-15	http-api	W10	pending		
 in	981ae4d8		2026-07-15	infra	-	declined		rustfmt line-wrapping only, in handlers/state.rs is_structural_non_entity; veld's CI format job (cargo fmt --all -- --check in ci.yml) keeps veld's own copies formatted
-in	b5ca5cd6	411	2026-07-15	eval	W0	ported	a4287ed8,4abe8e7b	
-in	f113ad58	409	2026-07-15	http-api	W10	ported	a4287ed8	list paging and truncation markers
+in	b5ca5cd6	411	2026-07-15	eval	W0	ported	482c0c8b,85385557	
+in	f113ad58	409	2026-07-15	http-api	W10	ported	482c0c8b	list paging and truncation markers
 in	09518ac8	422	2026-07-29	graph	W3	pending		
 in	e31bf3fd	421	2026-07-30	storage-integrity	W7	pending		
 in	a7b09381	418	2026-07-30	robotics-geo	W12	pending		
@@ -195,7 +195,7 @@ in	fb0d3a91	419	2026-07-30	lineage	W4	pending
 in	8c68a63b	420	2026-07-30	robotics-geo	W12	pending		
 in	f4164612	424	2026-07-30	web-ui	W11	pending		
 in	c1a89cdf	417	2026-07-31	robotics-geo	W12	veld-origin		Portll PR
-in	d553b466	426	2026-08-06	retrieval	W2	pending		re-waved from W0 in triage: the graph-leg boost form A/B is in graph_retrieval.rs; the harness arm is reported unavailable until it lands (feb4a42a)
+in	d553b466	426	2026-08-06	retrieval	W2	pending		re-waved from W0 in triage: the graph-leg boost form A/B is in graph_retrieval.rs; the harness arm is reported unavailable until it lands (c9daf38d)
 in	ac3c0d4a	428	2026-08-07	mcp-hooks	W9	pending		
 in	80ecac53	429	2026-08-07	robotics-geo	W12	pending		
 in	ebaa10be	433	2026-08-07	mcp-hooks	W9	pending		
@@ -209,13 +209,13 @@ in	6e5eabb4	443	2026-08-08	robotics-geo	W12	pending
 in	c13e83e4	440	2026-08-08	graph	W3	pending		
 in	0c44040c	439	2026-08-08	ner-entities	W6	pending		
 in	64fb8c58	444	2026-08-08	web-ui	W11	pending		
-in	057aa69a	446	2026-08-08	graph	W1	ported	15e1d82f	
+in	057aa69a	446	2026-08-08	graph	W1	ported	686a39a2	
 in	b91c5e22	447	2026-08-08	retrieval	W2	pending		
 in	804985d2	448	2026-08-08	web-ui	W11	pending		
 in	0111c562	449	2026-08-08	web-ui	W11	pending		
 in	a857609d	450	2026-08-08	retrieval	W2	pending		
-in	6655b73a	442	2026-08-08	facts-todos	W5	partial	daddfcc4,8415afab	fact invalidation is carried on veld's bi-temporal fields (valid_until, superseded_by, supersedes) with no record change; working-to-session promotion is persisted; the edge-tier invariants (promoted_at, per-tier decay) are left for W3; retiring Archive, a terminal promote(), deleting demote() and RetrievalFeedback are declined: veld assigns Archive through agent tier moves and reinforce_batch takes RetrievalFeedback
-in	7b79eb2d	445	2026-08-08	facts-todos	W5	adapted	6573927c	the distill_facts guard has nothing to guard in veld, whose distill_facts had no dedup step; the shared ingest of #459 covers it
+in	6655b73a	442	2026-08-08	facts-todos	W5	partial	38723b69,7989b06a	fact invalidation is carried on veld's bi-temporal fields (valid_until, superseded_by, supersedes) with no record change; working-to-session promotion is persisted; the edge-tier invariants (promoted_at, per-tier decay) are left for W3; retiring Archive, a terminal promote(), deleting demote() and RetrievalFeedback are declined: veld assigns Archive through agent tier moves and reinforce_batch takes RetrievalFeedback
+in	7b79eb2d	445	2026-08-08	facts-todos	W5	adapted	ef1c048f	the distill_facts guard has nothing to guard in veld, whose distill_facts had no dedup step; the shared ingest of #459 covers it
 in	c25c5691	451	2026-08-08	robotics-geo	W12	pending		
 in	2bad9638	452	2026-08-08	anomaly	W12	pending		
 in	4c1b93ac	453	2026-08-08	web-ui	W11	pending		
@@ -225,99 +225,99 @@ in	e180aab1	456	2026-08-08	mcp-hooks	W9	pending
 in	d4551d59	457	2026-08-09	anomaly	W12	pending		
 in	85e35537	458	2026-08-09	anomaly	W12	pending		
 in	e1c8a06f	461	2026-08-09	graph	W3	pending		
-in	2cdc403f	459	2026-08-09	facts-todos	W5	adapted	24ceaf4e	arbitration on veld's bi-temporal fields with one atomic put_many per outcome; the graph rebuild uses veld's delete_episode, which drops the edges the episode sourced; the HTTP tests poll instead of draining task_tracker; graph wiring of distilled facts is #341 (W6)
+in	2cdc403f	459	2026-08-09	facts-todos	W5	adapted	b5c9f0cc	arbitration on veld's bi-temporal fields with one atomic put_many per outcome; the graph rebuild uses veld's delete_episode, which drops the edges the episode sourced; the HTTP tests poll instead of draining task_tracker; graph wiring of distilled facts is #341 (W6)
 in	cac4c0b3	460	2026-08-09	ner-entities	W6	pending		
 in	fe95da84	463	2026-08-09	web-ui	W11	pending		
 in	6298ce66	464	2026-08-09	lineage	W4	pending		
 in	ab787db2	468	2026-08-09	lineage	W4	pending		
-in	4baef94c	465	2026-08-09	infra	W1	partial	ad49321a	"panic = ""abort"" is gone from [profile.release] (the cargo#6313 collision with the cdylib); the fortress profile keeps it, since it builds bins only. Not taken: the python.rs toponyms initialisers wait on W6; the CI gates do not map yet: veld CI has no per-feature check loop to add python to, an --all-features check cannot pass while the zenoh feature does not compile, and veld has no recall_eval_cli test to serve as the release-graph sentinel"
+in	4baef94c	465	2026-08-09	infra	W1	partial	031e13cb	"panic = ""abort"" is gone from [profile.release] (the cargo#6313 collision with the cdylib); the fortress profile keeps it, since it builds bins only. Not taken: the python.rs toponyms initialisers wait on W6; the CI gates do not map yet: veld CI has no per-feature check loop to add python to, an --all-features check cannot pass while the zenoh feature does not compile, and veld has no recall_eval_cli test to serve as the release-graph sentinel"
 in	229f99e9	466	2026-08-09	web-ui	W11	pending		
-in	a7344bbd	467	2026-08-09	eval	W0	already-in-veld	4d5d44d9	the two-query RECALL_DIAG_K split and the --corpus/--cases overrides came with the harness import, recall-eval arrived whole in e2502e73
+in	a7344bbd	467	2026-08-09	eval	W0	already-in-veld	acb4ccda	the two-query RECALL_DIAG_K split and the --corpus/--cases overrides came with the harness import, recall-eval arrived whole in 99001be8
 in	e24b1ab3	469	2026-08-09	mcp-hooks	W9	pending		
 in	ca72b5c1	470	2026-08-09	mcp-hooks	W9	pending		
-in	90a5092b	462	2026-08-09	retrieval	W2	partial	103e60c9	repeat-stable graph-leg edge ordering (523a32ac) ported with veld's own determinism fixes; the open-domain recall changes in the rest of #462 are W2's
-in	28f9c836	471	2026-08-09	facts-todos	W5	adapted	0a36e88d	Todo.blocked_by is not added: veld's depends_on is the same structured dependency list, so blocked_by is a request alias; todos are stored as JSON, so no layout changes
+in	90a5092b	462	2026-08-09	retrieval	W2	partial	a69ace81	repeat-stable graph-leg edge ordering (523a32ac) ported with veld's own determinism fixes; the open-domain recall changes in the rest of #462 are W2's
+in	28f9c836	471	2026-08-09	facts-todos	W5	adapted	3ce0c919	Todo.blocked_by is not added: veld's depends_on is the same structured dependency list, so blocked_by is a request alias; todos are stored as JSON, so no layout changes
 in	9a3e0ef8	472	2026-08-09	web-ui	W11	pending		
 in	4baf0d3f	474	2026-08-09	infra	-	declined		configures Dependabot for upstream's repository, including /seat and /front/ui; veld has no .github/dependabot.yml, and adopting Dependabot would be a veld CI decision, not a port
 in	689a89a7	484	2026-08-09	web-ui	W11	pending		
 in	6d9b8042	425	2026-08-09	storage-integrity	W7	pending		
-in	1500ac24	486	2026-08-10	facts-todos	W5	adapted	b44dc780,73c8f79a	PrimaryMemoryStore keeps get_fact_watermark and set_fact_watermark for the _watermark: keys migrate carries; veld's three-day consolidator floor stays; the fact_yield_report instrument is ported in W0
-in	9b9ad634	416	2026-08-10	security	W1	veld-origin	f15e6840	Portll PR
+in	1500ac24	486	2026-08-10	facts-todos	W5	adapted	acdbe151,faae24e4	PrimaryMemoryStore keeps get_fact_watermark and set_fact_watermark for the _watermark: keys migrate carries; veld's three-day consolidator floor stays; the fact_yield_report instrument is ported in W0
+in	9b9ad634	416	2026-08-10	security	W1	veld-origin	4730852d	Portll PR
 in	7c34a1cd	485	2026-08-10	mcp-hooks	W9	pending		
 in	2ffa24ef	480	2026-08-10	infra	-	declined		bumps actions in upstream's 22 workflow files, 19 of which veld does not have; veld's ci.yml, recall.yml and release.yml are its own and pin checkout@v4, cache@v4 and upload-artifact@v4, so moving them is a veld CI change
 in	0ae0d8bc	488	2026-08-10	infra	-	declined		excludes ort from the Dependabot group of #474, declined; veld has no Dependabot config
 in	62d7f659	489	2026-08-10	graph	W3	pending		
-in	5a8ea858	491	2026-08-10	infra	W1	ported	431c3575	
-in	87ddbb0e	492	2026-08-11	security	W1	veld-origin	ede90e40	Portll PR
+in	5a8ea858	491	2026-08-10	infra	W1	ported	7034e1a8	
+in	87ddbb0e	492	2026-08-11	security	W1	veld-origin	505b610a	Portll PR
 in	dbfe8eba	494	2026-08-12	eval	W0	declined		fixes weekly-trend.yml from #368, declined
 in	60eece98	479	2026-08-12	retrieval	W2	pending		
 in	f9b558fa	495	2026-08-13	web-ui	W11	pending		
 in	ce655e94	500	2026-08-14	infra	-	declined		upstream maintainer's agent rule for their own checkout (worktrees under kalki-v2/.claude/worktrees); veld keeps its own CLAUDE.md
 in	2b94deeb	496	2026-08-14	embeddings-vectors	W8	pending		
-in	c6dd561a	502	2026-08-14	infra	-	declined		veld already at or past all 58 versions in the group (tokio 1.53.1, uuid 1.26.0, serde_json 1.0.151 and the rest), and holds zenoh at 1.8.0 with lz4_flex 0.11.6 (f781e82d)
+in	c6dd561a	502	2026-08-14	infra	-	declined		veld already at or past all 58 versions in the group (tokio 1.53.1, uuid 1.26.0, serde_json 1.0.151 and the rest), and holds zenoh at 1.8.0 with lz4_flex 0.11.6 (fafac7a3)
 in	98c6e486	501	2026-08-14	web-ui	W11	pending		
-in	0d796f9e	514	2026-08-29	embeddings-vectors	W8	partial	a3e4178b	carries #513 through its merge dae86722: the ENFORCE_HTTPS default (9e3a954e) is ported, with the Linear and GitHub clients wired to the guard veld never called and the embedder kept on its own switch; #514's Vamana insert pruning and the rest of #513 (ablation module, vacuity guard, sharded LongMemEval) are pending, W8 and W0
-in	d892dfef	520	2026-08-29	eval	W0	partial	8c639a7e	locomo_mc10_eval abstains instead of scoring an unanswered judge as option 0; its larger judge budget was already in veld (26722a07); benchmarks/locomo_layer_eval.py is not in veld
+in	0d796f9e	514	2026-08-29	embeddings-vectors	W8	partial	8b81a32a	carries #513 through its merge dae86722: the ENFORCE_HTTPS default (9e3a954e) is ported, with the Linear and GitHub clients wired to the guard veld never called and the embedder kept on its own switch; #514's Vamana insert pruning and the rest of #513 (ablation module, vacuity guard, sharded LongMemEval) are pending, W8 and W0
+in	d892dfef	520	2026-08-29	eval	W0	partial	a4a2917c	locomo_mc10_eval abstains instead of scoring an unanswered judge as option 0; its larger judge budget was already in veld (438a9869); benchmarks/locomo_layer_eval.py is not in veld
 in	844d4358	493	2026-08-29	embeddings-vectors	W8	pending		
 in	0966441b	516	2026-08-29	web-ui	W11	pending		bumps front/ui, the React app W11 brings in; veld has no front/, so this closes with W11's import of front/ at upstream's current state
 in	e82b7149	523	2026-08-29	web-ui	W11	pending		
-in	41c2bd08	506	2026-08-29	infra	W1	ported	13d84ce9	
+in	41c2bd08	506	2026-08-29	infra	W1	ported	28316395	
 in	3eb23f1b	498	2026-08-29	embeddings-vectors	W8	pending		
 in	171ae467	503	2026-08-29	graph	W3	pending		re-waved from W0 in triage: outcome-gated coactivation changes graph writes on recall
 in	699033ca	504	2026-08-29	ner-entities	W6	pending		
 in	c94570e0	505	2026-08-29	lineage	W4	pending		
-in	6a7028fa	508	2026-08-30	facts-todos	W5	ported	a5b6d018	
+in	6a7028fa	508	2026-08-30	facts-todos	W5	ported	11fb9b32	
 in	8aad89b6	525	2026-08-31	graph	W3	pending		
-in	49bd8088	524	2026-08-31	eval	W0	ported	9e5c5e85	scripts/test_recall_diff.py and the suite input; the renderer change arrived with recall-eval (e2502e73). The held-out suite runs ungated in veld
-in	16269ca3	528	2026-08-31	eval	W0	already-in-veld	4d5d44d9	guard_ner_backend at the ingest chokepoint came with the harness import; the workflow hunks belong to graph-lever-confound.yml and locomo-recall.yml, which veld does not carry
-in	69a17d96	529	2026-08-31	eval	W0	partial	4d5d44d9	pinning in build_manager and the graph census came with the harness import; scripts/audit.py is not taken: veld's every_ablation_arm_flag_is_read_in_src_or_declared_unavailable test checks arm flags against src; graph-lever-confound.yml is not carried
-in	b3e27c74	530	2026-09-01	eval	W0	already-in-veld	4d5d44d9	the relation-substrate census came with the harness import; the workflow hunks belong to workflows veld does not carry
-in	8eb277ec	531	2026-09-01	eval	W0	already-in-veld	4d5d44d9	the connectivity probe came with the harness import, taken at this commit's revision
+in	49bd8088	524	2026-08-31	eval	W0	ported	0e092619	scripts/test_recall_diff.py and the suite input; the renderer change arrived with recall-eval (99001be8). The held-out suite runs ungated in veld
+in	16269ca3	528	2026-08-31	eval	W0	already-in-veld	acb4ccda	guard_ner_backend at the ingest chokepoint came with the harness import; the workflow hunks belong to graph-lever-confound.yml and locomo-recall.yml, which veld does not carry
+in	69a17d96	529	2026-08-31	eval	W0	partial	acb4ccda	pinning in build_manager and the graph census came with the harness import; scripts/audit.py is not taken: veld's every_ablation_arm_flag_is_read_in_src_or_declared_unavailable test checks arm flags against src; graph-lever-confound.yml is not carried
+in	b3e27c74	530	2026-09-01	eval	W0	already-in-veld	acb4ccda	the relation-substrate census came with the harness import; the workflow hunks belong to workflows veld does not carry
+in	8eb277ec	531	2026-09-01	eval	W0	already-in-veld	acb4ccda	the connectivity probe came with the harness import, taken at this commit's revision
 in	63a61e42	537	2026-09-04	web-ui	W11	pending		
-in	b0ba1c5e	518	2026-09-04	security	W1	veld-origin	4d50116c,49a1519	Portll PR; upstream port of veld 49a1519, taken back as 4d50116c
-in	6272430f	538	2026-09-04	graph	W3	ported	29108a10,7aa8336c	
-in	501d522f	539	2026-09-06	robotics-geo	W12	partial	f781e82d	zenoh held at 1.8.0 for RUSTSEC-2026-0041; the other dependency moves are not taken
+in	b0ba1c5e	518	2026-09-04	security	W1	veld-origin	3152d8cd,636f7d7	Portll PR; upstream port of veld 636f7d7, taken back as 3152d8cd
+in	6272430f	538	2026-09-04	graph	W3	ported	68f98a5a,585b11ef	
+in	501d522f	539	2026-09-06	robotics-geo	W12	partial	fafac7a3	zenoh held at 1.8.0 for RUSTSEC-2026-0041; the other dependency moves are not taken
 in	14ab7944	536	2026-09-06	retrieval	W2	pending		
 in	a2dab9de	541	2026-09-06	embeddings-vectors	W8	pending		
 in	6aa48bd5	534	2026-09-06	graph	W3	pending		
-in	c6411e3e	535	2026-09-07	eval	W0	partial	773b66c0	the degree census and the dispatch concurrency group are in; the nested-flag check extends scripts/audit.py, which veld does not carry, and the other eleven workflows are not veld's
+in	c6411e3e	535	2026-09-07	eval	W0	partial	dc886367	the degree census and the dispatch concurrency group are in; the nested-flag check extends scripts/audit.py, which veld does not carry, and the other eleven workflows are not veld's
 in	5f65ce44	497	2026-09-07	retrieval	W2	pending		
 in	a292546f	509	2026-09-08	graph	W3	pending		
 in	d475062e	545	2026-09-10	eval	W0	declined		shards longmemeval.yml from #326, declined
 in	3a3395f1	532	2026-09-10	storage-integrity	W7	pending		
-in	a724b862	548	2026-09-13	eval	W0	adapted	171723fd	reference-paired deltas, bootstrap intervals, per-case rows, the trailing baseline replicate, the preset-key refusal and the eval caps are in. veld's baseline reranks with the cross-encoder, so upstream's +ce operating point is veld's baseline and one -ce arm turns the dial off; -bm25, -spreading and leg=* are reported unavailable (no switch in recall.rs), and -boost-stack is unavailable under read-only recall. The matrix refuses to run when the cross-encoder does not load. locomo-recall.yml is not carried
+in	a724b862	548	2026-09-13	eval	W0	adapted	0a6a716a	reference-paired deltas, bootstrap intervals, per-case rows, the trailing baseline replicate, the preset-key refusal and the eval caps are in. veld's baseline reranks with the cross-encoder, so upstream's +ce operating point is veld's baseline and one -ce arm turns the dial off; -bm25, -spreading and leg=* are reported unavailable (no switch in recall.rs), and -boost-stack is unavailable under read-only recall. The matrix refuses to run when the cross-encoder does not load. locomo-recall.yml is not carried
 in	fbcc0c98	554	2026-09-21	security	W1	veld-origin		Portll PR
 in	e44fdce6	546	2026-09-21	retrieval	W2	veld-origin		Portll PR
 in	8d371432	551	2026-09-21	eval	W0	veld-origin		Portll PR
-in	928c728c	549	2026-09-21	storage-integrity	W7	veld-origin	7aa8336c	Portll PR
-in	66b9e209	550	2026-09-22	facts-todos	W5	veld-origin	b7fff76c	Portll PR
-in	355e0b72	559	2026-09-22	storage-integrity	W7	adapted	7a2e987a	both log_event spawn sites run on the task tracker as upstream; the test lives in handlers/state.rs and checks the audit store on both engines (and the shared RocksDB); the sources.rs lease-test drain has no counterpart, since veld has no source store (W7)
+in	928c728c	549	2026-09-21	storage-integrity	W7	veld-origin	585b11ef	Portll PR
+in	66b9e209	550	2026-09-22	facts-todos	W5	veld-origin	f621ce2e	Portll PR
+in	355e0b72	559	2026-09-22	storage-integrity	W7	adapted	9c90e033	both log_event spawn sites run on the task tracker as upstream; the test lives in handlers/state.rs and checks the audit store on both engines (and the shared RocksDB); the sources.rs lease-test drain has no counterpart, since veld has no source store (W7)
 in	cef67213	560	2026-09-22	graph	W3	pending		
-in	486a9d95	561	2026-09-22	eval	W0	adapted	c1e5bc99	the per-case diff and its tests are in; the per-case baseline is veld's own, from recording run 37485608452, and upstream's baseline regeneration is not taken
+in	486a9d95	561	2026-09-22	eval	W0	adapted	832caf61	the per-case diff and its tests are in; the per-case baseline is veld's own, from recording run 37485608452, and upstream's baseline regeneration is not taken
 in	cf886355	562	2026-09-22	retrieval	W2	pending		
 in	14f4239a	564	2026-09-22	http-api	W10	pending		
-in	681b2d8d	563	2026-09-23	eval	W0	partial	5acf877e	the timed and diagnostic recalls run in separate loops, and the gate refuses to run when the cross-encoder does not load. Not in: rerank_input_pool and the funnel's stage capture, which need memory/recall.rs, which the cobolwork-de session (fix/hebbian-learned) is rewriting; the stable BM25 cut and the content-keyed RRF tie-break, ranking changes for W2; stage timing in the gate, which needs #497 (W2)
+in	681b2d8d	563	2026-09-23	eval	W0	partial	5aae873e	the timed and diagnostic recalls run in separate loops, and the gate refuses to run when the cross-encoder does not load. Not in: rerank_input_pool and the funnel's stage capture, which need memory/recall.rs, which the cobolwork-de session (fix/hebbian-learned) is rewriting; the stable BM25 cut and the content-keyed RRF tie-break, ranking changes for W2; stage timing in the gate, which needs #497 (W2)
 in	95be77fe	566	2026-09-24	retrieval	W2	pending		
-in	d629d659	568	2026-09-24	eval	W0	adapted	7f8a5380	reports record the rerank setting (dial, cross-encoder id, budget cap) and compare_to_baseline refuses a pair whose settings differ or are unrecorded; veld's setting is the use_reranking dial and its cap, not SHODH_CE_RERANK and SHODH_CE_DEPTH
+in	d629d659	568	2026-09-24	eval	W0	adapted	fab07f23	reports record the rerank setting (dial, cross-encoder id, budget cap) and compare_to_baseline refuses a pair whose settings differ or are unrecorded; veld's setting is the use_reranking dial and its cap, not SHODH_CE_RERANK and SHODH_CE_DEPTH
 in	18df072a	567	2026-09-25	eval	W0	pending		waiting: the per-leg stage capture with scores and the ce stage it exports are calls in memory/recall.rs, which the cobolwork-de session (fix/hebbian-learned) is rewriting; scripts/stage_diff.py compares nothing without them
 in	2c3eb049	569	2026-09-25	retrieval	W2	pending		
-in	8ccaf6ab	570	2026-09-26	eval	W0	adapted	6ab967ec,40dea81d	model_tape.rs and its MiniLM, cross-encoder and neural-NER hooks, the harness's record-mode checks and the workflow inputs are in. veld's shipped NER is rule-based code, so NER is taped only when the neural model loads, and only the models that loaded are required; the HTTP and Nomic embedders are not taped; the recording skips the pre-warm pair as it skips the load probe (976e9f86)
+in	8ccaf6ab	570	2026-09-26	eval	W0	adapted	e31e5111,34c44668	model_tape.rs and its MiniLM, cross-encoder and neural-NER hooks, the harness's record-mode checks and the workflow inputs are in. veld's shipped NER is rule-based code, so NER is taped only when the neural model loads, and only the models that loaded are required; the HTTP and Nomic embedders are not taped; the recording skips the pre-warm pair as it skips the load probe (976e9f86)
 in	d6dd1ce7	571	2026-09-27	retrieval	W2	pending		
-in	93a29ba7	572	2026-09-27	eval	W0	adapted	80f18ff9	the held-out suite gets the job maximum of 360 minutes; veld's suite input came with #524's port
-in	f22faa2e	574	2026-09-27	eval	W0	adapted	0f884b32	reports record the tape they replayed and compare_to_baseline refuses a live run against a replay, or two tapes; the workflow replays the tape pinned in tests/recall/model-tape.json and runs live while no pin exists. veld has no kernel-class check (#566, W2), so there is none to skip
+in	93a29ba7	572	2026-09-27	eval	W0	adapted	06415c9a	the held-out suite gets the job maximum of 360 minutes; veld's suite input came with #524's port
+in	f22faa2e	574	2026-09-27	eval	W0	adapted	7d964609	reports record the tape they replayed and compare_to_baseline refuses a live run against a replay, or two tapes; the workflow replays the tape pinned in tests/recall/model-tape.json and runs live while no pin exists. veld has no kernel-class check (#566, W2), so there is none to skip
 in	902daf83	573	2026-09-27	ner-entities	W6	pending		
 out	c1098786	284	2026-06-05	security	-	merged		
-out	9b9ad634	416	2026-08-09	security	-	merged	f15e6840	
+out	9b9ad634	416	2026-08-09	security	-	merged	4730852d	
 out	c1a89cdf	417	2026-07-31	robotics-geo	-	merged		
-out	87ddbb0e	492	2026-08-11	security	-	merged	ede90e40	
-out	b0ba1c5e	518	2026-09-04	security	-	merged	49a1519	
+out	87ddbb0e	492	2026-08-11	security	-	merged	505b610a	
+out	b0ba1c5e	518	2026-09-04	security	-	merged	636f7d7	
 out	e44fdce6	546	2026-09-21	eval	-	merged		
-out	928c728c	549	2026-09-21	retrieval	-	merged	7aa8336c	
-out	66b9e209	550	2026-09-21	facts-todos	-	merged	b7fff76c	
+out	928c728c	549	2026-09-21	retrieval	-	merged	585b11ef	
+out	66b9e209	550	2026-09-21	facts-todos	-	merged	f621ce2e	
 out	8d371432	551	2026-09-21	eval	-	merged		
 out	fbcc0c98	554	2026-09-21	security	-	merged		
 out		318	2026-06-05	security	-	open		encryption-v2 crypto core
 out		555	2026-09-15	security	-	open		encryption crypto core
-out		556	2026-09-15	embeddings-vectors	-	open	0e8df63e	SPANN insert after load_from_file
+out		556	2026-09-15	embeddings-vectors	-	open	c9953577	SPANN insert after load_from_file
 out		285	2026-06-06	security	-	closed		superseded by the encryption-core PRs
 out		519	2026-09-06	infra	-	closed		superseded by #554 and #539

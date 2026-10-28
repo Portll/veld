@@ -24,7 +24,7 @@ so a reader can tell a redb fault from a leader fault.
 | | |
 |---|---|
 | Start | 2026-10-21T13:29Z |
-| Build | main `1b767103`, built 2026-10-21T13:02:45Z, carrying `feat/redb-parity` (`5c225c5e`) and the index tables, content-hash layout and parity fixes from the redb-equivalence plan |
+| Build | main `90572ea9`, built 2026-10-21T13:02:45Z, carrying `feat/redb-parity` (`c76548ec`) and the index tables, content-hash layout and parity fixes from the redb-equivalence plan |
 | End of window | 2026-11-04 |
 
 Earlier replica time (2026-10-19 to 13:29Z today) ran the 0.8.4+1 build of 2026-10-20 and does
