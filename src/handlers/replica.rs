@@ -1,0 +1,941 @@
+//! What a follower serves, and `GET /api/replication/role`.
+//!
+//! A follower holds the leader's memory records and nothing else (the follower
+//! applies only memory frames; see `crate::replication`), and only those frames may
+//! write to it. [`guard`] is the one place that decides, by route, what a client
+//! request does on a follower:
+//!
+//! - [`Access::Write`] changes state replication owns, or state the follower
+//!   would keep apart from its leader: refused with 503 `READ_ONLY_REPLICA`.
+//! - [`Access::NotReplicated`] reads a store replication does not carry, which on
+//!   a follower is empty or stale: refused with 503 `NOT_REPLICATED`.
+//! - [`Access::Read`] reads memory records or this process's own runtime state.
+//! - [`Access::Local`] writes only this instance's own operational state (its
+//!   logins, keyring, backups and the replication controls), which no leader owns.
+//!
+//! Every protected route is listed in [`ROUTES`]; a test holds the list to the
+//! routes `build_protected_routes` mounts, so a new route cannot go unclassified.
+//! On a leader or a standalone instance the guard passes every request through.
+
+use axum::{
+    extract::{MatchedPath, Request, State},
+    http::{header::RETRY_AFTER, HeaderValue, Method, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde_json::json;
+
+use super::router::AppState;
+use crate::auth::ApiKeyVerified;
+use crate::replication::{LeaderRef, RoleReport};
+
+pub const READ_ONLY_REPLICA: &str = "READ_ONLY_REPLICA";
+pub const NOT_REPLICATED: &str = "NOT_REPLICATED";
+/// Seconds this follower was behind its leader when it last reached it; see
+/// `FollowStatus::lag_seconds`. Absent until the follower has caught up once.
+pub const LAG_HEADER: &str = "x-veld-replica-lag-seconds";
+/// A follower stays one until an operator unfollows it, so a refused client is told
+/// to wait rather than retry at once.
+pub const RETRY_AFTER_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Read,
+    Write,
+    NotReplicated,
+    Local,
+}
+
+use Access::{Local, NotReplicated, Read, Write};
+
+/// Every route `build_protected_routes` mounts, by method and path template.
+pub const ROUTES: &[(&str, &str, Access)] = &[
+    ("GET", "/metrics", Read),
+    // User auth: this instance's own logins, sessions and keyring.
+    ("POST", "/api/user_auth/2fa/enroll", Local),
+    ("POST", "/api/user_auth/2fa/confirm", Local),
+    ("POST", "/api/user_auth/logout", Local),
+    ("POST", "/api/user_auth/admin/promote", Local),
+    ("POST", "/api/user_auth/admin/demote", Local),
+    ("POST", "/api/user_auth/sessions/revoke_all", Local),
+    ("POST", "/api/user_auth/sessions/revoke_mine", Local),
+    ("GET", "/api/user_auth/me", Local),
+    ("POST", "/api/user_auth/password", Local),
+    ("POST", "/api/user_auth/recovery_codes", Local),
+    ("POST", "/api/user_auth/sessions/revoke", Local),
+    ("GET", "/api/user_auth/admin/users", Local),
+    ("POST", "/api/user_auth/admin/users/disable", Local),
+    ("POST", "/api/user_auth/admin/users/enable", Local),
+    ("POST", "/api/user_auth/admin/users/reset_password", Local),
+    ("POST", "/api/user_auth/admin/users/reset_2fa", Local),
+    ("POST", "/api/user_auth/admin/users/unlock", Local),
+    ("GET", "/api/user_auth/admin/sessions", Local),
+    ("POST", "/api/user_auth/admin/sessions/revoke", Local),
+    ("GET", "/api/user_auth/admin/audit", Local),
+    ("GET", "/api/user_auth/admin/keys/status", Local),
+    ("POST", "/api/user_auth/admin/keys/init", Local),
+    ("POST", "/api/user_auth/admin/keys/recovery_codes", Local),
+    ("POST", "/api/user_auth/admin/keys/revoke", Local),
+    ("POST", "/api/user_auth/admin/keys/rotate_passphrase", Local),
+    ("POST", "/api/user_auth/admin/keys/rotate_data_keys", Local),
+    (
+        "POST",
+        "/api/user_auth/admin/keys/rotate_master_keys",
+        Local,
+    ),
+    ("POST", "/api/user_auth/admin/keys/factors", Local),
+    ("POST", "/api/user_auth/admin/keys/passkey", Local),
+    ("GET", "/api/user_auth/admin/keys/passkey/{ticket}", Local),
+    ("POST", "/api/user_auth/register", Local),
+    ("POST", "/api/user_auth/login", Local),
+    ("POST", "/api/user_auth/recover", Local),
+    ("GET", "/api/user_auth/keys/passkey/{ticket}", Local),
+    ("POST", "/api/user_auth/keys/passkey/{ticket}/result", Local),
+    ("ANY", "/api/user_auth/{*path}", Local),
+    ("GET", "/api/health/ready", Read),
+    ("GET", "/api/health/index", Read),
+    // Claude session status: posted by hooks, held in memory, never replicated.
+    ("GET", "/api/context/sse", NotReplicated),
+    ("GET", "/api/context/status", NotReplicated),
+    ("POST", "/api/context/status", Write),
+    ("GET", "/api/context_status", NotReplicated),
+    ("POST", "/api/context_status", Write),
+    ("POST", "/webhook/linear", Write),
+    ("POST", "/webhook/github", Write),
+    ("POST", "/api/remember", Write),
+    ("POST", "/api/remember/batch", Write),
+    ("POST", "/api/batch_remember", Write),
+    ("POST", "/api/upsert", Write),
+    ("POST", "/api/ingest", Write),
+    ("POST", "/api/seed", Write),
+    ("GET", "/api/ui/tags", Read),
+    ("GET", "/api/ui/recall-log", Read),
+    ("GET", "/api/ui/knows", Read),
+    // Recall's usage writes are off on a follower (`MultiUserMemoryManager::recall_readonly`).
+    ("POST", "/api/recall", Read),
+    ("POST", "/api/recall/tracked", Read),
+    ("POST", "/api/recall/tags", Read),
+    ("POST", "/api/recall/by-tags", Read),
+    ("POST", "/api/recall/date", Read),
+    ("POST", "/api/context_summary", Read),
+    ("POST", "/api/proactive_context", Read),
+    ("POST", "/api/context", Read),
+    ("POST", "/api/relevant", Read),
+    ("POST", "/api/reinforce", Write),
+    ("POST", "/api/prompt/gen", Read),
+    ("POST", "/api/prompt/generate", Read),
+    ("POST", "/api/entity/resolve", NotReplicated),
+    ("POST", "/api/entity/attribute", Write),
+    ("POST", "/api/entity/merge", Write),
+    ("POST", "/api/entity/alias", Write),
+    ("GET", "/api/memory/by-external-id", Read),
+    ("GET", "/api/memory/{memory_id}", Read),
+    ("GET", "/api/memories/{memory_id}", Read),
+    ("GET", "/api/memory/{memory_id}/health", Read),
+    ("PUT", "/api/memory/{memory_id}", Write),
+    ("DELETE", "/api/memory/{memory_id}", Write),
+    ("DELETE", "/api/forget/{memory_id}", Write),
+    ("GET", "/api/list/{user_id}", Read),
+    ("POST", "/api/memories", Read),
+    ("GET", "/api/memories", Read),
+    ("GET", "/api/memories/count", Read),
+    ("POST", "/api/memories/bulk", Write),
+    ("POST", "/api/memories/clear", Write),
+    ("POST", "/api/anchor", Write),
+    // Render applies Obsidian edits back to the store.
+    ("POST", "/api/wiki/render", Write),
+    ("POST", "/api/file_answer", Write),
+    ("POST", "/api/memory/merge", Write),
+    ("POST", "/api/memory/split", Write),
+    ("POST", "/api/memory/tier", Write),
+    ("POST", "/api/forget", Write),
+    ("POST", "/api/forget/age", Write),
+    ("POST", "/api/forget/importance", Write),
+    ("POST", "/api/forget/pattern", Write),
+    ("POST", "/api/forget/tags", Write),
+    ("POST", "/api/forget/date", Write),
+    ("GET", "/api/users", Read),
+    ("GET", "/api/users/{user_id}/stats", Read),
+    ("DELETE", "/api/users/{user_id}", Write),
+    ("GET", "/api/stats", Read),
+    ("POST", "/api/memory/compress", Write),
+    ("POST", "/api/memory/decompress", Write),
+    ("GET", "/api/storage/stats", Read),
+    ("POST", "/api/admin/storage/export", Read),
+    ("POST", "/api/admin/storage/import", Write),
+    ("POST", "/api/admin/storage/migrate", Write),
+    ("GET", "/api/admin/replication/status", Read),
+    ("GET", "/api/admin/replication/records", Read),
+    // Unfollowing is how an operator promotes a follower.
+    ("POST", "/api/admin/replication/follow", Local),
+    ("POST", "/api/admin/replication/unfollow", Local),
+    ("POST", "/api/search/advanced", Read),
+    ("POST", "/api/storage/uncompressed", Read),
+    ("POST", "/api/index/verify", Read),
+    ("POST", "/api/index/repair", Write),
+    ("POST", "/api/index/rebuild", Write),
+    ("POST", "/api/index/reembed", Write),
+    ("GET", "/api/embeddings/backlog", Read),
+    ("POST", "/api/embeddings/backlog/drain", Write),
+    ("POST", "/api/storage/cleanup", Write),
+    ("POST", "/api/storage/migrate", Write),
+    ("POST", "/api/consolidate", Write),
+    ("POST", "/api/consolidation/sleep", Write),
+    // Consolidation runs on the leader; its events are not carried.
+    ("POST", "/api/consolidation/report", NotReplicated),
+    ("GET", "/api/consolidation/events", NotReplicated),
+    // A backup reads this instance's store and changes no record.
+    ("POST", "/api/backup/create", Local),
+    ("POST", "/api/backup/list", Read),
+    ("POST", "/api/backups", Read),
+    ("POST", "/api/backup/verify", Read),
+    ("POST", "/api/backup/purge", Local),
+    ("POST", "/api/backups/purge", Local),
+    ("POST", "/api/backup/restore", Write),
+    ("POST", "/api/facts/list", NotReplicated),
+    ("POST", "/api/facts/search", NotReplicated),
+    ("POST", "/api/facts/by-entity", NotReplicated),
+    ("POST", "/api/facts/stats", NotReplicated),
+    ("POST", "/api/facts/narratives", NotReplicated),
+    ("POST", "/api/facts/preview-purge", NotReplicated),
+    ("POST", "/api/facts/purge", Write),
+    ("POST", "/api/facts/temporal", NotReplicated),
+    ("POST", "/api/facts/temporal/search", NotReplicated),
+    ("GET", "/api/context/blocks", NotReplicated),
+    ("GET", "/api/context/blocks/{key}", NotReplicated),
+    ("PUT", "/api/context/blocks/{key}", Write),
+    ("DELETE", "/api/context/blocks/{key}", Write),
+    ("POST", "/api/sleep_time/enqueue", Write),
+    ("GET", "/api/sleep_time/status", Read),
+    ("GET", "/api/sleep_time/status/{user_id}", Read),
+    ("POST", "/api/sleep_time/lock_block", Write),
+    ("POST", "/api/lineage/trace", NotReplicated),
+    ("POST", "/api/lineage/edges", NotReplicated),
+    ("POST", "/api/lineage/confirm", Write),
+    ("POST", "/api/lineage/reject", Write),
+    ("POST", "/api/lineage/link", Write),
+    ("POST", "/api/lineage/stats", NotReplicated),
+    ("POST", "/api/lineage/branches", NotReplicated),
+    ("POST", "/api/lineage/branch", Write),
+    // The knowledge graph and tag provenance are not journaled.
+    ("GET", "/api/graph/{user_id}/stats", NotReplicated),
+    ("GET", "/api/graph/{user_id}/universe", NotReplicated),
+    ("DELETE", "/api/graph/{user_id}/clear", Write),
+    ("POST", "/api/graph/{user_id}/rebuild", Write),
+    ("POST", "/api/graph/entity/find", NotReplicated),
+    ("DELETE", "/api/graph/entity/delete", Write),
+    ("POST", "/api/graph/entities/all", NotReplicated),
+    ("POST", "/api/graph/entities/frequency", NotReplicated),
+    ("POST", "/api/graph/tags/stamped-cores", NotReplicated),
+    ("POST", "/api/graph/relationship/invalidate", Write),
+    ("POST", "/api/graph/traverse", NotReplicated),
+    ("POST", "/api/graph/episode/get", NotReplicated),
+    ("POST", "/api/gap/analyze", Read),
+    ("POST", "/api/gap/stats", Read),
+    ("POST", "/api/gap/voronoi", Read),
+    ("POST", "/api/gap/persistence", Read),
+    ("POST", "/api/gap/mapper", Read),
+    ("POST", "/api/graph/entity/add", Write),
+    ("POST", "/api/graph/relationship/add", Write),
+    ("GET", "/api/brain/{user_id}", Read),
+    ("GET", "/api/graph/data/{user_id}", NotReplicated),
+    ("GET", "/api/visualization/{user_id}/stats", Read),
+    ("GET", "/api/visualization/{user_id}/dot", Read),
+    ("POST", "/api/visualization/build", Read),
+    ("POST", "/api/todos", NotReplicated),
+    ("POST", "/api/todos/list", NotReplicated),
+    ("POST", "/api/todos/add", Write),
+    ("POST", "/api/todos/update", Write),
+    ("POST", "/api/todos/complete", Write),
+    ("POST", "/api/todos/delete", Write),
+    ("POST", "/api/todos/reorder", Write),
+    ("POST", "/api/todos/due", NotReplicated),
+    ("GET", "/api/todos/{todo_id}", NotReplicated),
+    ("DELETE", "/api/todos/{todo_id}", Write),
+    ("POST", "/api/todos/{todo_id}/update", Write),
+    ("POST", "/api/todos/{todo_id}/complete", Write),
+    ("POST", "/api/todos/{todo_id}/reorder", Write),
+    ("GET", "/api/todos/{todo_id}/subtasks", NotReplicated),
+    ("GET", "/api/todos/{todo_id}/dependents", NotReplicated),
+    (
+        "GET",
+        "/api/todos/{todo_id}/dependency_chain",
+        NotReplicated,
+    ),
+    ("POST", "/api/todos/ready", NotReplicated),
+    ("GET", "/api/todos/{todo_id}/comments", NotReplicated),
+    ("POST", "/api/todos/{todo_id}/comments", Write),
+    ("PUT", "/api/todos/{todo_id}/comments/{comment_id}", Write),
+    (
+        "POST",
+        "/api/todos/{todo_id}/comments/{comment_id}/update",
+        Write,
+    ),
+    (
+        "DELETE",
+        "/api/todos/{todo_id}/comments/{comment_id}",
+        Write,
+    ),
+    ("POST", "/api/todos/stats", NotReplicated),
+    ("POST", "/api/projects", Write),
+    ("POST", "/api/projects/list", NotReplicated),
+    ("POST", "/api/projects/add", Write),
+    ("GET", "/api/projects/{project_id}", NotReplicated),
+    ("DELETE", "/api/projects/{project_id}", Write),
+    ("POST", "/api/projects/{project_id}/update", Write),
+    ("POST", "/api/projects/{project_id}/delete", Write),
+    ("POST", "/api/projects/{project_id}/files", NotReplicated),
+    ("POST", "/api/projects/{project_id}/scan", NotReplicated),
+    ("POST", "/api/projects/{project_id}/index", Write),
+    (
+        "POST",
+        "/api/projects/{project_id}/files/search",
+        NotReplicated,
+    ),
+    ("GET", "/api/files/stats", NotReplicated),
+    ("POST", "/api/reminders", NotReplicated),
+    ("POST", "/api/reminders/set", Write),
+    ("POST", "/api/remind", Write),
+    ("POST", "/api/reminders/due", NotReplicated),
+    ("POST", "/api/reminders/check", NotReplicated),
+    ("POST", "/api/reminders/context", NotReplicated),
+    ("POST", "/api/reminders/{reminder_id}/dismiss", Write),
+    ("POST", "/api/reminders/{reminder_id}/delete", Write),
+    ("POST", "/api/sessions", NotReplicated),
+    ("GET", "/api/sessions/stats", NotReplicated),
+    ("POST", "/api/sessions/end", Write),
+    ("GET", "/api/sessions/{session_id}", NotReplicated),
+    ("GET", "/api/ab/tests", NotReplicated),
+    ("POST", "/api/ab/tests", Write),
+    ("GET", "/api/ab/tests/{test_id}", NotReplicated),
+    ("DELETE", "/api/ab/tests/{test_id}", Write),
+    ("POST", "/api/ab/tests/{test_id}/start", Write),
+    ("POST", "/api/ab/tests/{test_id}/pause", Write),
+    ("POST", "/api/ab/tests/{test_id}/resume", Write),
+    ("POST", "/api/ab/tests/{test_id}/complete", Write),
+    ("GET", "/api/ab/tests/{test_id}/analyze", NotReplicated),
+    ("POST", "/api/ab/tests/{test_id}/impression", Write),
+    ("POST", "/api/ab/tests/{test_id}/click", Write),
+    ("POST", "/api/ab/tests/{test_id}/feedback", Write),
+    ("GET", "/api/ab/summary", NotReplicated),
+    ("POST", "/api/spine/dimensions", Write),
+    ("POST", "/api/sleight/dimensions", Write),
+    // The dials this process recalls with; tuning them would set it apart from its leader.
+    ("GET", "/api/dials", Read),
+    ("PUT", "/api/dials", Write),
+    ("GET", "/api/dials/schema", Read),
+    ("POST", "/api/external/dimensions", Write),
+    ("POST", "/api/wintermute/dimensions", Write),
+    ("POST", "/api/sync/linear", Write),
+    ("POST", "/api/sync/github", Write),
+    ("GET", "/api/context/monitor", Read),
+    ("GET", "/api/events/sse", Read),
+    ("GET", "/api/events", Read),
+    // The streaming WebSocket ingests memories.
+    ("GET", "/api/stream", Write),
+    ("POST", "/api/search/multimodal", Read),
+    ("POST", "/api/search/robotics", Read),
+    ("POST", "/api/datasets", Write),
+    ("GET", "/api/datasets", NotReplicated),
+    ("GET", "/api/datasets/{name}", NotReplicated),
+    ("DELETE", "/api/datasets/{name}", Write),
+    ("POST", "/api/datasets/{name}/rows", Write),
+    ("POST", "/api/datasets/{name}/query", NotReplicated),
+    ("POST", "/api/datasets/{name}/link", Write),
+    ("POST", "/api/query/plan", Read),
+    ("POST", "/api/query/execute", Read),
+    ("POST", "/api/export/mif", Read),
+    ("POST", "/api/import/mif", Write),
+    ("GET", "/api/mif/adapters", Read),
+    ("GET", "/api/replication/role", Read),
+];
+
+/// How `method` on the route template `path` is treated on a follower. A route the
+/// table does not name is a read when it is a GET and a write otherwise.
+pub fn access(method: &Method, path: &str) -> Access {
+    let method = if *method == Method::HEAD {
+        "GET"
+    } else {
+        method.as_str()
+    };
+    let named = |m: &str| {
+        ROUTES
+            .iter()
+            .find(|(rm, rp, _)| *rm == m && *rp == path)
+            .map(|(_, _, access)| *access)
+    };
+    named(method)
+        .or_else(|| named("ANY"))
+        .unwrap_or(if method == "GET" { Read } else { Write })
+}
+
+/// A 503 that tells the client to go to the leader. The leader is named only to a
+/// caller whose API key was verified: webhooks reach this layer without one.
+fn refusal(code: &str, message: &str, leader: &LeaderRef, name_leader: bool) -> Response {
+    let mut body = json!({ "code": code, "message": message });
+    if name_leader {
+        body["leader"] = json!({ "instance_id": leader.instance_id, "url": leader.url });
+    }
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECS));
+    response
+}
+
+/// Applied to every protected route. On a follower it refuses writes and reads of
+/// unreplicated stores, and stamps [`LAG_HEADER`] on authenticated responses.
+pub async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let Some(leader) = state.replication.leader() else {
+        return next.run(request).await;
+    };
+    let verified = request.extensions().get::<ApiKeyVerified>().is_some();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| access(request.method(), path.as_str()));
+    let mut response = match route {
+        Some(Write) => refusal(
+            READ_ONLY_REPLICA,
+            "this instance is a read-only replica; send writes to its leader",
+            &leader,
+            verified,
+        ),
+        Some(NotReplicated) => refusal(
+            NOT_REPLICATED,
+            "replication does not carry what this route reads; read it from the leader",
+            &leader,
+            verified,
+        ),
+        Some(Read | Local) | None => next.run(request).await,
+    };
+    if let (true, Some(lag)) = (verified, leader.lag_seconds) {
+        response
+            .headers_mut()
+            .insert(LAG_HEADER, HeaderValue::from(lag));
+    }
+    response
+}
+
+/// `GET /api/replication/role`: which role this instance plays. Identity-level, so
+/// any valid API key reads it, whatever tenant the key is bound to.
+pub async fn role(State(state): State<AppState>) -> Json<RoleReport> {
+    Json(state.replication.role())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::{HeaderMap, Request as HttpRequest};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::handlers::test_helpers::{get, get_unauthenticated, post_json, TestHarness};
+    use crate::intent_log::{payload, IntentPayload};
+    use crate::memory::types::{Experience, Memory, MemoryId};
+
+    const LEADER: &str = "http://127.0.0.1:9";
+    const USER: &str = "replica-user";
+
+    /// The `(METHOD, path)` of every `.route(…)` in `build_protected_routes`, read from
+    /// the source as the public-router guard reads it: axum does not expose its table.
+    fn mounted_routes() -> BTreeSet<(String, String)> {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/handlers/router.rs"
+        ))
+        .expect("read router.rs");
+        let start = source
+            .find("pub fn build_protected_routes(")
+            .expect("build_protected_routes in router.rs");
+        let end = start
+            + source[start..]
+                .find("\npub fn build_router(")
+                .expect("build_router follows it");
+        let body: String = source[start..end]
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut routes = BTreeSet::new();
+        let mut rest = body.as_str();
+        while let Some(at) = rest.find(".route(") {
+            rest = &rest[at + ".route(".len()..];
+            let call = &rest[..rest.find(".route(").unwrap_or(rest.len())];
+            let path = call
+                .trim_start()
+                .strip_prefix('"')
+                .and_then(|tail| tail.split('"').next())
+                .unwrap_or_else(|| panic!("a .route( without a literal path: {call:.60}"));
+            let before = routes.len();
+            for method in ["get", "post", "put", "delete", "patch", "any"] {
+                let token = format!("{method}(");
+                for (i, _) in call.match_indices(&token) {
+                    let prior = call[..i].chars().next_back();
+                    if !prior.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                        routes.insert((method.to_uppercase(), path.to_string()));
+                    }
+                }
+            }
+            assert!(routes.len() > before, "no method found for {path}");
+        }
+        routes
+    }
+
+    #[test]
+    fn every_protected_route_is_classified_exactly_once() {
+        let mounted = mounted_routes();
+        let classified: BTreeSet<(String, String)> = ROUTES
+            .iter()
+            .map(|(m, p, _)| (m.to_string(), p.to_string()))
+            .collect();
+        assert_eq!(classified.len(), ROUTES.len(), "a route is listed twice");
+        let unclassified: Vec<_> = mounted.difference(&classified).collect();
+        assert!(
+            unclassified.is_empty(),
+            "routes with no replica access in ROUTES: {unclassified:?}"
+        );
+        let stale: Vec<_> = classified.difference(&mounted).collect();
+        assert!(
+            stale.is_empty(),
+            "ROUTES names routes not mounted: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn an_unlisted_route_fails_closed_for_anything_but_a_get() {
+        assert_eq!(access(&Method::POST, "/api/remember"), Write);
+        assert_eq!(access(&Method::POST, "/api/no-such-route"), Write);
+        assert_eq!(access(&Method::GET, "/api/no-such-route"), Read);
+        assert_eq!(access(&Method::HEAD, "/api/todos/{todo_id}"), NotReplicated);
+        assert_eq!(access(&Method::PATCH, "/api/user_auth/{*path}"), Local);
+    }
+
+    fn follow(harness: &TestHarness) {
+        let state = harness.state();
+        state
+            .replication
+            .follow(&state.base_path, LEADER, "admin-key", Some("leader-key"))
+            .unwrap();
+    }
+
+    async fn call(
+        harness: &TestHarness,
+        request: HttpRequest<Body>,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let response = harness.router().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, headers, body)
+    }
+
+    fn remember_directly(harness: &TestHarness, content: &str) -> MemoryId {
+        let memory = harness.state().get_user_memory(USER).unwrap();
+        let id = memory
+            .read()
+            .remember(
+                Experience {
+                    content: content.to_string(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn a_follower_refuses_a_remember_and_an_upsert() {
+        let harness = TestHarness::new();
+        follow(&harness);
+        let writes = [
+            post_json(
+                "/api/remember",
+                &json!({"user_id": USER, "content": "the ferry leaves at nine"}),
+            ),
+            post_json(
+                "/api/upsert",
+                &json!({"user_id": USER, "external_id": "ferry", "content": "the ferry leaves at ten"}),
+            ),
+        ];
+        for request in writes {
+            let (status, headers, body) = call(&harness, request).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(body["code"], READ_ONLY_REPLICA, "{body}");
+            assert_eq!(body["leader"]["url"], LEADER, "{body}");
+            assert!(
+                body["leader"].get("instance_id").is_some(),
+                "the leader's id is named, null until a poll has read it: {body}"
+            );
+            assert_eq!(
+                headers.get(RETRY_AFTER).unwrap(),
+                &RETRY_AFTER_SECS.to_string()
+            );
+        }
+        let memory = harness.state().get_user_memory(USER).unwrap();
+        assert_eq!(memory.read().stored_count(), 0, "nothing reached the store");
+    }
+
+    #[tokio::test]
+    async fn a_webhook_refused_on_a_follower_does_not_learn_the_leader() {
+        let harness = TestHarness::new();
+        follow(&harness);
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/webhook/github")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, headers, body) = call(&harness, request).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], READ_ONLY_REPLICA);
+        assert!(body.get("leader").is_none(), "{body}");
+        assert!(headers.get(LAG_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_replication_apply_path_still_writes_on_a_follower() {
+        let harness = TestHarness::new();
+        follow(&harness);
+        let memory = Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                content: "the lock keeper works the night shift".into(),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        let frame = IntentPayload::Remember {
+            user_id: USER.into(),
+            memory_id: memory.id.0.to_string(),
+            memory_bincode: bincode::serde::encode_to_vec(&memory, bincode::config::standard())
+                .unwrap(),
+            schema_version: Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+        };
+        let state = harness.state();
+        let journaled = tokio::task::spawn_blocking(move || {
+            crate::replication::apply_replicated_page(&state, USER, vec![(0, frame)])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(journaled, 1);
+
+        let (status, _, body) = call(
+            &harness,
+            get(&format!("/api/memory/{}?user_id={USER}", memory.id.0)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["experience"]["content"]
+                .as_str()
+                .or(body["content"].as_str()),
+            Some("the lock keeper works the night shift"),
+            "{body}"
+        );
+    }
+
+    /// Everything recall can write.
+    #[derive(Debug, PartialEq)]
+    struct Usage {
+        retrievals: usize,
+        /// Id, access count, last access and importance bits of every memory.
+        records: Vec<(String, u32, i64, u32)>,
+        /// Entities and relationships, co-retrieval edges among them.
+        graph: (usize, usize),
+        journal_head: u64,
+    }
+
+    fn usage(harness: &TestHarness) -> Usage {
+        let state = harness.state();
+        let memory = state.get_user_memory(USER).unwrap();
+        let guard = memory.read();
+        let mut records: Vec<_> = guard
+            .get_all_memories()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m.id.0.to_string(),
+                    m.access_count(),
+                    m.last_accessed().timestamp_micros(),
+                    m.importance().to_bits(),
+                )
+            })
+            .collect();
+        records.sort();
+        let graph = state.get_user_graph_stats(USER).unwrap();
+        let journal = state
+            .get_user_journaled_writer(USER)
+            .unwrap()
+            .lock()
+            .log()
+            .next_lsn()
+            .0;
+        Usage {
+            retrievals: guard.stats().total_retrievals,
+            records,
+            graph: (graph.entity_count, graph.relationship_count),
+            journal_head: journal,
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_on_a_follower_makes_no_usage_writes() {
+        let harness = TestHarness::new();
+        for content in [
+            "the harbour crane is serviced every spring",
+            "the harbour master keeps the crane log",
+            "the crane operator starts at dawn",
+        ] {
+            remember_directly(&harness, content);
+        }
+        follow(&harness);
+        let before = usage(&harness);
+        for _ in 0..2 {
+            let (status, _, body) = call(
+                &harness,
+                post_json(
+                    "/api/recall",
+                    &json!({"user_id": USER, "query": "harbour crane"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let (status, _, body) = call(
+                &harness,
+                post_json(
+                    "/api/proactive_context",
+                    &json!({
+                        "user_id": USER,
+                        "context": "who looks after the harbour crane",
+                        "previous_response": "The harbour master keeps the crane log and the operator starts at dawn, so ask either of them about servicing.",
+                        "auto_ingest": true,
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body["ingested_memory_id"].is_null(), "{body}");
+        }
+        // Long enough for any fire-and-forget write a handler spawned to land.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(usage(&harness), before, "recall on a follower wrote");
+
+        harness.state().replication.unfollow();
+        let (status, _, body) = call(
+            &harness,
+            post_json(
+                "/api/recall",
+                &json!({"user_id": USER, "query": "harbour crane"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            usage(&harness).retrievals > before.retrievals,
+            "the same recall on a standalone instance counts itself, so the check above can see a write"
+        );
+    }
+
+    fn records(harness: &TestHarness) -> Vec<Vec<u8>> {
+        let memory = harness.state().get_user_memory(USER).unwrap();
+        let guard = memory.read();
+        let mut all: Vec<Vec<u8>> = guard
+            .get_all_memories()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                bincode::serde::encode_to_vec(m.as_ref(), bincode::config::standard()).unwrap()
+            })
+            .collect();
+        all.sort();
+        all
+    }
+
+    #[tokio::test]
+    async fn a_followers_maintenance_changes_no_record() {
+        let harness = TestHarness::new();
+        for content in [
+            "the tide gauge reads high on Thursdays",
+            "the tide gauge was recalibrated in March",
+        ] {
+            remember_directly(&harness, content);
+        }
+        follow(&harness);
+        let state = harness.state();
+        let before = (records(&harness), usage(&harness));
+        let processed = tokio::task::spawn_blocking(move || {
+            (0..7)
+                .map(|_| state.run_maintenance_all_users())
+                .sum::<usize>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            processed, 0,
+            "heavy and light cycles both skipped their writes"
+        );
+        assert_eq!((records(&harness), usage(&harness)), before);
+
+        harness.state().replication.unfollow();
+        let state = harness.state();
+        let processed = tokio::task::spawn_blocking(move || state.run_maintenance_all_users())
+            .await
+            .unwrap();
+        assert!(
+            processed > 0,
+            "a standalone instance's maintenance does run"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreplicated_stores_answer_not_replicated_on_a_follower() {
+        let harness = TestHarness::new();
+        let reads = || {
+            [
+                post_json("/api/todos/list", &json!({"user_id": USER})),
+                post_json("/api/reminders", &json!({"user_id": USER})),
+                post_json("/api/projects/list", &json!({"user_id": USER})),
+                get(&format!("/api/context/blocks?user_id={USER}")),
+            ]
+        };
+        for request in reads() {
+            let uri = request.uri().to_string();
+            let (status, _, body) = call(&harness, request).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri} on a standalone instance: {body}"
+            );
+        }
+        follow(&harness);
+        for request in reads() {
+            let uri = request.uri().to_string();
+            let (status, headers, body) = call(&harness, request).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+            assert_eq!(body["code"], NOT_REPLICATED, "{uri}: {body}");
+            assert_eq!(body["leader"]["url"], LEADER, "{uri}: {body}");
+            assert!(headers.get(RETRY_AFTER).is_some(), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_role_route_needs_an_api_key_and_no_admin_key() {
+        let harness = TestHarness::new();
+        let (status, _, body) = call(&harness, get("/api/replication/role")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"role": "standalone", "instance_id": crate::replication::instance_id()})
+        );
+
+        follow(&harness);
+        let (status, _, body) = call(&harness, get("/api/replication/role")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({
+                "role": "follower",
+                "instance_id": crate::replication::instance_id(),
+                "leader_url": LEADER,
+            }),
+            "lag and the leader's id are absent until a poll has measured them"
+        );
+
+        let (status, _, body) = call(&harness, get_unauthenticated("/api/replication/role")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_response_from_a_follower_carries_its_lag() {
+        let harness = TestHarness::new();
+        let (_, headers, _) = call(&harness, get("/api/replication/role")).await;
+        assert!(
+            headers.get(LAG_HEADER).is_none(),
+            "not on a standalone instance"
+        );
+
+        follow(&harness);
+        let replication = &harness.state().replication;
+        let leader_id = uuid::Uuid::new_v4();
+        let asked = chrono::Utc::now();
+        replication.record_pass(
+            replication.status().generation,
+            Some(leader_id),
+            &[],
+            asked,
+            asked + chrono::Duration::seconds(3),
+        );
+        let (status, headers, body) = call(&harness, get("/api/replication/role")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(LAG_HEADER).unwrap(), "3");
+        assert_eq!(body["leader_instance_id"], leader_id.to_string());
+        assert_eq!(body["lag_seconds"], 3);
+        assert_eq!(body["lag_frames"], serde_json::Value::Null);
+
+        let (status, headers, body) = call(
+            &harness,
+            post_json("/api/remember", &json!({"user_id": USER, "content": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            headers.get(LAG_HEADER).unwrap(),
+            "3",
+            "refusals carry it too"
+        );
+        assert_eq!(body["leader"]["instance_id"], leader_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn health_ready_publishes_no_topology_on_a_follower() {
+        let harness = TestHarness::new();
+        let ready = |harness: &TestHarness| {
+            let router = harness
+                .router()
+                .merge(crate::handlers::build_probe_routes(harness.state()));
+            async move {
+                let response = router
+                    .oneshot(
+                        HttpRequest::builder()
+                            .uri("/health/ready")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let headers = response.headers().clone();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                body.as_object_mut().unwrap().remove("timestamp");
+                (status, headers, body)
+            }
+        };
+        let standalone = ready(&harness).await;
+        follow(&harness);
+        let follower = ready(&harness).await;
+        assert_eq!(follower.0, standalone.0);
+        assert_eq!(follower.2, standalone.2, "the probe answers the same");
+        assert!(follower.1.get(LAG_HEADER).is_none());
+        let text = follower.2.to_string();
+        assert!(
+            !text.contains("127.0.0.1:9") && !text.contains("follow"),
+            "{text}"
+        );
+    }
+}

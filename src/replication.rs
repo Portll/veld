@@ -9,12 +9,17 @@
 //! re-embeds.
 //!
 //! Scope and limits, stated rather than implied:
-//! - One direction. A follower is read-mostly; writes made on it are not sent
-//!   back, and two instances following each other would echo frames forever, so
-//!   `follow` refuses a source that reports following us.
-//! - Memories only. Todos, reminders, projects, context blocks and dials are not
-//!   journaled, so they do not replicate. The knowledge graph is rebuilt from the
-//!   memories by the follower's own consolidation.
+//! - One direction. A follower is read-only: `handlers::replica` refuses client
+//!   writes, its recall makes no usage writes and its maintenance changes no
+//!   record, so only the frames applied here write. Two instances following each
+//!   other would echo frames forever, so `follow` refuses a source that reports
+//!   following us.
+//! - Memories only. The follower applies the five [`IntentPayload`] variants,
+//!   every one of them a memory record. Todos, reminders, projects, context
+//!   blocks, the knowledge graph, facts, lineage, sessions, A/B tests and
+//!   datasets are not journaled, so they do not replicate, and a follower
+//!   answers reads of them `NOT_REPLICATED`. Dials are each process's own: a
+//!   follower recalls with its own and refuses changes to them.
 //! - Frames leave the leader decrypted (its journal cryptor opens them) and are
 //!   sealed again by the follower's own keystore on append. The admin key and API
 //!   key ride every request, so a leader that is not on this host must be https.
@@ -30,6 +35,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -183,6 +189,11 @@ impl UserProgress {
             (None, _) => None,
         };
     }
+
+    /// Holds every frame the leader had when this tenant was last read.
+    fn caught_up(&self) -> bool {
+        self.lag == Some(0) && self.last_error.is_none() && self.diverged.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -203,10 +214,60 @@ pub struct FollowStatus {
     pub last_applied: Option<DateTime<Utc>>,
     /// The last failure to reach the leader at all; per-tenant failures are on the tenant.
     pub last_error: Option<String>,
+    /// The leader's process identity, from its status route at the last pass.
+    pub leader_instance_id: Option<uuid::Uuid>,
+    /// When the last pass over every tenant the leader listed finished.
+    pub reached_leader_at: Option<DateTime<Utc>>,
+    /// When the leader was asked for its tenants by the last pass that left every
+    /// one of them at its head: this follower held all the leader had then.
+    pub caught_up_at: Option<DateTime<Utc>>,
     pub users: BTreeMap<String, UserProgress>,
 }
 
 impl FollowStatus {
+    /// How far behind its leader this follower was, in seconds, when it last reached
+    /// it: the time from the last pass that caught every tenant up to the end of the
+    /// last pass. None until a pass has caught up since following began. It does not
+    /// grow while the leader is unreachable, because nothing is known to be missed;
+    /// `reached_leader_at` says how long ago that was.
+    pub fn lag_seconds(&self) -> Option<u64> {
+        let (caught_up, reached) = (self.caught_up_at?, self.reached_leader_at?);
+        Some((reached - caught_up).num_seconds().max(0) as u64)
+    }
+
+    /// Leader frames not yet applied, summed over the tenants whose lag is known.
+    pub fn lag_frames(&self) -> Option<u64> {
+        self.users
+            .values()
+            .filter_map(|progress| progress.lag)
+            .reduce(u64::saturating_add)
+    }
+
+    /// Record the end of a pass that read every tenant in `listed`, if `generation` is
+    /// still current. `asked` is when the leader was asked which tenants it has.
+    fn record_pass(
+        &mut self,
+        generation: u64,
+        leader_instance_id: Option<uuid::Uuid>,
+        listed: &[UserLogInfo],
+        asked: DateTime<Utc>,
+        finished: DateTime<Utc>,
+    ) {
+        if self.generation != generation {
+            return;
+        }
+        self.leader_instance_id = leader_instance_id;
+        self.reached_leader_at = Some(finished);
+        let caught_up = listed.iter().all(|info| {
+            self.users
+                .get(&info.user_id)
+                .is_some_and(UserProgress::caught_up)
+        });
+        if caught_up {
+            self.caught_up_at = Some(asked);
+        }
+    }
+
     /// Record one applied page for `user_id` if `generation` is still current.
     /// Returns the cursor to persist, or None when the poll is stale.
     fn record_page(
@@ -234,9 +295,6 @@ impl FollowStatus {
     }
 }
 
-static FOLLOW: LazyLock<RwLock<FollowStatus>> =
-    LazyLock::new(|| RwLock::new(FollowStatus::default()));
-
 static INSTANCE_ID: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
 
 /// This process's identity, new at every start. The status route reports it, so the
@@ -246,12 +304,122 @@ pub fn instance_id() -> uuid::Uuid {
     *INSTANCE_ID
 }
 
-pub fn status() -> FollowStatus {
-    FOLLOW.read().clone()
+/// The leader a follower names when it refuses a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderRef {
+    /// None until the first poll has read the leader's status.
+    pub instance_id: Option<uuid::Uuid>,
+    pub url: String,
+    pub lag_seconds: Option<u64>,
 }
 
-fn is_current(generation: u64) -> bool {
-    FOLLOW.read().generation == generation
+/// What this instance is to replication, as `GET /api/replication/role` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Leader,
+    Follower,
+    Standalone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoleReport {
+    pub role: Role,
+    pub instance_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader_instance_id: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lag_frames: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lag_seconds: Option<u64>,
+}
+
+/// One instance's replication state: what it follows. Held by the manager, so every
+/// store it opens sees the same flag, and two instances in one test process do not
+/// share a role.
+#[derive(Debug, Default)]
+pub struct Replication {
+    follow: RwLock<FollowStatus>,
+    /// `follow.target.is_some()`, readable without the lock: every recall on every
+    /// tenant checks it.
+    following: Arc<AtomicBool>,
+}
+
+impl Replication {
+    pub fn status(&self) -> FollowStatus {
+        self.follow.read().clone()
+    }
+
+    /// Whether this instance follows a leader, and so is a read-only replica.
+    pub fn is_following(&self) -> bool {
+        self.following.load(Ordering::Acquire)
+    }
+
+    /// The flag behind [`Self::is_following`], for the per-tenant stores to share.
+    pub fn following_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.following)
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.follow.read().generation == generation
+    }
+
+    /// Stop following under the caller's write lock, keeping the flag in step.
+    fn drop_target(&self, status: &mut FollowStatus) {
+        status.target = None;
+        status.generation += 1;
+        self.following.store(false, Ordering::Release);
+    }
+
+    /// Record the end of a pass over every tenant in `listed`; see
+    /// [`FollowStatus::lag_seconds`].
+    pub(crate) fn record_pass(
+        &self,
+        generation: u64,
+        leader_instance_id: Option<uuid::Uuid>,
+        listed: &[UserLogInfo],
+        asked: DateTime<Utc>,
+        finished: DateTime<Utc>,
+    ) {
+        self.follow
+            .write()
+            .record_pass(generation, leader_instance_id, listed, asked, finished);
+    }
+
+    pub fn leader(&self) -> Option<LeaderRef> {
+        if !self.is_following() {
+            return None;
+        }
+        let status = self.follow.read();
+        let target = status.target.as_ref()?;
+        Some(LeaderRef {
+            instance_id: status.leader_instance_id,
+            url: target.source.clone(),
+            lag_seconds: status.lag_seconds(),
+        })
+    }
+
+    pub fn role(&self) -> RoleReport {
+        let status = self.follow.read();
+        let mut report = RoleReport {
+            role: Role::Standalone,
+            instance_id: instance_id(),
+            leader_instance_id: None,
+            leader_url: None,
+            lag_frames: None,
+            lag_seconds: None,
+        };
+        if let Some(target) = &status.target {
+            report.role = Role::Follower;
+            report.leader_instance_id = status.leader_instance_id;
+            report.leader_url = Some(target.source.clone());
+            report.lag_frames = status.lag_frames();
+            report.lag_seconds = status.lag_seconds();
+        }
+        report
+    }
 }
 
 /// Host part of an http(s) URL, without brackets for IPv6.
@@ -839,65 +1007,97 @@ fn save_cursor(path: &Path, users: &BTreeMap<String, UserProgress>) -> Result<()
     Ok(())
 }
 
-/// Start (or switch) following `source`. The cursor saved for that source is
-/// resumed, so a follower that was stopped picks up where it left off. A poll still
-/// running for the previous target stops at its next page. Fails, naming the
-/// variable and the file, when the TLS variables do not yield a client.
-pub fn follow(
-    base: &Path,
-    source: &str,
-    admin_key: &str,
-    api_key: Option<&str>,
-) -> Result<FollowStatus> {
-    let source = normalize_source(source)?;
-    let api_key = api_key
-        .map(str::to_string)
-        .filter(|k| !k.trim().is_empty())
-        .or_else(|| default_api_key_for(&source))
-        .ok_or_else(|| {
-            anyhow!("no API key for the leader {source}: pass its key, or set {ENV_API_KEY}")
-        })?;
-    let http = leader_client(POLL_TIMEOUT)?;
-    let users = load_cursor(&cursor_path(base, &source));
-    let mut status = FOLLOW.write();
-    let generation = status.generation + 1;
-    *status = FollowStatus {
-        target: Some(FollowTarget {
-            source,
-            admin_key: admin_key.to_string(),
-            api_key,
-            http,
-            since: Utc::now(),
-        }),
-        generation,
-        users,
-        ..FollowStatus::default()
-    };
-    Ok(status.clone())
-}
+impl Replication {
+    /// Start (or switch) following `source`. The cursor saved for that source under
+    /// `base` is resumed, so a follower that was stopped picks up where it left off. A
+    /// poll still running for the previous target stops at its next page. Fails,
+    /// naming the variable and the file, when the TLS variables do not yield a client.
+    pub fn follow(
+        &self,
+        base: &Path,
+        source: &str,
+        admin_key: &str,
+        api_key: Option<&str>,
+    ) -> Result<FollowStatus> {
+        let source = normalize_source(source)?;
+        let api_key = api_key
+            .map(str::to_string)
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| default_api_key_for(&source))
+            .ok_or_else(|| {
+                anyhow!("no API key for the leader {source}: pass its key, or set {ENV_API_KEY}")
+            })?;
+        let http = leader_client(POLL_TIMEOUT)?;
+        let users = load_cursor(&cursor_path(base, &source));
+        let mut status = self.follow.write();
+        let generation = status.generation + 1;
+        *status = FollowStatus {
+            target: Some(FollowTarget {
+                source,
+                admin_key: admin_key.to_string(),
+                api_key,
+                http,
+                since: Utc::now(),
+            }),
+            generation,
+            users,
+            ..FollowStatus::default()
+        };
+        self.following.store(true, Ordering::Release);
+        Ok(status.clone())
+    }
 
-/// Stop following. A poll in progress stops at its next page; the cursor is kept.
-pub fn unfollow() -> FollowStatus {
-    let mut status = FOLLOW.write();
-    status.target = None;
-    status.generation += 1;
-    status.clone()
-}
+    /// Stop following. A poll in progress stops at its next page; the cursor is kept.
+    pub fn unfollow(&self) -> FollowStatus {
+        let mut status = self.follow.write();
+        self.drop_target(&mut status);
+        status.clone()
+    }
 
-/// `VELD_REPLICATE_FROM` + `VELD_REPLICATE_ADMIN_KEY` at boot.
-pub fn follow_from_env(base: &Path) -> Result<Option<FollowStatus>> {
-    let Some(source) = std::env::var(ENV_SOURCE)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    else {
-        return Ok(None);
-    };
-    let admin_key = std::env::var(ENV_ADMIN_KEY)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow!("{ENV_SOURCE} is set but {ENV_ADMIN_KEY} is not"))?;
-    let api_key = std::env::var(ENV_API_KEY).ok();
-    follow(base, &source, &admin_key, api_key.as_deref()).map(Some)
+    /// `VELD_REPLICATE_FROM` + `VELD_REPLICATE_ADMIN_KEY` at boot.
+    pub fn follow_from_env(&self, base: &Path) -> Result<Option<FollowStatus>> {
+        let Some(source) = std::env::var(ENV_SOURCE)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let admin_key = std::env::var(ENV_ADMIN_KEY)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("{ENV_SOURCE} is set but {ENV_ADMIN_KEY} is not"))?;
+        let api_key = std::env::var(ENV_API_KEY).ok();
+        self.follow(base, &source, &admin_key, api_key.as_deref())
+            .map(Some)
+    }
+
+    /// Mark a tenant diverged and persist the cursor, if the poll is still current.
+    fn mark_diverged(
+        &self,
+        generation: u64,
+        cursor: &Path,
+        user_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let users = {
+            let mut status = self.follow.write();
+            if status.generation != generation {
+                return Ok(());
+            }
+            let entry = status.users.entry(user_id.to_string()).or_default();
+            if entry.diverged.is_none() {
+                tracing::error!(
+                    tenant = %user_id,
+                    reason,
+                    "replication: tenant diverged from the leader and is no longer synced; \
+                     stop this follower, remove the tenant's directory here, and it replays from the start"
+                );
+            }
+            entry.diverged = Some(reason.to_string());
+            status.users.clone()
+        };
+        save_cursor(cursor, &users)
+    }
 }
 
 pub fn interval_from_env() -> Duration {
@@ -1057,28 +1257,6 @@ pub async fn probe_leader(
     Ok(leader.into())
 }
 
-/// Mark a tenant diverged and persist the cursor, if the poll is still current.
-fn mark_diverged(generation: u64, cursor: &Path, user_id: &str, reason: &str) -> Result<()> {
-    let users = {
-        let mut status = FOLLOW.write();
-        if status.generation != generation {
-            return Ok(());
-        }
-        let entry = status.users.entry(user_id.to_string()).or_default();
-        if entry.diverged.is_none() {
-            tracing::error!(
-                tenant = %user_id,
-                reason,
-                "replication: tenant diverged from the leader and is no longer synced; \
-                 stop this follower, remove the tenant's directory here, and it replays from the start"
-            );
-        }
-        entry.diverged = Some(reason.to_string());
-        status.users.clone()
-    };
-    save_cursor(cursor, &users)
-}
-
 /// Sync one tenant from its cursor to the leader's head, page by page, persisting
 /// the cursor after each page. Returns the frames consumed.
 async fn sync_user(
@@ -1089,13 +1267,15 @@ async fn sync_user(
     info: &UserLogInfo,
     shutdown: &CancellationToken,
 ) -> Result<u64> {
+    let replication = &manager.replication;
     let mut consumed = 0u64;
     let mut head: u64;
     loop {
-        if shutdown.is_cancelled() || !is_current(generation) {
+        if shutdown.is_cancelled() || !replication.is_current(generation) {
             return Ok(consumed);
         }
-        let progress = FOLLOW
+        let progress = replication
+            .follow
             .read()
             .users
             .get(&info.user_id)
@@ -1115,7 +1295,7 @@ async fn sync_user(
         };
         head = page.head_lsn;
         if let Some(reason) = divergence(&progress, &page) {
-            mark_diverged(generation, cursor, &info.user_id, &reason)?;
+            replication.mark_diverged(generation, cursor, &info.user_id, &reason)?;
             return Ok(consumed);
         }
         let Some(last_lsn) = page.records.last().map(|r| r.lsn) else {
@@ -1138,7 +1318,7 @@ async fn sync_user(
                 .await
                 .map_err(|e| anyhow!("apply task: {e}"))?
                 .with_context(|| format!("applying lsns up to {last_lsn} of {}", info.user_id))?;
-        let saved = FOLLOW.write().record_page(
+        let saved = replication.follow.write().record_page(
             generation,
             &info.user_id,
             &page,
@@ -1156,7 +1336,7 @@ async fn sync_user(
         }
     }
     let users = {
-        let mut status = FOLLOW.write();
+        let mut status = replication.follow.write();
         if status.generation != generation {
             return Ok(consumed);
         }
@@ -1180,40 +1360,42 @@ async fn poll_once(
     interval: Duration,
     shutdown: &CancellationToken,
 ) -> Result<u64> {
+    let replication = &manager.replication;
+    let asked = Utc::now();
     let leader: LeaderStatus = tokio::select! {
         leader = get_json(target, "/api/admin/replication/status") => leader?,
         () = shutdown.cancelled() => return Ok(0),
     };
     if leader.instance_id == Some(instance_id()) {
-        let mut status = FOLLOW.write();
+        let mut status = replication.follow.write();
         if status.generation == generation {
             let message = format!("{} is this instance; following stopped", target.source);
             tracing::error!(source = %target.source, "replication: {message}");
-            status.target = None;
-            status.generation += 1;
+            replication.drop_target(&mut status);
             status.last_error = Some(message);
         }
         return Ok(0);
     }
     let cursor = cursor_path(&manager.base_path, &target.source);
     let set_syncing = |tenant: Option<&str>| {
-        let mut status = FOLLOW.write();
+        let mut status = replication.follow.write();
         if status.generation == generation {
             status.syncing = tenant.map(str::to_string);
         }
     };
     {
-        let mut status = FOLLOW.write();
+        let mut status = replication.follow.write();
         if status.generation == generation {
             status.pass_started = Some(Utc::now());
         }
     }
     let mut consumed = 0u64;
     for info in &leader.users {
-        if shutdown.is_cancelled() || !is_current(generation) {
+        if shutdown.is_cancelled() || !replication.is_current(generation) {
             break;
         }
-        let progress = FOLLOW
+        let progress = replication
+            .follow
             .read()
             .users
             .get(&info.user_id)
@@ -1228,7 +1410,7 @@ async fn poll_once(
                 continue;
             }
             tracing::info!(tenant = %info.user_id, "replication: diverged tenant's local data removed; replaying it from the start");
-            let mut status = FOLLOW.write();
+            let mut status = replication.follow.write();
             if status.generation != generation {
                 break;
             }
@@ -1246,7 +1428,7 @@ async fn poll_once(
         match sync_user(manager, target, generation, &cursor, info, shutdown).await {
             Ok(n) => {
                 consumed += n;
-                let mut status = FOLLOW.write();
+                let mut status = replication.follow.write();
                 if status.generation == generation {
                     if let Some(entry) = status.users.get_mut(&info.user_id) {
                         if entry.last_error.take().is_some() {
@@ -1259,7 +1441,7 @@ async fn poll_once(
             }
             Err(e) => {
                 let message = format!("{e:#}");
-                let mut status = FOLLOW.write();
+                let mut status = replication.follow.write();
                 if status.generation != generation {
                     break;
                 }
@@ -1274,6 +1456,15 @@ async fn poll_once(
         }
     }
     set_syncing(None);
+    if !shutdown.is_cancelled() {
+        replication.record_pass(
+            generation,
+            leader.instance_id,
+            &leader.users,
+            asked,
+            Utc::now(),
+        );
+    }
     Ok(consumed)
 }
 
@@ -1283,11 +1474,12 @@ async fn poll_once(
 /// cursor, and no request or page starts after the cancel, so the store flush and
 /// the vector-index save at shutdown see no later writes.
 pub async fn run_follower(manager: Arc<MultiUserMemoryManager>, shutdown: CancellationToken) {
+    let replication = &manager.replication;
     let interval = interval_from_env();
     let mut failures = 0u32;
     loop {
         let (target, generation) = {
-            let status = FOLLOW.read();
+            let status = replication.follow.read();
             (status.target.clone(), status.generation)
         };
         let mut wait = interval;
@@ -1296,7 +1488,7 @@ pub async fn run_follower(manager: Arc<MultiUserMemoryManager>, shutdown: Cancel
             if shutdown.is_cancelled() {
                 break;
             }
-            let mut status = FOLLOW.write();
+            let mut status = replication.follow.write();
             if status.generation == generation {
                 status.polls += 1;
                 status.last_poll = Some(Utc::now());
@@ -1816,6 +2008,99 @@ mod tests {
         p.leader_head_lsn = None;
         p.refresh_lag();
         assert_eq!(p.lag, None);
+    }
+
+    fn listed(users: &[&str]) -> Vec<UserLogInfo> {
+        users
+            .iter()
+            .map(|u| UserLogInfo {
+                user_id: u.to_string(),
+                log_bytes: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lag_seconds_run_from_the_last_pass_that_caught_every_tenant_up() {
+        let at = |s: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + s, 0).unwrap();
+        let leader = Some(uuid::Uuid::new_v4());
+        let mut status = FollowStatus {
+            generation: 2,
+            ..FollowStatus::default()
+        };
+        let progress = |lag| UserProgress {
+            lag: Some(lag),
+            ..UserProgress::default()
+        };
+        status.users.insert("a".into(), progress(0));
+        status.users.insert("b".into(), progress(40));
+        status.record_pass(2, leader, &listed(&["a", "b"]), at(0), at(3));
+        assert_eq!(status.leader_instance_id, leader);
+        assert_eq!(
+            status.lag_seconds(),
+            None,
+            "never caught up since following began"
+        );
+        assert_eq!(status.lag_frames(), Some(40));
+
+        status.users.insert("b".into(), progress(0));
+        status.record_pass(2, leader, &listed(&["a", "b"]), at(10), at(12));
+        assert_eq!(status.lag_seconds(), Some(2), "behind by the pass itself");
+
+        status.users.get_mut("a").unwrap().last_error = Some("timed out".into());
+        status.record_pass(2, leader, &listed(&["a", "b"]), at(20), at(25));
+        assert_eq!(
+            status.lag_seconds(),
+            Some(15),
+            "a failed tenant is not caught up: the lag runs from the pass at 10"
+        );
+
+        status.record_pass(1, leader, &listed(&[]), at(30), at(31));
+        assert_eq!(
+            status.lag_seconds(),
+            Some(15),
+            "a stale poll records nothing"
+        );
+
+        status.users.get_mut("a").unwrap().diverged = Some("rolled back".into());
+        status.users.get_mut("a").unwrap().last_error = None;
+        status.record_pass(2, leader, &listed(&["a", "b"]), at(40), at(41));
+        assert_eq!(
+            status.lag_seconds(),
+            Some(31),
+            "a diverged tenant is behind"
+        );
+
+        status.record_pass(2, leader, &listed(&["b", "new"]), at(50), at(51));
+        assert_eq!(
+            status.lag_seconds(),
+            Some(41),
+            "a tenant the follower has never read is behind"
+        );
+    }
+
+    #[test]
+    fn the_role_follows_the_follow_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let replication = Replication::default();
+        let flag = replication.following_flag();
+        let standalone = replication.role();
+        assert_eq!(standalone.role, Role::Standalone);
+        assert_eq!(standalone.instance_id, instance_id());
+        assert!(replication.leader().is_none());
+
+        replication
+            .follow(dir.path(), "http://127.0.0.1:9", "admin", Some("key"))
+            .unwrap();
+        assert!(flag.load(Ordering::Acquire), "the stores see the follow");
+        let follower = replication.role();
+        assert_eq!(follower.role, Role::Follower);
+        assert_eq!(follower.leader_url.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(follower.lag_seconds, None);
+
+        replication.unfollow();
+        assert!(!flag.load(Ordering::Acquire), "and the unfollow");
+        assert_eq!(replication.role().role, Role::Standalone);
     }
 
     #[tokio::test]

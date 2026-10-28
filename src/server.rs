@@ -339,7 +339,7 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
 
     // Live replication: idle until this instance follows a leader, by
     // VELD_REPLICATE_FROM at boot or POST /api/admin/replication/follow later.
-    match crate::replication::follow_from_env(&manager.base_path) {
+    match manager.replication.follow_from_env(&manager.base_path) {
         Ok(Some(status)) => {
             if let Some(t) = &status.target {
                 info!("Replication: following {}", t.source);

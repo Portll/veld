@@ -127,6 +127,9 @@ pub(crate) fn scoring_now() -> chrono::DateTime<chrono::Utc> {
 /// in `graph_memory.rs` strengthens the edges it walks and is reached from the multi-hop leg
 /// of `recall`; gating it needs a parameter on that function and that file is under another
 /// session's edit at the time of writing.
+///
+/// The sites read it through `MemorySystem::recall_readonly` and `GraphMemory::recall_readonly`,
+/// which also hold recall read-only while the instance follows a leader.
 pub(crate) fn recall_readonly() -> bool {
     if RECALL_WRITES_FORCED.with(|f| f.get()) {
         return false;
@@ -495,6 +498,11 @@ pub struct MemorySystem {
     /// (edge_uuid, raw_contribution) pairs — normalisation to 1.0 happens inside
     /// `GraphMemory::apply_path_credit`.
     spreading_path_credit: Arc<parking_lot::Mutex<Vec<(uuid::Uuid, f32)>>>,
+
+    /// Set while this instance follows a leader: recall is then read-only whatever the
+    /// env says, because the leader owns the usage state. Shared with the manager's
+    /// replication state; see [`Self::share_replica_readonly`].
+    replica_readonly: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Extract causal entity pairs from memory content.
@@ -1736,7 +1744,21 @@ impl MemorySystem {
                 prefetch_tick::PrefetchUserState::default(),
             )),
             spreading_path_credit: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            replica_readonly: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Follow `flag` for whether this store belongs to a read-only replica.
+    pub fn share_replica_readonly(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.replica_readonly = flag;
+    }
+
+    /// [`recall_readonly`] for this store: also true while its instance follows a
+    /// leader, and then even under [`with_recall_writes`].
+    pub(crate) fn recall_readonly(&self) -> bool {
+        self.replica_readonly
+            .load(std::sync::atomic::Ordering::Acquire)
+            || recall_readonly()
     }
 
     /// Wire up GraphMemory for entity relationships and spreading activation

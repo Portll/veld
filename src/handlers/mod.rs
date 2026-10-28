@@ -5,6 +5,7 @@
 
 // Core modules
 pub mod lenient_json;
+pub mod replica;
 pub mod replication;
 pub mod router;
 pub mod state;

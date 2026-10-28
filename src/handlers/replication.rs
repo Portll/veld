@@ -65,7 +65,7 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Ok(u) => u,
         Err(e) => return failed(anyhow::anyhow!("listing logs: {e}")),
     };
-    let following = replication::status();
+    let following = state.replication.status();
     respond(
         StatusCode::OK,
         json!({
@@ -188,17 +188,20 @@ pub async fn follow(State(state): State<AppState>, headers: HeaderMap, body: Byt
         }
         None => {}
     }
-    match replication::follow(&state.base_path, &source, &req.admin_key, Some(&api_key)) {
+    match state
+        .replication
+        .follow(&state.base_path, &source, &req.admin_key, Some(&api_key))
+    {
         Ok(status) => respond(StatusCode::OK, json!({"following": status})),
         Err(e) => failed(e),
     }
 }
 
-pub async fn unfollow(headers: HeaderMap) -> Response {
+pub async fn unfollow(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(refusal) = require_admin_key(&headers) {
         return refusal;
     }
-    let status = replication::unfollow();
+    let status = state.replication.unfollow();
     respond(
         StatusCode::OK,
         json!({"following": null, "users": status.users}),

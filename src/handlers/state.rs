@@ -399,6 +399,11 @@ pub struct MultiUserMemoryManager {
     /// How far replication followers have read each tenant's feed, for the
     /// journal purge (kept only while the purge is on).
     feed_floors: parking_lot::Mutex<crate::replication::FeedFloors>,
+
+    /// What this instance follows. While it follows a leader it is a read-only replica:
+    /// every tenant store shares the flag, so recall makes no usage writes and
+    /// maintenance changes no record.
+    pub replication: Arc<crate::replication::Replication>,
 }
 
 /// Written into a tenant's directory by a backup restore and removed by the C2
@@ -809,6 +814,7 @@ impl MultiUserMemoryManager {
             feed_floors: parking_lot::Mutex::new(crate::replication::FeedFloors::load(
                 &base_path_for_floors,
             )),
+            replication: Arc::default(),
         };
 
         info!("Running initial audit log rotation...");
@@ -1610,6 +1616,7 @@ impl MultiUserMemoryManager {
         user_mem.set_graph_memory(graph);
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
         user_mem.set_feedback_store(self.feedback_store.clone());
+        user_mem.share_replica_readonly(self.replication.following_flag());
 
         let memory_arc: SharedUserMemory = Arc::new(parking_lot::RwLock::new(user_mem));
 
@@ -2110,7 +2117,7 @@ impl MultiUserMemoryManager {
         // Retry with backoff for RocksDB lock contention (same pattern as get_user_memory).
         // Graph eviction drops synchronously so contention is rare, but possible on Windows
         // where file handle release can lag.
-        let graph_memory = {
+        let mut graph_memory = {
             let mut last_err = None;
             let mut created = None;
             for attempt in 0..4u32 {
@@ -2156,6 +2163,7 @@ impl MultiUserMemoryManager {
                 }
             }
         };
+        graph_memory.share_replica_readonly(self.replication.following_flag());
         let graph_arc = Arc::new(parking_lot::RwLock::new(graph_memory));
 
         self.graph_memories
@@ -3116,11 +3124,69 @@ impl MultiUserMemoryManager {
         journaled
     }
 
+    /// Whether request handlers skip recall's usage writes (access bumps, reconsolidation,
+    /// coactivation edges, feedback): under the env gate, and always on a follower.
+    pub fn recall_readonly(&self) -> bool {
+        self.replication.is_following() || crate::memory::recall_readonly()
+    }
+
     /// Get graph statistics for a user
     pub fn get_user_graph_stats(&self, user_id: &str) -> Result<GraphStats> {
         let graph = self.get_user_graph(user_id)?;
         let graph_guard = graph.read();
         graph_guard.get_stats()
+    }
+
+    /// Heavy-cycle housekeeping: flush the stores and prune the per-tenant caches of
+    /// evicted tenants. It changes no record, so a follower runs it too.
+    fn heavy_cycle_housekeeping(&self) {
+        if let Err(e) = self.flush_all_databases() {
+            tracing::warn!("Periodic flush failed: {}", e);
+        }
+
+        // Prune init locks: remove entries for users no longer in cache.
+        // This prevents unbounded growth of the DashMaps over time.
+        let active_users: std::collections::HashSet<String> = self
+            .user_memories
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect();
+        self.user_memory_init_locks
+            .retain(|user_id, _| active_users.contains(user_id));
+        self.user_graph_init_locks
+            .retain(|user_id, _| active_users.contains(user_id));
+        // Prune SlowStore cache for evicted users to prevent unbounded DashMap growth.
+        // Each SlowStore holds an open SQLite connection with 8MB page cache.
+        let pre_slow = self.slow_stores.len();
+        self.slow_stores
+            .retain(|user_id, _| active_users.contains(user_id));
+        let pruned_slow = pre_slow.saturating_sub(self.slow_stores.len());
+        if pruned_slow > 0 {
+            tracing::info!(
+                "Pruned SlowStore connections for {} evicted users ({} active)",
+                pruned_slow,
+                self.slow_stores.len()
+            );
+        }
+        // A lock someone holds or waits on is kept: dropping it would let the next caller
+        // open the store under a fresh lock beside the open already running.
+        self.slow_store_init_locks
+            .retain(|user_id, lock| active_users.contains(user_id) || Arc::strong_count(lock) > 1);
+
+        // Prune audit logs for evicted users to prevent unbounded DashMap growth.
+        // Each user's log can hold up to audit_max_entries_per_user entries (~2-5MB),
+        // and without pruning, entries persist long after the user's memory/graph are evicted.
+        let pre_audit = self.audit_logs.len();
+        self.audit_logs
+            .retain(|user_id, _| active_users.contains(user_id));
+        let pruned_audit = pre_audit.saturating_sub(self.audit_logs.len());
+        if pruned_audit > 0 {
+            tracing::info!(
+                "Pruned audit logs for {} evicted users ({} active)",
+                pruned_audit,
+                self.audit_logs.len()
+            );
+        }
     }
 
     /// Run maintenance on all cached user memories
@@ -3208,6 +3274,21 @@ impl MultiUserMemoryManager {
             );
         } else {
             tracing::debug!("Maintenance cycle {} (light — in-memory only)", cycle);
+        }
+
+        // Decay write-back, tier promotion, compression, consolidation, fact extraction,
+        // graph strengthening and decay, sleep-time graduation and reminder cleanup all
+        // write derived state, and on a follower that state is the leader's: its frames
+        // bring every change maintenance makes there.
+        if self.replication.is_following() {
+            if is_heavy {
+                self.heavy_cycle_housekeeping();
+            }
+            tracing::debug!(
+                "Maintenance cycle {} skipped its writes: this instance follows a leader",
+                cycle
+            );
+            return 0;
         }
 
         let decay_factor = self.server_config.activation_decay_factor;
@@ -3545,54 +3626,7 @@ impl MultiUserMemoryManager {
         // Flush databases only on heavy cycles — flush triggers RocksDB compaction
         // which allocates significant C++ memory through Windows CRT
         if is_heavy {
-            if let Err(e) = self.flush_all_databases() {
-                tracing::warn!("Periodic flush failed: {}", e);
-            }
-
-            // Prune init locks: remove entries for users no longer in cache.
-            // This prevents unbounded growth of the DashMaps over time.
-            let active_users: std::collections::HashSet<String> = self
-                .user_memories
-                .iter()
-                .map(|(id, _)| id.to_string())
-                .collect();
-            self.user_memory_init_locks
-                .retain(|user_id, _| active_users.contains(user_id));
-            self.user_graph_init_locks
-                .retain(|user_id, _| active_users.contains(user_id));
-            // Prune SlowStore cache for evicted users to prevent unbounded DashMap growth.
-            // Each SlowStore holds an open SQLite connection with 8MB page cache.
-            let pre_slow = self.slow_stores.len();
-            self.slow_stores
-                .retain(|user_id, _| active_users.contains(user_id));
-            let pruned_slow = pre_slow.saturating_sub(self.slow_stores.len());
-            if pruned_slow > 0 {
-                tracing::info!(
-                    "Pruned SlowStore connections for {} evicted users ({} active)",
-                    pruned_slow,
-                    self.slow_stores.len()
-                );
-            }
-            // A lock someone holds or waits on is kept: dropping it would let the next caller
-            // open the store under a fresh lock beside the open already running.
-            self.slow_store_init_locks.retain(|user_id, lock| {
-                active_users.contains(user_id) || Arc::strong_count(lock) > 1
-            });
-
-            // Prune audit logs for evicted users to prevent unbounded DashMap growth.
-            // Each user's log can hold up to audit_max_entries_per_user entries (~2-5MB),
-            // and without pruning, entries persist long after the user's memory/graph are evicted.
-            let pre_audit = self.audit_logs.len();
-            self.audit_logs
-                .retain(|user_id, _| active_users.contains(user_id));
-            let pruned_audit = pre_audit.saturating_sub(self.audit_logs.len());
-            if pruned_audit > 0 {
-                tracing::info!(
-                    "Pruned audit logs for {} evicted users ({} active)",
-                    pruned_audit,
-                    self.audit_logs.len()
-                );
-            }
+            self.heavy_cycle_housekeeping();
         }
 
         tracing::info!(
@@ -3734,8 +3768,12 @@ impl MultiUserMemoryManager {
     /// and emit `REMINDER_DUE` events to the broadcast channel.
     ///
     /// Called by the dedicated 60-second reminder scheduler in main.rs.
-    /// Returns the number of reminders triggered.
+    /// Returns the number of reminders triggered. None on a follower: reminders are
+    /// not replicated, and its leader fires them.
     pub fn check_and_emit_due_reminders(&self) -> usize {
+        if self.replication.is_following() {
+            return 0;
+        }
         let due_tasks = match self.prospective_store.get_all_due_tasks() {
             Ok(tasks) => tasks,
             Err(e) => {
@@ -6161,6 +6199,8 @@ mod background_task_tests {
 impl MultiUserMemoryManager {
     /// Drain every cached user's embedding backlog, reconciling first when asked. Only users
     /// already in the cache: loading a cold user is seconds of work that a tick must not do.
+    /// Nothing on a follower: an embedding is part of the record, and its leader's frames
+    /// carry the one the leader computes.
     pub fn drain_embedding_backlogs(
         &self,
         limit_per_user: usize,
@@ -6170,6 +6210,9 @@ impl MultiUserMemoryManager {
         anyhow::Result<crate::memory::embedding_backlog::DrainReport>,
     )> {
         let mut out = Vec::new();
+        if self.replication.is_following() {
+            return out;
+        }
         for user_id in self.list_cached_users() {
             let Some(memory) = self.user_memories.get(&user_id) else {
                 continue;

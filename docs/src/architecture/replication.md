@@ -92,13 +92,52 @@ pages applied, polls (passes over every tenant) finished, when the current pass 
 initial sync is a single pass that can last hours, so `polls` stays at 0 through it;
 `pages`, `syncing` and `last_applied` show it moving.
 
+## A follower is a read-only replica
+
+While an instance follows a leader, only the frames it applies write to it:
+
+- **Client writes are refused** with `503 READ_ONLY_REPLICA` and `Retry-After: 30`.
+  `src/handlers/replica.rs` classifies every protected route in `ROUTES`, one layer on the
+  protected router applies the table, and a test holds the table to the routes
+  `build_protected_routes` mounts. The body names the leader (`leader: {instance_id, url}`)
+  to a caller whose API key was verified. A webhook arrives without one and is refused
+  without the leader named.
+- **Reads of stores replication does not carry** answer `503 NOT_REPLICATED` rather than
+  empty or stale data: todos and their comments, projects and project files, reminders,
+  context blocks, the knowledge graph and tag provenance, facts, lineage, sessions, A/B
+  tests, datasets, consolidation events and Claude session status. Memory reads (recall,
+  list, get, search, export) are served.
+- **Recall makes no usage writes**, as under `VELD_RECALL_READONLY=1`: no access counts,
+  coactivation edges, interference, retrieval counter, reconsolidation boost or feedback.
+  `proactive_context` does not auto-ingest, and its `ingested_memory_id` is empty.
+- **Maintenance changes no record.** Decay write-back, tier promotion, compression,
+  consolidation, fact extraction, graph strengthening and decay, the sleep-time passes and
+  reminder cleanup are skipped; the heavy cycle's flush and cache pruning still run.
+  Reminders do not fire and the embedding backlog does not drain.
+- **Writable on a follower, because no leader owns them:** the user-auth surface (this
+  instance's logins, sessions and keyring), `follow` and `unfollow` (unfollowing is how
+  an operator promotes a follower), and backup create and purge.
+
+`GET /api/replication/role` takes any API key, and neither the admin key nor a tenant. It
+reports `{role: leader|follower|standalone, instance_id, leader_instance_id?,
+leader_url?, lag_frames?, lag_seconds?}`. `lag_frames` sums the tenants' `lag`.
+`lag_seconds` is how far behind the follower was when it last reached its leader: the
+time from the start of the last pass that left every tenant at its head to the end of
+the last pass. It is absent until a pass has caught up, and it does not grow while the
+leader is unreachable. Authenticated responses from a follower carry it as
+`X-Veld-Replica-Lag-Seconds`. `/health/ready` is unchanged: it is public and publishes
+no topology.
+
 ## Limits, stated
 
-- **One direction.** A follower is read-mostly; writes made on it are not sent back. Two
-  instances following each other would echo frames forever, so `follow` refuses a source
-  that reports following us. A three-node cycle is not detected.
-- **Memories only.** Todos, reminders, projects, context blocks and dials are not journaled
-  and do not replicate. The knowledge graph is rebuilt by the follower's own consolidation.
+- **One direction.** A follower is read-only (above). Two instances following each other
+  would echo frames forever, so `follow` refuses a source that reports following us. A
+  three-node cycle is not detected.
+- **Memories only.** Todos, reminders, projects, context blocks, the knowledge graph,
+  facts, lineage, sessions, A/B tests, datasets and dials are not journaled and do not
+  replicate. Consolidation does not run on a follower, so its knowledge graph is not
+  rebuilt either: recall's graph legs find there only what the instance held before it
+  followed.
 - **Same embedding space.** A snapshot whose vector dimension differs from the follower's
   index is stored but not vector-indexed (BM25 and graph still find it). The embedding
   spaces plan (`docs/EXECUTION-embedding-spaces-2026-10-19.md`, step 4) lifts this.
