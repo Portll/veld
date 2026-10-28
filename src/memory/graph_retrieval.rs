@@ -44,11 +44,15 @@ use crate::constants::{
     ONTOLOGICAL_MIN_CONFIDENCE, ONTOLOGICAL_RELATION_PENALTY, QUERY_TYPE_ATTRIBUTE_GRAPH,
     QUERY_TYPE_ATTRIBUTE_LINGUISTIC, QUERY_TYPE_ATTRIBUTE_SEMANTIC, QUERY_TYPE_EXPLORATORY_GRAPH,
     QUERY_TYPE_EXPLORATORY_LINGUISTIC, QUERY_TYPE_EXPLORATORY_SEMANTIC, QUERY_TYPE_TEMPORAL_GRAPH,
-    QUERY_TYPE_TEMPORAL_LINGUISTIC, QUERY_TYPE_TEMPORAL_SEMANTIC, SALIENCE_BOOST_FACTOR,
-    SPREADING_ACTIVATION_THRESHOLD, SPREADING_DEGREE_NORMALIZATION,
-    SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO,
-    SPREADING_FRONTIER_CAP, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS,
-    SPREADING_NORMALIZATION_FACTOR, SPREADING_RELAXED_THRESHOLD,
+    QUERY_TYPE_TEMPORAL_LINGUISTIC, QUERY_TYPE_TEMPORAL_SEMANTIC, RECALL_GRAPH_LEG_ENTITIES,
+    RECALL_GRAPH_LEG_EPISODES_PER_ENTITY, RECALL_GRAPH_LEG_POOL, RECALL_PPR_EXPAND_HOPS,
+    RECALL_PPR_MAX_EXPANSIONS, RECALL_PPR_MAX_ITERATIONS, RECALL_PPR_MAX_NODES,
+    RECALL_PPR_POTENTIATION_MIN_FLOW, RECALL_PPR_RESTART, RECALL_PPR_TOLERANCE,
+    SALIENCE_BOOST_FACTOR, SEED_COVERAGE_BONUS, SPREADING_ACTIVATION_THRESHOLD,
+    SPREADING_DEGREE_NORMALIZATION, SPREADING_EARLY_TERMINATION_CANDIDATES,
+    SPREADING_EARLY_TERMINATION_RATIO, SPREADING_FRONTIER_CAP, SPREADING_MAX_HOPS,
+    SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
+    SPREADING_RELAXED_THRESHOLD,
 };
 use crate::embeddings::Embedder;
 use crate::graph_memory::{EdgeTier, EntityLabel, EpisodicNode, GraphMemory, RelationType};
@@ -310,6 +314,7 @@ struct SpreadEdge {
     effective: f32,
     /// `effective` blended with the directional strength from the source (A5 Max Sphere).
     blended: f32,
+    invalidated: bool,
 }
 
 /// Per-query adjacency: each entity's edges are read and decayed once, however many hops,
@@ -360,6 +365,7 @@ impl AdjacencyCache {
                         tier_trust,
                         effective,
                         blended,
+                        invalidated: edge.invalidated_at.is_some(),
                     }
                 })
                 .collect();
@@ -635,6 +641,284 @@ fn bidirectional_spread(
     );
 
     Ok((combined_map, all_edges, all_credit, intersection_count))
+}
+
+// =============================================================================
+// PERSONALIZED PAGERANK: recall's default graph leg
+// =============================================================================
+//
+// Ported from shodh-memory #325 (`personalized_pagerank`, default on there since its
+// LoCoMo runs measured recall@10 +0.012 with no category traded away). Random walk with
+// restart over the entity subgraph around the query's seeds: the stationary distribution
+// replaces hand-tuned hop decay and threshold pruning, and normalising each node's out-flow
+// keeps a hub from flooding its neighbourhood.
+
+/// A query entity recall's graph leg seeds from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GraphSeed {
+    pub(crate) uuid: Uuid,
+    /// Information content of the query word that named the entity.
+    pub(crate) ic_weight: f32,
+    pub(crate) mention_count: usize,
+}
+
+/// Each seed's restart weight, in seed order: `ic / mention_count`.
+///
+/// Dividing by the mention count is HippoRAG's node specificity (shodh-memory #325,
+/// `SHODH_PPR_SPECIFICITY`): a seed named in most memories, such as a conversation's speaker,
+/// yields its restart mass to a rare one instead of spreading the walk over its whole
+/// neighbourhood. Upstream also scales by stored entity salience; veld does not, because
+/// ingest compounds salience on every mention, so on a populated store every frequent entity
+/// sits at the 1.0 ceiling and the factor carries no information.
+pub(crate) fn seed_restart_weights(seeds: &[GraphSeed]) -> Vec<(Uuid, f32)> {
+    seeds
+        .iter()
+        .map(|s| (s.uuid, s.ic_weight / s.mention_count.max(1) as f32))
+        .collect()
+}
+
+/// The weight the walk spreads along `edge`: its decayed strength times its tier trust,
+/// times the ontological penalty when the query carries an intent.
+///
+/// The penalty is soft. An edge whose relation type the query did not ask for keeps
+/// `ONTOLOGICAL_RELATION_PENALTY` of its weight and a generic edge keeps all of it, where
+/// `traverse_weighted`'s relation filter drops both: on a graph whose edges are mostly
+/// generic, a query verb that maps to a relation type left that filter nothing to walk.
+fn ppr_edge_weight(
+    edge: &SpreadEdge,
+    intent: Option<&OntologicalIntent>,
+    graph: &GraphMemory,
+    entity_label_cache: &mut HashMap<Uuid, Option<Vec<EntityLabel>>>,
+) -> f32 {
+    let weight = edge.effective * edge.tier_trust;
+    let weight = match intent {
+        Some(intent) => weight * ontological_penalty(edge, intent, graph, entity_label_cache),
+        None => weight,
+    };
+    weight.max(0.0)
+}
+
+/// The stationary distribution of recall's personalized PageRank.
+#[derive(Debug, Default)]
+pub(crate) struct PprActivation {
+    /// Entity to stationary mass, for entities holding more than 1e-9. The masses sum to at
+    /// most 1: mass reaching an entity the walk did not expand leaves the walk.
+    pub(crate) mass: HashMap<Uuid, f32>,
+    /// Edges that carried at least `RECALL_PPR_POTENTIATION_MIN_FLOW` of the mass at
+    /// convergence, each once: the edges a recall strengthens.
+    pub(crate) carrying_edges: Vec<Uuid>,
+    /// Entities whose edges the walk read.
+    pub(crate) expanded: usize,
+}
+
+/// Intern `entity` into the walk's dense node index; true when it was not there yet.
+fn ppr_intern(
+    entity: Uuid,
+    nodes: &mut Vec<Uuid>,
+    index: &mut HashMap<Uuid, usize>,
+    adjacency: &mut Vec<Vec<(usize, f32, Uuid)>>,
+) -> (usize, bool) {
+    if let Some(&i) = index.get(&entity) {
+        return (i, false);
+    }
+    let i = nodes.len();
+    nodes.push(entity);
+    adjacency.push(Vec::new());
+    index.insert(entity, i);
+    (i, true)
+}
+
+/// Personalized PageRank from `seeds`, each `(entity, restart weight)`.
+///
+/// The subgraph is expanded breadth-first from the seeds for `RECALL_PPR_EXPAND_HOPS` hops,
+/// reading at most `RECALL_PPR_MAX_EXPANSIONS` entities' edges (each entity's 100 strongest,
+/// decayed to `now`, followed to their true neighbour) and holding at most
+/// `RECALL_PPR_MAX_NODES` entities. Power iteration then solves
+/// `r = (1 − α)·Wᵀr + α·p`, α = `RECALL_PPR_RESTART`, `p` the L1-normalised restart weights,
+/// `W` each entity's edge weights normalised over its out-flow.
+///
+/// Expansion follows the seed order and each entity's edges strongest first, ties by peer
+/// name, so two stores ingested from the same content walk the same subgraph.
+pub(crate) fn personalized_pagerank(
+    graph: &GraphMemory,
+    seeds: &[(Uuid, f32)],
+    intent: Option<&OntologicalIntent>,
+    now: DateTime<Utc>,
+) -> Result<PprActivation> {
+    let mut edges = AdjacencyCache::new(now);
+    let mut label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
+    let mut nodes: Vec<Uuid> = Vec::new();
+    let mut index: HashMap<Uuid, usize> = HashMap::new();
+    // Row u: (target node, weight, edge) for each edge the walk may take out of u.
+    let mut adjacency: Vec<Vec<(usize, f32, Uuid)>> = Vec::new();
+
+    let mut frontier: Vec<Uuid> = Vec::new();
+    for &(seed, _) in seeds {
+        if ppr_intern(seed, &mut nodes, &mut index, &mut adjacency).1 {
+            frontier.push(seed);
+        }
+    }
+    let mut expanded = 0usize;
+    'expand: for _hop in 0..RECALL_PPR_EXPAND_HOPS {
+        let mut next: Vec<Uuid> = Vec::new();
+        for &entity in &frontier {
+            if nodes.len() >= RECALL_PPR_MAX_NODES || expanded >= RECALL_PPR_MAX_EXPANSIONS {
+                break 'expand;
+            }
+            expanded += 1;
+            let from = index[&entity];
+            for edge in edges.edges_of(graph, &entity)? {
+                if edge.invalidated {
+                    continue;
+                }
+                let weight = ppr_edge_weight(edge, intent, graph, &mut label_cache);
+                if weight <= 0.0 {
+                    continue;
+                }
+                let (to, new) = ppr_intern(edge.target, &mut nodes, &mut index, &mut adjacency);
+                adjacency[from].push((to, weight, edge.uuid));
+                if new {
+                    next.push(edge.target);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+
+    let n = nodes.len();
+    let restart_total: f32 = seeds.iter().map(|(_, w)| w.max(0.0)).sum();
+    if n == 0 || restart_total <= 0.0 {
+        return Ok(PprActivation {
+            expanded,
+            ..Default::default()
+        });
+    }
+    let mut restart = vec![0.0_f32; n];
+    for &(seed, weight) in seeds {
+        restart[index[&seed]] += weight.max(0.0) / restart_total;
+    }
+    let out_weight: Vec<f32> = adjacency
+        .iter()
+        .map(|row| row.iter().map(|(_, w, _)| *w).sum())
+        .collect();
+
+    let mut rank = restart.clone();
+    for _ in 0..RECALL_PPR_MAX_ITERATIONS {
+        let mut next = vec![0.0_f32; n];
+        for (from, row) in adjacency.iter().enumerate() {
+            if rank[from] == 0.0 || out_weight[from] <= 0.0 {
+                continue;
+            }
+            let scale = (1.0 - RECALL_PPR_RESTART) * rank[from] / out_weight[from];
+            for &(to, weight, _) in row {
+                next[to] += scale * weight;
+            }
+        }
+        let mut delta = 0.0_f32;
+        for (i, value) in next.iter_mut().enumerate() {
+            *value += RECALL_PPR_RESTART * restart[i];
+            delta += (*value - rank[i]).abs();
+        }
+        rank = next;
+        if delta < RECALL_PPR_TOLERANCE {
+            break;
+        }
+    }
+
+    let mut carrying_edges: Vec<Uuid> = Vec::new();
+    for (from, row) in adjacency.iter().enumerate() {
+        if out_weight[from] <= 0.0 {
+            continue;
+        }
+        let scale = (1.0 - RECALL_PPR_RESTART) * rank[from] / out_weight[from];
+        carrying_edges.extend(
+            row.iter()
+                .filter(|(_, weight, _)| scale * weight >= RECALL_PPR_POTENTIATION_MIN_FLOW)
+                .map(|(_, _, edge)| *edge),
+        );
+    }
+    carrying_edges.sort_unstable();
+    carrying_edges.dedup();
+
+    let mass = nodes
+        .iter()
+        .zip(&rank)
+        .filter(|(_, r)| **r > 1e-9)
+        .map(|(entity, r)| (*entity, *r))
+        .collect();
+    Ok(PprActivation {
+        mass,
+        carrying_edges,
+        expanded,
+    })
+}
+
+/// The episodes of the walk's strongest entities, each once, with its graph activation, in
+/// the order they were reached.
+///
+/// Entities are visited by mass, at most `RECALL_GRAPH_LEG_ENTITIES` of them; each gives its
+/// newest `RECALL_GRAPH_LEG_EPISODES_PER_ENTITY` episodes, and the pool stops at
+/// `RECALL_GRAPH_LEG_POOL`. `admit` drops episodes outside the query's scope.
+///
+/// An episode's activation is the summed mass of every entity it names, plus the ones it was
+/// reached through, times `1 + SEED_COVERAGE_BONUS × (seeds named − 1)`.
+pub(crate) fn ppr_episode_pool(
+    graph: &GraphMemory,
+    ppr: &PprActivation,
+    seeds: &HashSet<Uuid>,
+    admit: impl Fn(&Uuid) -> bool,
+) -> Result<Vec<(Uuid, f32)>> {
+    let mut by_mass: Vec<(&Uuid, f32)> = ppr.mass.iter().map(|(e, m)| (e, *m)).collect();
+    by_mass.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    // Per pooled episode, the entities whose mass it collects.
+    let mut pool: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
+    let mut pooled: HashMap<Uuid, usize> = HashMap::new();
+    'entities: for (entity, _) in by_mass.into_iter().take(RECALL_GRAPH_LEG_ENTITIES) {
+        let room = RECALL_GRAPH_LEG_POOL - pool.len();
+        if room == 0 {
+            break;
+        }
+        let limit = RECALL_GRAPH_LEG_EPISODES_PER_ENTITY.min(room);
+        for episode in graph.get_recent_episodes_by_entity(entity, limit)? {
+            if let Some(&i) = pooled.get(&episode.uuid) {
+                pool[i].1.push(*entity);
+                continue;
+            }
+            if !admit(&episode.uuid) {
+                continue;
+            }
+            if pool.len() >= RECALL_GRAPH_LEG_POOL {
+                break 'entities;
+            }
+            let mut named = episode.entity_refs;
+            named.push(*entity);
+            pooled.insert(episode.uuid, pool.len());
+            pool.push((episode.uuid, named));
+        }
+    }
+
+    Ok(pool
+        .into_iter()
+        .map(|(episode, mut named)| {
+            named.sort_unstable();
+            named.dedup();
+            // Summed largest first: f32 addition is not associative, and this order is a
+            // function of the masses alone.
+            let mut masses: Vec<f32> = named
+                .iter()
+                .filter_map(|e| ppr.mass.get(e).copied())
+                .collect();
+            masses.sort_by(|a, b| b.total_cmp(a));
+            let coverage = named.iter().filter(|e| seeds.contains(e)).count();
+            let activation = masses.iter().sum::<f32>()
+                * (1.0 + SEED_COVERAGE_BONUS * coverage.saturating_sub(1) as f32);
+            (episode, activation)
+        })
+        .collect())
 }
 
 /// Spreading activation retrieval (legacy - uses fixed weights)
@@ -1282,7 +1566,11 @@ pub fn spreading_activation_retrieve_with_stats(
 /// - Modifiers (adjectives): 0.5 points each
 /// - Relations (verbs): 0.2 points each
 fn calculate_linguistic_match(memory: &Memory, analysis: &QueryAnalysis) -> f32 {
-    let content_lower = memory.experience.content.to_lowercase();
+    linguistic_match(&memory.experience.content.to_lowercase(), analysis)
+}
+
+/// [`calculate_linguistic_match`] over content the caller already lowercased.
+pub(crate) fn linguistic_match(content_lower: &str, analysis: &QueryAnalysis) -> f32 {
     let mut score = 0.0;
 
     // Entity matches (nouns) - highest weight
@@ -1981,5 +2269,269 @@ mod spreading_frontier_tests {
         assert_eq!(traversed.len(), seeds.len() * MAX_EDGES_PER_SPREAD);
         let distinct: HashSet<&Uuid> = traversed.iter().collect();
         assert_eq!(distinct.len(), traversed.len());
+    }
+}
+
+#[cfg(test)]
+mod ppr_tests {
+    use super::*;
+    use crate::constants::ONTOLOGICAL_RELATION_PENALTY;
+    use crate::graph_memory::{
+        EntityNode, EpisodeSource, LtpStatus, PiiClassification, RelationshipEdge,
+    };
+
+    fn entity(graph: &GraphMemory, name: &str, mentions: usize) -> Uuid {
+        let node = EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: mentions,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 1.0,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        };
+        graph.put_entity_record(&node).unwrap();
+        node.uuid
+    }
+
+    fn link(graph: &GraphMemory, from: Uuid, to: Uuid, relation: RelationType) -> Uuid {
+        let mut edge = RelationshipEdge::synthetic_for_sim(
+            0.5,
+            EdgeTier::L2Episodic,
+            LtpStatus::None,
+            Utc::now(),
+        );
+        edge.from_entity = from;
+        edge.to_entity = to;
+        edge.relation_type = relation;
+        graph.add_relationship(edge).unwrap()
+    }
+
+    fn episode(graph: &GraphMemory, entity_refs: Vec<Uuid>, content: &str) -> Uuid {
+        graph
+            .add_episode(EpisodicNode {
+                uuid: Uuid::new_v4(),
+                name: content.to_string(),
+                content: content.to_string(),
+                valid_at: Utc::now(),
+                created_at: Utc::now(),
+                entity_refs,
+                source: EpisodeSource::Message,
+                metadata: HashMap::new(),
+            })
+            .unwrap()
+    }
+
+    fn intent(relation_types: Vec<RelationType>) -> OntologicalIntent {
+        OntologicalIntent {
+            expected_labels: Vec::new(),
+            relation_types,
+            confidence: 1.0,
+        }
+    }
+
+    fn walk(
+        graph: &GraphMemory,
+        seeds: &[(Uuid, f32)],
+        intent: Option<&OntologicalIntent>,
+    ) -> PprActivation {
+        personalized_pagerank(graph, seeds, intent, Utc::now()).unwrap()
+    }
+
+    fn mass(ppr: &PprActivation, entity: &Uuid) -> f32 {
+        ppr.mass.get(entity).copied().unwrap_or(0.0)
+    }
+
+    #[test]
+    fn seed_weight_is_information_content_over_mentions() {
+        let seed = |ic_weight: f32, mention_count: usize| GraphSeed {
+            uuid: Uuid::new_v4(),
+            ic_weight,
+            mention_count,
+        };
+        let (rare, speaker, compound, unmentioned) =
+            (seed(2.3, 1), seed(2.3, 300), seed(3.45, 1), seed(2.3, 0));
+        let weights = seed_restart_weights(&[rare, speaker, compound, unmentioned]);
+
+        let order: Vec<Uuid> = weights.iter().map(|(u, _)| *u).collect();
+        assert_eq!(
+            order,
+            [rare.uuid, speaker.uuid, compound.uuid, unmentioned.uuid]
+        );
+        assert!(
+            (weights[0].1 / weights[1].1 - 300.0).abs() < 1e-3,
+            "{weights:?}"
+        );
+        assert!(
+            (weights[2].1 / weights[0].1 - 1.5).abs() < 1e-6,
+            "{weights:?}"
+        );
+        assert_eq!(weights[3].1, weights[0].1, "no mentions counts as one");
+    }
+
+    #[test]
+    fn a_rare_seed_holds_the_walk_and_a_speaker_seed_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let speaker = entity(&graph, "joanna", 300);
+        let rare = entity(&graph, "kestrel", 1);
+        let speaker_leaf = entity(&graph, "speaker leaf", 1);
+        let rare_leaf = entity(&graph, "rare leaf", 1);
+        link(&graph, speaker, speaker_leaf, RelationType::CoOccurs);
+        link(&graph, rare, rare_leaf, RelationType::CoOccurs);
+
+        let restart = seed_restart_weights(&[
+            GraphSeed {
+                uuid: speaker,
+                ic_weight: 2.3,
+                mention_count: 300,
+            },
+            GraphSeed {
+                uuid: rare,
+                ic_weight: 2.3,
+                mention_count: 1,
+            },
+        ]);
+        let ppr = walk(&graph, &restart, None);
+
+        let total: f32 = ppr.mass.values().sum();
+        assert!(total <= 1.0 + 1e-4, "mass is a distribution: {total}");
+        assert!(mass(&ppr, &rare) > mass(&ppr, &rare_leaf));
+        let ratio = mass(&ppr, &rare_leaf) / mass(&ppr, &speaker_leaf);
+        assert!(
+            (ratio - 300.0).abs() < 1.0,
+            "leaf mass follows seed specificity: {ratio}"
+        );
+    }
+
+    #[test]
+    fn another_relation_type_is_dampened_not_dropped_and_generic_ones_are_spared() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let seed = entity(&graph, "nate", 1);
+        let typed = entity(&graph, "employer", 1);
+        let related = entity(&graph, "related", 1);
+        let associated = entity(&graph, "associated", 1);
+        let co_occurring = entity(&graph, "co occurring", 1);
+        let wanted = entity(&graph, "tool", 1);
+        link(&graph, seed, typed, RelationType::WorksAt);
+        link(&graph, seed, related, RelationType::RelatedTo);
+        link(&graph, seed, associated, RelationType::AssociatedWith);
+        link(&graph, seed, co_occurring, RelationType::CoOccurs);
+        link(&graph, seed, wanted, RelationType::Uses);
+        let uses = intent(vec![RelationType::Uses]);
+
+        let mut adjacency = AdjacencyCache::new(Utc::now());
+        let mut labels = HashMap::new();
+        let edges = adjacency.edges_of(&graph, &seed).unwrap();
+        let weight_to = |target: Uuid, intent: Option<&OntologicalIntent>, labels: &mut _| {
+            let edge = edges.iter().find(|e| e.target == target).unwrap();
+            ppr_edge_weight(edge, intent, &graph, labels)
+        };
+        let plain = weight_to(typed, None, &mut labels);
+        assert!(plain > 0.0);
+        let dampened = weight_to(typed, Some(&uses), &mut labels);
+        assert!((dampened - plain * ONTOLOGICAL_RELATION_PENALTY).abs() < 1e-6);
+        for spared in [related, associated, co_occurring, wanted] {
+            assert_eq!(weight_to(spared, Some(&uses), &mut labels), plain);
+        }
+
+        let ppr = walk(&graph, &[(seed, 1.0)], Some(&uses));
+        assert!(
+            mass(&ppr, &typed) > 0.0,
+            "a mismatched relation still carries mass"
+        );
+        assert!(mass(&ppr, &typed) < mass(&ppr, &related));
+        for spared in [associated, co_occurring, wanted] {
+            assert!((mass(&ppr, &spared) - mass(&ppr, &related)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn the_walk_crosses_an_edge_from_either_end_and_skips_an_invalidated_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let seed = entity(&graph, "seed", 1);
+        let incoming = entity(&graph, "incoming", 1);
+        let retired = entity(&graph, "retired", 1);
+        link(&graph, incoming, seed, RelationType::CoOccurs);
+        let edge = link(&graph, seed, retired, RelationType::CoOccurs);
+        graph.invalidate_relationship(&edge).unwrap();
+
+        let ppr = walk(&graph, &[(seed, 1.0)], None);
+        assert!(
+            mass(&ppr, &incoming) > 0.0,
+            "an edge stored toward the seed is walked"
+        );
+        assert_eq!(
+            mass(&ppr, &retired),
+            0.0,
+            "an invalidated edge is not walked"
+        );
+    }
+
+    #[test]
+    fn only_edges_carrying_flow_are_strengthened() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let hub = entity(&graph, "hub", 1);
+        for leaf in 0..100 {
+            let leaf = entity(&graph, &format!("leaf {leaf}"), 1);
+            link(&graph, hub, leaf, RelationType::CoOccurs);
+        }
+        let ppr = walk(&graph, &[(hub, 1.0)], None);
+        assert!(
+            ppr.carrying_edges.is_empty(),
+            "a hub's flow splits below the floor"
+        );
+
+        let pair_seed = entity(&graph, "pair seed", 1);
+        let pair_peer = entity(&graph, "pair peer", 1);
+        let edge = link(&graph, pair_seed, pair_peer, RelationType::CoOccurs);
+        let ppr = walk(&graph, &[(pair_seed, 1.0)], None);
+        assert_eq!(ppr.carrying_edges, vec![edge]);
+
+        let bound = ((1.0 - RECALL_PPR_RESTART) / RECALL_PPR_POTENTIATION_MIN_FLOW) as usize;
+        let ppr = walk(&graph, &[(hub, 1.0), (pair_seed, 1.0)], None);
+        assert!(ppr.carrying_edges.len() <= bound);
+    }
+
+    #[test]
+    fn an_episode_naming_two_seeds_outranks_one_naming_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let speaker = entity(&graph, "melanie", 1);
+        let topic = entity(&graph, "sunrise", 1);
+        let neighbour = entity(&graph, "painting", 1);
+        let unreached = entity(&graph, "unreached", 1);
+        link(&graph, speaker, neighbour, RelationType::CoOccurs);
+        let both = episode(&graph, vec![speaker, topic], "Melanie painted a sunrise");
+        let one = episode(&graph, vec![speaker], "Melanie went running");
+        let near = episode(&graph, vec![neighbour], "a painting class");
+        let excluded = episode(&graph, vec![speaker], "out of scope");
+        let far = episode(&graph, vec![unreached], "never reached");
+
+        let seeds: HashSet<Uuid> = [speaker, topic].into_iter().collect();
+        let ppr = walk(&graph, &[(speaker, 1.0), (topic, 1.0)], None);
+        let pool: HashMap<Uuid, f32> = ppr_episode_pool(&graph, &ppr, &seeds, |e| *e != excluded)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(pool.len(), 3, "{pool:?}");
+        assert!(!pool.contains_key(&excluded) && !pool.contains_key(&far));
+        let expected = (mass(&ppr, &speaker) + mass(&ppr, &topic)) * (1.0 + SEED_COVERAGE_BONUS);
+        assert!(
+            (pool[&both] - expected).abs() < 1e-6,
+            "{} vs {expected}",
+            pool[&both]
+        );
+        assert!((pool[&one] - mass(&ppr, &speaker)).abs() < 1e-6);
+        assert!(pool[&both] > pool[&one] && pool[&one] > pool[&near] && pool[&near] > 0.0);
     }
 }

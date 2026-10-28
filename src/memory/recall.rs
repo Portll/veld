@@ -591,8 +591,8 @@ impl super::MemorySystem {
         let onto_confident = onto_intent.confidence >= crate::constants::ONTOLOGICAL_MIN_CONFIDENCE;
 
         // Query words resolved to graph entities once, for the ontology density gate below
-        // and Layer 2's traversal seeds. Nouns, adjectives AND verbs seed traversal, for
-        // multi-hop reasoning.
+        // and Layer 2. Only the nouns and path-shaped words seed Layer 2's walk; adjectives
+        // and verbs count toward the density that weighs the graph leg in fusion.
         let resolved_entities: Option<ResolvedQueryEntities> = self
             .graph_memory
             .as_ref()
@@ -1079,7 +1079,6 @@ impl super::MemorySystem {
             f32, // Keyword discriminativeness for dynamic BM25/vector weight adjustment
         ) = {
             if let Some(graph) = self.graph_memory.as_ref().filter(|_| use_graph) {
-                let g = graph.read();
                 // Extract IC weights for BM25 term boosting
                 let weights = query_analysis.to_ic_weights();
                 // Extract phrase boosts for exact phrase matching (e.g., "support group")
@@ -1098,177 +1097,175 @@ impl super::MemorySystem {
                 let entity_count = query_analysis.focal_entities.len()
                     + query_analysis.discriminative_modifiers.len();
 
-                // Query entities, each once: a word and its stem resolving to one entity
-                // would otherwise traverse it twice.
+                // Every resolved query word, each once.
                 let query_entities: &[uuid::Uuid] = resolved_entities
                     .as_ref()
                     .map(|r| r.all.as_slice())
                     .unwrap_or_default();
 
-                // Calculate PER-ENTITY density (not global graph density)
-                // Sparse entities = trust graph, Dense entities = trust vector
-                let d = if !query_entities.is_empty() {
-                    g.entities_average_density(query_entities).ok().flatten()
-                } else {
-                    // No query entities — skip density calculation.
-                    // The default weights (0.6, 0.3, 0.1) handle this case correctly.
-                    None
-                };
-
-                let mut ids = Vec::new();
-                // Episode content per candidate: the repeat-stable tie-break for the
-                // activation sort below (memory ids are random per ingest).
-                let mut episode_content: std::collections::HashMap<MemoryId, String> =
-                    std::collections::HashMap::new();
-                // Each reached entity's recent episodes, read once however many traversals
-                // reach it.
-                let mut entity_episodes: std::collections::HashMap<
-                    uuid::Uuid,
-                    Vec<(MemoryId, String)>,
-                > = std::collections::HashMap::new();
-
-                // Density-adaptive traversal: dense graphs get shallower depth
-                // and stricter strength filters to avoid exploring noisy L1 edges.
-                // Dense graph results are already downweighted in RRF fusion
-                // (graph_w=0.1 at density>2.0), so deep traversals add I/O cost
-                // for results that contribute <0.01% to the fused score.
-                let density_val = d.unwrap_or(0.0);
-                let (bidir_depth, bidir_min_str, weighted_depth, weighted_min_str) =
-                    if density_val > 15.0 {
-                        (3usize, 0.12f32, 3usize, 0.15f32)
-                    } else if density_val > 8.0 {
-                        (4, 0.08, 4, 0.12)
+                // The graph guard covers the walk and the episode reads only; the candidate
+                // records are read after it is released.
+                let (d, leg_weights, pool, seed_count) = {
+                    let g = graph.read();
+                    // Calculate PER-ENTITY density (not global graph density)
+                    // Sparse entities = trust graph, Dense entities = trust vector
+                    let d = if !query_entities.is_empty() {
+                        g.entities_average_density(query_entities).ok().flatten()
                     } else {
-                        (6, 0.05, 5, 0.10)
-                    };
-
-                if density_val > 0.0 {
-                    tracing::debug!(
-                        "Layer 2: density={:.1}, bidir_depth={}, bidir_min_str={:.2}, weighted_depth={}, weighted_min_str={:.2}",
-                        density_val, bidir_depth, bidir_min_str, weighted_depth, weighted_min_str
-                    );
-                }
-
-                // Multi-hop: Use bidirectional search between entity pairs
-                // Cap to top 3 pairs from first 4 entities to avoid O(n²) explosion.
-                // Entities are ordered by query analysis salience, so top pairs
-                // capture dominant relationships.
-                if query_entities.len() >= 2 {
-                    let max_pairs = 3usize;
-                    let max_ents = query_entities.len().min(4);
-                    let mut pair_count = 0usize;
-                    'bidir: for i in 0..max_ents {
-                        for j in (i + 1)..max_ents {
-                            if pair_count >= max_pairs {
-                                break 'bidir;
-                            }
-                            if let Ok(path) = g.traverse_bidirectional_at(
-                                &query_entities[i],
-                                &query_entities[j],
-                                bidir_depth,
-                                bidir_min_str,
-                                now,
-                            ) {
-                                for tr in &path.entities {
-                                    // Most recent episodes only: recency correlates with
-                                    // relevance for graph-surfaced candidates.
-                                    let episodes = recent_entity_episodes(
-                                        &g,
-                                        &mut entity_episodes,
-                                        &tr.entity.uuid,
-                                    );
-                                    for (mid, content) in episodes {
-                                        if episode_candidates
-                                            .as_ref()
-                                            .is_none_or(|c| c.contains(mid))
-                                        {
-                                            let path_boost = 1.5;
-                                            let activation =
-                                                tr.entity.salience * tr.decay_factor * path_boost;
-                                            // Relevance floor: skip low-activation candidates
-                                            if activation >= 0.1 {
-                                                episode_content
-                                                    .entry(mid.clone())
-                                                    .or_insert_with(|| content.clone());
-                                                ids.push((
-                                                    mid.clone(),
-                                                    activation,
-                                                    tr.decay_factor,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            pair_count += 1;
-                        }
-                    }
-                }
-
-                // Single-hop or supplement multi-hop: Weighted traversal from each entity.
-                // When ontological intent has sufficient confidence, pass relation types
-                // as a filter to traverse_weighted for type-aware graph expansion.
-                let use_onto_filter = onto_intent.confidence
-                    >= crate::constants::ONTOLOGICAL_MIN_CONFIDENCE
-                    && !onto_intent.relation_types.is_empty();
-                let relation_filter: Option<Vec<crate::graph_memory::RelationType>> =
-                    if use_onto_filter {
-                        Some(onto_intent.relation_types.clone())
-                    } else {
+                        // No query entities — skip density calculation.
+                        // The default weights (0.6, 0.3, 0.1) handle this case correctly.
                         None
                     };
+                    // Hybrid ranks the leg with fixed weights, the graph-led modes with their
+                    // density's, which also decides whether the ontology may shape the walk.
+                    let leg_density = match query.retrieval_mode {
+                        RetrievalMode::Associative | RetrievalMode::Causal => d,
+                        _ => None,
+                    };
+                    let leg_weights = leg_density.map(calculate_density_weights).unwrap_or((
+                        crate::constants::HYBRID_SEMANTIC_WEIGHT,
+                        crate::constants::HYBRID_GRAPH_WEIGHT,
+                        crate::constants::HYBRID_LINGUISTIC_WEIGHT,
+                    ));
+                    let intent = (onto_confident
+                        && !leg_density.is_some_and(|density| {
+                            density >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD
+                        }))
+                    .then_some(&onto_intent);
 
-                for entity_uuid in query_entities {
-                    if let Ok(t) = g.traverse_weighted_at(
-                        entity_uuid,
-                        weighted_depth,
-                        relation_filter.as_deref(),
-                        weighted_min_str,
-                        now,
-                    ) {
-                        for tr in &t.entities {
-                            let episodes =
-                                recent_entity_episodes(&g, &mut entity_episodes, &tr.entity.uuid);
-                            for (mid, content) in episodes {
-                                if episode_candidates.as_ref().is_none_or(|c| c.contains(mid)) {
-                                    let activation = tr.entity.salience * tr.decay_factor;
-                                    // Relevance floor: skip low-activation candidates
-                                    if activation >= 0.1 {
-                                        episode_content
-                                            .entry(mid.clone())
-                                            .or_insert_with(|| content.clone());
-                                        ids.push((mid.clone(), activation, tr.decay_factor));
+                    let seeds = graph_leg_seeds(
+                        &g,
+                        resolved_entities.as_ref(),
+                        &query_analysis,
+                        query.ner_entities.as_deref(),
+                    );
+                    let pool = if seeds.is_empty() {
+                        Vec::new()
+                    } else {
+                        let restart = crate::memory::graph_retrieval::seed_restart_weights(&seeds);
+                        let seed_set: HashSet<uuid::Uuid> = seeds.iter().map(|s| s.uuid).collect();
+                        let walked = crate::memory::graph_retrieval::personalized_pagerank(
+                            &g, &restart, intent, now,
+                        )
+                        .and_then(|ppr| {
+                            let pool = crate::memory::graph_retrieval::ppr_episode_pool(
+                                &g,
+                                &ppr,
+                                &seed_set,
+                                |episode| {
+                                    episode_candidates
+                                        .as_ref()
+                                        .is_none_or(|c| c.contains(&MemoryId(*episode)))
+                                },
+                            )?;
+                            Ok((ppr, pool))
+                        });
+                        match walked {
+                            Ok((ppr, pool)) => {
+                                // Retrieval-driven strengthening of the edges that carried the
+                                // walk: a usage write, skipped under read-only recall.
+                                if !ppr.carrying_edges.is_empty()
+                                    && !crate::memory::recall_readonly()
+                                    && super::ablation::is_enabled("graph_potentiation")
+                                {
+                                    if let Err(e) = g.batch_strengthen_synapses(
+                                        &ppr.carrying_edges,
+                                        &crate::graph_memory::ambient_evidence_source(),
+                                    ) {
+                                        tracing::debug!("Layer 2: edge strengthening failed: {e}");
                                     }
                                 }
+                                tracing::debug!(
+                                    seeds = seeds.len(),
+                                    expanded = ppr.expanded,
+                                    activated = ppr.mass.len(),
+                                    pool = pool.len(),
+                                    "Layer 2: personalized PageRank"
+                                );
+                                pool.into_iter()
+                                    .map(|(episode, activation)| (MemoryId(episode), activation))
+                                    .collect()
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Layer 2: graph leg failed, recall continues without it: {e:#}"
+                                );
+                                Vec::new()
                             }
                         }
-                    }
-                }
+                    };
+                    (d, leg_weights, pool, seeds.len())
+                };
 
-                let mut seen: std::collections::HashMap<MemoryId, (f32, f32)> =
-                    std::collections::HashMap::new();
-                for (id, act, heb) in ids {
-                    seen.entry(id)
-                        .and_modify(|(a, h)| {
-                            *a = a.max(act);
-                            *h = h.max(heb);
-                        })
-                        .or_insert((act, heb));
-                }
-                let mut r: Vec<_> = seen.into_iter().map(|(id, (a, h))| (id, a, h)).collect();
-                // CRITICAL: Sort by activation score so RRF rank is meaningful. Activations
-                // take few distinct values, so the cap below cuts through ties: those are
-                // ordered by content, which is unique per store (content-hash dedup).
-                r.sort_by(|a, b| {
-                    b.1.total_cmp(&a.1)
-                        .then_with(|| episode_content[&a.0].cmp(&episode_content[&b.0]))
+                // Rank the pool by relevance, as shodh-memory #258 ranks Layer 2 by final score:
+                // each episode's query cosine, linguistic match and graph activation, fused with
+                // the leg's weights. Recency, arousal and credibility are left to Layer 5, which
+                // applies them to every candidate.
+                let (semantic_w, leg_graph_w, linguistic_w) = leg_weights;
+                candidates.prefetch(pool.iter().map(|(id, _)| id));
+                let max_activation = pool.iter().map(|(_, a)| *a).fold(0.0_f32, f32::max);
+                let mut ranked: Vec<(MemoryId, f32, f32, Arc<CandidateView>)> = pool
+                    .into_iter()
+                    .filter_map(|(id, activation)| {
+                        let view = candidates.get(&id)?;
+                        if view.memory.is_forgotten() {
+                            return None;
+                        }
+                        let semantic = view
+                            .memory
+                            .experience
+                            .embeddings
+                            .as_deref()
+                            .map_or(0.0, |e| {
+                                crate::similarity::cosine_similarity(&query_embedding, e)
+                            });
+                        let linguistic = crate::memory::graph_retrieval::linguistic_match(
+                            &view.content_lower,
+                            &query_analysis,
+                        );
+                        let score = crate::memory::graph_retrieval::fuse_hybrid_score(
+                            semantic,
+                            activation,
+                            linguistic,
+                            semantic_w,
+                            leg_graph_w,
+                            linguistic_w,
+                            crate::memory::graph_retrieval::memory_tier_graph_trust(
+                                view.memory.tier,
+                            ),
+                        );
+                        let strength = if max_activation > 0.0 {
+                            activation / max_activation
+                        } else {
+                            0.0
+                        };
+                        Some((id, score, strength, view))
+                    })
+                    .collect();
+                // Memories without an embedding tie; content is unique per store and
+                // repeat-stable, where ids are random per ingest.
+                ranked.sort_by(|a, b| {
+                    b.1.total_cmp(&a.1).then_with(|| {
+                        a.3.memory
+                            .experience
+                            .content
+                            .cmp(&b.3.memory.experience.content)
+                    })
                 });
-                let pre_cap = r.len();
-                // Cap total graph candidates to prevent flooding RRF fusion
-                r.truncate(200);
+                let pre_cap = ranked.len();
+                ranked.truncate(crate::constants::RECALL_GRAPH_LEG_CANDIDATES);
+                let r: Vec<(MemoryId, f32, f32)> = ranked
+                    .into_iter()
+                    .map(|(id, score, strength, _)| (id, score, strength))
+                    .collect();
                 if !r.is_empty() {
-                    tracing::debug!("Layer 2: {} graph results (capped from {}), {} query entities, bidirectional={}, top_activation={:.3}",
-                        r.len(), pre_cap, entity_count, query_entities.len() >= 2, r.first().map(|x| x.1).unwrap_or(0.0));
+                    tracing::debug!(
+                        "Layer 2: {} graph results (ranked from {}), {} seeds, top={:.3}",
+                        r.len(),
+                        pre_cap,
+                        seed_count,
+                        r.first().map(|x| x.1).unwrap_or(0.0)
+                    );
                 }
                 (r, d, entity_count, weights, phrases, disc)
             } else {
@@ -6089,8 +6086,12 @@ fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
 pub(crate) struct ResolvedQueryEntities {
     /// Entities the focal words resolved to, in query order, each once.
     pub(crate) focal: Vec<uuid::Uuid>,
+    /// For each `focal` entity, the index in `focal_words` of the first word resolving to it.
+    pub(crate) focal_word: Vec<usize>,
+    /// FilePath entities the path-shaped query words name, each once.
+    pub(crate) paths: Vec<uuid::Uuid>,
     /// Every resolved entity in query order (focal, then the other words, then path-shaped
-    /// words' FilePath entities), each once: two words resolving to one entity traverse it once.
+    /// words' FilePath entities), each once.
     pub(crate) all: Vec<uuid::Uuid>,
 }
 
@@ -6107,15 +6108,19 @@ pub(crate) fn resolve_query_entities(
     query_text: &str,
 ) -> ResolvedQueryEntities {
     let mut focal: Vec<uuid::Uuid> = Vec::new();
+    let mut focal_word: Vec<usize> = Vec::new();
+    let mut paths: Vec<uuid::Uuid> = Vec::new();
     let mut all: Vec<uuid::Uuid> = Vec::new();
     let mut tried: HashSet<&str> = HashSet::new();
     let add = |list: &mut Vec<uuid::Uuid>, uuid: uuid::Uuid| {
-        if !list.contains(&uuid) {
+        let new = !list.contains(&uuid);
+        if new {
             list.push(uuid);
         }
+        new
     };
 
-    for &word in focal_words {
+    for (index, &word) in focal_words.iter().enumerate() {
         if !tried.insert(word) {
             continue;
         }
@@ -6130,7 +6135,9 @@ pub(crate) fn resolve_query_entities(
                 .map(|entity| entity.uuid)
         });
         if let Some(uuid) = resolved {
-            add(&mut focal, uuid);
+            if add(&mut focal, uuid) {
+                focal_word.push(index);
+            }
             add(&mut all, uuid);
         }
     }
@@ -6153,34 +6160,69 @@ pub(crate) fn resolve_query_entities(
         }
         if let Ok(found) = graph.find_file_paths_by_suffix(&token) {
             for entity in found {
+                add(&mut paths, entity.uuid);
                 add(&mut all, entity.uuid);
             }
         }
     }
-    ResolvedQueryEntities { focal, all }
+    ResolvedQueryEntities {
+        focal,
+        focal_word,
+        paths,
+        all,
+    }
 }
 
-/// An entity's most recent episodes as recall's graph layer uses them, read once per recall
-/// however many traversals reach the entity.
-fn recent_entity_episodes<'c>(
+/// The graph leg's seeds, each once: the entities the query's nouns resolved to, at their
+/// words' information content, then at a noun's the FilePath entities its path-shaped words
+/// name and the entities the caller's NER names resolve to strictly.
+///
+/// Adjectives and verbs do not seed: words like "working" or "enjoy" resolve to hub entities
+/// and spread the walk over the store. A seed whose entity cannot be read is left out.
+fn graph_leg_seeds(
     graph: &crate::graph_memory::GraphMemory,
-    cache: &'c mut std::collections::HashMap<uuid::Uuid, Vec<(MemoryId, String)>>,
-    entity: &uuid::Uuid,
-) -> &'c [(MemoryId, String)] {
-    cache.entry(*entity).or_insert_with(|| {
-        graph
-            .get_recent_episodes_by_entity(
-                entity,
-                crate::constants::RECALL_GRAPH_EPISODES_PER_ENTITY,
-            )
-            .map(|episodes| {
-                episodes
-                    .into_iter()
-                    .map(|ep| (MemoryId(ep.uuid), ep.content))
-                    .collect()
+    resolved: Option<&ResolvedQueryEntities>,
+    analysis: &query_parser::QueryAnalysis,
+    ner_names: Option<&[String]>,
+) -> Vec<crate::memory::graph_retrieval::GraphSeed> {
+    let noun_ic = crate::constants::IC_NOUN;
+    let mut named: Vec<(uuid::Uuid, f32)> = Vec::new();
+    let mut add = |uuid: uuid::Uuid, ic_weight: f32| {
+        if !named.iter().any(|(seen, _)| *seen == uuid) {
+            named.push((uuid, ic_weight));
+        }
+    };
+    if let Some(resolved) = resolved {
+        for (uuid, &word) in resolved.focal.iter().zip(&resolved.focal_word) {
+            let ic_weight = analysis
+                .focal_entities
+                .get(word)
+                .map_or(noun_ic, |e| e.ic_weight);
+            add(*uuid, ic_weight);
+        }
+        for uuid in &resolved.paths {
+            add(*uuid, noun_ic);
+        }
+    }
+    for name in ner_names.unwrap_or_default() {
+        if name.trim().chars().count() < 2 {
+            continue;
+        }
+        if let Some(uuid) = graph.find_entity_uuid_strict(name) {
+            add(uuid, noun_ic);
+        }
+    }
+    named
+        .into_iter()
+        .filter_map(|(uuid, ic_weight)| {
+            let entity = graph.get_entity(&uuid).ok().flatten()?;
+            Some(crate::memory::graph_retrieval::GraphSeed {
+                uuid,
+                ic_weight,
+                mention_count: entity.mention_count,
             })
-            .unwrap_or_default()
-    })
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -7082,7 +7124,61 @@ mod query_entity_resolution_tests {
             "when did we start deploying the Vornak Reactors",
         );
         assert_eq!(resolved.focal, vec![reactor]);
+        assert_eq!(resolved.focal_word, vec![0]);
+        assert!(resolved.paths.is_empty());
         assert_eq!(resolved.all, vec![reactor, deploy]);
+    }
+
+    #[test]
+    fn only_nouns_seed_the_graph_leg_at_their_information_content_and_rarity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let mut speaker = entity("Caroline");
+        speaker.mention_count = 300;
+        graph.put_entity_record(&speaker).unwrap();
+        let topic = graph.add_entity(entity("adoption")).unwrap();
+        let verb = graph.add_entity(entity("research")).unwrap();
+        let ner_only = graph.add_entity(entity("LGBTQ support group")).unwrap();
+
+        let analysis = crate::memory::query_parser::QueryAnalysis {
+            focal_entities: ["Caroline", "adoption", "Caroline"]
+                .iter()
+                .zip([2.3, 3.0, 2.3])
+                .map(
+                    |(text, ic_weight)| crate::memory::query_parser::FocalEntity {
+                        text: text.to_string(),
+                        stem: text.to_lowercase(),
+                        ic_weight,
+                        is_compound: false,
+                        negated: false,
+                    },
+                )
+                .collect(),
+            ..crate::memory::query_parser::analyze_query("")
+        };
+        let resolved = resolve_query_entities(
+            &graph,
+            &["Caroline", "adoption", "Caroline"],
+            &["research", "researched"],
+            "did Caroline research adoption",
+        );
+        assert!(resolved.all.contains(&verb), "the verb resolves");
+
+        let ner = vec!["LGBTQ support group".to_string(), "x".to_string()];
+        let seeds = super::graph_leg_seeds(&graph, Some(&resolved), &analysis, Some(&ner));
+        let seeded: Vec<(uuid::Uuid, f32, usize)> = seeds
+            .iter()
+            .map(|s| (s.uuid, s.ic_weight, s.mention_count))
+            .collect();
+        assert_eq!(
+            seeded,
+            vec![
+                (speaker.uuid, 2.3, 300),
+                (topic, 3.0, 1),
+                (ner_only, crate::constants::IC_NOUN, 1)
+            ],
+            "the verb does not seed; a repeated noun seeds once"
+        );
     }
 
     #[test]
