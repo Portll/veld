@@ -211,13 +211,15 @@ pub struct CognitiveDials {
     /// BM25 minimum-score floor for lexical candidates. Default 0.1.
     #[serde(default)]
     pub bm25_min_score: Option<f32>,
-    /// Ontological rerank boost per entity-label match. Default 0.15.
+    /// Ontological rerank boost per entity-label match, as a share of the memory's fused
+    /// score. Default 0.15.
     #[serde(default)]
     pub onto_rerank_boost: Option<f32>,
-    /// Ontological rerank boost cap. Default 0.40.
+    /// Ontological rerank boost cap, as a share of the fused score. Default 0.40.
     #[serde(default)]
     pub onto_rerank_max: Option<f32>,
-    /// Ontological rerank mismatch penalty (negative). Default -0.08.
+    /// Ontological rerank mismatch penalty (negative), as a share of the fused score: -1
+    /// zeroes it. Default -0.08.
     #[serde(default)]
     pub onto_rerank_penalty: Option<f32>,
     /// Cross-encoder share of the Layer 5.3 blend for every query shape at once, except that
@@ -225,7 +227,7 @@ pub struct CognitiveDials {
     /// and `constants::CE_BLEND_*` decide. See `ce_share`.
     #[serde(default)]
     pub ce_blend: Option<f32>,
-    /// Temporal-fact source-memory boost, as a share of the top fused score. Default 0.20.
+    /// Temporal-fact source-memory boost, as a share of the memory's fused score. Default 0.20.
     #[serde(default)]
     pub temporal_recall_boost: Option<f32>,
     /// Cross-encoder share for one query shape; each overrides its `constants::CE_BLEND_*`

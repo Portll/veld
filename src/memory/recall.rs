@@ -2127,18 +2127,13 @@ impl super::MemorySystem {
                 }
             }
 
-            // The top RRF score, the unit the boosts below are shares of. RRF scores sit near
-            // weight / (k + rank), about 0.02-0.04 at k = 20, so an absolute +0.10 outweighs
-            // every rank difference the fusion produced: on LoCoMo the entity-overlap and
-            // temporal-fact boosts took gold hit@10 from 0.72 to 0.45.
-            let fusion_scale = {
-                let top = fused.values().copied().fold(0.0_f32, f32::max);
-                if top > 0.0 {
-                    top
-                } else {
-                    hybrid_w / (k + 1.0)
-                }
-            };
+            // Every boost from here to Layer 4.92 multiplies a candidate's fused score by
+            // `1 + share`, so what it adds is a bounded share of that candidate's own score
+            // (shodh-memory #174). An absolute boost outweighed every rank difference the
+            // fusion produced: at k = 20 reciprocal-rank scores sit near 0.02-0.04, and on
+            // LoCoMo the entity-overlap and temporal-fact boosts took gold hit@10 from 0.72 to
+            // 0.45. A boost reorders what the fusion found; it does not add a memory the
+            // fusion did not find, since such a memory has no score to take a share of.
 
             // ===========================================================================
             // LAYER 4.5: ATTRIBUTE QUERY BOOST
@@ -2147,15 +2142,10 @@ impl super::MemorySystem {
             // AND an attribute synonym value. This ensures "Caroline is single" ranks
             // high for "What is Caroline's relationship status?".
             if !attribute_boost_ids.is_empty() {
-                const ATTRIBUTE_BOOST: f32 = 0.5; // Strong boost for attribute matches
                 let mut boosted_count = 0;
                 for id in &attribute_boost_ids {
                     if let Some(score) = fused.get_mut(id) {
-                        *score += ATTRIBUTE_BOOST;
-                        boosted_count += 1;
-                    } else {
-                        // Also add memories that weren't in the fusion but match attribute
-                        fused.insert(id.clone(), ATTRIBUTE_BOOST);
+                        *score *= 1.0 + crate::constants::ATTRIBUTE_QUERY_BOOST;
                         boosted_count += 1;
                     }
                 }
@@ -2171,11 +2161,11 @@ impl super::MemorySystem {
             // LAYER 4.55: TEMPORAL FACT BOOST
             // ===========================================================================
             // Source memories of matching temporal facts gain `temporal_recall_boost` (0.20) of
-            // the top fused score. Fires for all temporal intents (including WhenQuestion) and
+            // their fused score. Fires for all temporal intents (including WhenQuestion) and
             // broader temporal keywords. The entity-only fallback in Layer 0.6 can name fifty
-            // sources for one person, so the boost has to stay a nudge within the fusion's
-            // scale: as an absolute +0.20 those fifty outranked every semantic match and took
-            // LoCoMo temporal hit@10 from 0.89 to 0.35.
+            // sources for one person, so the boost has to stay a nudge: as an absolute +0.20
+            // those fifty outranked every semantic match and took LoCoMo temporal hit@10 from
+            // 0.89 to 0.35.
             // [signal: temporal_fact_boost] Gated by disabled_signals dial; default = always on.
             if !temporal_fact_boost_ids.is_empty()
                 && early_dials_snapshot.signal_enabled("temporal_fact_boost")
@@ -2184,19 +2174,15 @@ impl super::MemorySystem {
                     .cognitive_dials
                     .read()
                     .temporal_recall_boost
-                    .unwrap_or(crate::constants::TEMPORAL_RECALL_BOOST)
-                    * fusion_scale;
+                    .unwrap_or(crate::constants::TEMPORAL_RECALL_BOOST);
                 let mut boosted_count = 0;
                 for id in &temporal_fact_boost_ids {
                     if let Some(score) = fused.get_mut(id) {
-                        *score += temporal_recall_boost;
+                        *score *= 1.0 + temporal_recall_boost;
                         boosted_count += 1;
-                    } else {
-                        fused.insert(id.clone(), temporal_recall_boost);
-                        boosted_count += 1;
+                        // Signal attribution: mark temporal match
+                        attr.entry(id.clone()).or_default().temporal_match = true;
                     }
-                    // Signal attribution: mark temporal match
-                    attr.entry(id.clone()).or_default().temporal_match = true;
                 }
                 if boosted_count > 0 {
                     tracing::info!(
@@ -2226,7 +2212,6 @@ impl super::MemorySystem {
                     || (query_lower.contains("what") && query_lower.contains("use"));
 
                 if is_decision_query {
-                    const DECISION_TYPE_BOOST: f32 = 0.15;
                     let mut boosted_count = 0usize;
                     for (id, score) in fused.iter_mut() {
                         let is_decision = candidates.get(id).is_some_and(|view| {
@@ -2236,7 +2221,7 @@ impl super::MemorySystem {
                             )
                         });
                         if is_decision {
-                            *score += DECISION_TYPE_BOOST;
+                            *score *= 1.0 + crate::constants::DECISION_TYPE_BOOST;
                             boosted_count += 1;
                         }
                     }
@@ -2256,8 +2241,8 @@ impl super::MemorySystem {
             // Porter stemming resolves morphological mismatches: "bugs"->"bug",
             // "risks"->"risk", "testing"->"test". Stop word filtering prevents
             // false positives from "the" matching inside "prometheus" etc.
-            // A word match adds up to ENTITY_OVERLAP_SHARE of the top fused score, weighted by
-            // how few candidates it matches; four full matches are the cap.
+            // A word match adds up to ENTITY_OVERLAP_SHARE of the memory's fused score, weighted
+            // by how few candidates it matches; four full matches are the cap.
             // [signal: entity_overlap] Gated by disabled_signals dial; default = always on.
             let entity_overlap_on = early_dials_snapshot.signal_enabled("entity_overlap");
             {
@@ -2318,21 +2303,15 @@ impl super::MemorySystem {
                         }
                     }
 
-                    let share = crate::constants::ENTITY_OVERLAP_SHARE;
-                    // Abstract/decomposed queries match generic stems like "perform" on many
-                    // memories equally, so a word match there counts for 0.4 of its share.
-                    let per_match = if decomposed { 0.4 * share } else { share };
                     for (id, matched) in ids.iter().zip(&matches) {
                         let overlap = matched.len();
                         if overlap >= 1 {
-                            // A word match adds `per_match` of the top fused score, weighted by
-                            // how few candidates the word matches: a speaker's name is an
-                            // entity on half of a conversation and says nothing about which
-                            // turn is meant, while `thiserror` on one memory says everything.
-                            // An identifier match ("serve.mjs" against a declared
-                            // `repo:admin/serve.mjs`) matches at a name boundary or not at
-                            // all, so it stays an absolute +0.10 that outranks any fusion
-                            // score, decomposed or not.
+                            // A word match is weighted by how few candidates the word matches:
+                            // a speaker's name is an entity on half of a conversation and says
+                            // nothing about which turn is meant, while `thiserror` on one
+                            // memory says everything. An identifier match ("serve.mjs" against
+                            // a declared `repo:admin/serve.mjs`) matches at a name boundary or
+                            // not at all, so it counts in full.
                             let identifiers =
                                 matched.iter().filter(|qs| is_structured_token(qs)).count();
                             let word_weight: f32 = matched
@@ -2345,12 +2324,14 @@ impl super::MemorySystem {
                                     )
                                 })
                                 .sum();
-                            let boost = (per_match * word_weight).min(4.0 * per_match)
-                                * fusion_scale
-                                + (0.10 * identifiers as f32).min(0.40);
                             if entity_overlap_on {
                                 if let Some(score) = fused.get_mut(id) {
-                                    *score += boost;
+                                    *score *= 1.0
+                                        + entity_overlap_share(
+                                            word_weight,
+                                            identifiers,
+                                            decomposed,
+                                        );
                                 }
                             }
                             // Signal attribution: mark entity overlap
@@ -2358,8 +2339,8 @@ impl super::MemorySystem {
                         } else if !has_any_temporal_intent {
                             // Content-fallback: when no entity/tag overlap, check
                             // if query stems appear in memory content. Smaller boost
-                            // (0.05 of the top fused score per match, cap 0.20) to keep
-                            // below tag-match priority.
+                            // (0.05 of the memory's fused score per match, cap 0.20) to
+                            // keep below tag-match priority.
                             // Gated: skip for temporal queries where content overlap
                             // would boost wrong-session memories indiscriminately.
                             // [signal: content_fallback] Gated by disabled_signals dial; default = always on.
@@ -2371,10 +2352,9 @@ impl super::MemorySystem {
                                         .filter(|qs| content_lower.contains(qs.as_str()))
                                         .count();
                                     if content_overlap >= 2 {
-                                        let boost = (0.05 * content_overlap as f32).min(0.20)
-                                            * fusion_scale;
                                         if let Some(score) = fused.get_mut(id) {
-                                            *score += boost;
+                                            *score *=
+                                                1.0 + (0.05 * content_overlap as f32).min(0.20);
                                         }
                                     }
                                 }
@@ -2610,8 +2590,7 @@ impl super::MemorySystem {
             // via keyword or semantic similarity (built in recall handler C5).
             if let Some(ref signals) = query.prospective_signals {
                 if !signals.is_empty() {
-                    const PROSPECTIVE_BOOST_PER_MATCH: f32 = 0.15;
-                    const MAX_PROSPECTIVE_BOOST: f32 = 0.5;
+                    use crate::constants::{PROSPECTIVE_BOOST_MAX, PROSPECTIVE_BOOST_PER_MATCH};
 
                     // Tokenize all signals into unique terms (skip noise words < 3 chars)
                     let signal_terms: std::collections::HashSet<String> = signals
@@ -2637,10 +2616,10 @@ impl super::MemorySystem {
 
                                 if match_count > 0 {
                                     // Sqrt scaling: diminishing returns for additional matches
-                                    let boost = (PROSPECTIVE_BOOST_PER_MATCH
-                                        * (match_count as f32).sqrt())
-                                    .min(MAX_PROSPECTIVE_BOOST);
-                                    *score += boost;
+                                    *score *= 1.0
+                                        + (PROSPECTIVE_BOOST_PER_MATCH
+                                            * (match_count as f32).sqrt())
+                                        .min(PROSPECTIVE_BOOST_MAX);
                                     boosted_count += 1;
                                 }
                             }
@@ -2670,7 +2649,7 @@ impl super::MemorySystem {
                 let mut boosted_count = 0;
                 for (id, boost) in &fact_source_boosts {
                     if let Some(score) = fused.get_mut(id) {
-                        *score += boost;
+                        *score *= 1.0 + boost;
                         boosted_count += 1;
                     }
                 }
@@ -2685,9 +2664,8 @@ impl super::MemorySystem {
             // ===========================================================================
             // LAYER 4.9: ONTOLOGICAL RE-RANKING
             // ===========================================================================
-            // Boost memories connected to type-matching entities. Conservative additive
-            // boost on top of the fused score. Only active when ontological intent has
-            // sufficient confidence.
+            // Boost memories connected to type-matching entities, by a share of the fused
+            // score. Only active when ontological intent has sufficient confidence.
             //
             // Reference: Collins & Quillian (1969) — type-plausible paths retrieved faster
             // Pre-sort and limit candidates before expensive re-ranking.
@@ -2736,7 +2714,7 @@ impl super::MemorySystem {
                                         .onto_rerank_max
                                         .unwrap_or(crate::constants::ONTOLOGICAL_RERANK_MAX),
                                 );
-                                *fused_score += boost;
+                                *fused_score *= 1.0 + boost;
                                 boosted_count += 1;
                                 crate::metrics::ONTOLOGICAL_RERANK_BOOST_APPLIED
                                     .observe(boost as f64);
@@ -2747,11 +2725,12 @@ impl super::MemorySystem {
                                 // Memory has entities but NONE match expected types.
                                 // Apply penalty only at high confidence to avoid
                                 // punishing NER extraction gaps.
-                                *fused_score += self
-                                    .cognitive_dials
-                                    .read()
-                                    .onto_rerank_penalty
-                                    .unwrap_or(crate::constants::ONTOLOGICAL_RERANK_PENALTY);
+                                *fused_score *= 1.0
+                                    + self
+                                        .cognitive_dials
+                                        .read()
+                                        .onto_rerank_penalty
+                                        .unwrap_or(crate::constants::ONTOLOGICAL_RERANK_PENALTY);
                                 penalized_count += 1;
                             }
                         }
@@ -2825,7 +2804,7 @@ impl super::MemorySystem {
                 // Apply demotions
                 for (idx, penalty) in &demote_indices {
                     if let Some((_, score)) = res.get_mut(*idx) {
-                        *score -= penalty;
+                        *score *= 1.0 - penalty;
                         demoted += 1;
                     }
                 }
@@ -6227,6 +6206,17 @@ fn entity_match_specificity(n: usize, matching: usize) -> f32 {
     ((n as f32 / matching as f32).ln() / (n as f32).ln()).clamp(0.0, 1.0)
 }
 
+/// Layer 4.525's share of a memory's own fused score for its entity matches: each word match
+/// is worth `ENTITY_OVERLAP_SHARE` times its specificity (`word_weight` is their sum), 0.4 of
+/// that on a decomposed query, whose generic stems ("perform") match many memories alike; each
+/// identifier match is worth the full share, decomposed or not. Four full matches are the cap.
+fn entity_overlap_share(word_weight: f32, identifiers: usize, decomposed: bool) -> f32 {
+    let share = crate::constants::ENTITY_OVERLAP_SHARE;
+    let per_word = if decomposed { 0.4 * share } else { share };
+    let words = (per_word * word_weight).min(4.0 * per_word);
+    (words + share * identifiers as f32).min(4.0 * share)
+}
+
 /// One hybrid-list candidate as Layer 4's FLAT fusion reads it.
 #[derive(Debug, Clone, Copy)]
 struct HybridComponents {
@@ -7576,6 +7566,22 @@ mod fusion_tests {
         assert!(flat_hybrid(0.8, 0.5) > flat_hybrid(0.8, 0.0));
         // Symmetric in the two lists.
         assert_eq!(flat_hybrid(0.3, 0.9), flat_hybrid(0.9, 0.3));
+    }
+
+    #[test]
+    fn an_entity_match_is_a_bounded_share_of_the_memorys_own_score() {
+        let share = crate::constants::ENTITY_OVERLAP_SHARE;
+        assert_eq!(entity_overlap_share(0.0, 0, false), 0.0);
+        assert!((entity_overlap_share(1.0, 0, false) - share).abs() < EPS);
+        assert!((entity_overlap_share(0.5, 0, false) - 0.5 * share).abs() < EPS);
+        // A decomposed query's word matches count for 0.4; an identifier counts in full.
+        assert!((entity_overlap_share(1.0, 0, true) - 0.4 * share).abs() < EPS);
+        assert!((entity_overlap_share(0.0, 1, true) - share).abs() < EPS);
+        // Four full matches of either kind are the cap, decomposed or not.
+        assert!((entity_overlap_share(10.0, 0, false) - 4.0 * share).abs() < EPS);
+        assert!((entity_overlap_share(3.0, 3, false) - 4.0 * share).abs() < EPS);
+        assert!((entity_overlap_share(0.0, 9, true) - 4.0 * share).abs() < EPS);
+        assert!((entity_overlap_share(10.0, 0, true) - 1.6 * share).abs() < EPS);
     }
 
     #[test]

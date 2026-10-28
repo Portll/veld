@@ -1131,16 +1131,17 @@ pub const ONTOLOGICAL_ENTITY_PENALTY: f32 = 0.6;
 /// Uses same scale as entities_average_density() (edges per entity).
 pub const ONTOLOGICAL_DENSITY_THRESHOLD: f32 = 8.0;
 
-/// Post-RRF boost per type-matching entity connected to a memory (Layer 4.9).
-/// Additive on fused score. 0.15 per match, max 0.40.
+/// Post-fusion boost per type-matching entity connected to a memory (Layer 4.9), as a share
+/// of the memory's fused score. 0.15 per match, max 0.40.
 /// Increased from 0.08/0.25 to strengthen WH-word gravity signal:
 /// WHERE→Location, WHO→Person, WHEN→Temporal entities get meaningful advantage.
 pub const ONTOLOGICAL_RERANK_BOOST: f32 = 0.15;
 
-/// Maximum ontological re-rank boost per memory.
+/// Maximum ontological re-rank boost per memory, as a share of its fused score.
 pub const ONTOLOGICAL_RERANK_MAX: f32 = 0.40;
 
-/// Penalty for memories with ZERO type-matching entities (Layer 4.9).
+/// Penalty for memories with ZERO type-matching entities (Layer 4.9), as a share of the
+/// memory's fused score.
 /// Applied only when ontological intent has expected_labels AND the memory
 /// has entity_refs but none match. Asymmetric gating: penalties require
 /// higher confidence than boosts to avoid punishing entity extraction gaps.
@@ -2393,18 +2394,37 @@ pub const SEMANTIC_CLUSTER_THRESHOLD: f32 = 0.75;
 pub const TEMPORAL_CLUSTER_WINDOW_SECS: i64 = 1800;
 
 /// Layer 4.525's boost for one query word that matches a memory's entities, as a share of the
-/// top fused score, before the word is weighted by how few candidates carry it
-/// (`entity_match_specificity`). Four full-weight matches are the cap.
+/// memory's fused score, before the word is weighted by how few candidates carry it
+/// (`entity_match_specificity`). An identifier match counts as one full-weight word. Four
+/// full-weight matches are the cap, a factor of 9.
 pub const ENTITY_OVERLAP_SHARE: f32 = 2.0;
 
-/// Boost for memories whose IDs appear in temporal fact matches, as a share of the top
+/// Boost for memories whose IDs appear in temporal fact matches, as a share of the memory's
 /// fused score.
 ///
 /// Applied in Layer 4.55 when the query has temporal intent and
 /// TemporalFactStore returns facts whose `source_memory_id` matches a
-/// candidate. On one RRF leg at k = 20 a 0.20 share lifts a rank-10 memory to between
-/// ranks 3 and 4; a boosted memory from rank 7 or lower stays under an unboosted rank 1.
+/// candidate. A source memory the fusion did not find is not added.
 pub const TEMPORAL_RECALL_BOOST: f32 = 0.20;
+
+/// Layer 4.5: share of its fused score a memory gains when it holds both the entity and a
+/// value of the attribute an attribute query asks about ("Caroline is single" for "what is
+/// Caroline's relationship status?"). Upstream's value from #174, where the boost became a
+/// factor (2.5x); it had been an absolute 0.5, 31 times a typical reciprocal-rank score, and
+/// it also added matching memories the fusion had not found.
+pub const ATTRIBUTE_QUERY_BOOST: f32 = 1.5;
+
+/// Layer 4.52: share of its fused score a Decision-type memory gains on a decision query
+/// ("which ... did we choose"). It was an absolute 0.15, about four top reciprocal-rank
+/// scores, which put every Decision memory above every other candidate; the query test it
+/// fires on matches "what ... use" as well, so it is held well under the attribute share.
+pub const DECISION_TYPE_BOOST: f32 = 0.5;
+
+/// Layer 4.7: share of its fused score a memory gains per matching prospective-signal term,
+/// times the square root of the match count, capped at [`PROSPECTIVE_BOOST_MAX`]
+/// (shodh-memory #174; additive 0.15 per match, max 0.5, before it).
+pub const PROSPECTIVE_BOOST_PER_MATCH: f32 = 0.25;
+pub const PROSPECTIVE_BOOST_MAX: f32 = 0.75;
 
 /// Minimum inter-memory gap (seconds) marking a session boundary.
 /// Haar wavelet coefficient at this scale exceeds threshold iff gap > 7200s.
