@@ -1,7 +1,7 @@
 # Veld - Agentic Memory Retrieval Progress
 
 **Current Branch**: v0.7.7 | First packaged release — repo moved to portll/veld, CI added, track toward v0.8
-**Last Measured Retrieval**: LoCoMo, 1,531 questions over its 10 conversations, `3faec074` (MiniLM, mxbai cross-encoder at 20) | p@1 0.406 | MRR 0.492 | recall@10 0.589 | nDCG@10 0.493. The earlier MRR 0.925 is withdrawn: see [Benchmark Trajectory](#benchmark-trajectory).
+**Last Measured Retrieval**: LoCoMo, 1,531 questions over its 10 conversations, `4656be7f` (MiniLM, mxbai cross-encoder at 20) | p@1 0.406 | MRR 0.492 | recall@10 0.589 | nDCG@10 0.493. The earlier MRR 0.925 is withdrawn: see [Benchmark Trajectory](#benchmark-trajectory).
 **Immediate Target**: clean v0.8 cut from `main`
 **Post-v0.8 Target**: v0.9 redb integration and public release hardening
 
@@ -126,7 +126,7 @@
 synthetic memories and asks 20 questions about them. It is not the LoCoMo dataset, and a store
 of 20 memories leaves a retriever very few candidates to rank, so its MRR says little about
 retrieval quality. The same goes for the MRR 0.917 "warm-veld" snapshot (`6dae51f6`). Measured on
-LoCoMo itself (1,531 questions over 10 conversations, 2026-10-20, `3faec074`), veld scores MRR
+LoCoMo itself (1,531 questions over 10 conversations, 2026-10-20, `4656be7f`), veld scores MRR
 0.492, p@1 0.406, recall@10 0.589 and nDCG@10 0.493.
 
 These are retrieval metrics: whether the gold turn was ranked, and where. They are not

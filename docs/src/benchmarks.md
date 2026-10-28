@@ -7,7 +7,7 @@ in the repo. This page summarises the most recent snapshot.
 
 ## Most recent measurement: LoCoMo, 1,531 questions
 
-Measured 2026-10-20 at `3faec074` on 1,531 questions from the LoCoMo dataset's 10 conversations
+Measured 2026-10-20 at `4656be7f` on 1,531 questions from the LoCoMo dataset's 10 conversations
 (single-hop, multi-hop, temporal and open-domain; the adversarial category is left out), with the
 MiniLM embedder and the mxbai-rerank-xsmall-v1 cross-encoder reranking the top 20.
 
@@ -38,7 +38,7 @@ withdrawn; the table above replaces them.
 
 ## Not yet measured on the full suite
 
-Main has gained these since `3faec074`; the 100-question LoCoMo gate measured each one on its
+Main has gained these since `4656be7f`; the 100-question LoCoMo gate measured each one on its
 own, and a full-suite run of all of them together is part of the v0.8 track:
 
 - Recall embeds the query, and each sub-query, on the embedder's query side.

@@ -32,7 +32,7 @@ last successful run from GitHub Actions and fails past 48 hours.
 
 `scripts/upstream/translate <upstream commit>` rewrites an upstream commit's diff into veld's
 names and layout and applies it with `git apply --reject` in a throwaway worktree, reporting
-the hunks that apply and keeping the rejects. On 2026-10-03, against veld `b2a47508`, PR #559
+the hunks that apply and keeping the rejects. On 2026-10-03, against veld `b1d9a948`, PR #559
 rejected 4 of 4 hunks (one file absent in veld), #330 3 of 3 and #425 19 of 34; with
 `--context 1`, 3 of 4, 3 of 3 and 14 of 34. A port is written by hand from that guide, through
 the storage traits.

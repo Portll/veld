@@ -1,6 +1,6 @@
 # Embedding spaces: twelve steps, dependency-ordered
 
-Execution plan of 2026-10-19, written at `b38d86b2` (v0.8.1). It makes "which embedder
+Execution plan of 2026-10-19, written at `c92cd53c` (v0.8.1). It makes "which embedder
 produced this vector" a first-class fact, so a corpus can hold vectors from more than one
 model and more than one dimension, be searched across them, migrate between them in the
 background, replicate between instances with different embedders, and pay for N spaces
