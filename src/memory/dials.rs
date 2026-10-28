@@ -191,6 +191,14 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub fusion: Option<FusionMode>,
 
+    /// Whether the graph leg only admits candidates to recall Layer 4. A graph hit joins the
+    /// pool, but its fused score comes from the vector and BM25 lists alone: a hit neither list
+    /// returned is scored as the vector list would have scored it, its cosine over the list's
+    /// best, and the graph's activation and hop weight add nothing anywhere. `None` and
+    /// `Some(false)` score the graph leg.
+    #[serde(default)]
+    pub graph_candidates_only: Option<bool>,
+
     // ---- Recall ranking sliders (None = compile-time constant default) ---------------
     // Overlay the historical `const`s in recall.rs / hybrid_search.rs / constants.rs.
     // Rendered as sliders in the monitor "Dials" tab; see [`RECALL_SLIDER_SPECS`] for
@@ -669,6 +677,7 @@ impl Default for CognitiveDials {
             rrf_weights: None,
             date_window_leg: None,
             fusion: None,
+            graph_candidates_only: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
             rrf_k_inner: None,
@@ -828,7 +837,7 @@ impl CognitiveDials {
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
     /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG,
-    /// FUSION}`.
+    /// FUSION,GRAPH_CANDIDATES_ONLY}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -889,7 +898,14 @@ impl CognitiveDials {
         if let Some(v) = env_bool("VELD_DIALS_DATE_WINDOW_LEG") {
             d.date_window_leg = Some(v);
         }
-        // Empty is unset, as the recall gate passes an unused workflow input.
+        // Empty is unset in both, as the recall gate passes an unused workflow input.
+        if let Some(v) = std::env::var("VELD_DIALS_GRAPH_CANDIDATES_ONLY")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            let v = v.trim();
+            d.graph_candidates_only = Some(v.eq_ignore_ascii_case("true") || v == "1");
+        }
         if let Ok(raw) = std::env::var("VELD_DIALS_FUSION") {
             if !raw.trim().is_empty() {
                 d.fusion = FusionMode::parse(&raw);
@@ -978,6 +994,7 @@ mod tests {
         assert!(d.rrf_weights.is_none());
         assert!(d.date_window_leg.is_none());
         assert!(d.fusion.is_none());
+        assert!(d.graph_candidates_only.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,
             crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS

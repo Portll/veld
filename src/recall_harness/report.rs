@@ -154,6 +154,9 @@ pub struct RetrievalDials {
     /// The `fusion` dial: `None` is the engine default (FLAT).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fusion: Option<crate::memory::dials::FusionMode>,
+    /// The `graph_candidates_only` dial: `None` is the engine default (the graph leg scores).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_candidates_only: Option<bool>,
 }
 
 impl RetrievalDials {
@@ -162,6 +165,7 @@ impl RetrievalDials {
         Self {
             date_window_leg: dials.date_window_leg,
             fusion: dials.fusion,
+            graph_candidates_only: dials.graph_candidates_only,
         }
     }
 
@@ -172,6 +176,9 @@ impl RetrievalDials {
         }
         if let Some(v) = self.fusion {
             set.push(format!("fusion={}", v.as_str()));
+        }
+        if let Some(v) = self.graph_candidates_only {
+            set.push(format!("graph_candidates_only={v}"));
         }
         if set.is_empty() {
             "engine defaults".to_string()
@@ -1467,7 +1474,15 @@ mod tests {
             fusion: Some(crate::memory::dials::FusionMode::Rrf),
             ..Default::default()
         };
-        for (set, named) in [(off, "date_window_leg=false"), (rrf, "fusion=rrf")] {
+        let admit_only = RetrievalDials {
+            graph_candidates_only: Some(true),
+            ..Default::default()
+        };
+        for (set, named) in [
+            (off, "date_window_leg=false"),
+            (rrf, "fusion=rrf"),
+            (admit_only, "graph_candidates_only=true"),
+        ] {
             let set = Some(set);
             let defaults = Some(RetrievalDials::default());
             for (b, c) in [(defaults.clone(), set.clone()), (set.clone(), defaults)] {

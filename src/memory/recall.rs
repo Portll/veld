@@ -1944,13 +1944,19 @@ impl super::MemorySystem {
             );
 
             // Graph results: the leg's term, times the activation bonus. Under FLAT the term
-            // is the activation over the leg's highest.
+            // is the activation over the leg's highest. Under `graph_candidates_only` the leg
+            // adds no term and no hop weight; its hits that no hybrid list found are scored
+            // after the hybrid leg below.
+            let graph_candidates_only = early_dials_snapshot.graph_candidates_only.unwrap_or(false);
             let best_activation = best_leg_score(graph_results.iter().map(|(_, a, _)| *a));
             for (r, (id, activation, h)) in graph_results.iter().enumerate() {
-                let term = leg_term(fusion_mode, graph_w, k, r + 1, *activation, best_activation)
-                    * graph_activation_factor(graph_w, *activation);
-                *fused.entry(id.clone()).or_insert(0.0) += term;
-                heb.insert(id.clone(), *h);
+                if !graph_candidates_only {
+                    let term =
+                        leg_term(fusion_mode, graph_w, k, r + 1, *activation, best_activation)
+                            * graph_activation_factor(graph_w, *activation);
+                    *fused.entry(id.clone()).or_insert(0.0) += term;
+                    heb.insert(id.clone(), *h);
+                }
 
                 // Signal attribution: record graph contribution for memories
                 // that came from graph traversal (may not have hybrid search data)
@@ -1977,6 +1983,62 @@ impl super::MemorySystem {
                                 calibrated(c.bm25, best_bm25),
                             )
                             * c.refined;
+                    }
+                }
+            }
+
+            if graph_candidates_only {
+                let admitted: Vec<&MemoryId> = graph_results
+                    .iter()
+                    .map(|(id, _, _)| id)
+                    .filter(|id| !hybrid_components.contains_key(*id))
+                    .collect();
+                if !admitted.is_empty() {
+                    // The vector list's best by its own score, to put the admitted hits'
+                    // cosines on that list's scale: its scores are reciprocal ranks on a
+                    // decomposed query, so its best is re-read as a cosine like theirs.
+                    let mut vector_best: Option<(&MemoryId, f32)> = None;
+                    for (id, _) in &hybrid_ids {
+                        if let Some(c) = hybrid_components.get(id) {
+                            if vector_best.is_none_or(|(_, best)| c.vector > best) {
+                                vector_best = Some((id, c.vector));
+                            }
+                        }
+                    }
+                    candidates.prefetch(
+                        admitted
+                            .iter()
+                            .copied()
+                            .chain(vector_best.map(|(id, _)| id)),
+                    );
+                    let cosine = |id: &MemoryId| -> f32 {
+                        candidates
+                            .get(id)
+                            .and_then(|view| {
+                                view.memory
+                                    .experience
+                                    .embeddings
+                                    .as_ref()
+                                    .filter(|e| !e.is_empty())
+                                    .map(|e| {
+                                        crate::memory::hybrid_search::cosine_similarity_pub(
+                                            &query_embedding,
+                                            e,
+                                        )
+                                    })
+                            })
+                            .unwrap_or(0.0)
+                    };
+                    let scored = admitted_graph_hit_terms(
+                        fusion_mode,
+                        hybrid_w,
+                        k,
+                        hybrid_ids.len(),
+                        admitted.into_iter().map(|id| (id, cosine(id))).collect(),
+                        vector_best.map(|(id, _)| cosine(id)),
+                    );
+                    for (id, term) in scored {
+                        *fused.entry(id.clone()).or_insert(0.0) += term;
                     }
                 }
             }
@@ -6263,6 +6325,33 @@ fn flat_hybrid(vector: f32, bm25: f32) -> f32 {
     strong + crate::constants::FLAT_CONSENSUS * weak
 }
 
+/// Under the `graph_candidates_only` dial, the fused terms of the graph hits no hybrid list
+/// returned, each scored as the vector list would have scored it: under FLAT its cosine over
+/// the best of theirs and `vector_best` (the vector list's best, read as a cosine), times the
+/// hybrid weight; under reciprocal rank, ranked after the `hybrid_len` hybrid candidates in
+/// cosine order. Nothing of the graph's own weighting enters.
+fn admitted_graph_hit_terms<'a>(
+    mode: FusionMode,
+    hybrid_w: f32,
+    k: f32,
+    hybrid_len: usize,
+    mut cosines: Vec<(&'a MemoryId, f32)>,
+    vector_best: Option<f32>,
+) -> Vec<(&'a MemoryId, f32)> {
+    cosines.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let best = best_leg_score(cosines.iter().map(|(_, c)| *c).chain(vector_best));
+    cosines
+        .into_iter()
+        .enumerate()
+        .map(|(r, (id, cos))| {
+            (
+                id,
+                leg_term(mode, hybrid_w, k, hybrid_len + r + 1, cos, best),
+            )
+        })
+        .collect()
+}
+
 /// The multiplier on a graph candidate's graph term for its activation.
 fn graph_activation_factor(graph_w: f32, activation: f32) -> f32 {
     1.0 + graph_w * crate::constants::ACTIVATION_BONUS_SCALE * activation.clamp(0.0, 1.0)
@@ -7582,6 +7671,42 @@ mod fusion_tests {
         assert!((entity_overlap_share(3.0, 3, false) - 4.0 * share).abs() < EPS);
         assert!((entity_overlap_share(0.0, 9, true) - 4.0 * share).abs() < EPS);
         assert!((entity_overlap_share(10.0, 0, true) - 1.6 * share).abs() < EPS);
+    }
+
+    #[test]
+    fn an_admitted_graph_hit_scores_as_the_vector_list_would_have() {
+        let (a, b) = (
+            MemoryId(uuid::Uuid::new_v4()),
+            MemoryId(uuid::Uuid::new_v4()),
+        );
+        // FLAT: cosine over the vector list's best, at the hybrid weight, so an admitted hit
+        // never outscores the list's own best.
+        let flat = admitted_graph_hit_terms(
+            FusionMode::Flat,
+            0.7,
+            20.0,
+            40,
+            vec![(&a, 0.3), (&b, 0.45)],
+            Some(0.6),
+        );
+        assert_eq!(flat[0].0, &b, "cosine order");
+        assert!((flat[0].1 - 0.7 * 0.75).abs() < EPS);
+        assert!((flat[1].1 - 0.7 * 0.5).abs() < EPS);
+        // With no vector best to read, the hits calibrate among themselves.
+        let alone = admitted_graph_hit_terms(FusionMode::Flat, 0.7, 20.0, 0, vec![(&a, 0.3)], None);
+        assert!((alone[0].1 - 0.7).abs() < EPS);
+        // Reciprocal rank: after the 40 hybrid candidates, in cosine order.
+        let rrf = admitted_graph_hit_terms(
+            FusionMode::Rrf,
+            0.7,
+            20.0,
+            40,
+            vec![(&a, 0.3), (&b, 0.45)],
+            Some(0.6),
+        );
+        assert_eq!(rrf[0].0, &b);
+        assert!((rrf[0].1 - 0.7 / 61.0).abs() < EPS);
+        assert!((rrf[1].1 - 0.7 / 62.0).abs() < EPS);
     }
 
     #[test]

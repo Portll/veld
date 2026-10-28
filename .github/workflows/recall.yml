@@ -91,6 +91,13 @@ on:
           refuses it against the baseline: pair it with record=true.
         required: false
         default: ''
+      graph_candidates_only:
+        description: >-
+          true sets the graph_candidates_only dial: graph hits join the fusion pool but add no
+          score, so a hit is ranked by the vector and BM25 lists alone. Empty keeps the shipped
+          graph term. Recorded as an override like fusion: pair it with record=true.
+        required: false
+        default: ''
       embedder:
         description: >-
           Primary embedder. minilm-l6-v2 is what the baseline measures. arctic-embed-xs
@@ -261,6 +268,7 @@ jobs:
           VELD_DIALS_RERANK_POOL: ${{ github.event.inputs.rerank_pool || '' }}
           VELD_TUNE_CE_BLEND: ${{ github.event.inputs.ce_blend || '' }}
           VELD_DIALS_FUSION: ${{ github.event.inputs.fusion || '' }}
+          VELD_DIALS_GRAPH_CANDIDATES_ONLY: ${{ github.event.inputs.graph_candidates_only || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
           # minilm-l6-v2 is VELD_EMBEDDER=minilm, nomic-embed-text-v1.5 is VELD_EMBEDDER=nomic;
