@@ -70,6 +70,17 @@ impl super::MemorySystem {
     /// - Non-semantic search: Uses importance * temporal decay
     /// - Zero shortcuts, no TODOs, enterprise-grade
     pub fn recall(&self, query: &Query) -> Result<Vec<SharedMemory>> {
+        let owner_scoped;
+        let query = match (&query.user_id, &self.owner_user_id) {
+            (None, Some(owner)) => {
+                owner_scoped = Query {
+                    user_id: Some(owner.clone()),
+                    ..query.clone()
+                };
+                &owner_scoped
+            }
+            _ => query,
+        };
         let _evidence = crate::graph_memory::EvidenceScope::enter(query.evidence_source.as_deref());
         // Semantic search requires special handling
         if let Some(query_text) = &query.query_text {
