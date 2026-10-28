@@ -28,21 +28,30 @@
       "method": "DELETE",
       "path": "/api/ab/tests/{test_id}",
       "handler": "ab_testing::delete_ab_test",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "ABTestResponse"
     },
     {
       "method": "GET",
       "path": "/api/ab/tests/{test_id}",
       "handler": "ab_testing::get_ab_test",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "serde_json::Value"
     },
     {
       "method": "GET",
       "path": "/api/ab/tests/{test_id}/analyze",
       "handler": "ab_testing::analyze_ab_test",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "serde_json::Value"
     },
     {
@@ -50,14 +59,20 @@
       "path": "/api/ab/tests/{test_id}/click",
       "handler": "ab_testing::record_ab_click",
       "body": "RecordClickRequest",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "serde_json::Value"
     },
     {
       "method": "POST",
       "path": "/api/ab/tests/{test_id}/complete",
       "handler": "ab_testing::complete_ab_test",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "serde_json::Value"
     },
     {
@@ -65,7 +80,10 @@
       "path": "/api/ab/tests/{test_id}/feedback",
       "handler": "ab_testing::record_ab_feedback",
       "body": "RecordFeedbackRequest",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "serde_json::Value"
     },
     {
@@ -73,28 +91,40 @@
       "path": "/api/ab/tests/{test_id}/impression",
       "handler": "ab_testing::record_ab_impression",
       "body": "RecordImpressionRequest",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "serde_json::Value"
     },
     {
       "method": "POST",
       "path": "/api/ab/tests/{test_id}/pause",
       "handler": "ab_testing::pause_ab_test",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "ABTestResponse"
     },
     {
       "method": "POST",
       "path": "/api/ab/tests/{test_id}/resume",
       "handler": "ab_testing::resume_ab_test",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "ABTestResponse"
     },
     {
       "method": "POST",
       "path": "/api/ab/tests/{test_id}/start",
       "handler": "ab_testing::start_ab_test",
-      "path_params": "String",
+      "path_params": "{test_id: String}",
+      "path_param_names": [
+        "test_id"
+      ],
       "response": "ABTestResponse"
     },
     {
@@ -213,7 +243,10 @@
       "method": "GET",
       "path": "/api/brain/{user_id}",
       "handler": "visualization::get_brain_state",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "BrainStateResponse"
     },
     {
@@ -263,7 +296,10 @@
       "path": "/api/context/blocks/{key}",
       "handler": "context_blocks::delete_context_block",
       "query": "BlockQuery",
-      "path_params": "String",
+      "path_params": "{key: String}",
+      "path_param_names": [
+        "key"
+      ],
       "response": "BlockDeleteResponse"
     },
     {
@@ -271,7 +307,10 @@
       "path": "/api/context/blocks/{key}",
       "handler": "context_blocks::get_context_block",
       "query": "BlockQuery",
-      "path_params": "String",
+      "path_params": "{key: String}",
+      "path_param_names": [
+        "key"
+      ],
       "response": "BlockResponse"
     },
     {
@@ -279,7 +318,10 @@
       "path": "/api/context/blocks/{key}",
       "handler": "context_blocks::set_context_block",
       "body": "SetBlockRequest",
-      "path_params": "String",
+      "path_params": "{key: String}",
+      "path_param_names": [
+        "key"
+      ],
       "response": "BlockResponse"
     },
     {
@@ -346,7 +388,10 @@
       "path": "/api/datasets/{name}",
       "handler": "datasets::drop_dataset",
       "query": "DatasetUserQuery",
-      "path_params": "String",
+      "path_params": "{name: String}",
+      "path_param_names": [
+        "name"
+      ],
       "response": "DropDatasetResponse"
     },
     {
@@ -354,7 +399,10 @@
       "path": "/api/datasets/{name}",
       "handler": "datasets::get_dataset_metadata",
       "query": "DatasetUserQuery",
-      "path_params": "String",
+      "path_params": "{name: String}",
+      "path_param_names": [
+        "name"
+      ],
       "response": "DatasetMetadataResponse"
     },
     {
@@ -362,7 +410,10 @@
       "path": "/api/datasets/{name}/link",
       "handler": "datasets::link_row",
       "body": "LinkRequest",
-      "path_params": "String",
+      "path_params": "{name: String}",
+      "path_param_names": [
+        "name"
+      ],
       "response": "LinkResponse"
     },
     {
@@ -370,7 +421,10 @@
       "path": "/api/datasets/{name}/query",
       "handler": "datasets::query_dataset",
       "body": "QueryRequest",
-      "path_params": "String",
+      "path_params": "{name: String}",
+      "path_param_names": [
+        "name"
+      ],
       "response": "opaque"
     },
     {
@@ -378,7 +432,10 @@
       "path": "/api/datasets/{name}/rows",
       "handler": "datasets::insert_rows",
       "body": "InsertRowsRequest",
-      "path_params": "String",
+      "path_params": "{name: String}",
+      "path_param_names": [
+        "name"
+      ],
       "response": "InsertRowsResponse"
     },
     {
@@ -595,7 +652,10 @@
       "path": "/api/forget/{memory_id}",
       "handler": "crud::delete_memory",
       "query": "HashMap<String, String>",
-      "path_params": "String",
+      "path_params": "{memory_id: String}",
+      "path_param_names": [
+        "memory_id"
+      ],
       "response": "DeleteMemoryResponse"
     },
     {
@@ -637,7 +697,10 @@
       "method": "GET",
       "path": "/api/graph/data/{user_id}",
       "handler": "visualization::get_graph_data",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "GraphDataResponse"
     },
     {
@@ -714,28 +777,40 @@
       "method": "DELETE",
       "path": "/api/graph/{user_id}/clear",
       "handler": "graph::clear_user_graph",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "serde_json::Value"
     },
     {
       "method": "POST",
       "path": "/api/graph/{user_id}/rebuild",
       "handler": "graph::rebuild_user_graph",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "serde_json::Value"
     },
     {
       "method": "GET",
       "path": "/api/graph/{user_id}/stats",
       "handler": "graph::get_graph_stats",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "GraphStats"
     },
     {
       "method": "GET",
       "path": "/api/graph/{user_id}/universe",
       "handler": "graph::get_memory_universe",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "MemoryUniverse"
     },
     {
@@ -855,7 +930,10 @@
       "path": "/api/list/{user_id}",
       "handler": "crud::list_memories",
       "query": "ListQuery",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "ListResponse"
     },
     {
@@ -898,7 +976,10 @@
       "path": "/api/memories/{memory_id}",
       "handler": "crud::get_memory",
       "query": "HashMap<String, String>",
-      "path_params": "String",
+      "path_params": "{memory_id: String}",
+      "path_param_names": [
+        "memory_id"
+      ],
       "response": "MemoryWithHierarchy"
     },
     {
@@ -948,7 +1029,10 @@
       "path": "/api/memory/{memory_id}",
       "handler": "crud::delete_memory",
       "query": "HashMap<String, String>",
-      "path_params": "String",
+      "path_params": "{memory_id: String}",
+      "path_param_names": [
+        "memory_id"
+      ],
       "response": "DeleteMemoryResponse"
     },
     {
@@ -956,7 +1040,10 @@
       "path": "/api/memory/{memory_id}",
       "handler": "crud::get_memory",
       "query": "HashMap<String, String>",
-      "path_params": "String",
+      "path_params": "{memory_id: String}",
+      "path_param_names": [
+        "memory_id"
+      ],
       "response": "MemoryWithHierarchy"
     },
     {
@@ -964,7 +1051,10 @@
       "path": "/api/memory/{memory_id}",
       "handler": "crud::update_memory",
       "body": "UpdateMemoryRequest",
-      "path_params": "String",
+      "path_params": "{memory_id: String}",
+      "path_param_names": [
+        "memory_id"
+      ],
       "response": "UpdateMemoryResponse"
     },
     {
@@ -972,7 +1062,10 @@
       "path": "/api/memory/{memory_id}/health",
       "handler": "crud::get_memory_health",
       "query": "HashMap<String, String>",
-      "path_params": "String",
+      "path_params": "{memory_id: String}",
+      "path_param_names": [
+        "memory_id"
+      ],
       "response": "MemoryHealthResponse"
     },
     {
@@ -1014,7 +1107,10 @@
       "path": "/api/projects/{project_id}",
       "handler": "todos::delete_project",
       "body": "DeleteProjectRequest",
-      "path_params": "String",
+      "path_params": "{project_id: String}",
+      "path_param_names": [
+        "project_id"
+      ],
       "response": "ProjectResponse"
     },
     {
@@ -1022,7 +1118,10 @@
       "path": "/api/projects/{project_id}",
       "handler": "todos::get_project",
       "query": "TodoQuery",
-      "path_params": "String",
+      "path_params": "{project_id: String}",
+      "path_param_names": [
+        "project_id"
+      ],
       "response": "ProjectResponse"
     },
     {
@@ -1030,7 +1129,10 @@
       "path": "/api/projects/{project_id}/delete",
       "handler": "todos::delete_project",
       "body": "DeleteProjectRequest",
-      "path_params": "String",
+      "path_params": "{project_id: String}",
+      "path_param_names": [
+        "project_id"
+      ],
       "response": "ProjectResponse"
     },
     {
@@ -1038,7 +1140,10 @@
       "path": "/api/projects/{project_id}/files",
       "handler": "files::list_project_files",
       "body": "ListFilesRequest",
-      "path_params": "String",
+      "path_params": "{project_id: String}",
+      "path_param_names": [
+        "project_id"
+      ],
       "response": "FileListResponse"
     },
     {
@@ -1046,7 +1151,10 @@
       "path": "/api/projects/{project_id}/files/search",
       "handler": "files::search_project_files",
       "body": "SearchFilesRequest",
-      "path_params": "String",
+      "path_params": "{project_id: String}",
+      "path_param_names": [
+        "project_id"
+      ],
       "response": "FileListResponse"
     },
     {
@@ -1054,7 +1162,10 @@
       "path": "/api/projects/{project_id}/index",
       "handler": "files::index_project_codebase",
       "body": "IndexCodebaseRequest",
-      "path_params": "String",
+      "path_params": "{project_id: String}",
+      "path_param_names": [
+        "project_id"
+      ],
       "response": "IndexResponse"
     },
     {
@@ -1062,7 +1173,10 @@
       "path": "/api/projects/{project_id}/scan",
       "handler": "files::scan_project_codebase",
       "body": "IndexCodebaseRequest",
-      "path_params": "String",
+      "path_params": "{project_id: String}",
+      "path_param_names": [
+        "project_id"
+      ],
       "response": "ScanResponse"
     },
     {
@@ -1070,7 +1184,10 @@
       "path": "/api/projects/{project_id}/update",
       "handler": "todos::update_project",
       "body": "UpdateProjectRequest",
-      "path_params": "String",
+      "path_params": "{project_id: String}",
+      "path_param_names": [
+        "project_id"
+      ],
       "response": "ProjectResponse"
     },
     {
@@ -1154,6 +1271,7 @@
       "method": "POST",
       "path": "/api/remember",
       "handler": "remember::remember",
+      "body": "RememberRequest",
       "response": "RememberResponse"
     },
     {
@@ -1210,7 +1328,10 @@
       "path": "/api/reminders/{reminder_id}/delete",
       "handler": "todos::delete_reminder",
       "query": "DeleteReminderQuery",
-      "path_params": "String",
+      "path_params": "{reminder_id: String}",
+      "path_param_names": [
+        "reminder_id"
+      ],
       "response": "ReminderActionResponse"
     },
     {
@@ -1218,7 +1339,10 @@
       "path": "/api/reminders/{reminder_id}/dismiss",
       "handler": "todos::dismiss_reminder",
       "body": "DismissReminderRequest",
-      "path_params": "String",
+      "path_params": "{reminder_id: String}",
+      "path_param_names": [
+        "reminder_id"
+      ],
       "response": "ReminderActionResponse"
     },
     {
@@ -1274,7 +1398,10 @@
       "path": "/api/sessions/{session_id}",
       "handler": "sessions::get_session",
       "query": "GetSessionRequest",
-      "path_params": "String",
+      "path_params": "{session_id: String}",
+      "path_param_names": [
+        "session_id"
+      ],
       "response": "GetSessionResponse"
     },
     {
@@ -1301,7 +1428,10 @@
       "method": "GET",
       "path": "/api/sleep_time/status/{user_id}",
       "handler": "sleep_time::user_status",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "opaque"
     },
     {
@@ -1448,7 +1578,10 @@
       "path": "/api/todos/{todo_id}",
       "handler": "todos::delete_todo",
       "query": "TodoQuery",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "TodoResponse"
     },
     {
@@ -1456,7 +1589,10 @@
       "path": "/api/todos/{todo_id}",
       "handler": "todos::get_todo",
       "query": "TodoQuery",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "TodoResponse"
     },
     {
@@ -1464,7 +1600,10 @@
       "path": "/api/todos/{todo_id}/comments",
       "handler": "todos::list_todo_comments",
       "query": "TodoQuery",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "CommentListResponse"
     },
     {
@@ -1472,7 +1611,10 @@
       "path": "/api/todos/{todo_id}/comments",
       "handler": "todos::add_todo_comment",
       "body": "AddCommentRequest",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "CommentResponse"
     },
     {
@@ -1480,7 +1622,11 @@
       "path": "/api/todos/{todo_id}/comments/{comment_id}",
       "handler": "todos::delete_todo_comment",
       "query": "TodoQuery",
-      "path_params": "(String, String)",
+      "path_params": "{todo_id: String, comment_id: String}",
+      "path_param_names": [
+        "todo_id",
+        "comment_id"
+      ],
       "response": "CommentResponse"
     },
     {
@@ -1488,7 +1634,11 @@
       "path": "/api/todos/{todo_id}/comments/{comment_id}",
       "handler": "todos::update_todo_comment",
       "body": "UpdateCommentRequest",
-      "path_params": "(String, String)",
+      "path_params": "{todo_id: String, comment_id: String}",
+      "path_param_names": [
+        "todo_id",
+        "comment_id"
+      ],
       "response": "CommentResponse"
     },
     {
@@ -1496,7 +1646,11 @@
       "path": "/api/todos/{todo_id}/comments/{comment_id}/update",
       "handler": "todos::update_todo_comment",
       "body": "UpdateCommentRequest",
-      "path_params": "(String, String)",
+      "path_params": "{todo_id: String, comment_id: String}",
+      "path_param_names": [
+        "todo_id",
+        "comment_id"
+      ],
       "response": "CommentResponse"
     },
     {
@@ -1504,7 +1658,10 @@
       "path": "/api/todos/{todo_id}/complete",
       "handler": "todos::complete_todo",
       "body": "TodoQuery",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "TodoCompleteResponse"
     },
     {
@@ -1512,7 +1669,10 @@
       "path": "/api/todos/{todo_id}/dependency_chain",
       "handler": "todos::dependency_chain",
       "query": "DependencyChainQuery",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "TodoListResponse"
     },
     {
@@ -1520,7 +1680,10 @@
       "path": "/api/todos/{todo_id}/dependents",
       "handler": "todos::list_dependents",
       "query": "TodoQuery",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "TodoListResponse"
     },
     {
@@ -1528,7 +1691,10 @@
       "path": "/api/todos/{todo_id}/reorder",
       "handler": "todos::reorder_todo",
       "body": "ReorderTodoRequest",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "TodoResponse"
     },
     {
@@ -1536,7 +1702,10 @@
       "path": "/api/todos/{todo_id}/subtasks",
       "handler": "todos::list_subtasks",
       "query": "TodoQuery",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "TodoListResponse"
     },
     {
@@ -1544,7 +1713,10 @@
       "path": "/api/todos/{todo_id}/update",
       "handler": "todos::update_todo",
       "body": "UpdateTodoRequest",
-      "path_params": "String",
+      "path_params": "{todo_id: String}",
+      "path_param_names": [
+        "todo_id"
+      ],
       "response": "TodoResponse"
     },
     {
@@ -1627,6 +1799,9 @@
       "method": "GET",
       "path": "/api/user_auth/admin/keys/passkey/{ticket}",
       "handler": "keys::passkey_poll",
+      "path_param_names": [
+        "ticket"
+      ],
       "response": "opaque"
     },
     {
@@ -1736,6 +1911,9 @@
       "method": "GET",
       "path": "/api/user_auth/keys/passkey/{ticket}",
       "handler": "keys::passkey_page",
+      "path_param_names": [
+        "ticket"
+      ],
       "response": "opaque"
     },
     {
@@ -1743,6 +1921,9 @@
       "path": "/api/user_auth/keys/passkey/{ticket}/result",
       "handler": "keys::passkey_result",
       "body": "PasskeyResultBody",
+      "path_param_names": [
+        "ticket"
+      ],
       "response": "opaque"
     },
     {
@@ -1815,6 +1996,9 @@
       "method": "ANY",
       "path": "/api/user_auth/{*path}",
       "handler": "user_auth::disabled_fallback",
+      "path_param_names": [
+        "path"
+      ],
       "response": "opaque"
     },
     {
@@ -1827,14 +2011,20 @@
       "method": "DELETE",
       "path": "/api/users/{user_id}",
       "handler": "users::delete_user",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "DeleteUserResponse"
     },
     {
       "method": "GET",
       "path": "/api/users/{user_id}/stats",
       "handler": "users::get_user_stats",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "MemoryStats"
     },
     {
@@ -1848,14 +2038,20 @@
       "method": "GET",
       "path": "/api/visualization/{user_id}/dot",
       "handler": "visualization::get_visualization_dot",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "String"
     },
     {
       "method": "GET",
       "path": "/api/visualization/{user_id}/stats",
       "handler": "visualization::get_visualization_stats",
-      "path_params": "String",
+      "path_params": "{user_id: String}",
+      "path_param_names": [
+        "user_id"
+      ],
       "response": "VisualizationStats"
     },
     {
@@ -2166,6 +2362,9 @@
           "name": "min_importance",
           "type": "Option<f32>",
           "required": false,
+          "notes": [
+            "score"
+          ],
           "refs": [
             "Option"
           ]
@@ -2174,6 +2373,9 @@
           "name": "max_importance",
           "type": "Option<f32>",
           "required": false,
+          "notes": [
+            "score"
+          ],
           "refs": [
             "Option"
           ]
@@ -3341,7 +3543,10 @@
         {
           "name": "avg_importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         }
       ]
     },
@@ -3538,6 +3743,9 @@
           "name": "confidence",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Confidence in this link, 0.0–1.0."
         },
         {
@@ -4147,7 +4355,8 @@
           "type": "Option<f32>",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "BM25 minimum-score floor for lexical candidates. Default 0.1.",
           "refs": [
@@ -4319,7 +4528,8 @@
           "type": "Option<f32>",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Layer 5.36 query-term coverage weight; `0` disables. Default `constants::QUERY_COVERAGE_WEIGHT`.",
           "refs": [
@@ -4379,7 +4589,8 @@
           "type": "Option<f32>",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "PRF leg weight as a fraction of the hybrid weight. Default `constants::PRF_WEIGHT`.",
           "refs": [
@@ -6743,6 +6954,9 @@
           "name": "confidence",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Detection confidence (0.0-1.0)"
         }
       ]
@@ -7087,7 +7301,8 @@
           "type": "f32",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Confidence in the emotional assessment (0.0 to 1.0) Lower if inferred from text, higher if explicitly stated"
         }
@@ -8448,7 +8663,8 @@
           "type": "Option<f32>",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Confidence score for this decision (0.0-1.0) How confident was the system when making this decision?",
           "refs": [
@@ -8794,7 +9010,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "support_count",
@@ -8887,7 +9106,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "support_count",
@@ -8961,6 +9183,9 @@
           "name": "avg_confidence",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Average confidence across facts in the cluster"
         },
         {
@@ -9072,7 +9297,10 @@
         {
           "name": "avg_confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "avg_support",
@@ -10043,7 +10271,8 @@
           "type": "Option<f32>",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Minimum embedding similarity to flag a U-shape (default 0.3)",
           "refs": [
@@ -10276,12 +10505,18 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "embedding_similarity",
           "type": "Option<f32>",
           "required": false,
+          "notes": [
+            "score"
+          ],
           "refs": [
             "Option"
           ]
@@ -10289,7 +10524,10 @@
         {
           "name": "impact_score",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "entity_names",
@@ -11416,7 +11654,8 @@
           "type": "Option<f32>",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "refs": [
             "Option"
@@ -11650,7 +11889,10 @@
         {
           "name": "similarity",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "interference_type",
@@ -11699,6 +11941,9 @@
           "name": "similarity",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Cosine similarity between the two memories"
         },
         {
@@ -12292,6 +12537,9 @@
           "name": "confidence",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Confidence in this causal link (0.0-1.0)"
         },
         {
@@ -12480,7 +12728,10 @@
         {
           "name": "avg_confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         }
       ]
     },
@@ -13005,7 +13256,10 @@
         {
           "name": "importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "tags",
@@ -14013,7 +14267,10 @@
         {
           "name": "importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "access_count",
@@ -14134,7 +14391,10 @@
         {
           "name": "importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "tier",
@@ -14229,7 +14489,10 @@
         {
           "name": "importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "access_count",
@@ -14284,7 +14547,8 @@
           "type": "f32",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Elaboration quality score (0.0 = bare S-rep content, 1.0 = fully contextualized C-rep). Computed at encoding time based on RichContext field count, entity diversity, temporal specificity, emotional signal presence, and content density. Reference: Ehlers & Clark (2000) — S-rep vs C-rep distinction."
         },
@@ -14302,7 +14566,8 @@
           "type": "f32",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Bayesian-calibrated confidence: tracks retrieval correctness via alpha (helpful count) / beta (misleading count) Beta distribution. calibrated_confidence = alpha / (alpha + beta), with Bayesian weight ramp: w = min(1.0, (alpha + beta - 2) / 8) Range: 0.0 (untested or consistently misleading) to 1.0 (consistently helpful)"
         },
@@ -14356,7 +14621,10 @@
         {
           "name": "importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "tier",
@@ -14491,7 +14759,10 @@
         {
           "name": "average_importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "graph_nodes",
@@ -15028,7 +15299,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "start_char",
@@ -15636,7 +15910,8 @@
           "type": "f32",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Weight for entity matching in relevance scoring"
         },
@@ -15645,7 +15920,8 @@
           "type": "f32",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Weight for recency boost"
         },
@@ -15969,7 +16245,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "support_count",
@@ -16025,7 +16304,10 @@
         {
           "name": "importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "created_at",
@@ -16112,6 +16394,9 @@
           "name": "intrusion_score",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Intrusion score: high activation + recent access = likely co-activation intrusion. Low activation + old access = genuine semantic match. Formula: activation * (1.0 / hours_since_last_accessed.max(0.1))"
         },
         {
@@ -16218,7 +16503,8 @@
           "type": "Option<f32>",
           "required": false,
           "notes": [
-            "omitted when empty"
+            "omitted when empty",
+            "score"
           ],
           "doc": "Semantic similarity score (0.0 - 1.0)",
           "refs": [
@@ -17235,6 +17521,9 @@
           "name": "peak_confidence",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "How sharply the top result dominates: top/(top+second). ~0.5 = ambiguous, approaching 1.0 = a lone strong match."
         },
         {
@@ -17543,6 +17832,9 @@
           "name": "best_score",
           "type": "Option<f32>",
           "required": false,
+          "notes": [
+            "score"
+          ],
           "refs": [
             "Option"
           ]
@@ -17616,7 +17908,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "support_count",
@@ -17692,7 +17987,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         }
       ]
     },
@@ -17829,7 +18127,10 @@
         {
           "name": "importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "created_at",
@@ -19063,7 +19364,8 @@
           "type": "Option<f32>",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Entity extraction confidence (PIPE-5: Unified LTP Readiness) Average confidence of the entities connected by this edge. Affects LTP threshold: high confidence → faster LTP (7 activations) Low confidence → slower LTP (13 activations). Based on synaptic tagging: behaviorally relevant synapses consolidate faster.",
           "refs": [
@@ -19231,7 +19533,8 @@
           "type": "f32",
           "required": false,
           "notes": [
-            "default when absent"
+            "default when absent",
+            "score"
           ],
           "doc": "Minimum importance score for memories to be surfaced"
         },
@@ -19452,6 +19755,285 @@
           "refs": [
             "Option",
             "RelevanceDebug"
+          ]
+        }
+      ]
+    },
+    "RememberRequest (handlers/remember)": {
+      "name": "RememberRequest",
+      "file": "src/handlers/remember.rs",
+      "doc": "Remember request - store a new memory",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "content",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "tags",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "memory_type",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "external_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "Option<chrono::DateTime<chrono::Utc>>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "emotional_valence",
+          "type": "Option<f32>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "emotional_arousal",
+          "type": "Option<f32>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "emotion",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "source_type",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "credibility",
+          "type": "Option<f32>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "episode_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "sequence_number",
+          "type": "Option<u32>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "preceding_memory_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "agent_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "parent_agent_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "run_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "parent_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Parent memory ID for hierarchical organization Use this to create memory trees (e.g., \"71-research\" -> \"algebraic\" -> \"21×27≡-1\")",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "filename",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Optional filename for format detection (e.g. \"notes.md\", \"data.json\"). When provided, the content is run through the ingest text-extraction pipeline before storage.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "intent_tags",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Semantic intent tags from Claude (FIX-10) Merged into entity tags with \"intent:\" prefix for importance boost",
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "writer",
+          "type": "Option<crate::memory::facets::DeclaredWriter>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "WHO IS WRITING THIS, as the caller describes itself — session, model, transcript, workspace. Optional, and recorded verbatim under `session.declared`; nothing here is verified and nothing here grants anything. See [`crate::memory::facets::DeclaredWriter`] for why it has to come from the caller: the server's own session detection describes the server.",
+          "refs": [
+            "Option",
+            "DeclaredWriter"
+          ]
+        },
+        {
+          "name": "entities",
+          "type": "Vec<DeclaredEntityInput>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Typed entities the writer declares this memory is about. See [`crate::declared_entities`]: validated (400 on an unknown label, a weight outside [0, 1], or more than 50), exempt from the derived-entity cut, and stored as authored tags.",
+          "refs": [
+            "Vec",
+            "DeclaredEntityInput"
+          ]
+        },
+        {
+          "name": "repo",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Repository slug this memory belongs to, e.g. `\"Portll/veld\"`. Stored as the leading [`crate::memory::facets::Place::Repo`]; a recall with `repo` set returns only memories scoped to it.",
+          "refs": [
+            "Option",
+            "String"
           ]
         }
       ]
@@ -20067,18 +20649,27 @@
           "name": "graph_weight",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Actual graph weight used (density-dependent: 0.1 to 0.5)"
         },
         {
           "name": "semantic_weight",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Actual semantic weight used (1.0 - graph_weight - linguistic_weight)"
         },
         {
           "name": "linguistic_weight",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Linguistic weight used (fixed at 0.15)"
         },
         {
@@ -21001,6 +21592,9 @@
           "name": "confidence",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Confidence in this fact (0.0 - 1.0)"
         },
         {
@@ -21794,6 +22388,9 @@
           "name": "confidence",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Average edge confidence in the region (0.0 = weak, 1.0 = strong)"
         },
         {
@@ -22203,7 +22800,10 @@
         {
           "name": "average_importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "importance_sum",
@@ -22262,7 +22862,10 @@
         {
           "name": "importance",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "created_at",
@@ -22311,12 +22914,18 @@
           "name": "importance",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Base importance score"
         },
         {
           "name": "relevance_score",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "Relevance score for this context (0.0-1.0)"
         },
         {
@@ -22342,6 +22951,9 @@
           "name": "semantic_similarity",
           "type": "Option<f32>",
           "required": false,
+          "notes": [
+            "score"
+          ],
           "doc": "Semantic similarity score (if semantic-based)",
           "refs": [
             "Option"
@@ -22445,6 +23057,9 @@
           "name": "weight",
           "type": "f32",
           "required": true,
+          "notes": [
+            "score"
+          ],
           "doc": "`memories × ln(N / memories)`: a tag on every memory weighs nothing."
         },
         {
@@ -22809,7 +23424,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "source_text",
@@ -22888,7 +23506,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         },
         {
           "name": "source_text",
@@ -23143,7 +23764,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         }
       ]
     },
@@ -25167,7 +25791,10 @@
         {
           "name": "confidence",
           "type": "f32",
-          "required": true
+          "required": true,
+          "notes": [
+            "score"
+          ]
         }
       ]
     },

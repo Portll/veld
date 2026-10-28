@@ -6,7 +6,7 @@
 
 # HTTP API schemas
 
-The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **487** types. `schemas.json` beside this page holds the same facts for tools and tests.
+The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **488** types. `schemas.json` beside this page holds the same facts for tools and tests.
 
 **How to read a type.** *Required* means the field has no `Option` and no serde default, so a request without it is rejected and a response always carries it. A field marked *omitted when empty* is left out of a response when it has no value. Enum variants are listed in wire form. `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is any JSON. A response shown as *opaque* is built by hand in the handler; read the handler for it.
 
@@ -24,16 +24,16 @@ The request and response shape of every HTTP route, read from the handler signat
 | `GET` | `/api/ab/summary` | none | `serde_json::Value` |
 | `GET` | `/api/ab/tests` | none | `serde_json::Value` |
 | `POST` | `/api/ab/tests` | body [`CreateABTestRequest`](#createabtestrequest) | [`ABTestResponse`](#abtestresponse) |
-| `DELETE` | `/api/ab/tests/{test_id}` | path `String` | [`ABTestResponse`](#abtestresponse) |
-| `GET` | `/api/ab/tests/{test_id}` | path `String` | `serde_json::Value` |
-| `GET` | `/api/ab/tests/{test_id}/analyze` | path `String` | `serde_json::Value` |
-| `POST` | `/api/ab/tests/{test_id}/click` | body [`RecordClickRequest`](#recordclickrequest); path `String` | `serde_json::Value` |
-| `POST` | `/api/ab/tests/{test_id}/complete` | path `String` | `serde_json::Value` |
-| `POST` | `/api/ab/tests/{test_id}/feedback` | body [`RecordFeedbackRequest`](#recordfeedbackrequest); path `String` | `serde_json::Value` |
-| `POST` | `/api/ab/tests/{test_id}/impression` | body [`RecordImpressionRequest`](#recordimpressionrequest); path `String` | `serde_json::Value` |
-| `POST` | `/api/ab/tests/{test_id}/pause` | path `String` | [`ABTestResponse`](#abtestresponse) |
-| `POST` | `/api/ab/tests/{test_id}/resume` | path `String` | [`ABTestResponse`](#abtestresponse) |
-| `POST` | `/api/ab/tests/{test_id}/start` | path `String` | [`ABTestResponse`](#abtestresponse) |
+| `DELETE` | `/api/ab/tests/{test_id}` | path `{test_id: String}` | [`ABTestResponse`](#abtestresponse) |
+| `GET` | `/api/ab/tests/{test_id}` | path `{test_id: String}` | `serde_json::Value` |
+| `GET` | `/api/ab/tests/{test_id}/analyze` | path `{test_id: String}` | `serde_json::Value` |
+| `POST` | `/api/ab/tests/{test_id}/click` | body [`RecordClickRequest`](#recordclickrequest); path `{test_id: String}` | `serde_json::Value` |
+| `POST` | `/api/ab/tests/{test_id}/complete` | path `{test_id: String}` | `serde_json::Value` |
+| `POST` | `/api/ab/tests/{test_id}/feedback` | body [`RecordFeedbackRequest`](#recordfeedbackrequest); path `{test_id: String}` | `serde_json::Value` |
+| `POST` | `/api/ab/tests/{test_id}/impression` | body [`RecordImpressionRequest`](#recordimpressionrequest); path `{test_id: String}` | `serde_json::Value` |
+| `POST` | `/api/ab/tests/{test_id}/pause` | path `{test_id: String}` | [`ABTestResponse`](#abtestresponse) |
+| `POST` | `/api/ab/tests/{test_id}/resume` | path `{test_id: String}` | [`ABTestResponse`](#abtestresponse) |
+| `POST` | `/api/ab/tests/{test_id}/start` | path `{test_id: String}` | [`ABTestResponse`](#abtestresponse) |
 
 ### /admin
 
@@ -81,7 +81,7 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `GET` | `/api/brain/{user_id}` | path `String` | [`BrainStateResponse`](#brainstateresponse-handlers-visualization) |
+| `GET` | `/api/brain/{user_id}` | path `{user_id: String}` | [`BrainStateResponse`](#brainstateresponse-handlers-visualization) |
 
 ### /consolidate
 
@@ -103,9 +103,9 @@ The request and response shape of every HTTP route, read from the handler signat
 |---|---|---|---|
 | `POST` | `/api/context` | body [`ProactiveContextRequest`](#proactivecontextrequest-handlers-recall) | [`ProactiveContextResponse`](#proactivecontextresponse-handlers-recall) |
 | `GET` | `/api/context/blocks` | query [`BlockQuery`](#blockquery) | [`BlockListResponse`](#blocklistresponse) |
-| `DELETE` | `/api/context/blocks/{key}` | query [`BlockQuery`](#blockquery); path `String` | [`BlockDeleteResponse`](#blockdeleteresponse) |
-| `GET` | `/api/context/blocks/{key}` | query [`BlockQuery`](#blockquery); path `String` | [`BlockResponse`](#blockresponse) |
-| `PUT` | `/api/context/blocks/{key}` | body [`SetBlockRequest`](#setblockrequest); path `String` | [`BlockResponse`](#blockresponse) |
+| `DELETE` | `/api/context/blocks/{key}` | query [`BlockQuery`](#blockquery); path `{key: String}` | [`BlockDeleteResponse`](#blockdeleteresponse) |
+| `GET` | `/api/context/blocks/{key}` | query [`BlockQuery`](#blockquery); path `{key: String}` | [`BlockResponse`](#blockresponse) |
+| `PUT` | `/api/context/blocks/{key}` | body [`SetBlockRequest`](#setblockrequest); path `{key: String}` | [`BlockResponse`](#blockresponse) |
 | `GET` | `/api/context/monitor` | none | `opaque` |
 | `GET` | `/api/context/sse` | none | `Sse<impl futures::Stream<Item = Result<Event, Infallible>>>` |
 | `GET` | `/api/context/status` | none | Vec&lt;[`ContextStatus`](#contextstatus)&gt; |
@@ -130,11 +130,11 @@ The request and response shape of every HTTP route, read from the handler signat
 |---|---|---|---|
 | `GET` | `/api/datasets` | query [`DatasetUserQuery`](#datasetuserquery) | [`ListDatasetsResponse`](#listdatasetsresponse) |
 | `POST` | `/api/datasets` | body [`CreateDatasetRequest`](#createdatasetrequest) | [`CreateDatasetResponse`](#createdatasetresponse) |
-| `DELETE` | `/api/datasets/{name}` | query [`DatasetUserQuery`](#datasetuserquery); path `String` | [`DropDatasetResponse`](#dropdatasetresponse) |
-| `GET` | `/api/datasets/{name}` | query [`DatasetUserQuery`](#datasetuserquery); path `String` | [`DatasetMetadataResponse`](#datasetmetadataresponse) |
-| `POST` | `/api/datasets/{name}/link` | body [`LinkRequest`](#linkrequest); path `String` | [`LinkResponse`](#linkresponse) |
-| `POST` | `/api/datasets/{name}/query` | body [`QueryRequest`](#queryrequest); path `String` | `opaque` |
-| `POST` | `/api/datasets/{name}/rows` | body [`InsertRowsRequest`](#insertrowsrequest); path `String` | [`InsertRowsResponse`](#insertrowsresponse) |
+| `DELETE` | `/api/datasets/{name}` | query [`DatasetUserQuery`](#datasetuserquery); path `{name: String}` | [`DropDatasetResponse`](#dropdatasetresponse) |
+| `GET` | `/api/datasets/{name}` | query [`DatasetUserQuery`](#datasetuserquery); path `{name: String}` | [`DatasetMetadataResponse`](#datasetmetadataresponse) |
+| `POST` | `/api/datasets/{name}/link` | body [`LinkRequest`](#linkrequest); path `{name: String}` | [`LinkResponse`](#linkresponse) |
+| `POST` | `/api/datasets/{name}/query` | body [`QueryRequest`](#queryrequest); path `{name: String}` | `opaque` |
+| `POST` | `/api/datasets/{name}/rows` | body [`InsertRowsRequest`](#insertrowsrequest); path `{name: String}` | [`InsertRowsResponse`](#insertrowsresponse) |
 
 ### /dials
 
@@ -215,7 +215,7 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/forget/importance` | body [`ForgetByImportanceRequest`](#forgetbyimportancerequest-handlers-crud) | `serde_json::Value` |
 | `POST` | `/api/forget/pattern` | body [`ForgetByPatternRequest`](#forgetbypatternrequest-handlers-crud) | `serde_json::Value` |
 | `POST` | `/api/forget/tags` | body [`ForgetByTagsRequest`](#forgetbytagsrequest-handlers-crud) | `serde_json::Value` |
-| `DELETE` | `/api/forget/{memory_id}` | query `HashMap<String, String>`; path `String` | [`DeleteMemoryResponse`](#deletememoryresponse) |
+| `DELETE` | `/api/forget/{memory_id}` | query `HashMap<String, String>`; path `{memory_id: String}` | [`DeleteMemoryResponse`](#deletememoryresponse) |
 
 ### /gap
 
@@ -231,7 +231,7 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `GET` | `/api/graph/data/{user_id}` | path `String` | [`GraphDataResponse`](#graphdataresponse) |
+| `GET` | `/api/graph/data/{user_id}` | path `{user_id: String}` | [`GraphDataResponse`](#graphdataresponse) |
 | `POST` | `/api/graph/entities/all` | body [`GetAllEntitiesRequest`](#getallentitiesrequest-handlers-graph) | `serde_json::Value` |
 | `POST` | `/api/graph/entities/frequency` | body [`EntityFrequencyRequest`](#entityfrequencyrequest) | [`Frequency`](#frequency) |
 | `POST` | `/api/graph/entity/add` | body [`AddEntityRequest`](#addentityrequest-handlers-mif) | `serde_json::Value` |
@@ -242,10 +242,10 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/graph/relationship/invalidate` | body [`InvalidateRelationshipRequest`](#invalidaterelationshiprequest) | `serde_json::Value` |
 | `POST` | `/api/graph/tags/stamped-cores` | body [`StampedCoresRequest`](#stampedcoresrequest) | [`StampedCores`](#stampedcores) |
 | `POST` | `/api/graph/traverse` | body [`TraverseGraphRequest`](#traversegraphrequest) | [`GraphTraversal`](#graphtraversal) |
-| `DELETE` | `/api/graph/{user_id}/clear` | path `String` | `serde_json::Value` |
-| `POST` | `/api/graph/{user_id}/rebuild` | path `String` | `serde_json::Value` |
-| `GET` | `/api/graph/{user_id}/stats` | path `String` | [`GraphStats`](#graphstats-graph-memory) |
-| `GET` | `/api/graph/{user_id}/universe` | path `String` | [`MemoryUniverse`](#memoryuniverse) |
+| `DELETE` | `/api/graph/{user_id}/clear` | path `{user_id: String}` | `serde_json::Value` |
+| `POST` | `/api/graph/{user_id}/rebuild` | path `{user_id: String}` | `serde_json::Value` |
+| `GET` | `/api/graph/{user_id}/stats` | path `{user_id: String}` | [`GraphStats`](#graphstats-graph-memory) |
+| `GET` | `/api/graph/{user_id}/universe` | path `{user_id: String}` | [`MemoryUniverse`](#memoryuniverse) |
 | `GET` | `/graph/view` | query [`GraphViewParams`](#graphviewparams) | `opaque` |
 
 ### /health
@@ -297,7 +297,7 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `GET` | `/api/list/{user_id}` | query [`ListQuery`](#listquery); path `String` | [`ListResponse`](#listresponse) |
+| `GET` | `/api/list/{user_id}` | query [`ListQuery`](#listquery); path `{user_id: String}` | [`ListResponse`](#listresponse) |
 
 ### /memories
 
@@ -308,7 +308,7 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/memories/bulk` | body [`BulkDeleteRequest`](#bulkdeleterequest-handlers-crud) | `serde_json::Value` |
 | `POST` | `/api/memories/clear` | body [`ClearAllRequest`](#clearallrequest-handlers-crud) | `serde_json::Value` |
 | `GET` | `/api/memories/count` | query [`CountMemoriesQuery`](#countmemoriesquery) | [`CountResponse`](#countresponse) |
-| `GET` | `/api/memories/{memory_id}` | query `HashMap<String, String>`; path `String` | [`MemoryWithHierarchy`](#memorywithhierarchy) |
+| `GET` | `/api/memories/{memory_id}` | query `HashMap<String, String>`; path `{memory_id: String}` | [`MemoryWithHierarchy`](#memorywithhierarchy) |
 
 ### /memory
 
@@ -320,10 +320,10 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/memory/merge` | body [`MergeRequest`](#mergerequest) | `serde_json::Value` |
 | `POST` | `/api/memory/split` | body [`SplitRequest`](#splitrequest) | `serde_json::Value` |
 | `POST` | `/api/memory/tier` | body [`TierMoveRequest`](#tiermoverequest-handlers-crud) | [`TierMoveResponse`](#tiermoveresponse-handlers-crud) |
-| `DELETE` | `/api/memory/{memory_id}` | query `HashMap<String, String>`; path `String` | [`DeleteMemoryResponse`](#deletememoryresponse) |
-| `GET` | `/api/memory/{memory_id}` | query `HashMap<String, String>`; path `String` | [`MemoryWithHierarchy`](#memorywithhierarchy) |
-| `PUT` | `/api/memory/{memory_id}` | body [`UpdateMemoryRequest`](#updatememoryrequest); path `String` | [`UpdateMemoryResponse`](#updatememoryresponse) |
-| `GET` | `/api/memory/{memory_id}/health` | query `HashMap<String, String>`; path `String` | [`MemoryHealthResponse`](#memoryhealthresponse) |
+| `DELETE` | `/api/memory/{memory_id}` | query `HashMap<String, String>`; path `{memory_id: String}` | [`DeleteMemoryResponse`](#deletememoryresponse) |
+| `GET` | `/api/memory/{memory_id}` | query `HashMap<String, String>`; path `{memory_id: String}` | [`MemoryWithHierarchy`](#memorywithhierarchy) |
+| `PUT` | `/api/memory/{memory_id}` | body [`UpdateMemoryRequest`](#updatememoryrequest); path `{memory_id: String}` | [`UpdateMemoryResponse`](#updatememoryresponse) |
+| `GET` | `/api/memory/{memory_id}/health` | query `HashMap<String, String>`; path `{memory_id: String}` | [`MemoryHealthResponse`](#memoryhealthresponse) |
 
 ### /metrics
 
@@ -350,14 +350,14 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/projects` | body [`CreateProjectRequest`](#createprojectrequest) | [`ProjectResponse`](#projectresponse) |
 | `POST` | `/api/projects/add` | body [`CreateProjectRequest`](#createprojectrequest) | [`ProjectResponse`](#projectresponse) |
 | `POST` | `/api/projects/list` | body [`ListProjectsRequest`](#listprojectsrequest) | [`ProjectListResponse`](#projectlistresponse) |
-| `DELETE` | `/api/projects/{project_id}` | body [`DeleteProjectRequest`](#deleteprojectrequest); path `String` | [`ProjectResponse`](#projectresponse) |
-| `GET` | `/api/projects/{project_id}` | query [`TodoQuery`](#todoquery); path `String` | [`ProjectResponse`](#projectresponse) |
-| `POST` | `/api/projects/{project_id}/delete` | body [`DeleteProjectRequest`](#deleteprojectrequest); path `String` | [`ProjectResponse`](#projectresponse) |
-| `POST` | `/api/projects/{project_id}/files` | body [`ListFilesRequest`](#listfilesrequest); path `String` | [`FileListResponse`](#filelistresponse) |
-| `POST` | `/api/projects/{project_id}/files/search` | body [`SearchFilesRequest`](#searchfilesrequest); path `String` | [`FileListResponse`](#filelistresponse) |
-| `POST` | `/api/projects/{project_id}/index` | body [`IndexCodebaseRequest`](#indexcodebaserequest); path `String` | [`IndexResponse`](#indexresponse) |
-| `POST` | `/api/projects/{project_id}/scan` | body [`IndexCodebaseRequest`](#indexcodebaserequest); path `String` | [`ScanResponse`](#scanresponse) |
-| `POST` | `/api/projects/{project_id}/update` | body [`UpdateProjectRequest`](#updateprojectrequest); path `String` | [`ProjectResponse`](#projectresponse) |
+| `DELETE` | `/api/projects/{project_id}` | body [`DeleteProjectRequest`](#deleteprojectrequest); path `{project_id: String}` | [`ProjectResponse`](#projectresponse) |
+| `GET` | `/api/projects/{project_id}` | query [`TodoQuery`](#todoquery); path `{project_id: String}` | [`ProjectResponse`](#projectresponse) |
+| `POST` | `/api/projects/{project_id}/delete` | body [`DeleteProjectRequest`](#deleteprojectrequest); path `{project_id: String}` | [`ProjectResponse`](#projectresponse) |
+| `POST` | `/api/projects/{project_id}/files` | body [`ListFilesRequest`](#listfilesrequest); path `{project_id: String}` | [`FileListResponse`](#filelistresponse) |
+| `POST` | `/api/projects/{project_id}/files/search` | body [`SearchFilesRequest`](#searchfilesrequest); path `{project_id: String}` | [`FileListResponse`](#filelistresponse) |
+| `POST` | `/api/projects/{project_id}/index` | body [`IndexCodebaseRequest`](#indexcodebaserequest); path `{project_id: String}` | [`IndexResponse`](#indexresponse) |
+| `POST` | `/api/projects/{project_id}/scan` | body [`IndexCodebaseRequest`](#indexcodebaserequest); path `{project_id: String}` | [`ScanResponse`](#scanresponse) |
+| `POST` | `/api/projects/{project_id}/update` | body [`UpdateProjectRequest`](#updateprojectrequest); path `{project_id: String}` | [`ProjectResponse`](#projectresponse) |
 
 ### /prompt
 
@@ -399,7 +399,7 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `POST` | `/api/remember` | none | [`RememberResponse`](#rememberresponse-handlers-remember) |
+| `POST` | `/api/remember` | body [`RememberRequest`](#rememberrequest-handlers-remember) | [`RememberResponse`](#rememberresponse-handlers-remember) |
 | `POST` | `/api/remember/batch` | body [`BatchRememberRequest`](#batchrememberrequest-handlers-remember) | [`BatchRememberResponse`](#batchrememberresponse-handlers-remember) |
 
 ### /remind
@@ -417,8 +417,8 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/reminders/context` | body [`CheckContextRemindersRequest`](#checkcontextremindersrequest) | [`DueRemindersResponse`](#dueremindersresponse) |
 | `POST` | `/api/reminders/due` | body [`GetDueRemindersRequest`](#getdueremindersrequest) | [`DueRemindersResponse`](#dueremindersresponse) |
 | `POST` | `/api/reminders/set` | body [`CreateReminderRequest`](#createreminderrequest) | [`CreateReminderResponse`](#createreminderresponse) |
-| `POST` | `/api/reminders/{reminder_id}/delete` | query [`DeleteReminderQuery`](#deletereminderquery); path `String` | [`ReminderActionResponse`](#reminderactionresponse) |
-| `POST` | `/api/reminders/{reminder_id}/dismiss` | body [`DismissReminderRequest`](#dismissreminderrequest); path `String` | [`ReminderActionResponse`](#reminderactionresponse) |
+| `POST` | `/api/reminders/{reminder_id}/delete` | query [`DeleteReminderQuery`](#deletereminderquery); path `{reminder_id: String}` | [`ReminderActionResponse`](#reminderactionresponse) |
+| `POST` | `/api/reminders/{reminder_id}/dismiss` | body [`DismissReminderRequest`](#dismissreminderrequest); path `{reminder_id: String}` | [`ReminderActionResponse`](#reminderactionresponse) |
 
 ### /search
 
@@ -441,7 +441,7 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/sessions` | body [`ListSessionsRequest`](#listsessionsrequest) | [`ListSessionsResponse`](#listsessionsresponse) |
 | `POST` | `/api/sessions/end` | body [`EndSessionRequest`](#endsessionrequest) | [`EndSessionResponse`](#endsessionresponse) |
 | `GET` | `/api/sessions/stats` | none | [`SessionStoreStatsResponse`](#sessionstorestatsresponse) |
-| `GET` | `/api/sessions/{session_id}` | query [`GetSessionRequest`](#getsessionrequest); path `String` | [`GetSessionResponse`](#getsessionresponse) |
+| `GET` | `/api/sessions/{session_id}` | query [`GetSessionRequest`](#getsessionrequest); path `{session_id: String}` | [`GetSessionResponse`](#getsessionresponse) |
 
 ### /sleep_time
 
@@ -450,7 +450,7 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/sleep_time/enqueue` | body [`EnqueueRequest`](#enqueuerequest) | `opaque` |
 | `POST` | `/api/sleep_time/lock_block` | body [`LockBlockRequest`](#lockblockrequest) | `opaque` |
 | `GET` | `/api/sleep_time/status` | none | `opaque` |
-| `GET` | `/api/sleep_time/status/{user_id}` | path `String` | `opaque` |
+| `GET` | `/api/sleep_time/status/{user_id}` | path `{user_id: String}` | `opaque` |
 
 ### /sleight
 
@@ -506,19 +506,19 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/todos/reorder` | body [`ReorderTodoRequest`](#reordertodorequest) | [`TodoResponse`](#todoresponse) |
 | `POST` | `/api/todos/stats` | body [`TodoStatsRequest`](#todostatsrequest) | [`TodoStatsResponse`](#todostatsresponse) |
 | `POST` | `/api/todos/update` | body [`UpdateTodoRequest`](#updatetodorequest) | [`TodoResponse`](#todoresponse) |
-| `DELETE` | `/api/todos/{todo_id}` | query [`TodoQuery`](#todoquery); path `String` | [`TodoResponse`](#todoresponse) |
-| `GET` | `/api/todos/{todo_id}` | query [`TodoQuery`](#todoquery); path `String` | [`TodoResponse`](#todoresponse) |
-| `GET` | `/api/todos/{todo_id}/comments` | query [`TodoQuery`](#todoquery); path `String` | [`CommentListResponse`](#commentlistresponse) |
-| `POST` | `/api/todos/{todo_id}/comments` | body [`AddCommentRequest`](#addcommentrequest); path `String` | [`CommentResponse`](#commentresponse) |
-| `DELETE` | `/api/todos/{todo_id}/comments/{comment_id}` | query [`TodoQuery`](#todoquery); path `(String, String)` | [`CommentResponse`](#commentresponse) |
-| `PUT` | `/api/todos/{todo_id}/comments/{comment_id}` | body [`UpdateCommentRequest`](#updatecommentrequest); path `(String, String)` | [`CommentResponse`](#commentresponse) |
-| `POST` | `/api/todos/{todo_id}/comments/{comment_id}/update` | body [`UpdateCommentRequest`](#updatecommentrequest); path `(String, String)` | [`CommentResponse`](#commentresponse) |
-| `POST` | `/api/todos/{todo_id}/complete` | body [`TodoQuery`](#todoquery); path `String` | [`TodoCompleteResponse`](#todocompleteresponse) |
-| `GET` | `/api/todos/{todo_id}/dependency_chain` | query [`DependencyChainQuery`](#dependencychainquery); path `String` | [`TodoListResponse`](#todolistresponse) |
-| `GET` | `/api/todos/{todo_id}/dependents` | query [`TodoQuery`](#todoquery); path `String` | [`TodoListResponse`](#todolistresponse) |
-| `POST` | `/api/todos/{todo_id}/reorder` | body [`ReorderTodoRequest`](#reordertodorequest); path `String` | [`TodoResponse`](#todoresponse) |
-| `GET` | `/api/todos/{todo_id}/subtasks` | query [`TodoQuery`](#todoquery); path `String` | [`TodoListResponse`](#todolistresponse) |
-| `POST` | `/api/todos/{todo_id}/update` | body [`UpdateTodoRequest`](#updatetodorequest); path `String` | [`TodoResponse`](#todoresponse) |
+| `DELETE` | `/api/todos/{todo_id}` | query [`TodoQuery`](#todoquery); path `{todo_id: String}` | [`TodoResponse`](#todoresponse) |
+| `GET` | `/api/todos/{todo_id}` | query [`TodoQuery`](#todoquery); path `{todo_id: String}` | [`TodoResponse`](#todoresponse) |
+| `GET` | `/api/todos/{todo_id}/comments` | query [`TodoQuery`](#todoquery); path `{todo_id: String}` | [`CommentListResponse`](#commentlistresponse) |
+| `POST` | `/api/todos/{todo_id}/comments` | body [`AddCommentRequest`](#addcommentrequest); path `{todo_id: String}` | [`CommentResponse`](#commentresponse) |
+| `DELETE` | `/api/todos/{todo_id}/comments/{comment_id}` | query [`TodoQuery`](#todoquery); path `{todo_id: String, comment_id: String}` | [`CommentResponse`](#commentresponse) |
+| `PUT` | `/api/todos/{todo_id}/comments/{comment_id}` | body [`UpdateCommentRequest`](#updatecommentrequest); path `{todo_id: String, comment_id: String}` | [`CommentResponse`](#commentresponse) |
+| `POST` | `/api/todos/{todo_id}/comments/{comment_id}/update` | body [`UpdateCommentRequest`](#updatecommentrequest); path `{todo_id: String, comment_id: String}` | [`CommentResponse`](#commentresponse) |
+| `POST` | `/api/todos/{todo_id}/complete` | body [`TodoQuery`](#todoquery); path `{todo_id: String}` | [`TodoCompleteResponse`](#todocompleteresponse) |
+| `GET` | `/api/todos/{todo_id}/dependency_chain` | query [`DependencyChainQuery`](#dependencychainquery); path `{todo_id: String}` | [`TodoListResponse`](#todolistresponse) |
+| `GET` | `/api/todos/{todo_id}/dependents` | query [`TodoQuery`](#todoquery); path `{todo_id: String}` | [`TodoListResponse`](#todolistresponse) |
+| `POST` | `/api/todos/{todo_id}/reorder` | body [`ReorderTodoRequest`](#reordertodorequest); path `{todo_id: String}` | [`TodoResponse`](#todoresponse) |
+| `GET` | `/api/todos/{todo_id}/subtasks` | query [`TodoQuery`](#todoquery); path `{todo_id: String}` | [`TodoListResponse`](#todolistresponse) |
+| `POST` | `/api/todos/{todo_id}/update` | body [`UpdateTodoRequest`](#updatetodorequest); path `{todo_id: String}` | [`TodoResponse`](#todoresponse) |
 
 ### /ui
 
@@ -580,16 +580,16 @@ The request and response shape of every HTTP route, read from the handler signat
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `GET` | `/api/users` | none | `Vec<String>` |
-| `DELETE` | `/api/users/{user_id}` | path `String` | [`DeleteUserResponse`](#deleteuserresponse) |
-| `GET` | `/api/users/{user_id}/stats` | path `String` | [`MemoryStats`](#memorystats) |
+| `DELETE` | `/api/users/{user_id}` | path `{user_id: String}` | [`DeleteUserResponse`](#deleteuserresponse) |
+| `GET` | `/api/users/{user_id}/stats` | path `{user_id: String}` | [`MemoryStats`](#memorystats) |
 
 ### /visualization
 
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `POST` | `/api/visualization/build` | body [`BuildVisualizationRequest`](#buildvisualizationrequest-handlers-visualization) | `VisualizationStats` |
-| `GET` | `/api/visualization/{user_id}/dot` | path `String` | `String` |
-| `GET` | `/api/visualization/{user_id}/stats` | path `String` | `VisualizationStats` |
+| `GET` | `/api/visualization/{user_id}/dot` | path `{user_id: String}` | `String` |
+| `GET` | `/api/visualization/{user_id}/stats` | path `{user_id: String}` | `VisualizationStats` |
 
 ### /webhook
 
@@ -676,8 +676,8 @@ Defined in `src/handlers/search.rs`. Request for advanced search
 | `entity_name` | `Option<String>` | no |  |
 | `start_date` | `Option<String>` | no |  |
 | `end_date` | `Option<String>` | no |  |
-| `min_importance` | `Option<f32>` | no |  |
-| `max_importance` | `Option<f32>` | no |  |
+| `min_importance` | `Option<f32>` | no | score |
+| `max_importance` | `Option<f32>` | no | score |
 
 ### AgentRef
 
@@ -994,7 +994,7 @@ Defined in `src/handlers/visualization.rs`. Brain statistics
 | `session_count` | `usize` | yes |  |
 | `longterm_count` | `usize` | yes |  |
 | `avg_activation` | `f32` | yes |  |
-| `avg_importance` | `f32` | yes |  |
+| `avg_importance` | `f32` | yes | score |
 
 ### Bucket (entity_frequency)
 
@@ -1056,7 +1056,7 @@ Defined in `src/memory/facets.rs`. A typed causal link between this engram and a
 |---|---|---|---|
 | `other` | [`MemoryId`](#memoryid) | yes | The other memory. |
 | `relation` | [`CausalRelation`](#causalrelation-memory-facets) | yes | The kind of causal relation. |
-| `confidence` | `f32` | yes | Confidence in this link, 0.0–1.0. |
+| `confidence` | `f32` | yes | score; Confidence in this link, 0.0–1.0. |
 | `inferred` | `bool` | yes | Was this link observed or inferred? Inferred links are weaker evidence at retrieval — the source-monitoring discipline applied to Veld's own inferences. |
 
 ### CausalRelation (memory/facets)
@@ -1211,7 +1211,7 @@ Defined in `src/memory/dials.rs`. Runtime-tunable cognitive parameters for a sin
 | `rrf_k_decomp` | `Option<f32>` | no | default when absent; RRF k for the decomposed sub-query merge. Default 20. |
 | `rrf_k_inner` | `Option<f32>` | no | default when absent; RRF k for the inner BM25+vector fusion (hybrid_search). Default 45. |
 | `secondary_rrf_ratio` | `Option<f32>` | no | default when absent; Weight ratio of the secondary (768d) vector index signal. Default 0.5. |
-| `bm25_min_score` | `Option<f32>` | no | default when absent; BM25 minimum-score floor for lexical candidates. Default 0.1. |
+| `bm25_min_score` | `Option<f32>` | no | default when absent; score; BM25 minimum-score floor for lexical candidates. Default 0.1. |
 | `onto_rerank_boost` | `Option<f32>` | no | default when absent; Ontological rerank boost per entity-label match. Default 0.15. |
 | `onto_rerank_max` | `Option<f32>` | no | default when absent; Ontological rerank boost cap. Default 0.40. |
 | `onto_rerank_penalty` | `Option<f32>` | no | default when absent; Ontological rerank mismatch penalty (negative). Default -0.08. |
@@ -1226,12 +1226,12 @@ Defined in `src/memory/dials.rs`. Runtime-tunable cognitive parameters for a sin
 | `ce_blend_attribute` | `Option<f32>` | no | default when absent |
 | `ce_blend_relational` | `Option<f32>` | no | default when absent |
 | `ce_blend_abstract` | `Option<f32>` | no | default when absent |
-| `query_coverage_weight` | `Option<f32>` | no | default when absent; Layer 5.36 query-term coverage weight; `0` disables. Default `constants::QUERY_COVERAGE_WEIGHT`. |
+| `query_coverage_weight` | `Option<f32>` | no | default when absent; score; Layer 5.36 query-term coverage weight; `0` disables. Default `constants::QUERY_COVERAGE_WEIGHT`. |
 | `people_boost_max` | `Option<f32>` | no | default when absent; Layer 5.37 person-density boost ceiling for people questions; `0` disables. Default `constants::PEOPLE_BOOST_MAX`. |
 | `use_prf` | `Option<bool>` | no | default when absent; Pseudo-relevance feedback leg. Default `constants::PRF_ENABLED_DEFAULT`. |
 | `prf_docs` | `Option<usize>` | no | default when absent; Top first-pass documents PRF reads terms from. Default `constants::PRF_DOCS`. |
 | `prf_terms` | `Option<usize>` | no | default when absent; Expansion terms PRF appends. Default `constants::PRF_TERMS`. |
-| `prf_weight` | `Option<f32>` | no | default when absent; PRF leg weight as a fraction of the hybrid weight. Default `constants::PRF_WEIGHT`. |
+| `prf_weight` | `Option<f32>` | no | default when absent; score; PRF leg weight as a fraction of the hybrid weight. Default `constants::PRF_WEIGHT`. |
 | `mmr_lambda_exploratory` | `Option<f32>` | no | default when absent; MMR diversity λ for exploratory queries. Default 0.6. |
 | `mmr_lambda_abstract` | `Option<f32>` | no | default when absent; MMR diversity λ for abstract queries. Default 0.5. |
 | `mmr_lambda_relationship` | `Option<f32>` | no | default when absent; MMR diversity λ for relationship queries. Default 0.7. |
@@ -1840,7 +1840,7 @@ Defined in `src/relevance.rs`. Detected entity with confidence
 |---|---|---|---|
 | `name` | `String` | yes | Entity name |
 | `entity_type` | `String` | yes | Entity type (Person, Organization, etc.) |
-| `confidence` | `f32` | yes | Detection confidence (0.0-1.0) |
+| `confidence` | `f32` | yes | score; Detection confidence (0.0-1.0) |
 
 ### DetectedEntityInfo
 
@@ -1962,7 +1962,7 @@ Defined in `src/memory/types.rs`. Emotional context - captures affective state d
 | `arousal` | `f32` | no | default when absent; Arousal level: 0.0 (calm) to 1.0 (highly aroused/excited) |
 | `dominant_emotion` | `Option<String>` | no | default when absent; Dominant emotion label (optional, for categorical access) E.g., "joy", "frustration", "surprise", "satisfaction", "anxiety" |
 | `content_sentiment` | `Option<f32>` | no | default when absent; Sentiment of the content itself (not the user's reaction) Useful for distinguishing "user felt frustrated" vs "content describes frustration" |
-| `confidence` | `f32` | no | default when absent; Confidence in the emotional assessment (0.0 to 1.0) Lower if inferred from text, higher if explicitly stated |
+| `confidence` | `f32` | no | default when absent; score; Confidence in the emotional assessment (0.0 to 1.0) Lower if inferred from text, higher if explicitly stated |
 
 ### EndSessionRequest
 
@@ -2247,7 +2247,7 @@ Defined in `src/memory/types.rs`.
 | `action_params` | `Option<HashMap<String, String>>` | no | default when absent; Action parameters: Specific parameters of the action taken E.g., {"speed": "0.5", "turn_angle": "45", "altitude_change": "-10"} |
 | `outcome_type` | `Option<String>` | no | default when absent; Outcome type: success, failure, partial, aborted, timeout |
 | `outcome_details` | `Option<String>` | no | default when absent; Outcome details: What specifically happened? |
-| `confidence` | `Option<f32>` | no | default when absent; Confidence score for this decision (0.0-1.0) How confident was the system when making this decision? |
+| `confidence` | `Option<f32>` | no | default when absent; score; Confidence score for this decision (0.0-1.0) How confident was the system when making this decision? |
 | `alternatives_considered` | `Vec<String>` | no | default when absent; Alternative actions considered but not taken For learning "what else could have been done" |
 | `weather` | `Option<HashMap<String, String>>` | no | default when absent; Weather conditions: {"wind_speed": "15", "visibility": "good", "precipitation": "none"} |
 | `terrain_type` | `Option<String>` | no | default when absent; Terrain type: indoor, outdoor, urban, rural, water, aerial |
@@ -2309,7 +2309,7 @@ Defined in `src/handlers/ui.rs`.
 |---|---|---|---|
 | `id` | `String` | yes |  |
 | `fact` | `String` | yes |  |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 | `support_count` | `usize` | yes |  |
 | `source_memories` | `Vec<String>` | yes |  |
 | `related_entities` | `Vec<String>` | yes |  |
@@ -2327,7 +2327,7 @@ Defined in `src/memory/introspection.rs`. Change in a semantic fact
 |---|---|---|---|
 | `fact_id` | `String` | yes |  |
 | `fact_content` | `String` | yes |  |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 | `support_count` | `usize` | yes |  |
 | `fact_type` | `String` | yes |  |
 | `timestamp` | `DateTime<Utc>` | yes |  |
@@ -2342,7 +2342,7 @@ Defined in `src/memory/compression.rs`. A cluster of related facts grouped by sh
 | `entities` | `Vec<String>` | yes | All entities appearing in the cluster's facts (sorted, deduped) |
 | `facts` | Vec&lt;[`SemanticFact`](#semanticfact)&gt; | yes | Facts in this cluster, sorted by created_at ascending |
 | `narrative` | `String` | yes | Template-generated narrative summary (no LLM required) |
-| `avg_confidence` | `f32` | yes | Average confidence across facts in the cluster |
+| `avg_confidence` | `f32` | yes | score; Average confidence across facts in the cluster |
 | `total_support` | `usize` | yes | Sum of support_count across all facts (drives cluster ranking) |
 | `causal_chains` | Vec&lt;[`CausalFactLink`](#causalfactlink)&gt; | yes | Detected causal relationships between facts in this cluster |
 
@@ -2375,7 +2375,7 @@ Defined in `src/memory/facts.rs`. Statistics about semantic facts
 |---|---|---|---|
 | `total_facts` | `usize` | yes |  |
 | `by_type` | `std::collections::HashMap<String, usize>` | yes |  |
-| `avg_confidence` | `f32` | yes |  |
+| `avg_confidence` | `f32` | yes | score |
 | `avg_support` | `f32` | yes |  |
 
 ### FactType
@@ -2685,7 +2685,7 @@ Defined in `src/handlers/gap_analysis.rs`.
 | `max_gaps_per_type` | `usize` | no | default when absent |
 | `offset` | `usize` | no | default when absent |
 | `limit` | `usize` | no | default when absent |
-| `min_embedding_similarity` | `Option<f32>` | no | default when absent; Minimum embedding similarity to flag a U-shape (default 0.3) |
+| `min_embedding_similarity` | `Option<f32>` | no | default when absent; score; Minimum embedding similarity to flag a U-shape (default 0.3) |
 | `star_min_spokes` | `Option<usize>` | no | default when absent; Minimum spokes for star gap detection (default 3) |
 | `orbit_min_cluster_size` | `Option<usize>` | no | default when absent; Minimum cluster size for orbit detection (default 3) |
 | `namespace` | `Option<String>` | no | default when absent; Only entities named `{namespace}:…`. |
@@ -2736,9 +2736,9 @@ Defined in `src/handlers/gap_analysis.rs`.
 |---|---|---|---|
 | `id` | `String` | yes |  |
 | `gap_type` | `String` | yes |  |
-| `confidence` | `f32` | yes |  |
-| `embedding_similarity` | `Option<f32>` | no |  |
-| `impact_score` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
+| `embedding_similarity` | `Option<f32>` | no | score |
+| `impact_score` | `f32` | yes | score |
 | `entity_names` | `Vec<String>` | yes |  |
 | `shape` | [`ShapeSummary`](#shapesummary) | yes |  |
 
@@ -3050,7 +3050,7 @@ Defined in `src/handlers/ingest.rs`. Ingest request - auto-detect format, extrac
 | `content` | `String` | yes |  |
 | `filename` | `Option<String>` | no | default when absent; Optional filename for format detection (e.g. "notes.md", "data.csv") |
 | `tags` | `Vec<String>` | no | default when absent |
-| `importance` | `Option<f32>` | no | default when absent |
+| `importance` | `Option<f32>` | no | default when absent; score |
 | `memory_type` | `Option<String>` | no | default when absent |
 | `tabular` | `bool` | no | default when absent; W7 tabular mode: when `true` and the content is CSV or JSON, store the input as a relational dataset (one row per record) instead of a single free-text memory. Requires a configured relational backend. Default `false` preserves the memory-storing behaviour. |
 | `dataset_name` | `Option<String>` | no | default when absent; Optional dataset name for tabular mode. Defaults to the filename stem, or `ingest_dataset` when no filename is given. |
@@ -3113,7 +3113,7 @@ Defined in `src/memory/introspection.rs`. Interference event details (SHO-106)
 |---|---|---|---|
 | `new_memory_id` | `String` | yes |  |
 | `old_memory_id` | `String` | yes |  |
-| `similarity` | `f32` | yes |  |
+| `similarity` | `f32` | yes | score |
 | `interference_type` | [`InterferenceType`](#interferencetype) | yes |  |
 | `timestamp` | `DateTime<Utc>` | yes |  |
 
@@ -3125,7 +3125,7 @@ Defined in `src/memory/types.rs`. Interference event reported in retrieval stats
 |---|---|---|---|
 | `affected_memory_id` | `String` | yes | Memory ID that was affected |
 | `interfering_memory_id` | `String` | yes | Memory ID that caused the interference |
-| `similarity` | `f32` | yes | Cosine similarity between the two memories |
+| `similarity` | `f32` | yes | score; Cosine similarity between the two memories |
 | `decay_applied` | `f32` | yes | Amount of importance decay applied |
 | `interference_type` | `String` | yes | Type: "retroactive" or "proactive" |
 
@@ -3271,7 +3271,7 @@ Defined in `src/memory/lineage.rs`. A causal edge between two memories
 | `from` | [`MemoryId`](#memoryid) | yes | Source memory (cause) |
 | `to` | [`MemoryId`](#memoryid) | yes | Target memory (effect) |
 | `relation` | [`CausalRelation`](#causalrelation-memory-facets) | yes | Type of causal relationship |
-| `confidence` | `f32` | yes | Confidence in this causal link (0.0-1.0) |
+| `confidence` | `f32` | yes | score; Confidence in this causal link (0.0-1.0) |
 | `source` | [`LineageSource`](#lineagesource) | yes | How this edge was created |
 | `branch_id` | `Option<String>` | no | Branch this edge belongs to (None = main branch) |
 | `created_at` | `DateTime<Utc>` | yes | When the edge was created |
@@ -3330,7 +3330,7 @@ Defined in `src/memory/lineage.rs`. Statistics about the lineage graph
 | `total_branches` | `usize` | yes |  |
 | `active_branches` | `usize` | yes |  |
 | `edges_by_relation` | `HashMap<String, usize>` | yes |  |
-| `avg_confidence` | `f32` | yes |  |
+| `avg_confidence` | `f32` | yes | score |
 
 ### LineageTraceRequest (handlers/lineage)
 
@@ -3482,7 +3482,7 @@ Defined in `src/handlers/crud.rs`.
 | `content_truncated` | `bool` | yes | True when `content` is shorter than the stored content. |
 | `content_length` | `usize` | yes | Character length of the full stored content. |
 | `memory_type` | `String` | yes |  |
-| `importance` | `f32` | yes |  |
+| `importance` | `f32` | yes | score |
 | `tags` | `Vec<String>` | yes |  |
 | `created_at` | `String` | yes |  |
 | `tier` | `String` | yes |  |
@@ -3733,7 +3733,7 @@ Defined in `src/handlers/ui.rs`.
 | `head` | `String` | yes |  |
 | `experience_type` | `String` | yes |  |
 | `created_at` | `DateTime<Utc>` | yes |  |
-| `importance` | `f32` | yes |  |
+| `importance` | `f32` | yes | score |
 | `access_count` | `u32` | yes |  |
 | `anchored` | `bool` | yes |  |
 | `authored_tags` | `Option<Vec<String>>` | no | Tags whose source is caller or intent; `None` when the record has no tag-source row. |
@@ -3761,7 +3761,7 @@ Defined in `src/handlers/crud.rs`. Memory health response — exposes internal s
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `memory_id` | `String` | yes |  |
-| `importance` | `f32` | yes |  |
+| `importance` | `f32` | yes | score |
 | `tier` | `String` | yes |  |
 | `access_count` | `u32` | yes |  |
 | `created_at` | `String` | yes |  |
@@ -3784,16 +3784,16 @@ Defined in `src/memory/types.rs`. Mutable metadata for memory (interior mutabili
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `importance` | `f32` | yes |  |
+| `importance` | `f32` | yes | score |
 | `access_count` | `u32` | yes |  |
 | `last_accessed` | `DateTime<Utc>` | yes |  |
 | `temporal_relevance` | `f32` | yes |  |
 | `activation` | `f32` | yes | Activation level (spreading activation algorithm) Decays over time, boosted by access and co-activation Range: 0.0 (dormant) to 1.0 (highly active) |
 | `anchored` | `bool` | no | default when absent; Anchored memories resist decay — importance cannot fall below ANCHOR_IMPORTANCE_FLOOR. Set via the `/api/anchor` endpoint or `anchor` MCP tool. Anchored memories also skip compression. |
 | `access_history` | `Vec<DateTime<Utc>>` | no | default when absent; Per-memory access timestamp history for temporal autocorrelation analysis. Capped at MAX_ACCESS_HISTORY entries (oldest evicted first). Enables rhythm detection: bursty vs steady access patterns per memory. |
-| `elaboration_score` | `f32` | no | default when absent; Elaboration quality score (0.0 = bare S-rep content, 1.0 = fully contextualized C-rep). Computed at encoding time based on RichContext field count, entity diversity, temporal specificity, emotional signal presence, and content density. Reference: Ehlers & Clark (2000) — S-rep vs C-rep distinction. |
+| `elaboration_score` | `f32` | no | default when absent; score; Elaboration quality score (0.0 = bare S-rep content, 1.0 = fully contextualized C-rep). Computed at encoding time based on RichContext field count, entity diversity, temporal specificity, emotional signal presence, and content density. Reference: Ehlers & Clark (2000) — S-rep vs C-rep distinction. |
 | `fragment_demotion` | `f32` | no | default when absent; Fragment demotion factor (1.0 = no demotion, FRAGMENT_DEMOTION_FLOOR = heavily demoted). Applied when a consolidated fact exists for this source fragment. Reference: Berntsen (2021) — functional constraints on involuntary memory. |
-| `calibrated_confidence` | `f32` | no | default when absent; Bayesian-calibrated confidence: tracks retrieval correctness via alpha (helpful count) / beta (misleading count) Beta distribution. calibrated_confidence = alpha / (alpha + beta), with Bayesian weight ramp: w = min(1.0, (alpha + beta - 2) / 8) Range: 0.0 (untested or consistently misleading) to 1.0 (consistently helpful) |
+| `calibrated_confidence` | `f32` | no | default when absent; score; Bayesian-calibrated confidence: tracks retrieval correctness via alpha (helpful count) / beta (misleading count) Beta distribution. calibrated_confidence = alpha / (alpha + beta), with Bayesian weight ramp: w = min(1.0, (alpha + beta - 2) / 8) Range: 0.0 (untested or consistently misleading) to 1.0 (consistently helpful) |
 | `confidence_alpha` | `f32` | no | default when absent; Beta distribution alpha parameter (successful retrievals + prior) |
 | `confidence_beta` | `f32` | no | default when absent; Beta distribution beta parameter (failed retrievals + prior) |
 
@@ -3806,7 +3806,7 @@ Defined in `src/handlers/visualization.rs`. Individual memory neuron for visuali
 | `id` | `String` | yes |  |
 | `content_preview` | `String` | yes |  |
 | `activation` | `f32` | yes |  |
-| `importance` | `f32` | yes |  |
+| `importance` | `f32` | yes | score |
 | `tier` | `String` | yes |  |
 | `access_count` | `u32` | yes |  |
 | `created_at` | `String` | yes |  |
@@ -3838,7 +3838,7 @@ Defined in `src/memory/types.rs`. Memory statistics
 | `promotions_to_session` | `usize` | yes |  |
 | `promotions_to_longterm` | `usize` | yes |  |
 | `total_retrievals` | `usize` | yes |  |
-| `average_importance` | `f32` | yes |  |
+| `average_importance` | `f32` | yes | score |
 | `graph_nodes` | `usize` | no | default when absent; Knowledge graph entity count |
 | `graph_edges` | `usize` | no | default when absent; Knowledge graph relationship count |
 
@@ -3994,7 +3994,7 @@ Defined in `src/memory/types.rs`. Raw experience data to be stored (ENHANCED wit
 |---|---|---|---|
 | `text` | `String` | yes |  |
 | `entity_type` | `String` | yes | NER type: "PER", "ORG", "LOC", "MISC" |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 | `start_char` | `Option<usize>` | no | default when absent; Character offset of entity start in source content |
 | `end_char` | `Option<usize>` | no | default when absent; Character offset of entity end in source content |
 
@@ -4188,8 +4188,8 @@ Defined in `src/handlers/recall.rs`. Request for proactive context - returns rel
 | `context` | `String` | yes |  |
 | `max_results` | `usize` | no | default when absent |
 | `semantic_threshold` | `f32` | no | default when absent; Minimum semantic similarity threshold (0.0-1.0) |
-| `entity_match_weight` | `f32` | no | default when absent; Weight for entity matching in relevance scoring |
-| `recency_weight` | `f32` | no | default when absent; Weight for recency boost |
+| `entity_match_weight` | `f32` | no | default when absent; score; Weight for entity matching in relevance scoring |
+| `recency_weight` | `f32` | no | default when absent; score; Weight for recency boost |
 | `memory_types` | `Vec<String>` | no | default when absent; Filter to specific memory types |
 | `auto_ingest` | `bool` | no | default when absent; Whether to auto-ingest the context as a Conversation memory. Off unless asked: hooks already record each turn, and a default ingest stored the same context twice. |
 | `previous_response` | `Option<String>` | no | default when absent; Agent's previous response (for implicit feedback extraction) |
@@ -4231,7 +4231,7 @@ Defined in `src/handlers/recall.rs`. Consolidated fact surfaced in proactive con
 |---|---|---|---|
 | `id` | `String` | yes |  |
 | `fact` | `String` | yes |  |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 | `support_count` | `usize` | yes |  |
 | `related_entities` | `Vec<String>` | yes |  |
 
@@ -4245,7 +4245,7 @@ Defined in `src/handlers/recall.rs`. Surfaced memory in proactive context respon
 | `content` | `String` | yes |  |
 | `memory_type` | `String` | yes |  |
 | `score` | `f32` | yes |  |
-| `importance` | `f32` | yes |  |
+| `importance` | `f32` | yes | score |
 | `created_at` | `String` | yes |  |
 | `tags` | `Vec<String>` | yes |  |
 | `tier` | `String` | yes |  |
@@ -4256,7 +4256,7 @@ Defined in `src/handlers/recall.rs`. Surfaced memory in proactive context respon
 | `access_count` | `u32` | yes | Number of times this memory has been retrieved |
 | `activation_level` | `f32` | yes | Current activation level (0.0 = dormant, 1.0 = labile/active) |
 | `retrieval_trigger` | `String` | yes | How this memory was triggered: "semantic" \| "entity" \| "co_activation" \| "combined" |
-| `intrusion_score` | `f32` | yes | Intrusion score: high activation + recent access = likely co-activation intrusion. Low activation + old access = genuine semantic match. Formula: activation * (1.0 / hours_since_last_accessed.max(0.1)) |
+| `intrusion_score` | `f32` | yes | score; Intrusion score: high activation + recent access = likely co-activation intrusion. Low activation + old access = genuine semantic match. Formula: activation * (1.0 / hours_since_last_accessed.max(0.1)) |
 | `competition_conflict` | `Option<bool>` | no | omitted when empty; Whether this memory is in active competition with another result. |
 | `competition_opponent` | `Option<String>` | no | omitted when empty; Opponent memory ID when competition_conflict is true. |
 
@@ -4274,7 +4274,7 @@ Defined in `src/handlers/recall.rs`. Todo item in proactive context response
 | `project` | `Option<String>` | no |  |
 | `due_date` | `Option<String>` | no |  |
 | `relevance_reason` | `String` | yes |  |
-| `similarity_score` | `Option<f32>` | no | omitted when empty; Semantic similarity score (0.0 - 1.0) |
+| `similarity_score` | `Option<f32>` | no | omitted when empty; score; Semantic similarity score (0.0 - 1.0) |
 
 ### Producer
 
@@ -4523,7 +4523,7 @@ Defined in `src/memory/types.rs`. Query-level metacognition (M3): a returned fee
 |---|---|---|---|
 | `fok` | `f32` | yes | Calibrated feeling-of-knowing for the whole query, 0.0–1.0. |
 | `label` | `String` | yes | Coarse label: "high" \| "medium" \| "low". |
-| `peak_confidence` | `f32` | yes | How sharply the top result dominates: top/(top+second). ~0.5 = ambiguous, approaching 1.0 = a lone strong match. |
+| `peak_confidence` | `f32` | yes | score; How sharply the top result dominates: top/(top+second). ~0.5 = ambiguous, approaching 1.0 = a lone strong match. |
 | `answerability` | `f32` | yes | Squashed top score top/(top+1): a bounded proxy for "is there an answer". |
 | `cross_embedder_agreement` | `Option<f32>` | no | omitted when empty; Cross-embedder (S3) agreement over the top results, when available. |
 | `coverage` | `Option<f32>` | no | omitted when empty; Query-level entity coverage (M4): fraction of the query's focal entities covered by any top result. None when the query has no resolved entities. |
@@ -4598,7 +4598,7 @@ Defined in `src/memory/recall_events.rs`.
 | `query_redactions` | `usize` | yes | Tokens in the query replaced by a credential class label. |
 | `episode_id` | `Option<String>` | no |  |
 | `result_count` | `usize` | yes |  |
-| `best_score` | `Option<f32>` | no |  |
+| `best_score` | `Option<f32>` | no | score |
 | `hits` | Vec&lt;[`RecallHit`](#recallhit)&gt; | yes |  |
 
 ### RecallExperience
@@ -4619,7 +4619,7 @@ Defined in `src/handlers/types.rs`. Semantic fact returned in recall results
 |---|---|---|---|
 | `id` | `String` | yes |  |
 | `fact` | `String` | yes |  |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 | `support_count` | `usize` | yes |  |
 | `related_entities` | `Vec<String>` | yes |  |
 
@@ -4642,7 +4642,7 @@ Defined in `src/handlers/types.rs`. Causal lineage edge returned in recall resul
 | `from` | `String` | yes |  |
 | `to` | `String` | yes |  |
 | `relation` | `String` | yes |  |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 
 ### RecallLogQuery
 
@@ -4678,7 +4678,7 @@ Defined in `src/handlers/types.rs`.
 |---|---|---|---|
 | `id` | `String` | yes |  |
 | `experience` | [`RecallExperience`](#recallexperience) | yes |  |
-| `importance` | `f32` | yes |  |
+| `importance` | `f32` | yes | score |
 | `created_at` | `String` | yes |  |
 | `score` | `f32` | yes |  |
 | `tier` | `String` | yes |  |
@@ -4963,7 +4963,7 @@ Defined in `src/graph_memory.rs`. Relationship edge between entities
 | `ltp_status` | [`LtpStatus`](#ltpstatus) | no | default when absent; Long-Term Potentiation status (PIPE-4: multi-scale LTP) Replaces simple bool with tiered protection levels: - None: Normal decay - Burst: Temporary 2x protection (5+ activations in 24h) - Weekly: Moderate 3x protection (3+/week for 2 weeks) - Full: Maximum 10x protection (10+ activations or 5+ over 30 days) |
 | `tier` | [`EdgeTier`](#edgetier) | no | default when absent; Memory tier for consolidation (L1→L2→L3) Edges start in L1 (working memory) and promote based on Hebbian strength |
 | `activation_timestamps` | `Option<VecDeque<DateTime<Utc>>>` | no | default when absent; Activation timestamp history for temporal pattern detection (PIPE-4) Only populated for L2+ edges (L1 edges die too quickly to need history) Capacity: L2 = 20 timestamps, L3 = 50 timestamps Enables: burst detection, weekly patterns, temporal query relevance |
-| `entity_confidence` | `Option<f32>` | no | default when absent; Entity extraction confidence (PIPE-5: Unified LTP Readiness) Average confidence of the entities connected by this edge. Affects LTP threshold: high confidence → faster LTP (7 activations) Low confidence → slower LTP (13 activations). Based on synaptic tagging: behaviorally relevant synapses consolidate faster. |
+| `entity_confidence` | `Option<f32>` | no | default when absent; score; Entity extraction confidence (PIPE-5: Unified LTP Readiness) Average confidence of the entities connected by this edge. Affects LTP threshold: high confidence → faster LTP (7 activations) Low confidence → slower LTP (13 activations). Based on synaptic tagging: behaviorally relevant synapses consolidate faster. |
 | `created_by` | [`EdgeSource`](#edgesource) | no | default when absent; Creation source for this edge (FIX-06: dream replay tagging) Tracks whether this edge was created from direct co-occurrence, dream replay, Hebbian coactivation, or explicit user input. Enables retrieval to distinguish speculative from empirical associations. |
 | `forward_strength` | `f32` | no | default when absent; Forward activation strength (from_entity triggered, to_entity co-retrieved) Increases when from_entity is the query match and to_entity is co-retrieved, once per strengthening source, as `strength` does. |
 | `backward_strength` | `f32` | no | default when absent; Backward activation strength (to_entity triggered, from_entity co-retrieved) Increases when to_entity is the query match and from_entity is co-retrieved, once per strengthening source, as `strength` does. |
@@ -4999,7 +4999,7 @@ Defined in `src/relevance.rs`. Configuration for relevance triggers
 | `memory_types` | `Vec<String>` | no | default when absent; Memory types to include (empty = all types) |
 | `enable_entity_matching` | `bool` | no | default when absent; Whether to include entity-based matching |
 | `enable_semantic_matching` | `bool` | no | default when absent; Whether to include semantic similarity matching |
-| `min_importance` | `f32` | no | default when absent; Minimum importance score for memories to be surfaced |
+| `min_importance` | `f32` | no | default when absent; score; Minimum importance score for memories to be surfaced |
 | `recency_boost_hours` | `u64` | no | default when absent; Time window for recency boost (memories within this window get boosted) |
 | `recency_boost_multiplier` | `f32` | no | default when absent; Recency boost multiplier (1.0 = no boost) |
 | `graph_boost_multiplier` | `f32` | no | default when absent; Graph connectivity boost multiplier (FBK-7) Applied to memories that have graph relationships with detected entities |
@@ -5054,6 +5054,36 @@ Defined in `src/relevance.rs`. Response from proactive memory surfacing
 | `latency_ms` | `f64` | yes | Processing time in milliseconds |
 | `latency_target_met` | `bool` | yes | Whether latency target (<30ms) was met |
 | `debug` | Option&lt;[`RelevanceDebug`](#relevancedebug)&gt; | no | omitted when empty; Debug info (only in debug builds) |
+
+### RememberRequest (handlers/remember)
+
+Defined in `src/handlers/remember.rs`. Remember request - store a new memory
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `String` | yes |  |
+| `content` | `String` | yes |  |
+| `tags` | `Vec<String>` | no | default when absent |
+| `memory_type` | `Option<String>` | no | default when absent |
+| `external_id` | `Option<String>` | no | default when absent |
+| `created_at` | `Option<chrono::DateTime<chrono::Utc>>` | no | default when absent |
+| `emotional_valence` | `Option<f32>` | no | default when absent |
+| `emotional_arousal` | `Option<f32>` | no | default when absent |
+| `emotion` | `Option<String>` | no | default when absent |
+| `source_type` | `Option<String>` | no | default when absent |
+| `credibility` | `Option<f32>` | no | default when absent |
+| `episode_id` | `Option<String>` | no | default when absent |
+| `sequence_number` | `Option<u32>` | no | default when absent |
+| `preceding_memory_id` | `Option<String>` | no | default when absent |
+| `agent_id` | `Option<String>` | no | default when absent |
+| `parent_agent_id` | `Option<String>` | no | default when absent |
+| `run_id` | `Option<String>` | no | default when absent |
+| `parent_id` | `Option<String>` | no | default when absent; Parent memory ID for hierarchical organization Use this to create memory trees (e.g., "71-research" -> "algebraic" -> "21×27≡-1") |
+| `filename` | `Option<String>` | no | default when absent; Optional filename for format detection (e.g. "notes.md", "data.json"). When provided, the content is run through the ingest text-extraction pipeline before storage. |
+| `intent_tags` | `Vec<String>` | no | default when absent; Semantic intent tags from Claude (FIX-10) Merged into entity tags with "intent:" prefix for importance boost |
+| `writer` | Option&lt;crate::memory::facets::[`DeclaredWriter`](#declaredwriter)&gt; | no | default when absent; WHO IS WRITING THIS, as the caller describes itself — session, model, transcript, workspace. Optional, and recorded verbatim under `session.declared`; nothing here is verified and nothing here grants anything. See [`crate::memory::facets::DeclaredWriter`] for why it has to come from the caller: the server's own session detection describes the server. |
+| `entities` | Vec&lt;[`DeclaredEntityInput`](#declaredentityinput)&gt; | no | default when absent; Typed entities the writer declares this memory is about. See [`crate::declared_entities`]: validated (400 on an unknown label, a weight outside [0, 1], or more than 50), exempt from the derived-entity cut, and stored as authored tags. |
+| `repo` | `Option<String>` | no | default when absent; Repository slug this memory belongs to, e.g. `"Portll/veld"`. Stored as the leading [`crate::memory::facets::Place::Repo`]; a recall with `repo` set returns only memories scoped to it. |
 
 ### RememberResponse (handlers/remember)
 
@@ -5221,9 +5251,9 @@ Defined in `src/memory/types.rs`. Retrieval statistics for SHO-26 associative re
 | `semantic_candidates` | `usize` | yes | Number of memories retrieved via semantic similarity |
 | `graph_candidates` | `usize` | yes | Number of memories retrieved via graph traversal |
 | `graph_density` | `f32` | yes | Graph density (edges per memory) - determines graph weight |
-| `graph_weight` | `f32` | yes | Actual graph weight used (density-dependent: 0.1 to 0.5) |
-| `semantic_weight` | `f32` | yes | Actual semantic weight used (1.0 - graph_weight - linguistic_weight) |
-| `linguistic_weight` | `f32` | yes | Linguistic weight used (fixed at 0.15) |
+| `graph_weight` | `f32` | yes | score; Actual graph weight used (density-dependent: 0.1 to 0.5) |
+| `semantic_weight` | `f32` | yes | score; Actual semantic weight used (1.0 - graph_weight - linguistic_weight) |
+| `linguistic_weight` | `f32` | yes | score; Linguistic weight used (fixed at 0.15) |
 | `graph_hops` | `usize` | yes | Number of graph hops performed in spreading activation |
 | `entities_activated` | `usize` | yes | Number of unique entities activated during graph traversal |
 | `avg_salience_boost` | `f32` | yes | Average salience boost applied to initial activations (0.0 if no entities) Tracks ACT-R inspired salience weighting effectiveness |
@@ -5421,7 +5451,7 @@ Defined in `src/memory/compression.rs`. A semantic fact extracted from episodic 
 |---|---|---|---|
 | `id` | `String` | yes | Unique identifier |
 | `fact` | `String` | yes | The factual statement |
-| `confidence` | `f32` | yes | Confidence in this fact (0.0 - 1.0) |
+| `confidence` | `f32` | yes | score; Confidence in this fact (0.0 - 1.0) |
 | `support_count` | `usize` | yes | How many episodic memories support this fact |
 | `source_memories` | Vec&lt;[`MemoryId`](#memoryid)&gt; | yes | Source memory IDs that contributed to this fact |
 | `related_entities` | `Vec<String>` | yes | Keywords/entities this fact relates to |
@@ -5639,7 +5669,7 @@ Defined in `src/handlers/external_dimensions.rs`. Request body for POST /api/sle
 | `density` | `f32` | yes | Entity density in the relevant region (0.0 = sparse, 1.0 = saturated) |
 | `coherence` | `f32` | yes | Semantic coherence of neighbors (0.0 = unrelated, 1.0 = tight cluster) |
 | `closure` | `f32` | yes | Fraction of potential triangles closed (0.0 = all open, 1.0 = fully closed) |
-| `confidence` | `f32` | yes | Average edge confidence in the region (0.0 = weak, 1.0 = strong) |
+| `confidence` | `f32` | yes | score; Average edge confidence in the region (0.0 = weak, 1.0 = strong) |
 | `isotropy` | `f32` | yes | Directional balance of knowledge (0.0 = anisotropic, 1.0 = isotropic) |
 
 ### SleightDimensionsResponse
@@ -5764,7 +5794,7 @@ Defined in `src/memory/storage.rs`. Storage statistics
 | `total_count` | `usize` | yes |  |
 | `compressed_count` | `usize` | yes |  |
 | `total_size_bytes` | `usize` | yes |  |
-| `average_importance` | `f32` | yes |  |
+| `average_importance` | `f32` | yes | score |
 | `importance_sum` | `f32` | yes |  |
 | `total_retrievals` | `usize` | no | default when absent; Total number of recall/retrieval operations (persisted) |
 
@@ -5784,7 +5814,7 @@ Defined in `src/handlers/recall.rs`. Summary item - simplified memory for contex
 |---|---|---|---|
 | `id` | `String` | yes |  |
 | `content` | `String` | yes |  |
-| `importance` | `f32` | yes |  |
+| `importance` | `f32` | yes | score |
 | `created_at` | `String` | yes |  |
 
 ### SurfacedMemory (relevance)
@@ -5796,11 +5826,11 @@ Defined in `src/relevance.rs`. A surfaced memory with relevance scoring
 | `id` | `String` | yes | Memory ID |
 | `content` | `String` | yes | Memory content |
 | `memory_type` | `String` | yes | Memory type (Decision, Learning, etc.) |
-| `importance` | `f32` | yes | Base importance score |
-| `relevance_score` | `f32` | yes | Relevance score for this context (0.0-1.0) |
+| `importance` | `f32` | yes | score; Base importance score |
+| `relevance_score` | `f32` | yes | score; Relevance score for this context (0.0-1.0) |
 | `relevance_reason` | [`RelevanceReason`](#relevancereason) | yes | Why this memory was surfaced |
 | `matched_entities` | `Vec<String>` | yes | Matched entities (if entity-based) |
-| `semantic_similarity` | `Option<f32>` | no | Semantic similarity score (if semantic-based) |
+| `semantic_similarity` | `Option<f32>` | no | score; Semantic similarity score (if semantic-based) |
 | `created_at` | `DateTime<Utc>` | yes | When the memory was created |
 | `tags` | `Vec<String>` | yes | Tags associated with the memory |
 
@@ -5839,7 +5869,7 @@ Defined in `src/handlers/ui.rs`.
 | `tag` | `String` | yes |  |
 | `class` | [`TagClass`](#tagclass) | yes |  |
 | `memories` | `usize` | yes | Memories carrying the tag (document frequency). |
-| `weight` | `f32` | yes | `memories × ln(N / memories)`: a tag on every memory weighs nothing. |
+| `weight` | `f32` | yes | score; `memories × ln(N / memories)`: a tag on every memory weighs nothing. |
 | `origin` | [`OriginCounts`](#origincounts) | yes |  |
 | `sources` | `BTreeMap<&'static str, usize>` | yes |  |
 | `first_seen` | `DateTime<Utc>` | yes |  |
@@ -5913,7 +5943,7 @@ Defined in `src/handlers/facts.rs`. A single temporal fact in the API response
 | `event_type` | `String` | yes |  |
 | `timestamp` | `String` | yes |  |
 | `source_memory_id` | `String` | yes |  |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 | `source_text` | `String` | yes |  |
 | `valid_from` | `Option<String>` | no | When this fact became true (ISO 8601) |
 | `valid_until` | `Option<String>` | no | When this fact was invalidated (ISO 8601). None means still valid. |
@@ -5929,7 +5959,7 @@ Defined in `src/handlers/temporal_derivation.rs`. A temporal fact projected to t
 | `event` | `String` | yes |  |
 | `resolved_time` | `String` | yes |  |
 | `source_memory_id` | `String` | yes |  |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 | `source_text` | `String` | yes |  |
 
 ### TemporalFactsRequest
@@ -6008,7 +6038,7 @@ Defined in `src/memory/types.rs`. Time pattern for recurring behavior
 | `pattern_type` | `String` | yes |  |
 | `frequency` | `String` | yes |  |
 | `time_range` | `Option<(String, String)>` | no |  |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 
 ### TimePrecision
 
@@ -6522,7 +6552,7 @@ Defined in `src/handlers/gap_analysis.rs`.
 |---|---|---|---|
 | `boundary_entities` | `Vec<String>` | yes |  |
 | `radius` | `f32` | yes |  |
-| `confidence` | `f32` | yes |  |
+| `confidence` | `f32` | yes | score |
 
 ### VoronoiAnalysisRequest
 

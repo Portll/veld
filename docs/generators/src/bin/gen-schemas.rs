@@ -1,8 +1,10 @@
 //! gen-schemas — every HTTP route's request and response types, with their fields, read from
 //! the handler source: `src/handlers/router.rs` names the handlers, each handler's signature
-//! names its `Json`, `Query` and `Path` extractors and its `Json` reply, and the structs and
-//! enums behind those names are walked with their serde attributes, so the page states the
-//! wire shape a client sends and receives rather than a hand-kept copy of it.
+//! names its body extractor (`Json`, `LenientJson`, anything ending in `Json`), its `Query`
+//! and `Path` extractors and its `Json` reply, and the structs and enums behind those names
+//! are walked with their serde attributes, so the page states the wire shape a client sends
+//! and receives rather than a hand-kept copy of it. `Path` tuples are paired with the route's
+//! `{name}` segments, and an `f32` field whose name ends in a score word is noted as a score.
 //!
 //! Emits `docs/src/reference/schemas.md` for people and `schemas.json` for tools and tests.
 //!
@@ -39,7 +41,63 @@ struct Route {
     query: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path_params: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    path_param_names: Vec<String>,
     response: String,
+}
+
+/// The `{name}` segments of a route path, in order.
+fn path_segment_names(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter_map(|seg| {
+            seg.strip_prefix('{')
+                .and_then(|s| s.strip_suffix('}'))
+                .map(|s| s.trim_start_matches('*').to_string())
+        })
+        .collect()
+}
+
+/// `Path<(A, B)>` paired with `{a}` and `{b}` renders as `{a: A, b: B}`; a lone `Path<A>`
+/// pairs with the single segment. Positions without a segment keep the bare type.
+fn render_path_params(rendered: &str, names: &[String]) -> String {
+    let inner = rendered
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(rendered);
+    let types: Vec<&str> = if rendered.starts_with('(') {
+        split_top_level(inner)
+    } else {
+        vec![rendered]
+    };
+    if types.len() != names.len() {
+        return rendered.to_string();
+    }
+    let pairs: Vec<String> = names
+        .iter()
+        .zip(types)
+        .map(|(n, t)| format!("{n}: {}", t.trim()))
+        .collect();
+    format!("{{{}}}", pairs.join(", "))
+}
+
+/// Split `A, B<C, D>, E` on the commas that are not inside angle brackets or parentheses.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
 }
 
 struct RouteCollector {
@@ -464,6 +522,13 @@ fn collect_use(tree: &UseTree, prefix: &mut Vec<String>, scope: &mut FileScope) 
     }
 }
 
+const SCORE_SUFFIXES: &[&str] = &["_score", "similarity", "confidence", "weight", "importance"];
+
+/// An `f32` whose wire name says it is a score rather than a measurement.
+fn is_score_field(wire_name: &str, ty: &str) -> bool {
+    matches!(ty, "f32" | "Option<f32>") && SCORE_SUFFIXES.iter().any(|s| wire_name.ends_with(s))
+}
+
 fn describe_struct(item: &ItemStruct, file: &str) -> TypeDoc {
     let outer = serde_attrs(&item.attrs);
     let doc = doc_of(&item.attrs);
@@ -491,11 +556,15 @@ fn describe_struct(item: &ItemStruct, file: &str) -> TypeDoc {
                 if attrs.flatten {
                     notes.push("flattened into the parent".to_string());
                 }
+                let ty = type_string(&f.ty);
+                if is_score_field(&wire, &ty) {
+                    notes.push("score".to_string());
+                }
                 let mut refs = Vec::new();
                 named_idents(&f.ty, &mut refs);
                 fields.push(FieldDoc {
                     name: wire,
-                    ty: type_string(&f.ty),
+                    ty,
                     required: !optional,
                     notes,
                     doc: doc_of(&f.attrs),
@@ -878,7 +947,7 @@ fn handler_shape(root: &Path, handler: &str) -> Result<Option<HandlerShape>> {
         if let FnArg::Typed(pt) = input {
             if let Some((name, args)) = last_segment(&pt.ty) {
                 match (name.as_str(), args.first()) {
-                    ("Json", Some(t)) => shape.body = Some(t.clone()),
+                    (n, Some(t)) if n.ends_with("Json") => shape.body = Some(t.clone()),
                     ("Query", Some(t)) => shape.query = Some(t.clone()),
                     ("Path", Some(t)) => shape.path = Some(t.clone()),
                     _ => {}
@@ -1257,6 +1326,7 @@ fn main() -> Result<()> {
                 body: None,
                 query: None,
                 path_params: None,
+                path_param_names: Vec::new(),
                 response: "unknown".to_string(),
             });
             continue;
@@ -1264,7 +1334,11 @@ fn main() -> Result<()> {
         let from = shape.file.clone();
         let body = shape.body.as_ref().map(|t| walker.visit_type(t, &from));
         let query = shape.query.as_ref().map(|t| walker.visit_type(t, &from));
-        let path_params = shape.path.as_ref().map(|t| walker.visit_type(t, &from));
+        let path_param_names = path_segment_names(path);
+        let path_params = shape
+            .path
+            .as_ref()
+            .map(|t| render_path_params(&walker.visit_type(t, &from), &path_param_names));
         let response = match (&shape.response, shape.opaque) {
             (Some(t), _) => walker.visit_type(t, &from),
             (None, true) => "opaque".to_string(),
@@ -1277,6 +1351,7 @@ fn main() -> Result<()> {
             body,
             query,
             path_params,
+            path_param_names,
             response,
         });
     }
