@@ -38,6 +38,11 @@
 //! - `tags`    — `Memory::experience::tags`, space-joined,
 //! - `entities` — `Memory::experience::entities`, space-joined.
 //!
+//! A conversation turn with the `turn_context` dial on gets its contextualised
+//! text instead (`memory::index_text`): the date and the entities of the turn
+//! its `preceding_memory_id` names, through the tenant's
+//! [`Bm25DocumentSource`].
+//!
 //! These mirror what the existing
 //! [`crate::memory::HybridSearchEngine::index_memory`] backfill writes, so
 //! a projection-driven rebuild and a backfill-driven rebuild produce the
@@ -93,7 +98,35 @@ use crate::intent_log::{
 };
 
 use super::hybrid_search::BM25Index;
+use super::index_text::TurnIndexText;
 use super::types::{Memory, MemoryId};
+
+/// Supplies the contextualised BM25 text of a stored record (a conversation turn's date
+/// and the entities of the turn it follows, `memory::index_text`). `None` indexes the
+/// record's own content, tags and entities.
+pub trait Bm25DocumentSource: Send + Sync {
+    fn turn_text(&self, memory: &Memory) -> Option<TurnIndexText>;
+}
+
+/// A tenant's [`Bm25DocumentSource`], bound once its memory system opens.
+///
+/// The writer (and with it this projection) and the memory system open on separate
+/// paths, so the projection holds the slot rather than the source. Every live write
+/// goes through an open memory system, which binds the slot before the store↔log
+/// reconcile opens the writer, so live applies and the replay at writer open both see
+/// the bound source.
+#[derive(Default)]
+pub struct Bm25DocumentSlot(parking_lot::RwLock<Option<Arc<dyn Bm25DocumentSource>>>);
+
+impl Bm25DocumentSlot {
+    pub fn bind(&self, source: Arc<dyn Bm25DocumentSource>) {
+        *self.0.write() = Some(source);
+    }
+
+    fn turn_text(&self, memory: &Memory) -> Option<TurnIndexText> {
+        self.0.read().as_ref()?.turn_text(memory)
+    }
+}
 
 /// Errors raised by [`Bm25Projection`]. Distinct from `anyhow::Error`
 /// because [`Projection::Error`] requires `std::error::Error` and
@@ -165,6 +198,8 @@ pub struct Bm25Projection {
     applies_since_commit: u64,
     /// Live-path time trigger; [`COMMIT_INTERVAL`] unless overridden.
     commit_interval: Duration,
+    /// Where a record's contextualised text comes from; empty indexes every record bare.
+    documents: Arc<Bm25DocumentSlot>,
 }
 
 impl Bm25Projection {
@@ -179,6 +214,7 @@ impl Bm25Projection {
             checkpoint,
             applies_since_commit: 0,
             commit_interval: COMMIT_INTERVAL,
+            documents: Arc::default(),
         }
     }
 
@@ -195,12 +231,19 @@ impl Bm25Projection {
             checkpoint: None,
             applies_since_commit: 0,
             commit_interval: COMMIT_INTERVAL,
+            documents: Arc::default(),
         }
     }
 
     /// Replace the live-path time trigger (default [`COMMIT_INTERVAL`]).
     pub fn with_commit_interval(mut self, interval: Duration) -> Self {
         self.commit_interval = interval;
+        self
+    }
+
+    /// Read contextualised record text from `slot` (default: every record bare).
+    pub fn with_document_slot(mut self, slot: Arc<Bm25DocumentSlot>) -> Self {
+        self.documents = slot;
         self
     }
 
@@ -239,11 +282,16 @@ impl Bm25Projection {
                         .delete(&mid)
                         .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
                 } else {
-                    let content = memory.experience.content.as_str();
-                    let tags = memory.experience.tags.as_slice();
-                    let entities = memory.experience.entities.as_slice();
+                    let turn = self.documents.turn_text(&memory);
+                    let (content, entities) = match &turn {
+                        Some(turn) => (turn.bm25_content.as_str(), turn.bm25_entities.as_slice()),
+                        None => (
+                            memory.experience.content.as_str(),
+                            memory.experience.entities.as_slice(),
+                        ),
+                    };
                     self.index
-                        .upsert(&mid, content, tags, entities)
+                        .upsert(&mid, content, memory.experience.tags.as_slice(), entities)
                         .map_err(|e| Bm25ProjectionError::Bm25(e.to_string()))?;
                 }
             }
@@ -456,6 +504,62 @@ mod tests {
             memory_bincode: bytes,
             schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
         }
+    }
+
+    struct FixedTurnText(MemoryId, TurnIndexText);
+
+    impl Bm25DocumentSource for FixedTurnText {
+        fn turn_text(&self, memory: &Memory) -> Option<TurnIndexText> {
+            (memory.id == self.0).then(|| self.1.clone())
+        }
+    }
+
+    /// A journaled turn reaches the index with the text its tenant's source derives: an
+    /// empty slot indexes the bare content, a bound one the date and the prior turn's
+    /// entities, and replaying the same frame re-derives the same document.
+    #[test]
+    fn a_bound_document_source_supplies_the_indexed_text() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("document_source");
+        let (index, _ckpt, proj) = open_projection(&bm25_path, &checkpoint_path);
+        let slot = Arc::new(Bm25DocumentSlot::default());
+        let mut proj = proj.with_document_slot(slot.clone());
+
+        let reply = mk_memory(
+            Uuid::new_v4(),
+            "Nate: I've had them for 3 years now!",
+            &[],
+            &[],
+        );
+        TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&reply)).unwrap();
+        Projection::persist_checkpoint(&mut proj).unwrap();
+        assert!(
+            index.search("turtles", 10).unwrap().is_empty(),
+            "an empty slot indexes the bare content"
+        );
+
+        slot.bind(Arc::new(FixedTurnText(
+            reply.id.clone(),
+            TurnIndexText {
+                embedding: String::new(),
+                bm25_content: "[2023-05-20] 20 May 2023 Nate: I've had them for 3 years now!"
+                    .to_string(),
+                bm25_entities: vec!["turtles".to_string()],
+            },
+        )));
+        for lsn in [1, 2] {
+            TypedProjection::apply(&mut proj, Lsn(lsn), &remember_payload(&reply)).unwrap();
+        }
+        Projection::persist_checkpoint(&mut proj).unwrap();
+        let ids = |query: &str| -> Vec<MemoryId> {
+            index
+                .search(query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids("turtles"), vec![reply.id.clone()]);
+        assert_eq!(ids("May 2023"), vec![reply.id]);
     }
 
     /// Round-trip: three memories remembered through `TypedProjection::apply`

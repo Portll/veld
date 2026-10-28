@@ -370,6 +370,7 @@ pub fn generate_bridge_fixtures(
                     format!("the {detail} review"),
                 ],
                 created_at: next_ts(),
+                episode: None,
             });
         }
 
@@ -384,6 +385,7 @@ pub fn generate_bridge_fixtures(
             memory_type: "fact".to_string(),
             tags: vec![b_hub.clone(), b_target.clone()],
             created_at: next_ts(),
+            episode: None,
         });
         for m in 1..cluster_size {
             let detail = cycle(DETAIL_WORDS, u * cluster_size + m + units * cluster_size);
@@ -396,6 +398,7 @@ pub fn generate_bridge_fixtures(
                 memory_type: "fact".to_string(),
                 tags: vec![b_hub.clone(), format!("the {detail} schedule")],
                 created_at: next_ts(),
+                episode: None,
             });
         }
 
@@ -411,6 +414,7 @@ pub fn generate_bridge_fixtures(
                 memory_type: "fact".to_string(),
                 tags: vec![a_anchor.clone(), b_target.clone()],
                 created_at: next_ts(),
+                episode: None,
             });
             bridge_ids.push(id.clone());
             this_case_bridges.push(id);

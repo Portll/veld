@@ -52,6 +52,10 @@ enum Suite {
     /// conversation's 629-turn corpus. The per-PR recall-regression gate that
     /// replaced the synthetic smoke suite. Fast (~1-2 min), real data.
     LocomoGate,
+    /// Agent sessions shaped the way the Claude Code hook writes them: tasks, errors, fixes
+    /// and decisions threaded by episode, among unthreaded project notes. Measures recall
+    /// off dialogue, where adjacency is an episode chain. Not gated.
+    AgentEpisodes,
 }
 
 impl Suite {
@@ -61,6 +65,7 @@ impl Suite {
             Suite::Locomo => "locomo",
             Suite::LocomoHoldout => "locomo-holdout",
             Suite::LocomoGate => "locomo-gate",
+            Suite::AgentEpisodes => "agent-episodes",
         }
     }
 
@@ -81,6 +86,10 @@ impl Suite {
             Suite::LocomoGate => Some((
                 fx::manifest_path(fx::LOCOMO_GATE_CORPUS_PATH),
                 fx::manifest_path(fx::LOCOMO_GATE_CASES_PATH),
+            )),
+            Suite::AgentEpisodes => Some((
+                fx::manifest_path(fx::AGENT_EPISODES_CORPUS_PATH),
+                fx::manifest_path(fx::AGENT_EPISODES_CASES_PATH),
             )),
         }
     }

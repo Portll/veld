@@ -21,6 +21,47 @@ changes nothing — every retrieval dial is `None` so the engine uses its
 learned-weight default; every plasticity dial is `false`/zero so
 reconsolidation behaves exactly as it did pre-dials.
 
+### Ingest dial: `turn_context`
+
+One retrieval dial acts at write time rather than on the recall path.
+`turn_context: Option<bool>` controls whether a linked memory (a `Conversation`
+turn, or any memory its writer threaded into an episode with an `episode_id` or
+a `preceding_memory_id`) is indexed with its date and the memory it follows (`src/memory/index_text.rs`,
+[ADR 0009](../decisions/0009-index-text-derived-not-stored.md)). `None`
+keeps the engine default, which is **on**; `Some(false)` indexes the bare
+content. Env seed: `VELD_DIALS_TURN_CONTEXT=0|1`. Flipping it changes what
+the embedder is fed for turns written afterwards; records already written
+keep their embedding until re-indexed. Prior-turn resolution is counted in
+`veld_turn_context_total{source="preceding_id"|"conversation_key"|"none"}`.
+
+### Recall dials: neighbour expansion
+
+An anaphoric reply ("Nate: I've had them for 3 years now!") shares no word
+with the question about it ("How long has Nate had his turtles?"), but the
+turn it answers usually does. Neighbour expansion (recall Layer 4.97, after
+fusion and before the pre-rerank cut) brings the turn that followed a
+well-ranked linked memory into the pool just below it, and the
+cross-encoder judges it on its own text. A linked memory is a conversation
+turn or an episode-threaded memory, so an agent session's fix follows the
+error it fixed the way a reply follows its question.
+
+| Dial | Env | Default | What it switches |
+|---|---|---|---|
+| `neighbour_expansion` | `VELD_DIALS_NEIGHBOUR_EXPANSION=0\|1` | `None` (on) | For each of the top `neighbour_expansion_top` fused candidates that is a live linked memory, the memories recorded as following it (at most two) join the pool at the parent's fused score × `NEIGHBOUR_EXPANSION_SCORE_DECAY` (0.95, `src/constants.rs`). A neighbour already in the pool below that score is lifted to it. A neighbour always scores below its parent, so the top fused candidate does not change. `Some(false)` leaves the pool as fusion built it. |
+| `neighbour_expansion_top` | `VELD_DIALS_NEIGHBOUR_EXPANSION_TOP=<n>` | `None` (10) | How many top fused candidates are read as parents. Sanitised to `1..=50` (50 is the widest pre-rerank pool, a decomposed query's). |
+| `neighbour_expansion_predecessor` | `VELD_DIALS_NEIGHBOUR_EXPANSION_PREDECESSOR=0\|1` | `None` (off) | Also brings in the turn each ranked turn follows (its `preceding_memory_id`), at the same score. Has no effect while `neighbour_expansion` is off. |
+
+The successors come from a per-user index written by `remember`
+(`src/memory/turn_successors.rs`, one KV row per prior → successor pair,
+the same on RocksDB and redb), so a turn ranked after a restart still finds
+its reply. A row is written only when `remember` resolves the prior turn,
+which `turn_context` governs: turns written while `turn_context` is off have
+no successor rows. A successor forgotten since its row was written is
+skipped. The leg runs in the `Full` layer mode only, so the layer-attribution
+rungs below it are unchanged. Turns placed are counted in
+`veld_recall_neighbour_candidates_total{direction="successor"|"predecessor"}`,
+and the gold funnel records the leg's own list as the `neighbour` stage.
+
 ### Candidate-generation switches
 
 | Dial | Env | Default | What it switches |
@@ -30,6 +71,24 @@ reconsolidation behaves exactly as it did pre-dials.
 The recall gate records the overrides a run was measured under
 (`retrieval_dials` in `tests/recall/locomo-gate-baseline.json`) and refuses to
 diff two runs that overrode them differently.
+
+### Signal switches
+
+`disabled_signals` (`VELD_DIALS_DISABLE_SIGNALS=id,id`) switches named recall
+signals off; every signal runs by default. `turn_context` and
+`neighbour_expansion` honour it too, so one build runs an arm with them off.
+
+`enabled_signals` (`VELD_DIALS_ENABLE_SIGNALS=id,id`) switches on opt-in
+signals: ranking changes kept measurable on one build that did not earn a
+default. Each was measured on `locomo-holdout` (1,166 cases) on 2026-10-21 at
+pool 100 / count 50 / blend 0.4, by switching it off from the set of all four:
+
+| Opt-in signal | What it changes | Off from the full set |
+|---|---|---|
+| `rerank_context` | The cross-encoder reads a linked memory with its date and the memory it follows. | recall@10 −0.030 [−0.042, −0.018], MRR −0.019: it pays, but every reranked passage of a linked memory gets longer, so it waits for the rerank-depth decision and a paired latency measurement. |
+| `entity_overlap_relative` | Layer 4.525 weighs a matched query word by its rarity in the candidate pool and scales the score instead of adding a flat 0.10. | recall@100 +0.031 [+0.017, +0.046], multi_hop recall@10 +0.032: it hurts. |
+| `topic_dedup_topical` | Layer 4.54 ignores entities that a quarter of the candidates carry and demotes a memory once. | 0 cases moved. |
+| `competition_demote` | A competition's loser is kept, ×0.85, instead of deleted. | 1 case moved. |
 
 ## Lifecycle
 

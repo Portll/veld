@@ -62,6 +62,7 @@ pub fn generate_lineage_fixtures(chains: usize) -> (Vec<CorpusItem>, Vec<SmokeCa
             memory_type: "fact".to_string(),
             tags: vec![a.clone(), b.clone()],
             created_at: base + chrono::Duration::minutes(2 * i as i64),
+            episode: None,
         });
         // mid: b → c. Mentions c, so it is the tempting DIRECT-cause distractor the
         // root-cause query must traverse PAST (it is the gold for the control only).
@@ -71,6 +72,7 @@ pub fn generate_lineage_fixtures(chains: usize) -> (Vec<CorpusItem>, Vec<SmokeCa
             memory_type: "fact".to_string(),
             tags: vec![b.clone(), c.clone()],
             created_at: base + chrono::Duration::minutes(2 * i as i64 + 1),
+            episode: None,
         });
 
         // Root-cause case: gold = root (a→b), which never mentions c and shares no
@@ -175,6 +177,7 @@ pub fn generate_lineage_fixtures_hard(chains: usize) -> (Vec<CorpusItem>, Vec<Sm
             memory_type: "fact".to_string(),
             tags: vec![a.clone(), b.clone()],
             created_at: base + chrono::Duration::minutes(4 * i as i64),
+            episode: None,
         });
         corpus.push(CorpusItem {
             id: m2.clone(),
@@ -182,6 +185,7 @@ pub fn generate_lineage_fixtures_hard(chains: usize) -> (Vec<CorpusItem>, Vec<Sm
             memory_type: "fact".to_string(),
             tags: vec![b.clone(), c.clone()],
             created_at: base + chrono::Duration::minutes(4 * i as i64 + 1),
+            episode: None,
         });
         corpus.push(CorpusItem {
             id: m3.clone(),
@@ -189,6 +193,7 @@ pub fn generate_lineage_fixtures_hard(chains: usize) -> (Vec<CorpusItem>, Vec<Sm
             memory_type: "fact".to_string(),
             tags: vec![c.clone(), d.clone()],
             created_at: base + chrono::Duration::minutes(4 * i as i64 + 2),
+            episode: None,
         });
         // Distractor: mentions the effect d but carries NO causal link back.
         corpus.push(CorpusItem {
@@ -197,6 +202,7 @@ pub fn generate_lineage_fixtures_hard(chains: usize) -> (Vec<CorpusItem>, Vec<Sm
             memory_type: "fact".to_string(),
             tags: vec![d.clone()],
             created_at: base + chrono::Duration::minutes(4 * i as i64 + 3),
+            episode: None,
         });
 
         // Root-cause case: gold = m1 (a→b), THREE causal hops back (d←c←b←a). Reachable
