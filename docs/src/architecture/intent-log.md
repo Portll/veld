@@ -66,8 +66,34 @@ puts back the archive's segments and removes the live ones sealed after the
 backup. A point-in-time restore into a sealed segment copies it before cutting
 it, so the archive's link keeps every frame.
 
-A log that has rotated needs a build that reads segments. Nothing removes old
-segments yet: the log's total size still grows with every write.
+A log that has rotated needs a build that reads segments. Segments are kept:
+the log's total size grows with every write.
+
+## Erasing forgotten memories
+
+A hard forget journals a `Forget` frame, and every earlier frame of that memory
+stays in the log. With `VELD_JOURNAL_FORGET_PURGE_DAYS` (config.toml
+`journal_forget_purge_days`; 0, the default, never erases), the heavy maintenance
+cycle (every six hours, for each tenant the server has open) rewrites each sealed segment last written at least that many days ago
+without the frames of the memories forgotten in them, the `Forget` included.
+Replay from the first frame still reaches the same live state, and the memory's
+content leaves the live journal. A memory created again under the same id keeps
+its later frames. The head is never rewritten.
+
+A rewritten segment carries a `sparse` header flag, because its LSNs now skip
+numbers, and keeps the old file's modification time. It replaces the old file
+by rename, so a backup's hard link keeps the frames it captured until that
+backup is purged. A legacy segment without a header is left as it is, and so
+is a sealed journal whose key the server does not hold. A point-in-time
+restore to an erased LSN cuts after the last frame below it.
+
+Replication followers are protected for as long as the window. The leader
+keeps, per tenant and by hour, the lowest cursor a follower asked its feed to
+read past (`<data>/replication/feed-floors.json`, recorded only while erasure
+is on), and erases a `Forget` only once that floor is at or past it. A follower
+that does not poll for longer than the window is no longer counted: if it had
+applied a memory but not its `Forget`, it keeps the memory. The server warns at
+startup when erasure is on and it can feed followers.
 
 ## Payload shape
 
