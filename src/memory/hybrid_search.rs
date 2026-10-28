@@ -1763,7 +1763,7 @@ impl HybridSearchEngine {
                 bm25_weight,
                 vector_weight,
                 keyword_discriminativeness,
-                &query[..query.len().min(50)]
+                &query[..query.floor_char_boundary(50)]
             );
         }
 

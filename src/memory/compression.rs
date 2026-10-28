@@ -1577,7 +1577,8 @@ impl SemanticConsolidator {
                 if *marker == "like" && SIMILE_PREFIXES.iter().any(|p| lower[..pos].ends_with(p)) {
                     continue;
                 }
-                let lookback_start = pos.saturating_sub(30);
+                // 30 bytes back can land inside a multi-byte char; slicing there panics.
+                let lookback_start = lower.floor_char_boundary(pos.saturating_sub(30));
                 let before_marker = &lower[lookback_start..pos];
                 if FIRST_PERSON.iter().any(|s| before_marker.contains(s)) {
                     if let Some(sentence) = Self::extract_sentence(content, pos) {
@@ -2717,6 +2718,42 @@ mod tests {
         assert!(consolidator
             .extract_procedure("Step 1: run cargo fmt before every commit to the repository.")
             .is_some());
+    }
+
+    #[test]
+    fn a_preference_after_multi_byte_text_is_read_without_slicing_inside_a_char() {
+        // Twenty 3-byte box-drawing chars put "prefer" at byte 64, so a 30-byte lookback
+        // starts at byte 34, inside the twelfth char: the input that panicked live workers.
+        let content = format!("{} we prefer dark mode in every editor.", "━".repeat(20));
+        let pos = content.find("prefer").unwrap();
+        assert!(!content.is_char_boundary(pos - 30));
+
+        let preference = SemanticConsolidator::new().extract_preference(&content);
+
+        assert!(preference.is_some_and(|p| p.contains("prefer dark mode")));
+    }
+
+    #[test]
+    fn every_extractor_survives_multi_byte_text_around_its_markers() {
+        let consolidator = SemanticConsolidator::new();
+        let filler = "━─│é漢🦀".repeat(12);
+        for marker in [
+            "prefer", "like", "want", "should", "always", "never", " is ", " means ", "step 1",
+            "first", "error", "panic", "timeout",
+        ] {
+            for content in [
+                format!("{filler}{marker}{filler}."),
+                format!("{filler} we {marker} {filler}"),
+                format!("{marker}{filler}"),
+                format!("{filler}{marker}"),
+            ] {
+                consolidator.extract_preference(&content);
+                consolidator.extract_definition(&content);
+                consolidator.extract_procedure(&content);
+                consolidator.extract_pattern(&content);
+                consolidator.extract_salient_statement(&content, &["漢".to_string()]);
+            }
+        }
     }
 
     #[test]

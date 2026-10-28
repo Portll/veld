@@ -2832,7 +2832,7 @@ impl MemoryTreeNode {
         // Truncate content for display
         let content = &self.memory.experience.content;
         let display_content = if content.len() > 60 {
-            format!("{}...", &content[..57])
+            format!("{}...", &content[..content.floor_char_boundary(57)])
         } else {
             content.clone()
         };
@@ -5919,6 +5919,18 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn a_tree_line_shortens_multi_byte_content_on_a_char_boundary() {
+        let mut memory = memory_at(0.5);
+        // One byte then three-byte chars: byte 57 falls inside the 19th, so the cut floors to 55.
+        memory.experience.content = format!("x{}", "━".repeat(30));
+        assert!(!memory.experience.content.is_char_boundary(57));
+
+        let tree = super::MemoryTreeNode::new(memory, 0).format_tree();
+
+        assert!(tree.contains(&format!("x{}...", "━".repeat(18))), "{tree}");
     }
 
     #[test]
