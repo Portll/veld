@@ -238,6 +238,27 @@ pub const EDGE_SEMANTIC_WEIGHT_FLOOR: f32 = 0.2;
 pub const SPREADING_DEGREE_NORMALIZATION: bool = true;
 
 // =============================================================================
+// GRAPH ADMISSION: WHICH SPANS AND TAGS BECOME NODES, WHICH EDGES ARE BORN
+// Ported from upstream shodh-memory. Each switch is read on every graph write, so a
+// harness arm can set it after the process has started. The gates act at birth: an
+// existing store keeps the nodes and edges it already has.
+// =============================================================================
+
+/// Lowest confidence at which the rule-based fallback NER commits a span.
+///
+/// Upstream shodh-memory drops fallback spans under 0.5 (its `NerConfig` default). The
+/// fallback reads `EntityExtractor` salience as confidence (`0.9 × salience`, at most 0.85):
+/// typed PER/ORG/LOC spans land at 0.63–0.81 and pass; a content word lands at 0.45 (noun),
+/// 0.36 (verb) or 0.32 (adjective) and passes only when YAKE rates it discriminative; an
+/// unlisted multi-word capitalised run is typed Concept at 0.43 and is dropped. veld's
+/// neural floor (`VELD_NER_CONFIDENCE`, 0.7) is set on BERT-tiny's softmax, a different
+/// quantity, so the fallback has its own. [`NER_FALLBACK_CONFIDENCE_ENV`] overrides it.
+pub const NER_FALLBACK_CONFIDENCE_FLOOR: f32 = 0.5;
+
+/// Env var overriding [`NER_FALLBACK_CONFIDENCE_FLOOR`].
+pub const NER_FALLBACK_CONFIDENCE_ENV: &str = "VELD_NER_FALLBACK_CONFIDENCE";
+
+// =============================================================================
 // COMPRESSION THRESHOLDS
 // Based on information theory and cognitive psychology research on memory decay
 // =============================================================================

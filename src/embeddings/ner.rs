@@ -239,9 +239,21 @@ pub struct NeuralNer {
     use_fallback: bool,
     /// Lazy-loaded EntityExtractor for comprehensive rule-based fallback
     entity_extractor: OnceLock<crate::graph_memory::EntityExtractor>,
+    /// Minimum confidence of a fallback span; see
+    /// [`crate::constants::NER_FALLBACK_CONFIDENCE_FLOOR`].
+    fallback_confidence_floor: f32,
     /// LRU cache for extracted entities (keyed by text hash)
     /// Avoids re-processing identical texts
     entity_cache: moka::sync::Cache<u64, Vec<NerEntity>>,
+}
+
+/// The fallback NER's commit floor: [`crate::constants::NER_FALLBACK_CONFIDENCE_ENV`] when it
+/// parses, else [`crate::constants::NER_FALLBACK_CONFIDENCE_FLOOR`].
+fn fallback_confidence_floor_from_env() -> f32 {
+    std::env::var(crate::constants::NER_FALLBACK_CONFIDENCE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(crate::constants::NER_FALLBACK_CONFIDENCE_FLOOR)
 }
 
 impl NeuralNer {
@@ -264,6 +276,7 @@ impl NeuralNer {
                 lazy_model: OnceLock::new(),
                 use_fallback: true,
                 entity_extractor: OnceLock::new(),
+                fallback_confidence_floor: fallback_confidence_floor_from_env(),
                 entity_cache: cache,
             });
         }
@@ -277,6 +290,7 @@ impl NeuralNer {
             lazy_model: OnceLock::new(),
             use_fallback: false,
             entity_extractor: OnceLock::new(),
+            fallback_confidence_floor: fallback_confidence_floor_from_env(),
             entity_cache: cache,
         })
     }
@@ -288,6 +302,7 @@ impl NeuralNer {
             lazy_model: OnceLock::new(),
             use_fallback: true,
             entity_extractor: OnceLock::new(),
+            fallback_confidence_floor: fallback_confidence_floor_from_env(),
             entity_cache: moka::sync::Cache::builder()
                 .max_capacity(NER_CACHE_SIZE)
                 .time_to_live(std::time::Duration::from_secs(3600))
@@ -985,6 +1000,7 @@ impl NeuralNer {
                     end,
                 }
             })
+            .filter(|e| e.confidence >= self.fallback_confidence_floor)
             .collect();
 
         // The neural and batch paths both dedup (see the two other call sites);
@@ -1387,6 +1403,50 @@ mod tests {
                 entity.confidence
             );
         }
+    }
+
+    /// The floor drops every fallback span under it, and at its default keeps every typed
+    /// span: those score 0.63-0.81, while an unboosted content word scores 0.32-0.45. YAKE
+    /// lifts most words of a short sentence well above the default, so the cut that proves the
+    /// filter is taken from the sentence's own spread.
+    #[test]
+    fn fallback_spans_under_the_floor_are_dropped_and_typed_spans_kept() {
+        let config = || NerConfig {
+            model_path: PathBuf::from("nonexistent.onnx"),
+            tokenizer_path: PathBuf::from("nonexistent.json"),
+            max_length: 128,
+            confidence_threshold: 0.7,
+        };
+        let with_floor = |floor: f32| {
+            let mut ner = NeuralNer::new_fallback(config());
+            ner.fallback_confidence_floor = floor;
+            ner
+        };
+        let text = "Caroline met Melanie in Boston after the support group and they \
+                    talked about painting, adoption, camping and her new pottery class.";
+        let all = with_floor(0.0).extract(text).unwrap();
+        let (lowest, highest) = all.iter().fold((f32::MAX, f32::MIN), |(lo, hi), e| {
+            (lo.min(e.confidence), hi.max(e.confidence))
+        });
+        assert!(lowest < highest, "{all:?}");
+
+        let cut = (lowest + highest) / 2.0;
+        let kept = with_floor(cut).extract(text).unwrap();
+        assert!(kept.len() < all.len(), "{kept:?}");
+        assert!(kept.iter().all(|e| e.confidence >= cut), "{kept:?}");
+
+        let typed = |spans: &[NerEntity]| -> Vec<String> {
+            spans
+                .iter()
+                .filter(|e| !matches!(e.entity_type, NerEntityType::Misc))
+                .map(|e| e.text.clone())
+                .collect()
+        };
+        let default_kept = with_floor(crate::constants::NER_FALLBACK_CONFIDENCE_FLOOR)
+            .extract(text)
+            .unwrap();
+        assert!(!typed(&all).is_empty(), "{all:?}");
+        assert_eq!(typed(&all), typed(&default_kept));
     }
 
     // ==================== NerEntity Tests ====================
