@@ -30,6 +30,7 @@
 # Reference
 
 - [HTTP API](reference/http-api.md)
+- [HTTP API schemas](reference/schemas.md)
 - [MCP tools](reference/mcp-tools.md)
 - [Configuration](reference/config.md)
 - [CLI](reference/cli.md)
@@ -44,6 +45,7 @@
 - [VS Code Copilot](guides/vscode-copilot.md)
 - [Cursor integration](guides/cursor-integration.md)
 - [Deploying](guides/deploying.md)
+- [Network access](guides/network-access.md)
 - [Relational backends](guides/relational-backends.md)
 - [Tuning retrieval](guides/tuning-retrieval.md)
 - [Multi-tenant](guides/multi-tenant.md)

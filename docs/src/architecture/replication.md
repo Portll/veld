@@ -20,9 +20,9 @@ reach.
 
 | Route | Role | Purpose |
 |---|---|---|
-| `GET status` | both | `users: [{user_id, log_bytes}]` this instance can feed; `following` when it tails a leader |
+| `GET status` | both | `instance_id`, this process's id, new at every start; `users: [{user_id, log_bytes}]` this instance can feed; `following` when it tails a leader |
 | `GET records?user_id&after_lsn&limit` | leader | Frames after `after_lsn`, decrypted, base64, with `head_lsn`, `more` and `log_created`. 404 for a tenant with no log; it never creates one |
-| `POST follow {source, admin_key, api_key?}` | follower | Start tailing; refused when the source is this instance (any loopback name with this port) or already follows it |
+| `POST follow {source, admin_key, api_key?}` | follower | Start tailing; refused when the source is this instance (any loopback name with this port, or a source whose status reports this process's `instance_id`) or already follows it. A leader whose status carries no `instance_id` (an older build) is followed |
 | `POST unfollow` | follower | Stop; a poll in progress stops at its next page; the cursor is kept |
 
 At boot: `VELD_REPLICATE_FROM`, `VELD_REPLICATE_ADMIN_KEY`, `VELD_REPLICATE_API_KEY`,
@@ -36,6 +36,13 @@ private link. URLs carrying credentials are refused. When no API key is given, t
 follower offers its own key only to a leader on this host; a remote leader must be given
 its key. A leader's error body is echoed back in at most 300 characters, and a reply over
 256 MB is refused.
+
+`VELD_CA_CERT` adds a PEM bundle of trust roots to the built-in ones, for a leader whose
+certificate a private CA signed. `VELD_REPLICATE_CLIENT_CERT` and
+`VELD_REPLICATE_CLIENT_KEY`, set together, present a client certificate to a leader that
+requires one. The client is built when a follow starts, so a missing, unreadable or
+unparseable file fails the follow with the variable and the path named. See
+[Network access](../guides/network-access.md).
 
 ## Follower loop
 

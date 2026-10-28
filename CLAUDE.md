@@ -10,7 +10,7 @@
 
 - Production-grade code only. **No** TODOs, placeholders, mocks, or stubs in committed code.
 - Take a bird's-eye view before changing anything: understand architecture, data flow, and the affected scoring/retrieval layers before fixing.
-- **Do not** run `cargo build` or trunk-serve. The user keeps these running in the background. You may run `cargo check` and `cargo clippy` (compiler frontend only, no binary output).
+- **Do not** run `cargo build` or trunk-serve. The user keeps these running in the background. Tests run locally under the tiers in **Build & Test Discipline** below.
 - On **macOS**, prefer `./scripts/cargo-dev.sh ...` so Cargo inherits the local `libclang` workaround needed by the current RocksDB build path. (See `scripts/setup-libclang-env.sh`.)
 - **No git-commit signatures** — no "Generated with Claude Code", no "Co-Authored-By" lines. Clean commit messages only.
 - Maintain the per-user lock pattern (see [src/handlers/consolidation.rs](src/handlers/consolidation.rs) `CONSOLIDATION_LOCKS`) for any new write path that mutates shared per-user state.
@@ -213,8 +213,17 @@ Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (be
 
 ## Build & Test Discipline
 
-- **Don't** run `cargo build`, `trunk serve`, `cargo run`, or any binary-producing command. The user runs these.
-- **You may** run `cargo check`, `cargo check --all-features`, `cargo clippy`, `cargo clippy --all-features`, and `cargo test --no-run` (compile-only test build).
+- **Don't** run `cargo build`, `trunk serve`, `cargo run`, release builds, executed benches, or anything that binds :3030 or :3031. The user runs these, and the live servers on this machine serve every session.
+- **Tests run in three tiers** (operator-approved 2026-10-22):
+
+  | Tier | What | When |
+  |---|---|---|
+  | 0 | `cargo check`, `cargo clippy`, `cargo fmt --check`, `cargo test --no-run`, `cargo bench --no-run` | any time |
+  | 1 | `scripts/test-local.sh <selectors>`: the unit tests of the modules a change touches, plus `--test handler_tests` | before every commit |
+  | 2 | `scripts/ci-local.sh`: CI's version and ledger checks, then `scripts/test-local.sh --full`: fmt, clippy (default, redb-only, zenoh), and on default, redb-only and rocksdb-only `cargo nextest run --profile ci`, the doctests and a bench build | push gate only; one at a time per machine |
+
+  Run tests through [scripts/test-local.sh](scripts/test-local.sh), not bare `cargo test`. It runs them niced with `RUST_TEST_THREADS=4` and a private target dir. It gives them a throwaway `HOME`, sharing only the model cache, and strips every inherited `VELD_*`/`SHODH_*` variable, so a test that forgets its own storage path cannot reach a live tenant. Tier 2 holds a machine-wide lock: full matrices run side by side pushed the load to 37 on 2026-10-21 and made tests flake. Tier 2 skips only the tests listed in [scripts/test-local.known-red](scripts/test-local.known-red), each with an owner and a task.
+- **Push gate**: a push to `main`, a `v*` tag or a branch with an open PR, and `gh pr create`, need a green tier 2 for the pushed tree. spine's `bin/ci-verdict.mjs --repo <worktree> --rev <sha>` runs `scripts/ci-local.sh` on a clean checkout of that commit and records the verdict in `.claude/store/ci-verdicts.jsonl`; the `spine-push-gate.mjs` hook refuses the push without a green one. The override, `CI_LOCAL_SKIP='<reason>' git push …`, is recorded in `.claude/store/push-gate.jsonl` and is the visible exception, not a habit. GitHub CI stays the authority for what is on origin.
 - **On macOS**, prefix Cargo calls with `./scripts/cargo-dev.sh` so libclang/RocksDB build path picks up the env shim.
 - **Local install builds** use `cargo build --profile local --bin veld` in a private `CARGO_TARGET_DIR` (no LTO, incremental codegen); `--release` (fat LTO, one unit) is for tagged releases. The Python cdylib is the `veld-py` crate, built only by maturin; `build.rs` reruns only when git HEAD moves, so a no-change rebuild is a no-op.
 - **Per-user locking**: any new write handler that mutates shared per-user state should follow the `CONSOLIDATION_LOCKS` pattern in [src/handlers/consolidation.rs](src/handlers/consolidation.rs):

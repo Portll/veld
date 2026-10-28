@@ -21,6 +21,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+mod http;
 mod logo;
 mod stream;
 mod tabs;
@@ -55,6 +56,7 @@ fn generate_title(state: &AppState) -> String {
         ViewMode::Git => "Git",
         ViewMode::Dials => "Dials",
         ViewMode::Loops => "Loops",
+        ViewMode::Spine => "Spine",
     };
 
     format!("🌾 Veld - {}", view_name)
@@ -214,7 +216,7 @@ fn extract_error_message(body: &str) -> String {
 }
 
 async fn fetch_users(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/users", base_url);
     match client.get(&url).header("X-API-Key", api_key).send().await {
         Ok(resp) => {
@@ -1199,6 +1201,10 @@ fn api_key_from_env() -> String {
 /// Status line mode: reads JSON from stdin, posts to backend, outputs formatted status
 /// This is called by Claude Code's statusLine configuration
 async fn run_statusline() -> Result<()> {
+    // The status line's only output is the line Claude Code renders, and its POST is
+    // fire-and-forget; a bad bundle leaves the plain client, so that POST fails like
+    // any other unreachable server instead of replacing the line with an error.
+    let _ = http::init();
     let base_url = env::var("VELD_API_URL")
         .or_else(|_| env::var("VELD_SERVER_URL"))
         .unwrap_or_else(|_| "http://127.0.0.1:3030".to_string());
@@ -1263,7 +1269,7 @@ async fn run_statusline() -> Result<()> {
         };
 
     // POST to veld backend (fire and forget)
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let post_body = serde_json::json!({
         "session_id": session_id,
         "tokens_used": current_tokens,
@@ -1332,6 +1338,8 @@ async fn main() -> Result<()> {
     if args.len() > 1 && args[1] == "statusline" {
         return run_statusline().await;
     }
+
+    http::init().map_err(anyhow::Error::msg)?;
 
     let base_url = std::env::var("VELD_SERVER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3030".to_string())
@@ -1782,6 +1790,14 @@ async fn run_tui(
                             }
                         }
                         KeyCode::Char('6') => g.set_view(ViewMode::Loops),
+                        KeyCode::Char('7') => g.set_view(ViewMode::Spine),
+                        KeyCode::Char('o') if matches!(g.view_mode, ViewMode::Spine) => tabs::spine::action("open", false),
+                        KeyCode::Char('i') if matches!(g.view_mode, ViewMode::Spine) => tabs::spine::action("install", false),
+                        KeyCode::Char('u') if matches!(g.view_mode, ViewMode::Spine) => tabs::spine::arm_uninstall(),
+                        KeyCode::Char('y') if matches!(g.view_mode, ViewMode::Spine) && tabs::spine::confirming() => tabs::spine::action("uninstall", false),
+                        KeyCode::Char('Y') if matches!(g.view_mode, ViewMode::Spine) && tabs::spine::confirming() => tabs::spine::action("uninstall", true),
+                        KeyCode::Char('n') if matches!(g.view_mode, ViewMode::Spine) && tabs::spine::confirming() => tabs::spine::cancel(),
+                        KeyCode::Char('r') if matches!(g.view_mode, ViewMode::Spine) => tabs::spine::refresh(),
                         KeyCode::Char('d') => g.set_view(ViewMode::Dashboard),
                         KeyCode::Char('p') => g.set_view(ViewMode::Projects),
                         KeyCode::Char('a') => g.set_view(ViewMode::ActivityLogs),
@@ -2632,7 +2648,7 @@ async fn execute_search(
     query: &str,
     mode: SearchMode,
 ) -> Result<Vec<types::SearchResult>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
 
     let url = match mode {
         SearchMode::Keyword => format!("{}/api/list/{}?query={}", base_url, user_id, query),
@@ -2799,7 +2815,7 @@ fn parse_memory_list_response(data: serde_json::Value) -> Result<Vec<types::Sear
 }
 
 async fn rebuild_graph(base_url: &str, api_key: &str, user_id: &str) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/graph/{}/rebuild", base_url, user_id);
 
     let resp = client
@@ -2846,7 +2862,7 @@ async fn fetch_graph_data(
     ),
     String,
 > {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
 
     // Fetch universe data (entities + connections)
     let url = format!("{}/api/graph/{}/universe", base_url, user_id);

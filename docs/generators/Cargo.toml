@@ -24,11 +24,18 @@ publish = false
 anyhow = "1"
 regex = "1"
 syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 walkdir = "2"
 
 [[bin]]
 name = "gen-http-api"
 path = "src/bin/gen-http-api.rs"
+
+[[bin]]
+name = "gen-schemas"
+path = "src/bin/gen-schemas.rs"
 
 [[bin]]
 name = "gen-mcp-tools"

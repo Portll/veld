@@ -16,7 +16,7 @@ created and the `/api/user_auth/*` routes return 404.
 | ------------------------- | -------------------------------------------------------------------------------------------- |
 | `VELD_USER_AUTH_ENABLED`  | `true` / `1` / `yes` / `on` enables the surface. Default: off (no CF; routes answer 503).    |
 | `VELD_KEYSTORE_PATH`      | With `VELD_MASTER_PASSPHRASE`, the keystore TOTP secrets are sealed under (purpose `totp`).  |
-| `VELD_TLS_ACK`            | Required for key management on a non-loopback bind: TLS terminates in front of veld.        |
+| `VELD_TLS_ACK`            | Key management over a non-loopback plain bind: TLS terminates in front of veld. Requests over the TLS listener (`VELD_TLS_PORT`) need no ack. |
 
 Without `VELD_KEYSTORE_PATH`, TOTP secrets are sealed under the keyring when the server
 started with one (see [key-management.md](key-management.md)). With neither, 2FA enrollment

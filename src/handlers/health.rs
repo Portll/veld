@@ -1521,16 +1521,15 @@ mod probes_while_a_tenant_opens {
         assert!(std::sync::Arc::ptr_eq(&opened, &cached.expect("cached")));
     }
 
-    /// The open waits out SQLite's busy timeout while another connection holds the file
-    /// exclusively. Made on the one runtime thread, it would stall the timeout below until the
-    /// hold ends, after 5 s at most.
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_uncached_slow_store_opens_off_the_runtime_thread_and_is_cached() {
-        const SLOW_TENANT: &str = "tenant-slow-store-mid-open";
-        let harness = TestHarness::new();
+    /// Holds `tenant`'s slow-store file exclusively from another connection until the returned
+    /// sender fires or 5 s pass. An open waits out SQLite's busy timeout meanwhile.
+    fn hold_slow_store_file(
+        harness: &TestHarness,
+        tenant: &str,
+    ) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
         let db_path = harness
             .manager
-            .user_dir(SLOW_TENANT)
+            .user_dir(tenant)
             .expect("tenant dir")
             .join("slow_store.db");
         std::fs::create_dir_all(db_path.parent().expect("tenant dir")).expect("tenant dir");
@@ -1546,6 +1545,16 @@ mod probes_while_a_tenant_opens {
             conn.execute_batch("COMMIT").expect("end the hold");
         });
         held_rx.recv().expect("file held");
+        (release_tx, holder)
+    }
+
+    /// Made on the one runtime thread, the open would stall the timeout below until the hold on
+    /// the store's file ends, after 5 s at most.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_uncached_slow_store_opens_off_the_runtime_thread_and_is_cached() {
+        const SLOW_TENANT: &str = "tenant-slow-store-mid-open";
+        let harness = TestHarness::new();
+        let (release_tx, holder) = hold_slow_store_file(&harness, SLOW_TENANT);
 
         let manager = harness.manager.clone();
         let mut lookup =
@@ -1568,5 +1577,56 @@ mod probes_while_a_tenant_opens {
                 .expect("the open cached the store"),
         );
         assert!(std::sync::Arc::ptr_eq(&opened, &cached));
+    }
+
+    /// The file is held so the first open cannot finish before the second caller has missed the
+    /// cache. Unserialised, both opened SQLite, each caller kept the store it opened, and the
+    /// cache kept whichever was inserted last.
+    #[test]
+    fn concurrent_first_opens_of_a_slow_store_make_one_store() {
+        const RACED_TENANT: &str = "tenant-slow-store-raced";
+        let harness = TestHarness::new();
+        let (release_tx, holder) = hold_slow_store_file(&harness, RACED_TENANT);
+
+        let openers: Vec<_> = (0..2)
+            .map(|_| {
+                let manager = harness.manager.clone();
+                std::thread::spawn(move || manager.get_user_slow_store(RACED_TENANT))
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.manager.slow_store_opens() == 0 {
+            assert!(Instant::now() < deadline, "neither caller reached the open");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // One caller is opening against the held file; this is the other's time to miss too.
+        std::thread::sleep(Duration::from_millis(200));
+
+        release_tx.send(()).expect("holder waits for release");
+        holder.join().expect("holder thread");
+        let stores: Vec<_> = openers
+            .into_iter()
+            .map(|opener| opener.join().expect("opener thread").expect("open"))
+            .collect();
+        let cached = std::sync::Arc::clone(
+            &harness
+                .manager
+                .slow_stores
+                .get(RACED_TENANT)
+                .expect("the open cached the store"),
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&stores[0], &stores[1]),
+            "the two callers were handed different stores"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&stores[0], &cached),
+            "the cache holds a store neither caller was handed"
+        );
+        assert_eq!(
+            harness.manager.slow_store_opens(),
+            1,
+            "SQLite was opened twice"
+        );
     }
 }

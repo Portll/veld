@@ -3309,6 +3309,12 @@ pub struct PrefetchContext {
     pub episode_id: Option<String>,
     /// Current emotional valence - for mood-congruent retrieval
     pub emotional_valence: Option<f32>,
+    /// The instant `hour_of_day` and `day_of_week` were read from. The temporal query takes
+    /// its date from the same instant; without it the date was the wall clock's while the hour
+    /// was the caller's, so a tick on a pinned scoring clock searched a day it never stored.
+    /// `None` (contexts built from a request's fields): the wall clock.
+    #[serde(default)]
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl PrefetchContext {
@@ -3346,15 +3352,21 @@ impl PrefetchContext {
             } else {
                 None
             },
+            at: None,
         }
     }
 
     /// Create context from current system state
     pub fn from_current_time() -> Self {
-        let now = chrono::Utc::now();
+        Self::at(chrono::Utc::now())
+    }
+
+    /// Context for the hour and weekday of `now`.
+    pub fn at(now: chrono::DateTime<chrono::Utc>) -> Self {
         Self {
             hour_of_day: Some(now.hour()),
             day_of_week: Some(now.weekday().num_days_from_sunday()),
+            at: Some(now),
             ..Default::default()
         }
     }
@@ -3443,7 +3455,7 @@ impl AnticipatoryPrefetch {
 
         // Priority 4: Temporal pattern prefetch
         if let (Some(hour), Some(day)) = (context.hour_of_day, context.day_of_week) {
-            return Some(self.temporal_query(hour, day));
+            return Some(self.temporal_query(hour, day, context.at));
         }
 
         None
@@ -3487,8 +3499,13 @@ impl AnticipatoryPrefetch {
     }
 
     /// Generate query for temporal pattern matching
-    fn temporal_query(&self, hour: u32, _day: u32) -> Query {
-        let now = chrono::Utc::now();
+    fn temporal_query(
+        &self,
+        hour: u32,
+        _day: u32,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Query {
+        let now = at.unwrap_or_else(chrono::Utc::now);
 
         // Find similar time window
         let start_hour = hour.saturating_sub(PREFETCH_TEMPORAL_WINDOW_HOURS as u32);
@@ -3775,6 +3792,18 @@ mod tests {
         assert!(query.is_some());
         let query = query.unwrap();
         assert!(query.time_range.is_some());
+    }
+
+    #[test]
+    fn a_temporal_query_searches_the_day_its_context_was_taken_at() {
+        let at = chrono::DateTime::parse_from_rfc3339("2025-03-04T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let query = AnticipatoryPrefetch::new()
+            .generate_prefetch_query(&PrefetchContext::at(at))
+            .expect("an hour and a weekday give a temporal query");
+        let (start, end) = query.time_range.expect("a temporal query has a range");
+        assert!(start <= at && at <= end, "{start}..{end} must contain {at}");
     }
 
     #[test]

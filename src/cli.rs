@@ -23,8 +23,8 @@ use clap::{Parser, Subcommand};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, ErrorCode, Implementation, ProtocolVersion, ServerCapabilities,
-        ServerInfo,
+        CallToolResult, ContentBlock, ErrorCode, Implementation, ProtocolVersion,
+        ServerCapabilities, ServerInfo,
     },
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
@@ -88,12 +88,35 @@ enum Commands {
         production: bool,
 
         /// Rate limit: max requests per second per client (0 = disabled)
-        #[arg(long, env = "VELD_RATE_LIMIT", default_value_t = 4000)]
+        #[arg(long, env = "VELD_RATE_LIMIT", default_value_t = veld::config::RATE_LIMIT_DEFAULT)]
         rate_limit: u64,
 
         /// Maximum concurrent requests before load shedding
         #[arg(long, env = "VELD_MAX_CONCURRENT", default_value_t = 200)]
         max_concurrent: usize,
+
+        // The --tls-* values are text, not u16 or paths: clap refuses a blank or padded
+        // VELD_TLS_* value as either and exits, and a supervisor then respawns it every
+        // few seconds. TlsSettings trims them, treats blank as unset and names a bad port.
+        /// PEM certificate chain for the HTTPS listener (with --tls-key and --tls-port)
+        #[arg(long, env = "VELD_TLS_CERT")]
+        tls_cert: Option<String>,
+
+        /// PEM private key for the HTTPS listener: PKCS#8, RSA or SEC1
+        #[arg(long, env = "VELD_TLS_KEY")]
+        tls_key: Option<String>,
+
+        /// Port of an HTTPS listener serving the same API beside the plain one
+        #[arg(long, env = "VELD_TLS_PORT")]
+        tls_port: Option<String>,
+
+        /// Bind address of the HTTPS listener [default: 0.0.0.0]
+        #[arg(long, env = "VELD_TLS_HOST")]
+        tls_host: Option<String>,
+
+        /// CA a client certificate must chain to on the HTTPS listener (mTLS)
+        #[arg(long, env = "VELD_TLS_CLIENT_CA")]
+        tls_client_ca: Option<String>,
     },
 
     /// Launch the TUI dashboard
@@ -524,6 +547,11 @@ async fn main() -> Result<()> {
             production,
             rate_limit,
             max_concurrent,
+            tls_cert,
+            tls_key,
+            tls_port,
+            tls_host,
+            tls_client_ca,
         } => {
             // server::run() builds its own tokio runtime, so we need to exit
             // the current one first. Drop the async context and call synchronously.
@@ -538,6 +566,13 @@ async fn main() -> Result<()> {
                     production,
                     rate_limit,
                     max_concurrent,
+                    tls: veld::config::TlsSettings {
+                        cert: tls_cert.map(PathBuf::from),
+                        key: tls_key.map(PathBuf::from),
+                        port: tls_port,
+                        host: tls_host,
+                        client_ca: tls_client_ca.map(PathBuf::from),
+                    },
                 })
             })
             .await?;
@@ -2269,7 +2304,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Stored memory: {}",
                 resp.id
             ))])),
@@ -2313,7 +2348,7 @@ impl VeldMcpServer {
                         mem.experience.content
                     ));
                 }
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -2354,7 +2389,7 @@ impl VeldMcpServer {
                         mem.content.chars().take(200).collect::<String>()
                     ));
                 }
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -2419,7 +2454,7 @@ impl VeldMcpServer {
                     output.push_str(&format!("\n**Path:** {}\n", resp.path.join(" → ")));
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -2448,7 +2483,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "✓ Confirmed edge: {} - {}",
                 resp.edge_id, resp.message
             ))])),
@@ -2479,7 +2514,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "✗ Rejected edge: {}",
                 resp.message
             ))])),
@@ -2512,7 +2547,7 @@ impl VeldMcpServer {
             .await;
 
         match result {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "⚡ Created link: {} - {}",
                 resp.edge_id, resp.message
             ))])),
@@ -2566,7 +2601,7 @@ impl VeldMcpServer {
                     }
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -2812,7 +2847,26 @@ mod tests {
             started_at: None,
             last_heartbeat: chrono::Utc::now(),
             launch: None,
+            tls_url: None,
         }
+    }
+
+    #[test]
+    fn server_takes_blank_and_padded_tls_values_as_text() {
+        for given in ["", " 3443 "] {
+            let cli = Cli::try_parse_from(["veld", "server", "--tls-port", given])
+                .unwrap_or_else(|e| panic!("--tls-port {given:?}: {e}"));
+            assert!(
+                matches!(&cli.command, Commands::Server { tls_port: Some(p), .. } if p == given),
+                "{given:?}"
+            );
+        }
+        let cli = Cli::try_parse_from(["veld", "server", "--tls-cert", "", "--tls-key", " "])
+            .expect("a blank path is left to TlsSettings, which reads it as unset");
+        assert!(matches!(
+            &cli.command,
+            Commands::Server { tls_cert: Some(c), tls_key: Some(k), .. } if c.is_empty() && k == " "
+        ));
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod search;
 
 // Knowledge graph
 pub mod gap_analysis;
+mod gap_runs;
 pub mod graph;
 pub mod visualization;
 
