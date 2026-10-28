@@ -381,9 +381,12 @@ impl KeywordExtractor {
         Self { stop_words }
     }
 
+    /// Up to ten keywords, most frequent first. Words of equal frequency keep the order they
+    /// first appear in: these become a fact's `related_entities`, which order its graph edges
+    /// and, past ten, decide which words are kept, so the result must not follow hash order.
     fn extract(&self, text: &str) -> Vec<String> {
-        // Simple TF-IDF style extraction
-        let mut word_freq: HashMap<String, usize> = HashMap::new();
+        let mut first_seen: HashMap<String, usize> = HashMap::new();
+        let mut keywords: Vec<(String, usize)> = Vec::new();
 
         for word in text.split_whitespace() {
             let clean_word = word
@@ -393,12 +396,16 @@ impl KeywordExtractor {
                 .collect::<String>();
 
             if clean_word.len() >= 2 && !self.stop_words.contains(&clean_word) {
-                *word_freq.entry(clean_word).or_insert(0) += 1;
+                match first_seen.get(&clean_word) {
+                    Some(&index) => keywords[index].1 += 1,
+                    None => {
+                        first_seen.insert(clean_word.clone(), keywords.len());
+                        keywords.push((clean_word, 1));
+                    }
+                }
             }
         }
 
-        // Sort by frequency and take top keywords
-        let mut keywords: Vec<(String, usize)> = word_freq.into_iter().collect();
         keywords.sort_by(|a, b| b.1.cmp(&a.1));
 
         keywords
@@ -2279,6 +2286,23 @@ mod tests {
     }
 
     #[test]
+    fn keywords_of_equal_frequency_keep_their_order_in_the_text() {
+        let extractor = KeywordExtractor::new();
+        let text = "zebra yak xerus walrus vole urchin tapir seal rhea quail panda oryx \
+                    moose yak oryx";
+        let expected: Vec<String> = [
+            "yak", "oryx", "zebra", "xerus", "walrus", "vole", "urchin", "tapir", "seal", "rhea",
+        ]
+        .iter()
+        .map(|word| word.to_string())
+        .collect();
+
+        for _ in 0..16 {
+            assert_eq!(extractor.extract(text), expected);
+        }
+    }
+
+    #[test]
     fn test_stop_words_filtered() {
         let extractor = KeywordExtractor::new();
         let text = "the is at which on and a an as are was were";
@@ -2548,6 +2572,44 @@ mod tests {
             result.new_facts.iter().all(|f| f.support_count == 1),
             "a new fact has been confirmed by one consolidation cycle"
         );
+    }
+
+    /// Two stores holding one corpus under different memory ids extract the same fact with
+    /// the same related entities, in the order its statement names them.
+    #[test]
+    fn a_fact_names_its_related_entities_in_statement_order_on_every_run() {
+        let consolidator = SemanticConsolidator::with_thresholds(2, 0);
+        let related_entities_of_the_rust_fact = || {
+            let corpus = [
+                create_typed_memory(
+                    "Rust is a systems programming language with memory safety and performance guarantees",
+                    0.8,
+                    ExperienceType::Learning,
+                    vec!["Rust".to_string()],
+                ),
+                create_typed_memory(
+                    "Rust is a compiled language providing memory safety with great performance",
+                    0.7,
+                    ExperienceType::Learning,
+                    vec!["Rust".to_string()],
+                ),
+            ];
+            let result = consolidator.consolidate(&corpus);
+            let fact = result
+                .new_facts
+                .iter()
+                .find(|f| f.fact.to_lowercase().contains("rust"))
+                .expect("the two Rust memories cluster into a fact");
+            let statement_order = consolidator.keyword_extractor.extract(&fact.fact);
+            assert_eq!(fact.related_entities, statement_order);
+            fact.related_entities.clone()
+        };
+
+        let first = related_entities_of_the_rust_fact();
+        assert!(first.len() > 1, "{first:?}");
+        for _ in 0..8 {
+            assert_eq!(related_entities_of_the_rust_fact(), first);
+        }
     }
 
     #[test]

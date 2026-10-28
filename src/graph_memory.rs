@@ -6767,8 +6767,12 @@ impl GraphMemory {
     ///
     /// Returns a `GraphDecayResult` with pruned count and orphaned entity/memory IDs
     /// for Direction 2 coupling (edge pruning → orphan detection).
+    ///
+    /// Ages edges on the scoring clock, as `effective_strength` reads them: the decayed
+    /// strengths are written back, so under a pinned `VELD_EVAL_NOW` a wall-clock pass would
+    /// store a strength that depends on when maintenance happened to run.
     pub fn apply_decay(&self) -> Result<crate::memory::types::GraphDecayResult> {
-        self.apply_decay_at(Utc::now())
+        self.apply_decay_at(crate::memory::scoring_now())
     }
 
     /// As [`apply_decay`](Self::apply_decay), ageing every edge as of `now`.
@@ -10875,6 +10879,10 @@ mod tests {
 
     #[test]
     fn apply_decay_at_ages_stored_edges_to_the_injected_time() {
+        // apply_decay reads the scoring clock, which tests in this crate pin.
+        let _env = crate::memory::ablation::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
         let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
         let mut ids = Vec::new();
@@ -10902,7 +10910,7 @@ mod tests {
         assert_eq!(
             graph.apply_decay().unwrap().pruned_count,
             0,
-            "fresh edges survive the wall clock"
+            "fresh edges survive the scoring clock"
         );
 
         let stored: Vec<RelationshipEdge> = ids
@@ -11913,6 +11921,72 @@ mod ablation_gate_tests {
             None => std::env::remove_var("VELD_EVAL_NOW"),
         }
     }
+
+    /// The maintenance decay pass writes the decayed strength back, so under a pinned
+    /// `VELD_EVAL_NOW` it must age edges to the pinned instant, not to whenever it ran.
+    #[test]
+    fn eval_now_freezes_the_strength_maintenance_decay_stores() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let anchor = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        graph.add_entity(node(a, "DecayClockA")).unwrap();
+        graph.add_entity(node(b, "DecayClockB")).unwrap();
+        let edge_id = graph
+            .add_relationship(RelationshipEdge {
+                uuid: Uuid::new_v4(),
+                from_entity: a,
+                to_entity: b,
+                relation_type: RelationType::RelatedTo,
+                strength: 0.8,
+                created_at: anchor - chrono::Duration::hours(200),
+                valid_at: anchor - chrono::Duration::hours(200),
+                invalidated_at: None,
+                source_episode_id: None,
+                context: String::new(),
+                last_activated: anchor - chrono::Duration::hours(100),
+                activation_count: 1,
+                ltp_status: LtpStatus::None,
+                activation_timestamps: None,
+                tier: EdgeTier::L2Episodic,
+                created_by: EdgeSource::CoOccurrence,
+                entity_confidence: None,
+                forward_strength: 0.8,
+                backward_strength: 0.8,
+                strengthening_sources: Default::default(),
+                last_corroborated: None,
+            })
+            .unwrap();
+        let stored = graph.get_relationship(&edge_id).unwrap().unwrap();
+        let mut expected = stored.clone();
+        assert!(!expected.decay_at(anchor), "the fixture must survive 100h");
+        assert_ne!(
+            expected.strength, stored.strength,
+            "the fixture must decay measurably over 100h"
+        );
+
+        let prev = std::env::var("VELD_EVAL_NOW").ok();
+        std::env::set_var("VELD_EVAL_NOW", "2030-01-01T00:00:00Z");
+        let decay = graph.apply_decay();
+        match prev {
+            Some(v) => std::env::set_var("VELD_EVAL_NOW", v),
+            None => std::env::remove_var("VELD_EVAL_NOW"),
+        }
+
+        assert_eq!(decay.unwrap().pruned_count, 0);
+        let decayed = graph.get_relationship(&edge_id).unwrap().unwrap();
+        assert_eq!(
+            decayed.strength.to_bits(),
+            expected.strength.to_bits(),
+            "stored {} after maintenance, the pinned clock gives {}",
+            decayed.strength,
+            expected.strength
+        );
+        assert_eq!(decayed.last_activated, anchor);
+    }
 }
 
 #[cfg(test)]
@@ -12228,6 +12302,11 @@ mod edge_index_tests {
 
     #[test]
     fn a_queued_prune_spares_an_edge_strengthened_since() {
+        // The prune decides on the scoring clock, which other tests in this binary pin; an edge
+        // stamped with the wall clock reads as years old while one of them holds it.
+        let _env = crate::memory::ablation::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
         let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
         let [a, b, c] =
@@ -12241,7 +12320,7 @@ mod edge_index_tests {
 
         let mut strengthened = graph.get_relationship(&ids[0]).unwrap().unwrap();
         strengthened.strength = 0.9;
-        strengthened.last_activated = Utc::now();
+        strengthened.last_activated = crate::memory::scoring_now();
         graph.put_relationship_record(&strengthened).unwrap();
 
         graph.flush_pending_maintenance().unwrap();

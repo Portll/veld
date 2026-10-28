@@ -287,6 +287,15 @@ pub struct MultiUserMemoryManager {
     /// and ensures the sync TTL actually works across requests.
     pub slow_stores: DashMap<String, std::sync::Arc<crate::memory::slow_store::SlowStore>>,
 
+    /// Per-user creation locks for `slow_stores`. Two callers that both missed the cache
+    /// would each open SQLite, and the later insert would replace the store the earlier
+    /// caller had already handed out.
+    slow_store_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
+
+    /// Slow stores opened, so tests can tell one open from two.
+    #[cfg(test)]
+    slow_store_opens: std::sync::atomic::AtomicUsize,
+
     /// Per-user BM25 (tantivy) index cache. Shared between the live
     /// [`crate::memory::Bm25Projection`] (which writes through it from
     /// the intent log) and any read-side hybrid-search reader that
@@ -751,6 +760,9 @@ impl MultiUserMemoryManager {
             user_graph_init_locks: DashMap::new(),
             shared_rocksdb_cache,
             slow_stores: DashMap::new(),
+            slow_store_init_locks: DashMap::new(),
+            #[cfg(test)]
+            slow_store_opens: std::sync::atomic::AtomicUsize::new(0),
             bm25_indices: DashMap::new(),
             journaled_writers: DashMap::new(),
             journaled_writer_init_locks: DashMap::new(),
@@ -2154,8 +2166,9 @@ impl MultiUserMemoryManager {
     /// SlowStores are cached per-user to avoid reopening SQLite on every request
     /// and to ensure the sync TTL actually works across calls.
     ///
-    /// A miss opens SQLite and creates its schema on the calling thread. Async code calls
-    /// [`Self::get_user_slow_store_async`] instead.
+    /// A miss opens SQLite and creates its schema on the calling thread, under a per-user
+    /// lock with a re-check inside it, as [`Self::get_user_memory`] does, so concurrent
+    /// misses make one store. Async code calls [`Self::get_user_slow_store_async`] instead.
     pub fn get_user_slow_store(
         &self,
         user_id: &str,
@@ -2164,9 +2177,22 @@ impl MultiUserMemoryManager {
             return Ok(store.clone());
         }
 
+        let lock = self
+            .slow_store_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock();
+        if let Some(store) = self.slow_stores.get(user_id) {
+            return Ok(store.clone());
+        }
+
         let user_path = self.user_dir(user_id)?;
         std::fs::create_dir_all(&user_path)?;
         let db_path = user_path.join("slow_store.db");
+        #[cfg(test)]
+        self.slow_store_opens
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Full memory snapshots, like the journal: sealed under the same keystore.
         let store = std::sync::Arc::new(crate::memory::slow_store::SlowStore::open_with_encryptor(
             &db_path,
@@ -2191,6 +2217,13 @@ impl MultiUserMemoryManager {
         tokio::task::spawn_blocking(move || manager.get_user_slow_store(&user_id))
             .await
             .context("slow store open task did not complete")?
+    }
+
+    /// Slow stores [`Self::get_user_slow_store`] has opened since this manager was built.
+    #[cfg(test)]
+    pub(crate) fn slow_store_opens(&self) -> usize {
+        self.slow_store_opens
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Get or create the per-tenant `Arc<BM25Index>`.
@@ -3438,6 +3471,11 @@ impl MultiUserMemoryManager {
                     self.slow_stores.len()
                 );
             }
+            // A lock someone holds or waits on is kept: dropping it would let the next caller
+            // open the store under a fresh lock beside the open already running.
+            self.slow_store_init_locks.retain(|user_id, lock| {
+                active_users.contains(user_id) || Arc::strong_count(lock) > 1
+            });
 
             // Prune audit logs for evicted users to prevent unbounded DashMap growth.
             // Each user's log can hold up to audit_max_entries_per_user entries (~2-5MB),

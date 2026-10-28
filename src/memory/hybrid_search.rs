@@ -865,7 +865,7 @@ impl BM25Index {
         let mut window = limit + 1;
         let top_docs = loop {
             let docs = searcher
-                .search(&parsed_query, &TopDocs::with_limit(window))
+                .search(&parsed_query, &TopDocs::with_limit(window).order_by_score())
                 .context("BM25 search failed")?;
             if docs.len() < window
                 || docs[window - 1].0 != docs[limit - 1].0
@@ -2112,7 +2112,9 @@ mod tests {
                 tantivy::Term::from_field_text(index.id_field, &id.0.to_string()),
                 tantivy::schema::IndexRecordOption::Basic,
             );
-            let hits = searcher.search(&query, &TopDocs::with_limit(1)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(1).order_by_score())
+                .unwrap();
             let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
             doc.get_first(index.content_field)
                 .and_then(|v| v.as_str())
