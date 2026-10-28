@@ -56,10 +56,6 @@ const WINDOW_CONTENT: usize = MAX_LENGTH - 2;
 /// caller-supplied text is a denial of service.
 const MAX_WINDOWS: usize = 64;
 
-/// Texts per ONNX run on the batch path. The attention scores are batch x 12 heads x seq^2 floats,
-/// about 12MB per text at a full window, so a batch of long facts is split rather than sent whole.
-const BATCH_CHUNK: usize = 16;
-
 const SESSION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What a query looks like to the model.
@@ -456,47 +452,6 @@ impl ArcticEmbedder {
         let mut session = model.lock()?;
         embed_windowed(model, &mut session, &content)
     }
-
-    /// Documents in batches: texts that fit one window share runs of [`BATCH_CHUNK`], a longer
-    /// text takes the windowed path alone, and an empty text is a zero vector in its place.
-    fn embed_batch_live(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let model = self.ensure_model_loaded()?;
-        let contents: Vec<Option<Vec<i64>>> = texts
-            .iter()
-            .map(|t| {
-                if t.is_empty() {
-                    Ok(None)
-                } else {
-                    model.content_ids(t).map(Some)
-                }
-            })
-            .collect::<Result<_>>()?;
-
-        let mut fits: Vec<(usize, &[i64])> = Vec::new();
-        let mut long: Vec<(usize, &[i64])> = Vec::new();
-        for (i, content) in contents.iter().enumerate() {
-            if let Some(content) = content {
-                if content.len() <= WINDOW_CONTENT {
-                    fits.push((i, content));
-                } else {
-                    long.push((i, content));
-                }
-            }
-        }
-
-        let mut out = vec![vec![0.0f32; DIMENSION]; texts.len()];
-        let mut session = model.lock()?;
-        for chunk in fits.chunks(BATCH_CHUNK) {
-            let framed: Vec<Vec<i64>> = chunk.iter().map(|(_, c)| model.frame(c)).collect();
-            for ((i, _), cls) in chunk.iter().zip(run_cls(&mut session, &framed)?) {
-                out[*i] = normalized(cls);
-            }
-        }
-        for (i, content) in long {
-            out[i] = embed_windowed(model, &mut session, content)?;
-        }
-        Ok(out)
-    }
 }
 
 fn record_outcome(mode: &str, seconds: f64, ok: bool) {
@@ -537,25 +492,6 @@ impl Embedder for ArcticEmbedder {
             return Ok(vec![0.0; DIMENSION]);
         }
         self.embed_seen(&query_text(text))
-    }
-
-    fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Under a model tape each text is keyed and replayed on its own: a batch pads to its
-        // longest member, which would make a recorded vector depend on its neighbours.
-        if super::model_tape::active() {
-            return texts.iter().map(|t| self.encode(t)).collect();
-        }
-        let start = std::time::Instant::now();
-        let result = self.embed_batch_live(texts);
-        record_outcome(
-            "arctic_onnx_batch",
-            start.elapsed().as_secs_f64(),
-            result.is_ok(),
-        );
-        result
     }
 }
 
@@ -662,8 +598,7 @@ mod tests {
                 assert!((got - w).abs() < 2e-3, "{query}: {got} vs card {w}");
             }
         }
-        // The single-text and batch paths read the same text the same way.
-        let alone = embedder.encode("The Data Cloud!").unwrap();
-        assert!(dot(&alone, &docs[0]) > 0.9999);
+        // A text's batched vector is the one it gets alone.
+        assert_eq!(embedder.encode("The Data Cloud!").unwrap(), docs[0]);
     }
 }

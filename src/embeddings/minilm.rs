@@ -928,164 +928,6 @@ impl MiniLMEmbedder {
 
         Ok(pooled)
     }
-
-    /// Generate embeddings for multiple texts in a single ONNX batch
-    ///
-    /// This is significantly faster than encoding texts one at a time because:
-    /// 1. Single ONNX session.run() call amortizes overhead
-    /// 2. GPU/CPU can parallelize across batch dimension
-    /// 3. Memory allocation is done once for the batch
-    ///
-    /// # Arguments
-    /// * `texts` - Slice of text strings to encode
-    ///
-    /// # Returns
-    /// * Vector of embeddings, one per input text
-    fn generate_embeddings_batch_onnx(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Lazy load model on first use
-        let model = self.ensure_model_loaded()?;
-        let lock_timeout = std::time::Duration::from_secs(30);
-        let mut session = model.sessions.acquire(lock_timeout).ok_or_else(|| {
-            tracing::error!(
-                "ONNX session lock timed out after {}s in batch embed — \
-                 a previous inference call is likely stuck.",
-                lock_timeout.as_secs()
-            );
-            anyhow::anyhow!(
-                "ONNX session lock timeout ({}s) in batch embed",
-                lock_timeout.as_secs()
-            )
-        })?;
-
-        let batch_size = texts.len();
-        let max_length = self.config.max_length;
-
-        // Tokenize all texts
-        let encodings: Vec<_> = texts
-            .iter()
-            .map(|text| {
-                model
-                    .tokenizer
-                    .encode(*text, true)
-                    .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // The batch tensor is one fixed [batch, max_length] block, so a text longer than the
-        // window cannot be represented in it — the `.take(max_length)` below is the same silent
-        // drop the single-text path had. Rather than quietly giving batched callers a worse answer
-        // than unbatched ones (the shape of defect where two paths disagree and only one is
-        // tested), any over-length text is handed to the windowed single-text path and its result
-        // spliced back into position. Batches of short text — the overwhelmingly common case —
-        // take the fast path untouched.
-        let over: Vec<usize> = encodings
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.get_ids().len() > max_length)
-            .map(|(i, _)| i)
-            .collect();
-        if !over.is_empty() {
-            tracing::debug!(
-                over = over.len(),
-                batch = batch_size,
-                "batch holds text longer than one window; routing those to the windowed path"
-            );
-            drop(session);
-            return texts
-                .iter()
-                .map(|text| self.generate_embedding_onnx(text))
-                .collect();
-        }
-
-        // Prepare batched tensors
-        let total_elements = batch_size * max_length;
-        let mut input_ids = vec![0i64; total_elements];
-        let mut attention_masks = vec![0i64; total_elements];
-        let token_type_ids = vec![0i64; total_elements];
-
-        for (batch_idx, encoding) in encodings.iter().enumerate() {
-            let tokens = encoding.get_ids();
-            let attention_mask = encoding.get_attention_mask();
-            let offset = batch_idx * max_length;
-
-            for (i, &token) in tokens.iter().take(max_length).enumerate() {
-                input_ids[offset + i] = token as i64;
-            }
-            for (i, &mask) in attention_mask.iter().take(max_length).enumerate() {
-                attention_masks[offset + i] = mask as i64;
-            }
-        }
-
-        // Create batched input tensors
-        let input_ids_value = Value::from_array((vec![batch_size, max_length], input_ids))?;
-        let attention_mask_value =
-            Value::from_array((vec![batch_size, max_length], attention_masks.clone()))?;
-        let token_type_ids_value =
-            Value::from_array((vec![batch_size, max_length], token_type_ids))?;
-
-        // Run batch inference
-        let outputs = session.run(ort::inputs![
-            "input_ids" => &input_ids_value,
-            "attention_mask" => &attention_mask_value,
-            "token_type_ids" => &token_type_ids_value,
-        ])?;
-
-        // Extract embeddings - output shape is [batch_size, seq_length, hidden_size]
-        let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
-        let (_shape, output_data) = output_tensor;
-
-        // Mean pooling for each item in batch
-        let mut results = Vec::with_capacity(batch_size);
-
-        for batch_idx in 0..batch_size {
-            let mut pooled = vec![0.0; self.dimension];
-            let mut mask_sum = 0.0;
-
-            let batch_offset = batch_idx * max_length * self.dimension;
-            let attention_offset = batch_idx * max_length;
-
-            for seq_idx in 0..max_length {
-                if attention_masks[attention_offset + seq_idx] == 1 {
-                    for (dim_idx, pooled_val) in pooled.iter_mut().enumerate().take(self.dimension)
-                    {
-                        let idx = batch_offset + seq_idx * self.dimension + dim_idx;
-                        *pooled_val += output_data[idx];
-                    }
-                    mask_sum += 1.0;
-                }
-            }
-
-            // Average
-            if mask_sum > 0.0 {
-                for val in &mut pooled {
-                    *val /= mask_sum;
-                }
-            }
-
-            // Handle NaN/Inf values
-            for val in pooled.iter_mut() {
-                if val.is_nan() || val.is_infinite() {
-                    *val = 0.0;
-                }
-            }
-
-            // L2 normalize
-            let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > f32::EPSILON && !norm.is_nan() {
-                for val in &mut pooled {
-                    *val /= norm;
-                }
-            }
-
-            results.push(pooled);
-        }
-
-        Ok(results)
-    }
 }
 
 /// The model name this embedder reports, and the one a corpus marker of `minilm` maps to.
@@ -1172,118 +1014,6 @@ impl Embedder for MiniLMEmbedder {
     fn dimension(&self) -> usize {
         self.dimension
     }
-
-    fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Handle empty strings in batch
-        let empty_embedding = vec![0.0; self.dimension];
-        if texts.iter().all(|t| t.is_empty()) {
-            return Ok(vec![empty_embedding; texts.len()]);
-        }
-
-        // Under a model tape each text goes through `encode`, so it is keyed and replayed on
-        // its own: the batch path pads to its longest member, which would make a text's
-        // recorded vector depend on its neighbours.
-        if super::model_tape::active() {
-            return texts.iter().map(|t| self.encode(t)).collect();
-        }
-
-        // Use simplified mode if in that mode
-        if self.simplified_mode {
-            let start = std::time::Instant::now();
-            let results: Result<Vec<_>> = texts
-                .iter()
-                .map(|text| {
-                    if text.is_empty() {
-                        Ok(vec![0.0; self.dimension])
-                    } else {
-                        self.generate_embedding_simplified(text)
-                    }
-                })
-                .collect();
-            let duration = start.elapsed().as_secs_f64();
-
-            crate::metrics::EMBEDDING_GENERATE_DURATION
-                .with_label_values(&["simplified_batch"])
-                .observe(duration);
-            crate::metrics::EMBEDDING_GENERATE_TOTAL
-                .with_label_values(&[
-                    "simplified_batch",
-                    if results.is_ok() {
-                        "success"
-                    } else {
-                        "failure"
-                    },
-                ])
-                .inc();
-
-            return results;
-        }
-
-        // Try batched ONNX inference
-        let start = std::time::Instant::now();
-
-        // Filter out empty strings and track their positions
-        let (non_empty_texts, empty_indices): (Vec<_>, Vec<_>) =
-            texts.iter().enumerate().partition(|(_, t)| !t.is_empty());
-
-        let non_empty_texts: Vec<&str> = non_empty_texts.into_iter().map(|(_, t)| *t).collect();
-        let empty_indices: Vec<usize> = empty_indices.into_iter().map(|(i, _)| i).collect();
-
-        match self.generate_embeddings_batch_onnx(&non_empty_texts) {
-            Ok(embeddings) => {
-                let duration = start.elapsed().as_secs_f64();
-                crate::metrics::EMBEDDING_GENERATE_DURATION
-                    .with_label_values(&["onnx_batch"])
-                    .observe(duration);
-                crate::metrics::EMBEDDING_GENERATE_TOTAL
-                    .with_label_values(&["onnx_batch", "success"])
-                    .inc();
-
-                // Reconstruct results with empty embeddings in correct positions
-                let mut results = Vec::with_capacity(texts.len());
-                let mut embedding_iter = embeddings.into_iter();
-
-                for i in 0..texts.len() {
-                    if empty_indices.contains(&i) {
-                        results.push(vec![0.0; self.dimension]);
-                    } else {
-                        results.push(
-                            embedding_iter
-                                .next()
-                                .unwrap_or_else(|| vec![0.0; self.dimension]),
-                        );
-                    }
-                }
-
-                Ok(results)
-            }
-            Err(e) => {
-                crate::metrics::EMBEDDING_GENERATE_TOTAL
-                    .with_label_values(&["onnx_batch", "failure"])
-                    .inc();
-                tracing::warn!(
-                    "Batch ONNX inference failed: {}. Falling back to sequential simplified.",
-                    e
-                );
-
-                // Fallback to sequential simplified
-                texts
-                    .iter()
-                    .map(|text| {
-                        if text.is_empty() {
-                            Ok(vec![0.0; self.dimension])
-                        } else {
-                            self.generate_embedding_simplified(text)
-                        }
-                    })
-                    .collect()
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1366,6 +1096,37 @@ mod tests {
         assert_eq!(embeddings.len(), 3);
         for emb in embeddings {
             assert_eq!(emb.len(), 384);
+        }
+    }
+
+    /// The quantized model scales its activations over a whole batch, so a batched run gave a
+    /// text a different vector from the one it got alone; stored chunk vectors moved with their
+    /// sibling chunks (conv-42_q84).
+    #[test]
+    fn a_batched_text_gets_the_vector_it_gets_alone() {
+        let embedder = crate::embeddings::shared::minilm_embedder(
+            &EmbeddingConfig::from_env(),
+            OrtThreading::resolve(),
+            default_session_pool_size(),
+        )
+        .expect("minilm");
+        assert!(
+            !embedder.is_simplified(),
+            "needs the ONNX model: cargo run --bin model-fetch -- --onnxruntime --minilm"
+        );
+        let long = "A longer note about backups and their windows. ".repeat(60);
+        let within_one_window = [
+            "The tide tables were reprinted.",
+            "",
+            "Melanie painted a sunrise over the lake after the storm had passed.",
+            "Backups ran.",
+        ];
+        // One over-length text sends a whole batch down another path, so it gets its own batch.
+        for texts in [&within_one_window[..], &[long.as_str(), "Backups ran."][..]] {
+            let batch = embedder.encode_batch(texts).unwrap();
+            for (text, vector) in texts.iter().zip(&batch) {
+                assert_eq!(&embedder.encode(text).unwrap(), vector, "{text:.40}");
+            }
         }
     }
 }

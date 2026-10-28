@@ -135,6 +135,11 @@ drainer ticks every 250 ms (`VELD_EMBED_QUEUE_INTERVAL_MS`). A drain takes up to
 write gate. A chunked memory's chunk vectors come from one call too. Concurrent writes coalesce:
 a drain that finds the queue already taken returns at once.
 
+`encode_batch` gives each text exactly the vector `encode` gives it alone. The local models
+and the HTTP embedder therefore run one text at a time. In a batched run, the quantized ONNX
+models scale their activations over the whole batch, and an OpenAI-compatible server moved a
+vector by up to 5.9e-5, so a stored vector depended on the texts beside it.
+
 An upsert that changes content drops the old vectors and leaves the vector indexes until its new
 vectors arrive. Until then a queued memory is found by keyword and graph search, as during an
 embedder outage. When the batch call fails, every memory it was for becomes a backlog row,
