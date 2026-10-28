@@ -6,7 +6,7 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **122** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **123** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
@@ -58,6 +58,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_HOST` | — | `src/config.rs` |
 | `VELD_INSTANCE_LABEL` | — | `src/instance_registry.rs` |
 | `VELD_INTENT_LOG_SEGMENT_MB` | — | `src/config.rs` |
+| `VELD_JOURNAL_FORGET_PURGE_DAYS` | — | `src/config.rs` |
 | `VELD_KEYSTORE_PATH` | — | `src/keystore.rs` |
 | `VELD_KMS_WRAP_KEY` | — | `src/keystore.rs` |
 | `VELD_LAZY_CROSS_ENCODER` | — | `src/embeddings/cross_encoder.rs` |

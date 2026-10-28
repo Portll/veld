@@ -164,6 +164,11 @@ impl MultiUserMemoryManagerRotationHelper {
     }
 }
 
+/// One journal purge of forgotten memories per tenant at a time.
+static JOURNAL_PURGE_LOCKS: std::sync::LazyLock<
+    dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
 /// Multi-user Veld manager for the server runtime.
 pub struct MultiUserMemoryManager {
     /// Per-user UserMemory handles with LRU eviction.
@@ -390,6 +395,10 @@ pub struct MultiUserMemoryManager {
     /// embedding, audit persistence). Shutdown closes it and waits, so the stores are not
     /// flushed or released under a write still in flight.
     pub task_tracker: tokio_util::task::TaskTracker,
+
+    /// How far replication followers have read each tenant's feed, for the
+    /// journal purge (kept only while the purge is on).
+    feed_floors: parking_lot::Mutex<crate::replication::FeedFloors>,
 }
 
 /// Written into a tenant's directory by a backup restore and removed by the C2
@@ -713,6 +722,18 @@ impl MultiUserMemoryManager {
             None
         };
 
+        if server_config.journal_forget_purge_age().is_some()
+            && std::env::var(super::admin::ADMIN_API_KEY_ENV).is_ok_and(|k| !k.trim().is_empty())
+        {
+            tracing::warn!(
+                days = server_config.journal_forget_purge_days,
+                "journal purge of forgotten memories is on, and this server can feed replication \
+                 followers: a Forget is erased only once every follower seen in the window has read \
+                 past it, but a follower that does not poll for longer than the window keeps the \
+                 memories forgotten meanwhile",
+            );
+        }
+        let base_path_for_floors = base_path.clone();
         let manager = Self {
             user_memories,
             audit_logs: Arc::new(DashMap::new()),
@@ -785,6 +806,9 @@ impl MultiUserMemoryManager {
             // See `set_sleep_time_orchestrator()`.
             sleep_time_orchestrator: parking_lot::RwLock::new(None),
             task_tracker,
+            feed_floors: parking_lot::Mutex::new(crate::replication::FeedFloors::load(
+                &base_path_for_floors,
+            )),
         };
 
         info!("Running initial audit log rotation...");
@@ -3100,6 +3124,73 @@ impl MultiUserMemoryManager {
     }
 
     /// Run maintenance on all cached user memories
+    /// Erase from `user_id`'s sealed journal segments the frames of memories
+    /// forgotten more than `min_age` ago (see [`crate::intent_log::purge`]). One
+    /// pass per tenant at a time; best effort, a failure is logged.
+    /// Note that a replication follower asked for `user_id`'s frames after
+    /// `after_lsn`, for [`Self::purge_forgotten_journal`]. A fresh follower (no
+    /// cursor) needs no protection: it never applied what a purge erases.
+    pub fn note_feed_cursor(&self, user_id: &str, after_lsn: Option<u64>) {
+        let (Some(window), Some(after_lsn)) =
+            (self.server_config.journal_forget_purge_age(), after_lsn)
+        else {
+            return;
+        };
+        self.feed_floors
+            .lock()
+            .note(user_id, after_lsn, window, std::time::SystemTime::now());
+    }
+
+    fn purge_forgotten_journal(&self, user_id: &str, min_age: std::time::Duration) {
+        let lock = JOURNAL_PURGE_LOCKS
+            .entry(user_id.to_string())
+            .or_default()
+            .clone();
+        let Ok(_purging) = lock.try_lock() else {
+            return;
+        };
+        let Ok(log) = self.user_dir(user_id).map(|dir| dir.join("intent.log")) else {
+            return;
+        };
+        if !log.is_file() {
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        // A Forget a follower has not read yet stays: erased, it would never
+        // reach that follower, which would keep the memory.
+        let follower_floor = self
+            .feed_floors
+            .lock()
+            .floor(user_id, min_age, now)
+            .map(crate::intent_log::Lsn);
+        let outcome = self
+            .purpose_cryptor(user_id, "journal")
+            .and_then(|cryptor| {
+                crate::intent_log::purge::purge_forgotten(
+                    &log,
+                    cryptor.as_ref(),
+                    min_age,
+                    follower_floor,
+                    now,
+                )
+                .map_err(anyhow::Error::from)
+            });
+        match outcome {
+            Ok(report) if report.frames_dropped > 0 => tracing::info!(
+                user_id,
+                memories = report.memories_purged,
+                frames = report.frames_dropped,
+                segments = report.segments_rewritten,
+                bytes = report.bytes_reclaimed,
+                "erased the journal frames of forgotten memories",
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(user_id, error = %e, "journal purge of forgotten memories failed")
+            }
+        }
+    }
+
     pub fn run_maintenance_all_users(&self) -> usize {
         let cycle = self
             .maintenance_cycle
@@ -3436,6 +3527,17 @@ impl MultiUserMemoryManager {
                         );
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // Heavy cycle: erase from sealed journal segments the frames of memories
+        // forgotten longer ago than the configured window. Off unless
+        // VELD_JOURNAL_FORGET_PURGE_DAYS is set.
+        if is_heavy {
+            if let Some(min_age) = self.server_config.journal_forget_purge_age() {
+                for (user_id_arc, _) in self.user_memories.iter() {
+                    self.purge_forgotten_journal(user_id_arc.as_ref(), min_age);
                 }
             }
         }
