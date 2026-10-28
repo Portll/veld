@@ -1,0 +1,11 @@
+# zstd 0.13 / zstd-safe 7 arrive only through tantivy-sstable, and the fixes need zstd 0.14 /
+# zstd-safe 8, a semver break tantivy has not taken. Unreachable here (security review 2026-10-28,
+# DOS and SUPPLY reports): veld never calls zstd; tantivy-sstable uses the bulk API with a fresh
+# decompressor per block, so no context is reused (0391), no legacy-frame streaming (0403) and no
+# Seekable (0398). Drop these once tantivy moves to zstd 0.14.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+]
