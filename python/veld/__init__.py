@@ -30,6 +30,9 @@ LLM Framework Integrations:
     # LlamaIndex - pip install veld[llamaindex]
     from veld.integrations.llamaindex import VeldLlamaMemory
 
+    # CrewAI - pip install veld[crewai]
+    from veld.integrations.crewai import VeldCrewMemory
+
     # Both - pip install veld[all]
 """
 

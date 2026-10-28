@@ -5,11 +5,13 @@ Optional adapters for popular LLM frameworks:
 - LangChain: VeldMemory class for ConversationChain, agents
 - LlamaIndex: VeldLlamaMemory for chat engines
 - OpenAI Agents SDK: VeldTools + VeldSession for agents
+- CrewAI: VeldCrewMemory for Crew(memory=...) and Agent(memory=...)
 
 Install extras:
     pip install veld[langchain]
     pip install veld[llamaindex]
     pip install veld[openai-agents]
+    pip install veld[crewai]
     pip install veld[all]
 """
 
@@ -34,9 +36,15 @@ def get_openai_agents_session():
     from .openai_agents import VeldSession
     return VeldSession
 
+def get_crewai_memory():
+    """Get CrewAI VeldCrewMemory class (requires crewai installed)"""
+    from .crewai import VeldCrewMemory
+    return VeldCrewMemory
+
 __all__ = [
     "get_langchain_memory",
     "get_llamaindex_memory",
     "get_openai_agents_tools",
     "get_openai_agents_session",
+    "get_crewai_memory",
 ]
