@@ -1,0 +1,58 @@
+{
+  "name": "@veld/vercel-ai",
+  "version": "0.8.4",
+  "description": "Veld memory for the Vercel AI SDK: remember and recall tools, and recalled memories in the prompt.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "ai": "^7.0.0",
+    "zod": "^3.25.76 || ^4.1.8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "ai": "^7.0.155",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5",
+    "zod": "^4.6.7"
+  },
+  "keywords": [
+    "ai",
+    "ai-sdk",
+    "vercel",
+    "memory",
+    "persistent-memory",
+    "agents",
+    "veld"
+  ],
+  "author": "Veld Team <john@portll.net>",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Portll/veld.git",
+    "directory": "integrations/vercel-ai"
+  },
+  "homepage": "https://github.com/Portll/veld/tree/main/integrations/vercel-ai#readme",
+  "bugs": {
+    "url": "https://github.com/Portll/veld/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
