@@ -13,8 +13,9 @@
 //!   concurrent row's p95 is within 1.3x of the one-space row's at 100 000 memories. In
 //!   recall the second space's search also overlaps graph traversal and BM25, which this row
 //!   leaves out, so it bounds the overlap from below.
-//! - **footprint**: bytes a space holds as full vectors and as product-quantized codes, and the
-//!   process RSS growth while its index is built; per size, what two spaces (the second as
+//! - **footprint**: bytes a space holds as full vectors and as product-quantized codes, and how
+//!   much the process's memory moved while its index was built (physical footprint on macOS,
+//!   resident size elsewhere; signed); per size, what two spaces (the second as
 //!   `pq`, the default codec since step 11) hold against one. Step 11 is done when that is
 //!   under 1.3x at 100 000 memories.
 //! - **quality**: recall@10 of each codec's search against exact search, the `pq` index's
@@ -102,7 +103,7 @@ enum Row {
         space: String,
         codec: &'static str,
         bytes: usize,
-        rss_growth_bytes: Option<u64>,
+        memory_growth_bytes: Option<i64>,
         build_ms: u64,
     },
     TwoSpaces {
@@ -110,7 +111,7 @@ enum Row {
         one_space_bytes: usize,
         two_spaces_bytes: usize,
         bytes_ratio: f64,
-        rss_ratio: Option<f64>,
+        memory_ratio: Option<f64>,
     },
     Quality {
         memories: usize,
@@ -234,11 +235,37 @@ fn percentile(sorted: &[Duration], p: f64) -> u64 {
     sorted[rank].as_micros() as u64
 }
 
-fn rss_bytes() -> Option<u64> {
+/// Bytes of memory this process owns. On macOS that is its physical footprint, the figure
+/// Activity Monitor shows: resident size leaves out pages the kernel has compressed or swapped,
+/// and under memory pressure it stays flat or falls while the process allocates hundreds of
+/// megabytes. Elsewhere it is resident size.
+#[cfg(target_os = "macos")]
+fn memory_bytes() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+    // SAFETY: for RUSAGE_INFO_V2, proc_pid_rusage writes one rusage_info_v2 into the buffer,
+    // which is sized for one, and reads nothing from it.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    // SAFETY: a zero return means the call filled the struct.
+    (rc == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn memory_bytes() -> Option<u64> {
     let pid = sysinfo::get_current_pid().ok()?;
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).map(|p| p.memory())
+}
+
+/// How much the process's memory moved between two readings, signed: a fall is reported as one.
+fn growth(before: Option<u64>, after: Option<u64>) -> Option<i64> {
+    before.zip(after).map(|(a, b)| b as i64 - a as i64)
 }
 
 fn vamana(dim: usize, vectors: Vec<Vec<f32>>) -> Result<VamanaIndex> {
@@ -324,34 +351,30 @@ fn measure_search_and_footprint(
         let primary_queries = queries_near(&primary_vectors, query_count, 3);
         let secondary_queries = queries_near(&secondary_vectors, query_count, 4);
 
-        let rss_before = rss_bytes();
+        let mem_before = memory_bytes();
         let start = Instant::now();
         let primary_index = vamana(PRIMARY_DIM, primary_vectors.clone())?;
         let primary_build = start.elapsed();
-        let rss_primary = rss_bytes();
+        let mem_primary = memory_bytes();
         rows.push(Row::Footprint {
             memories: n,
             space: primary.to_string(),
             codec: "f32",
             bytes: n * PRIMARY_DIM * 4,
-            rss_growth_bytes: rss_before
-                .zip(rss_primary)
-                .map(|(a, b)| b.saturating_sub(a)),
+            memory_growth_bytes: growth(mem_before, mem_primary),
             build_ms: primary_build.as_millis() as u64,
         });
 
         let start = Instant::now();
         let secondary_index = vamana(SECONDARY_DIM, secondary_vectors.clone())?;
         let secondary_build = start.elapsed();
-        let rss_secondary = rss_bytes();
+        let mem_secondary = memory_bytes();
         rows.push(Row::Footprint {
             memories: n,
             space: secondary.to_string(),
             codec: "f32",
             bytes: n * SECONDARY_DIM * 4,
-            rss_growth_bytes: rss_primary
-                .zip(rss_secondary)
-                .map(|(a, b)| b.saturating_sub(a)),
+            memory_growth_bytes: growth(mem_primary, mem_secondary),
             build_ms: secondary_build.as_millis() as u64,
         });
 
@@ -401,34 +424,30 @@ fn measure_search_and_footprint(
 
         // The secondary space as the default codec holds it: product-quantized codes searched
         // flat, each search's best candidates reranked against the exact vectors.
-        let rss_before_pq = rss_bytes();
+        let mem_before_pq = memory_bytes();
         let start = Instant::now();
         let mut pq = QuantizedIndex::new(SECONDARY_DIM);
         pq.build(secondary_vectors.clone())?;
         let pq_build = start.elapsed();
-        let rss_pq = rss_before_pq
-            .zip(rss_bytes())
-            .map(|(a, b)| b.saturating_sub(a));
+        let mem_pq = growth(mem_before_pq, memory_bytes());
         rows.push(Row::Footprint {
             memories: n,
             space: secondary.to_string(),
             codec: "pq",
             bytes: pq.memory_bytes(),
-            rss_growth_bytes: rss_pq,
+            memory_growth_bytes: mem_pq,
             build_ms: pq_build.as_millis() as u64,
         });
         let one_space_bytes = n * PRIMARY_DIM * 4;
         let two_spaces_bytes = one_space_bytes + pq.memory_bytes();
-        let rss_one = rss_before
-            .zip(rss_primary)
-            .map(|(a, b)| b.saturating_sub(a));
+        let mem_one = growth(mem_before, mem_primary);
         rows.push(Row::TwoSpaces {
             memories: n,
             one_space_bytes,
             two_spaces_bytes,
             bytes_ratio: two_spaces_bytes as f64 / one_space_bytes.max(1) as f64,
-            rss_ratio: rss_one
-                .zip(rss_pq)
+            memory_ratio: mem_one
+                .zip(mem_pq)
                 .filter(|(one, _)| *one > 0)
                 .map(|(one, pq)| (one + pq) as f64 / one as f64),
         });
@@ -701,24 +720,24 @@ fn print_table(report: &Report) {
                 space,
                 codec,
                 bytes,
-                rss_growth_bytes,
+                memory_growth_bytes,
                 build_ms,
             } => println!(
-                "footprint {memories:>7}  {space:<48} {codec:<4} {:>8} KiB stored  rss +{:>8} KiB  build {build_ms} ms",
+                "footprint {memories:>7}  {space:<48} {codec:<4} {:>8} KiB stored  memory {:>9} KiB  build {build_ms} ms",
                 bytes / 1024,
-                rss_growth_bytes.map_or_else(|| "?".to_string(), |b| (b / 1024).to_string())
+                memory_growth_bytes.map_or_else(|| "?".to_string(), |b| format!("{:+}", b / 1024))
             ),
             Row::TwoSpaces {
                 memories,
                 one_space_bytes,
                 two_spaces_bytes,
                 bytes_ratio,
-                rss_ratio,
+                memory_ratio,
             } => println!(
-                "two/one   {memories:>7}  {:>8} KiB vs {:>8} KiB stored: {bytes_ratio:.2}x  rss {}",
+                "two/one   {memories:>7}  {:>8} KiB vs {:>8} KiB stored: {bytes_ratio:.2}x  memory {}",
                 two_spaces_bytes / 1024,
                 one_space_bytes / 1024,
-                rss_ratio.map_or_else(|| "?".to_string(), |r| format!("{r:.2}x"))
+                memory_ratio.map_or_else(|| "?".to_string(), |r| format!("{r:.2}x"))
             ),
             Row::Quality {
                 memories,
