@@ -1586,6 +1586,7 @@ impl MultiUserMemoryManager {
         user_mem.set_graph_memory(graph);
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
         user_mem.set_feedback_store(self.feedback_store.clone());
+        user_mem.set_owner_user_id(user_id);
 
         let memory_arc: SharedUserMemory = Arc::new(parking_lot::RwLock::new(user_mem));
 
@@ -6132,6 +6133,19 @@ mod reserved_dir_tests {
         assert!(manager.get_user_memory("instances").is_err());
         assert!(!root.path().join("instances").exists());
         assert!(manager.user_dir("alice").is_ok());
+    }
+
+    #[test]
+    fn a_tenant_memory_system_knows_its_owner() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = ServerConfig {
+            storage_path: root.path().to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        let manager = MultiUserMemoryManager::new(root.path().to_path_buf(), config).unwrap();
+        let alice = manager.get_user_memory("alice").unwrap();
+        assert_eq!(alice.read().owner_user_id(), Some("alice"));
     }
 }
 
