@@ -91,7 +91,7 @@ Five retrieval dials drive the Layer 5.3 cross-encoder
 | `rerank_count` | `Option<usize>`, clamped to 1..=200 | at most 20 candidates (30 for a decomposed query), and never more than twice `max_results`; a set value is the budget itself | `VELD_DIALS_RERANK_COUNT` |
 | `rerank_pool` | `Option<usize>`, clamped to 10..=500 | Layer 4 keeps 30 fused candidates (50 for a decomposed query) for the layer; never fewer than `rerank_count` | `VELD_DIALS_RERANK_POOL` |
 | `ce_blend` | `Option<f32>`, clamped to 0..=1 | each query shape takes its own cross-encoder share (`ce_blend_<shape>`, else `constants::CE_BLEND_*`); a set value is the share for every shape, and a decomposed query never takes less than its own | `VELD_TUNE_CE_BLEND` |
-| `rerank_model` | `Option<String>`, a registry id | the process-wide model: `VELD_CROSS_ENCODER`, else `mxbai-rerank-xsmall-v1` | `VELD_DIALS_RERANK_MODEL` |
+| `rerank_model` | `Option<String>`, a registry id | the process-wide model: `VELD_CROSS_ENCODER`, else `ms-marco-MiniLM-L-6-v2` | `VELD_DIALS_RERANK_MODEL` |
 
 Depth takes all three of `rerank_pool`, `rerank_count` and `ce_blend`. On the LoCoMo
 gate a quarter of all gold sits between rank 11 and rank 100. A larger `rerank_count`
@@ -111,8 +111,11 @@ The recall gate records the model, cap, pool and blend it measured under
 (`RerankSetting` in `src/recall_harness/report.rs`) and refuses to gate across
 them. `recall.yml` takes `rerank_model`, `rerank_count`, `rerank_pool` and
 `ce_blend` as dispatch inputs for a comparison run (`record=true`). The baseline
-is `mxbai-rerank-xsmall-v1` at cap 20 with the shipped pool and blend, and the
-parity arm against upstream shodh-memory is `ms-marco-MiniLM-L-6-v2` at cap 30.
+is `ms-marco-MiniLM-L-6-v2` at cap 30 with the shipped pool and blend, which is
+also the parity arm against upstream shodh-memory. It replaced
+`mxbai-rerank-xsmall-v1` at cap 20 on 2026-10-28: measured back to back on one
+machine on the LoCoMo gate, ms-marco at 30 gave recall@10 0.5994 against 0.5589
+and p50 505 ms against 647 ms.
 
 Selectable models (`src/embeddings/cross_encoder.rs`). Two are pinned to a
 revision and verified by SHA-256 before they load; the rest follow their
@@ -121,8 +124,8 @@ measurement.
 
 | Registry id | Params | Licence | Pinned |
 |---|---|---|---|
-| `mxbai-rerank-xsmall-v1` (default) | 70 M | Apache-2.0 | `b5c6e9da` |
-| `ms-marco-MiniLM-L-6-v2` (parity arm) | 22 M | Apache-2.0 | `233902d2` |
+| `mxbai-rerank-xsmall-v1` | 70 M | Apache-2.0 | `b5c6e9da` |
+| `ms-marco-MiniLM-L-6-v2` (default, parity arm) | 22 M | Apache-2.0 | `233902d2` |
 | `mxbai-rerank-base-v1` | 184 M | Apache-2.0 | no |
 | `mxbai-rerank-large-v1` | 435 M | Apache-2.0 | no |
 | `jina-reranker-v1-tiny-en` | 33 M | Apache-2.0 | no |

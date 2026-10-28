@@ -14,7 +14,7 @@
 //! [`OnnxCrossEncoder`] is the concrete ONNX-runtime-backed implementation,
 //! parameterised by [`CrossEncoderConfig`]. Built-in configs:
 //!
-//! - `ms-marco-MiniLM-L-6-v2` — 22M params, MS MARCO web-search training (legacy default).
+//! - `ms-marco-MiniLM-L-6-v2` — 22M params, MS MARCO web-search training (the default).
 //! - `bge-reranker-v2-m3` — 568M params, multilingual, multi-task QA/conversational.
 //! - `mxbai-rerank-large-v1` — 435M params, QA + retrieval.
 //! - `jina-reranker-v2-base-multilingual` — 278M params, multilingual late-interaction.
@@ -31,7 +31,7 @@
 //! - `VELD_CROSS_ENCODER=<id>` — single model.
 //! - `VELD_CROSS_ENCODERS=<id1>:<weight1>,<id2>:<weight2>,...` — weighted
 //!   ensemble. Weights default to 1.0 if omitted (`<id>` is allowed).
-//! - Default (neither set): mxbai-rerank-xsmall-v1.
+//! - Default (neither set): ms-marco-MiniLM-L-6-v2 at depth 30.
 //!
 //! The env vars are the process-wide choice. On top of it, the per-user `rerank_model`
 //! dial (`crate::memory::dials::CognitiveDials`) selects one registry id at runtime;
@@ -116,18 +116,23 @@ fn build_session(model_path: &std::path::Path, threading: OrtThreading) -> Resul
         .context("Failed to load ONNX model")
 }
 
-/// Default cross-encoder id when no env var is set. mxbai-rerank-xsmall-v1
-/// is the smallest 2024-vintage reranker that meaningfully beats the
-/// legacy ms-marco-MiniLM — ~280 MB download, 70 M params, modern QA +
-/// retrieval training. Picks the size/quality sweet spot for the typical
-/// veld install: fast to download, fast at query time, well above the
-/// ms-marco floor. Swap up to `bge-reranker-v2-m3` (568 M) for the best
-/// quality, or stack via `VELD_CROSS_ENCODERS=…`.
-const DEFAULT_CROSS_ENCODER_ID: &str = "mxbai-rerank-xsmall-v1";
+/// Default cross-encoder id when no env var is set: ms-marco-MiniLM-L-6-v2 at
+/// depth 30, the setting upstream shodh-memory ships and measures under.
+///
+/// mxbai-rerank-xsmall-v1 at depth 20 was the default from 76c25717 on the
+/// strength of its training vintage. Measured on the 100-case LoCoMo gate on
+/// one machine, back to back, 2026-10-24: mxbai at 20 gave p@1 0.38,
+/// ndcg@10 0.4588, recall@10 0.5589, p50 647 ms; ms-marco at 30 gave p@1 0.39,
+/// ndcg@10 0.4919, recall@10 0.5994, p50 505 ms. The smaller model at the
+/// deeper cap is both better and faster here, and it is a quarter of the
+/// download (87 MB against 280 MB). mxbai stays registered; select it with
+/// `VELD_CROSS_ENCODER` or the `rerank_model` dial. Swap up to
+/// `bge-reranker-v2-m3` (568 M) for the best quality, or stack via
+/// `VELD_CROSS_ENCODERS=…`.
+const DEFAULT_CROSS_ENCODER_ID: &str = MS_MARCO_MINILM_L6_ID;
 
-/// Registry id of the legacy reranker, pinned so the recall gate has a parity arm against
-/// upstream shodh-memory (which measured under this model). Select it per user with the
-/// `rerank_model` dial.
+/// Registry id of the default reranker, pinned to a revision and checksummed: it is also the
+/// parity arm of the recall gate against upstream shodh-memory, which measures under it.
 pub const MS_MARCO_MINILM_L6_ID: &str = "ms-marco-MiniLM-L-6-v2";
 
 /// The query and the candidate the background pre-warm scores.
@@ -306,9 +311,9 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
                  The mini-class option for English-only deployments wanting a small accuracy bump.",
             license: "apache-2.0",
         },
-        // Pinned like the default: upstream shodh-memory measured its LoCoMo numbers under
-        // this model, so it is the parity arm of the recall gate (`rerank_model` dial), and
-        // a parity arm whose files can move is not one.
+        // The default, pinned: upstream shodh-memory measured its LoCoMo numbers under this
+        // model at depth 30, so it is also the parity arm of the recall gate, and a parity
+        // arm whose files can move is not one.
         CrossEncoderConfig {
             id: MS_MARCO_MINILM_L6_ID.into(),
             model_url:
@@ -327,8 +332,8 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             params_millions: 22,
             download_mb: 87,
             year: 2021,
-            rerank_top_k: 20,
-            notes: "BERT-style; trained on MS MARCO web-search passages. Fast, narrow domain.",
+            rerank_top_k: 30,
+            notes: "BERT-style; trained on MS MARCO web-search passages. Fast; the default.",
             license: "apache-2.0",
         },
         CrossEncoderConfig {
@@ -454,7 +459,10 @@ pub fn current_rerank_depth() -> usize {
         .ok()
         .unwrap_or_else(|| DEFAULT_CROSS_ENCODER_ID.to_string());
 
-    lookup(&id).map(|c| c.rerank_top_k).unwrap_or(20)
+    lookup(&id)
+        .or_else(|_| lookup(DEFAULT_CROSS_ENCODER_ID))
+        .map(|c| c.rerank_top_k)
+        .unwrap_or(30)
 }
 
 /// Snapshot of registered models — `(id, params_M, download_MB, year, notes)`.
@@ -1608,6 +1616,15 @@ mod tests {
         let key = cfg.cache_key();
         assert!(!key.contains('/'));
         assert!(!key.contains('\\'));
+    }
+
+    #[test]
+    fn the_default_is_ms_marco_at_depth_30() {
+        // Measured 2026-10-24 on the LoCoMo gate, back to back on one machine: this
+        // setting beat mxbai-rerank-xsmall-v1 at 20 on every quality metric and was
+        // faster. It is also what upstream shodh-memory measures under.
+        assert_eq!(DEFAULT_CROSS_ENCODER_ID, MS_MARCO_MINILM_L6_ID);
+        assert_eq!(lookup(DEFAULT_CROSS_ENCODER_ID).unwrap().rerank_top_k, 30);
     }
 
     #[test]

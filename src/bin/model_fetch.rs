@@ -44,7 +44,7 @@ struct Args {
     #[arg(long)]
     arctic_xs: bool,
 
-    /// mxbai-rerank-xsmall-v1 — the default cross-encoder that reranks recall's candidates.
+    /// ms-marco-MiniLM-L-6-v2 — the default cross-encoder that reranks recall's candidates.
     /// Without it recall keeps its fused order and logs that the reranker is unavailable.
     #[arg(long)]
     cross_encoder: bool,

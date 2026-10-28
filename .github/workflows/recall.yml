@@ -61,9 +61,10 @@ on:
       rerank_model:
         description: >-
           Cross-encoder registry id for the rerank_model dial (src/embeddings/cross_encoder.rs);
-          empty keeps the shipped default. The baseline was recorded under mxbai-rerank-xsmall-v1,
-          so another model is another pipeline: the gate refuses the comparison, so pair this
-          with record=true and read the diff table as a comparison, not a gate.
+          empty keeps the shipped default (ms-marco-MiniLM-L-6-v2 at cap 30). The baseline
+          records the model and cap it was measured under, so another model is another
+          pipeline: the gate refuses the comparison, so pair this with record=true and read the
+          diff table as a comparison, not a gate.
         required: false
         default: ''
       rerank_count:

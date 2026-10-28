@@ -135,8 +135,8 @@ pub struct CognitiveDials {
 
     /// Which cross-encoder reranks, by registry id
     /// (`crate::embeddings::cross_encoder::lookup`). `None` keeps the process-wide choice
-    /// (`VELD_CROSS_ENCODER`, else mxbai-rerank-xsmall-v1). Set to
-    /// `ms-marco-MiniLM-L-6-v2` for the recall gate's parity arm against upstream.
+    /// (`VELD_CROSS_ENCODER`, else ms-marco-MiniLM-L-6-v2, the model upstream
+    /// shodh-memory measures under).
     /// [`CognitiveDials::sanitized`] drops an id the registry does not know, so what
     /// `GET /api/dials` returns is what reranks.
     #[serde(default)]
