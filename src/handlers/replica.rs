@@ -938,4 +938,100 @@ mod tests {
             "{text}"
         );
     }
+
+    /// A feed request and a status poll from one follower, as the leader's admin
+    /// status and role route then report them.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_leader_shows_who_follows_it_and_how_far_behind() {
+        use crate::handlers::admin::{ADMIN_API_KEY_ENV, ADMIN_API_KEY_HEADER, ADMIN_ENV_LOCK};
+        use crate::replication::{FOLLOWER_URL_HEADER, INSTANCE_ID_HEADER};
+        const ADMIN_KEY: &str = "replica-test-admin-key";
+        let _env = ADMIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(ADMIN_API_KEY_ENV, ADMIN_KEY);
+
+        let harness = TestHarness::new();
+        for content in [
+            "the swing bridge opens on the hour",
+            "the swing bridge was greased",
+        ] {
+            let (status, _, body) = call(
+                &harness,
+                post_json(
+                    "/api/remember",
+                    &json!({"user_id": USER, "content": content}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let follower = uuid::Uuid::new_v4();
+        let peer: std::net::SocketAddr = "10.4.0.9:40112".parse().unwrap();
+        let admin_get = |uri: &str, named: bool| {
+            let mut request = get(uri);
+            let headers = request.headers_mut();
+            headers.insert(ADMIN_API_KEY_HEADER, ADMIN_KEY.parse().unwrap());
+            if named {
+                headers.insert(INSTANCE_ID_HEADER, follower.to_string().parse().unwrap());
+                headers.insert(
+                    FOLLOWER_URL_HEADER,
+                    "https://replica.example:3443".parse().unwrap(),
+                );
+            }
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            request
+        };
+
+        let (status, _, page) = call(
+            &harness,
+            admin_get(
+                &format!("/api/admin/replication/records?user_id={USER}&after_lsn=0"),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let head = page["head_lsn"].as_u64().unwrap();
+        assert!(head >= 2, "two remembers journaled: {page}");
+        let (status, _, _) = call(&harness, admin_get("/api/admin/replication/status", true)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, body) =
+            call(&harness, admin_get("/api/admin/replication/status", false)).await;
+        std::env::remove_var(ADMIN_API_KEY_ENV);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let followers = body["followers"].as_array().expect("followers");
+        assert_eq!(
+            followers.len(),
+            1,
+            "a poll that names no follower is not one: {body}"
+        );
+        let one = &followers[0];
+        assert_eq!(one["instance_id"], follower.to_string());
+        assert_eq!(one["url"], "https://replica.example:3443/");
+        assert_eq!(one["remote_addr"], "10.4.0.9:40112");
+        assert!(
+            one["first_seen"].is_string() && one["last_poll"].is_string(),
+            "{one}"
+        );
+        assert_eq!(
+            one["users"][USER],
+            json!({"requested_lsn": 1, "leader_head_lsn": head, "lag_frames": head - 1}),
+            "it asked from lsn 1, after the frame at 0"
+        );
+
+        let (status, _, role) = call(&harness, get("/api/replication/role")).await;
+        assert_eq!(status, StatusCode::OK, "{role}");
+        assert_eq!(
+            role,
+            json!({
+                "role": "leader",
+                "instance_id": crate::replication::instance_id(),
+                "followers_count": 1,
+                "max_lag_frames": head - 1,
+            })
+        );
+    }
 }

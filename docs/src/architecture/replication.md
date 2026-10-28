@@ -20,7 +20,7 @@ reach.
 
 | Route | Role | Purpose |
 |---|---|---|
-| `GET status` | both | `instance_id`, this process's id, new at every start; `users: [{user_id, log_bytes}]` this instance can feed; `following` when it tails a leader |
+| `GET status` | both | `instance_id`, this process's id, new at every start; `users: [{user_id, log_bytes}]` this instance can feed; `followers` that polled it in the last 10 minutes; `following` when it tails a leader |
 | `GET records?user_id&after_lsn&limit` | leader | Frames after `after_lsn`, decrypted, base64, with `head_lsn`, `more` and `log_created`. 404 for a tenant with no log; it never creates one |
 | `POST follow {source, admin_key, api_key?}` | follower | Start tailing; refused when the source is this instance (any loopback name with this port, or a source whose status reports this process's `instance_id`) or already follows it. A leader whose status carries no `instance_id` (an older build) is followed |
 | `POST unfollow` | follower | Stop; a poll in progress stops at its next page; the cursor is kept |
@@ -120,13 +120,41 @@ While an instance follows a leader, only the frames it applies write to it:
 
 `GET /api/replication/role` takes any API key, and neither the admin key nor a tenant. It
 reports `{role: leader|follower|standalone, instance_id, leader_instance_id?,
-leader_url?, lag_frames?, lag_seconds?}`. `lag_frames` sums the tenants' `lag`.
+leader_url?, lag_frames?, lag_seconds?, followers_count?, max_lag_frames?}`. A leader is
+an instance that follows nothing and has been polled in the last 10 minutes; it reports
+how many followers did and the largest of their summed `lag_frames`. `lag_frames` sums the tenants' `lag`.
 `lag_seconds` is how far behind the follower was when it last reached its leader: the
 time from the start of the last pass that left every tenant at its head to the end of
 the last pass. It is absent until a pass has caught up, and it does not grow while the
 leader is unreachable. Authenticated responses from a follower carry it as
 `X-Veld-Replica-Lag-Seconds`. `/health/ready` is unchanged: it is public and publishes
 no topology.
+
+## The leader's view of its followers
+
+A follower sends `X-Veld-Instance-Id` (its `instance_id`) on every `status` and `records`
+request, and `X-Veld-Follower-Url` with its TLS URL when it has a TLS listener. The
+leader keeps, in memory, one entry per follower that named itself, at most 64 (a new one
+evicts the one polled longest ago), and drops a follower that has not polled for 10
+minutes. `status` lists them:
+
+```
+followers: [{instance_id, url?, remote_addr, first_seen, last_poll,
+             users: {user_id: {requested_lsn, leader_head_lsn, lag_frames}}}]
+```
+
+- `url` is what the follower says it is: kept only if it parses as an http(s) URL of at
+  most 512 bytes with no credentials, shown and never dialled. `remote_addr` is the
+  socket's peer.
+- `requested_lsn` is the first LSN the follower asked for. Its `after_lsn` is its cursor,
+  the last frame it applied, so it asks for `after_lsn + 1`, or 0 when it has applied
+  nothing.
+- `lag_frames = leader_head_lsn - requested_lsn` (0 when it asks from the head or past
+  it): the frames the leader held at or above `requested_lsn`, which is what that request
+  is served with no page limit. It is measured at the request and includes the frames
+  the reply carried, and a follower does not ask again for a tenant whose log is
+  unchanged, so a caught-up tenant shows its last page's size until its next change.
+  The follower's own `lag` (`leader_head_lsn - 1 - applied_lsn`) is the same count.
 
 ## Limits, stated
 

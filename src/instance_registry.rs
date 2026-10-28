@@ -141,7 +141,7 @@ fn connectable_host(host: &str) -> String {
 /// `https://` URL of a TLS listener bound to `addr`. A wildcard bind is named by the
 /// machine's hostname: the URL is for clients on other machines (local ones use
 /// `base_url`), and to them 127.0.0.1 is their own loopback.
-fn tls_url(addr: SocketAddr) -> String {
+pub(crate) fn tls_url(addr: SocketAddr) -> String {
     let host = if addr.ip().is_unspecified() {
         sysinfo::System::host_name()
             .filter(|h| !h.is_empty())
