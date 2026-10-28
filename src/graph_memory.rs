@@ -1973,6 +1973,16 @@ impl RelationType {
         }
     }
 
+    /// Whether this relation asserts nothing about its kind, so no ontological intent can
+    /// mismatch it: the documented generics plus the co-retrieval and co-occurrence edges
+    /// recall and ingest write between any two entities.
+    pub fn is_generic(&self) -> bool {
+        matches!(
+            self,
+            Self::RelatedTo | Self::AssociatedWith | Self::CoRetrieved | Self::CoOccurs
+        )
+    }
+
     /// Whether this edge asserts that its `from_entity` caused its `to_entity`.
     pub fn is_causal(&self) -> bool {
         // Exhaustive so a new variant cannot join or leave the causal set by default.

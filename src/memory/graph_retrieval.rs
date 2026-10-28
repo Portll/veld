@@ -388,7 +388,7 @@ fn select_frontier(
 }
 
 /// Ontological type penalty for spreading through `edge`: dampens wrong-type relations and
-/// targets. CoOccurs, RelatedTo and CoRetrieved are generic bridges and never penalized.
+/// targets. Generic relations ([`RelationType::is_generic`]) are bridges and never penalized.
 /// Target labels are read from storage at most once per query through `entity_label_cache`.
 fn ontological_penalty(
     edge: &SpreadEdge,
@@ -398,10 +398,7 @@ fn ontological_penalty(
 ) -> f32 {
     let mut penalty = 1.0_f32;
     if !intent.relation_types.is_empty()
-        && !matches!(
-            edge.relation_type,
-            RelationType::CoOccurs | RelationType::RelatedTo | RelationType::CoRetrieved
-        )
+        && !edge.relation_type.is_generic()
         && !intent.relation_types.contains(&edge.relation_type)
     {
         penalty *= ONTOLOGICAL_RELATION_PENALTY;
