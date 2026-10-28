@@ -17,9 +17,10 @@
 //!   bytes. Zero for the first segment and for every file written before
 //!   segments existed, whose first frame is LSN 0. Readers that predate
 //!   it ignore reserved bytes, so it is an additive change;
-//! - 4 reserved bytes, zeroed today. Reserved space lets a forwards-
-//!   compatible *additive* change to the header land without bumping
-//!   `format_version`;
+//! - 4 bytes of `flags`, zero unless a flag below is set. Readers that
+//!   predate a flag ignore it, so a new one is an additive change.
+//!   [`FLAG_SPARSE`]: frames were purged from this file, so its LSNs may
+//!   skip numbers;
 //! - a CRC32 over every preceding byte, so a torn write *during header
 //!   creation* (process killed between the header write and any frame
 //!   write) is detected as a corrupt header rather than silently
@@ -29,8 +30,8 @@
 //!
 //! ```text
 //!   ┌────────────┬─────────────┬───────────────┬─────────────┬────────────┬──────────┐
-//!   │ magic 8 B  │ version 4 B │ created 8 B   │ base_lsn 8B │ reserved 4 │ crc 4 B  │
-//!   │ "VELDIL01" │   u32 LE    │ u64 LE secs   │   u64 LE    │   zero     │  u32 LE  │
+//!   │ magic 8 B  │ version 4 B │ created 8 B   │ base_lsn 8B │ flags 4 B  │ crc 4 B  │
+//!   │ "VELDIL01" │   u32 LE    │ u64 LE secs   │   u64 LE    │   u32 LE   │  u32 LE  │
 //!   └────────────┴─────────────┴───────────────┴─────────────┴────────────┴──────────┘
 //!     offset 0       8             12              20            28           32
 //! ```
@@ -73,9 +74,10 @@ pub const HEADER_BYTES: usize = 36;
 /// i.e. everything except the CRC itself.
 const HEADER_PRECRC_BYTES: usize = HEADER_BYTES - 4;
 
-/// Reserved-byte span after `base_lsn`. Filled with zero on write; readers
-/// ignore the contents but the CRC covers them so a torn write is detected.
-const RESERVED_BYTES: usize = 4;
+/// Header flag: frames were purged from this file (see
+/// [`crate::intent_log::purge`]), so the LSNs in it, and the step from the
+/// file before it, may skip numbers.
+pub const FLAG_SPARSE: u32 = 1;
 
 /// Errors raised when reading or validating the intent log header.
 #[derive(Debug, thiserror::Error)]
@@ -111,6 +113,8 @@ pub struct IntentLogHeader {
     pub created_unix_secs: u64,
     /// LSN of the first frame in this file: 0 for the first segment.
     pub base_lsn: u64,
+    /// `FLAG_*` bits.
+    pub flags: u32,
 }
 
 impl IntentLogHeader {
@@ -127,6 +131,7 @@ impl IntentLogHeader {
             format_version: CURRENT_FORMAT_VERSION,
             created_unix_secs: created,
             base_lsn: 0,
+            flags: 0,
         }
     }
 
@@ -138,7 +143,13 @@ impl IntentLogHeader {
             format_version: CURRENT_FORMAT_VERSION,
             created_unix_secs,
             base_lsn,
+            flags: 0,
         }
+    }
+
+    /// Whether frames were purged from the file this header starts.
+    pub fn is_sparse(&self) -> bool {
+        self.flags & FLAG_SPARSE != 0
     }
 
     /// Serialise this header to its on-disk byte sequence. The returned
@@ -150,7 +161,7 @@ impl IntentLogHeader {
         buf[8..12].copy_from_slice(&self.format_version.to_le_bytes());
         buf[12..20].copy_from_slice(&self.created_unix_secs.to_le_bytes());
         buf[20..28].copy_from_slice(&self.base_lsn.to_le_bytes());
-        // buf[28..32] stays zero — reserved.
+        buf[28..32].copy_from_slice(&self.flags.to_le_bytes());
         let crc = crc32fast::hash(&buf[..HEADER_PRECRC_BYTES]);
         buf[HEADER_PRECRC_BYTES..HEADER_BYTES].copy_from_slice(&crc.to_le_bytes());
         buf
@@ -189,15 +200,14 @@ impl IntentLogHeader {
         }
         let created_unix_secs = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let base_lsn = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        // bytes[28..32] are reserved-and-zero. We do not enforce that
-        // they are literally zero — future minor changes will write
-        // additive fields there, and existing parsers must not refuse
-        // those files. The CRC keeps the bytes honest either way.
-        let _ = RESERVED_BYTES;
+        // Unknown flag bits are kept, not refused: a later build may set
+        // them, and the CRC keeps the bytes honest either way.
+        let flags = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
         Ok(Self {
             format_version,
             created_unix_secs,
             base_lsn,
+            flags,
         })
     }
 
@@ -243,6 +253,7 @@ mod tests {
             format_version: CURRENT_FORMAT_VERSION,
             created_unix_secs: 1_700_000_000,
             base_lsn: 41_000,
+            flags: FLAG_SPARSE,
         };
         let bytes = h.to_bytes();
         let back = IntentLogHeader::parse(&bytes).unwrap();
@@ -292,6 +303,7 @@ mod tests {
             format_version: 999,
             created_unix_secs: 0,
             base_lsn: 0,
+            flags: 0,
         };
         // Hand-build a header with version=999 but a correct CRC.
         let mut bytes = [0u8; HEADER_BYTES];

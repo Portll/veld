@@ -568,6 +568,10 @@ fn load_config_path_into_env(path: &std::path::Path) {
         ("gap_worker_chunk_rows", "VELD_GAP_WORKER_CHUNK_ROWS"),
         ("gap_worker_cpu_pct", "VELD_GAP_WORKER_CPU_PCT"),
         ("intent_log_segment_mb", "VELD_INTENT_LOG_SEGMENT_MB"),
+        (
+            "journal_forget_purge_days",
+            "VELD_JOURNAL_FORGET_PURGE_DAYS",
+        ),
     ];
 
     let mut applied: Vec<&str> = Vec::new();
@@ -959,6 +963,12 @@ pub struct ServerConfig {
     /// has rotated needs a build that reads segments.
     /// Env `VELD_INTENT_LOG_SEGMENT_MB`, config.toml key `intent_log_segment_mb`.
     pub intent_log_segment_mb: u64,
+
+    /// Days after which a forgotten memory's frames, its `Forget` included, are
+    /// erased from the tenant's sealed journal segments (default: 0, never).
+    /// Must outlast any replication follower's time behind this server.
+    /// Env `VELD_JOURNAL_FORGET_PURGE_DAYS`, config.toml key `journal_forget_purge_days`.
+    pub journal_forget_purge_days: u64,
 }
 
 impl Default for ServerConfig {
@@ -1000,6 +1010,7 @@ impl Default for ServerConfig {
             gap_worker_chunk_rows: GapWorkerConfig::default().chunk_rows,
             gap_worker_cpu_pct: GapWorkerConfig::default().cpu_pct,
             intent_log_segment_mb: INTENT_LOG_SEGMENT_MB_DEFAULT,
+            journal_forget_purge_days: 0,
         }
     }
 }
@@ -1054,6 +1065,14 @@ impl ServerConfig {
             ttl: self.graph_mirror_sync_ttl(),
             chunk_rows: self.gap_worker_chunk_rows,
         }
+    }
+
+    /// How long a `Forget` stays in the journal before its memory's frames are
+    /// erased; `None` keeps them.
+    pub fn journal_forget_purge_age(&self) -> Option<std::time::Duration> {
+        (self.journal_forget_purge_days > 0).then(|| {
+            std::time::Duration::from_secs(self.journal_forget_purge_days.saturating_mul(86_400))
+        })
     }
 
     /// The intent-log segment size in bytes, for `IntentLog::set_segment_bytes`.
@@ -1308,6 +1327,16 @@ impl ServerConfig {
             1,
             100,
         );
+
+        if let Ok(val) = env::var("VELD_JOURNAL_FORGET_PURGE_DAYS") {
+            match val.trim().parse::<u64>() {
+                Ok(n) => config.journal_forget_purge_days = n,
+                Err(_) => tracing::warn!(
+                    "VELD_JOURNAL_FORGET_PURGE_DAYS={} is not a number, keeping forgotten frames",
+                    val
+                ),
+            }
+        }
 
         if let Ok(val) = env::var("VELD_INTENT_LOG_SEGMENT_MB") {
             match val.trim().parse::<u64>() {
@@ -1787,6 +1816,21 @@ mod tests {
         env::set_var("VELD_AUTO_COMPRESS", "maybe");
         assert!(ServerConfig::from_env().auto_compress);
         env::remove_var("VELD_AUTO_COMPRESS");
+    }
+
+    #[test]
+    fn test_journal_forget_purge_days_env_parsing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("VELD_JOURNAL_FORGET_PURGE_DAYS");
+        assert_eq!(ServerConfig::from_env().journal_forget_purge_age(), None);
+        env::set_var("VELD_JOURNAL_FORGET_PURGE_DAYS", "30");
+        assert_eq!(
+            ServerConfig::from_env().journal_forget_purge_age(),
+            Some(std::time::Duration::from_secs(30 * 86_400))
+        );
+        env::set_var("VELD_JOURNAL_FORGET_PURGE_DAYS", "soon");
+        assert_eq!(ServerConfig::from_env().journal_forget_purge_age(), None);
+        env::remove_var("VELD_JOURNAL_FORGET_PURGE_DAYS");
     }
 
     #[test]

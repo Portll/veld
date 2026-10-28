@@ -449,6 +449,110 @@ pub fn user_logs(manager: &MultiUserMemoryManager) -> Vec<UserLogInfo> {
     out
 }
 
+/// Leader side: the lowest cursor each tenant's feed was asked to read past, by
+/// hour, so a journal purge can leave alone the `Forget` frames a follower has
+/// not read yet. Followers are not named; a lagging one shows as a low cursor,
+/// and its low hours drop out as the purge window moves past them. Persisted
+/// beside the followers' own cursors, so a restart does not forget a follower
+/// that has not polled since.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct FeedFloors {
+    /// Tenant -> unix hour -> lowest `after_lsn` asked for in that hour.
+    tenants: BTreeMap<String, BTreeMap<u64, u64>>,
+    #[serde(skip)]
+    path: Option<PathBuf>,
+}
+
+impl FeedFloors {
+    const FILE: &'static str = "feed-floors.json";
+
+    /// Load the floors kept under `base`; a missing or unreadable file starts
+    /// empty (logged), as the follower cursors do.
+    pub fn load(base: &Path) -> Self {
+        let path = base.join(CURSOR_DIR).join(Self::FILE);
+        let mut floors = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str::<FeedFloors>(&text).unwrap_or_else(|e| {
+                tracing::warn!(path = %path.display(), error = %e, "replication feed floors unreadable; starting empty");
+                FeedFloors::default()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => FeedFloors::default(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "replication feed floors unreadable; starting empty");
+                FeedFloors::default()
+            }
+        };
+        floors.path = Some(path);
+        floors
+    }
+
+    fn hour(at: std::time::SystemTime) -> u64 {
+        at.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 3600)
+            .unwrap_or(0)
+    }
+
+    /// Note a feed page asked for after `after_lsn`, dropping hours older than
+    /// `window`. Written to disk only when it changes what the floor can be: a
+    /// new hour, or a lower cursor within one.
+    pub fn note(
+        &mut self,
+        user_id: &str,
+        after_lsn: u64,
+        window: Duration,
+        at: std::time::SystemTime,
+    ) {
+        let hour = Self::hour(at);
+        let oldest = hour.saturating_sub(window.as_secs() / 3600);
+        let hours = self.tenants.entry(user_id.to_string()).or_default();
+        let before = hours.len();
+        hours.retain(|h, _| *h >= oldest);
+        let changed = match hours.get_mut(&hour) {
+            Some(low) if *low <= after_lsn => hours.len() != before,
+            Some(low) => {
+                *low = after_lsn;
+                true
+            }
+            None => {
+                hours.insert(hour, after_lsn);
+                true
+            }
+        };
+        if changed {
+            self.save();
+        }
+    }
+
+    /// The lowest cursor asked for in the last `window`, or `None` when no
+    /// follower read this tenant's feed in that time.
+    pub fn floor(&self, user_id: &str, window: Duration, at: std::time::SystemTime) -> Option<u64> {
+        let oldest = Self::hour(at).saturating_sub(window.as_secs() / 3600);
+        self.tenants
+            .get(user_id)?
+            .range(oldest..)
+            .map(|(_, low)| *low)
+            .min()
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let written = serde_json::to_vec(self)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let tmp = path.with_extension("json.tmp");
+                std::fs::write(&tmp, bytes)?;
+                std::fs::rename(&tmp, path)
+            });
+        if let Err(e) = written {
+            tracing::warn!(path = %path.display(), error = %e, "replication feed floors not saved");
+        }
+    }
+}
+
 /// Whether `user_id` already has an intent log on this instance. The feed only
 /// serves existing logs: opening a writer for an unknown tenant would create one.
 pub fn has_log(manager: &MultiUserMemoryManager, user_id: &str) -> bool {
@@ -1750,6 +1854,119 @@ mod tests {
 
         let (page, more) = page_below_head((0..4).map(record).chain(torn()), 4, 4, 500).unwrap();
         assert!(page.is_empty() && !more);
+    }
+
+    /// The floor is the lowest cursor asked for within the window; a lower one
+    /// wins, hours older than the window drop out, and the floors survive a
+    /// restart.
+    #[test]
+    fn feed_floors_keep_the_lowest_cursor_inside_the_window() {
+        let base = tempfile::TempDir::new().unwrap();
+        let day = Duration::from_secs(86_400);
+        let window = 7 * day;
+        let now = std::time::SystemTime::now();
+        let mut floors = FeedFloors::load(base.path());
+        assert_eq!(floors.floor("alice", window, now), None, "no follower seen");
+
+        floors.note("alice", 40, window, now - 3 * day);
+        floors.note("alice", 90, window, now - day);
+        floors.note("alice", 70, window, now - day);
+        floors.note("bob", 5, window, now);
+        assert_eq!(floors.floor("alice", window, now), Some(40));
+        assert_eq!(floors.floor("bob", window, now), Some(5));
+
+        let reloaded = FeedFloors::load(base.path());
+        assert_eq!(reloaded.floor("alice", window, now), Some(40));
+
+        let later = now + 5 * day;
+        assert_eq!(
+            floors.floor("alice", window, later),
+            Some(70),
+            "the low hour aged out of the window"
+        );
+        floors.note("alice", 120, window, later);
+        assert_eq!(floors.floor("alice", window, later), Some(70));
+    }
+
+    /// A follower whose cursor lies inside a range the leader erased (a forgotten
+    /// memory's frames purged from a sealed segment) reads on from the next frame
+    /// left: the page starts past the gap, as `feed` pages it. A follower that had
+    /// applied the memory before its `Forget` was erased keeps it, which is why the
+    /// purge window must outlast follower lag.
+    #[test]
+    fn a_cursor_inside_an_erased_range_reads_on_past_it() {
+        use crate::intent_log::{payload, purge, IntentLog, Lsn};
+        let snapshot = |id: &str| {
+            payload::encode(&IntentPayload::Remember {
+                user_id: "u".to_string(),
+                memory_id: id.to_string(),
+                memory_bincode: format!("{id}-content").into_bytes(),
+                schema_version: None,
+            })
+            .unwrap()
+        };
+        let forget = |id: &str| {
+            payload::encode(&IntentPayload::Forget {
+                user_id: "u".to_string(),
+                memory_id: id.to_string(),
+                schema_version: None,
+            })
+            .unwrap()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut log = IntentLog::open(dir.path().join("intent.log")).unwrap();
+        log.set_segment_bytes(Some(120));
+        for frame in [
+            snapshot("a"),
+            snapshot("b"),
+            snapshot("a"),
+            forget("a"),
+            snapshot("c"),
+            snapshot("b"),
+        ] {
+            log.append(&frame).unwrap();
+            log.sync().unwrap();
+        }
+        let ten_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+        for segment in log.sealed() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&segment.path)
+                .unwrap()
+                .set_modified(ten_days_ago)
+                .unwrap();
+        }
+        let report = purge::purge_forgotten(
+            log.path(),
+            None,
+            std::time::Duration::from_secs(7 * 86_400),
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(report.frames_dropped, 3, "a's two snapshots and its Forget");
+        let head = log.next_lsn().0;
+        let page_from = |floor: u64, limit: usize| {
+            page_below_head(log.iter_from(Lsn(floor)).unwrap(), floor, head, limit).unwrap()
+        };
+
+        let (page, more) = page_from(1, 500);
+        assert_eq!(lsns(&page), vec![1, 4, 5]);
+        assert!(!more);
+        let (page, more) = page_from(2, 500);
+        assert_eq!(
+            lsns(&page),
+            vec![4, 5],
+            "a cursor on an erased LSN resumes at the next frame"
+        );
+        assert!(!more);
+        let (page, more) = page_from(2, 1);
+        assert_eq!(lsns(&page), vec![4]);
+        assert!(more);
+        let (page, more) = page_from(5, 1);
+        assert_eq!(lsns(&page), vec![5]);
+        assert!(!more);
     }
 
     fn frame(lsn: u64, id: &str, kind: &str) -> (u64, IntentPayload) {
