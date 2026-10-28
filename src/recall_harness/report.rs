@@ -151,6 +151,9 @@ pub struct RetrievalDials {
     /// The `date_window_leg` dial: `None` is the engine default (on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_window_leg: Option<bool>,
+    /// The `fusion` dial: `None` is the engine default (FLAT).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion: Option<crate::memory::dials::FusionMode>,
 }
 
 impl RetrievalDials {
@@ -158,6 +161,7 @@ impl RetrievalDials {
     pub fn of(dials: &crate::memory::dials::CognitiveDials) -> Self {
         Self {
             date_window_leg: dials.date_window_leg,
+            fusion: dials.fusion,
         }
     }
 
@@ -165,6 +169,9 @@ impl RetrievalDials {
         let mut set: Vec<String> = Vec::new();
         if let Some(v) = self.date_window_leg {
             set.push(format!("date_window_leg={v}"));
+        }
+        if let Some(v) = self.fusion {
+            set.push(format!("fusion={}", v.as_str()));
         }
         if set.is_empty() {
             "engine defaults".to_string()
@@ -1452,22 +1459,30 @@ mod tests {
     /// two candidate pools. Refused before any metric, in either order.
     #[test]
     fn different_retrieval_dials_refuse_before_any_metric_is_compared() {
-        let off = Some(RetrievalDials {
+        let off = RetrievalDials {
             date_window_leg: Some(false),
-        });
-        let defaults = Some(RetrievalDials::default());
-        for (b, c) in [(defaults.clone(), off.clone()), (off, defaults)] {
-            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
-            let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
-            baseline.retrieval_dials = b;
-            current.retrieval_dials = c;
-            let failures = compare_to_baseline(&baseline, &current, 2.0);
-            assert_eq!(failures.len(), 1, "{failures:?}");
-            assert_eq!(failures[0].kind, "infrastructure");
-            let detail = &failures[0].detail;
-            assert!(detail.contains("retrieval dials differ"), "{detail}");
-            assert!(detail.contains("date_window_leg=false"), "{detail}");
-            assert!(detail.contains("engine defaults"), "{detail}");
+            ..Default::default()
+        };
+        let rrf = RetrievalDials {
+            fusion: Some(crate::memory::dials::FusionMode::Rrf),
+            ..Default::default()
+        };
+        for (set, named) in [(off, "date_window_leg=false"), (rrf, "fusion=rrf")] {
+            let set = Some(set);
+            let defaults = Some(RetrievalDials::default());
+            for (b, c) in [(defaults.clone(), set.clone()), (set.clone(), defaults)] {
+                let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+                let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+                baseline.retrieval_dials = b;
+                current.retrieval_dials = c;
+                let failures = compare_to_baseline(&baseline, &current, 2.0);
+                assert_eq!(failures.len(), 1, "{failures:?}");
+                assert_eq!(failures[0].kind, "infrastructure");
+                let detail = &failures[0].detail;
+                assert!(detail.contains("retrieval dials differ"), "{detail}");
+                assert!(detail.contains(named), "{detail}");
+                assert!(detail.contains("engine defaults"), "{detail}");
+            }
         }
     }
 
@@ -1488,6 +1503,7 @@ mod tests {
     fn same_retrieval_dial_override_on_both_sides_is_compared() {
         let off = Some(RetrievalDials {
             date_window_leg: Some(false),
+            ..Default::default()
         });
         let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
         let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);

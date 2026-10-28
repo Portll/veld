@@ -2803,13 +2803,28 @@ pub const QUERY_COVERAGE_MIN_TERMS: usize = 2;
 pub const PEOPLE_BOOST_MAX: f32 = 0.0;
 
 /// Pseudo-relevance feedback: a second lexical pass whose query is the original plus terms
-/// shared by the first pass's top documents, fused as its own reciprocal-rank leg at
-/// [`PRF_WEIGHT`] of the hybrid weight. Pulls in siblings of strong hits that share their
-/// vocabulary but not the query's.
+/// shared by the first pass's top documents, fused as its own leg at [`PRF_WEIGHT`] of the
+/// hybrid weight. Pulls in siblings of strong hits that share their vocabulary but not the
+/// query's.
 pub const PRF_ENABLED_DEFAULT: bool = false;
 pub const PRF_DOCS: usize = 3;
 pub const PRF_TERMS: usize = 5;
 pub const PRF_WEIGHT: f32 = 0.3;
+
+/// FLAT fusion (recall Layer 4, shodh-memory #320): the share of the weaker of a candidate's
+/// two calibrated hybrid scores, vector and BM25, added to the stronger. The stronger alone
+/// keeps a candidate one list ranks well from being buried by the other list's crowd; the
+/// share is the credit for both lists finding it. Upstream's value. Upstream measured FLAT
+/// against reciprocal-rank fusion at +0.0665 recall@10 on its LoCoMo run, and on veld's
+/// 100-case gate (2026-10-24, rule-based NER) at 0.664 against 0.622.
+pub const FLAT_CONSENSUS: f32 = 0.3;
+
+/// Graph activation bonus in recall Layer 4 (shodh-memory #174): a graph candidate's graph
+/// term is multiplied by `1 + graph_w × this × activation`, activation clamped to [0, 1].
+/// A fully activated hit gains 3% at the densest graph's weight (0.1) and 15% at the
+/// sparsest's (0.5). It replaced an additive `0.2 × graph_w × activation`, up to 0.1,
+/// which outweighed every reciprocal-rank score the fusion produced.
+pub const ACTIVATION_BONUS_SCALE: f32 = 0.3;
 
 /// Duration of the reconsolidation labile window in seconds.
 ///

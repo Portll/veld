@@ -53,6 +53,37 @@ fn default_working_memory_threshold() -> u32 {
 /// (each `MemorySystem` opens that user's own database), so a bare key is sufficient.
 pub const COGNITIVE_DIALS_KEY: &[u8] = b"cognitive_dials";
 
+/// How recall Layer 4 joins its candidate lists into one fused score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FusionMode {
+    /// Calibrated max (shodh-memory's FLAT fusion, #320). Each list enters at its weight
+    /// times the candidate's score over the list's best score; the vector and BM25 lists
+    /// join as the larger of the two plus [`crate::constants::FLAT_CONSENSUS`] of the
+    /// smaller.
+    Flat,
+    /// Reciprocal rank: each list adds `weight / (k + rank)`, with k from `rrf_k_outer`.
+    Rrf,
+}
+
+impl FusionMode {
+    /// Parses `flat` or `rrf`, in any case.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "flat" => Some(Self::Flat),
+            "rrf" => Some(Self::Rrf),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Rrf => "rrf",
+        }
+    }
+}
+
 /// Runtime-tunable cognitive parameters for a single user's [`crate::memory::MemorySystem`].
 ///
 /// See the module docs. All reconsolidation toggles default OFF; all retrieval overrides
@@ -154,11 +185,18 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub date_window_leg: Option<bool>,
 
+    /// How recall Layer 4 fuses its candidate lists. `None` is [`FusionMode::Flat`] unless
+    /// `SHODH_FUSION_RRF` asks for reciprocal rank ([`crate::memory::ablation`]); a set dial
+    /// wins over that variable.
+    #[serde(default)]
+    pub fusion: Option<FusionMode>,
+
     // ---- Recall ranking sliders (None = compile-time constant default) ---------------
     // Overlay the historical `const`s in recall.rs / hybrid_search.rs / constants.rs.
     // Rendered as sliders in the monitor "Dials" tab; see [`RECALL_SLIDER_SPECS`] for
     // each one's default / recommended / absolute range.
-    /// RRF k for the outer graph+hybrid fusion (recall.rs Layer 4). Default 20.
+    /// RRF k for the outer graph+hybrid fusion (recall.rs Layer 4), read only under
+    /// [`FusionMode::Rrf`]. Default 20.
     #[serde(default)]
     pub rrf_k_outer: Option<f32>,
     /// RRF k for the decomposed sub-query merge. Default 20.
@@ -628,6 +666,7 @@ impl Default for CognitiveDials {
             rerank_model: None,
             rrf_weights: None,
             date_window_leg: None,
+            fusion: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
             rrf_k_inner: None,
@@ -786,7 +825,8 @@ impl CognitiveDials {
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
-    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG}`.
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG,
+    /// FUSION}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -846,6 +886,15 @@ impl CognitiveDials {
         }
         if let Some(v) = env_bool("VELD_DIALS_DATE_WINDOW_LEG") {
             d.date_window_leg = Some(v);
+        }
+        // Empty is unset, as the recall gate passes an unused workflow input.
+        if let Ok(raw) = std::env::var("VELD_DIALS_FUSION") {
+            if !raw.trim().is_empty() {
+                d.fusion = FusionMode::parse(&raw);
+                if d.fusion.is_none() {
+                    tracing::warn!("VELD_DIALS_FUSION={raw:?} is neither flat nor rrf (ignored)");
+                }
+            }
         }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
@@ -926,6 +975,7 @@ mod tests {
         assert!(d.rerank_model.is_none());
         assert!(d.rrf_weights.is_none());
         assert!(d.date_window_leg.is_none());
+        assert!(d.fusion.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,
             crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS
@@ -1120,6 +1170,19 @@ mod tests {
         }
         .sanitized();
         assert_eq!(empty.rerank_model, None);
+    }
+
+    #[test]
+    fn fusion_dial_parses_and_round_trips() {
+        assert_eq!(FusionMode::parse(" RRF "), Some(FusionMode::Rrf));
+        assert_eq!(FusionMode::parse("flat"), Some(FusionMode::Flat));
+        assert_eq!(FusionMode::parse("sum"), None);
+        let d: CognitiveDials = serde_json::from_str(r#"{"fusion": "rrf"}"#).unwrap();
+        assert_eq!(d.fusion, Some(FusionMode::Rrf));
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""fusion":"rrf""#), "{json}");
+        let older: CognitiveDials = serde_json::from_str("{}").unwrap();
+        assert_eq!(older.fusion, None);
     }
 
     #[test]

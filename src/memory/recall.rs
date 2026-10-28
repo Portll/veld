@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::constants::{HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING};
 use crate::embeddings::Embedder;
+use crate::memory::dials::FusionMode;
 use crate::memory::graph_retrieval::calculate_density_weights;
 use crate::memory::introspection::{self, StrengtheningReason};
 use crate::memory::learning_history;
@@ -1839,28 +1840,56 @@ impl super::MemorySystem {
             } else {
                 None
             };
-            let hybrid_ids = hybrid_search_results
-                .map(|r| {
-                    r.into_iter()
-                        .map(|x| {
-                            attr.insert(
-                                x.memory_id.clone(),
-                                SignalAttribution {
-                                    bm25_contribution: x.bm25_score.unwrap_or(0.0),
-                                    vector_contribution: x.vector_score.unwrap_or(0.0),
-                                    graph_contribution: x.graph_score.unwrap_or(0.0),
-                                    cross_encoder_contribution: x.rerank_score.unwrap_or(0.0),
-                                    ..Default::default()
+            // What FLAT fuses: each hybrid candidate's raw scores in the two lists, and the
+            // factor the optional LLM refiner multiplied its hybrid score by (1 without one).
+            let mut hybrid_components: std::collections::HashMap<MemoryId, HybridComponents> =
+                std::collections::HashMap::new();
+            let hybrid_ids = match hybrid_search_results {
+                Some(r) => r
+                    .into_iter()
+                    .map(|x| {
+                        attr.insert(
+                            x.memory_id.clone(),
+                            SignalAttribution {
+                                bm25_contribution: x.bm25_score.unwrap_or(0.0),
+                                vector_contribution: x.vector_score.unwrap_or(0.0),
+                                graph_contribution: x.graph_score.unwrap_or(0.0),
+                                cross_encoder_contribution: x.rerank_score.unwrap_or(0.0),
+                                ..Default::default()
+                            },
+                        );
+                        hybrid_components.insert(
+                            x.memory_id.clone(),
+                            HybridComponents {
+                                bm25: x.bm25_score.unwrap_or(0.0),
+                                vector: x.vector_score.unwrap_or(0.0),
+                                refined: if x.rrf_score > 0.0 {
+                                    x.score / x.rrf_score
+                                } else {
+                                    1.0
                                 },
-                            );
-                            (x.memory_id, x.score)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or(vector_results);
+                            },
+                        );
+                        (x.memory_id, x.score)
+                    })
+                    .collect::<Vec<_>>(),
+                None => {
+                    for (id, score) in &vector_results {
+                        hybrid_components.insert(
+                            id.clone(),
+                            HybridComponents {
+                                bm25: 0.0,
+                                vector: *score,
+                                refined: 1.0,
+                            },
+                        );
+                    }
+                    vector_results
+                }
+            };
 
             // ===========================================================================
-            // LAYER 4: RRF FUSION WITH DENSITY-BASED WEIGHTS (PIPE-11)
+            // LAYER 4: FUSION WITH DENSITY-BASED WEIGHTS (PIPE-11)
             // ===========================================================================
             // Biological model: Memory graphs start dense (noisy L1 edges) and become
             // sparse over time through pruning (Hebbian "use it or lose it").
@@ -1868,11 +1897,14 @@ impl super::MemorySystem {
             // Sparse graphs = mature, curated connections = trust graph more
             // Dense graphs = fresh, noisy connections = trust semantic/BM25 more
             //
-            // The density weights directly control the balance - no extra multipliers.
-            // This follows ACT-R's additive activation model.
-            // K controls top-rank discrimination: K=20 → rank-1 vs rank-5 gap is 19%
-            // (vs 12% at K=30). Higher K = more equal weighting, lower K = sharper.
-            // Precedence: per-query rrf_k → live dial `rrf_k_outer` → const 20.0.
+            // FLAT (the default) scores a candidate in each list by its score over the list's
+            // best, so a list's top hit enters at the list's weight: reciprocal rank gave rank 1
+            // weight / 21 and discarded how far ahead of rank 2 it was, which buried a candidate
+            // one list was sure of under the other list's crowd. Vector and BM25 join as the
+            // stronger plus FLAT_CONSENSUS of the weaker; the other lists add. The `fusion` dial
+            // (or SHODH_FUSION_RRF) restores reciprocal rank, where K sets top-rank
+            // discrimination. K precedence: per-query rrf_k → live dial `rrf_k_outer` → 20.0.
+            let fusion_mode = super::ablation::fusion_mode(early_dials_snapshot.fusion);
             let k: f32 = query
                 .rrf_k
                 .or_else(|| self.cognitive_dials.read().rrf_k_outer)
@@ -1903,20 +1935,21 @@ impl super::MemorySystem {
             let hybrid_w = semantic_w + linguistic_w;
 
             tracing::debug!(
-                "Layer 4 RRF: density={:?}, graph_w={:.2}, hybrid_w={:.2}, query_entities={}",
+                "Layer 4 {} fusion: density={:?}, graph_w={:.2}, hybrid_w={:.2}, query_entities={}",
+                fusion_mode.as_str(),
                 graph_density,
                 graph_w,
                 hybrid_w,
                 query_entity_count
             );
 
-            // Graph results: pure RRF with density weight
+            // Graph results: the leg's term, times the activation bonus. Under FLAT the term
+            // is the activation over the leg's highest.
+            let best_activation = best_leg_score(graph_results.iter().map(|(_, a, _)| *a));
             for (r, (id, activation, h)) in graph_results.iter().enumerate() {
-                // Standard RRF: weight / (k + rank), rank is 1-indexed
-                let rrf_score = graph_w / (k + (r + 1) as f32);
-                // RRF score + additive activation bonus (ACT-R spreading activation)
-                let activation_bonus = graph_w * 0.2 * activation.clamp(0.0, 1.0);
-                *fused.entry(id.clone()).or_insert(0.0) += rrf_score + activation_bonus;
+                let term = leg_term(fusion_mode, graph_w, k, r + 1, *activation, best_activation)
+                    * graph_activation_factor(graph_w, *activation);
+                *fused.entry(id.clone()).or_insert(0.0) += term;
                 heb.insert(id.clone(), *h);
 
                 // Signal attribution: record graph contribution for memories
@@ -1924,9 +1957,28 @@ impl super::MemorySystem {
                 attr.entry(id.clone()).or_default().graph_contribution = *activation;
             }
 
-            // Hybrid (BM25+vector) results: pure RRF with density weight
-            for (r, (id, _)) in hybrid_ids.iter().enumerate() {
-                *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
+            // Hybrid (BM25+vector) results.
+            match fusion_mode {
+                FusionMode::Rrf => {
+                    for (r, (id, _)) in hybrid_ids.iter().enumerate() {
+                        *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
+                    }
+                }
+                FusionMode::Flat => {
+                    let best_vector = best_leg_score(hybrid_components.values().map(|c| c.vector));
+                    let best_bm25 = best_leg_score(hybrid_components.values().map(|c| c.bm25));
+                    for (id, _) in &hybrid_ids {
+                        let Some(c) = hybrid_components.get(id) else {
+                            continue;
+                        };
+                        *fused.entry(id.clone()).or_insert(0.0) += hybrid_w
+                            * flat_hybrid(
+                                calibrated(c.vector, best_vector),
+                                calibrated(c.bm25, best_bm25),
+                            )
+                            * c.refined;
+                    }
+                }
             }
 
             // PSEUDO-RELEVANCE FEEDBACK: a second lexical pass whose query adds the terms the
@@ -1961,8 +2013,10 @@ impl super::MemorySystem {
                         .search(&expanded, query.max_results * 5)
                         .unwrap_or_default();
                     let prf_w = hybrid_w * prf_weight;
-                    for (r, (id, _)) in prf_hits.iter().enumerate() {
-                        *fused.entry(id.clone()).or_insert(0.0) += prf_w / (k + (r + 1) as f32);
+                    let best_prf = best_leg_score(prf_hits.iter().map(|(_, s)| *s));
+                    for (r, (id, score)) in prf_hits.iter().enumerate() {
+                        *fused.entry(id.clone()).or_insert(0.0) +=
+                            leg_term(fusion_mode, prf_w, k, r + 1, *score, best_prf);
                     }
                     tracing::debug!(
                         terms = terms.join(" "),
@@ -1972,24 +2026,27 @@ impl super::MemorySystem {
                 }
             }
 
-            // Date window results (Layer 3.7): pure RRF at the hybrid weight. A memory
-            // the hybrid list also holds gains from both, which is the point: the date
-            // confirms the match. One the hybrid list could not reach enters here.
+            // Date window results (Layer 3.7), at the hybrid weight. A memory the hybrid
+            // list also holds gains from both, which is the point: the date confirms the
+            // match. One the hybrid list could not reach enters here.
             if !date_window_results.is_empty() {
-                for (r, (id, _)) in date_window_results.iter().enumerate() {
-                    *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
+                let best_dated = best_leg_score(date_window_results.iter().map(|(_, s)| *s));
+                for (r, (id, score)) in date_window_results.iter().enumerate() {
+                    *fused.entry(id.clone()).or_insert(0.0) +=
+                        leg_term(fusion_mode, hybrid_w, k, r + 1, *score, best_dated);
                     attr.entry(id.clone()).or_default().temporal_match = true;
                 }
                 tracing::debug!(
-                    "Layer 4 RRF: date window leg added {} results (w={:.2})",
+                    "Layer 4 fusion: date window leg added {} results (w={:.2})",
                     date_window_results.len(),
                     hybrid_w
                 );
             }
 
-            // Secondary Vamana (768d) results: 4th RRF signal
-            // RRF is rank-based, so score scale differences between 384d/768d spaces
-            // don't matter. Weight is split from semantic_w to avoid inflating total.
+            // Secondary Vamana (768d) results: a fourth list. Both fusions are blind to the
+            // scale difference between the 384d and 768d spaces: reciprocal rank reads ranks,
+            // FLAT calibrates against the list's own best. Weight is split from semantic_w to
+            // avoid inflating total.
             let use_dual = query.dual_index.unwrap_or(true);
             if use_dual {
                 // When a learned secondary→primary alignment is installed for the
@@ -2025,11 +2082,13 @@ impl super::MemorySystem {
                             .secondary_rrf_ratio
                             .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
                         let sec_w = semantic_w * sec_ratio;
-                        for (r, (id, _)) in aligned.iter().enumerate() {
-                            *fused.entry(id.clone()).or_insert(0.0) += sec_w / (k + (r + 1) as f32);
+                        let best_aligned = best_leg_score(aligned.iter().map(|(_, s)| *s));
+                        for (r, (id, score)) in aligned.iter().enumerate() {
+                            *fused.entry(id.clone()).or_insert(0.0) +=
+                                leg_term(fusion_mode, sec_w, k, r + 1, *score, best_aligned);
                         }
                         tracing::debug!(
-                            "Layer 4 RRF: aligned secondary (projected→primary) added {} results (w={:.2})",
+                            "Layer 4 fusion: aligned secondary (projected→primary) added {} results (w={:.2})",
                             aligned.len(),
                             sec_w
                         );
@@ -2049,12 +2108,13 @@ impl super::MemorySystem {
                                 .secondary_rrf_ratio
                                 .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
                             let sec_w = semantic_w * sec_ratio;
-                            for (r, (id, _)) in sec_results.iter().enumerate() {
+                            let best_sec = best_leg_score(sec_results.iter().map(|(_, s)| *s));
+                            for (r, (id, score)) in sec_results.iter().enumerate() {
                                 *fused.entry(id.clone()).or_insert(0.0) +=
-                                    sec_w / (k + (r + 1) as f32);
+                                    leg_term(fusion_mode, sec_w, k, r + 1, *score, best_sec);
                             }
                             tracing::debug!(
-                                "Layer 4 RRF: secondary Vamana added {} results (w={:.2})",
+                                "Layer 4 fusion: secondary Vamana added {} results (w={:.2})",
                                 sec_results.len(),
                                 sec_w
                             );
@@ -6167,6 +6227,57 @@ fn entity_match_specificity(n: usize, matching: usize) -> f32 {
     ((n as f32 / matching as f32).ln() / (n as f32).ln()).clamp(0.0, 1.0)
 }
 
+/// One hybrid-list candidate as Layer 4's FLAT fusion reads it.
+#[derive(Debug, Clone, Copy)]
+struct HybridComponents {
+    /// Raw BM25 score, 0 when only the vector list found it.
+    bm25: f32,
+    /// Raw vector-list score (cosine, or reciprocal rank on a decomposed query), 0 when
+    /// only BM25 found it.
+    vector: f32,
+    /// The factor the LLM refiner multiplied the hybrid score by; 1 when it did not run.
+    refined: f32,
+}
+
+/// The highest score in a fused list, the denominator FLAT calibrates the list against.
+fn best_leg_score(scores: impl Iterator<Item = f32>) -> f32 {
+    scores.filter(|s| s.is_finite()).fold(0.0, f32::max)
+}
+
+/// `score` over its list's best, in [0, 1]; 0 for a list with no positive score.
+fn calibrated(score: f32, best: f32) -> f32 {
+    if best > 0.0 && score.is_finite() {
+        (score / best).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// What one list adds to a candidate's fused score: `weight / (k + rank)` (rank from 1) under
+/// reciprocal rank, `weight × score / best` under FLAT.
+fn leg_term(mode: FusionMode, weight: f32, k: f32, rank: usize, score: f32, best: f32) -> f32 {
+    match mode {
+        FusionMode::Rrf => weight / (k + rank as f32),
+        FusionMode::Flat => weight * calibrated(score, best),
+    }
+}
+
+/// FLAT's join of a candidate's calibrated vector and BM25 scores: the stronger, plus
+/// `FLAT_CONSENSUS` of the weaker.
+fn flat_hybrid(vector: f32, bm25: f32) -> f32 {
+    let (strong, weak) = if vector >= bm25 {
+        (vector, bm25)
+    } else {
+        (bm25, vector)
+    };
+    strong + crate::constants::FLAT_CONSENSUS * weak
+}
+
+/// The multiplier on a graph candidate's graph term for its activation.
+fn graph_activation_factor(graph_w: f32, activation: f32) -> f32 {
+    1.0 + graph_w * crate::constants::ACTIVATION_BONUS_SCALE * activation.clamp(0.0, 1.0)
+}
+
 /// Layer 4.54 (temporal topic dedup) over the `cap` highest fused scores: for each pair of
 /// those whose lowercase entity sets have Jaccard > 0.40, the older is demoted ×0.85, once
 /// however many newer memories share its topic. Compounded per pair, the oldest memory on a
@@ -7419,5 +7530,63 @@ mod query_entity_resolution_tests {
         let as_focal = resolve_query_entities(&graph, &["Vornak"], &[], "vornak");
         assert_eq!(as_focal.focal, vec![reactor]);
         assert_eq!(as_focal.all, vec![reactor]);
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+
+    const EPS: f32 = 1e-6;
+
+    #[test]
+    fn flat_scores_a_list_by_how_close_a_candidate_is_to_its_best() {
+        // Rank does not enter: the same score over the same best is the same term at rank 1
+        // and rank 50, so a leg's length cannot change what fusion believes of a candidate.
+        let at_1 = leg_term(FusionMode::Flat, 0.7, 20.0, 1, 0.45, 0.6);
+        let at_50 = leg_term(FusionMode::Flat, 0.7, 20.0, 50, 0.45, 0.6);
+        assert!((at_1 - 0.7 * 0.75).abs() < EPS);
+        assert_eq!(at_1, at_50);
+        // A list's best enters at the list's weight, not weight / (k + 1).
+        assert!((leg_term(FusionMode::Flat, 0.3, 20.0, 1, 0.9, 0.9) - 0.3).abs() < EPS);
+        assert!((leg_term(FusionMode::Rrf, 0.3, 20.0, 1, 0.9, 0.9) - 0.3 / 21.0).abs() < EPS);
+        assert!((leg_term(FusionMode::Rrf, 0.3, 20.0, 10, 0.1, 0.9) - 0.3 / 30.0).abs() < EPS);
+    }
+
+    #[test]
+    fn calibration_is_bounded_and_safe_on_an_empty_list() {
+        assert_eq!(calibrated(0.5, 0.0), 0.0);
+        assert_eq!(calibrated(f32::NAN, 1.0), 0.0);
+        assert_eq!(calibrated(-0.2, 0.8), 0.0);
+        assert_eq!(calibrated(0.8, 0.8), 1.0);
+        assert_eq!(best_leg_score(std::iter::empty()), 0.0);
+        assert_eq!(best_leg_score([0.2, f32::NAN, 0.7].into_iter()), 0.7);
+    }
+
+    #[test]
+    fn a_candidate_one_list_is_sure_of_beats_a_crowd_both_lists_half_match() {
+        // The burial FLAT exists to undo: vector's best, absent from BM25, against a
+        // candidate both lists put at 0.6 of their best.
+        let single = flat_hybrid(1.0, 0.0);
+        let crowd = flat_hybrid(0.6, 0.6);
+        assert!((single - 1.0).abs() < EPS);
+        assert!((crowd - (0.6 + 0.3 * 0.6)).abs() < EPS);
+        assert!(single > crowd);
+        // Both lists finding a candidate is still worth something over one list.
+        assert!(flat_hybrid(0.8, 0.5) > flat_hybrid(0.8, 0.0));
+        // Symmetric in the two lists.
+        assert_eq!(flat_hybrid(0.3, 0.9), flat_hybrid(0.9, 0.3));
+    }
+
+    #[test]
+    fn graph_activation_multiplies_the_graph_term_within_a_bound() {
+        assert!((graph_activation_factor(0.5, 1.0) - 1.15).abs() < EPS);
+        assert!((graph_activation_factor(0.1, 1.0) - 1.03).abs() < EPS);
+        assert_eq!(
+            graph_activation_factor(0.5, 7.0),
+            graph_activation_factor(0.5, 1.0)
+        );
+        assert_eq!(graph_activation_factor(0.0, 1.0), 1.0);
+        assert_eq!(graph_activation_factor(0.5, -1.0), 1.0);
     }
 }

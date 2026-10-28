@@ -25,7 +25,8 @@ reconsolidation behaves exactly as it did pre-dials.
 
 | Dial | Env | Default | What it switches |
 |---|---|---|---|
-| `date_window_leg` | `VELD_DIALS_DATE_WINDOW_LEG` | `None` (on) | The date window candidate leg (recall Layer 3.7). When a query names a calendar day ("1 May, 2022") or month-year ("April 2022"), the memories whose `created_at` falls in that window — a day widened by one day either side, a month as written — enter RRF fusion as their own list, ranked by similarity to the query and capped at `candidate_count` (or `max_results × 8`). Year-only mentions never fire it. `Some(false)` leaves dated queries to the Layer 4.55 temporal boost alone. |
+| `date_window_leg` | `VELD_DIALS_DATE_WINDOW_LEG` | `None` (on) | The date window candidate leg (recall Layer 3.7). When a query names a calendar day ("1 May, 2022") or month-year ("April 2022"), the memories whose `created_at` falls in that window — a day widened by one day either side, a month as written — enter Layer 4 fusion as their own list, ranked by similarity to the query and capped at `candidate_count` (or `max_results × 8`). Year-only mentions never fire it. `Some(false)` leaves dated queries to the Layer 4.55 temporal boost alone. |
+| `fusion` | `VELD_DIALS_FUSION` (`flat` or `rrf`) | `None` (FLAT) | How recall Layer 4 joins its lists. FLAT, shodh-memory's calibrated max: each list adds its weight times the candidate's score over the list's best score, and the vector and BM25 lists join as the stronger plus `FLAT_CONSENSUS` (0.3) of the weaker. `rrf` adds `weight / (k + rank)` per list, k from `rrf_k_outer`. Unset, upstream's `SHODH_FUSION_RRF=1` also selects `rrf`; a set dial wins. |
 
 The recall gate records the overrides a run was measured under
 (`retrieval_dials` in `tests/recall/locomo-gate-baseline.json`) and refuses to
