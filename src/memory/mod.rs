@@ -195,8 +195,8 @@ pub use crate::memory::hybrid_search::{
     LearnedWeights, RRFusion, SignalScores,
 };
 pub use crate::memory::introspection::{
-    AssociationChange, ConsolidationEvent, ConsolidationEventBuffer, ConsolidationReport,
-    ConsolidationStats, EdgeFormationReason, FactChange, InterferenceEvent, InterferenceType,
+    AssociationChange, ConsolidationEvent, ConsolidationEventBuffer, ConsolidationInterference,
+    ConsolidationReport, ConsolidationStats, EdgeFormationReason, FactChange, InterferenceType,
     MemoryChange, PruningReason, ReplayEvent, ReportPeriod, StrengtheningReason,
 };
 pub use crate::memory::learning_history::{
@@ -222,7 +222,7 @@ pub use crate::memory::segmentation::{
 };
 pub use crate::memory::sessions::{
     Session, SessionEvent, SessionId, SessionStats, SessionStatus, SessionStore, SessionStoreStats,
-    SessionSummary, TemporalContext, TimeOfDay,
+    SessionSummary, SessionTimeContext, TimeOfDay,
 };
 pub use crate::memory::temporal_facts::{
     ContradictionType, EventType, ResolvedTime, TemporalFact, TemporalFactStore,

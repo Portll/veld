@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use serde_reflection::{Registry, Samples, Tracer, TracerConfig};
 use veld::memory::compression::PurgeReason;
 use veld::memory::facets::{
-    AgentRole, BoundaryCause, CausalRelation, ContentKind, Place, RecordKind, TimePrecision,
+    AgentRole, BoundaryCause, CausalKind, ContentKind, Place, RecordKind, TimePrecision,
 };
 use veld::memory::types::{
     ChangeType, ExperienceType, MediaType, Memory, MemoryTier, RelationshipType, SourceType,
@@ -46,7 +46,7 @@ fn trace_memory_enums(tracer: &mut Tracer, samples: &Samples) {
         samples,
         AgentRole,
         BoundaryCause,
-        CausalRelation,
+        CausalKind,
         ChangeType,
         ContentKind,
         ExperienceType,

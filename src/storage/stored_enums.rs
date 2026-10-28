@@ -12,7 +12,7 @@ use crate::graph_memory::{
 };
 use crate::memory::compression::FactType;
 use crate::memory::facets::{
-    AgentRole, BoundaryCause, CausalRelation, ContentKind, PlanStatus, RecordKind, TimePrecision,
+    AgentRole, BoundaryCause, CausalKind, ContentKind, PlanStatus, RecordKind, TimePrecision,
 };
 use crate::memory::types::{
     ChangeType, ExperienceType, FileType, LearnedFrom, MediaType, MemoryTier, ProjectStatus,
@@ -117,11 +117,11 @@ fn facet_enums_keep_their_positions() {
         AgentRole::Mentioned,
     );
     pinned!(
-        CausalRelation::Caused,
-        CausalRelation::Triggered,
-        CausalRelation::Enabled,
-        CausalRelation::Prevented,
-        CausalRelation::Motivated,
+        CausalKind::Caused,
+        CausalKind::Triggered,
+        CausalKind::Enabled,
+        CausalKind::Prevented,
+        CausalKind::Motivated,
     );
     pinned!(
         BoundaryCause::GoalChange,

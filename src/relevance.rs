@@ -382,7 +382,7 @@ struct GraphEntityIndex {
 /// Weights are normalized to sum to 1.0 and updated via gradient descent
 /// when user provides feedback on surfaced memories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LearnedWeights {
+pub struct LearnedSignalWeights {
     /// Weight for semantic similarity score
     pub semantic: f32,
     /// Weight for entity matching score
@@ -422,7 +422,7 @@ fn default_graph_strength_weight() -> f32 {
     DEFAULT_GRAPH_STRENGTH_WEIGHT
 }
 
-impl Default for LearnedWeights {
+impl Default for LearnedSignalWeights {
     fn default() -> Self {
         Self {
             semantic: DEFAULT_SEMANTIC_WEIGHT,
@@ -438,7 +438,7 @@ impl Default for LearnedWeights {
     }
 }
 
-impl LearnedWeights {
+impl LearnedSignalWeights {
     /// Normalize weights to sum to 1.0
     pub fn normalize(&mut self) {
         let sum = self.semantic
@@ -671,7 +671,7 @@ pub struct RelevanceEngine {
     entity_index: Arc<RwLock<HashMap<usize, GraphEntityIndex>>>,
 
     /// Learned weights for score fusion, adapted via feedback
-    learned_weights: Arc<RwLock<LearnedWeights>>,
+    learned_weights: Arc<RwLock<LearnedSignalWeights>>,
 
     /// Active A/B test ID (if any) for this engine
     active_ab_test: Arc<RwLock<Option<String>>>,
@@ -683,7 +683,7 @@ impl RelevanceEngine {
         Self {
             ner,
             entity_index: Arc::new(RwLock::new(HashMap::new())),
-            learned_weights: Arc::new(RwLock::new(LearnedWeights::default())),
+            learned_weights: Arc::new(RwLock::new(LearnedSignalWeights::default())),
             active_ab_test: Arc::new(RwLock::new(None)),
         }
     }
@@ -701,12 +701,12 @@ impl RelevanceEngine {
     }
 
     /// Get current learned weights
-    pub fn get_weights(&self) -> LearnedWeights {
+    pub fn get_weights(&self) -> LearnedSignalWeights {
         self.learned_weights.read().clone()
     }
 
     /// Set learned weights (e.g., loaded from storage)
-    pub fn set_weights(&self, weights: LearnedWeights) {
+    pub fn set_weights(&self, weights: LearnedSignalWeights) {
         *self.learned_weights.write() = weights;
     }
 
@@ -787,7 +787,7 @@ impl RelevanceEngine {
         graph_memory: Option<&GraphMemory>,
         config: &RelevanceConfig,
         feedback_store: Option<&RwLock<FeedbackStore>>,
-        weights_override: Option<LearnedWeights>,
+        weights_override: Option<LearnedSignalWeights>,
     ) -> Result<RelevanceResponse> {
         let start = Instant::now();
         let mut debug = RelevanceDebug {
@@ -2004,7 +2004,7 @@ mod tests {
 
     #[test]
     fn test_learned_weights_default() {
-        let weights = LearnedWeights::default();
+        let weights = LearnedSignalWeights::default();
 
         // Should sum to 1.0 (includes momentum, access_count, and graph_strength)
         let sum = weights.semantic
@@ -2028,7 +2028,7 @@ mod tests {
 
     #[test]
     fn test_learned_weights_normalize() {
-        let mut weights = LearnedWeights {
+        let mut weights = LearnedSignalWeights {
             semantic: 0.5,
             entity: 0.5,
             tag: 0.5,
@@ -2056,7 +2056,7 @@ mod tests {
 
     #[test]
     fn test_learned_weights_feedback_helpful() {
-        let mut weights = LearnedWeights::default();
+        let mut weights = LearnedSignalWeights::default();
         let initial_semantic = weights.semantic;
         let initial_entity = weights.entity;
 
@@ -2086,7 +2086,7 @@ mod tests {
 
     #[test]
     fn test_learned_weights_feedback_not_helpful() {
-        let mut weights = LearnedWeights::default();
+        let mut weights = LearnedSignalWeights::default();
 
         // Negative feedback - semantic was the main signal
         weights.apply_feedback(true, false, false, false, false);
@@ -2119,7 +2119,7 @@ mod tests {
 
     #[test]
     fn test_score_fusion() {
-        let weights = LearnedWeights::default();
+        let weights = LearnedSignalWeights::default();
 
         // All high scores with high momentum, access count, and graph strength
         let high = weights.fuse_scores_full(0.9, 0.9, 0.9, 0.9, 0.9, 16, 0.9);
@@ -2164,7 +2164,7 @@ mod tests {
 
     #[test]
     fn test_min_weight_enforcement() {
-        let mut weights = LearnedWeights {
+        let mut weights = LearnedSignalWeights {
             semantic: 0.1,
             entity: MIN_WEIGHT + 0.01, // 0.06
             tag: 0.3,                  // Reduced from 0.5 so sum < 1.0
@@ -2202,7 +2202,7 @@ mod tests {
 
     #[test]
     fn test_fuse_scores_nan_inf_guard() {
-        let weights = LearnedWeights::default();
+        let weights = LearnedSignalWeights::default();
 
         // NaN input
         let result = weights.fuse_scores_full(f32::NAN, 0.5, 0.5, 0.5, 0.0, 1, 0.5);

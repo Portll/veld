@@ -783,20 +783,38 @@ fn module_prefix(module: &[String], from: &str) -> Option<String> {
     })
 }
 
-impl Index {
-    /// The key under which a definition is published: its name when that is unique in the
-    /// crate, else `name` qualified by the file it lives in.
-    fn key(&self, def: &TypeDoc) -> String {
-        if self.defs.get(&def.name).map(Vec::len).unwrap_or(0) <= 1 {
-            def.name.clone()
-        } else {
-            format!(
-                "{} ({})",
-                def.name,
-                def.file.trim_start_matches("src/").trim_end_matches(".rs")
-            )
-        }
+/// `name (file)`: the identity of a definition while the walk runs, before it is known
+/// which names are unique among the definitions reached.
+fn qualified_key(def: &TypeDoc) -> String {
+    format!(
+        "{} ({})",
+        def.name,
+        def.file.trim_start_matches("src/").trim_end_matches(".rs")
+    )
+}
+
+/// Re-key the reached definitions for publication: a name is plain when it is unique among
+/// the types on the page, and `name (file)` only when two reached definitions share it. A
+/// twin elsewhere in the crate that no route reaches does not qualify the name.
+fn publish(reached: BTreeMap<String, TypeDoc>) -> BTreeMap<String, TypeDoc> {
+    let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
+    for def in reached.values() {
+        *by_name.entry(def.name.clone()).or_default() += 1;
     }
+    reached
+        .into_values()
+        .map(|def| {
+            let key = if by_name[&def.name] == 1 {
+                def.name.clone()
+            } else {
+                qualified_key(&def)
+            };
+            (key, def)
+        })
+        .collect()
+}
+
+impl Index {
 
     fn resolve(&self, module: &[String], name: &str, from: &str) -> Resolution {
         if BUILTIN.contains(&name) {
@@ -1027,7 +1045,7 @@ impl<'a> Walker<'a> {
     fn visit_name(&mut self, module: &[String], name: &str, from: &str) {
         match self.index.resolve(module, name, from) {
             Resolution::Found(def) => {
-                let key = self.index.key(&def);
+                let key = qualified_key(&def);
                 if self.types.contains_key(&key) {
                     return;
                 }
@@ -1360,7 +1378,7 @@ fn main() -> Result<()> {
     let output = Output {
         generated_from: vec!["src/handlers/router.rs", "src/handlers/*.rs", "src/**/*.rs"],
         routes,
-        types: walker.types,
+        types: publish(walker.types),
         ambiguous: walker.ambiguous,
         handlers_not_found: not_found,
     };

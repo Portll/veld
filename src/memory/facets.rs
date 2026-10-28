@@ -593,7 +593,7 @@ pub struct CausalLink {
     /// The other memory.
     pub other: MemoryId,
     /// The kind of causal relation.
-    pub relation: CausalRelation,
+    pub relation: CausalKind,
     /// Confidence in this link, 0.0–1.0.
     pub confidence: f32,
     /// Was this link observed or inferred? Inferred links are weaker evidence
@@ -605,7 +605,7 @@ pub struct CausalLink {
 /// Kinds of causal relation between memories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum CausalRelation {
+pub enum CausalKind {
     /// Strictly caused.
     #[default]
     Caused,
@@ -1306,7 +1306,7 @@ mod tests {
             }],
             causes: vec![CausalLink {
                 other,
-                relation: CausalRelation::Triggered,
+                relation: CausalKind::Triggered,
                 confidence: 0.8,
                 inferred: true,
             }],
@@ -1319,7 +1319,7 @@ mod tests {
         let back: WhyFacet = serde_json::from_str(&json).unwrap();
         assert_eq!(back.goal_stack.len(), 1);
         assert_eq!(back.causes.len(), 1);
-        assert_eq!(back.causes[0].relation, CausalRelation::Triggered);
+        assert_eq!(back.causes[0].relation, CausalKind::Triggered);
         assert!(back.causes[0].inferred);
         assert_eq!(back.boundary, Some(BoundaryCause::GoalChange));
     }

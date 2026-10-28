@@ -735,7 +735,7 @@ pub struct MemoryCard {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Shelf<T> {
+pub struct UiShelf<T> {
     pub count: usize,
     pub items: Vec<T>,
 }
@@ -782,23 +782,23 @@ pub struct CountCard {
 
 #[derive(Debug, Serialize)]
 pub struct Knows {
-    pub settled_facts: Field<Shelf<FactCard>>,
-    pub changed_its_mind: Field<Shelf<FactCard>>,
-    pub contradictions: Field<Shelf<FactCard>>,
-    pub rulings: Field<Shelf<MemoryCard>>,
-    pub scars: Field<Shelf<MemoryCard>>,
-    pub who_and_what: Field<Shelf<EntityCard>>,
-    pub strongest_associations: Field<Shelf<AssociationCard>>,
-    pub about_to_forget: Field<Shelf<MemoryCard>>,
-    pub pinned: Field<Shelf<MemoryCard>>,
-    pub known_but_never_asked: Field<Shelf<MemoryCard>>,
-    pub most_asked: Field<Shelf<MemoryCard>>,
-    pub asked_but_not_known: Field<Shelf<MissedQuery>>,
-    pub suspected_unknowns: Field<Shelf<String>>,
-    pub this_week: Field<Shelf<CountCard>>,
-    pub where_learned: Field<Shelf<CountCard>>,
-    pub sense_of_self: Field<Shelf<MemoryCard>>,
-    pub undetermined: Field<Shelf<CountCard>>,
+    pub settled_facts: Field<UiShelf<FactCard>>,
+    pub changed_its_mind: Field<UiShelf<FactCard>>,
+    pub contradictions: Field<UiShelf<FactCard>>,
+    pub rulings: Field<UiShelf<MemoryCard>>,
+    pub scars: Field<UiShelf<MemoryCard>>,
+    pub who_and_what: Field<UiShelf<EntityCard>>,
+    pub strongest_associations: Field<UiShelf<AssociationCard>>,
+    pub about_to_forget: Field<UiShelf<MemoryCard>>,
+    pub pinned: Field<UiShelf<MemoryCard>>,
+    pub known_but_never_asked: Field<UiShelf<MemoryCard>>,
+    pub most_asked: Field<UiShelf<MemoryCard>>,
+    pub asked_but_not_known: Field<UiShelf<MissedQuery>>,
+    pub suspected_unknowns: Field<UiShelf<String>>,
+    pub this_week: Field<UiShelf<CountCard>>,
+    pub where_learned: Field<UiShelf<CountCard>>,
+    pub sense_of_self: Field<UiShelf<MemoryCard>>,
+    pub undetermined: Field<UiShelf<CountCard>>,
 }
 
 fn head(s: &str, n: usize) -> String {
@@ -836,10 +836,10 @@ fn memory_card(m: &Memory, sources: Option<&HashMap<MemoryId, TagSources>>) -> M
     }
 }
 
-fn shelf<T>(mut items: Vec<T>, keep: usize) -> Shelf<T> {
+fn shelf<T>(mut items: Vec<T>, keep: usize) -> UiShelf<T> {
     let count = items.len();
     items.truncate(keep);
-    Shelf { count, items }
+    UiShelf { count, items }
 }
 
 fn fact_card(f: &crate::memory::compression::SemanticFact) -> FactCard {
@@ -889,7 +889,7 @@ pub fn build_knows(i: KnowsInputs<'_>) -> Knows {
             .unwrap_or_default()
     };
 
-    let by_type = |types: &[ExperienceType]| -> Field<Shelf<MemoryCard>> {
+    let by_type = |types: &[ExperienceType]| -> Field<UiShelf<MemoryCard>> {
         match mems {
             None => Field::unmeasured(mem_err(), W_MEMORIES),
             Some(ms) => {
@@ -911,7 +911,7 @@ pub fn build_knows(i: KnowsInputs<'_>) -> Knows {
     };
     let memory_shelf = |filter: &dyn Fn(&Memory) -> bool,
                         order: &dyn Fn(&Memory, &Memory) -> std::cmp::Ordering|
-     -> Field<Shelf<MemoryCard>> {
+     -> Field<UiShelf<MemoryCard>> {
         match mems {
             None => Field::unmeasured(mem_err(), W_MEMORIES),
             Some(ms) => {
@@ -1108,7 +1108,7 @@ pub fn build_knows(i: KnowsInputs<'_>) -> Knows {
                 0,
             );
             Field::measured(
-                Shelf {
+                UiShelf {
                     count: r.misses,
                     items: r.top_misses,
                 },
@@ -1170,7 +1170,7 @@ pub fn build_knows(i: KnowsInputs<'_>) -> Knows {
         (Some(ms), Some(s)) => {
             let without = ms.iter().filter(|m| !s.contains_key(&m.id)).count();
             Field::measured(
-                Shelf {
+                UiShelf {
                     count: without,
                     items: vec![CountCard {
                         key: "memories without a tag-source row".into(),

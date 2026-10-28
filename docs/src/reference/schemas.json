@@ -2228,7 +2228,7 @@
         }
       ]
     },
-    "AddEntityRequest (handlers/mif)": {
+    "AddEntityRequest": {
       "name": "AddEntityRequest",
       "file": "src/handlers/mif.rs",
       "kind": "struct",
@@ -2270,7 +2270,7 @@
         }
       ]
     },
-    "AddRelationshipRequest (handlers/mif)": {
+    "AddRelationshipRequest": {
       "name": "AddRelationshipRequest",
       "file": "src/handlers/mif.rs",
       "kind": "struct",
@@ -2558,7 +2558,7 @@
         }
       ]
     },
-    "AnchorRequest (handlers/crud)": {
+    "AnchorRequest": {
       "name": "AnchorRequest",
       "file": "src/handlers/crud.rs",
       "doc": "Request to anchor or unanchor a memory",
@@ -2591,7 +2591,7 @@
         }
       ]
     },
-    "AnchorResponse (handlers/crud)": {
+    "AnchorResponse": {
       "name": "AnchorResponse",
       "file": "src/handlers/crud.rs",
       "doc": "Response for anchor operations",
@@ -2988,7 +2988,7 @@
         }
       ]
     },
-    "BatchErrorItem (handlers/remember)": {
+    "BatchErrorItem": {
       "name": "BatchErrorItem",
       "file": "src/handlers/remember.rs",
       "doc": "Error detail for batch item",
@@ -3009,7 +3009,7 @@
         }
       ]
     },
-    "BatchMemoryItem (handlers/remember)": {
+    "BatchMemoryItem": {
       "name": "BatchMemoryItem",
       "file": "src/handlers/remember.rs",
       "doc": "Single item in batch remember",
@@ -3206,7 +3206,7 @@
         }
       ]
     },
-    "BatchRememberOptions (handlers/remember)": {
+    "BatchRememberOptions": {
       "name": "BatchRememberOptions",
       "file": "src/handlers/remember.rs",
       "doc": "Options for batch remember",
@@ -3230,7 +3230,7 @@
         }
       ]
     },
-    "BatchRememberRequest (handlers/remember)": {
+    "BatchRememberRequest": {
       "name": "BatchRememberRequest",
       "file": "src/handlers/remember.rs",
       "doc": "Batch remember request",
@@ -3266,7 +3266,7 @@
         }
       ]
     },
-    "BatchRememberResponse (handlers/remember)": {
+    "BatchRememberResponse": {
       "name": "BatchRememberResponse",
       "file": "src/handlers/remember.rs",
       "doc": "Batch remember response",
@@ -3466,7 +3466,7 @@
         }
       ]
     },
-    "BrainStateResponse (handlers/visualization)": {
+    "BrainStateResponse": {
       "name": "BrainStateResponse",
       "file": "src/handlers/visualization.rs",
       "doc": "Brain state response with memories organized by tier",
@@ -3509,7 +3509,7 @@
         }
       ]
     },
-    "BrainStats (handlers/visualization)": {
+    "BrainStats": {
       "name": "BrainStats",
       "file": "src/handlers/visualization.rs",
       "doc": "Brain statistics",
@@ -3550,7 +3550,7 @@
         }
       ]
     },
-    "Bucket (entity_frequency)": {
+    "Bucket": {
       "name": "Bucket",
       "file": "src/entity_frequency.rs",
       "kind": "enum",
@@ -3589,7 +3589,7 @@
         }
       ]
     },
-    "BuildVisualizationRequest (handlers/visualization)": {
+    "BuildVisualizationRequest": {
       "name": "BuildVisualizationRequest",
       "file": "src/handlers/visualization.rs",
       "doc": "Request to build visualization",
@@ -3605,7 +3605,7 @@
         }
       ]
     },
-    "BulkDeleteRequest (handlers/crud)": {
+    "BulkDeleteRequest": {
       "name": "BulkDeleteRequest",
       "file": "src/handlers/crud.rs",
       "doc": "Bulk delete memories by filters",
@@ -3715,49 +3715,8 @@
         }
       ]
     },
-    "CausalLink": {
-      "name": "CausalLink",
-      "file": "src/memory/facets.rs",
-      "doc": "A typed causal link between this engram and another memory.",
-      "kind": "struct",
-      "fields": [
-        {
-          "name": "other",
-          "type": "MemoryId",
-          "required": true,
-          "doc": "The other memory.",
-          "refs": [
-            "MemoryId"
-          ]
-        },
-        {
-          "name": "relation",
-          "type": "CausalRelation",
-          "required": true,
-          "doc": "The kind of causal relation.",
-          "refs": [
-            "CausalRelation"
-          ]
-        },
-        {
-          "name": "confidence",
-          "type": "f32",
-          "required": true,
-          "notes": [
-            "score"
-          ],
-          "doc": "Confidence in this link, 0.0–1.0."
-        },
-        {
-          "name": "inferred",
-          "type": "bool",
-          "required": true,
-          "doc": "Was this link observed or inferred? Inferred links are weaker evidence at retrieval — the source-monitoring discipline applied to Veld's own inferences."
-        }
-      ]
-    },
-    "CausalRelation (memory/facets)": {
-      "name": "CausalRelation",
+    "CausalKind": {
+      "name": "CausalKind",
       "file": "src/memory/facets.rs",
       "doc": "Kinds of causal relation between memories.",
       "kind": "enum",
@@ -3785,7 +3744,48 @@
         }
       ]
     },
-    "CausalRelation (memory/lineage)": {
+    "CausalLink": {
+      "name": "CausalLink",
+      "file": "src/memory/facets.rs",
+      "doc": "A typed causal link between this engram and another memory.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "other",
+          "type": "MemoryId",
+          "required": true,
+          "doc": "The other memory.",
+          "refs": [
+            "MemoryId"
+          ]
+        },
+        {
+          "name": "relation",
+          "type": "CausalKind",
+          "required": true,
+          "doc": "The kind of causal relation.",
+          "refs": [
+            "CausalKind"
+          ]
+        },
+        {
+          "name": "confidence",
+          "type": "f32",
+          "required": true,
+          "notes": [
+            "score"
+          ],
+          "doc": "Confidence in this link, 0.0–1.0."
+        },
+        {
+          "name": "inferred",
+          "type": "bool",
+          "required": true,
+          "doc": "Was this link observed or inferred? Inferred links are weaker evidence at retrieval — the source-monitoring discipline applied to Veld's own inferences."
+        }
+      ]
+    },
+    "CausalRelation": {
       "name": "CausalRelation",
       "file": "src/memory/lineage.rs",
       "doc": "Causal relationship types between memories",
@@ -3938,7 +3938,7 @@
         }
       ]
     },
-    "ClearAllRequest (handlers/crud)": {
+    "ClearAllRequest": {
       "name": "ClearAllRequest",
       "file": "src/handlers/crud.rs",
       "doc": "Clear ALL memories for a user (GDPR compliance)",
@@ -5194,6 +5194,55 @@
         }
       ]
     },
+    "ConsolidationInterference": {
+      "name": "ConsolidationInterference",
+      "file": "src/memory/introspection.rs",
+      "doc": "Interference event details (SHO-106)",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "new_memory_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "old_memory_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "similarity",
+          "type": "f32",
+          "required": true,
+          "notes": [
+            "score"
+          ]
+        },
+        {
+          "name": "interference_type",
+          "type": "InterferenceType",
+          "required": true,
+          "refs": [
+            "InterferenceType"
+          ]
+        },
+        {
+          "name": "timestamp",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        }
+      ]
+    },
     "ConsolidationReport": {
       "name": "ConsolidationReport",
       "file": "src/memory/introspection.rs",
@@ -5321,12 +5370,12 @@
         },
         {
           "name": "interference_events",
-          "type": "Vec<InterferenceEvent>",
+          "type": "Vec<ConsolidationInterference>",
           "required": true,
           "doc": "Interference events detected",
           "refs": [
             "Vec",
-            "InterferenceEvent"
+            "ConsolidationInterference"
           ]
         },
         {
@@ -5612,7 +5661,7 @@
         }
       ]
     },
-    "ContextStatusRequest (handlers/health)": {
+    "ContextStatusRequest": {
       "name": "ContextStatusRequest",
       "file": "src/handlers/health.rs",
       "doc": "Context status request from Claude Code status line",
@@ -5937,26 +5986,26 @@
         },
         {
           "name": "control_weights",
-          "type": "Option<relevance::LearnedWeights>",
+          "type": "Option<relevance::LearnedSignalWeights>",
           "required": false,
           "notes": [
             "default when absent"
           ],
           "refs": [
             "Option",
-            "LearnedWeights"
+            "LearnedSignalWeights"
           ]
         },
         {
           "name": "treatment_weights",
-          "type": "Option<relevance::LearnedWeights>",
+          "type": "Option<relevance::LearnedSignalWeights>",
           "required": false,
           "notes": [
             "default when absent"
           ],
           "refs": [
             "Option",
-            "LearnedWeights"
+            "LearnedSignalWeights"
           ]
         },
         {
@@ -6926,7 +6975,7 @@
         }
       ]
     },
-    "DetectedEntity (relevance)": {
+    "DetectedEntity": {
       "name": "DetectedEntity",
       "file": "src/relevance.rs",
       "doc": "Detected entity with confidence",
@@ -9976,7 +10025,7 @@
         }
       ]
     },
-    "ForgetByAgeRequest (handlers/crud)": {
+    "ForgetByAgeRequest": {
       "name": "ForgetByAgeRequest",
       "file": "src/handlers/crud.rs",
       "doc": "Forget memories by age",
@@ -9997,7 +10046,7 @@
         }
       ]
     },
-    "ForgetByDateRequest (handlers/crud)": {
+    "ForgetByDateRequest": {
       "name": "ForgetByDateRequest",
       "file": "src/handlers/crud.rs",
       "doc": "Forget memories by date range",
@@ -10057,7 +10106,7 @@
         }
       ]
     },
-    "ForgetByImportanceRequest (handlers/crud)": {
+    "ForgetByImportanceRequest": {
       "name": "ForgetByImportanceRequest",
       "file": "src/handlers/crud.rs",
       "doc": "Forget memories by importance threshold",
@@ -10078,7 +10127,7 @@
         }
       ]
     },
-    "ForgetByPatternRequest (handlers/crud)": {
+    "ForgetByPatternRequest": {
       "name": "ForgetByPatternRequest",
       "file": "src/handlers/crud.rs",
       "doc": "Forget memories matching a pattern",
@@ -10102,7 +10151,7 @@
         }
       ]
     },
-    "ForgetByTagsRequest (handlers/crud)": {
+    "ForgetByTagsRequest": {
       "name": "ForgetByTagsRequest",
       "file": "src/handlers/crud.rs",
       "doc": "Forget memories by tags",
@@ -10548,7 +10597,7 @@
         }
       ]
     },
-    "GetAllEntitiesRequest (handlers/graph)": {
+    "GetAllEntitiesRequest": {
       "name": "GetAllEntitiesRequest",
       "file": "src/handlers/graph.rs",
       "doc": "Request to get all entities",
@@ -10689,7 +10738,7 @@
         }
       ]
     },
-    "GetUncompressedRequest (handlers/mif)": {
+    "GetUncompressedRequest": {
       "name": "GetUncompressedRequest",
       "file": "src/handlers/mif.rs",
       "kind": "struct",
@@ -11107,7 +11156,7 @@
         }
       ]
     },
-    "GraphStats (graph_memory)": {
+    "GraphStats": {
       "name": "GraphStats",
       "file": "src/graph_memory.rs",
       "doc": "Graph statistics",
@@ -11235,7 +11284,7 @@
         }
       ]
     },
-    "HealthResponse (handlers/health)": {
+    "HealthResponse": {
       "name": "HealthResponse",
       "file": "src/handlers/health.rs",
       "doc": "Health response for main health endpoint",
@@ -11864,56 +11913,7 @@
         }
       ]
     },
-    "InterferenceEvent (memory/introspection)": {
-      "name": "InterferenceEvent",
-      "file": "src/memory/introspection.rs",
-      "doc": "Interference event details (SHO-106)",
-      "kind": "struct",
-      "fields": [
-        {
-          "name": "new_memory_id",
-          "type": "String",
-          "required": true,
-          "refs": [
-            "String"
-          ]
-        },
-        {
-          "name": "old_memory_id",
-          "type": "String",
-          "required": true,
-          "refs": [
-            "String"
-          ]
-        },
-        {
-          "name": "similarity",
-          "type": "f32",
-          "required": true,
-          "notes": [
-            "score"
-          ]
-        },
-        {
-          "name": "interference_type",
-          "type": "InterferenceType",
-          "required": true,
-          "refs": [
-            "InterferenceType"
-          ]
-        },
-        {
-          "name": "timestamp",
-          "type": "DateTime<Utc>",
-          "required": true,
-          "refs": [
-            "DateTime",
-            "Utc"
-          ]
-        }
-      ]
-    },
-    "InterferenceEvent (memory/types)": {
+    "InterferenceEvent": {
       "name": "InterferenceEvent",
       "file": "src/memory/types.rs",
       "doc": "Interference event reported in retrieval stats (FIX-03)",
@@ -12064,171 +12064,171 @@
       "fields": [
         {
           "name": "settled_facts",
-          "type": "Field<Shelf<FactCard>>",
+          "type": "Field<UiShelf<FactCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "FactCard"
           ]
         },
         {
           "name": "changed_its_mind",
-          "type": "Field<Shelf<FactCard>>",
+          "type": "Field<UiShelf<FactCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "FactCard"
           ]
         },
         {
           "name": "contradictions",
-          "type": "Field<Shelf<FactCard>>",
+          "type": "Field<UiShelf<FactCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "FactCard"
           ]
         },
         {
           "name": "rulings",
-          "type": "Field<Shelf<MemoryCard>>",
+          "type": "Field<UiShelf<MemoryCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "MemoryCard"
           ]
         },
         {
           "name": "scars",
-          "type": "Field<Shelf<MemoryCard>>",
+          "type": "Field<UiShelf<MemoryCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "MemoryCard"
           ]
         },
         {
           "name": "who_and_what",
-          "type": "Field<Shelf<EntityCard>>",
+          "type": "Field<UiShelf<EntityCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "EntityCard"
           ]
         },
         {
           "name": "strongest_associations",
-          "type": "Field<Shelf<AssociationCard>>",
+          "type": "Field<UiShelf<AssociationCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "AssociationCard"
           ]
         },
         {
           "name": "about_to_forget",
-          "type": "Field<Shelf<MemoryCard>>",
+          "type": "Field<UiShelf<MemoryCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "MemoryCard"
           ]
         },
         {
           "name": "pinned",
-          "type": "Field<Shelf<MemoryCard>>",
+          "type": "Field<UiShelf<MemoryCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "MemoryCard"
           ]
         },
         {
           "name": "known_but_never_asked",
-          "type": "Field<Shelf<MemoryCard>>",
+          "type": "Field<UiShelf<MemoryCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "MemoryCard"
           ]
         },
         {
           "name": "most_asked",
-          "type": "Field<Shelf<MemoryCard>>",
+          "type": "Field<UiShelf<MemoryCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "MemoryCard"
           ]
         },
         {
           "name": "asked_but_not_known",
-          "type": "Field<Shelf<MissedQuery>>",
+          "type": "Field<UiShelf<MissedQuery>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "MissedQuery"
           ]
         },
         {
           "name": "suspected_unknowns",
-          "type": "Field<Shelf<String>>",
+          "type": "Field<UiShelf<String>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "String"
           ]
         },
         {
           "name": "this_week",
-          "type": "Field<Shelf<CountCard>>",
+          "type": "Field<UiShelf<CountCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "CountCard"
           ]
         },
         {
           "name": "where_learned",
-          "type": "Field<Shelf<CountCard>>",
+          "type": "Field<UiShelf<CountCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "CountCard"
           ]
         },
         {
           "name": "sense_of_self",
-          "type": "Field<Shelf<MemoryCard>>",
+          "type": "Field<UiShelf<MemoryCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "MemoryCard"
           ]
         },
         {
           "name": "undetermined",
-          "type": "Field<Shelf<CountCard>>",
+          "type": "Field<UiShelf<CountCard>>",
           "required": true,
           "refs": [
             "Field",
-            "Shelf",
+            "UiShelf",
             "CountCard"
           ]
         }
@@ -12298,7 +12298,86 @@
         }
       ]
     },
-    "LineageAddEdgeRequest (handlers/lineage)": {
+    "LearnedSignalWeights": {
+      "name": "LearnedSignalWeights",
+      "file": "src/relevance.rs",
+      "doc": "Learned weights for score fusion, adapted via feedback",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "semantic",
+          "type": "f32",
+          "required": true,
+          "doc": "Weight for semantic similarity score"
+        },
+        {
+          "name": "entity",
+          "type": "f32",
+          "required": true,
+          "doc": "Weight for entity matching score"
+        },
+        {
+          "name": "tag",
+          "type": "f32",
+          "required": true,
+          "doc": "Weight for tag matching score"
+        },
+        {
+          "name": "importance",
+          "type": "f32",
+          "required": true,
+          "notes": [
+            "score"
+          ],
+          "doc": "Weight for importance score"
+        },
+        {
+          "name": "momentum",
+          "type": "f32",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Weight for feedback momentum EMA (FBK-5) Higher momentum = memory has been consistently helpful Lower/negative momentum = memory has been consistently misleading"
+        },
+        {
+          "name": "access_count",
+          "type": "f32",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Weight for access count (CTX-3) Higher access count = memory has proven retrieval value"
+        },
+        {
+          "name": "graph_strength",
+          "type": "f32",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Weight for graph Hebbian strength (CTX-3) Higher strength = stronger entity relationships in knowledge graph"
+        },
+        {
+          "name": "update_count",
+          "type": "u32",
+          "required": true,
+          "doc": "Number of feedback updates applied"
+        },
+        {
+          "name": "last_updated",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "doc": "Last time weights were updated",
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        }
+      ]
+    },
+    "LineageAddEdgeRequest": {
       "name": "LineageAddEdgeRequest",
       "file": "src/handlers/lineage.rs",
       "doc": "Request to add an explicit lineage edge",
@@ -12589,7 +12668,7 @@
         }
       ]
     },
-    "LineageEdgeRequest (handlers/lineage)": {
+    "LineageEdgeRequest": {
       "name": "LineageEdgeRequest",
       "file": "src/handlers/lineage.rs",
       "doc": "Request to confirm/reject an edge",
@@ -12735,7 +12814,7 @@
         }
       ]
     },
-    "LineageTraceRequest (handlers/lineage)": {
+    "LineageTraceRequest": {
       "name": "LineageTraceRequest",
       "file": "src/handlers/lineage.rs",
       "doc": "Request to trace lineage from a memory",
@@ -12778,7 +12857,7 @@
         }
       ]
     },
-    "LineageTraceResponse (handlers/lineage)": {
+    "LineageTraceResponse": {
       "name": "LineageTraceResponse",
       "file": "src/handlers/lineage.rs",
       "doc": "Response for lineage trace",
@@ -13480,7 +13559,7 @@
         }
       ]
     },
-    "ListTodosRequest (handlers/todos)": {
+    "ListTodosRequest": {
       "name": "ListTodosRequest",
       "file": "src/handlers/todos.rs",
       "doc": "Request to list todos with filters",
@@ -14591,7 +14670,7 @@
         }
       ]
     },
-    "MemoryNeuron (handlers/visualization)": {
+    "MemoryNeuron": {
       "name": "MemoryNeuron",
       "file": "src/handlers/visualization.rs",
       "doc": "Individual memory neuron for visualization",
@@ -15234,7 +15313,7 @@
         }
       ]
     },
-    "MultiModalSearchRequest (handlers/search)": {
+    "MultiModalSearchRequest": {
       "name": "MultiModalSearchRequest",
       "file": "src/handlers/search.rs",
       "kind": "struct",
@@ -15866,7 +15945,7 @@
         }
       ]
     },
-    "ProactiveContextRequest (handlers/recall)": {
+    "ProactiveContextRequest": {
       "name": "ProactiveContextRequest",
       "file": "src/handlers/recall.rs",
       "doc": "Request for proactive context - returns relevant memories + triggered reminders",
@@ -16088,7 +16167,7 @@
         }
       ]
     },
-    "ProactiveContextResponse (handlers/recall)": {
+    "ProactiveContextResponse": {
       "name": "ProactiveContextResponse",
       "file": "src/handlers/recall.rs",
       "doc": "Response for proactive context",
@@ -17421,7 +17500,7 @@
         }
       ]
     },
-    "Query (query_planner/predicate)": {
+    "Query": {
       "name": "Query",
       "file": "src/query_planner/predicate.rs",
       "doc": "A single planner-level query. Combines relational filters, an optional vector scan, and graph reachability predicates against a single tenant (`user_id`).",
@@ -17661,7 +17740,7 @@
         }
       ]
     },
-    "RecallByDateRequest (handlers/recall)": {
+    "RecallByDateRequest": {
       "name": "RecallByDateRequest",
       "file": "src/handlers/recall.rs",
       "doc": "Recall memories by date range",
@@ -17706,7 +17785,7 @@
         }
       ]
     },
-    "RecallByTagsRequest (handlers/recall)": {
+    "RecallByTagsRequest": {
       "name": "RecallByTagsRequest",
       "file": "src/handlers/recall.rs",
       "doc": "Recall memories by tags",
@@ -18296,7 +18375,7 @@
         }
       ]
     },
-    "RecallRequest (handlers/types)": {
+    "RecallRequest": {
       "name": "RecallRequest",
       "file": "src/handlers/types.rs",
       "doc": "Simplified recall request - just query text",
@@ -18444,7 +18523,7 @@
         }
       ]
     },
-    "RecallResponse (handlers/types)": {
+    "RecallResponse": {
       "name": "RecallResponse",
       "file": "src/handlers/types.rs",
       "doc": "Simplified recall response - returns just text snippets",
@@ -19759,7 +19838,7 @@
         }
       ]
     },
-    "RememberRequest (handlers/remember)": {
+    "RememberRequest": {
       "name": "RememberRequest",
       "file": "src/handlers/remember.rs",
       "doc": "Remember request - store a new memory",
@@ -20038,7 +20117,7 @@
         }
       ]
     },
-    "RememberResponse (handlers/remember)": {
+    "RememberResponse": {
       "name": "RememberResponse",
       "file": "src/handlers/remember.rs",
       "doc": "Remember response",
@@ -20080,108 +20159,7 @@
         }
       ]
     },
-    "ReminderItem (handlers/recall)": {
-      "name": "ReminderItem",
-      "file": "src/handlers/recall.rs",
-      "doc": "Individual reminder in response",
-      "kind": "struct",
-      "fields": [
-        {
-          "name": "id",
-          "type": "String",
-          "required": true,
-          "refs": [
-            "String"
-          ]
-        },
-        {
-          "name": "content",
-          "type": "String",
-          "required": true,
-          "refs": [
-            "String"
-          ]
-        },
-        {
-          "name": "trigger_type",
-          "type": "String",
-          "required": true,
-          "refs": [
-            "String"
-          ]
-        },
-        {
-          "name": "status",
-          "type": "String",
-          "required": true,
-          "refs": [
-            "String"
-          ]
-        },
-        {
-          "name": "due_at",
-          "type": "Option<chrono::DateTime<chrono::Utc>>",
-          "required": false,
-          "refs": [
-            "Option",
-            "DateTime",
-            "Utc"
-          ]
-        },
-        {
-          "name": "created_at",
-          "type": "chrono::DateTime<chrono::Utc>",
-          "required": true,
-          "refs": [
-            "DateTime",
-            "Utc"
-          ]
-        },
-        {
-          "name": "triggered_at",
-          "type": "Option<chrono::DateTime<chrono::Utc>>",
-          "required": false,
-          "refs": [
-            "Option",
-            "DateTime",
-            "Utc"
-          ]
-        },
-        {
-          "name": "dismissed_at",
-          "type": "Option<chrono::DateTime<chrono::Utc>>",
-          "required": false,
-          "refs": [
-            "Option",
-            "DateTime",
-            "Utc"
-          ]
-        },
-        {
-          "name": "priority",
-          "type": "u8",
-          "required": true
-        },
-        {
-          "name": "tags",
-          "type": "Vec<String>",
-          "required": true,
-          "refs": [
-            "Vec",
-            "String"
-          ]
-        },
-        {
-          "name": "overdue_seconds",
-          "type": "Option<i64>",
-          "required": false,
-          "refs": [
-            "Option"
-          ]
-        }
-      ]
-    },
-    "ReminderItem (handlers/todos)": {
+    "ReminderItem": {
       "name": "ReminderItem",
       "file": "src/handlers/todos.rs",
       "doc": "Individual reminder in list response",
@@ -21124,7 +21102,7 @@
         }
       ]
     },
-    "RoboticsSearchRequest (handlers/search)": {
+    "RoboticsSearchRequest": {
       "name": "RoboticsSearchRequest",
       "file": "src/handlers/search.rs",
       "kind": "struct",
@@ -21800,11 +21778,11 @@
         },
         {
           "name": "temporal",
-          "type": "TemporalContext",
+          "type": "SessionTimeContext",
           "required": true,
           "doc": "Temporal context (time of day, relative date, etc.)",
           "refs": [
-            "TemporalContext"
+            "SessionTimeContext"
           ]
         },
         {
@@ -21913,7 +21891,7 @@
         "Uuid"
       ]
     },
-    "SessionStats (memory/sessions)": {
+    "SessionStats": {
       "name": "SessionStats",
       "file": "src/memory/sessions.rs",
       "doc": "Session statistics",
@@ -22102,11 +22080,11 @@
         },
         {
           "name": "temporal",
-          "type": "TemporalContext",
+          "type": "SessionTimeContext",
           "required": true,
           "doc": "Temporal context with human-readable labels",
           "refs": [
-            "TemporalContext"
+            "SessionTimeContext"
           ]
         },
         {
@@ -22125,6 +22103,77 @@
           "required": true,
           "refs": [
             "SessionStats"
+          ]
+        }
+      ]
+    },
+    "SessionTimeContext": {
+      "name": "SessionTimeContext",
+      "file": "src/memory/sessions.rs",
+      "doc": "Temporal context for a session",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "time_of_day",
+          "type": "TimeOfDay",
+          "required": true,
+          "doc": "Time of day when session started",
+          "refs": [
+            "TimeOfDay"
+          ]
+        },
+        {
+          "name": "day_of_week",
+          "type": "u32",
+          "required": true,
+          "doc": "Day of week (Monday=0, Sunday=6)"
+        },
+        {
+          "name": "day_name",
+          "type": "String",
+          "required": true,
+          "doc": "Day of week name",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "month_name",
+          "type": "String",
+          "required": true,
+          "doc": "Month name",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "day",
+          "type": "u32",
+          "required": true,
+          "doc": "Day of month"
+        },
+        {
+          "name": "year",
+          "type": "i32",
+          "required": true,
+          "doc": "Year"
+        },
+        {
+          "name": "label",
+          "type": "String",
+          "required": true,
+          "doc": "Human-readable label like \"Morning session of Dec 20th\"",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "relative",
+          "type": "String",
+          "required": true,
+          "doc": "Relative time label like \"Today\", \"Yesterday\", \"Last week\"",
+          "refs": [
+            "String"
           ]
         }
       ]
@@ -22265,7 +22314,7 @@
         }
       ]
     },
-    "Shelf (entity_hygiene)": {
+    "Shelf": {
       "name": "Shelf",
       "file": "src/entity_hygiene.rs",
       "kind": "enum",
@@ -22279,27 +22328,6 @@
         },
         {
           "name": "noise"
-        }
-      ]
-    },
-    "Shelf (handlers/ui)": {
-      "name": "Shelf",
-      "file": "src/handlers/ui.rs",
-      "kind": "struct",
-      "fields": [
-        {
-          "name": "count",
-          "type": "usize",
-          "required": true
-        },
-        {
-          "name": "items",
-          "type": "Vec<T>",
-          "required": true,
-          "refs": [
-            "Vec",
-            "T"
-          ]
         }
       ]
     },
@@ -22877,7 +22905,7 @@
         }
       ]
     },
-    "SurfacedMemory (relevance)": {
+    "SurfacedMemory": {
       "name": "SurfacedMemory",
       "file": "src/relevance.rs",
       "doc": "A surfaced memory with relevance scoring",
@@ -23238,78 +23266,7 @@
         }
       ]
     },
-    "TemporalContext (memory/sessions)": {
-      "name": "TemporalContext",
-      "file": "src/memory/sessions.rs",
-      "doc": "Temporal context for a session",
-      "kind": "struct",
-      "fields": [
-        {
-          "name": "time_of_day",
-          "type": "TimeOfDay",
-          "required": true,
-          "doc": "Time of day when session started",
-          "refs": [
-            "TimeOfDay"
-          ]
-        },
-        {
-          "name": "day_of_week",
-          "type": "u32",
-          "required": true,
-          "doc": "Day of week (Monday=0, Sunday=6)"
-        },
-        {
-          "name": "day_name",
-          "type": "String",
-          "required": true,
-          "doc": "Day of week name",
-          "refs": [
-            "String"
-          ]
-        },
-        {
-          "name": "month_name",
-          "type": "String",
-          "required": true,
-          "doc": "Month name",
-          "refs": [
-            "String"
-          ]
-        },
-        {
-          "name": "day",
-          "type": "u32",
-          "required": true,
-          "doc": "Day of month"
-        },
-        {
-          "name": "year",
-          "type": "i32",
-          "required": true,
-          "doc": "Year"
-        },
-        {
-          "name": "label",
-          "type": "String",
-          "required": true,
-          "doc": "Human-readable label like \"Morning session of Dec 20th\"",
-          "refs": [
-            "String"
-          ]
-        },
-        {
-          "name": "relative",
-          "type": "String",
-          "required": true,
-          "doc": "Relative time label like \"Today\", \"Yesterday\", \"Last week\"",
-          "refs": [
-            "String"
-          ]
-        }
-      ]
-    },
-    "TemporalContext (memory/types)": {
+    "TemporalContext": {
       "name": "TemporalContext",
       "file": "src/memory/types.rs",
       "doc": "Temporal context",
@@ -23635,7 +23592,7 @@
         }
       ]
     },
-    "TierMoveRequest (handlers/crud)": {
+    "TierMoveRequest": {
       "name": "TierMoveRequest",
       "file": "src/handlers/crud.rs",
       "doc": "Request body for the tier-move endpoint.",
@@ -23668,7 +23625,7 @@
         }
       ]
     },
-    "TierMoveResponse (handlers/crud)": {
+    "TierMoveResponse": {
       "name": "TierMoveResponse",
       "file": "src/handlers/crud.rs",
       "doc": "Response for tier-move operations.",
@@ -23836,7 +23793,7 @@
         }
       ]
     },
-    "Todo (memory/types)": {
+    "Todo": {
       "name": "Todo",
       "file": "src/memory/types.rs",
       "doc": "A GTD-style todo item",
@@ -24749,25 +24706,31 @@
         }
       ]
     },
-    "Undetermined (entity_frequency)": {
-      "name": "Undetermined",
-      "file": "src/entity_frequency.rs",
-      "doc": "Why the result cannot be read as a measurement of the window. Absent when it can.",
+    "UiShelf": {
+      "name": "UiShelf",
+      "file": "src/handlers/ui.rs",
       "kind": "struct",
       "fields": [
         {
-          "name": "reason",
-          "type": "String",
+          "name": "count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "items",
+          "type": "Vec<T>",
           "required": true,
           "refs": [
-            "String"
+            "Vec",
+            "T"
           ]
         }
       ]
     },
-    "Undetermined (tag_cores)": {
+    "Undetermined": {
       "name": "Undetermined",
-      "file": "src/tag_cores.rs",
+      "file": "src/entity_frequency.rs",
+      "doc": "Why the result cannot be read as a measurement of the window. Absent when it can.",
       "kind": "struct",
       "fields": [
         {
@@ -25279,7 +25242,7 @@
         }
       ]
     },
-    "UpsertRequest (handlers/remember)": {
+    "UpsertRequest": {
       "name": "UpsertRequest",
       "file": "src/handlers/remember.rs",
       "doc": "Upsert request - create or update memory",
@@ -25447,7 +25410,7 @@
         }
       ]
     },
-    "UpsertResponse (handlers/remember)": {
+    "UpsertResponse": {
       "name": "UpsertResponse",
       "file": "src/handlers/remember.rs",
       "doc": "Upsert response",
@@ -26154,11 +26117,5 @@
         }
       ]
     }
-  },
-  "ambiguous": {
-    "LearnedWeights": [
-      "src/memory/hybrid_search.rs",
-      "src/relevance.rs"
-    ]
   }
 }
