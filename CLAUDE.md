@@ -313,7 +313,7 @@ Tags are the cheap "what kind of thing" signal (scoring signal 15). Keep them sh
 
 A memory typically carries one domain + one kind tag (`["storage", "decision"]`); add more only if you'll search by them.
 
-Veld adds derived tags of its own (NER, YAKE, ingest hints, cold-start extraction) and keeps at most `DERIVED_TAG_BUDGET` (12, env `VELD_DERIVED_TAG_BUDGET`) of them per record, the rarest by graph mention count, after dropping any without a letter or carrying code punctuation ([src/entity_cap.rs](src/entity_cap.rs)). Authored tags are never counted against that budget; the record-wide limit stays 50.
+Veld adds derived tags of its own (NER, YAKE, ingest hints, cold-start extraction). After redaction it drops any derived tag without a letter, under two characters, or carrying code punctuation, then keeps the rarest by graph mention count up to `DERIVED_TAG_BUDGET` ([src/entity_cap.rs](src/entity_cap.rs)). The default budget is 50, the record-wide limit, so it cuts nothing: on the recall gate a budget of 12 lost eleven gold documents and 24 lost three (PR #88). `VELD_DERIVED_TAG_BUDGET` lowers it for a store that wants to measure. Authored tags are never counted against it.
 
 ### Citation format
 

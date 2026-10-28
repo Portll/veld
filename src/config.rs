@@ -927,8 +927,8 @@ pub struct ServerConfig {
     pub max_entities_per_memory: usize,
 
     /// Derived tags (NER, YAKE, ingest hints, cold start) a stored record keeps beside the
-    /// writer's own; default `constants::DERIVED_TAG_BUDGET`, env `VELD_DERIVED_TAG_BUDGET`
-    /// (1–50). Set 50 to restore the pre-0.8.5 behaviour of filling the record to the cap.
+    /// writer's own; default `constants::DERIVED_TAG_BUDGET` (50, which cuts nothing), env
+    /// `VELD_DERIVED_TAG_BUDGET` (1–50) to lower it on a store that measures the effect.
     pub derived_tag_budget: usize,
 
     /// Log-periodic fractal decay scales in days (default: [7.0, 30.0, 365.0])
