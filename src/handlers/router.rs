@@ -268,10 +268,11 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             "/api/context/status",
             get(health::get_context_status).post(health::update_context_status),
         )
+        // Alias of /api/context/status, kept for the TUI; same handlers, same shapes.
         .route(
             "/api/context_status",
             get(health::get_context_status).post(health::update_context_status),
-        ) // TUI alias
+        )
         // =================================================================
         // EXTERNAL WEBHOOKS (auth + rate limited — prevents unauthenticated memory injection)
         // =================================================================
@@ -341,7 +342,8 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         ) // FIX-02: observability
         .route("/api/memory/{memory_id}", put(crud::update_memory))
         .route("/api/memory/{memory_id}", delete(crud::delete_memory))
-        .route("/api/forget/{memory_id}", delete(crud::delete_memory)) // OpenAPI alias
+        // Alias of DELETE /api/memory/{memory_id}, kept for the OpenAPI clients; same handler.
+        .route("/api/forget/{memory_id}", delete(crud::delete_memory))
         .route("/api/list/{user_id}", get(crud::list_memories)) // TUI uses this
         .route("/api/memories", post(crud::list_memories_post)) // POST version
         .route("/api/memories", get(crud::list_memories_get)) // Cloudflare compat alias
